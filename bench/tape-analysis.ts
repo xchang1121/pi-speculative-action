@@ -2,6 +2,7 @@ import { stableStringify } from "../src/stable-json.ts";
 import { ForkBenefitGate, type ForkBenefitGatePolicy } from "../src/fork-benefit-gate.ts";
 
 interface TapeChunk {
+	readonly atMs?: number;
 	readonly dataBase64: string;
 }
 
@@ -81,12 +82,28 @@ export interface TapeForkGateAnalysis {
 	readonly gatedNetBenefitMs: number;
 }
 
+export interface TapeReprobeAnalysis {
+	readonly decisions: number;
+	readonly actorActionTurns: number;
+	readonly d1ExactHits: number;
+	readonly d1Misses: number;
+	readonly boundedReprobes: number;
+	readonly secondProbeRecoveredHits: number;
+	readonly anyLaterRecoveredHits: number;
+	readonly additionalForkCostMs: number;
+	readonly snapshotReprobeTurns: number;
+	readonly snapshotReprobeActionTurns: number;
+	readonly snapshotReprobeRunwayMs: number;
+}
+
 interface ParsedExchange {
 	readonly sequence: number;
 	readonly model: string;
 	readonly contextKey: string;
 	readonly endedAtMs: number;
 	readonly calls: readonly TapeToolCall[];
+	readonly snapshotDeltaMs: readonly number[];
+	readonly toolDeltaMs: readonly number[];
 }
 
 export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string): TapeAnalysis {
@@ -187,6 +204,68 @@ export function analyzeTapeForkGate(
 	};
 }
 
+/** Measure whether one D2 retry could recover a D1 miss and whether Actor stream runway exists. */
+export function analyzeTapeReprobe(
+	tape: LlmTape,
+	actorModel: string,
+	drafterModel: string,
+): TapeReprobeAnalysis {
+	const { parsed } = parseTape(tape);
+	const draftersByContext = groupBy(
+		parsed.filter((exchange) => exchange.model === drafterModel),
+		(exchange) => exchange.contextKey,
+	);
+	let decisions = 0;
+	let actorActionTurns = 0;
+	let d1ExactHits = 0;
+	let boundedReprobes = 0;
+	let secondProbeRecoveredHits = 0;
+	let anyLaterRecoveredHits = 0;
+	let additionalForkCostMs = 0;
+	let snapshotReprobeTurns = 0;
+	let snapshotReprobeActionTurns = 0;
+	let snapshotReprobeRunwayMs = 0;
+	for (const actor of parsed.filter((exchange) => exchange.model === actorModel)) {
+		const drafters = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
+			(left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence,
+		);
+		if (!drafters.length) continue;
+		decisions++;
+		if (actor.calls.length) actorActionTurns++;
+		const actual = new Set(actor.calls.map(actionIdentity));
+		const exact = (candidate: ParsedExchange): boolean =>
+			candidate.calls.some((call) => actual.has(actionIdentity(call)));
+		if (exact(drafters[0])) {
+			d1ExactHits++;
+		} else if (drafters.length > 1) {
+			boundedReprobes++;
+			additionalForkCostMs += drafters[1].endedAtMs;
+			if (exact(drafters[1])) secondProbeRecoveredHits++;
+			if (drafters.slice(1).some(exact)) anyLaterRecoveredHits++;
+		}
+
+		const actionBoundaryMs = actor.toolDeltaMs.length ? Math.min(...actor.toolDeltaMs) : actor.endedAtMs;
+		const snapshots = actor.snapshotDeltaMs.filter((atMs) => atMs < actionBoundaryMs);
+		if (snapshots.length < 2) continue;
+		snapshotReprobeTurns++;
+		if (actor.calls.length) snapshotReprobeActionTurns++;
+		snapshotReprobeRunwayMs += Math.max(0, actionBoundaryMs - snapshots[1]);
+	}
+	return {
+		decisions,
+		actorActionTurns,
+		d1ExactHits,
+		d1Misses: decisions - d1ExactHits,
+		boundedReprobes,
+		secondProbeRecoveredHits,
+		anyLaterRecoveredHits,
+		additionalForkCostMs,
+		snapshotReprobeTurns,
+		snapshotReprobeActionTurns,
+		snapshotReprobeRunwayMs,
+	};
+}
+
 function parseTape(tape: LlmTape): { readonly completed: readonly TapeExchange[]; readonly parsed: readonly ParsedExchange[] } {
 	const completed = tape.exchanges.filter((exchange) => exchange.response?.completed === true);
 	const parsed = completed.flatMap((exchange) => {
@@ -194,13 +273,17 @@ function parseTape(tape: LlmTape): { readonly completed: readonly TapeExchange[]
 		const model = string(body?.model);
 		const endedAtMs = finiteMetric(exchange.response?.endedAtMs);
 		if (!model || endedAtMs === undefined) return [];
+		const chunks = exchange.response?.chunks ?? [];
+		const stream = decodeStreamShape(chunks);
 		return [
 			{
 				sequence: exchange.sequence,
 				model,
 				contextKey: stableStringify(body?.messages ?? []),
 				endedAtMs,
-				calls: decodeToolCalls(exchange.response?.chunks ?? []),
+				calls: decodeToolCalls(chunks),
+				snapshotDeltaMs: stream.snapshotDeltaMs,
+				toolDeltaMs: stream.toolDeltaMs,
 			},
 		];
 	});
@@ -239,21 +322,8 @@ function opportunity(
 
 function decodeToolCalls(chunks: readonly TapeChunk[]): readonly TapeToolCall[] {
 	const calls = new Map<number, { name: string; arguments: string }>();
-	const text = chunks.map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
-	for (const block of text.split(/\r?\n\r?\n/u)) {
-		const data = block
-			.split(/\r?\n/u)
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trim())
-			.join("\n");
-		if (!data || data === "[DONE]") continue;
-		let event: unknown;
-		try {
-			event = JSON.parse(data);
-		} catch {
-			continue;
-		}
-		const root = record(event);
+	for (const event of decodeSseEvents(chunks)) {
+		const root = event.value;
 		const choice = record(array(root?.choices)[0]);
 		const delta = record(choice?.delta) ?? record(choice?.message);
 		for (const rawCall of array(delta?.tool_calls)) {
@@ -276,6 +346,62 @@ function decodeToolCalls(chunks: readonly TapeChunk[]): readonly TapeToolCall[] 
 				return [];
 			}
 		});
+}
+
+function decodeStreamShape(chunks: readonly TapeChunk[]): {
+	readonly snapshotDeltaMs: readonly number[];
+	readonly toolDeltaMs: readonly number[];
+} {
+	const snapshotDeltaMs: number[] = [];
+	const toolDeltaMs: number[] = [];
+	for (const event of decodeSseEvents(chunks)) {
+		if (event.atMs === undefined) continue;
+		const choice = record(array(event.value.choices)[0]);
+		const delta = record(choice?.delta) ?? record(choice?.message);
+		if (!delta) continue;
+		if (
+			(nonEmptyString(delta.content) ?? nonEmptyString(delta.reasoning_content) ?? nonEmptyString(delta.reasoning)) !==
+			undefined
+		)
+			snapshotDeltaMs.push(event.atMs);
+		if (array(delta.tool_calls).length) toolDeltaMs.push(event.atMs);
+	}
+	return { snapshotDeltaMs, toolDeltaMs };
+}
+
+interface DecodedSseEvent {
+	readonly atMs?: number;
+	readonly value: Readonly<Record<string, unknown>>;
+}
+
+function decodeSseEvents(chunks: readonly TapeChunk[]): readonly DecodedSseEvent[] {
+	const events: DecodedSseEvent[] = [];
+	let buffered = "";
+	let latestAtMs: number | undefined;
+	for (const chunk of chunks) {
+		buffered += Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+		latestAtMs = finiteMetric(chunk.atMs) ?? latestAtMs;
+		const blocks = buffered.split(/\r?\n\r?\n/u);
+		buffered = blocks.pop() ?? "";
+		for (const block of blocks) appendDecodedSseEvent(events, block, latestAtMs);
+	}
+	if (buffered.trim()) appendDecodedSseEvent(events, buffered, latestAtMs);
+	return events;
+}
+
+function appendDecodedSseEvent(target: DecodedSseEvent[], block: string, atMs: number | undefined): void {
+	const data = block
+		.split(/\r?\n/u)
+		.filter((line) => line.startsWith("data:"))
+		.map((line) => line.slice(5).trim())
+		.join("\n");
+	if (!data || data === "[DONE]") return;
+	try {
+		const value = record(JSON.parse(data));
+		if (value) target.push({ ...(atMs === undefined ? {} : { atMs }), value });
+	} catch {
+		// Malformed or truncated events are intentionally ignored by the strict analyzer.
+	}
 }
 
 function actionIdentity(call: TapeToolCall): string {
@@ -313,6 +439,11 @@ function array(value: unknown): readonly unknown[] {
 
 function string(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+	const selected = string(value);
+	return selected?.length ? selected : undefined;
 }
 
 function integer(value: unknown): number | undefined {

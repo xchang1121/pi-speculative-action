@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { analyzeTape, analyzeTapeForkGate, type LlmTape } from "../bench/tape-analysis.ts";
+import {
+	analyzeTape,
+	analyzeTapeForkGate,
+	analyzeTapeReprobe,
+	type LlmTape,
+} from "../bench/tape-analysis.ts";
 
 describe("LLM tape action analysis", () => {
 	it("pairs exact contexts, deduplicates full K(a), and measures only early exact candidates", () => {
@@ -82,14 +87,50 @@ describe("LLM tape action analysis", () => {
 			gatedForkCostMs: 190,
 		});
 	});
+
+	it("measures bounded D2 recovery separately from later Actor snapshot runway", () => {
+		const messages = [{ role: "user", content: "decision" }];
+		const result = analyzeTapeReprobe(
+			{
+				exchanges: [
+					exchange(0, "actor", messages, 120, [
+						{ atMs: 10, data: content("thinking ") },
+						{ atMs: 40, data: content("more") },
+						{ atMs: 90, data: call("read", '{"path":"actor"}') },
+					]),
+					exchange(1, "draft", messages, 30, [call("read", '{"path":"miss"}')]),
+					exchange(2, "draft", messages, 50, [call("read", '{"path":"actor"}')]),
+					exchange(3, "draft", messages, 70, [call("read", '{"path":"later"}')]),
+				],
+			},
+			"actor",
+			"draft",
+		);
+
+		expect(result).toEqual({
+			decisions: 1,
+			actorActionTurns: 1,
+			d1ExactHits: 0,
+			d1Misses: 1,
+			boundedReprobes: 1,
+			secondProbeRecoveredHits: 1,
+			anyLaterRecoveredHits: 1,
+			additionalForkCostMs: 50,
+			snapshotReprobeTurns: 1,
+			snapshotReprobeActionTurns: 1,
+			snapshotReprobeRunwayMs: 50,
+		});
+	});
 });
+
+type TapeFixtureChunk = string | { readonly atMs: number; readonly data: string };
 
 function exchange(
 	sequence: number,
 	model: string,
 	messages: unknown,
 	endedAtMs: number,
-	chunks: readonly string[],
+	chunks: readonly TapeFixtureChunk[],
 ): LlmTape["exchanges"][number] {
 	return {
 		sequence,
@@ -97,9 +138,19 @@ function exchange(
 		response: {
 			completed: true,
 			endedAtMs,
-			chunks: chunks.map((data) => ({ dataBase64: Buffer.from(data).toString("base64") })),
+			chunks: chunks.map((chunk) => {
+				const data = typeof chunk === "string" ? chunk : chunk.data;
+				return {
+					...(typeof chunk === "string" ? {} : { atMs: chunk.atMs }),
+					dataBase64: Buffer.from(data).toString("base64"),
+				};
+			}),
 		},
 	};
+}
+
+function content(value: string): string {
+	return `data: ${JSON.stringify({ choices: [{ delta: { content: value } }] })}\n\n`;
 }
 
 function call(name: string, argumentsDelta: string): string {

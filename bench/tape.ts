@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
-import { analyzeTape, analyzeTapeForkGate, type LlmTape } from "./tape-analysis.ts";
+import { analyzeTape, analyzeTapeForkGate, analyzeTapeReprobe, type LlmTape } from "./tape-analysis.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -30,6 +30,7 @@ console.log(
 				probeInterval: SELF_SPECULATION_DEFAULTS.forkGateProbeInterval,
 				failureThreshold: SELF_SPECULATION_DEFAULTS.forkGateFailureThreshold,
 			}),
+			reprobe: analyzeTapeReprobe(tape, values["actor-model"], values["drafter-model"]),
 		},
 		undefined,
 		2,
