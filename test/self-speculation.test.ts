@@ -165,6 +165,34 @@ describe("self-speculation control plane", () => {
 		expect(coordinator.snapshot().forkExactMatches).toBe(1);
 	});
 
+	it("gates persistently negative forks after warm-up without blocking bounded probes", async () => {
+		let requestSequence = 0;
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar" }),
+			requestID: () => `actor-${++requestSequence}`,
+			fetch: vi.fn(async (input) =>
+				Response.json(
+					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+						? forkReceipt("read", { path: "never-used.txt" })
+						: { ok: true },
+				),
+			),
+		});
+		for (let decision = 1; decision <= 4; decision++) {
+			coordinator.startTurn(`turn-${decision}`, model(), context(), decision);
+			coordinator.decorateActorPayload({ prompt: "P" });
+			coordinator.observeActorOutput(delta("thinking_delta", "reason"));
+			await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(decision));
+			coordinator.endTurn();
+		}
+
+		coordinator.startTurn("turn-5", model(), context(), 5);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
+		expect(coordinator.snapshot()).toMatchObject({ forkRequests: 4, forkGateSkips: 1, forkGateSamples: 4 });
+		await coordinator.dispose();
+	});
+
 	it("contains control-plane failures instead of rejecting Actor cleanup", async () => {
 		const settings = enabledSettings({ forkEnabled: false });
 		const coordinator = new SelfSpeculationCoordinator({

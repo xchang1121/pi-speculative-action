@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
-import { analyzeTape, type LlmTape } from "./tape-analysis.ts";
+import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
+import { analyzeTape, analyzeTapeForkGate, type LlmTape } from "./tape-analysis.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -16,4 +17,21 @@ if (!values.tape || !values["actor-model"] || !values["drafter-model"]) {
 }
 
 const tape = JSON.parse(await readFile(values.tape, "utf8")) as LlmTape;
-console.log(JSON.stringify(analyzeTape(tape, values["actor-model"], values["drafter-model"]), undefined, 2));
+const actionAnalysis = analyzeTape(tape, values["actor-model"], values["drafter-model"]);
+console.log(
+	JSON.stringify(
+		{
+			...actionAnalysis,
+			forkGate: analyzeTapeForkGate(tape, values["actor-model"], values["drafter-model"], {
+				enabled: SELF_SPECULATION_DEFAULTS.forkGateEnabled,
+				minSamples: SELF_SPECULATION_DEFAULTS.forkGateMinSamples,
+				windowSize: SELF_SPECULATION_DEFAULTS.forkGateWindowSize,
+				minNetBenefitMs: SELF_SPECULATION_DEFAULTS.forkGateMinNetBenefitMs,
+				probeInterval: SELF_SPECULATION_DEFAULTS.forkGateProbeInterval,
+				failureThreshold: SELF_SPECULATION_DEFAULTS.forkGateFailureThreshold,
+			}),
+		},
+		undefined,
+		2,
+	),
+);

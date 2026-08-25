@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
+import { ForkBenefitGate, type ForkBenefitGatePolicy } from "./fork-benefit-gate.ts";
 import type { MaterializedSpeculativeCandidate } from "./runtime.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
@@ -32,6 +33,12 @@ export interface SelfSpeculationSettingsInput {
 	readonly requireLogprobs?: boolean;
 	/** Apply the same provider-side self-fork control to Drafter requests. */
 	readonly drafterEnabled?: boolean;
+	readonly forkGateEnabled?: boolean;
+	readonly forkGateMinSamples?: number;
+	readonly forkGateWindowSize?: number;
+	readonly forkGateMinNetBenefitMs?: number;
+	readonly forkGateProbeInterval?: number;
+	readonly forkGateFailureThreshold?: number;
 }
 
 export interface SelfSpeculationSettings {
@@ -55,6 +62,12 @@ export interface SelfSpeculationSettings {
 	readonly forkForcedPrefix: string;
 	readonly requireLogprobs: boolean;
 	readonly drafterEnabled: boolean;
+	readonly forkGateEnabled: boolean;
+	readonly forkGateMinSamples: number;
+	readonly forkGateWindowSize: number;
+	readonly forkGateMinNetBenefitMs: number;
+	readonly forkGateProbeInterval: number;
+	readonly forkGateFailureThreshold: number;
 }
 
 export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze({
@@ -77,12 +90,26 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	forkForcedPrefix: "<tool_call>",
 	requireLogprobs: false,
 	drafterEnabled: true,
+	forkGateEnabled: true,
+	forkGateMinSamples: 4,
+	forkGateWindowSize: 4,
+	forkGateMinNetBenefitMs: 25,
+	forkGateProbeInterval: 4,
+	forkGateFailureThreshold: 2,
 });
 
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
 	const endpoint = nonEmptyString(input.endpoint) ?? SELF_SPECULATION_DEFAULTS.endpoint;
 	const apiKeyEnv = nonEmptyString(input.apiKeyEnv);
+	const forkGateMinSamples = positiveInteger(
+		input.forkGateMinSamples,
+		SELF_SPECULATION_DEFAULTS.forkGateMinSamples,
+	);
+	const forkGateWindowSize = Math.max(
+		forkGateMinSamples,
+		positiveInteger(input.forkGateWindowSize, SELF_SPECULATION_DEFAULTS.forkGateWindowSize),
+	);
 	return {
 		enabled: booleanOr(input.enabled, SELF_SPECULATION_DEFAULTS.enabled),
 		endpoint: endpoint.replace(/\/+$/u, ""),
@@ -104,6 +131,21 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 		forkForcedPrefix: nonEmptyString(input.forkForcedPrefix) ?? SELF_SPECULATION_DEFAULTS.forkForcedPrefix,
 		requireLogprobs: booleanOr(input.requireLogprobs, SELF_SPECULATION_DEFAULTS.requireLogprobs),
 		drafterEnabled: booleanOr(input.drafterEnabled, SELF_SPECULATION_DEFAULTS.drafterEnabled),
+		forkGateEnabled: booleanOr(input.forkGateEnabled, SELF_SPECULATION_DEFAULTS.forkGateEnabled),
+		forkGateMinSamples,
+		forkGateWindowSize,
+		forkGateMinNetBenefitMs: nonNegativeNumber(
+			input.forkGateMinNetBenefitMs,
+			SELF_SPECULATION_DEFAULTS.forkGateMinNetBenefitMs,
+		),
+		forkGateProbeInterval: positiveInteger(
+			input.forkGateProbeInterval,
+			SELF_SPECULATION_DEFAULTS.forkGateProbeInterval,
+		),
+		forkGateFailureThreshold: positiveInteger(
+			input.forkGateFailureThreshold,
+			SELF_SPECULATION_DEFAULTS.forkGateFailureThreshold,
+		),
 	};
 }
 
@@ -122,6 +164,9 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly forkLatencyMs: number;
 	readonly forkLogprobTokens: number;
 	readonly forkMeanLogprob?: number;
+	readonly forkGateSkips: number;
+	readonly forkGateSamples: number;
+	readonly forkGateExpectedNetBenefitMs?: number;
 	readonly failures: number;
 	readonly lastError?: string;
 }
@@ -154,6 +199,13 @@ interface TurnState {
 	readonly actorActionKeys: Set<string>;
 	readonly forkCandidateKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
+	readonly actorActionTimes: Map<string, number>;
+	readonly gateKey: string;
+	forkStartedAt?: number;
+	forkCompletedAt?: number;
+	forkFailed: boolean;
+	ended: boolean;
+	gateSampleRecorded: boolean;
 }
 
 interface CandidateRecord {
@@ -185,6 +237,7 @@ export class SelfSpeculationCoordinator {
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
 	private readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
+	private readonly forkGate = new ForkBenefitGate();
 	private readonly background = new Set<Promise<void>>();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
@@ -203,6 +256,8 @@ export class SelfSpeculationCoordinator {
 	private totalForkLatencyMs = 0;
 	private totalForkLogprob = 0;
 	private totalForkLogprobTokens = 0;
+	private forkGateSkips = 0;
+	private latestGateKey?: string;
 	private failureCount = 0;
 	private lastFailure?: string;
 
@@ -244,7 +299,13 @@ export class SelfSpeculationCoordinator {
 			actorActionKeys: new Set(),
 			forkCandidateKeys: new Set(),
 			matchedForkKeys: new Set(),
+			actorActionTimes: new Map(),
+			gateKey: modelKey(model),
+			forkFailed: false,
+			ended: false,
+			gateSampleRecorded: false,
 		};
+		this.latestGateKey = modelKey(model);
 	}
 
 	/** Bind exactly one non-Drafter provider request to the current speculative turn. */
@@ -359,7 +420,13 @@ export class SelfSpeculationCoordinator {
 		if (!event.delta || !state.requestID) return;
 		state.forkRequested = true;
 		if (settings.forkTransport !== "sidecar") return;
+		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
+		if (!gateDecision.allowed) {
+			this.forkGateSkips++;
+			return;
+		}
 		this.forks++;
+		state.forkStartedAt = performance.now();
 		state.forkTask = this.post(
 			settings.forkPath,
 			{
@@ -379,6 +446,12 @@ export class SelfSpeculationCoordinator {
 			settings,
 		)
 			.then((receipt) => this.recordReceipt(receipt, state, true))
+			.catch((error: unknown) => {
+				state.forkFailed = true;
+				state.forkCompletedAt = performance.now();
+				this.finalizeGateSample(state);
+				throw error;
+			})
 			.finally(() => {
 				state.forkTask = undefined;
 			});
@@ -392,6 +465,7 @@ export class SelfSpeculationCoordinator {
 		const key = this.actionKey(tool, input);
 		if (!key) return;
 		state.actorActionKeys.add(key);
+		if (!state.actorActionTimes.has(key)) state.actorActionTimes.set(key, performance.now());
 		this.reconcileForkMatches(state);
 	}
 
@@ -409,6 +483,10 @@ export class SelfSpeculationCoordinator {
 
 	private closeActive(preserveForRetry: boolean): void {
 		const state = this.active;
+		if (state) {
+			state.ended = true;
+			this.finalizeGateSample(state);
+		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			const retained = this.pendingCandidates.get(state.decisionSequence) ?? new Map<string, CandidateRecord>();
@@ -432,6 +510,7 @@ export class SelfSpeculationCoordinator {
 	}
 
 	snapshot(): SelfSpeculationCoordinatorSnapshot {
+		const gate = this.latestGateKey ? this.forkGate.snapshot(this.latestGateKey) : undefined;
 		return {
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
 			bufferedCandidates:
@@ -451,6 +530,11 @@ export class SelfSpeculationCoordinator {
 			...(this.totalForkLogprobTokens > 0
 				? { forkMeanLogprob: this.totalForkLogprob / this.totalForkLogprobTokens }
 				: {}),
+			forkGateSkips: this.forkGateSkips,
+			forkGateSamples: gate?.samples ?? 0,
+			...(gate?.expectedNetBenefitMs === undefined
+				? {}
+				: { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
@@ -501,6 +585,7 @@ export class SelfSpeculationCoordinator {
 		this.draftTokensAccepted += nonNegativeInteger(receipt.accepted_token_count);
 		if (!fork) return;
 		this.completedForks++;
+		state.forkCompletedAt = performance.now();
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
 		for (const rawCandidate of array(bundle?.candidates)) {
@@ -528,6 +613,7 @@ export class SelfSpeculationCoordinator {
 			}
 		}
 		this.reconcileForkMatches(state);
+		this.finalizeGateSample(state);
 	}
 
 	private reconcileForkMatches(state: TurnState): void {
@@ -536,6 +622,31 @@ export class SelfSpeculationCoordinator {
 			state.matchedForkKeys.add(key);
 			this.exactForkMatches++;
 		}
+	}
+
+	private finalizeGateSample(state: TurnState): void {
+		if (
+			state.gateSampleRecorded ||
+			!state.ended ||
+			state.forkStartedAt === undefined ||
+			state.forkCompletedAt === undefined
+		)
+			return;
+		state.gateSampleRecorded = true;
+		const actorMatchAt = [...state.matchedForkKeys]
+			.map((key) => state.actorActionTimes.get(key))
+			.filter((value): value is number => value !== undefined)
+			.reduce<number | undefined>((earliest, value) => (earliest === undefined ? value : Math.min(earliest, value)), undefined);
+		this.forkGate.observe(
+			state.gateKey,
+			{
+				forkLatencyMs: state.forkCompletedAt - state.forkStartedAt,
+				exactLeadMs:
+					actorMatchAt === undefined ? 0 : Math.max(0, actorMatchAt - state.forkCompletedAt),
+				...(state.forkFailed ? { failed: true } : {}),
+			},
+			forkGatePolicy(state.settings),
+		);
 	}
 
 	private async post(
@@ -602,6 +713,7 @@ function providerPayload(
 			fork_decoder: settings.forkDecoder,
 			fork_forced_prefix: settings.forkForcedPrefix,
 			require_logprobs: settings.requireLogprobs,
+			fork_gate: forkGatePayload(settings),
 		},
 	};
 }
@@ -616,6 +728,29 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 		max_draft_tokens: settings.maxDraftTokens,
 		draft_format: settings.draftFormat,
 		draft_boundary: settings.draftBoundary,
+		fork_gate: forkGatePayload(settings),
+	};
+}
+
+function forkGatePayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
+	return {
+		enabled: settings.forkGateEnabled,
+		min_samples: settings.forkGateMinSamples,
+		window_size: settings.forkGateWindowSize,
+		min_net_benefit_ms: settings.forkGateMinNetBenefitMs,
+		probe_interval: settings.forkGateProbeInterval,
+		failure_threshold: settings.forkGateFailureThreshold,
+	};
+}
+
+function forkGatePolicy(settings: SelfSpeculationSettings): ForkBenefitGatePolicy {
+	return {
+		enabled: settings.forkGateEnabled,
+		minSamples: settings.forkGateMinSamples,
+		windowSize: settings.forkGateWindowSize,
+		minNetBenefitMs: settings.forkGateMinNetBenefitMs,
+		probeInterval: settings.forkGateProbeInterval,
+		failureThreshold: settings.forkGateFailureThreshold,
 	};
 }
 
@@ -719,6 +854,10 @@ function cloneSerializable(value: unknown): unknown {
 
 function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 	return { provider: model.provider, api: model.api, id: model.id };
+}
+
+function modelKey(model: Model<Api>): string {
+	return JSON.stringify([model.provider, model.api, model.id]);
 }
 
 function metric(value: number | undefined, fallback: number): number {

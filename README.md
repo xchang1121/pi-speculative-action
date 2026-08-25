@@ -82,6 +82,12 @@ Example:
     "endpoint": "http://127.0.0.1:8010",
     "forkTransport": "sidecar",
     "forkEnabled": true,
+    "forkGateEnabled": true,
+    "forkGateMinSamples": 4,
+    "forkGateWindowSize": 4,
+    "forkGateMinNetBenefitMs": 25,
+    "forkGateProbeInterval": 4,
+    "forkGateFailureThreshold": 2,
     "maxCandidates": 8,
     "maxDraftTokens": 20,
     "draftFormat": "tagged_json",
@@ -111,7 +117,9 @@ There are two fork transports:
 - `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
 - `provider` places a versioned `self_speculation` control object directly in both Actor and, when `drafterEnabled` is true, Drafter provider payloads. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
 
-The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, tool-call format/boundary, fork decoder/prefix, temperature, and logprob requirement. The boundary, formatter, decoder, and target tokenizer must describe the same model format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
+For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact Actor lead - fork latency`. It allows four warm-up observations by default, suppresses a persistently negative fork, and still sends one bounded probe every four skipped decisions so a changed workload can recover. Two consecutive endpoint failures use the same probe circuit. All thresholds are configurable above; disabling `forkGateEnabled` restores unconditional forks. The same `fork_gate` policy is included as a provider/SPORK hint, but a provider transport must enforce that hint itself.
+
+The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format/boundary, fork decoder/prefix, temperature, and logprob requirement. The boundary, formatter, decoder, and target tokenizer must describe the same model format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
 
 When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
 

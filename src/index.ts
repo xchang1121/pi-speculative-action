@@ -1,4 +1,12 @@
 export {
+	ForkBenefitGate,
+	type ForkBenefitDecision,
+	type ForkBenefitDecisionReason,
+	type ForkBenefitGatePolicy,
+	type ForkBenefitGateSnapshot,
+	type ForkBenefitObservation,
+} from "./fork-benefit-gate.ts";
+export {
 	type ActionProjectionCoverage,
 	type ActionProjectionRule,
 	READ_RANGE_ACTION_KEY_PROJECTOR,

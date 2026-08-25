@@ -190,7 +190,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
+		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
@@ -506,7 +506,7 @@ async function installController(
 		},
 		statusText: () => {
 			const bridge = selfSpeculation.snapshot();
-			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens}/${bridge.acceptedDraftTokens} draft tokens submitted/accepted; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens}/${bridge.acceptedDraftTokens} draft tokens submitted/accepted; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -859,6 +859,12 @@ async function openSelfSpeculationSettings(
 			`Fork transport: ${self.forkTransport}`,
 			`Actor fork: ${self.forkEnabled ? "On" : "Off"}`,
 			`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`,
+			`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`,
+			`Gate warm-up: ${self.forkGateMinSamples}`,
+			`Gate window: ${self.forkGateWindowSize}`,
+			`Gate minimum net: ${formatDuration(self.forkGateMinNetBenefitMs)}`,
+			`Gate probe interval: ${self.forkGateProbeInterval}`,
+			`Gate failure threshold: ${self.forkGateFailureThreshold}`,
 			`Candidate bundle: ${self.maxCandidates}`,
 			`Draft tokens: ${self.maxDraftTokens}`,
 			`Draft format: ${self.draftFormat}`,
@@ -884,6 +890,30 @@ async function openSelfSpeculationSettings(
 			updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled });
 		if (choice.startsWith("Drafter fork:"))
 			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
+		if (choice.startsWith("Fork gate:"))
+			updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled });
+		if (choice.startsWith("Gate warm-up:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateMinSamples", "Gate warm-up samples");
+		if (choice.startsWith("Gate window:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateWindowSize", "Gate rolling window");
+		if (choice.startsWith("Gate minimum net:"))
+			await editSelfSpeculationNonNegativeNumber(
+				ctx,
+				controller,
+				settings,
+				"forkGateMinNetBenefitMs",
+				"Gate minimum net benefit (ms)",
+			);
+		if (choice.startsWith("Gate probe interval:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateProbeInterval", "Gate probe interval");
+		if (choice.startsWith("Gate failure threshold:"))
+			await editSelfSpeculationInteger(
+				ctx,
+				controller,
+				settings,
+				"forkGateFailureThreshold",
+				"Gate failure threshold",
+			);
 		if (choice.startsWith("Candidate bundle:"))
 			await editSelfSpeculationInteger(ctx, controller, settings, "maxCandidates", "Candidate bundle size");
 		if (choice.startsWith("Draft tokens:"))
@@ -1164,7 +1194,15 @@ async function editSelfSpeculationInteger(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
-	field: "maxCandidates" | "maxDraftTokens" | "forkMaxTokens" | "timeoutMs",
+	field:
+		| "maxCandidates"
+		| "maxDraftTokens"
+		| "forkMaxTokens"
+		| "timeoutMs"
+		| "forkGateMinSamples"
+		| "forkGateWindowSize"
+		| "forkGateProbeInterval"
+		| "forkGateFailureThreshold",
 	title: string,
 ): Promise<void> {
 	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
@@ -1172,6 +1210,23 @@ async function editSelfSpeculationInteger(
 	const parsed = Number(value.trim());
 	if (!Number.isInteger(parsed) || parsed <= 0) {
 		ctx.ui.notify(`${title} must be a positive integer.`, "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { [field]: parsed });
+}
+
+async function editSelfSpeculationNonNegativeNumber(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+	field: "forkGateMinNetBenefitMs",
+	title: string,
+): Promise<void> {
+	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		ctx.ui.notify(`${title} must be a non-negative number.`, "warning");
 		return;
 	}
 	updateSelfSpeculation(controller, settings, { [field]: parsed });

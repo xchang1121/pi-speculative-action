@@ -1,4 +1,5 @@
 import { stableStringify } from "../src/stable-json.ts";
+import { ForkBenefitGate, type ForkBenefitGatePolicy } from "../src/fork-benefit-gate.ts";
 
 interface TapeChunk {
 	readonly dataBase64: string;
@@ -66,6 +67,20 @@ export interface TapeAnalysis {
 	};
 }
 
+export interface TapeForkGateAnalysis {
+	readonly decisions: number;
+	readonly allowed: number;
+	readonly skipped: number;
+	readonly requestReduction: number;
+	readonly exactHitsAvailable: number;
+	readonly exactHitsRetained: number;
+	readonly forkCostMs: number;
+	readonly gatedForkCostMs: number;
+	readonly forkCostReduction: number;
+	readonly netBenefitMs: number;
+	readonly gatedNetBenefitMs: number;
+}
+
 interface ParsedExchange {
 	readonly sequence: number;
 	readonly model: string;
@@ -75,22 +90,7 @@ interface ParsedExchange {
 }
 
 export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string): TapeAnalysis {
-	const completed = tape.exchanges.filter((exchange) => exchange.response?.completed === true);
-	const parsed = completed.flatMap((exchange) => {
-		const body = record(exchange.request.descriptor.body);
-		const model = string(body?.model);
-		const endedAtMs = finiteMetric(exchange.response?.endedAtMs);
-		if (!model || endedAtMs === undefined) return [];
-		return [
-			{
-				sequence: exchange.sequence,
-				model,
-				contextKey: stableStringify(body?.messages ?? []),
-				endedAtMs,
-				calls: decodeToolCalls(exchange.response?.chunks ?? []),
-			},
-		];
-	});
+	const { completed, parsed } = parseTape(tape);
 	const draftersByContext = groupBy(
 		parsed.filter((exchange) => exchange.model === drafterModel),
 		(exchange) => exchange.contextKey,
@@ -127,6 +127,84 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 			exactLeadMs: sum(opportunities, (value) => value.exactLeadMs),
 		},
 	};
+}
+
+/** Replay the production rolling gate with the fastest-completing same-context Drafter as a D1 proxy. */
+export function analyzeTapeForkGate(
+	tape: LlmTape,
+	actorModel: string,
+	drafterModel: string,
+	policy: ForkBenefitGatePolicy,
+): TapeForkGateAnalysis {
+	const { parsed } = parseTape(tape);
+	const draftersByContext = groupBy(
+		parsed.filter((exchange) => exchange.model === drafterModel),
+		(exchange) => exchange.contextKey,
+	);
+	const gate = new ForkBenefitGate();
+	let decisions = 0;
+	let allowed = 0;
+	let exactHitsAvailable = 0;
+	let exactHitsRetained = 0;
+	let forkCostMs = 0;
+	let gatedForkCostMs = 0;
+	let netBenefitMs = 0;
+	let gatedNetBenefitMs = 0;
+	for (const actor of parsed.filter((exchange) => exchange.model === actorModel)) {
+		const proxy = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
+			(left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence,
+		)[0];
+		if (!proxy) continue;
+		decisions++;
+		const exact = proxy.calls.some((candidate) =>
+			actor.calls.some((actual) => actionIdentity(candidate) === actionIdentity(actual)),
+		);
+		const exactLeadMs = exact ? Math.max(0, actor.endedAtMs - proxy.endedAtMs) : 0;
+		const net = exactLeadMs - proxy.endedAtMs;
+		forkCostMs += proxy.endedAtMs;
+		netBenefitMs += net;
+		if (exact) exactHitsAvailable++;
+		const decision = gate.decide(actorModel, policy);
+		if (!decision.allowed) continue;
+		allowed++;
+		gatedForkCostMs += proxy.endedAtMs;
+		gatedNetBenefitMs += net;
+		if (exact) exactHitsRetained++;
+		gate.observe(actorModel, { forkLatencyMs: proxy.endedAtMs, exactLeadMs }, policy);
+	}
+	return {
+		decisions,
+		allowed,
+		skipped: decisions - allowed,
+		requestReduction: ratio(decisions - allowed, decisions),
+		exactHitsAvailable,
+		exactHitsRetained,
+		forkCostMs,
+		gatedForkCostMs,
+		forkCostReduction: ratio(forkCostMs - gatedForkCostMs, forkCostMs),
+		netBenefitMs,
+		gatedNetBenefitMs,
+	};
+}
+
+function parseTape(tape: LlmTape): { readonly completed: readonly TapeExchange[]; readonly parsed: readonly ParsedExchange[] } {
+	const completed = tape.exchanges.filter((exchange) => exchange.response?.completed === true);
+	const parsed = completed.flatMap((exchange) => {
+		const body = record(exchange.request.descriptor.body);
+		const model = string(body?.model);
+		const endedAtMs = finiteMetric(exchange.response?.endedAtMs);
+		if (!model || endedAtMs === undefined) return [];
+		return [
+			{
+				sequence: exchange.sequence,
+				model,
+				contextKey: stableStringify(body?.messages ?? []),
+				endedAtMs,
+				calls: decodeToolCalls(exchange.response?.chunks ?? []),
+			},
+		];
+	});
+	return { completed, parsed };
 }
 
 function opportunity(
