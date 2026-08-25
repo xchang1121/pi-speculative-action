@@ -160,7 +160,17 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly forkAgreements: number;
 	readonly forkExactMatches: number;
 	readonly submittedDraftTokens: number;
+	/** Registration acknowledgements; not necessarily target-model acceptance. */
 	readonly acceptedDraftTokens: number;
+	readonly verificationRequests: number;
+	readonly verifiedDraftProposals: number;
+	readonly verifiedDraftTokens: number;
+	readonly verifiedAcceptedDraftTokens: number;
+	readonly verifiedRejectedDraftTokens: number;
+	readonly unresolvedDraftProposals: number;
+	readonly unresolvedDraftTokens: number;
+	readonly verifiedDraftAcceptanceRate?: number;
+	readonly lastVerification?: SelfSpeculationVerificationOutcome;
 	readonly forkLatencyMs: number;
 	readonly forkLogprobTokens: number;
 	readonly forkMeanLogprob?: number;
@@ -169,6 +179,28 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly forkGateExpectedNetBenefitMs?: number;
 	readonly failures: number;
 	readonly lastError?: string;
+}
+
+export interface SelfSpeculationVerificationStep {
+	readonly candidateIndex: number;
+	readonly candidateID?: string;
+	readonly sources: readonly string[];
+	readonly draftedTokens: number;
+	readonly acceptedTokens: number;
+	readonly rejectedTokens: number;
+}
+
+export interface SelfSpeculationVerificationOutcome {
+	readonly requestID: string;
+	readonly speculativeSteps: number;
+	readonly draftedTokens: number;
+	readonly acceptedTokens: number;
+	readonly rejectedTokens: number;
+	readonly acceptanceRate: number;
+	readonly meanAcceptanceLength: number;
+	readonly unresolvedProposals: number;
+	readonly unresolvedDraftTokens: number;
+	readonly steps: readonly SelfSpeculationVerificationStep[];
 }
 
 export interface SelfSpeculationCoordinatorOptions {
@@ -199,6 +231,7 @@ interface TurnState {
 	readonly actorActionKeys: Set<string>;
 	readonly forkCandidateKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
+	readonly candidateSourcesByID: Map<string, Set<string>>;
 	readonly actorActionTimes: Map<string, number>;
 	readonly gateKey: string;
 	forkStartedAt?: number;
@@ -253,6 +286,14 @@ export class SelfSpeculationCoordinator {
 	private exactForkMatches = 0;
 	private draftTokensSubmitted = 0;
 	private draftTokensAccepted = 0;
+	private verificationRequests = 0;
+	private verifiedDraftProposals = 0;
+	private verifiedDraftTokens = 0;
+	private verifiedAcceptedDraftTokens = 0;
+	private verifiedRejectedDraftTokens = 0;
+	private unresolvedDraftProposals = 0;
+	private unresolvedDraftTokens = 0;
+	private lastVerification?: SelfSpeculationVerificationOutcome;
 	private totalForkLatencyMs = 0;
 	private totalForkLogprob = 0;
 	private totalForkLogprobTokens = 0;
@@ -299,6 +340,7 @@ export class SelfSpeculationCoordinator {
 			actorActionKeys: new Set(),
 			forkCandidateKeys: new Set(),
 			matchedForkKeys: new Set(),
+			candidateSourcesByID: new Map(),
 			actorActionTimes: new Map(),
 			gateKey: modelKey(model),
 			forkFailed: false,
@@ -505,7 +547,7 @@ export class SelfSpeculationCoordinator {
 					state.settings,
 				),
 			)
-			.then(() => undefined);
+			.then((receipt) => this.recordVerification(receipt, state));
 		this.track(cleanup);
 	}
 
@@ -525,6 +567,17 @@ export class SelfSpeculationCoordinator {
 			forkExactMatches: this.exactForkMatches,
 			submittedDraftTokens: this.draftTokensSubmitted,
 			acceptedDraftTokens: this.draftTokensAccepted,
+			verificationRequests: this.verificationRequests,
+			verifiedDraftProposals: this.verifiedDraftProposals,
+			verifiedDraftTokens: this.verifiedDraftTokens,
+			verifiedAcceptedDraftTokens: this.verifiedAcceptedDraftTokens,
+			verifiedRejectedDraftTokens: this.verifiedRejectedDraftTokens,
+			unresolvedDraftProposals: this.unresolvedDraftProposals,
+			unresolvedDraftTokens: this.unresolvedDraftTokens,
+			...(this.verifiedDraftTokens > 0
+				? { verifiedDraftAcceptanceRate: this.verifiedAcceptedDraftTokens / this.verifiedDraftTokens }
+				: {}),
+			...(this.lastVerification ? { lastVerification: this.lastVerification } : {}),
 			forkLatencyMs: this.totalForkLatencyMs,
 			forkLogprobTokens: this.totalForkLogprobTokens,
 			...(this.totalForkLogprobTokens > 0
@@ -538,6 +591,35 @@ export class SelfSpeculationCoordinator {
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
+	}
+
+	private recordVerification(receipt: unknown, state: TurnState): void {
+		const verification = record(record(receipt)?.verification);
+		if (!verification || !state.requestID) return;
+		try {
+			const sourcesByCandidateID = new Map(
+				[...state.candidateSourcesByID].map(([candidateID, sources]) => [
+					candidateID,
+					[...sources].sort(),
+				] as const),
+			);
+			const outcome = parseVerificationOutcome(
+				verification,
+				state.requestID,
+				sourcesByCandidateID,
+			);
+			this.verificationRequests++;
+			this.verifiedDraftProposals += outcome.speculativeSteps;
+			this.verifiedDraftTokens += outcome.draftedTokens;
+			this.verifiedAcceptedDraftTokens += outcome.acceptedTokens;
+			this.verifiedRejectedDraftTokens += outcome.rejectedTokens;
+			this.unresolvedDraftProposals += outcome.unresolvedProposals;
+			this.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
+			this.lastVerification = outcome;
+		} catch (error) {
+			this.failureCount++;
+			this.lastFailure = error instanceof Error ? error.message : String(error);
+		}
 	}
 
 	async dispose(): Promise<void> {
@@ -583,15 +665,24 @@ export class SelfSpeculationCoordinator {
 		this.receipts++;
 		this.draftTokensSubmitted += nonNegativeInteger(receipt.draft_token_count);
 		this.draftTokensAccepted += nonNegativeInteger(receipt.accepted_token_count);
-		if (!fork) return;
-		this.completedForks++;
-		state.forkCompletedAt = performance.now();
+		if (fork) {
+			this.completedForks++;
+			state.forkCompletedAt = performance.now();
+		}
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
 		for (const rawCandidate of array(bundle?.candidates)) {
 			const candidate = record(rawCandidate);
 			if (!candidate) continue;
 			const sources = array(candidate.sources).filter((value): value is string => typeof value === "string");
+			for (const rawCandidateID of array(candidate.candidate_ids)) {
+				const candidateID = nonEmptyString(rawCandidateID);
+				if (!candidateID) continue;
+				const knownSources = state.candidateSourcesByID.get(candidateID) ?? new Set<string>();
+				for (const source of sources) knownSources.add(source);
+				state.candidateSourcesByID.set(candidateID, knownSources);
+			}
+			if (!fork) continue;
 			if (!sources.includes("self-speculation")) continue;
 			const call = record(array(candidate.tool_calls)[0]);
 			const tool = nonEmptyString(call?.name);
@@ -612,6 +703,7 @@ export class SelfSpeculationCoordinator {
 				this.totalForkLogprobTokens += logprobTokens;
 			}
 		}
+		if (!fork) return;
 		this.reconcileForkMatches(state);
 		this.finalizeGateSample(state);
 	}
@@ -858,6 +950,112 @@ function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 
 function modelKey(model: Model<Api>): string {
 	return JSON.stringify([model.provider, model.api, model.id]);
+}
+
+function parseVerificationOutcome(
+	verification: Readonly<Record<string, unknown>>,
+	requestID: string,
+	sourcesByCandidateID: ReadonlyMap<string, readonly string[]>,
+): SelfSpeculationVerificationOutcome {
+	const rawSteps = verification.steps;
+	if (rawSteps !== undefined && !Array.isArray(rawSteps))
+		throw new Error("self-speculation verification steps must be an array");
+	const steps = (rawSteps ?? []).map((value, index) => {
+		const step = record(value);
+		if (!step) throw new Error("self-speculation verification step must be an object");
+		const draftedTokens = requiredVerificationInteger(step.drafted_tokens, "drafted_tokens", true);
+		const acceptedTokens = requiredVerificationInteger(step.accepted_tokens, "accepted_tokens");
+		const rejectedTokens = optionalVerificationInteger(step.rejected_tokens, "rejected_tokens") ??
+			draftedTokens - acceptedTokens;
+		if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
+			throw new Error("self-speculation verification step token counts are inconsistent");
+		const candidateIndex = optionalVerificationInteger(step.candidate_index, "candidate_index") ?? index;
+		const candidateID = step.candidate_id === undefined || step.candidate_id === null
+			? undefined
+			: nonEmptyString(step.candidate_id);
+		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
+			throw new Error("self-speculation verification candidate_id must be a non-empty string");
+		return Object.freeze({
+			candidateIndex,
+			...(candidateID ? { candidateID } : {}),
+			sources: Object.freeze([...(candidateID ? sourcesByCandidateID.get(candidateID) ?? [] : [])]),
+			draftedTokens,
+			acceptedTokens,
+			rejectedTokens,
+		});
+	});
+	const stepDraftedTokens = steps.reduce((total, step) => total + step.draftedTokens, 0);
+	const stepAcceptedTokens = steps.reduce((total, step) => total + step.acceptedTokens, 0);
+	const stepRejectedTokens = steps.reduce((total, step) => total + step.rejectedTokens, 0);
+	const speculativeSteps = optionalVerificationInteger(verification.num_spec_steps, "num_spec_steps") ?? steps.length;
+	const draftedTokens = optionalVerificationInteger(verification.num_draft_tokens, "num_draft_tokens") ??
+		stepDraftedTokens;
+	const acceptedTokens = optionalVerificationInteger(
+		verification.num_accepted_draft_tokens,
+		"num_accepted_draft_tokens",
+	) ?? stepAcceptedTokens;
+	const rejectedTokens = optionalVerificationInteger(
+		verification.num_rejected_draft_tokens,
+		"num_rejected_draft_tokens",
+	) ?? draftedTokens - acceptedTokens;
+	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
+		throw new Error("self-speculation verification token counts are inconsistent");
+	if (
+		steps.length > 0 &&
+		(speculativeSteps !== steps.length ||
+			draftedTokens !== stepDraftedTokens ||
+			acceptedTokens !== stepAcceptedTokens ||
+			rejectedTokens !== stepRejectedTokens)
+	)
+		throw new Error("self-speculation verification totals do not match its steps");
+	const unresolvedProposals = optionalVerificationInteger(
+		verification.unresolved_proposals,
+		"unresolved_proposals",
+	) ?? 0;
+	const unresolvedDraftTokens = optionalVerificationInteger(
+		verification.unresolved_draft_tokens,
+		"unresolved_draft_tokens",
+	) ?? 0;
+	const meanAcceptanceLength = optionalVerificationNumber(
+		verification.mean_acceptance_length,
+		"mean_acceptance_length",
+	) ?? (speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
+	return Object.freeze({
+		requestID,
+		speculativeSteps,
+		draftedTokens,
+		acceptedTokens,
+		rejectedTokens,
+		acceptanceRate: draftedTokens > 0 ? acceptedTokens / draftedTokens : 0,
+		meanAcceptanceLength,
+		unresolvedProposals,
+		unresolvedDraftTokens,
+		steps: Object.freeze(steps),
+	});
+}
+
+function optionalVerificationNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+		throw new Error(`self-speculation verification ${field} must be a non-negative number`);
+	return value;
+}
+
+function optionalVerificationInteger(value: unknown, field: string): number | undefined {
+	const number = optionalVerificationNumber(value, field);
+	if (number === undefined) return undefined;
+	if (!Number.isSafeInteger(number))
+		throw new Error(`self-speculation verification ${field} must be an integer`);
+	return number;
+}
+
+function requiredVerificationInteger(value: unknown, field: string, positive = false): number {
+	const number = optionalVerificationInteger(value, field);
+	if (number === undefined || (positive && number === 0))
+		throw new Error(
+			`self-speculation verification ${field} must be ${positive ? "positive" : "present"}`,
+		);
+	return number;
 }
 
 function metric(value: number | undefined, fallback: number): number {

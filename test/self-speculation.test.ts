@@ -90,6 +90,115 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
+	it("records clear-time target verification without confusing registration receipts", async () => {
+		const requests: CapturedRequest[] = [];
+		const coordinator = coordinatorFixture(
+			requests,
+			{ forkEnabled: false },
+			["actor-request"],
+			(request) =>
+				request.path === SELF_SPECULATION_DEFAULTS.clearPath
+					? {
+							status: "cleared",
+							verification: {
+								num_spec_steps: 1,
+								num_draft_tokens: 3,
+								num_accepted_draft_tokens: 2,
+								num_rejected_draft_tokens: 1,
+								draft_acceptance_rate: 2 / 3,
+								mean_acceptance_length: 3,
+								steps: [
+									{
+										candidate_index: 0,
+										candidate_id: "hash-a",
+										drafted_tokens: 3,
+										accepted_tokens: 2,
+										rejected_tokens: 1,
+									},
+								],
+								unresolved_proposals: 0,
+								unresolved_draft_tokens: 0,
+							},
+						}
+					: {
+							registered: true,
+							draft_token_count: 3,
+							accepted_token_count: 3,
+							details: {
+								bundle: {
+									candidates: [
+										{
+											candidate_ids: ["hash-a"],
+											sources: ["drafter", "pattern-aware"],
+										},
+									],
+								},
+							},
+						},
+		);
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 0.8));
+		coordinator.addCandidate(
+			candidate("pattern-aware", "key-a", "hash-a", "read", { path: "a.txt" }, 0.9),
+		);
+		coordinator.decorateActorPayload({ model: "actor" });
+
+		await coordinator.dispose();
+
+		expect(coordinator.snapshot()).toMatchObject({
+			submittedDraftTokens: 3,
+			acceptedDraftTokens: 3,
+			verificationRequests: 1,
+			verifiedDraftProposals: 1,
+			verifiedDraftTokens: 3,
+			verifiedAcceptedDraftTokens: 2,
+			verifiedRejectedDraftTokens: 1,
+			verifiedDraftAcceptanceRate: 2 / 3,
+			unresolvedDraftProposals: 0,
+			unresolvedDraftTokens: 0,
+			lastVerification: {
+				requestID: "actor-request",
+				speculativeSteps: 1,
+				draftedTokens: 3,
+				acceptedTokens: 2,
+				rejectedTokens: 1,
+				steps: [
+					expect.objectContaining({
+						candidateIndex: 0,
+						candidateID: "hash-a",
+						sources: ["drafter", "pattern-aware"],
+					}),
+				],
+			},
+		});
+	});
+
+	it("contains malformed optional verification without breaking cleanup", async () => {
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkEnabled: false }),
+			requestID: () => "actor-request",
+			fetch: vi.fn(async () =>
+				Response.json({
+					verification: {
+						num_draft_tokens: 2,
+						num_accepted_draft_tokens: 2,
+						num_rejected_draft_tokens: 1,
+					},
+				}),
+			),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.decorateActorPayload({ model: "actor" });
+
+		await expect(coordinator.dispose()).resolves.toBeUndefined();
+
+		expect(coordinator.snapshot()).toMatchObject({
+			verificationRequests: 0,
+			failures: 1,
+			lastError: "self-speculation verification token counts are inconsistent",
+		});
+	});
+
 	it("requests one sidecar fork from the first Actor output snapshot", async () => {
 		const requests: CapturedRequest[] = [];
 		const coordinator = coordinatorFixture(

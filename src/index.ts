@@ -199,6 +199,8 @@ export {
 	type SelfSpeculationForkTransport,
 	type SelfSpeculationSettings,
 	type SelfSpeculationSettingsInput,
+	type SelfSpeculationVerificationOutcome,
+	type SelfSpeculationVerificationStep,
 } from "./self-speculation.ts";
 export {
 	type SpeculativeActionPackageSettings,

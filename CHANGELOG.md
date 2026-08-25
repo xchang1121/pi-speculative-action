@@ -21,6 +21,7 @@
 
 ### Added
 
+- Added clear-time target-verification telemetry with per-candidate IDs, Drafter/PatternAware source correlation, and separate resolved, accepted, rejected, and unresolved draft-token counters.
 - Added a model-scoped net-benefit gate for sidecar forks with bounded recovery probes, endpoint-failure backoff, strict Actor K(a) outcome telemetry, and tape replay analysis.
 - Added an opt-in SPORK/self-speculation bridge with stable Actor request IDs, provider and sidecar fork transports, bounded control requests, configurable model-format boundaries, and package/TUI settings.
 - Added one ranked target-decoder bundle for every validated concrete K(a), merging identical Drafter and PatternAware predictions with source/proposal provenance even when local execution is unavailable.

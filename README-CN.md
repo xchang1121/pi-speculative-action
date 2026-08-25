@@ -112,6 +112,8 @@ pi install https://github.com/xchang1121/pi
 
 桥接为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 fork 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 
+如果目标端在 clear 响应中返回 `verification`，协调器会把真实的 proposed、accepted、rejected 和 unresolved draft token 与注册回执分开统计。每个 verifier step 都保留 candidate ID；能与外部候选对应的 ID 会在 `lastVerification` 中重新关联到合并后的 Drafter/PatternAware 来源，累计的 `verified*` snapshot 字段可供后续策略校准。为保持 API 兼容，`acceptedDraftTokens` 仍表示注册确认，不能当作目标模型验收；目标端在清理前未能观察到的最后一次 proposal 会明确记为 unresolved。
+
 fork 有两种传输方式：
 
 - `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。该模式看不到 Drafter 的私有流，因此 Drafter 动作仍进入统一候选包，但不会进行 Drafter 自 fork。

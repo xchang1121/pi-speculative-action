@@ -112,6 +112,8 @@ Example:
 
 The bridge binds one stable request ID to each Actor decision, submits the ranked bundle for that exact absolute decision sequence to `POST /self-speculation/candidates`, and clears it with `POST /self-speculation/clear` after all pending submissions and forks settle. Predictions for later decisions stay buffered until the matching Actor request starts; an unchanged decision retry inherits its bundle, while older predictions are discarded. Network and decoding failures are best-effort acceleration failures and never replace Actor behavior.
 
+When the target returns a clear-time `verification` object, the coordinator records real proposed, accepted, rejected, and unresolved draft tokens separately from registration receipts. Each detailed verifier step retains its candidate ID; known external IDs are joined back to the merged Drafter/PatternAware sources in `lastVerification`. The cumulative `verified*` snapshot fields are therefore suitable for later policy calibration. `acceptedDraftTokens` remains the registration acknowledgement counter for API compatibility and must not be interpreted as target acceptance. A final proposal that the engine could not observe before cleanup remains explicitly unresolved.
+
 There are two fork transports:
 
 - `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
