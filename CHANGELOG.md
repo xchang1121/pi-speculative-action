@@ -21,6 +21,9 @@
 
 ### Added
 
+- Added an opt-in SPORK/self-speculation bridge with stable Actor request IDs, provider and sidecar fork transports, bounded control requests, configurable model-format boundaries, and package/TUI settings.
+- Added one ranked target-decoder bundle for every validated concrete K(a), merging identical Drafter and PatternAware predictions with source/proposal provenance even when local execution is unavailable.
+- Added non-mutating PatternAware prediction rebasing after authoritative Actor actions and adopted Drafter results, allowing actual tool outputs to revise later same-turn actions before the normal learning boundary.
 - Added a standalone repository boundary with its own TypeScript configuration, dependency lock, and Pi public-loader test; development no longer requires a Pi monorepo checkout.
 - Added a speculative tool runtime with a host adapter, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
 - Added canonical sandbox keys, an explicit sandbox host boundary, temporary `write`/`edit` execution, verified adoption, and opt-in bash process execution.
@@ -42,6 +45,7 @@
 
 ### Changed
 
+- PatternAware now carries an unchanged K(a)/horizon set across the provider-turn boundary instead of issuing a duplicate prediction opportunity; changed authoritative feedback still emits a fresh candidate set for normal runtime arbitration.
 - Detached the repository from its former GitHub fork network while preserving the standalone speculative-action history; `xchang1121/pi` is now an independent repository.
 - The Pi package manifest now loads `src/extension.ts` directly, so Git installation works without monorepo build artifacts; npm packing still builds the exported `dist` library.
 - Actor stream previews now start lossless covering reads when a complete path field is decoded; final K(a), realized coverage, and freshness remain authoritative.
@@ -69,6 +73,8 @@
 
 ### Fixed
 
+- Target-decoder candidate bundles are now routed by the Plan Runtime's absolute expected Actor decision sequence, so output-informed and multi-step predictions cannot be submitted to an already-finished request; same-decision retries retain the bundle and stale decisions are dropped.
+- Self-speculation cleanup now waits for in-flight candidate and sidecar-fork submissions, fences the package-level disabled state, and keeps Drafter request identities isolated from the Actor request.
 - Output-informed Drafter continuations now permit a terminal response instead of forcing an unrelated tool call after the speculative branch has completed.
 - A newly captured exact-key result remains reachable when an older cache generation cannot be freshness-validated; bounded cache retention now owns both generations until one is proven stale or evicted.
 - Continuation work can be reused immediately, but its prediction is anchored to the first causally eligible Actor decision; same-batch reuse is no longer misattributed as a future-step match.

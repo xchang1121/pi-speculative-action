@@ -41,11 +41,13 @@ import {
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type {
 	CandidatePreflight,
+	MaterializedSpeculativeCandidate,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
 	SpeculativePlanSource,
 } from "./runtime.ts";
+import type { SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableStringify } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
@@ -68,6 +70,7 @@ export interface SpeculativeAgentSettingsInput {
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs?: number;
 	readonly patternAware?: Partial<PatternAwareSettings>;
+	readonly selfSpeculation?: SelfSpeculationSettingsInput;
 	/** Legacy grouped input is accepted only for configuration migration. */
 	readonly tools?: SpeculativeToolSelectionInput;
 }
@@ -125,6 +128,15 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly patternWorkspaceIdentity?: string;
 	/** Optional injected store, primarily for embedding and deterministic tests. */
 	readonly patternStore?: PatternAwareStore | Promise<PatternAwareStore>;
+	/** Starts request-scoped inference integration before prediction sources launch. */
+	readonly onTurnStarted?: (input: {
+		readonly turnID: string;
+		readonly actorModel: Model<Api>;
+		readonly context: Context;
+		readonly decisionSequence: number;
+	}) => void | Promise<void>;
+	/** Receives every validated K(a) as a concrete tool call, independent of execution isolation. */
+	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
@@ -219,6 +231,8 @@ export function createSpeculativeActionHost(
 	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
 	let openedPatternStoreKey: string | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
+	const patternRevisions = new Map<string, number>();
+	const carriedPatternPredictions = new Map<string, string>();
 	const drafterBatches = new Map<
 		string,
 		Promise<{
@@ -237,6 +251,18 @@ export function createSpeculativeActionHost(
 			});
 	};
 	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
+	const nextPatternRevision = (batchSessionID: string, turnID: string) => {
+		const key = authoritativeBatchKey(batchSessionID, turnID);
+		const revision = (patternRevisions.get(key) ?? -1) + 1;
+		patternRevisions.set(key, revision);
+		return revision;
+	};
+	const patternPredictionSignature = (candidates: readonly PatternAwareCandidate[]) =>
+		JSON.stringify(
+			candidates
+				.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
+				.sort(([left], [right]) => left.localeCompare(right)),
+		);
 	const clearAuthoritativeSession = (batchSessionID: string) => {
 		for (const [key, batch] of authoritativeBatches) {
 			if (batch.values().next().value?.sessionID === batchSessionID) authoritativeBatches.delete(key);
@@ -294,6 +320,8 @@ export function createSpeculativeActionHost(
 	};
 	const finishPatternSession = async (): Promise<void> => {
 		drafterBatches.clear();
+		patternRevisions.clear();
+		carriedPatternPredictions.clear();
 		clearAuthoritativeSession(sessionID);
 		await patternAnalysisTail;
 		const store = options.patternStore
@@ -515,11 +543,18 @@ export function createSpeculativeActionHost(
 			await patternAnalysisTail;
 			const store = await resolvePatternStore(settings);
 			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
+			const signature = patternPredictionSignature(candidates);
+			const carried = carriedPatternPredictions.get(startInput.sessionID);
+			carriedPatternPredictions.delete(startInput.sessionID);
+			// The previous authoritative observation already issued these candidates early for this decision.
+			// Re-issuing an unchanged K(a) set at the provider boundary creates duplicate prediction
+			// opportunities and can restart a losing alternative after the shared winner is adopted.
+			if (carried === signature) return undefined;
 			if (!candidates.length) return undefined;
 			return {
 				id: `pattern:${startInput.turnID}`,
 				source: "pattern_aware",
-				revision: 0,
+				revision: nextPatternRevision(startInput.sessionID, startInput.turnID),
 				actions: candidates.map((candidate) =>
 					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
 				),
@@ -578,8 +613,9 @@ export function createSpeculativeActionHost(
 				),
 			};
 		},
-		observe: async ({ startInput, settings, consumeInput, tool, concrete, output, durationMs, order }) => {
-			if (!sourcePatternSettings(settings).enabled) return undefined;
+		observe: async ({ startInput, data, settings, consumeInput, tool, concrete, output, durationMs, order }) => {
+			const patternSettings = sourcePatternSettings(settings);
+			if (!patternSettings.enabled) return undefined;
 			const definition = startInput.tools.find((item) => item.name === tool);
 			const observation = projectPatternAwareObservation(
 				output?.result,
@@ -588,7 +624,7 @@ export function createSpeculativeActionHost(
 			);
 			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
-			batch.set(order, {
+			const event: PatternAwareEventInput = {
 				sessionID: consumeInput.sessionID,
 				turnID: consumeInput.turnID,
 				tool,
@@ -599,9 +635,28 @@ export function createSpeculativeActionHost(
 				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
 				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
 				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
-			});
+			};
+			batch.set(order, event);
 			authoritativeBatches.set(key, batch);
-			return undefined;
+			if (!patternSettings.multiStepEnabled) return undefined;
+			await patternAnalysisTail;
+			const store = await resolvePatternStore(settings);
+			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
+			const candidates = store.predictAfterBatch(
+				consumeInput.sessionID,
+				ordered,
+				data.schemaHashes,
+				patternSettings,
+			);
+			carriedPatternPredictions.set(consumeInput.sessionID, patternPredictionSignature(candidates));
+			return {
+				id: `pattern:${consumeInput.turnID}`,
+				source: "pattern_aware",
+				revision: nextPatternRevision(consumeInput.sessionID, consumeInput.turnID),
+				actions: candidates.map((candidate) =>
+					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
+				),
+			};
 		},
 		onIssued: ({ feedback }) => {
 			const context = asPatternPlanFeedback(feedback);
@@ -721,12 +776,27 @@ export function createSpeculativeActionHost(
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
-		onTurnStarted: ({ startInput, settings, signal }) => {
-			authoritativeBatches.delete(authoritativeBatchKey(startInput.sessionID, startInput.turnID));
+		onTurnStarted: async ({ startInput, decisionSequence, settings, signal }) => {
+			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
+			authoritativeBatches.delete(key);
+			patternRevisions.delete(key);
+			try {
+				await options.onTurnStarted?.({
+					turnID: startInput.turnID,
+					actorModel: startInput.actorModel,
+					context: startInput.context,
+					decisionSequence,
+				});
+			} catch {
+				// Optional inference integration cannot prevent source launch or Actor execution.
+			}
 			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
 				// Turn warm-up is best-effort; route resolution remains authoritative.
 			});
-			if (!sourcePatternSettings(settings).enabled) return;
+			if (!settings.enabled || !sourcePatternSettings(settings).enabled) {
+				carriedPatternPredictions.delete(startInput.sessionID);
+				return;
+			}
 			queuePatternAnalysis(async () => {
 				const store = await resolvePatternStore(settings);
 				store.observeTurn();
@@ -737,7 +807,12 @@ export function createSpeculativeActionHost(
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const batch = authoritativeBatches.get(key);
 			authoritativeBatches.delete(key);
-			if (!sourcePatternSettings(settings).enabled) return;
+			patternRevisions.delete(key);
+			if (terminal) carriedPatternPredictions.delete(startInput.sessionID);
+			if (!settings.enabled || !sourcePatternSettings(settings).enabled) {
+				carriedPatternPredictions.delete(startInput.sessionID);
+				return;
+			}
 			const events = batch?.size
 				? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
 				: [];
@@ -748,6 +823,7 @@ export function createSpeculativeActionHost(
 				if (terminal) store.finishSession(startInput.sessionID);
 			});
 		},
+		onCandidateMaterialized: options.onCandidateMaterialized,
 		onEvent: options.onEvent,
 	});
 

@@ -76,6 +76,22 @@ Example:
   "patternAware": {
     "enabled": true,
     "multiStepEnabled": true
+  },
+  "selfSpeculation": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:8010",
+    "forkTransport": "sidecar",
+    "forkEnabled": true,
+    "maxCandidates": 8,
+    "maxDraftTokens": 20,
+    "draftFormat": "tagged_json",
+    "draftBoundary": "<tool_call>",
+    "forkMaxTokens": 128,
+    "forkTemperature": 0,
+    "forkDecoder": "auto",
+    "forkForcedPrefix": "<tool_call>",
+    "requireLogprobs": true,
+    "timeoutMs": 2000
   }
 }
 ```
@@ -83,6 +99,21 @@ Example:
 `drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
 
 `drafterMaxTokens` is an optional hard cap. Omit it—or clear the TUI field—to use the provider's output limit, which avoids truncating long commands and structured tool arguments.
+
+### Target-decoder self-speculation bridge
+
+`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. Every source still enters the existing plan Runtime: self-speculation does not add a second Drafter source or execute a tool. After schema validation and argument materialization, every concrete Drafter or PatternAware `K(a)` is copied to one request-scoped candidate bundle. Identical keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
+
+The bridge binds one stable request ID to each Actor decision, submits the ranked bundle for that exact absolute decision sequence to `POST /self-speculation/candidates`, and clears it with `POST /self-speculation/clear` after all pending submissions and forks settle. Predictions for later decisions stay buffered until the matching Actor request starts; an unchanged decision retry inherits its bundle, while older predictions are discarded. Network and decoding failures are best-effort acceleration failures and never replace Actor behavior.
+
+There are two fork transports:
+
+- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
+- `provider` places a versioned `self_speculation` control object directly in both Actor and, when `drafterEnabled` is true, Drafter provider payloads. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
+
+The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, tool-call format/boundary, fork decoder/prefix, temperature, and logprob requirement. The boundary, formatter, decoder, and target tokenizer must describe the same model format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
+
+When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
 
 The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.
 

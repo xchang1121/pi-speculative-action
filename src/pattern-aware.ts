@@ -548,6 +548,47 @@ export class PatternAwareStore {
 		);
 	}
 
+	predictAfterBatch(
+		sessionID: string,
+		inputs: ReadonlyArray<PatternAwareEventInput>,
+		schemaHashes: Readonly<Record<string, string>> = {},
+		predictionSettings: PatternAwareSettings = this.settings,
+	) {
+		if (!predictionSettings.enabled || !inputs.length) return [];
+		if (inputs.some((input) => input.sessionID !== sessionID)) {
+			throw new Error("PatternAware hypothetical actions must belong to the active session");
+		}
+		const turnID = inputs[0]!.turnID;
+		if (inputs.some((input) => input.turnID !== turnID)) {
+			throw new Error("PatternAware hypothetical actions must belong to one provider turn");
+		}
+		const ordered = inputs
+			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
+			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+			.map((item) => item.input);
+		const history = [...(this.history.get(sessionID) ?? [])];
+		const sequence = history.at(-1)?.sequence ?? this.clock;
+		history.push(
+			...ordered.map(
+				(input, index): PatternAwareEvent => ({
+					...input,
+					sequence: sequence + index + 1,
+					batchID: turnID,
+					batchIndex: index,
+					batchSize: ordered.length,
+					learnTarget: false,
+				}),
+			),
+		);
+		this.trimSessionHistory(history);
+		return this.predictHistory(
+			history,
+			schemaHashes,
+			{ history, visitedPatternIDs: [], pathProbability: 1 },
+			predictionSettings,
+		);
+	}
+
 	continue(
 		continuation: PatternAwareContinuation,
 		input: PatternAwareEventInput,

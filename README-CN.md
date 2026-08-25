@@ -76,6 +76,22 @@ pi install https://github.com/xchang1121/pi
   "patternAware": {
     "enabled": true,
     "multiStepEnabled": true
+  },
+  "selfSpeculation": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:8010",
+    "forkTransport": "sidecar",
+    "forkEnabled": true,
+    "maxCandidates": 8,
+    "maxDraftTokens": 20,
+    "draftFormat": "tagged_json",
+    "draftBoundary": "<tool_call>",
+    "forkMaxTokens": 128,
+    "forkTemperature": 0,
+    "forkDecoder": "auto",
+    "forkForcedPrefix": "<tool_call>",
+    "requireLogprobs": true,
+    "timeoutMs": 2000
   }
 }
 ```
@@ -83,6 +99,21 @@ pi install https://github.com/xchang1121/pi
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 
 `drafterMaxTokens` 是可选的硬上限。省略该项——或清空 TUI 输入框——会使用服务商默认输出上限，避免长命令和结构化工具参数被截断。
+
+### 目标解码器自投机桥接
+
+`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。所有来源仍先进入现有 Plan Runtime：自投机不会新增第二个 Drafter source，也不会执行工具。候选通过 schema 校验并完成参数物化后，每个 Drafter 或 PatternAware 的具体 `K(a)` 都会复制到同一个 request-scoped 候选包；相同 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
+
+桥接为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 fork 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
+
+fork 有两种传输方式：
+
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。该模式看不到 Drafter 的私有流，因此 Drafter 动作仍进入统一候选包，但不会进行 Drafter 自 fork。
+- `provider`：把版本化的 `self_speculation` 控制对象直接放进 Actor 请求；`drafterEnabled` 打开时也放进每个 Drafter 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
+
+JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、tool-call 格式与边界、fork decoder/prefix、温度及 logprob 要求。边界、formatter、decoder 和目标 tokenizer 必须属于同一种模型格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
+
+PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor 采纳的 Drafter 结果——都会连同真实输出一起做一次不修改学习状态的同轮重基准；正式学习仍在权威 batch 边界进行。若跨轮的 `K(a)` 与 horizon 集合完全不变，则沿用提前签发的机会而不重复创建，避免共享命中被采纳后又启动同组落选候选。
 
 旧的 `resourceCached` / `sandbox` / `predictionOnly` 三组对象仅作为迁移输入继续识别，读取后统一规范化为一个 `tools` 数组。
 

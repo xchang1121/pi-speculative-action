@@ -174,6 +174,32 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("rebases predictions over an authoritative provider batch without learning it early", () => {
+		const store = new PatternAwareStore(settings());
+		trainGrepRead(store, "one", "src/a.ts");
+		trainGrepRead(store, "two", "src/b.ts");
+		const before = store.recent("probe");
+
+		const candidates = store.predictAfterBatch("probe", [
+			input({
+				sessionID: "probe",
+				turnID: "probe:scan",
+				tool: "grep",
+				input: { pattern: "TODO" },
+				outputPaths: ["src/c.ts"],
+			}),
+		]);
+
+		expect(candidates).toContainEqual(
+			expect.objectContaining({
+				source: "pattern_aware",
+				tool: "read",
+				input: { filePath: "src/c.ts" },
+			}),
+		);
+		expect(store.recent("probe")).toEqual(before);
+	});
+
 	test("learns provider batches canonically without inventing sibling causality", () => {
 		const store = new PatternAwareStore(settings());
 		for (const [sessionID, filePath, reverse] of [

@@ -810,6 +810,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		try {
 			await adapter.onTurnStarted?.({
 				startInput: input,
+				decisionSequence: state.decisionSequence,
 				settings,
 				definitions,
 				candidateNames: names,
@@ -1160,6 +1161,38 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!executionInput) {
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
+		}
+		const onCandidateMaterialized = adapter.onCandidateMaterialized;
+		if (onCandidateMaterialized) {
+			const materializedKey = key;
+			session.effects.enqueue(() =>
+				onCandidateMaterialized({
+					sessionID: session.id,
+					turnID: context.startInput.turnID,
+					expectedDecisionSequence: node.expectedDecisionSeq,
+					latestDecisionSequence: node.latestDecisionSeq,
+					source: node.source,
+					proposalID: node.proposalID,
+					actionID: node.action.id,
+					tool: node.action.tool,
+					input: structuredClone(concrete),
+					action: materializedKey,
+					...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
+					...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
+					...(node.action.conditionalProbability !== undefined
+						? { conditionalProbability: node.action.conditionalProbability }
+						: {}),
+					...(node.action.empiricalProbability !== undefined
+						? { empiricalProbability: node.action.empiricalProbability }
+						: {}),
+					...(node.action.expectedLatencyBenefitMs !== undefined
+						? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
+						: {}),
+					...(node.action.expectedDurationMs !== undefined
+						? { expectedDurationMs: node.action.expectedDurationMs }
+						: {}),
+				}),
+			);
 		}
 		const admission = await executionRouteFor({
 			startInput: context.startInput,

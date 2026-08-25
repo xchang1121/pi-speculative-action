@@ -10,7 +10,7 @@ import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-i
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import type { SpeculativeActionEvent } from "../src/runtime.ts";
+import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({
@@ -144,6 +144,8 @@ describe("speculative action host", () => {
 		let executions = 0;
 		let preflights = 0;
 		const events: SpeculativeActionEvent<string>[] = [];
+		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const turnStarts: Array<{ turnID: string; decisionSequence: number }> = [];
 		const tool: AgentTool<typeof bashSchema> = {
 			name: "bash",
 			label: "bash",
@@ -170,6 +172,12 @@ describe("speculative action host", () => {
 				preflights++;
 				return true;
 			},
+			onTurnStarted: ({ turnID, decisionSequence }) => {
+				turnStarts.push({ turnID, decisionSequence });
+			},
+			onCandidateMaterialized: (candidate) => {
+				materialized.push(candidate);
+			},
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -177,6 +185,8 @@ describe("speculative action host", () => {
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => host.runtime.inspect("session").executionBlockedPlanActions === 1);
+		await waitFor(() => materialized.length === 1);
+		expect(turnStarts).toEqual([{ turnID: "turn-1", decisionSequence: 1 }]);
 		expect(host.runtime.inspect("session")).toMatchObject({
 			exclusiveCandidates: 0,
 			sharedCandidates: 0,
@@ -184,6 +194,18 @@ describe("speculative action host", () => {
 		expect(executions).toBe(0);
 		expect(preflights).toBe(0);
 		expect(events.some((event) => event.type === "candidate")).toBe(false);
+		expect(materialized).toMatchObject([
+			{
+				sessionID: "session",
+				turnID: "turn-1",
+				expectedDecisionSequence: 1,
+				latestDecisionSequence: 1,
+				source: "drafter",
+				tool: "bash",
+				input: { command: "npm test" },
+				action: { tool: "bash", input: { command: "npm test" } },
+			},
+		]);
 
 		const call = { turnID: "turn-1", id: "actor-bash", tool: "bash", args: { command: "npm test" }, tools: [tool] };
 		expect(await host.consume(call)).toBeUndefined();
@@ -560,6 +582,216 @@ describe("speculative action host", () => {
 		expect(predictionStates).toEqual([false, true]);
 		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(disposed).toBe(1);
+	});
+
+	it("rebases PatternAware from an authoritative Actor action within the same turn", async () => {
+		const cwd = await temporaryWorkspace();
+		const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
+		const patternStore = new PatternAwareStore(patternSettings);
+		for (const [trainingSession, filePath] of [
+			["training-a", "alpha.txt"],
+			["training-b", "beta.txt"],
+		] as const) {
+			patternStore.observe({
+				sessionID: trainingSession,
+				turnID: `${trainingSession}:scan`,
+				tool: "grep",
+				input: { pattern: "one", path: "." },
+				outcome: "success",
+				outputPaths: [filePath],
+				durationMs: 10,
+			});
+			patternStore.observe({
+				sessionID: trainingSession,
+				turnID: `${trainingSession}:read`,
+				tool: "read",
+				input: { path: filePath },
+				outcome: "success",
+				durationMs: 10,
+			});
+		}
+		const grepTool: AgentTool<typeof grepSchema> = {
+			name: "grep",
+			label: "grep",
+			description: "grep",
+			parameters: grepSchema,
+			execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
+		};
+		const readTool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
+		};
+		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const host = createSpeculativeActionHost("probe", {
+			cwd,
+			getSettings: () => ({
+				...settings(4),
+				drafterEnabled: false,
+				tools: ["grep", "read"],
+				patternAware: patternSettings,
+			}),
+			patternStore,
+			complete: async () => assistant([{ type: "text", text: "unused" }], "stop"),
+			preflight: () => true,
+			onCandidateMaterialized: (candidate) => {
+				materialized.push(candidate);
+			},
+		});
+		const tools = [grepTool, readTool];
+		await host.startTurn({
+			turnID: "probe:turn",
+			actorModel: model("actor"),
+			context: { systemPrompt: "system", messages: [], tools },
+			actorOptions: undefined,
+			tools,
+		});
+		expect(materialized).toHaveLength(0);
+		expect(
+			await host.consume({
+				turnID: "probe:turn",
+				id: "actor-grep",
+				tool: "grep",
+				args: { pattern: "one", path: "." },
+				tools,
+			}),
+		).toBeUndefined();
+		const output = await grepTool.execute("actor-grep", { pattern: "one", path: "." });
+		await host.actual({
+			turnID: "probe:turn",
+			id: "actor-grep",
+			tool: "grep",
+			args: { pattern: "one", path: "." },
+			tools,
+			durationMs: 12,
+			output: { result: output, isError: false },
+		});
+
+		await waitFor(() => materialized.some((candidate) => candidate.source === "pattern_aware"));
+		expect(materialized).toContainEqual(
+			expect.objectContaining({
+				sessionID: "probe",
+				turnID: "probe:turn",
+				expectedDecisionSequence: 2,
+				latestDecisionSequence: 2,
+				source: "pattern_aware",
+				tool: "read",
+				input: { path: "notes.txt" },
+			}),
+		);
+		expect(patternStore.recent("probe")).toHaveLength(0);
+		await host.finishTurn("probe:turn");
+		await host.dispose();
+	});
+
+	it("rebases PatternAware after the Actor adopts a Drafter execution", async () => {
+		const cwd = await temporaryWorkspace();
+		const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
+		const patternStore = new PatternAwareStore(patternSettings);
+		for (const [trainingSession, filePath] of [
+			["training-a", "alpha.txt"],
+			["training-b", "beta.txt"],
+		] as const) {
+			patternStore.observe({
+				sessionID: trainingSession,
+				turnID: `${trainingSession}:scan`,
+				tool: "grep",
+				input: { pattern: "one", path: "." },
+				outcome: "success",
+				outputPaths: [filePath],
+				durationMs: 10,
+			});
+			patternStore.observe({
+				sessionID: trainingSession,
+				turnID: `${trainingSession}:read`,
+				tool: "read",
+				input: { path: filePath },
+				outcome: "success",
+				durationMs: 10,
+			});
+		}
+		const grepTool: AgentTool<typeof grepSchema> = {
+			name: "grep",
+			label: "grep",
+			description: "grep",
+			parameters: grepSchema,
+			execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
+		};
+		const readTool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
+		};
+		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("probe", {
+			cwd,
+			getSettings: () => ({
+				...settings(1),
+				drafterMaxDepth: 0,
+				tools: ["grep", "read"],
+				patternAware: patternSettings,
+			}),
+			patternStore,
+			draftModel: model("draft"),
+			complete: async () =>
+				assistant(
+					[{ type: "toolCall", id: "draft-grep", name: "grep", arguments: { pattern: "one", path: "." } }],
+					"toolUse",
+				),
+			preflight: () => true,
+			onCandidateMaterialized: (candidate) => {
+				materialized.push(candidate);
+			},
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+		const tools = [grepTool, readTool];
+		await host.startTurn({
+			turnID: "probe:turn",
+			actorModel: model("actor"),
+			context: { systemPrompt: "system", messages: [], tools },
+			actorOptions: undefined,
+			tools,
+		});
+		await waitFor(() =>
+			events.some(
+				(event) =>
+					event.type === "candidate" &&
+					event.candidate.source === "drafter" &&
+					event.state.status === "succeeded",
+			),
+		);
+
+		const adopted = await host.consume({
+			turnID: "probe:turn",
+			id: "actor-grep",
+			tool: "grep",
+			args: { pattern: "one", path: "." },
+			tools,
+		});
+
+		expect(adopted).toBeDefined();
+		await waitFor(() =>
+			materialized.some((candidate) => candidate.source === "pattern_aware" && candidate.tool === "read"),
+		);
+		expect(materialized).toContainEqual(
+			expect.objectContaining({
+				expectedDecisionSequence: 2,
+				latestDecisionSequence: 2,
+				source: "pattern_aware",
+				tool: "read",
+				input: { path: "notes.txt" },
+			}),
+		);
+		expect(patternStore.recent("probe")).toHaveLength(0);
+		await host.finishTurn("probe:turn");
+		await host.dispose();
 	});
 
 	it("runs independent single-action drafts concurrently and deduplicates them by K(a)", async () => {

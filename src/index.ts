@@ -178,9 +178,20 @@ export {
 	type SpeculativeActionSettings,
 	type SpeculativeCandidate,
 	type SpeculativeDraftCandidate,
+	type MaterializedSpeculativeCandidate,
 	type SpeculativePlanSource,
 	type SpeculativeRuntimeInspection,
 } from "./runtime.ts";
+export {
+	normalizeSelfSpeculationSettings,
+	SELF_SPECULATION_DEFAULTS,
+	SelfSpeculationCoordinator,
+	type SelfSpeculationCoordinatorOptions,
+	type SelfSpeculationCoordinatorSnapshot,
+	type SelfSpeculationForkTransport,
+	type SelfSpeculationSettings,
+	type SelfSpeculationSettingsInput,
+} from "./self-speculation.ts";
 export {
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,

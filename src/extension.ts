@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
@@ -46,6 +47,12 @@ import {
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import {
+	normalizeSelfSpeculationSettings,
+	SelfSpeculationCoordinator,
+	type SelfSpeculationCoordinatorSnapshot,
+	type SelfSpeculationSettings,
+} from "./self-speculation.ts";
+import {
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
@@ -86,6 +93,7 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly resourceCacheMaxBytes: number;
 	readonly predictionTimeoutMs: number;
 	readonly patternAware: PatternAwareSettings;
+	readonly selfSpeculation: SelfSpeculationSettings;
 	readonly tools: readonly string[];
 }
 
@@ -117,6 +125,10 @@ interface SpeculativeActionController {
 	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
 	readonly previewActorTool: (tool: string, signal?: AbortSignal) => void;
 	readonly previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => void;
+	readonly decorateActorPayload: (payload: unknown) => unknown;
+	readonly decorateDrafterPayload: (payload: unknown) => unknown;
+	readonly observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) => void;
+	readonly selfSpeculationSnapshot: () => SelfSpeculationCoordinatorSnapshot;
 	readonly finishTurn: (terminal?: boolean) => Promise<void>;
 	readonly execute: (
 		tool: string,
@@ -134,6 +146,7 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly createExecutionWorlds?: () => readonly SpeculativeAgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
+	readonly selfSpeculationFetch?: typeof globalThis.fetch;
 }
 
 export function normalizeSpeculativeActionSettings(
@@ -153,6 +166,7 @@ export function normalizeSpeculativeActionSettings(
 		resourceCacheMaxBytes: positiveInteger(input?.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
 		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
 		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
+		selfSpeculation: normalizeSelfSpeculationSettings(input?.selfSpeculation),
 		tools: normalizeSpeculativeToolSelection(input?.tools, KEYABLE_TOOLS),
 	};
 }
@@ -175,6 +189,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
@@ -197,10 +212,17 @@ export function createSpeculativeActionExtension(
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
 		const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
+		const providerRole = new AsyncLocalStorage<"drafter">();
+
+		pi.on("before_provider_request", (event) =>
+			providerRole.getStore() === "drafter"
+				? controller?.decorateDrafterPayload(event.payload)
+				: controller?.decorateActorPayload(event.payload),
+		);
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
-			controller = await installController(ctx, pi, dependencies, wrapperSources);
+			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRole);
 			controller.attachUI(ctx.ui);
 		});
 		pi.on("context", async (event, ctx) => {
@@ -208,6 +230,7 @@ export function createSpeculativeActionExtension(
 			await controller?.startTurn(event.messages, ctx);
 		});
 		pi.on("message_update", (event, ctx) => {
+			controller?.observeActorOutput(event.assistantMessageEvent);
 			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
 				if (preview.type === "tool") {
 					if (controller?.registeredTools().has(preview.tool))
@@ -247,6 +270,7 @@ async function installController(
 	pi: ExtensionAPI,
 	dependencies: SpeculativeActionExtensionDependencies,
 	wrapperSources: Map<string, string>,
+	providerRole: AsyncLocalStorage<"drafter">,
 ): Promise<SpeculativeActionController> {
 	let currentMetrics = emptyMetrics();
 	let ui: ExtensionUIContext | undefined;
@@ -261,6 +285,13 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
+	const selfSpeculation = new SelfSpeculationCoordinator({
+		settings: () => {
+			const configured = settings().selfSpeculation;
+			return settings().enabled ? configured : { ...configured, enabled: false };
+		},
+		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
+	});
 	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
 		loadPiToolSettings(context.cwd),
@@ -300,7 +331,8 @@ async function installController(
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
 		cwd: context.cwd,
 		getSettings: settings,
-		complete: (model, llmContext, options) => latestContext.modelRegistry.complete(model, llmContext, options),
+		complete: (model, llmContext, options) =>
+			providerRole.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
 		draftModel: (actorModel) =>
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
 		getDraftOptions: async ({ draftModel, actorOptions, signal }) =>
@@ -326,6 +358,9 @@ async function installController(
 		executionWorlds,
 		patternStateDirectory: getAgentDir(),
 		patternWorkspaceIdentity,
+		onTurnStarted: ({ turnID, actorModel, context: actorContext, decisionSequence }) =>
+			selfSpeculation.startTurn(turnID, actorModel, actorContext, decisionSequence),
+		onCandidateMaterialized: (candidate) => selfSpeculation.addCandidate(candidate),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
 			recentEvents.push(formatSpeculativeActionEvent(event));
@@ -347,6 +382,7 @@ async function installController(
 			if (value) settingsStore.setEffective(value);
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
 			void recoverSpeculation(() => host.runtime.settingsChanged(currentSettings));
 			renderFooter();
 		},
@@ -369,15 +405,16 @@ async function installController(
 					.getActiveTools()
 					.map((name) => agentTools.get(name))
 					.filter((tool): tool is AgentTool => tool !== undefined);
+				const actorContext = {
+					systemPrompt: nextContext.getSystemPrompt(),
+					messages: convertToLlm(messages),
+					tools: [...turnTools],
+				};
 				await host.startTurn(
 					{
 						turnID: currentTurnID,
 						actorModel: model,
-						context: {
-							systemPrompt: nextContext.getSystemPrompt(),
-							messages: convertToLlm(messages),
-							tools: [...turnTools],
-						},
+						context: actorContext,
 						actorOptions: nextContext.signal ? { signal: nextContext.signal } : undefined,
 						tools: turnTools,
 					},
@@ -399,6 +436,10 @@ async function installController(
 			if (!turnID || !baseDefinitions.has(tool)) return;
 			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
 		},
+		decorateActorPayload: (payload) => selfSpeculation.decorateActorPayload(payload),
+		decorateDrafterPayload: (payload) => selfSpeculation.decorateDrafterPayload(payload),
+		observeActorOutput: (event) => selfSpeculation.observeActorOutput(event),
+		selfSpeculationSnapshot: () => selfSpeculation.snapshot(),
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);
 			if (!turnID) return;
@@ -407,6 +448,8 @@ async function installController(
 				lastTurnID = turnID;
 			}
 			await recoverSpeculation(() => host.finishTurn(turnID, terminal));
+			if (terminal) selfSpeculation.reset();
+			else selfSpeculation.endTurn();
 			if (terminal) lastTurnID = undefined;
 		},
 		execute: async (tool, callID, input, signal, onUpdate, nextContext) => {
@@ -458,13 +501,19 @@ async function installController(
 				throw error;
 			}
 		},
-		statusText: () =>
-			`${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
+		statusText: () => {
+			const bridge = selfSpeculation.snapshot();
+			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles; ${bridge.forkRequests} forks; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
 			await settingsStore.flush();
-			await host.dispose();
+			try {
+				await host.dispose();
+			} finally {
+				await selfSpeculation.dispose();
+			}
 		},
 	};
 	for (const definition of baseDefinitions.values())
@@ -687,6 +736,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			`Enabled: ${applied.enabled ? "On" : "Off"}`,
 			`Configuration scope: ${controller.settingsScope()}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
+			`Target decoding › ${selfSpeculationSummary(draft.selfSpeculation)}`,
 			`Scheduling & cache › ${draft.candidateLimit} draft requests, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} entries`,
 			`Tools & execution › ${enabledToolCount(draft)} tools`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
@@ -718,6 +768,10 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 		}
 		if (choice.startsWith("Prediction sources")) {
 			await openPredictionSources(ctx, editor);
+			continue;
+		}
+		if (choice.startsWith("Target decoding")) {
+			await openSelfSpeculationSettings(ctx, editor);
 			continue;
 		}
 		if (choice.startsWith("Scheduling & cache")) {
@@ -754,7 +808,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			if (
 				!(await ctx.ui.confirm(
 					"Restore defaults?",
-					"Restore tunable settings while preserving enabled prediction sources?",
+					"Restore tunable settings while preserving enabled sources and target decoding?",
 				))
 			)
 				continue;
@@ -764,6 +818,10 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 				enabled: applied.enabled,
 				drafterEnabled: applied.drafterEnabled,
 				patternAware: { ...defaults.patternAware, enabled: applied.patternAware.enabled },
+				selfSpeculation: {
+					...defaults.selfSpeculation,
+					enabled: applied.selfSpeculation.enabled,
+				},
 			});
 			reload();
 			ctx.ui.notify("Speculative-action defaults restored.", "info");
@@ -782,6 +840,69 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Drafter")) await openDrafterSettings(ctx, controller);
 		if (choice.startsWith("PatternAware")) await openPatternAwareSettings(ctx, controller);
+	}
+}
+
+async function openSelfSpeculationSettings(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+): Promise<void> {
+	while (true) {
+		const settings = controller.settings();
+		const self = settings.selfSpeculation;
+		const choice = await ctx.ui.select("Self-speculation", [
+			`Enabled: ${self.enabled ? "On" : "Off"}`,
+			`Endpoint: ${self.endpoint}`,
+			`Fork transport: ${self.forkTransport}`,
+			`Actor fork: ${self.forkEnabled ? "On" : "Off"}`,
+			`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`,
+			`Candidate bundle: ${self.maxCandidates}`,
+			`Draft tokens: ${self.maxDraftTokens}`,
+			`Draft format: ${self.draftFormat}`,
+			`Draft boundary: ${self.draftBoundary}`,
+			`Fork tokens: ${self.forkMaxTokens}`,
+			`Fork temperature: ${formatNumber(self.forkTemperature)}`,
+			`Decoder: ${self.forkDecoder}`,
+			`Forced prefix: ${self.forkForcedPrefix}`,
+			`Require logprobs: ${self.requireLogprobs ? "On" : "Off"}`,
+			`Control timeout: ${formatDuration(self.timeoutMs)}`,
+			`Bearer-token env: ${self.apiKeyEnv ?? "none"}`,
+			BACK,
+		]);
+		if (!choice || choice === BACK) return;
+		if (choice.startsWith("Enabled:")) updateSelfSpeculation(controller, settings, { enabled: !self.enabled });
+		if (choice.startsWith("Endpoint:")) await editSelfSpeculationEndpoint(ctx, controller, settings);
+		if (choice.startsWith("Fork transport:")) {
+			const selected = await ctx.ui.select("Fork transport", ["provider", "sidecar", BACK]);
+			if (selected === "provider" || selected === "sidecar")
+				updateSelfSpeculation(controller, settings, { forkTransport: selected });
+		}
+		if (choice.startsWith("Actor fork:"))
+			updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled });
+		if (choice.startsWith("Drafter fork:"))
+			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
+		if (choice.startsWith("Candidate bundle:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "maxCandidates", "Candidate bundle size");
+		if (choice.startsWith("Draft tokens:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "maxDraftTokens", "Draft tokens");
+		if (choice.startsWith("Draft format:"))
+			await editSelfSpeculationString(ctx, controller, settings, "draftFormat", "Draft format", false);
+		if (choice.startsWith("Draft boundary:"))
+			await editSelfSpeculationString(ctx, controller, settings, "draftBoundary", "Draft boundary", false);
+		if (choice.startsWith("Fork tokens:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "forkMaxTokens", "Fork tokens");
+		if (choice.startsWith("Control timeout:"))
+			await editSelfSpeculationInteger(ctx, controller, settings, "timeoutMs", "Control timeout (ms)");
+		if (choice.startsWith("Fork temperature:"))
+			await editSelfSpeculationTemperature(ctx, controller, settings);
+		if (choice.startsWith("Decoder:"))
+			await editSelfSpeculationString(ctx, controller, settings, "forkDecoder", "Fork decoder", false);
+		if (choice.startsWith("Forced prefix:"))
+			await editSelfSpeculationString(ctx, controller, settings, "forkForcedPrefix", "Forced prefix", false);
+		if (choice.startsWith("Require logprobs:"))
+			updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs });
+		if (choice.startsWith("Bearer-token env:"))
+			await editSelfSpeculationString(ctx, controller, settings, "apiKeyEnv", "Bearer-token environment variable", true);
 	}
 }
 
@@ -1008,6 +1129,83 @@ async function editToolPolicy(
 		const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
 		controller.setSettings({ ...settings, tools: next });
 	}
+}
+
+function updateSelfSpeculation(
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+	update: Partial<SelfSpeculationSettings>,
+): void {
+	controller.setSettings({
+		...settings,
+		selfSpeculation: { ...settings.selfSpeculation, ...update },
+	});
+}
+
+async function editSelfSpeculationEndpoint(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+): Promise<void> {
+	const value = await ctx.ui.input("Self-speculation endpoint", settings.selfSpeculation.endpoint);
+	if (value === undefined) return;
+	const endpoint = value.trim();
+	if (!/^https?:\/\/[^\s]+$/u.test(endpoint)) {
+		ctx.ui.notify("Endpoint must be an absolute HTTP(S) URL.", "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { endpoint });
+}
+
+async function editSelfSpeculationInteger(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+	field: "maxCandidates" | "maxDraftTokens" | "forkMaxTokens" | "timeoutMs",
+	title: string,
+): Promise<void> {
+	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		ctx.ui.notify(`${title} must be a positive integer.`, "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { [field]: parsed });
+}
+
+async function editSelfSpeculationTemperature(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+): Promise<void> {
+	const value = await ctx.ui.input("Fork temperature", String(settings.selfSpeculation.forkTemperature));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		ctx.ui.notify("Fork temperature must be a non-negative number.", "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { forkTemperature: parsed });
+}
+
+async function editSelfSpeculationString(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+	field: "draftFormat" | "draftBoundary" | "forkDecoder" | "forkForcedPrefix" | "apiKeyEnv",
+	title: string,
+	allowEmpty: boolean,
+): Promise<void> {
+	const current = settings.selfSpeculation[field] ?? "";
+	const value = await ctx.ui.input(title, current);
+	if (value === undefined) return;
+	const normalized = value.trim();
+	if (!allowEmpty && !normalized) {
+		ctx.ui.notify(`${title} cannot be empty.`, "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { [field]: normalized || undefined });
 }
 
 async function editPositiveInteger(
@@ -1367,6 +1565,7 @@ function cloneSettings(settings: EffectiveSpeculativeActionSettings): EffectiveS
 	return {
 		...settings,
 		patternAware: { ...settings.patternAware },
+		selfSpeculation: { ...settings.selfSpeculation },
 		tools: [...settings.tools],
 	};
 }
@@ -1384,6 +1583,12 @@ function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 		.filter((source): source is string => source !== undefined)
 		.join(" + ");
 	return sources || "No source enabled";
+}
+
+function selfSpeculationSummary(settings: SelfSpeculationSettings): string {
+	return settings.enabled
+		? `On, ${settings.forkTransport}, ${settings.maxCandidates}×${settings.maxDraftTokens}`
+		: "Off";
 }
 
 function activeModelReference(ctx: ExtensionContext): string {

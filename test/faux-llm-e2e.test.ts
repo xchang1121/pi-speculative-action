@@ -352,6 +352,7 @@ describe("faux LLM speculative action end to end", () => {
 		});
 		expect(result.summary).toMatchObject({
 			actorActions: 2,
+			predictionsSettled: 2,
 			speculativeHits: 1,
 			actorFallbacks: 1,
 			candidateTerminalCauses: { "admission:scheduler_preempted": 1 },

@@ -68,6 +68,29 @@ export interface SpeculativeCandidate {
 	readonly planDependencies?: PlanAction["dependsOn"];
 }
 
+/** A validated, concrete prediction suitable for a target-model draft verifier. */
+export interface MaterializedSpeculativeCandidate<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	/** Absolute Actor decision that this prediction is expected to match. */
+	readonly expectedDecisionSequence: number;
+	/** Last Actor decision for which the prediction may still be considered. */
+	readonly latestDecisionSequence: number;
+	readonly source: string;
+	readonly proposalID: string;
+	readonly actionID: string;
+	readonly tool: string;
+	/** Producer-facing arguments, before K(a) canonicalization or execution projection. */
+	readonly input: Readonly<Record<string, unknown>>;
+	readonly action: ActionKey;
+	readonly depth?: number;
+	readonly horizon?: number;
+	readonly conditionalProbability?: number;
+	readonly empiricalProbability?: number;
+	readonly expectedLatencyBenefitMs?: number;
+	readonly expectedDurationMs?: number;
+}
+
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
 export type AdoptedAction = Pick<SpeculativeCandidate, "key" | "input">;
 
@@ -220,6 +243,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => string | undefined;
 	readonly onTurnStarted?: (input: {
 		readonly startInput: StartInput;
+		readonly decisionSequence: number;
 		readonly settings: SpeculativeActionSettings;
 		readonly definitions: readonly DrafterToolDefinition[];
 		readonly candidateNames: readonly string[];
@@ -231,6 +255,8 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly terminal: boolean;
 		readonly durationMs: number;
 	}) => MaybePromise<void>;
+	/** Best-effort side channel; failures cannot affect candidate admission or Actor behavior. */
+	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => MaybePromise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
 }
 

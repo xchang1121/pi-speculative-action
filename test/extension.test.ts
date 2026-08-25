@@ -33,6 +33,7 @@ import {
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
+import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
 import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
 
 const roots: string[] = [];
@@ -80,6 +81,22 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "cached" }]);
 		expect(fixture.host.consume).toHaveBeenCalledOnce();
 		expect(fixture.host.actual).not.toHaveBeenCalled();
+	});
+
+	it("keeps the inference bridge inactive when the package-level switch is off", async () => {
+		const fixture = await createFixture({
+			settings: {
+				...effectiveSettings(),
+				enabled: false,
+				selfSpeculation: { ...SELF_SPECULATION_DEFAULTS, enabled: true },
+			},
+		});
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("context", { messages: [] }, fixture.context);
+		const decorate = fixture.handlers.get("before_provider_request")?.[0];
+		const payload = { model: "actor" };
+
+		expect(await decorate?.({ payload } as never, fixture.context)).toBe(payload);
 	});
 
 	it("previews the streamed tool before its complete call without claiming either", async () => {
@@ -311,6 +328,7 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Speculative action")).toEqual(
 			expect.arrayContaining([
 				expect.stringMatching(/^Prediction sources/),
+				expect.stringMatching(/^Target decoding/),
 				expect.stringMatching(/^Scheduling & cache/),
 				expect.stringMatching(/^Tools & execution/),
 			]),
@@ -356,6 +374,7 @@ describe("zero-modification Pi extension", () => {
 interface FixtureOptions {
 	readonly consume?: SpeculativeActionHost["consume"];
 	readonly overriddenTools?: readonly string[];
+	readonly settings?: SpeculativeActionPackageSettings;
 }
 
 async function createFixture(options: FixtureOptions = {}) {
@@ -419,7 +438,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		signal: undefined,
 		thinkingLevel: "off",
 	} as unknown as ExtensionContext;
-	const store = memorySettingsStore();
+	const store = memorySettingsStore(options.settings);
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -480,8 +499,8 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 	};
 }
 
-function memorySettingsStore(): SpeculativeSettingsStore {
-	let value: SpeculativeActionPackageSettings | undefined = { enabled: false };
+function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabled: false }): SpeculativeSettingsStore {
+	let value: SpeculativeActionPackageSettings | undefined = initial;
 	let scope: "global" | "project" = "global";
 	return {
 		get scope() {
@@ -549,6 +568,7 @@ function effectiveSettings() {
 			maxPatterns: 100,
 			minBindingReplayProbability: 0.8,
 		},
+		selfSpeculation: { ...SELF_SPECULATION_DEFAULTS },
 		tools: ["read", "write", "edit", "bash"],
 	};
 }
