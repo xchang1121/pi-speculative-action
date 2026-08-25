@@ -4,6 +4,22 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
+Analyze a private `pi-llm-tape` recording without replaying or exposing its
+prompts. Actor and Drafter requests are paired only when their complete message
+contexts match; tool name and all parsed arguments must match exactly:
+
+```sh
+npm run bench:tape -- \
+  --tape /private/path/deepseek.json \
+  --actor-model deepseek-v4-pro \
+  --drafter-model deepseek-v4-flash
+```
+
+The report distinguishes raw and unique K(a), duplicate Drafter work, exact
+hits, candidates ready before Actor completion, decode lead, and aggregate
+Drafter service time. Recordings remain private and are never copied into the
+repository.
+
 The checked-in suites select real GitHub issue-resolution tasks from
 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench).
 The runner fetches only the selected base commit into a bare cache, creates a
