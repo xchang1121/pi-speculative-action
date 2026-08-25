@@ -21,6 +21,7 @@
 
 ### Added
 
+- Added a model-scoped net-benefit gate for sidecar forks with bounded recovery probes, endpoint-failure backoff, strict Actor K(a) outcome telemetry, and tape replay analysis.
 - Added an opt-in SPORK/self-speculation bridge with stable Actor request IDs, provider and sidecar fork transports, bounded control requests, configurable model-format boundaries, and package/TUI settings.
 - Added one ranked target-decoder bundle for every validated concrete K(a), merging identical Drafter and PatternAware predictions with source/proposal provenance even when local execution is unavailable.
 - Added non-mutating PatternAware prediction rebasing after authoritative Actor actions and adopted Drafter results, allowing actual tool outputs to revise later same-turn actions before the normal learning boundary.
@@ -45,6 +46,7 @@
 
 ### Changed
 
+- Raised the default target-decoder action draft cap from 20 to the tape-derived Pareto saturation point of 28 tokens; explicit user and engine caps still win.
 - PatternAware now carries an unchanged K(a)/horizon set across the provider-turn boundary instead of issuing a duplicate prediction opportunity; changed authoritative feedback still emits a fresh candidate set for normal runtime arbitration.
 - Detached the repository from its former GitHub fork network while preserving the standalone speculative-action history; `xchang1121/pi` is now an independent repository.
 - The Pi package manifest now loads `src/extension.ts` directly, so Git installation works without monorepo build artifacts; npm packing still builds the exported `dist` library.

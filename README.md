@@ -89,7 +89,7 @@ Example:
     "forkGateProbeInterval": 4,
     "forkGateFailureThreshold": 2,
     "maxCandidates": 8,
-    "maxDraftTokens": 20,
+    "maxDraftTokens": 28,
     "draftFormat": "tagged_json",
     "draftBoundary": "<tool_call>",
     "forkMaxTokens": 128,
@@ -118,6 +118,8 @@ There are two fork transports:
 - `provider` places a versioned `self_speculation` control object directly in both Actor and, when `drafterEnabled` is true, Drafter provider payloads. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
 
 For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact Actor lead - fork latency`. It allows four warm-up observations by default, suppresses a persistently negative fork, and still sends one bounded probe every four skipped decisions so a changed workload can recover. Two consecutive endpoint failures use the same probe circuit. All thresholds are configurable above; disabling `forkGateEnabled` restores unconditional forks. The same `fork_gate` policy is included as a provider/SPORK hint, but a provider transport must enforce that hint itself.
+
+The default D3 cap is 28 draft tokens. In the strict DeepSeek-tokenizer tape replay, raising the former cap of 20 to 28 added 12 accepted tokens, no rejected tokens, and 10 saved target-step proxies; 32 added nothing further. This remains configurable and is bounded again by the inference engine.
 
 The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format/boundary, fork decoder/prefix, temperature, and logprob requirement. The boundary, formatter, decoder, and target tokenizer must describe the same model format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
 

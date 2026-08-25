@@ -79,7 +79,7 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	clearPath: "/self-speculation/clear",
 	timeoutMs: 2_000,
 	maxCandidates: 8,
-	maxDraftTokens: 20,
+	maxDraftTokens: 28,
 	draftFormat: "tagged_json",
 	draftBoundary: "<tool_call>",
 	forkEnabled: true,

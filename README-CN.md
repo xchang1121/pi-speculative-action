@@ -89,7 +89,7 @@ pi install https://github.com/xchang1121/pi
     "forkGateProbeInterval": 4,
     "forkGateFailureThreshold": 2,
     "maxCandidates": 8,
-    "maxDraftTokens": 20,
+    "maxDraftTokens": 28,
     "draftFormat": "tagged_json",
     "draftBoundary": "<tool_call>",
     "forkMaxTokens": 128,
@@ -118,6 +118,8 @@ fork 有两种传输方式：
 - `provider`：把版本化的 `self_speculation` 控制对象直接放进 Actor 请求；`drafterEnabled` 打开时也放进每个 Drafter 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
 
 在 `sidecar` 模式下，按模型隔离的 fork 门控会滚动学习 `Actor 精确命中的领先时间 - fork 延迟`。默认先放行 4 个样本；持续负收益时暂停请求，但每跳过 4 次仍做一次有界探测，使工作负载改变后可以恢复。连续 2 次 endpoint 失败也进入同一探测回路。上述阈值都可配置；关闭 `forkGateEnabled` 即恢复无条件 fork。同一份 `fork_gate` 策略也会作为 provider/SPORK 提示发送，但 provider 传输需要由推理服务自行执行该策略。
+
+D3 默认上限为 28 个 draft token。严格 DeepSeek tokenizer tape 回放中，相比旧上限 20，28 多提交的 12 个 token 全部被接受、没有增加拒绝 token，并额外减少 10 个 target-step 代理；升到 32 不再增加收益。该值仍可配置，并会再次受推理引擎硬上限约束。
 
 JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、tool-call 格式与边界、fork decoder/prefix、温度及 logprob 要求。边界、formatter、decoder 和目标 tokenizer 必须属于同一种模型格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
 
