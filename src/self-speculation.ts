@@ -112,6 +112,16 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly bufferedCandidates: number;
 	readonly candidateSubmissions: number;
 	readonly forkRequests: number;
+	readonly candidateReceipts: number;
+	readonly forkCompletions: number;
+	readonly forkCandidates: number;
+	readonly forkAgreements: number;
+	readonly forkExactMatches: number;
+	readonly submittedDraftTokens: number;
+	readonly acceptedDraftTokens: number;
+	readonly forkLatencyMs: number;
+	readonly forkLogprobTokens: number;
+	readonly forkMeanLogprob?: number;
 	readonly failures: number;
 	readonly lastError?: string;
 }
@@ -120,6 +130,8 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly settings: () => SelfSpeculationSettings;
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
+	/** Resolve the same exact K(a) identity used by Actor execution. */
+	readonly actionKey?: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
 }
 
 interface TurnState {
@@ -139,6 +151,9 @@ interface TurnState {
 	flushTask?: Promise<void>;
 	forkTask?: Promise<void>;
 	providerPayload?: unknown;
+	readonly actorActionKeys: Set<string>;
+	readonly forkCandidateKeys: Set<string>;
+	readonly matchedForkKeys: Set<string>;
 }
 
 interface CandidateRecord {
@@ -169,6 +184,7 @@ export class SelfSpeculationCoordinator {
 	private readonly settings: () => SelfSpeculationSettings;
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
+	private readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
 	private readonly background = new Set<Promise<void>>();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
@@ -177,6 +193,16 @@ export class SelfSpeculationCoordinator {
 	private candidateSequence = 0;
 	private submissions = 0;
 	private forks = 0;
+	private receipts = 0;
+	private completedForks = 0;
+	private observedForkCandidates = 0;
+	private agreedForkCandidates = 0;
+	private exactForkMatches = 0;
+	private draftTokensSubmitted = 0;
+	private draftTokensAccepted = 0;
+	private totalForkLatencyMs = 0;
+	private totalForkLogprob = 0;
+	private totalForkLogprobTokens = 0;
 	private failureCount = 0;
 	private lastFailure?: string;
 
@@ -184,6 +210,7 @@ export class SelfSpeculationCoordinator {
 		this.settings = options.settings;
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
+		this.actionKey = options.actionKey ?? fallbackActionKey;
 	}
 
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
@@ -214,6 +241,9 @@ export class SelfSpeculationCoordinator {
 			reasoning: "",
 			outputChunks: 0,
 			dirty: candidates.size > 0,
+			actorActionKeys: new Set(),
+			forkCandidateKeys: new Set(),
+			matchedForkKeys: new Set(),
 		};
 	}
 
@@ -348,11 +378,21 @@ export class SelfSpeculationCoordinator {
 			},
 			settings,
 		)
-			.then(() => undefined)
+			.then((receipt) => this.recordReceipt(receipt, state, true))
 			.finally(() => {
 				state.forkTask = undefined;
 			});
 		this.track(state.forkTask);
+	}
+
+	/** Observe the authoritative Actor action regardless of fork completion order. */
+	observeActorAction(tool: string, input: unknown): void {
+		const state = this.active;
+		if (!state || !isRecord(input)) return;
+		const key = this.actionKey(tool, input);
+		if (!key) return;
+		state.actorActionKeys.add(key);
+		this.reconcileForkMatches(state);
 	}
 
 	endTurn(): void {
@@ -399,6 +439,18 @@ export class SelfSpeculationCoordinator {
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
 			candidateSubmissions: this.submissions,
 			forkRequests: this.forks,
+			candidateReceipts: this.receipts,
+			forkCompletions: this.completedForks,
+			forkCandidates: this.observedForkCandidates,
+			forkAgreements: this.agreedForkCandidates,
+			forkExactMatches: this.exactForkMatches,
+			submittedDraftTokens: this.draftTokensSubmitted,
+			acceptedDraftTokens: this.draftTokensAccepted,
+			forkLatencyMs: this.totalForkLatencyMs,
+			forkLogprobTokens: this.totalForkLogprobTokens,
+			...(this.totalForkLogprobTokens > 0
+				? { forkMeanLogprob: this.totalForkLogprob / this.totalForkLogprobTokens }
+				: {}),
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
@@ -424,7 +476,7 @@ export class SelfSpeculationCoordinator {
 			const settings = state.settings;
 			const candidates = rankedCandidates(state.candidates.values()).slice(0, settings.maxCandidates);
 			if (!candidates.length) continue;
-			await this.post(
+			const receipt = await this.post(
 				settings.candidatePath,
 				{
 					version: 1,
@@ -437,7 +489,52 @@ export class SelfSpeculationCoordinator {
 				},
 				settings,
 			);
+			this.recordReceipt(receipt, state, false);
 			this.submissions++;
+		}
+	}
+
+	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
+		if (!isRecord(receipt)) return;
+		this.receipts++;
+		this.draftTokensSubmitted += nonNegativeInteger(receipt.draft_token_count);
+		this.draftTokensAccepted += nonNegativeInteger(receipt.accepted_token_count);
+		if (!fork) return;
+		this.completedForks++;
+		const details = record(receipt.details);
+		const bundle = record(details?.bundle);
+		for (const rawCandidate of array(bundle?.candidates)) {
+			const candidate = record(rawCandidate);
+			if (!candidate) continue;
+			const sources = array(candidate.sources).filter((value): value is string => typeof value === "string");
+			if (!sources.includes("self-speculation")) continue;
+			const call = record(array(candidate.tool_calls)[0]);
+			const tool = nonEmptyString(call?.name);
+			const input = record(call?.arguments);
+			const key = tool && input ? this.actionKey(tool, input) : undefined;
+			if (key && !state.forkCandidateKeys.has(key)) {
+				state.forkCandidateKeys.add(key);
+				this.observedForkCandidates++;
+				if (sources.some((source) => source !== "self-speculation")) this.agreedForkCandidates++;
+			}
+			const forkObservation = record(candidate.fork);
+			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
+			const logprobs = record(forkObservation?.logprobs);
+			const logprobTokens = nonNegativeInteger(logprobs?.token_count);
+			const meanLogprob = finiteNumber(logprobs?.mean);
+			if (logprobTokens > 0 && meanLogprob !== undefined) {
+				this.totalForkLogprob += meanLogprob * logprobTokens;
+				this.totalForkLogprobTokens += logprobTokens;
+			}
+		}
+		this.reconcileForkMatches(state);
+	}
+
+	private reconcileForkMatches(state: TurnState): void {
+		for (const key of state.forkCandidateKeys) {
+			if (!state.actorActionKeys.has(key) || state.matchedForkKeys.has(key)) continue;
+			state.matchedForkKeys.add(key);
+			this.exactForkMatches++;
 		}
 	}
 
@@ -651,4 +748,28 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return isRecord(value) ? value : undefined;
+}
+
+function array(value: unknown): readonly unknown[] {
+	return Array.isArray(value) ? value : [];
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function observedNonNegativeNumber(value: unknown): number {
+	return Math.max(0, finiteNumber(value) ?? 0);
+}
+
+function nonNegativeInteger(value: unknown): number {
+	return Math.floor(observedNonNegativeNumber(value));
+}
+
+function fallbackActionKey(tool: string, input: Readonly<Record<string, unknown>>): string {
+	return JSON.stringify([tool, input]);
 }

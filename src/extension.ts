@@ -23,6 +23,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+	buildPiActionKey,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	UNBOUNDED_ACTION_TOOLS,
@@ -291,6 +292,7 @@ async function installController(
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
+		actionKey: (tool, input) => buildPiActionKey(tool, input, context.cwd)?.key,
 	});
 	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
@@ -454,6 +456,7 @@ async function installController(
 		},
 		execute: async (tool, callID, input, signal, onUpdate, nextContext) => {
 			latestContext = nextContext;
+			selfSpeculation.observeActorAction(tool, input);
 			const definition = baseDefinitions.get(tool);
 			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
 			const turnID = currentTurnID;
@@ -503,7 +506,7 @@ async function installController(
 		},
 		statusText: () => {
 			const bridge = selfSpeculation.snapshot();
-			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles; ${bridge.forkRequests} forks; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens}/${bridge.acceptedDraftTokens} draft tokens submitted/accepted; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);

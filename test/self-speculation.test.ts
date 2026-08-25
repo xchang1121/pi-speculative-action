@@ -92,7 +92,15 @@ describe("self-speculation control plane", () => {
 
 	it("requests one sidecar fork from the first Actor output snapshot", async () => {
 		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, { forkTransport: "sidecar" }, ["actor-request"]);
+		const coordinator = coordinatorFixture(
+			requests,
+			{ forkTransport: "sidecar" },
+			["actor-request"],
+			(request) =>
+				request.path === SELF_SPECULATION_DEFAULTS.forkPath
+					? forkReceipt("write", { path: "out.txt" })
+					: { registered: true, draft_token_count: 8 },
+		);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		expect(coordinator.decorateActorPayload({ model: "actor", prompt: "PROMPT" })).toEqual({
 			model: "actor",
@@ -102,6 +110,7 @@ describe("self-speculation control plane", () => {
 		expect(coordinator.decorateDrafterPayload({ model: "drafter" })).toEqual({ model: "drafter" });
 		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 		coordinator.observeActorOutput(delta("text_delta", "later"));
+		coordinator.observeActorAction("write", { path: "out.txt" });
 		await coordinator.dispose();
 
 		const forks = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath);
@@ -117,7 +126,43 @@ describe("self-speculation control plane", () => {
 			},
 			options: { decoder: "auto", forced_prefix: "<tool_call>" },
 		});
-		expect(coordinator.snapshot().forkRequests).toBe(1);
+		expect(coordinator.snapshot()).toEqual(
+			expect.objectContaining({
+				forkRequests: 1,
+				forkCompletions: 1,
+				forkCandidates: 1,
+				forkAgreements: 1,
+				forkExactMatches: 1,
+				submittedDraftTokens: 12,
+				acceptedDraftTokens: 3,
+				forkLatencyMs: 25,
+				forkLogprobTokens: 2,
+				forkMeanLogprob: -0.3,
+			}),
+		);
+	});
+
+	it("matches a fork that completes after the authoritative Actor action", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar" }),
+			requestID: () => "actor-request",
+			fetch: vi.fn(async (input) => {
+				if (new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath) await gate;
+				return Response.json(forkReceipt("read", { path: "late.txt" }));
+			}),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+		coordinator.observeActorAction("read", { path: "late.txt" });
+		release();
+		await coordinator.dispose();
+
+		expect(coordinator.snapshot().forkExactMatches).toBe(1);
 	});
 
 	it("contains control-plane failures instead of rejecting Actor cleanup", async () => {
@@ -222,19 +267,40 @@ function coordinatorFixture(
 	requests: CapturedRequest[],
 	overrides: Partial<SelfSpeculationSettings>,
 	requestIDs: string[],
+	response?: (request: CapturedRequest) => unknown,
 ): SelfSpeculationCoordinator {
 	const settings = enabledSettings(overrides);
 	return new SelfSpeculationCoordinator({
 		settings: () => settings,
 		requestID: () => requestIDs.shift() ?? "unexpected-request",
 		fetch: vi.fn(async (input, init) => {
-			requests.push({
+			const request = {
 				path: new URL(String(input)).pathname,
 				body: JSON.parse(String(init?.body)) as Record<string, any>,
-			});
-			return Response.json({ ok: true });
+			};
+			requests.push(request);
+			return Response.json(response?.(request) ?? { ok: true });
 		}),
 	});
+}
+
+function forkReceipt(tool: string, input: Record<string, unknown>): Record<string, unknown> {
+	return {
+		registered: true,
+		draft_token_count: 12,
+		accepted_token_count: 3,
+		details: {
+			bundle: {
+				candidates: [
+					{
+						sources: ["drafter", "self-speculation"],
+						tool_calls: [{ name: tool, arguments: input }],
+						fork: { total_ms: 25, logprobs: { token_count: 2, mean: -0.3 } },
+					},
+				],
+			},
+		},
+	};
 }
 
 function enabledSettings(overrides: Partial<SelfSpeculationSettings>): SelfSpeculationSettings {
