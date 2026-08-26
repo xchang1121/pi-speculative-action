@@ -17,8 +17,11 @@ npm run bench:tape -- \
 
 The report distinguishes raw and unique K(a), duplicate Drafter work, exact
 hits, candidates ready before Actor completion, decode lead, and aggregate
-Drafter service time. Recordings remain private and are never copied into the
-repository.
+Drafter service time. It also replays static Drafter request widths 1, 2, 3, and
+8 in request-dispatch order. Width costs are charged once per Actor turn while
+exact coverage remains action-scoped, so a multi-tool Actor response cannot
+artificially multiply Drafter work. Recordings remain private and are never
+copied into the repository.
 
 The checked-in suites select real GitHub issue-resolution tasks from
 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench).

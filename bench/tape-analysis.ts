@@ -96,6 +96,35 @@ export interface TapeReprobeAnalysis {
 	readonly snapshotReprobeRunwayMs: number;
 }
 
+export interface TapeDrafterWidthPoint {
+	readonly width: number;
+	readonly actorTurns: number;
+	readonly opportunities: number;
+	readonly exactHits: number;
+	readonly marginalExactHits: number;
+	readonly hitRate: number;
+	readonly exactReadyBeforeActor: number;
+	readonly earlyHitRate: number;
+	readonly drafterRequests: number;
+	readonly requestReductionFromAvailable: number;
+	readonly drafterServiceMs: number;
+	readonly serviceReductionFromAvailable: number;
+	readonly drafterCompletionSpanMs: number;
+	readonly candidateCount: number;
+	readonly uniqueCandidateCount: number;
+	readonly duplicateCandidateCount: number;
+	readonly uniqueYield: number;
+	readonly exactLeadMs: number;
+}
+
+export interface TapeDrafterWidthAnalysis {
+	readonly actorTurns: number;
+	readonly opportunities: number;
+	readonly availableDrafterRequests: number;
+	readonly availableDrafterServiceMs: number;
+	readonly points: readonly TapeDrafterWidthPoint[];
+}
+
 interface ParsedExchange {
 	readonly sequence: number;
 	readonly model: string;
@@ -263,6 +292,109 @@ export function analyzeTapeReprobe(
 		snapshotReprobeTurns,
 		snapshotReprobeActionTurns,
 		snapshotReprobeRunwayMs,
+	};
+}
+
+/**
+ * Replay a static Drafter request cap in dispatch order.
+ *
+ * Request/service costs are charged once per Actor turn, even when the Actor
+ * emits multiple tool calls. Exact coverage remains action-scoped.
+ */
+export function analyzeTapeDrafterWidth(
+	tape: LlmTape,
+	actorModel: string,
+	drafterModel: string,
+	widths: readonly number[],
+): TapeDrafterWidthAnalysis {
+	const selectedWidths = [...new Set(widths.filter((width) => Number.isSafeInteger(width) && width > 0))].sort(
+		(left, right) => left - right,
+	);
+	if (!selectedWidths.length) throw new Error("At least one positive integer Drafter width is required");
+
+	const { parsed } = parseTape(tape);
+	const draftersByContext = groupBy(
+		parsed.filter((exchange) => exchange.model === drafterModel),
+		(exchange) => exchange.contextKey,
+	);
+	const turns = parsed
+		.filter((exchange) => exchange.model === actorModel && exchange.calls.length > 0)
+		.flatMap((actor) => {
+			const drafters = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
+				(left, right) => left.sequence - right.sequence,
+			);
+			return drafters.length ? [{ actor, drafters }] : [];
+		});
+	const availableDrafterRequests = sum(turns, ({ drafters }) => drafters.length);
+	const availableDrafterServiceMs = sum(turns, ({ drafters }) =>
+		sum(drafters, (exchange) => exchange.endedAtMs),
+	);
+	const actionOpportunities = sum(turns, ({ actor }) => actor.calls.length);
+	let previousExactHits = 0;
+	const points = selectedWidths.map((width): TapeDrafterWidthPoint => {
+		let exactHits = 0;
+		let exactReadyBeforeActor = 0;
+		let drafterRequests = 0;
+		let drafterServiceMs = 0;
+		let drafterCompletionSpanMs = 0;
+		let candidateCount = 0;
+		let uniqueCandidateCount = 0;
+		let exactLeadMs = 0;
+		for (const { actor, drafters } of turns) {
+			const selected = drafters.slice(0, width);
+			const candidates = selected.flatMap((exchange) => exchange.calls);
+			const identities = new Set(candidates.map(actionIdentity));
+			drafterRequests += selected.length;
+			drafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
+			drafterCompletionSpanMs += Math.max(...selected.map((exchange) => exchange.endedAtMs));
+			candidateCount += candidates.length;
+			uniqueCandidateCount += identities.size;
+			for (const actual of actor.calls) {
+				const actualIdentity = actionIdentity(actual);
+				if (!identities.has(actualIdentity)) continue;
+				exactHits++;
+				const exactReadyMs = Math.min(
+					...selected
+						.filter((exchange) => exchange.calls.some((candidate) => actionIdentity(candidate) === actualIdentity))
+						.map((exchange) => exchange.endedAtMs),
+				);
+				const leadMs = Math.max(0, actor.endedAtMs - exactReadyMs);
+				if (leadMs > 0) exactReadyBeforeActor++;
+				exactLeadMs += leadMs;
+			}
+		}
+		const point = {
+			width,
+			actorTurns: turns.length,
+			opportunities: actionOpportunities,
+			exactHits,
+			marginalExactHits: exactHits - previousExactHits,
+			hitRate: ratio(exactHits, actionOpportunities),
+			exactReadyBeforeActor,
+			earlyHitRate: ratio(exactReadyBeforeActor, actionOpportunities),
+			drafterRequests,
+			requestReductionFromAvailable: ratio(availableDrafterRequests - drafterRequests, availableDrafterRequests),
+			drafterServiceMs,
+			serviceReductionFromAvailable: ratio(
+				availableDrafterServiceMs - drafterServiceMs,
+				availableDrafterServiceMs,
+			),
+			drafterCompletionSpanMs,
+			candidateCount,
+			uniqueCandidateCount,
+			duplicateCandidateCount: candidateCount - uniqueCandidateCount,
+			uniqueYield: ratio(uniqueCandidateCount, candidateCount),
+			exactLeadMs,
+		};
+		previousExactHits = exactHits;
+		return point;
+	});
+	return {
+		actorTurns: turns.length,
+		opportunities: actionOpportunities,
+		availableDrafterRequests,
+		availableDrafterServiceMs,
+		points,
 	};
 }
 

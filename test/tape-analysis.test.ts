@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	analyzeTape,
+	analyzeTapeDrafterWidth,
 	analyzeTapeForkGate,
 	analyzeTapeReprobe,
 	type LlmTape,
@@ -121,6 +122,95 @@ describe("LLM tape action analysis", () => {
 			snapshotReprobeRunwayMs: 50,
 		});
 	});
+
+	it("replays Drafter width in dispatch order and charges request costs once per Actor turn", () => {
+		const messages = [{ role: "user", content: "decision" }];
+		const tape: LlmTape = {
+			exchanges: [
+				exchange(0, "actor", messages, 100, [calls(["read", '{"path":"first"}'], ["write", '{"path":"second"}'])]),
+				exchange(1, "draft", messages, 80, [call("read", '{"path":"first"}')]),
+				exchange(2, "draft", messages, 10, [call("write", '{"path":"second"}')]),
+				exchange(3, "draft", messages, 20, [call("read", '{"path":"first"}')]),
+			],
+		};
+
+		const result = analyzeTapeDrafterWidth(tape, "actor", "draft", [3, 1, 2, 2, 0]);
+
+		expect(result).toMatchObject({
+			actorTurns: 1,
+			opportunities: 2,
+			availableDrafterRequests: 3,
+			availableDrafterServiceMs: 110,
+		});
+		expect(result.points).toEqual([
+			{
+				width: 1,
+				actorTurns: 1,
+				opportunities: 2,
+				exactHits: 1,
+				marginalExactHits: 1,
+				hitRate: 0.5,
+				exactReadyBeforeActor: 1,
+				earlyHitRate: 0.5,
+				drafterRequests: 1,
+				requestReductionFromAvailable: 2 / 3,
+				drafterServiceMs: 80,
+				serviceReductionFromAvailable: 30 / 110,
+				drafterCompletionSpanMs: 80,
+				candidateCount: 1,
+				uniqueCandidateCount: 1,
+				duplicateCandidateCount: 0,
+				uniqueYield: 1,
+				exactLeadMs: 20,
+			},
+			{
+				width: 2,
+				actorTurns: 1,
+				opportunities: 2,
+				exactHits: 2,
+				marginalExactHits: 1,
+				hitRate: 1,
+				exactReadyBeforeActor: 2,
+				earlyHitRate: 1,
+				drafterRequests: 2,
+				requestReductionFromAvailable: 1 / 3,
+				drafterServiceMs: 90,
+				serviceReductionFromAvailable: 20 / 110,
+				drafterCompletionSpanMs: 80,
+				candidateCount: 2,
+				uniqueCandidateCount: 2,
+				duplicateCandidateCount: 0,
+				uniqueYield: 1,
+				exactLeadMs: 110,
+			},
+			{
+				width: 3,
+				actorTurns: 1,
+				opportunities: 2,
+				exactHits: 2,
+				marginalExactHits: 0,
+				hitRate: 1,
+				exactReadyBeforeActor: 2,
+				earlyHitRate: 1,
+				drafterRequests: 3,
+				requestReductionFromAvailable: 0,
+				drafterServiceMs: 110,
+				serviceReductionFromAvailable: 0,
+				drafterCompletionSpanMs: 80,
+				candidateCount: 3,
+				uniqueCandidateCount: 2,
+				duplicateCandidateCount: 1,
+				uniqueYield: 2 / 3,
+				exactLeadMs: 170,
+			},
+		]);
+	});
+
+	it("rejects an empty static Drafter width grid", () => {
+		expect(() => analyzeTapeDrafterWidth({ exchanges: [] }, "actor", "draft", [0, -1, 1.5])).toThrow(
+			"At least one positive integer Drafter width is required",
+		);
+	});
 });
 
 type TapeFixtureChunk = string | { readonly atMs: number; readonly data: string };
@@ -156,5 +246,20 @@ function content(value: string): string {
 function call(name: string, argumentsDelta: string): string {
 	return `data: ${JSON.stringify({
 		choices: [{ delta: { tool_calls: [{ index: 0, function: { name, arguments: argumentsDelta } }] } }],
+	})}\n\ndata: [DONE]\n\n`;
+}
+
+function calls(...entries: readonly (readonly [name: string, argumentsDelta: string])[]): string {
+	return `data: ${JSON.stringify({
+		choices: [
+			{
+				delta: {
+					tool_calls: entries.map(([name, argumentsDelta], index) => ({
+						index,
+						function: { name, arguments: argumentsDelta },
+					})),
+				},
+			},
+		],
 	})}\n\ndata: [DONE]\n\n`;
 }
