@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	analyzeTape,
+	analyzeTapeDrafterRace,
 	analyzeTapeDrafterWidth,
 	analyzeTapeForkGate,
 	analyzeTapeReprobe,
@@ -209,6 +210,81 @@ describe("LLM tape action analysis", () => {
 	it("rejects an empty static Drafter width grid", () => {
 		expect(() => analyzeTapeDrafterWidth({ exchanges: [] }, "actor", "draft", [0, -1, 1.5])).toThrow(
 			"At least one positive integer Drafter width is required",
+		);
+	});
+
+	it("races the dispatch-selected Drafters and charges only residual service after a valid winner", () => {
+		const messages = [{ role: "user", content: "decision" }];
+		const tape: LlmTape = {
+			exchanges: [
+				exchange(0, "actor", messages, 100, [calls(["read", '{"path":"slow"}'], ["write", '{"path":"fast"}'])]),
+				exchange(1, "draft", messages, 80, [call("read", '{"path":"slow"}')]),
+				exchange(2, "draft", messages, 10, [call("write", '{"path":"fast"}')]),
+				// Faster completion is outside width=2 and must not enter the race.
+				exchange(3, "draft", messages, 1, [call("read", '{"path":"slow"}')]),
+			],
+		};
+
+		expect(analyzeTapeDrafterRace(tape, "actor", "draft", 2)).toEqual({
+			width: 2,
+			actorTurns: 1,
+			opportunities: 2,
+			winnerTurns: 1,
+			noWinnerTurns: 0,
+			selectedDrafterRequests: 2,
+			abortableDrafterRequests: 1,
+			abortableRequestRate: 0.5,
+			fullDrafterServiceMs: 90,
+			racedDrafterServiceMs: 20,
+			residualServiceSavedMs: 70,
+			serviceReduction: 70 / 90,
+			fullCandidateCount: 2,
+			fullUniqueCandidateCount: 2,
+			racedCandidateCount: 1,
+			racedUniqueCandidateCount: 1,
+			fullExactHits: 2,
+			racedExactHits: 1,
+			laterRecoveredExactHits: 1,
+			fullExactReadyBeforeActor: 2,
+			racedExactReadyBeforeActor: 1,
+			fullExactLeadMs: 110,
+			racedExactLeadMs: 90,
+		});
+	});
+
+	it("does not let an empty response win or claim already-completed peers as abortable", () => {
+		const messages = [{ role: "user", content: "decision" }];
+		const result = analyzeTapeDrafterRace(
+			{
+				exchanges: [
+					exchange(0, "actor", messages, 100, [call("read", '{"path":"winner"}')]),
+					exchange(1, "draft", messages, 5, [content("no tool")]),
+					exchange(2, "draft", messages, 20, [call("read", '{"path":"winner"}')]),
+					exchange(3, "draft", messages, 50, [call("read", '{"path":"late"}')]),
+				],
+			},
+			"actor",
+			"draft",
+			3,
+		);
+
+		expect(result).toMatchObject({
+			winnerTurns: 1,
+			abortableDrafterRequests: 1,
+			fullDrafterServiceMs: 75,
+			racedDrafterServiceMs: 45,
+			residualServiceSavedMs: 30,
+			fullCandidateCount: 2,
+			racedCandidateCount: 1,
+			fullExactHits: 1,
+			racedExactHits: 1,
+			laterRecoveredExactHits: 0,
+		});
+	});
+
+	it("rejects an invalid Drafter race width", () => {
+		expect(() => analyzeTapeDrafterRace({ exchanges: [] }, "actor", "draft", 0)).toThrow(
+			"A positive integer Drafter race width is required",
 		);
 	});
 });

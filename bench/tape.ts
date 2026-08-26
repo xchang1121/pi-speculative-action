@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
 import {
 	analyzeTape,
+	analyzeTapeDrafterRace,
 	analyzeTapeDrafterWidth,
 	analyzeTapeForkGate,
 	analyzeTapeReprobe,
@@ -38,6 +39,7 @@ console.log(
 			}),
 			reprobe: analyzeTapeReprobe(tape, values["actor-model"], values["drafter-model"]),
 			drafterWidth: analyzeTapeDrafterWidth(tape, values["actor-model"], values["drafter-model"], [1, 2, 3, 8]),
+			drafterRace: analyzeTapeDrafterRace(tape, values["actor-model"], values["drafter-model"], 2),
 		},
 		undefined,
 		2,

@@ -125,6 +125,32 @@ export interface TapeDrafterWidthAnalysis {
 	readonly points: readonly TapeDrafterWidthPoint[];
 }
 
+export interface TapeDrafterRaceAnalysis {
+	readonly width: number;
+	readonly actorTurns: number;
+	readonly opportunities: number;
+	readonly winnerTurns: number;
+	readonly noWinnerTurns: number;
+	readonly selectedDrafterRequests: number;
+	readonly abortableDrafterRequests: number;
+	readonly abortableRequestRate: number;
+	readonly fullDrafterServiceMs: number;
+	readonly racedDrafterServiceMs: number;
+	readonly residualServiceSavedMs: number;
+	readonly serviceReduction: number;
+	readonly fullCandidateCount: number;
+	readonly fullUniqueCandidateCount: number;
+	readonly racedCandidateCount: number;
+	readonly racedUniqueCandidateCount: number;
+	readonly fullExactHits: number;
+	readonly racedExactHits: number;
+	readonly laterRecoveredExactHits: number;
+	readonly fullExactReadyBeforeActor: number;
+	readonly racedExactReadyBeforeActor: number;
+	readonly fullExactLeadMs: number;
+	readonly racedExactLeadMs: number;
+}
+
 interface ParsedExchange {
 	readonly sequence: number;
 	readonly model: string;
@@ -395,6 +421,132 @@ export function analyzeTapeDrafterWidth(
 		availableDrafterRequests,
 		availableDrafterServiceMs,
 		points,
+	};
+}
+
+/**
+ * Replay a hedged Drafter race at a fixed dispatch width.
+ *
+ * The first completed response containing a decodable K(a) wins. Responses
+ * without a tool call do not cancel peers. All requests are assumed to launch
+ * together, so only service after the winner completes is counterfactually
+ * removable. Candidate and request costs are charged once per Actor turn;
+ * exact coverage remains action-scoped. Each response contributes only its
+ * first K(a), matching the production Drafter source.
+ */
+export function analyzeTapeDrafterRace(
+	tape: LlmTape,
+	actorModel: string,
+	drafterModel: string,
+	width: number,
+): TapeDrafterRaceAnalysis {
+	if (!Number.isSafeInteger(width) || width <= 0) throw new Error("A positive integer Drafter race width is required");
+
+	const { parsed } = parseTape(tape);
+	const draftersByContext = groupBy(
+		parsed.filter((exchange) => exchange.model === drafterModel),
+		(exchange) => exchange.contextKey,
+	);
+	const turns = parsed
+		.filter((exchange) => exchange.model === actorModel && exchange.calls.length > 0)
+		.flatMap((actor) => {
+			const selected = [...(draftersByContext.get(actor.contextKey) ?? [])]
+				.sort((left, right) => left.sequence - right.sequence)
+				.slice(0, width);
+			return selected.length ? [{ actor, selected }] : [];
+		});
+
+	let winnerTurns = 0;
+	let selectedDrafterRequests = 0;
+	let abortableDrafterRequests = 0;
+	let fullDrafterServiceMs = 0;
+	let racedDrafterServiceMs = 0;
+	let fullCandidateCount = 0;
+	let fullUniqueCandidateCount = 0;
+	let racedCandidateCount = 0;
+	let racedUniqueCandidateCount = 0;
+	let fullExactHits = 0;
+	let racedExactHits = 0;
+	let laterRecoveredExactHits = 0;
+	let fullExactReadyBeforeActor = 0;
+	let racedExactReadyBeforeActor = 0;
+	let fullExactLeadMs = 0;
+	let racedExactLeadMs = 0;
+
+	for (const { actor, selected } of turns) {
+		const winner = selected
+			.filter((exchange) => exchange.calls.length > 0)
+			.sort((left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence)[0];
+		const fullCandidates = selected.flatMap((exchange) => exchange.calls.slice(0, 1));
+		const racedCandidates = winner?.calls.slice(0, 1) ?? [];
+		const fullIdentities = new Set(fullCandidates.map(actionIdentity));
+		const racedIdentities = new Set(racedCandidates.map(actionIdentity));
+
+		selectedDrafterRequests += selected.length;
+		fullDrafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
+		fullCandidateCount += fullCandidates.length;
+		fullUniqueCandidateCount += fullIdentities.size;
+		racedCandidateCount += racedCandidates.length;
+		racedUniqueCandidateCount += racedIdentities.size;
+		if (winner) {
+			winnerTurns++;
+			racedDrafterServiceMs += sum(selected, (exchange) => Math.min(exchange.endedAtMs, winner.endedAtMs));
+			abortableDrafterRequests += selected.filter((exchange) => exchange.endedAtMs > winner.endedAtMs).length;
+		} else {
+			racedDrafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
+		}
+
+		for (const actual of actor.calls) {
+			const identity = actionIdentity(actual);
+			const fullHit = fullIdentities.has(identity);
+			const racedHit = racedIdentities.has(identity);
+			if (fullHit) {
+				fullExactHits++;
+				const readyMs = Math.min(
+					...selected
+						.filter((exchange) => exchange.calls[0] && actionIdentity(exchange.calls[0]) === identity)
+						.map((exchange) => exchange.endedAtMs),
+				);
+				const leadMs = Math.max(0, actor.endedAtMs - readyMs);
+				if (leadMs > 0) fullExactReadyBeforeActor++;
+				fullExactLeadMs += leadMs;
+			}
+			if (racedHit && winner) {
+				racedExactHits++;
+				const leadMs = Math.max(0, actor.endedAtMs - winner.endedAtMs);
+				if (leadMs > 0) racedExactReadyBeforeActor++;
+				racedExactLeadMs += leadMs;
+			} else if (fullHit) {
+				laterRecoveredExactHits++;
+			}
+		}
+	}
+
+	const residualServiceSavedMs = fullDrafterServiceMs - racedDrafterServiceMs;
+	return {
+		width,
+		actorTurns: turns.length,
+		opportunities: sum(turns, ({ actor }) => actor.calls.length),
+		winnerTurns,
+		noWinnerTurns: turns.length - winnerTurns,
+		selectedDrafterRequests,
+		abortableDrafterRequests,
+		abortableRequestRate: ratio(abortableDrafterRequests, selectedDrafterRequests),
+		fullDrafterServiceMs,
+		racedDrafterServiceMs,
+		residualServiceSavedMs,
+		serviceReduction: ratio(residualServiceSavedMs, fullDrafterServiceMs),
+		fullCandidateCount,
+		fullUniqueCandidateCount,
+		racedCandidateCount,
+		racedUniqueCandidateCount,
+		fullExactHits,
+		racedExactHits,
+		laterRecoveredExactHits,
+		fullExactReadyBeforeActor,
+		racedExactReadyBeforeActor,
+		fullExactLeadMs,
+		racedExactLeadMs,
 	};
 }
 
