@@ -52,7 +52,8 @@ import type {
 	SpeculativeActionSettings,
 	SpeculativePlanSource,
 } from "./runtime.ts";
-import type { SelfSpeculationSettingsInput } from "./self-speculation.ts";
+import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
+import type { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableStringify } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
@@ -127,6 +128,8 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
+	/** Completed sidecar fork actions enter the same runtime through this bounded handoff. */
+	readonly selfSpeculationActionBridge?: SelfSpeculationActionBridge;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
 	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	/** Optional persistence root for workspace-hashed PatternAware state. */
@@ -281,6 +284,7 @@ export function createSpeculativeActionHost(
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		const drafter = normalizeDrafterRequestSettings(settings);
+		const selfSpeculation = normalizeSelfSpeculationSettings(settings.selfSpeculation);
 		return {
 			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
 			drafterEnabled:
@@ -303,6 +307,11 @@ export function createSpeculativeActionHost(
 						? settings.drafterGateEnabled
 						: DEFAULTS.drafterGateEnabled,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
+				selfSpeculationActionEnabled:
+					selfSpeculation.enabled &&
+					selfSpeculation.forkEnabled &&
+					selfSpeculation.forkActionEnabled &&
+					selfSpeculation.forkTransport === "sidecar",
 			},
 			tools: normalizeSpeculativeToolSelection(settings.tools, actionSemantics.toolNames()),
 		};
@@ -312,6 +321,8 @@ export function createSpeculativeActionHost(
 	const sourceDrafterSettings = (settings: SpeculativeActionSettings) =>
 		normalizeDrafterRequestSettings(settings.sourceConfig);
 	const drafterModelKey = (model: Model<Api>): string => JSON.stringify([model.provider, model.api, model.id]);
+	const selfSpeculationActionEnabled = (settings: SpeculativeActionSettings): boolean =>
+		settings.sourceConfig?.selfSpeculationActionEnabled === true;
 	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
 		if (options.patternStore) {
 			return options.patternStore;
@@ -580,6 +591,32 @@ export function createSpeculativeActionHost(
 			};
 		},
 	};
+	const selfSpeculationSource: AgentPlanSource = {
+		id: "self-speculation",
+		enabled: (settings) =>
+			options.selfSpeculationActionBridge !== undefined && selfSpeculationActionEnabled(settings),
+		timeoutMs: (settings) => settings.predictionTimeoutMs,
+		requestLifetime: "actor_decision",
+		propose: async ({ startInput, candidateNames, signal }) => {
+			const candidates =
+				(await options.selfSpeculationActionBridge?.waitForCandidates(startInput.turnID, signal)) ?? [];
+			return candidates
+				.filter((candidate) => candidateNames.includes(candidate.tool))
+				.map((candidate, index) => ({
+					id: `self-speculation:${startInput.turnID}:${index}`,
+					source: "self-speculation",
+					revision: 0,
+					actions: [
+						{
+							id: `${index}:fork`,
+							type: "tool_call" as const,
+							tool: candidate.tool,
+							input: candidate.input,
+						},
+					],
+				}));
+		},
+	};
 	const patternSource: AgentPlanSource = {
 		id: "pattern_aware",
 		enabled: (settings) => sourcePatternSettings(settings).enabled,
@@ -730,7 +767,7 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources: [patternSource, drafterSource],
+		sources: [patternSource, drafterSource, selfSpeculationSource],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),

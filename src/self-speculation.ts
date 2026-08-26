@@ -6,6 +6,7 @@ import {
 	type ForkBenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
 import type { MaterializedSpeculativeCandidate } from "./runtime.ts";
+import type { SelfSpeculationActionBridge, SelfSpeculationActionCandidate } from "./self-speculation-action-bridge.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
@@ -28,6 +29,8 @@ export interface SelfSpeculationSettingsInput {
 	/** Optional environment variable containing a bearer token for the control plane. */
 	readonly apiKeyEnv?: string;
 	readonly forkEnabled?: boolean;
+	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
+	readonly forkActionEnabled?: boolean;
 	readonly forkTransport?: SelfSpeculationForkTransport;
 	readonly forkMaxTokens?: number;
 	readonly forkTemperature?: number;
@@ -59,6 +62,7 @@ export interface SelfSpeculationSettings {
 	readonly draftBoundary: string;
 	readonly apiKeyEnv?: string;
 	readonly forkEnabled: boolean;
+	readonly forkActionEnabled: boolean;
 	readonly forkTransport: SelfSpeculationForkTransport;
 	readonly forkMaxTokens: number;
 	readonly forkTemperature: number;
@@ -87,6 +91,7 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	draftFormat: "tagged_json",
 	draftBoundary: "<tool_call>",
 	forkEnabled: true,
+	forkActionEnabled: true,
 	forkTransport: "provider",
 	forkMaxTokens: 128,
 	forkTemperature: 0,
@@ -128,6 +133,7 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 		draftBoundary: nonEmptyString(input.draftBoundary) ?? SELF_SPECULATION_DEFAULTS.draftBoundary,
 		...(apiKeyEnv ? { apiKeyEnv } : {}),
 		forkEnabled: booleanOr(input.forkEnabled, SELF_SPECULATION_DEFAULTS.forkEnabled),
+		forkActionEnabled: booleanOr(input.forkActionEnabled, SELF_SPECULATION_DEFAULTS.forkActionEnabled),
 		forkTransport: input.forkTransport === "sidecar" ? "sidecar" : "provider",
 		forkMaxTokens: positiveInteger(input.forkMaxTokens, SELF_SPECULATION_DEFAULTS.forkMaxTokens),
 		forkTemperature: nonNegativeNumber(input.forkTemperature, SELF_SPECULATION_DEFAULTS.forkTemperature),
@@ -211,6 +217,7 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly settings: () => SelfSpeculationSettings;
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
+	readonly actionBridge?: SelfSpeculationActionBridge;
 	/** Resolve the same exact K(a) identity used by Actor execution. */
 	readonly actionKey?: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
 }
@@ -274,6 +281,7 @@ export class SelfSpeculationCoordinator {
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
 	private readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
+	private readonly actionBridge?: SelfSpeculationActionBridge;
 	private readonly forkGate = new ForkBenefitGate();
 	private readonly background = new Set<Promise<void>>();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
@@ -311,6 +319,7 @@ export class SelfSpeculationCoordinator {
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
 		this.actionKey = options.actionKey ?? fallbackActionKey;
+		this.actionBridge = options.actionBridge;
 	}
 
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
@@ -351,6 +360,7 @@ export class SelfSpeculationCoordinator {
 			ended: false,
 			gateSampleRecorded: false,
 		};
+		this.actionBridge?.startTurn(turnID);
 		this.latestGateKey = modelKey(model);
 	}
 
@@ -469,6 +479,7 @@ export class SelfSpeculationCoordinator {
 		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 		if (!gateDecision.allowed) {
 			this.forkGateSkips++;
+			this.actionBridge?.publish(state.turnID, []);
 			return;
 		}
 		this.forks++;
@@ -495,6 +506,7 @@ export class SelfSpeculationCoordinator {
 			.catch((error: unknown) => {
 				state.forkFailed = true;
 				state.forkCompletedAt = performance.now();
+				this.actionBridge?.publish(state.turnID, []);
 				this.finalizeGateSample(state);
 				throw error;
 			})
@@ -522,6 +534,7 @@ export class SelfSpeculationCoordinator {
 	/** Clear both the active request and every future-decision candidate. */
 	reset(): void {
 		this.closeActive(false);
+		this.actionBridge?.reset();
 		this.pendingCandidates.clear();
 		this.latestStartedDecisionSequence = 0;
 		this.acceptingCandidates = false;
@@ -532,6 +545,7 @@ export class SelfSpeculationCoordinator {
 		if (state) {
 			state.ended = true;
 			this.finalizeGateSample(state);
+			this.actionBridge?.closeTurn(state.turnID);
 		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
@@ -665,7 +679,10 @@ export class SelfSpeculationCoordinator {
 	}
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
-		if (!isRecord(receipt)) return;
+		if (!isRecord(receipt)) {
+			if (fork) this.actionBridge?.publish(state.turnID, []);
+			return;
+		}
 		this.receipts++;
 		this.draftTokensSubmitted += nonNegativeInteger(receipt.draft_token_count);
 		this.draftTokensAccepted += nonNegativeInteger(receipt.accepted_token_count);
@@ -675,6 +692,7 @@ export class SelfSpeculationCoordinator {
 		}
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
+		const actionCandidates = new Map<string, SelfSpeculationActionCandidate>();
 		for (const rawCandidate of array(bundle?.candidates)) {
 			const candidate = record(rawCandidate);
 			if (!candidate) continue;
@@ -697,6 +715,8 @@ export class SelfSpeculationCoordinator {
 				this.observedForkCandidates++;
 				if (sources.some((source) => source !== "self-speculation")) this.agreedForkCandidates++;
 			}
+			if (key && tool && input && !actionCandidates.has(key))
+				actionCandidates.set(key, { tool, input: structuredClone(input) });
 			const forkObservation = record(candidate.fork);
 			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
@@ -708,6 +728,10 @@ export class SelfSpeculationCoordinator {
 			}
 		}
 		if (!fork) return;
+		this.actionBridge?.publish(
+			state.turnID,
+			state.settings.forkActionEnabled ? [...actionCandidates.values()].slice(0, state.settings.maxCandidates) : [],
+		);
 		this.reconcileForkMatches(state);
 		this.finalizeGateSample(state);
 	}

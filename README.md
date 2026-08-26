@@ -83,6 +83,7 @@ Example:
     "endpoint": "http://127.0.0.1:8010",
     "forkTransport": "sidecar",
     "forkEnabled": true,
+    "forkActionEnabled": true,
     "forkGateEnabled": true,
     "forkGateMinSamples": 4,
     "forkGateWindowSize": 4,
@@ -113,7 +114,7 @@ Example:
 
 ### Target-decoder self-speculation bridge
 
-`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. Every source still enters the existing plan Runtime: self-speculation does not add a second Drafter source or execute a tool. After schema validation and argument materialization, every concrete Drafter or PatternAware `K(a)` is copied to one request-scoped candidate bundle. Identical keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
+`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. After schema validation and argument materialization, every concrete Drafter or PatternAware `K(a)` is copied to one request-scoped candidate bundle. Identical keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
 
 The bridge binds one stable request ID to each Actor decision, submits the ranked bundle for that exact absolute decision sequence to `POST /self-speculation/candidates`, and clears it with `POST /self-speculation/clear` after all pending submissions and forks settle. Predictions for later decisions stay buffered until the matching Actor request starts; an unchanged decision retry inherits its bundle, while older predictions are discarded. Network and decoding failures are best-effort acceleration failures and never replace Actor behavior.
 
@@ -121,7 +122,7 @@ When the target returns a clear-time `verification` object, the coordinator reco
 
 There are two fork transports:
 
-- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
+- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. With `forkActionEnabled`, complete fork tool calls re-enter the ordinary action Runtime as bounded alternatives: they use the same schema validation, K(a) deduplication, execution policy, Scheduler, and Actor settlement as Drafter and PatternAware actions. This handoff sends no additional inference request. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
 - `provider` places a versioned `self_speculation` control object directly in both Actor and, when `drafterEnabled` is true, Drafter provider payloads. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
 
 For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact Actor lead - fork latency`. It allows four warm-up observations by default, suppresses a persistently negative fork, and still sends one bounded probe every four skipped decisions so a changed workload can recover. Two consecutive endpoint failures use the same probe circuit. All thresholds are configurable above; disabling `forkGateEnabled` restores unconditional forks. The same `fork_gate` policy is included as a provider/SPORK hint, but a provider transport must enforce that hint itself.

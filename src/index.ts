@@ -211,6 +211,10 @@ export {
 	type SelfSpeculationVerificationStep,
 } from "./self-speculation.ts";
 export {
+	SelfSpeculationActionBridge,
+	type SelfSpeculationActionCandidate,
+} from "./self-speculation-action-bridge.ts";
+export {
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,

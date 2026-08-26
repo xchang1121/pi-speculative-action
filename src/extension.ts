@@ -47,6 +47,7 @@ import {
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
+import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SelfSpeculationCoordinator,
@@ -193,7 +194,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
+		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
@@ -289,6 +290,7 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
+	const selfSpeculationActions = new SelfSpeculationActionBridge();
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
 			const configured = settings().selfSpeculation;
@@ -296,6 +298,7 @@ async function installController(
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 		actionKey: (tool, input) => buildPiActionKey(tool, input, context.cwd)?.key,
+		actionBridge: selfSpeculationActions,
 	});
 	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
@@ -361,6 +364,7 @@ async function installController(
 			...(piToolSettings.shellCommandPrefix ? [] : [PI_BASH_TAIL_LINES_PROJECTION_RULE]),
 		],
 		executionWorlds,
+		selfSpeculationActionBridge: selfSpeculationActions,
 		patternStateDirectory: getAgentDir(),
 		patternWorkspaceIdentity,
 		onTurnStarted: ({ turnID, actorModel, context: actorContext, decisionSequence }) =>
@@ -863,6 +867,7 @@ async function openSelfSpeculationSettings(
 			`Endpoint: ${self.endpoint}`,
 			`Fork transport: ${self.forkTransport}`,
 			`Actor fork: ${self.forkEnabled ? "On" : "Off"}`,
+			`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`,
 			`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`,
 			`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`,
 			`Gate warm-up: ${self.forkGateMinSamples}`,
@@ -893,6 +898,8 @@ async function openSelfSpeculationSettings(
 		}
 		if (choice.startsWith("Actor fork:"))
 			updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled });
+		if (choice.startsWith("Fork action source:"))
+			updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled });
 		if (choice.startsWith("Drafter fork:"))
 			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
 		if (choice.startsWith("Fork gate:"))
@@ -1645,6 +1652,12 @@ function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 	const sources = [
 		settings.drafterEnabled ? "Drafter" : undefined,
 		settings.patternAware.enabled ? "PatternAware" : undefined,
+		settings.selfSpeculation.enabled &&
+		settings.selfSpeculation.forkTransport === "sidecar" &&
+		settings.selfSpeculation.forkEnabled &&
+		settings.selfSpeculation.forkActionEnabled
+			? "SidecarFork"
+			: undefined,
 	]
 		.filter((source): source is string => source !== undefined)
 		.join(" + ");

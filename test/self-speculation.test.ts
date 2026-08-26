@@ -2,6 +2,7 @@ import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works
 import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
 import type { MaterializedSpeculativeCandidate } from "../src/runtime.ts";
+import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -249,6 +250,65 @@ describe("self-speculation control plane", () => {
 				forkMeanLogprob: -0.3,
 			}),
 		);
+	});
+
+	it("publishes only unique, keyable sidecar fork actions as bounded alternatives", async () => {
+		const actionBridge = new SelfSpeculationActionBridge();
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar", maxCandidates: 2 }),
+			requestID: () => "actor-request",
+			actionBridge,
+			fetch: vi.fn(async (input) =>
+				Response.json(
+					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+						? {
+								details: {
+									bundle: {
+										candidates: [
+											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
+											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
+											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
+											{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
+											{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
+										],
+									},
+								},
+							}
+						: {},
+				),
+			),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+
+		expect(await actions).toEqual([
+			{ tool: "read", input: { path: "a.txt" } },
+			{ tool: "write", input: { path: "b.txt" } },
+		]);
+		await coordinator.dispose();
+	});
+
+	it.each([
+		["disabled", false, forkReceipt("read", { path: "a.txt" })],
+		["malformed", true, null],
+	])("releases action waiters for %s fork output", async (_label, forkActionEnabled, receipt) => {
+		const actionBridge = new SelfSpeculationActionBridge();
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar", forkActionEnabled }),
+			requestID: () => "actor-request",
+			actionBridge,
+			fetch: vi.fn(async (input) =>
+				Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}),
+			),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+		expect(await actions).toEqual([]);
+		await coordinator.dispose();
 	});
 
 	it("matches a fork that completes after the authoritative Actor action", async () => {

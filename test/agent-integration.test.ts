@@ -11,6 +11,12 @@ import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
+import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
+import {
+	normalizeSelfSpeculationSettings,
+	SELF_SPECULATION_DEFAULTS,
+	SelfSpeculationCoordinator,
+} from "../src/self-speculation.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({
@@ -1080,6 +1086,147 @@ describe("speculative action host", () => {
 		expect(completeCalls).toBe(20);
 		expect(draftOptionsCalls).toBe(10);
 		await host.dispose();
+	}, 5_000);
+
+	it("turns one sidecar fork batch into safe action alternatives with real execution ahead", async () => {
+		const cwd = await temporaryWorkspace();
+		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
+		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
+		const events: SpeculativeActionEvent<string>[] = [];
+		const actionBridge = new SelfSpeculationActionBridge();
+		let forkPath = "notes.txt";
+		let actionSourceEnabled = true;
+		const selfSettings = () =>
+			normalizeSelfSpeculationSettings({
+				enabled: true,
+				forkTransport: "sidecar",
+				forkActionEnabled: actionSourceEnabled,
+				forkGateEnabled: false,
+				timeoutMs: 1_000,
+			});
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: selfSettings,
+			requestID: () => "actor-request",
+			actionBridge,
+			fetch: vi.fn(async (input) =>
+				Response.json(
+					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+						? {
+								details: {
+									bundle: {
+										candidates: [
+											{
+												sources: ["self-speculation"],
+												tool_calls: [{ name: "read", arguments: { path: forkPath } }],
+											},
+										],
+									},
+								},
+							}
+						: {},
+				),
+			),
+		});
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => {
+				await new Promise((resolve) => setTimeout(resolve, 80));
+				return { content: [{ type: "text", text: input.path }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({
+				...settings(1),
+				drafterEnabled: false,
+				maxConcurrentActions: 2,
+				selfSpeculation: selfSettings(),
+			}),
+			selfSpeculationActionBridge: actionBridge,
+			complete: async () => assistant([], "stop"),
+			preflight: () => true,
+			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
+				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+		const triggerFork = async (turnID: string) => {
+			await host.startTurn(startInput(tool, turnID));
+			coordinator.decorateActorPayload({ prompt: "P" });
+			coordinator.observeActorOutput({ type: "text_delta", contentIndex: 0, delta: "x", partial: undefined as never });
+		};
+		const finishTurn = async (turnID: string) => {
+			await host.finishTurn(turnID);
+			coordinator.endTurn();
+		};
+
+		await triggerFork("fork-hit");
+		await waitFor(() =>
+			events.some(
+				(event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded",
+			),
+		);
+		coordinator.observeActorAction("read", { path: "notes.txt" });
+		const hit = await host.consume({
+			turnID: "fork-hit",
+			id: "actor-hit",
+			tool: "read",
+			args: { path: "notes.txt" },
+			tools: [tool],
+		});
+		expect(hit?.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
+		await waitFor(() => events.some((event) => event.type === "actor_action" && event.turnID === "fork-hit"));
+		const adopted = events.find((event) => event.type === "actor_action" && event.turnID === "fork-hit");
+		expect(adopted).toMatchObject({ candidate: { source: "self-speculation" } });
+		expect(
+			adopted?.type === "actor_action" && adopted.settlement.provider.kind === "speculative"
+				? adopted.settlement.provider.timing.executionAheadMs
+				: 0,
+		).toBeGreaterThan(50);
+		expect(events.filter((event) => event.type === "source_request" && event.turnID === "fork-hit")).toHaveLength(1);
+		await finishTurn("fork-hit");
+
+		forkPath = "wrong.txt";
+		await triggerFork("fork-miss");
+		await waitFor(() =>
+			events.some(
+				(event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded",
+			),
+		);
+		coordinator.observeActorAction("read", { path: "actor-miss.txt" });
+		expect(
+			await host.consume({
+				turnID: "fork-miss",
+				id: "actor-miss",
+				tool: "read",
+				args: { path: "actor-miss.txt" },
+				tools: [tool],
+			}),
+		).toBeUndefined();
+		await host.actual({
+			turnID: "fork-miss",
+			id: "actor-miss",
+			tool: "read",
+			args: { path: "actor-miss.txt" },
+			tools: [tool],
+			durationMs: 80,
+			output: { result: { content: [{ type: "text", text: "actor-miss.txt" }], details: {} }, isError: false },
+		});
+		await finishTurn("fork-miss");
+
+		actionSourceEnabled = false;
+		forkPath = "notes.txt";
+		await triggerFork("fork-disabled");
+		await waitFor(() => coordinator.snapshot().forkCompletions === 3);
+		expect(events.some((event) => event.type === "source_request" && event.turnID === "fork-disabled")).toBe(false);
+		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-disabled")).toBe(false);
+		await finishTurn("fork-disabled");
+		await host.dispose();
+		await coordinator.dispose();
 	}, 5_000);
 
 	it("does not let an invalid tool call cancel a valid default-width peer", async () => {
