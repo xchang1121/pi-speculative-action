@@ -84,6 +84,7 @@ pi install https://github.com/xchang1121/pi
     "forkTransport": "sidecar",
     "forkEnabled": true,
     "forkActionEnabled": true,
+    "forkActionMinConfidence": 0.9,
     "forkGateEnabled": true,
     "forkGateMinSamples": 4,
     "forkGateWindowSize": 4,
@@ -122,8 +123,10 @@ pi install https://github.com/xchang1121/pi
 
 fork 有两种传输方式：
 
-- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，完整的 fork tool call 会作为一批互斥候选重新进入普通动作 Runtime，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算；这个交接不会新增推理请求。该模式看不到 Drafter 的私有流，因此 Drafter 动作仍进入统一候选包，但不会进行 Drafter 自 fork。
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，完整的 fork tool call 会作为一批互斥候选重新进入普通动作 Runtime，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只有 SPORK 报告的“已选 token 最低 top-1 概率”达到门槛时才提前执行；证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数动作。该门控只影响动作交接，已经运行的 fork 与目标解码遥测保持不变，也不会新增推理请求。该模式看不到 Drafter 的私有流，因此 Drafter 动作仍进入统一候选包，但不会进行 Drafter 自 fork。
 - `provider`：把版本化的 `self_speculation` 控制对象直接放进 Actor 请求；`drafterEnabled` 打开时也放进每个 Drafter 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
+
+使用正数动作置信度门槛与参考 sidecar 时，应把 `requireLogprobs` 设为 `true`；若引擎无法提供证据，fork 会明确失败，而不会静默执行无分数动作。
 
 在 `sidecar` 模式下，按模型隔离的 fork 门控会滚动学习 `Actor 精确命中的领先时间 - fork 延迟`。默认先放行 4 个样本；持续负收益时暂停请求，但每跳过 4 次仍做一次有界探测，使工作负载改变后可以恢复。连续 2 次 endpoint 失败也进入同一探测回路。上述阈值都可配置；关闭 `forkGateEnabled` 即恢复无条件 fork。同一份 `fork_gate` 策略也会作为 provider/SPORK 提示发送，但 provider 传输需要由推理服务自行执行该策略。
 

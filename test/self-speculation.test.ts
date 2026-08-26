@@ -21,6 +21,7 @@ describe("self-speculation control plane", () => {
 				maxCandidates: 0,
 				forkTransport: "sidecar",
 				forkTemperature: -1,
+				forkActionMinConfidence: 2,
 				forkForcedPrefix: "",
 				apiKeyEnv: " TOKEN_ENV ",
 			}),
@@ -31,6 +32,7 @@ describe("self-speculation control plane", () => {
 			forkTransport: "sidecar",
 			apiKeyEnv: "TOKEN_ENV",
 		});
+		expect(normalizeSelfSpeculationSettings({ forkActionMinConfidence: 0 }).forkActionMinConfidence).toBe(0);
 	});
 
 	it("buffers every source, merges the same K(a), and submits one ordered Actor bundle", async () => {
@@ -247,7 +249,7 @@ describe("self-speculation control plane", () => {
 				acceptedDraftTokens: 3,
 				forkLatencyMs: 25,
 				forkLogprobTokens: 2,
-				forkMeanLogprob: -0.3,
+				forkMeanLogprob: -0.03,
 			}),
 		);
 	});
@@ -255,7 +257,8 @@ describe("self-speculation control plane", () => {
 	it("publishes only unique, keyable sidecar fork actions as bounded alternatives", async () => {
 		const actionBridge = new SelfSpeculationActionBridge();
 		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar", maxCandidates: 2 }),
+			settings: () =>
+				enabledSettings({ forkTransport: "sidecar", forkActionMinConfidence: 0, maxCandidates: 2 }),
 			requestID: () => "actor-request",
 			actionBridge,
 			fetch: vi.fn(async (input) =>
@@ -287,6 +290,36 @@ describe("self-speculation control plane", () => {
 			{ tool: "read", input: { path: "a.txt" } },
 			{ tool: "write", input: { path: "b.txt" } },
 		]);
+		await coordinator.dispose();
+	});
+
+	it.each([
+		["exact-boundary", { token_count: 2, mean: Math.log(0.9), minimum: Math.log(0.9) }, true],
+		["next-lower", { token_count: 2, mean: Math.log(0.9), minimum: Math.log(0.8999999999999999) }, false],
+		["missing", { token_count: 2, mean: -0.03 }, false],
+		["malformed", { token_count: 2, mean: -0.03, minimum: "bad" }, false],
+		["positive", { token_count: 2, mean: -0.03, minimum: 0.01 }, false],
+		["infinite", { token_count: 2, mean: -0.03, minimum: Number.POSITIVE_INFINITY }, false],
+	])("applies the fork confidence gate to %s evidence", async (_label, logprobs, admitted) => {
+		const actionBridge = new SelfSpeculationActionBridge();
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar" }),
+			requestID: () => "actor-request",
+			actionBridge,
+			fetch: vi.fn(async (input) =>
+				Response.json(
+					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+						? forkReceipt("read", { path: "not-executed.txt" }, logprobs)
+						: {},
+				),
+			),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+
+		expect(await actions).toEqual(admitted ? [{ tool: "read", input: { path: "not-executed.txt" } }] : []);
 		await coordinator.dispose();
 	});
 
@@ -481,7 +514,11 @@ function coordinatorFixture(
 	});
 }
 
-function forkReceipt(tool: string, input: Record<string, unknown>): Record<string, unknown> {
+function forkReceipt(
+	tool: string,
+	input: Record<string, unknown>,
+	logprobs: unknown = { token_count: 2, mean: -0.03, minimum: Math.log(0.95) },
+): Record<string, unknown> {
 	return {
 		registered: true,
 		draft_token_count: 12,
@@ -492,7 +529,7 @@ function forkReceipt(tool: string, input: Record<string, unknown>): Record<strin
 					{
 						sources: ["drafter", "self-speculation"],
 						tool_calls: [{ name: tool, arguments: input }],
-						fork: { total_ms: 25, logprobs: { token_count: 2, mean: -0.3 } },
+						fork: { total_ms: 25, logprobs },
 					},
 				],
 			},

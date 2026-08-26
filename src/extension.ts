@@ -194,7 +194,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? "On" : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
+		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
@@ -868,6 +868,7 @@ async function openSelfSpeculationSettings(
 			`Fork transport: ${self.forkTransport}`,
 			`Actor fork: ${self.forkEnabled ? "On" : "Off"}`,
 			`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`,
+			`Fork action confidence: ${formatNumber(self.forkActionMinConfidence)}`,
 			`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`,
 			`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`,
 			`Gate warm-up: ${self.forkGateMinSamples}`,
@@ -900,6 +901,14 @@ async function openSelfSpeculationSettings(
 			updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled });
 		if (choice.startsWith("Fork action source:"))
 			updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled });
+		if (choice.startsWith("Fork action confidence:"))
+			await editSelfSpeculationProbability(
+				ctx,
+				controller,
+				settings,
+				"forkActionMinConfidence",
+				"Fork action minimum confidence",
+			);
 		if (choice.startsWith("Drafter fork:"))
 			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
 		if (choice.startsWith("Fork gate:"))
@@ -1242,6 +1251,23 @@ async function editSelfSpeculationNonNegativeNumber(
 	const parsed = Number(value.trim());
 	if (!Number.isFinite(parsed) || parsed < 0) {
 		ctx.ui.notify(`${title} must be a non-negative number.`, "warning");
+		return;
+	}
+	updateSelfSpeculation(controller, settings, { [field]: parsed });
+}
+
+async function editSelfSpeculationProbability(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	settings: EffectiveSpeculativeActionSettings,
+	field: "forkActionMinConfidence",
+	title: string,
+): Promise<void> {
+	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
+	if (value === undefined) return;
+	const parsed = Number(value.trim());
+	if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+		ctx.ui.notify(`${title} must be between 0 and 1.`, "warning");
 		return;
 	}
 	updateSelfSpeculation(controller, settings, { [field]: parsed });

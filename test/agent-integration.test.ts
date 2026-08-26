@@ -1095,6 +1095,7 @@ describe("speculative action host", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const actionBridge = new SelfSpeculationActionBridge();
 		let forkPath = "notes.txt";
+		let forkMinimumLogprob = Math.log(0.95);
 		let actionSourceEnabled = true;
 		const selfSettings = () =>
 			normalizeSelfSpeculationSettings({
@@ -1118,6 +1119,13 @@ describe("speculative action host", () => {
 											{
 												sources: ["self-speculation"],
 												tool_calls: [{ name: "read", arguments: { path: forkPath } }],
+												fork: {
+													logprobs: {
+														token_count: 1,
+														mean: forkMinimumLogprob,
+														minimum: forkMinimumLogprob,
+													},
+												},
 											},
 										],
 									},
@@ -1218,10 +1226,22 @@ describe("speculative action host", () => {
 		});
 		await finishTurn("fork-miss");
 
-		actionSourceEnabled = false;
 		forkPath = "notes.txt";
-		await triggerFork("fork-disabled");
+		forkMinimumLogprob = Math.log(0.8);
+		await triggerFork("fork-low-confidence");
 		await waitFor(() => coordinator.snapshot().forkCompletions === 3);
+		const lowConfidenceRequests = events.filter(
+			(event) => event.type === "source_request" && event.turnID === "fork-low-confidence",
+		);
+		expect(lowConfidenceRequests).toHaveLength(1);
+		expect(lowConfidenceRequests[0]).toMatchObject({ request: { settlement: { status: "empty" } } });
+		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-low-confidence")).toBe(false);
+		await finishTurn("fork-low-confidence");
+
+		actionSourceEnabled = false;
+		forkMinimumLogprob = Math.log(0.95);
+		await triggerFork("fork-disabled");
+		await waitFor(() => coordinator.snapshot().forkCompletions === 4);
 		expect(events.some((event) => event.type === "source_request" && event.turnID === "fork-disabled")).toBe(false);
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-disabled")).toBe(false);
 		await finishTurn("fork-disabled");

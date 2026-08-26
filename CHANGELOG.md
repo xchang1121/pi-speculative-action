@@ -21,6 +21,7 @@
 
 ### Added
 
+- Added a configurable SPORK minimum-token confidence gate for sidecar action execution; the default 0.90 threshold fails closed on missing evidence without suppressing the underlying fork or decoder telemetry.
 - Added a bounded, turn-scoped handoff that admits complete sidecar-fork tool calls to the ordinary speculative-action Runtime without issuing another inference request.
 - Added a batch-atomic action-Drafter utility gate that charges all root proposal service, credits only realized Drafter-owned tool execution ahead, and retains bounded recovery probes; it is independently configurable from target-decoder self-speculation.
 - Added clear-time target-verification telemetry with per-candidate IDs, Drafter/PatternAware source correlation, and separate resolved, accepted, rejected, and unresolved draft-token counters.

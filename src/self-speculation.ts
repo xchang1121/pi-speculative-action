@@ -31,6 +31,8 @@ export interface SelfSpeculationSettingsInput {
 	readonly forkEnabled?: boolean;
 	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
 	readonly forkActionEnabled?: boolean;
+	/** Minimum SPORK selected-token top-1 probability required for action execution. */
+	readonly forkActionMinConfidence?: number;
 	readonly forkTransport?: SelfSpeculationForkTransport;
 	readonly forkMaxTokens?: number;
 	readonly forkTemperature?: number;
@@ -63,6 +65,7 @@ export interface SelfSpeculationSettings {
 	readonly apiKeyEnv?: string;
 	readonly forkEnabled: boolean;
 	readonly forkActionEnabled: boolean;
+	readonly forkActionMinConfidence: number;
 	readonly forkTransport: SelfSpeculationForkTransport;
 	readonly forkMaxTokens: number;
 	readonly forkTemperature: number;
@@ -92,6 +95,7 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	draftBoundary: "<tool_call>",
 	forkEnabled: true,
 	forkActionEnabled: true,
+	forkActionMinConfidence: 0.9,
 	forkTransport: "provider",
 	forkMaxTokens: 128,
 	forkTemperature: 0,
@@ -134,6 +138,10 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 		...(apiKeyEnv ? { apiKeyEnv } : {}),
 		forkEnabled: booleanOr(input.forkEnabled, SELF_SPECULATION_DEFAULTS.forkEnabled),
 		forkActionEnabled: booleanOr(input.forkActionEnabled, SELF_SPECULATION_DEFAULTS.forkActionEnabled),
+		forkActionMinConfidence: probability(
+			input.forkActionMinConfidence,
+			SELF_SPECULATION_DEFAULTS.forkActionMinConfidence,
+		),
 		forkTransport: input.forkTransport === "sidecar" ? "sidecar" : "provider",
 		forkMaxTokens: positiveInteger(input.forkMaxTokens, SELF_SPECULATION_DEFAULTS.forkMaxTokens),
 		forkTemperature: nonNegativeNumber(input.forkTemperature, SELF_SPECULATION_DEFAULTS.forkTemperature),
@@ -715,13 +723,23 @@ export class SelfSpeculationCoordinator {
 				this.observedForkCandidates++;
 				if (sources.some((source) => source !== "self-speculation")) this.agreedForkCandidates++;
 			}
-			if (key && tool && input && !actionCandidates.has(key))
-				actionCandidates.set(key, { tool, input: structuredClone(input) });
 			const forkObservation = record(candidate.fork);
 			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
 			const logprobTokens = nonNegativeInteger(logprobs?.token_count);
 			const meanLogprob = finiteNumber(logprobs?.mean);
+			const minimumLogprob = finiteNumber(logprobs?.minimum);
+			const confidence =
+				minimumLogprob !== undefined && minimumLogprob <= 0 ? Math.exp(minimumLogprob) : undefined;
+			if (
+				key &&
+				tool &&
+				input &&
+				!actionCandidates.has(key) &&
+				(state.settings.forkActionMinConfidence === 0 ||
+					(confidence !== undefined && confidence >= state.settings.forkActionMinConfidence))
+			)
+				actionCandidates.set(key, { tool, input: structuredClone(input) });
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
 				this.totalForkLogprobTokens += logprobTokens;
@@ -1101,6 +1119,10 @@ function positiveInteger(value: unknown, fallback: number): number {
 
 function nonNegativeNumber(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function probability(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
 }
 
 function booleanOr(value: unknown, fallback: boolean): boolean {

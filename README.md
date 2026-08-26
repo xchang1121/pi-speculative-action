@@ -84,6 +84,7 @@ Example:
     "forkTransport": "sidecar",
     "forkEnabled": true,
     "forkActionEnabled": true,
+    "forkActionMinConfidence": 0.9,
     "forkGateEnabled": true,
     "forkGateMinSamples": 4,
     "forkGateWindowSize": 4,
@@ -122,8 +123,10 @@ When the target returns a clear-time `verification` object, the coordinator reco
 
 There are two fork transports:
 
-- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. With `forkActionEnabled`, complete fork tool calls re-enter the ordinary action Runtime as bounded alternatives: they use the same schema validation, K(a) deduplication, execution policy, Scheduler, and Actor settlement as Drafter and PatternAware actions. This handoff sends no additional inference request. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
+- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. This is the portable reference path implemented by the companion `self-speculation` package. With `forkActionEnabled`, complete fork tool calls re-enter the ordinary action Runtime as bounded alternatives: they use the same schema validation, K(a) deduplication, execution policy, Scheduler, and Actor settlement as Drafter and PatternAware actions. The default `forkActionMinConfidence` of `0.9` admits execution only when SPORK reports a selected-token minimum top-1 probability at or above the threshold; missing or malformed evidence fails closed. Set it to `0` to admit unscored actions. This gate changes only action handoff—the already-running fork and target-decoder telemetry remain unchanged—and sends no additional inference request. The extension cannot observe a Drafter's private stream in this mode, so Drafter actions still join the common candidate bundle but Drafter self-forking remains off.
 - `provider` places a versioned `self_speculation` control object directly in both Actor and, when `drafterEnabled` is true, Drafter provider payloads. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
+
+Set `requireLogprobs` to `true` when using a positive action-confidence threshold with the reference sidecar; an engine that cannot provide the evidence then fails the fork explicitly instead of silently executing an unscored action.
 
 For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact Actor lead - fork latency`. It allows four warm-up observations by default, suppresses a persistently negative fork, and still sends one bounded probe every four skipped decisions so a changed workload can recover. Two consecutive endpoint failures use the same probe circuit. All thresholds are configurable above; disabling `forkGateEnabled` restores unconditional forks. The same `fork_gate` policy is included as a provider/SPORK hint, but a provider transport must enforce that hint itself.
 

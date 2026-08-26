@@ -292,8 +292,10 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("states the unified execution boundary without claiming a bundled process sandbox", () => {
+		const settings = effectiveSettings();
+		settings.selfSpeculation = { ...settings.selfSpeculation, enabled: true, forkTransport: "sidecar" };
 		const status = formatSpeculativeActionStatus({
-			settings: effectiveSettings(),
+			settings,
 			metrics: emptyMetrics(),
 		});
 
@@ -303,6 +305,7 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
+		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
@@ -316,8 +319,12 @@ describe("zero-modification Pi extension", () => {
 			if (title === "Speculative action" && visit === 0) {
 				return options.find((option) => option.startsWith("Tools & execution"));
 			}
+			if (title === "Speculative action" && visit === 1) {
+				return options.find((option) => option.startsWith("Target decoding"));
+			}
 			if (title === "Tools & execution" && visit === 0) return "Execution guarantees";
 			if (title === "Tools & execution") return "Back";
+			if (title === "Self-speculation") return "Back";
 			if (title === "Speculative action") return "Close";
 			return undefined;
 		};
@@ -336,6 +343,7 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Tools & execution")).toEqual(
 			expect.arrayContaining([expect.stringMatching(/^Tool policy/), "Execution guarantees"]),
 		);
+		expect(menus.get("Self-speculation")).toEqual(expect.arrayContaining(["Fork action confidence: 0.9"]));
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("runtime-wide sandbox"), "info");
 	});
 
