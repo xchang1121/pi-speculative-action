@@ -23,6 +23,7 @@ import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {
 	it("normalizes configured request counts without hidden upper bounds", () => {
+		expect(DEFAULTS.candidateLimit).toBe(2);
 		expect(clampCandidateLimit(0)).toBe(1);
 		expect(clampCandidateLimit(4.9)).toBe(4);
 		expect(clampCandidateLimit(100)).toBe(100);

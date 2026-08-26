@@ -38,7 +38,7 @@ export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
 	...DRAFTER_DEFAULTS,
-	candidateLimit: 8,
+	candidateLimit: 2,
 	maxConcurrentActions: 8,
 	resourceCacheMaxEntries: 512,
 	resourceCacheMaxBytes: 256 * 1024 * 1024,

@@ -69,7 +69,7 @@ Example:
 {
   "enabled": true,
   "draftModel": "deepseek/deepseek-chat",
-  "candidateLimit": 8,
+  "candidateLimit": 2,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
@@ -101,6 +101,8 @@ Example:
   }
 }
 ```
+
+`candidateLimit` defaults to two independent one-action Drafter requests per Actor decision. In the strict tape replay, two retained all 6 available exact hits and their complete lead while removing 30% of recorded requests and 35.2% of summed Drafter service time versus all recorded requests. It remains configurable without a hidden upper bound for models that produce useful wider samples.
 
 `drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
 

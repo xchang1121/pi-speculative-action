@@ -69,7 +69,7 @@ pi install https://github.com/xchang1121/pi
 {
   "enabled": true,
   "draftModel": "deepseek/deepseek-chat",
-  "candidateLimit": 8,
+  "candidateLimit": 2,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
@@ -101,6 +101,8 @@ pi install https://github.com/xchang1121/pi
   }
 }
 ```
+
+`candidateLimit` 默认在每次 Actor 决策发出两个独立的单动作 Drafter 请求。严格 tape 回放中，宽度 2 保留了全部 6 个可用精确命中及其完整提前量；相对录制中的全部请求，请求数减少 30%，Drafter 服务时间总和减少 35.2%。该值没有隐藏上限，能产生有效宽样本的模型仍可显式调高。
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 

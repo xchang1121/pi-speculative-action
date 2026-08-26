@@ -47,6 +47,7 @@
 
 ### Changed
 
+- Reduced the default independent Drafter request width from eight to the tape-derived Pareto point of two; explicit `candidateLimit` settings remain uncapped, while the retained width preserves all recorded exact hits and lead with 30% fewer requests than the full recorded cohort.
 - Raised the default target-decoder action draft cap from 20 to the tape-derived Pareto saturation point of 28 tokens; explicit user and engine caps still win.
 - PatternAware now carries an unchanged K(a)/horizon set across the provider-turn boundary instead of issuing a duplicate prediction opportunity; changed authoritative feedback still emits a fresh candidate set for normal runtime arbitration.
 - Detached the repository from its former GitHub fork network while preserving the standalone speculative-action history; `xchang1121/pi` is now an independent repository.
