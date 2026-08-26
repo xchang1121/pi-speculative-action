@@ -925,6 +925,114 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
+	it("cancels the slower default-width Drafter after the first valid tool call", async () => {
+		const cwd = await temporaryWorkspace();
+		const events: SpeculativeActionEvent<string>[] = [];
+		const requestSignals: AbortSignal[] = [];
+		let loserAborted = false;
+		const complete: CreateComplete = async (_model, _context, requestOptions) => {
+			const signal = requestOptions?.signal;
+			if (!signal) throw new Error("Drafter request must receive an AbortSignal");
+			const index = requestSignals.push(signal) - 1;
+			if (index === 0) {
+				await Promise.resolve();
+				return drafterCall({ path: "notes.txt" });
+			}
+			return new Promise<AssistantMessage>((resolve) => {
+				signal.addEventListener(
+					"abort",
+					() => {
+						loserAborted = true;
+						resolve(assistant([], "aborted"));
+					},
+					{ once: true },
+				);
+			});
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => ({ content: [{ type: "text", text: input.path }], details: {} }),
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(2), drafterMaxDepth: 0 }),
+			draftModel: model("draft"),
+			complete,
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => requestSignals.length === 2);
+		await waitFor(() => events.filter((event) => event.type === "source_request").length === 2);
+		await waitFor(() => host.runtime.inspect("session").sharedCandidates === 1);
+
+		expect(loserAborted).toBe(true);
+		expect(requestSignals[1]?.aborted).toBe(true);
+		expect(
+			events
+				.filter((event) => event.type === "source_request")
+				.map((event) => event.request.settlement.status),
+		).toEqual(expect.arrayContaining(["produced", "aborted"]));
+		await host.dispose();
+	});
+
+	it("does not let an invalid tool call cancel a valid default-width peer", async () => {
+		const cwd = await temporaryWorkspace();
+		const events: SpeculativeActionEvent<string>[] = [];
+		const requestSignals: AbortSignal[] = [];
+		let releaseValid!: () => void;
+		const validGate = new Promise<void>((resolve) => {
+			releaseValid = resolve;
+		});
+		const complete: CreateComplete = async (_model, _context, requestOptions) => {
+			const signal = requestOptions?.signal;
+			if (!signal) throw new Error("Drafter request must receive an AbortSignal");
+			const index = requestSignals.push(signal) - 1;
+			if (index === 0) return drafterCall({ offset: 1 });
+			await validGate;
+			return drafterCall({ path: "notes.txt" });
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => ({ content: [{ type: "text", text: input.path }], details: {} }),
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(2), drafterMaxDepth: 0 }),
+			draftModel: model("draft"),
+			complete,
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		await host.startTurn(startInput(tool));
+		await waitFor(() => requestSignals.length === 2);
+		await waitFor(() => events.filter((event) => event.type === "source_request").length === 1);
+		expect(events.find((event) => event.type === "source_request")?.request.settlement.status).toBe("empty");
+		expect(requestSignals[1]?.aborted).toBe(false);
+
+		releaseValid();
+		await waitFor(() => events.filter((event) => event.type === "source_request").length === 2);
+		await waitFor(() => host.runtime.inspect("session").sharedCandidates === 1);
+		expect(
+			events
+				.filter((event) => event.type === "source_request")
+				.map((event) => event.request.settlement.status),
+		).toEqual(expect.arrayContaining(["empty", "produced"]));
+		await host.dispose();
+	});
+
 	it("lets output-informed Drafter branches terminate without forcing another tool", async () => {
 		const cwd = await temporaryWorkspace();
 		const requests: Array<Parameters<CreateComplete>[2]> = [];

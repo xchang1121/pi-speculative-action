@@ -441,8 +441,12 @@ export function createSpeculativeActionHost(
 		},
 		continueOn: ["execution_succeeded"],
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
+		concurrentProposalPolicy: (settings) =>
+			clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit) === 2 ? "first_produced" : "all",
 		propose: async ({
 			startInput: input,
+			data,
+			candidateNames,
 			proposalIndex,
 			proposalCount,
 			signal,
@@ -493,6 +497,13 @@ export function createSpeculativeActionHost(
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
+			const tool = data.tools.get(call.name);
+			if (
+				!tool ||
+				!candidateNames.includes(call.name) ||
+				validateCandidateArguments(tool, call.name, call.arguments, call.id) === undefined
+			)
+				return undefined;
 			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
 			return {
 				id: proposalID,

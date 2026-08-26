@@ -456,6 +456,66 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
+	it("cancels outstanding initial proposal siblings only after the first produced result", async () => {
+		let releaseWinner!: () => void;
+		const winnerGate = new Promise<void>((resolve) => {
+			releaseWinner = resolve;
+		});
+		const entered: number[] = [];
+		const aborted: number[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			proposalCount: () => 3,
+			concurrentProposalPolicy: () => "first_produced",
+			propose: async ({ proposalIndex, signal }) => {
+				entered.push(proposalIndex);
+				if (proposalIndex === 0) return undefined;
+				if (proposalIndex === 1) {
+					await winnerGate;
+					return plan("source", "winner", { path: "README.md" });
+				}
+				return new Promise<undefined>((resolve) => {
+					signal.addEventListener(
+						"abort",
+						() => {
+							aborted.push(proposalIndex);
+							resolve(undefined);
+						},
+						{ once: true },
+					);
+				});
+			},
+		};
+		const fixture = harness({ source });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => entered.length === 3);
+		releaseWinner();
+		await waitFor(() => fixture.events.filter((event) => event.type === "source_request").length === 3);
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+
+		expect(aborted).toEqual([2]);
+		expect(
+			fixture.events
+				.filter((event) => event.type === "source_request")
+				.map((event) => [event.request.request.index, event.request.settlement]),
+		).toEqual(
+			expect.arrayContaining([
+				[0, expect.objectContaining({ status: "empty" })],
+				[1, expect.objectContaining({ status: "produced" })],
+				[
+					2,
+					expect.objectContaining({
+						status: "aborted",
+						cause: expect.objectContaining({ code: "proposal_race_lost" }),
+					}),
+				],
+			]),
+		);
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+	});
+
 	it("does not deduplicate equal K(a) work across different execution routes", async () => {
 		const source: Source = {
 			id: "source",

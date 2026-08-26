@@ -102,7 +102,7 @@ Example:
 }
 ```
 
-`candidateLimit` defaults to two independent one-action Drafter requests per Actor decision. In the strict tape replay, two retained all 6 available exact hits and their complete lead while removing 30% of recorded requests and 35.2% of summed Drafter service time versus all recorded requests. It remains configurable without a hidden upper bound for models that produce useful wider samples.
+`candidateLimit` defaults to two concurrent one-action Drafter requests per Actor decision. At width two they act as a latency hedge: the first response containing a schema-valid enabled `K(a)` is admitted and its still-running peer is canceled through the provider `AbortSignal`; errors, empty responses, and invalid calls do not win. Strict action and target-token replay retained all 6 available exact hits, the complete lead, and identical D3 verifier work, while identifying 7.78% of width-two Drafter service as removable residual work. Widths above two retain every completed sample and remain available without a hidden cap for models that produce useful wider diversity.
 
 `drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
 

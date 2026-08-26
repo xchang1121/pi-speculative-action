@@ -47,6 +47,7 @@
 
 ### Changed
 
+- Width-two Drafter requests now use first-valid hedged admission: the first schema-valid enabled action cancels only still-running initial-proposal siblings through their existing provider signals. Empty, failed, and invalid responses cannot win; explicitly wider sampling still admits all responses. Recorded strict hits, lead, and D3 verifier work are unchanged while 7.78% of width-two service is removable residual work.
 - Reduced the default independent Drafter request width from eight to the tape-derived Pareto point of two; explicit `candidateLimit` settings remain uncapped, while the retained width preserves all recorded exact hits and lead with 30% fewer requests than the full recorded cohort.
 - Raised the default target-decoder action draft cap from 20 to the tape-derived Pareto saturation point of 28 tokens; explicit user and engine caps still win.
 - PatternAware now carries an unchanged K(a)/horizon set across the provider-turn boundary instead of issuing a duplicate prediction opportunity; changed authoritative feedback still emits a fresh candidate set for normal runtime arbitration.

@@ -116,6 +116,8 @@ export interface SpeculativePlanSource<
 	readonly requestLifetime?: "actor_decision" | "turn";
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings, feedback?: unknown) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
+	/** Admission policy for concurrent initial proposals targeting one Actor decision. */
+	readonly concurrentProposalPolicy?: (settings: SpeculativeActionSettings) => "all" | "first_produced";
 	readonly propose: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;

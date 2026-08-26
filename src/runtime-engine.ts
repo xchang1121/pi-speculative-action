@@ -40,6 +40,7 @@ import type {
 	ResolutionCause,
 	ResourceValidation,
 	SettledSourceRequest,
+	SourceRequestKind,
 } from "./settlement.ts";
 import { cause, zeroValidationMetrics } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
@@ -542,6 +543,7 @@ interface PlanActionContext<StartInput, StateData> {
 interface SourceRequestSlot {
 	readonly source: string;
 	readonly targetDecisionSequence: number;
+	readonly requestKind: SourceRequestKind;
 	readonly expiresAtTarget: boolean;
 	readonly generations: Set<SourceGeneration>;
 	readonly owners: Set<string>;
@@ -832,6 +834,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		source: string,
 		targetDecisionSequence: number,
 		limit: number,
+		requestKind: SourceRequestKind,
 		expiresAtTarget = true,
 	): SourceRequestSlot | undefined => {
 		const used = [...session.sourceSlots].filter(
@@ -841,6 +844,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const slot: SourceRequestSlot = {
 			source,
 			targetDecisionSequence,
+			requestKind,
 			expiresAtTarget,
 			generations: new Set(),
 			owners: new Set(),
@@ -872,6 +876,20 @@ export function makeStructuralSpeculativeActionRuntime<
 	const releaseSourceRequest = (session: Session, slot: SourceRequestSlot): void => {
 		slot.pendingRequests = Math.max(0, slot.pendingRequests - 1);
 		releaseUnusedSourceSlot(session, slot);
+	};
+
+	const cancelCompetingProposals = (session: Session, winner: SourceRequestSlot): void => {
+		for (const slot of [...session.sourceSlots]) {
+			if (
+				slot === winner ||
+				!slot.active ||
+				slot.requestKind !== "proposal" ||
+				slot.source !== winner.source ||
+				slot.targetDecisionSequence !== winner.targetDecisionSequence
+			)
+				continue;
+			releaseSourceSlot(session, slot, cause("source", "proposal_race_lost"));
+		}
 	};
 
 	const expireSourceHorizon = (session: Session, decisionSequence: number, failure: ResolutionCause): void => {
@@ -911,6 +929,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					source.id,
 					targetDecisionSequence,
 					count,
+					"proposal",
 					source.requestLifetime === "actor_decision",
 				);
 				if (!slot) break;
@@ -973,6 +992,16 @@ export function makeStructuralSpeculativeActionRuntime<
 		const session = scope.session;
 		session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
 		try {
+			if (
+				request.request.kind === "proposal" &&
+				request.settlement.status === "produced" &&
+				request.value !== undefined &&
+				slot.active &&
+				!scope.signal.aborted &&
+				source.concurrentProposalPolicy?.(scope.settings) === "first_produced"
+			) {
+				cancelCompetingProposals(session, slot);
+			}
 			queueSourceRequestEvent(session, turnID, scope.settings, request);
 			if (
 				request.settlement.status !== "produced" ||
@@ -2257,7 +2286,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const requestLimit = clampCandidateLimit(source.proposalCount?.(context.settings));
 		const pending = context.continuationTail
 			.then(async () => {
-				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit);
+				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit, "continuation");
 				if (!slot) return;
 				context.continuationSlots.add(slot);
 				retainSourceRequest(slot);
