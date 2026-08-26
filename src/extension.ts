@@ -82,6 +82,7 @@ type BaseToolDefinition =
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
+	readonly drafterGateEnabled: boolean;
 	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens?: number;
 	readonly drafterDeterministicCandidates: number;
@@ -157,6 +158,8 @@ export function normalizeSpeculativeActionSettings(
 	return {
 		enabled: typeof input?.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
 		drafterEnabled: typeof input?.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
+		drafterGateEnabled:
+			typeof input?.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
 		...drafter,
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
@@ -505,8 +508,10 @@ async function installController(
 			}
 		},
 		statusText: () => {
+			const effective = settings();
 			const bridge = selfSpeculation.snapshot();
-			return `${formatSpeculativeActionStatus({ settings: settings(), metrics: currentMetrics })}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			const drafterGate = host.drafterGateSnapshot();
+			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -944,6 +949,7 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Drafter", [
 			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
+			`Action utility gate: ${settings.drafterGateEnabled ? "On" : "Off"}`,
 			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
 			`Rollout depth: ${settings.drafterMaxDepth}`,
 			`Output tokens: ${settings.drafterMaxTokens ?? "provider default"}`,
@@ -955,6 +961,8 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Enabled:"))
 			controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled });
+		if (choice.startsWith("Action utility gate:"))
+			controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled });
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
 		if (choice.startsWith("Rollout depth:")) {
 			await editDrafterNonNegativeInteger(ctx, controller, settings, "drafterMaxDepth", "Drafter rollout depth");

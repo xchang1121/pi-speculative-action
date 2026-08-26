@@ -362,6 +362,7 @@ describe("zero-modification Pi extension", () => {
 
 		expect(menus.get("Drafter")).toEqual(
 			expect.arrayContaining([
+				"Action utility gate: On",
 				"Rollout depth: 1",
 				"Output tokens: provider default",
 				"Deterministic requests: 1",
@@ -495,6 +496,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		consume: vi.fn(consume),
 		actual: vi.fn(),
 		finishTurn: vi.fn(),
+		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),
 		dispose: vi.fn(),
 	};
 }
@@ -545,6 +547,7 @@ function effectiveSettings() {
 	return {
 		enabled: true,
 		drafterEnabled: true,
+		drafterGateEnabled: true,
 		drafterMaxDepth: 1,
 		drafterMaxTokens: 128,
 		drafterDeterministicCandidates: 1,

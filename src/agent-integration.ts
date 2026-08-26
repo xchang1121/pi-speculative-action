@@ -24,6 +24,11 @@ import {
 } from "./common.ts";
 import { ExecutionWorldRouter, type SpeculativeExecutionRoute } from "./execution-world.ts";
 import {
+	DrafterUtilityGate,
+	type DrafterUtilityBatch,
+	type DrafterUtilityGateSnapshot,
+} from "./drafter-utility-gate.ts";
+import {
 	acquirePatternAwareStore,
 	asPatternAwareRuntimeContext,
 	PATTERN_AWARE_DEFAULTS,
@@ -55,6 +60,8 @@ import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
+	/** Adaptively skip a root Drafter batch when its measured action-side utility is negative. */
+	readonly drafterGateEnabled?: boolean;
 	/** Output-informed successor actions retained after the first Drafter action. */
 	readonly drafterMaxDepth?: number;
 	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
@@ -163,8 +170,11 @@ export interface SpeculativeActionHost {
 		input: Omit<AgentConsumeInput, "sessionID"> & { readonly durationMs: number; readonly output?: ToolSettlement },
 	) => Promise<void>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
+	readonly drafterGateSnapshot: () => ActionDrafterGateSnapshot;
 	readonly dispose: () => Promise<void>;
 }
+
+export type ActionDrafterGateSnapshot = DrafterUtilityGateSnapshot;
 
 interface AgentStartInput {
 	readonly sessionID: string;
@@ -233,14 +243,14 @@ export function createSpeculativeActionHost(
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const patternRevisions = new Map<string, number>();
 	const carriedPatternPredictions = new Map<string, string>();
-	const drafterBatches = new Map<
-		string,
-		Promise<{
-			readonly model: Model<Api>;
-			readonly context: Context;
-			readonly options: SimpleStreamOptions;
-		}>
-	>();
+	type DrafterBatch = {
+		readonly model: Model<Api>;
+		readonly context: Context;
+		readonly options: SimpleStreamOptions;
+		readonly utility: DrafterUtilityBatch;
+	};
+	const drafterBatches = new Map<string, Promise<DrafterBatch>>();
+	const drafterGate = new DrafterUtilityGate();
 	let patternAnalysisTail: Promise<void> = Promise.resolve();
 	const queuePatternAnalysis = (analysis: () => void | Promise<void>) => {
 		patternAnalysisTail = patternAnalysisTail
@@ -288,6 +298,10 @@ export function createSpeculativeActionHost(
 			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
 			sourceConfig: {
 				...drafter,
+				drafterGateEnabled:
+					typeof settings.drafterGateEnabled === "boolean"
+						? settings.drafterGateEnabled
+						: DEFAULTS.drafterGateEnabled,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 			},
 			tools: normalizeSpeculativeToolSelection(settings.tools, actionSemantics.toolNames()),
@@ -297,6 +311,7 @@ export function createSpeculativeActionHost(
 		patternAwareSettings(settings.sourceConfig?.patternAware);
 	const sourceDrafterSettings = (settings: SpeculativeActionSettings) =>
 		normalizeDrafterRequestSettings(settings.sourceConfig);
+	const drafterModelKey = (model: Model<Api>): string => JSON.stringify([model.provider, model.api, model.id]);
 	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
 		if (options.patternStore) {
 			return options.patternStore;
@@ -320,6 +335,7 @@ export function createSpeculativeActionHost(
 	};
 	const finishPatternSession = async (): Promise<void> => {
 		drafterBatches.clear();
+		drafterGate.reset();
 		patternRevisions.clear();
 		carriedPatternPredictions.clear();
 		clearAuthoritativeSession(sessionID);
@@ -453,7 +469,7 @@ export function createSpeculativeActionHost(
 			settings,
 		}): Promise<PlanProposal | undefined> => {
 			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
-			const batchKey = JSON.stringify([input.sessionID, input.turnID]);
+			const batchKey = authoritativeBatchKey(input.sessionID, input.turnID);
 			let batch = drafterBatches.get(batchKey);
 			if (!batch) {
 				batch = (async () => {
@@ -462,23 +478,33 @@ export function createSpeculativeActionHost(
 							? await options.draftModel(input.actorModel)
 							: options.draftModel;
 					const model = configuredDraftModel ?? input.actorModel;
-					const configuredDraftOptions = options.getDraftOptions
-						? await options.getDraftOptions({
+					const utility = drafterGate.start(
+						drafterModelKey(model),
+						proposalCount,
+						settings.sourceConfig?.drafterGateEnabled !== false,
+					);
+					let configuredDraftOptions: SimpleStreamOptions | undefined;
+					if (utility.allowed) {
+						configuredDraftOptions = options.getDraftOptions
+							? await options.getDraftOptions({
 								actorModel: input.actorModel,
 								draftModel: model,
 								actorOptions: input.actorOptions,
 								signal,
-							})
-						: input.actorOptions;
+								})
+							: input.actorOptions;
+					}
 					return {
 						model,
 						context: input.context,
 						options: configuredDraftOptions ?? {},
+						utility,
 					};
 				})();
 				drafterBatches.set(batchKey, batch);
 			}
 			const prepared = await batch;
+			if (!prepared.utility.allowed) return undefined;
 			const drafter = sourceDrafterSettings(settings);
 			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
 			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
@@ -491,9 +517,20 @@ export function createSpeculativeActionHost(
 				sessionId: prepared.options.sessionId ?? sessionID,
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
-			const message = await options.complete(prepared.model, prepared.context, { ...draftOptions, signal });
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+			const requestStartedAt = performance.now();
+			let requestFailed = false;
+			let message: AssistantMessage;
+			try {
+				message = await options.complete(prepared.model, prepared.context, { ...draftOptions, signal });
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					requestFailed = message.stopReason === "error" || !signal.aborted;
+					throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+				}
+			} catch (error) {
+				if (!signal.aborted) requestFailed = true;
+				throw error;
+			} finally {
+				drafterGate.requestSettled(prepared.utility, performance.now() - requestStartedAt, requestFailed);
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
@@ -814,8 +851,18 @@ export function createSpeculativeActionHost(
 			});
 		},
 		onTurnFinished: ({ startInput, settings, terminal }) => {
-			drafterBatches.delete(JSON.stringify([startInput.sessionID, startInput.turnID]));
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
+			const drafterBatch = drafterBatches.get(key);
+			drafterBatches.delete(key);
+			if (drafterBatch) {
+				void drafterBatch
+					.then((batch) => {
+						drafterGate.finish(batch.utility);
+					})
+					.catch(() => {
+						// Model/auth resolution failures are already represented by source request events.
+					});
+			}
 			const batch = authoritativeBatches.get(key);
 			authoritativeBatches.delete(key);
 			patternRevisions.delete(key);
@@ -835,7 +882,30 @@ export function createSpeculativeActionHost(
 			});
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
-		onEvent: options.onEvent,
+		onEvent: async (event) => {
+			if (
+				event.type === "actor_action" &&
+				event.candidate?.source === "drafter" &&
+				event.settlement.provider.kind === "speculative" &&
+				event.settlement.matchedPredictions.some(
+					(prediction) =>
+						prediction.source === "drafter" && prediction.proposalID.startsWith(`drafter:${event.turnID}:`),
+				)
+			) {
+				const batch = drafterBatches.get(authoritativeBatchKey(event.sessionID, event.turnID));
+				if (batch) {
+					try {
+						drafterGate.creditExecutionAhead(
+							(await batch).utility,
+							event.settlement.provider.timing.executionAheadMs,
+						);
+					} catch {
+						// Source resolution failures cannot own an adopted speculative candidate.
+					}
+				}
+			}
+			await options.onEvent?.(event);
+		},
 	});
 
 	return {
@@ -846,6 +916,7 @@ export function createSpeculativeActionHost(
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		actual: (input) => runtime.actual({ ...input, sessionID }),
+		drafterGateSnapshot: () => drafterGate.snapshot(),
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
 			if (terminal) await finishPatternSession();

@@ -982,6 +982,106 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
+	it("gates the whole Drafter batch by realized action execution ahead and recovers with a bounded probe", async () => {
+		const cwd = await temporaryWorkspace();
+		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
+		const events: SpeculativeActionEvent<string>[] = [];
+		let completeCalls = 0;
+		let draftOptionsCalls = 0;
+		let exactDraft = false;
+		let gateEnabled = true;
+		const complete: CreateComplete = async () => {
+			completeCalls++;
+			await new Promise((resolve) => setTimeout(resolve, 15));
+			return drafterCall({ path: exactDraft ? "notes.txt" : "wrong.txt" });
+		};
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => {
+				if (input.path === "notes.txt") await new Promise((resolve) => setTimeout(resolve, 300));
+				return { content: [{ type: "text", text: input.path }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({ ...settings(2), drafterMaxDepth: 0, drafterGateEnabled: gateEnabled }),
+			draftModel: model("draft"),
+			getDraftOptions: () => {
+				draftOptionsCalls++;
+				return {};
+			},
+			complete,
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		const runTurn = async (index: number, providerExpected: boolean, exact: boolean) => {
+			const turnID = `gate-${index}`;
+			exactDraft = exact;
+			await host.startTurn(startInput(tool, turnID));
+			await waitFor(
+				() => events.filter((event) => event.type === "source_request" && event.turnID === turnID).length === 2,
+			);
+			if (providerExpected && exact) {
+				await waitFor(() =>
+					events.some(
+						(event) => event.type === "candidate" && event.turnID === turnID && event.state.status === "succeeded",
+					),
+				);
+			}
+			const hit = await host.consume({
+				turnID,
+				id: `actor-${index}`,
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: [tool],
+			});
+			if (!hit) {
+				await host.actual({
+					turnID,
+					id: `actor-${index}`,
+					tool: "read",
+					args: { path: "notes.txt" },
+					tools: [tool],
+					durationMs: 0,
+					output: { result: { content: [], details: {} }, isError: false },
+				});
+			}
+			await host.finishTurn(turnID);
+		};
+
+		for (let index = 1; index <= 4; index++) await runTurn(index, true, false);
+		await waitFor(() => host.drafterGateSnapshot().samples === 4);
+		expect(host.drafterGateSnapshot().expectedNetBenefitMs).toBeLessThan(0);
+		expect(completeCalls).toBe(8);
+		expect(draftOptionsCalls).toBe(4);
+
+		for (let index = 5; index <= 7; index++) await runTurn(index, false, false);
+		expect(completeCalls).toBe(8);
+		expect(draftOptionsCalls).toBe(4);
+		expect(host.drafterGateSnapshot().skippedBatches).toBe(3);
+
+		await runTurn(8, true, true);
+		await waitFor(() => (host.drafterGateSnapshot().expectedNetBenefitMs ?? -Infinity) >= 25);
+		expect(host.drafterGateSnapshot().expectedNetBenefitMs).toBeGreaterThanOrEqual(25);
+		for (let index = 9; index <= 12; index++) await runTurn(index, true, false);
+		expect(completeCalls).toBe(18);
+		await waitFor(() => (host.drafterGateSnapshot().expectedNetBenefitMs ?? Infinity) < 0);
+		await runTurn(13, false, false);
+		expect(completeCalls).toBe(18);
+
+		gateEnabled = false;
+		await runTurn(14, true, false);
+		expect(completeCalls).toBe(20);
+		expect(draftOptionsCalls).toBe(10);
+		await host.dispose();
+	}, 5_000);
+
 	it("does not let an invalid tool call cancel a valid default-width peer", async () => {
 		const cwd = await temporaryWorkspace();
 		const events: SpeculativeActionEvent<string>[] = [];

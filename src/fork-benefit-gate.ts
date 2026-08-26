@@ -1,4 +1,4 @@
-export interface ForkBenefitGatePolicy {
+export interface BenefitGatePolicy {
 	readonly enabled: boolean;
 	readonly minSamples: number;
 	readonly windowSize: number;
@@ -7,13 +7,30 @@ export interface ForkBenefitGatePolicy {
 	readonly failureThreshold: number;
 }
 
+export type ForkBenefitGatePolicy = BenefitGatePolicy;
+
+export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze({
+	enabled: true,
+	minSamples: 4,
+	windowSize: 4,
+	minNetBenefitMs: 25,
+	probeInterval: 4,
+	failureThreshold: 2,
+});
+
+export interface BenefitObservation {
+	readonly costMs: number;
+	readonly benefitMs: number;
+	readonly failed?: boolean;
+}
+
 export interface ForkBenefitObservation {
 	readonly forkLatencyMs: number;
 	readonly exactLeadMs: number;
 	readonly failed?: boolean;
 }
 
-export type ForkBenefitDecisionReason =
+export type BenefitDecisionReason =
 	| "disabled"
 	| "warmup"
 	| "profitable"
@@ -22,19 +39,25 @@ export type ForkBenefitDecisionReason =
 	| "negative_utility"
 	| "failure_circuit";
 
-export interface ForkBenefitDecision {
+export type ForkBenefitDecisionReason = BenefitDecisionReason;
+
+export interface BenefitDecision {
 	readonly allowed: boolean;
-	readonly reason: ForkBenefitDecisionReason;
+	readonly reason: BenefitDecisionReason;
 	readonly samples: number;
 	readonly expectedNetBenefitMs?: number;
 }
 
-export interface ForkBenefitGateSnapshot {
+export type ForkBenefitDecision = BenefitDecision;
+
+export interface BenefitGateSnapshot {
 	readonly samples: number;
 	readonly expectedNetBenefitMs?: number;
 	readonly consecutiveFailures: number;
 	readonly suppressedDecisions: number;
 }
+
+export type ForkBenefitGateSnapshot = BenefitGateSnapshot;
 
 interface GateState {
 	readonly netBenefits: number[];
@@ -43,11 +66,11 @@ interface GateState {
 	totalSuppressed: number;
 }
 
-/** Model-scoped rolling utility gate with bounded exploration and a failure circuit. */
-export class ForkBenefitGate {
+/** Key-scoped rolling utility gate with bounded exploration and a failure circuit. */
+export class BenefitGate {
 	private readonly states = new Map<string, GateState>();
 
-	decide(key: string, policy: ForkBenefitGatePolicy): ForkBenefitDecision {
+	decide(key: string, policy: BenefitGatePolicy): BenefitDecision {
 		const state = this.state(key);
 		const expected = mean(state.netBenefits);
 		const base = {
@@ -62,11 +85,15 @@ export class ForkBenefitGate {
 		return this.probeDecision(state, policy, "utility_probe", "negative_utility", base);
 	}
 
-	observe(key: string, observation: ForkBenefitObservation, policy: ForkBenefitGatePolicy): void {
+	observe(
+		key: string,
+		observation: BenefitObservation | ForkBenefitObservation,
+		policy: BenefitGatePolicy,
+	): void {
 		const state = this.state(key);
-		const latency = metric(observation.forkLatencyMs);
-		const lead = metric(observation.exactLeadMs);
-		state.netBenefits.push(lead - latency);
+		const costMs = "costMs" in observation ? observation.costMs : observation.forkLatencyMs;
+		const benefitMs = "benefitMs" in observation ? observation.benefitMs : observation.exactLeadMs;
+		state.netBenefits.push(metric(benefitMs) - metric(costMs));
 		if (state.netBenefits.length > policy.windowSize) {
 			state.netBenefits.splice(0, state.netBenefits.length - policy.windowSize);
 		}
@@ -74,7 +101,7 @@ export class ForkBenefitGate {
 		state.suppressedSinceProbe = 0;
 	}
 
-	snapshot(key: string): ForkBenefitGateSnapshot {
+	snapshot(key: string): BenefitGateSnapshot {
 		const state = this.state(key);
 		const expected = mean(state.netBenefits);
 		return {
@@ -91,11 +118,11 @@ export class ForkBenefitGate {
 
 	private probeDecision(
 		state: GateState,
-		policy: ForkBenefitGatePolicy,
+		policy: BenefitGatePolicy,
 		probeReason: "utility_probe" | "failure_probe",
 		skipReason: "negative_utility" | "failure_circuit",
-		base: Pick<ForkBenefitDecision, "samples" | "expectedNetBenefitMs">,
-	): ForkBenefitDecision {
+		base: Pick<BenefitDecision, "samples" | "expectedNetBenefitMs">,
+	): BenefitDecision {
 		state.suppressedSinceProbe++;
 		if (state.suppressedSinceProbe >= policy.probeInterval) {
 			state.suppressedSinceProbe = 0;
@@ -118,6 +145,9 @@ export class ForkBenefitGate {
 		return created;
 	}
 }
+
+/** Backward-compatible constructor name for fork-specific consumers. */
+export { BenefitGate as ForkBenefitGate };
 
 function metric(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;

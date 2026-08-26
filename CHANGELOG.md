@@ -21,6 +21,7 @@
 
 ### Added
 
+- Added a batch-atomic action-Drafter utility gate that charges all root proposal service, credits only realized Drafter-owned tool execution ahead, and retains bounded recovery probes; it is independently configurable from target-decoder self-speculation.
 - Added clear-time target-verification telemetry with per-candidate IDs, Drafter/PatternAware source correlation, and separate resolved, accepted, rejected, and unresolved draft-token counters.
 - Added a model-scoped net-benefit gate for sidecar forks with bounded recovery probes, endpoint-failure backoff, strict Actor K(a) outcome telemetry, and tape replay analysis.
 - Added an opt-in SPORK/self-speculation bridge with stable Actor request IDs, provider and sidecar fork transports, bounded control requests, configurable model-format boundaries, and package/TUI settings.

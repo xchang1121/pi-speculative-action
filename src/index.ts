@@ -1,4 +1,11 @@
 export {
+	BenefitGate,
+	type BenefitDecision,
+	type BenefitDecisionReason,
+	type BenefitGatePolicy,
+	type BenefitGateSnapshot,
+	type BenefitObservation,
+	DEFAULT_BENEFIT_GATE_POLICY,
 	ForkBenefitGate,
 	type ForkBenefitDecision,
 	type ForkBenefitDecisionReason,
@@ -61,6 +68,7 @@ export {
 	type SpeculativeToolExecutionContext,
 } from "./agent-execution-world.ts";
 export {
+	type ActionDrafterGateSnapshot,
 	type CreateSpeculativeActionHostOptions,
 	createSpeculativeActionHost,
 	type DraftOptionsContext,

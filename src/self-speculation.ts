@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
-import { ForkBenefitGate, type ForkBenefitGatePolicy } from "./fork-benefit-gate.ts";
+import {
+	DEFAULT_BENEFIT_GATE_POLICY,
+	ForkBenefitGate,
+	type ForkBenefitGatePolicy,
+} from "./fork-benefit-gate.ts";
 import type { MaterializedSpeculativeCandidate } from "./runtime.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
@@ -90,12 +94,12 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	forkForcedPrefix: "<tool_call>",
 	requireLogprobs: false,
 	drafterEnabled: true,
-	forkGateEnabled: true,
-	forkGateMinSamples: 4,
-	forkGateWindowSize: 4,
-	forkGateMinNetBenefitMs: 25,
-	forkGateProbeInterval: 4,
-	forkGateFailureThreshold: 2,
+	forkGateEnabled: DEFAULT_BENEFIT_GATE_POLICY.enabled,
+	forkGateMinSamples: DEFAULT_BENEFIT_GATE_POLICY.minSamples,
+	forkGateWindowSize: DEFAULT_BENEFIT_GATE_POLICY.windowSize,
+	forkGateMinNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
+	forkGateProbeInterval: DEFAULT_BENEFIT_GATE_POLICY.probeInterval,
+	forkGateFailureThreshold: DEFAULT_BENEFIT_GATE_POLICY.failureThreshold,
 });
 
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {

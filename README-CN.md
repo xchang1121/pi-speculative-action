@@ -69,6 +69,7 @@ pi install https://github.com/xchang1121/pi
 {
   "enabled": true,
   "draftModel": "deepseek/deepseek-chat",
+  "drafterGateEnabled": true,
   "candidateLimit": 2,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
@@ -103,6 +104,8 @@ pi install https://github.com/xchang1121/pi
 ```
 
 `candidateLimit` 默认在每次 Actor 决策并发发出两个单动作 Drafter 请求。宽度为 2 时它们组成延迟对冲：首个包含 schema 有效且已启用 `K(a)` 的响应被接纳，并通过 provider `AbortSignal` 取消仍在运行的同伴；错误、空响应和无效调用不会胜出。严格动作与目标 token 回放保留了全部 6 个可用精确命中、完整提前量以及完全相同的 D3 verifier 工作，同时识别出宽度 2 下 7.78% 的 Drafter 服务为可消除的剩余工作。显式设为 3 或更高时仍保留所有完成样本，也没有隐藏上限，供确实能产生有效宽多样性的模型使用。
+
+`drafterGateEnabled` 默认为 `true`。它把并发根请求视为一个批次，滚动学习动作侧净收益：只有由 Drafter 实际拥有并被 Actor 采纳的工作才按真实工具 `executionAheadMs` 计收益，再减去该批所有请求的服务时间总和。前 4 批用于预热；持续负收益时暂停整批请求，但每跳过 4 次仍做一次有界探测，以便工作负载变化后恢复。设为 `false` 即恢复无条件 Drafter 批次；PatternAware 候选和 Drafter 后继请求不受此门控。
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 

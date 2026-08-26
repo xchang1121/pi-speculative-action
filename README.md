@@ -69,6 +69,7 @@ Example:
 {
   "enabled": true,
   "draftModel": "deepseek/deepseek-chat",
+  "drafterGateEnabled": true,
   "candidateLimit": 2,
   "maxConcurrentActions": 8,
   "drafterMaxDepth": 1,
@@ -103,6 +104,8 @@ Example:
 ```
 
 `candidateLimit` defaults to two concurrent one-action Drafter requests per Actor decision. At width two they act as a latency hedge: the first response containing a schema-valid enabled `K(a)` is admitted and its still-running peer is canceled through the provider `AbortSignal`; errors, empty responses, and invalid calls do not win. Strict action and target-token replay retained all 6 available exact hits, the complete lead, and identical D3 verifier work, while identifying 7.78% of width-two Drafter service as removable residual work. Widths above two retain every completed sample and remain available without a hidden cap for models that produce useful wider diversity.
+
+`drafterGateEnabled` defaults to `true`. It treats the concurrent root requests as one batch and learns their action-side net utility: actual tool `executionAheadMs` credited only to Drafter-owned adopted work, minus the summed service time of every request in the batch. Four warm-up batches precede suppression; one bounded probe every four skipped decisions lets a changed workload recover. Set it to `false` to restore unconditional Drafter batches. PatternAware candidates and Drafter continuations are not gated.
 
 `drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
 

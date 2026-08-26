@@ -37,6 +37,7 @@ const DRAFTER_DEFAULTS: DrafterRequestSettings = {
 export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
+	drafterGateEnabled: true,
 	...DRAFTER_DEFAULTS,
 	candidateLimit: 2,
 	maxConcurrentActions: 8,
