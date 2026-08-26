@@ -4,6 +4,10 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
+Ablation reports, preregistrations, and private recordings are intentionally
+kept outside this repository. The checked-in runner and suites remain the
+reproducible measurement surface.
+
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
 contexts match; tool name and all parsed arguments must match exactly:
