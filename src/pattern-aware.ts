@@ -1891,10 +1891,13 @@ function findBinding(
 	return candidateBindings(context, target, true, isPathField(String(targetPath.at(-1) ?? "")))[0];
 }
 
-const candidateBindingCache = new WeakMap<
-	ReadonlyArray<PatternAwareEvent>,
-	Map<string, ReadonlyArray<PatternAwareBinding>>
->();
+type CandidateBindingSlots = Array<ReadonlyArray<PatternAwareBinding> | undefined>;
+type CandidateBindingCache = {
+	readonly stringTargets: Map<string, CandidateBindingSlots>;
+	otherTargets?: Map<string, CandidateBindingSlots>;
+};
+
+const candidateBindingCache = new WeakMap<ReadonlyArray<PatternAwareEvent>, CandidateBindingCache>();
 
 function candidateBindings(
 	context: ReadonlyArray<PatternAwareEvent>,
@@ -1902,13 +1905,24 @@ function candidateBindings(
 	includeComposites = true,
 	targetIsPath = false,
 ): PatternAwareBinding[] {
-	const cacheKey = `${Number(includeComposites)}:${Number(targetIsPath)}:${typeof target}:${typeof target === "string" ? target : stableStringify(target)}`;
-	const cache = candidateBindingCache.get(context) ?? new Map<string, ReadonlyArray<PatternAwareBinding>>();
-	candidateBindingCache.set(context, cache);
-	const cached = cache.get(cacheKey);
+	const stringTarget = typeof target === "string";
+	const cacheKey = stringTarget ? target : `${typeof target}:${stableStringify(target)}`;
+	let cache = candidateBindingCache.get(context);
+	if (!cache) {
+		cache = { stringTargets: new Map() };
+		candidateBindingCache.set(context, cache);
+	}
+	const targets = stringTarget ? cache.stringTargets : (cache.otherTargets ??= new Map());
+	const option = Number(includeComposites) * 2 + Number(targetIsPath);
+	let slots = targets.get(cacheKey);
+	const cached = slots?.[option];
 	if (cached) return [...cached];
 	const result = inferCandidateBindings(context, target, includeComposites, targetIsPath);
-	cache.set(cacheKey, result);
+	if (!slots) {
+		slots = [];
+		targets.set(cacheKey, slots);
+	}
+	slots[option] = result;
 	return result;
 }
 
