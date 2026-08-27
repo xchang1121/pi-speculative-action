@@ -2438,12 +2438,29 @@ function transform(operation: "dirname" | "basename" | "normalize_path", value: 
 	return path.normalize(value).replaceAll("\\", "/");
 }
 
+const PATH_OPERATION_CACHE_LIMIT = 128;
+const normalizedPaths = new Map<string, string>();
+const joinedPaths = new Map<string, string>();
+
+function cachePathResult(cache: Map<string, string>, key: string, value: string) {
+	if (cache.size >= PATH_OPERATION_CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+	cache.set(key, value);
+	return value;
+}
+
 function joinPath(left: string, right: string) {
+	const key = `${left.length}:${left}${right}`;
+	const cached = joinedPaths.get(key);
+	if (cached !== undefined) return cached;
 	const root = normalizePath(left);
 	const output = normalizePath(right);
-	if (output === root || output.startsWith(`${root}/`)) return output;
-	if (path.posix.basename(root) === output) return root;
-	return normalizePath(path.join(root, output));
+	const result =
+		output === root || output.startsWith(`${root}/`)
+			? output
+			: path.posix.basename(root) === output
+				? root
+				: normalizePath(path.join(root, output));
+	return cachePathResult(joinedPaths, key, result);
 }
 
 function getPath(value: unknown, segments: PatternAwarePath): unknown {
@@ -3138,7 +3155,9 @@ function uniqueStrings(values: ReadonlyArray<string>) {
 }
 
 function normalizePath(value: string) {
-	return path.normalize(value).replaceAll("\\", "/");
+	const cached = normalizedPaths.get(value);
+	if (cached !== undefined) return cached;
+	return cachePathResult(normalizedPaths, value, path.normalize(value).replaceAll("\\", "/"));
 }
 
 function hash(value: string) {
