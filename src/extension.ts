@@ -23,7 +23,9 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+	type ActionKeyMatch,
 	buildPiActionKey,
+	isPartialResultReuse,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	UNBOUNDED_ACTION_TOOLS,
@@ -198,6 +200,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
+		`Reuse: ${metrics.exactReuseHits} exact actions; ${metrics.partialResultReuseHits} partial results (${countSummary(metrics.partialResultReuseByProjector)})`,
 		`Predictions: ${metrics.predictionsMatched}/${metrics.predictionsObserved} matched (${formatPercent(metrics.predictionPrecision)}); ${metrics.predictionsAdopted}/${metrics.predictionsMatched} adopted (${formatPercent(metrics.adoptionYield)}); unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
@@ -1543,7 +1546,8 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			parts.push(settlement.prediction.source, settlement.prediction.actionID);
 			if (settlement.observation === "unobserved") parts.push(`unobserved ${causeSummary(settlement.cause)}`);
 			else if (!settlement.match.matched) parts.push("not matched");
-			else if (settlement.match.adoption.status === "adopted") parts.push("matched and adopted");
+			else if (settlement.match.adoption.status === "adopted")
+				parts.push(`matched ${formatActionReuse(settlement.match.relation)} and adopted`);
 			else parts.push(`matched, rejected ${causeSummary(settlement.match.adoption.cause)}`);
 			break;
 		}
@@ -1567,6 +1571,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			);
 			if (event.settlement.provider.kind === "speculative") {
 				parts.push(
+					formatActionReuse(event.settlement.provider.match),
 					`${formatDuration(event.settlement.provider.timing.executionAheadMs)} ahead`,
 					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
 					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,
@@ -1592,6 +1597,10 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 		}
 	}
 	return parts.join(" · ");
+}
+
+function formatActionReuse(match: ActionKeyMatch): string {
+	return isPartialResultReuse(match) ? `partial-result reuse (${match.projector})` : "exact-action reuse";
 }
 
 function causeSummary(value: { readonly stage: string; readonly code: string; readonly detail?: string }): string {

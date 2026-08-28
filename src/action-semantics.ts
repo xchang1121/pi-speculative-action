@@ -56,6 +56,7 @@ export interface ExactActionKeyMatch {
 }
 
 export interface ProjectedActionKeyMatch {
+	/** The speculative action ran in full; only a lossless view of its result is reused. */
 	readonly kind: "projected";
 	readonly distance: number;
 	readonly projector: string;
@@ -332,6 +333,11 @@ export function actionKeyProjects(
 	projectors: readonly ActionKeyProjector[],
 ): boolean {
 	return actionKeyMatch(speculative, actor, projectors)?.kind === "projected";
+}
+
+/** Whether an authoritative match reuses a lossless result view rather than the whole result. */
+export function isPartialResultReuse(match: ActionKeyMatch): match is ProjectedActionKeyMatch {
+	return match.kind === "projected";
 }
 
 /** K(a_s) covers K(a) without relying on completed-output coverage. */

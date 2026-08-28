@@ -45,6 +45,7 @@ export {
 	FIND_DEFAULT_LIMIT,
 	GREP_DEFAULT_LIMIT,
 	inferredActionEffect,
+	isPartialResultReuse,
 	KEYABLE_TOOLS,
 	LS_DEFAULT_LIMIT,
 	normalizeReadLimit,

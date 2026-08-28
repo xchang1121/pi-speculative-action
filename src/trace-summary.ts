@@ -1,3 +1,4 @@
+import { isPartialResultReuse } from "./action-semantics.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import type { ResolutionCause } from "./settlement.ts";
 
@@ -19,6 +20,11 @@ export interface SpeculativeTraceSummary {
 	readonly candidateTerminalCauses: Readonly<Record<string, number>>;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
+	/** Adopted identical K(a) results. */
+	readonly exactReuseHits: number;
+	/** Adopted lossless result views from a different speculative K(a); the speculative action ran in full. */
+	readonly partialResultReuseHits: number;
+	readonly partialResultReuseByProjector: Readonly<Record<string, number>>;
 	readonly actorPreviews: number;
 	readonly actorFallbacks: number;
 	readonly hitRate: number;
@@ -83,6 +89,9 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		candidateTerminalCauses: {},
 		actorActions: 0,
 		speculativeHits: 0,
+		exactReuseHits: 0,
+		partialResultReuseHits: 0,
+		partialResultReuseByProjector: {},
 		actorPreviews: 0,
 		actorFallbacks: 0,
 		hitRate: 0,
@@ -167,6 +176,11 @@ export function reduceSpeculativeTrace<SessionID>(
 			}
 			if (event.settlement.provider.kind === "speculative") {
 				next.speculativeHits++;
+				const match = event.settlement.provider.match;
+				if (isPartialResultReuse(match)) {
+					next.partialResultReuseHits++;
+					increment(next.partialResultReuseByProjector, match.projector);
+				} else next.exactReuseHits++;
 				next.executionAheadMs += metric(event.settlement.provider.timing.executionAheadMs);
 				next.attemptLeadMs += metric(event.settlement.provider.timing.attemptLeadMs);
 				next.hitLatencyMs += metric(event.settlement.provider.timing.hitLatencyMs);
@@ -215,6 +229,7 @@ function mutableSummary(current: SpeculativeTraceSummary): MutableSummary {
 		predictionRejectedAfterMatch: { ...current.predictionRejectedAfterMatch },
 		candidateTerminalCauses: { ...current.candidateTerminalCauses },
 		actorCandidateRejections: { ...current.actorCandidateRejections },
+		partialResultReuseByProjector: { ...current.partialResultReuseByProjector },
 		cache: cloneCache(current.cache),
 	};
 }

@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeculativeActionHost } from "../src/agent-integration.ts";
 import {
 	createSpeculativeActionExtension,
+	formatSpeculativeActionEvent,
 	formatSpeculativeActionStatus,
 	resolveSpeculativeDraftModel,
 	type SpeculativeActionMetrics,
@@ -305,7 +306,34 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
+		expect(status).toContain("Reuse: 0 exact actions; 0 partial results (none)");
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
+	});
+
+	it("labels an adopted read projection as partial-result reuse", () => {
+		const event = {
+			sessionID: "session",
+			turnID: "turn",
+			timestamp: 1,
+			cache: emptyMetrics().cache,
+			type: "actor_action" as const,
+			actualAction: "read notes.txt:20-29",
+			settlement: {
+				actorAction: { id: "actor", sequence: 1, turnID: "turn" },
+				tool: "read",
+				matchedPredictions: [],
+				rejections: [],
+				provider: {
+					kind: "speculative" as const,
+					candidateID: "candidate",
+					match: { kind: "projected" as const, projector: "read.range", distance: 90 },
+					timing: { executionAheadMs: 5, attemptLeadMs: 10, hitLatencyMs: 1 },
+					toolExecution: { startedAt: 0, completedAt: 5 },
+				},
+			},
+		};
+
+		expect(formatSpeculativeActionEvent(event)).toContain("partial-result reuse (read.range)");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
