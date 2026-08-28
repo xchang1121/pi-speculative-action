@@ -25,7 +25,7 @@ import {
 import {
 	type ActionKeyMatch,
 	buildPiActionKey,
-	isPartialResultReuse,
+	isProjectedActionKeyMatch,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	UNBOUNDED_ACTION_TOOLS,
@@ -1546,8 +1546,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			parts.push(settlement.prediction.source, settlement.prediction.actionID);
 			if (settlement.observation === "unobserved") parts.push(`unobserved ${causeSummary(settlement.cause)}`);
 			else if (!settlement.match.matched) parts.push("not matched");
-			else if (settlement.match.adoption.status === "adopted")
-				parts.push(`matched ${formatActionReuse(settlement.match.relation)} and adopted`);
+			else if (settlement.match.adoption.status === "adopted") parts.push("matched and adopted");
 			else parts.push(`matched, rejected ${causeSummary(settlement.match.adoption.cause)}`);
 			break;
 		}
@@ -1600,7 +1599,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 }
 
 function formatActionReuse(match: ActionKeyMatch): string {
-	return isPartialResultReuse(match) ? `partial-result reuse (${match.projector})` : "exact-action reuse";
+	return isProjectedActionKeyMatch(match) ? `partial-result reuse (${match.projector})` : "exact-action reuse";
 }
 
 function causeSummary(value: { readonly stage: string; readonly code: string; readonly detail?: string }): string {

@@ -7,6 +7,7 @@ import {
 	actionKeyMismatchReason,
 	buildActionKey,
 	buildPiActionKey,
+	isProjectedActionKeyMatch,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
@@ -66,9 +67,10 @@ describe("ActionSemanticsRegistry", () => {
 		);
 
 		expect(implicit?.key).not.toBe(explicit?.key);
-		expect(
-			implicit && explicit ? actionKeyMatch(implicit, explicit, [READ_RANGE_ACTION_KEY_PROJECTOR]) : undefined,
-		).toMatchObject({ kind: "projected", projector: "read.range" });
+		const relation = implicit && explicit ? actionKeyMatch(implicit, explicit, [READ_RANGE_ACTION_KEY_PROJECTOR]) : undefined;
+		expect(relation).toMatchObject({ kind: "projected", projector: "read.range" });
+		expect(relation && isProjectedActionKeyMatch(relation)).toBe(true);
+		expect(isProjectedActionKeyMatch({ kind: "exact", distance: 0 })).toBe(false);
 		expect(implicit).toMatchObject({
 			tool: "read",
 			semanticsEpoch: "pi.read.v2",

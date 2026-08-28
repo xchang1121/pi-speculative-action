@@ -3,7 +3,9 @@ import type { ResourceValidation } from "./settlement.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
-export type ActionReuseKind = "shared_result" | "exclusive_branch";
+export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
+/** @deprecated Use WorldReuseStrategy; this names world isolation policy, not an action-key reuse relation. */
+export type ActionReuseKind = WorldReuseStrategy;
 export type ExecutionWorldScope = "runtime" | "fallback";
 
 /** Tool effects are resolved independently from K(a) and prediction source. */
@@ -17,7 +19,7 @@ export interface ExecutionWorldRequest {
 /** One resolved execution capability. Absence of a route means speculation is blocked. */
 export interface SpeculativeExecutionRoute {
 	readonly isolation: SpeculativeExecution;
-	readonly reuse: ActionReuseKind;
+	readonly reuse: WorldReuseStrategy;
 	readonly scope: ExecutionWorldScope;
 	readonly backend: string;
 	readonly fingerprint: string;

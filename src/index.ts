@@ -45,7 +45,7 @@ export {
 	FIND_DEFAULT_LIMIT,
 	GREP_DEFAULT_LIMIT,
 	inferredActionEffect,
-	isPartialResultReuse,
+	isProjectedActionKeyMatch,
 	KEYABLE_TOOLS,
 	LS_DEFAULT_LIMIT,
 	normalizeReadLimit,
@@ -109,6 +109,7 @@ export {
 	type WorldCommitMetrics,
 	type WorldCompatibilityEvidence,
 	type WorldExecutionMetrics,
+	type WorldReuseStrategy,
 } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,
