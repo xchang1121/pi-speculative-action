@@ -62,7 +62,12 @@ describe("faux LLM speculative action end to end", () => {
 			settings: drafterSettings(),
 		});
 
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
+		expect(result.summary).toMatchObject({
+			actorActions: 1,
+			speculativeHits: 1,
+			exactReuseHits: 1,
+			actorFallbacks: 0,
+		});
 		expect(result.executions.read).toBe(1);
 	});
 

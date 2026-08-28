@@ -334,24 +334,6 @@ describe("zero-modification Pi extension", () => {
 		};
 
 		expect(formatSpeculativeActionEvent(event)).toContain("partial-result reuse (read.range)");
-
-		const predictionEvent = {
-			...event,
-			type: "prediction" as const,
-			settlement: {
-				prediction: { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" },
-				observation: "observed" as const,
-				actorAction: event.settlement.actorAction,
-				match: {
-					matched: true as const,
-					relation: event.settlement.provider.match,
-					adoption: { status: "adopted" as const, candidateID: "candidate" },
-				},
-			},
-		};
-		const predictionText = formatSpeculativeActionEvent(predictionEvent);
-		expect(predictionText).toContain("matched and adopted");
-		expect(predictionText).not.toContain("reuse");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {

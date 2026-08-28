@@ -45,7 +45,6 @@ export {
 	FIND_DEFAULT_LIMIT,
 	GREP_DEFAULT_LIMIT,
 	inferredActionEffect,
-	isProjectedActionKeyMatch,
 	KEYABLE_TOOLS,
 	LS_DEFAULT_LIMIT,
 	normalizeReadLimit,

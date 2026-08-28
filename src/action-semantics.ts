@@ -335,11 +335,6 @@ export function actionKeyProjects(
 	return actionKeyMatch(speculative, actor, projectors)?.kind === "projected";
 }
 
-/** Narrow an action-key relation without implying that execution or reuse has completed. */
-export function isProjectedActionKeyMatch(match: ActionKeyMatch): match is ProjectedActionKeyMatch {
-	return match.kind === "projected";
-}
-
 /** K(a_s) covers K(a) without relying on completed-output coverage. */
 export function actionKeyCovers(
 	speculative: ActionKey,

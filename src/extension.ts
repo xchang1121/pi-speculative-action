@@ -23,9 +23,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
-	type ActionKeyMatch,
 	buildPiActionKey,
-	isProjectedActionKeyMatch,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	UNBOUNDED_ACTION_TOOLS,
@@ -1569,8 +1567,9 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				sources.join("+") || (event.settlement.provider.kind === "speculative" ? "cache" : "no prediction"),
 			);
 			if (event.settlement.provider.kind === "speculative") {
+				const match = event.settlement.provider.match;
 				parts.push(
-					formatActionReuse(event.settlement.provider.match),
+					match.kind === "projected" ? `partial-result reuse (${match.projector})` : "exact-action reuse",
 					`${formatDuration(event.settlement.provider.timing.executionAheadMs)} ahead`,
 					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
 					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,
@@ -1597,11 +1596,6 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 	}
 	return parts.join(" · ");
 }
-
-function formatActionReuse(match: ActionKeyMatch): string {
-	return isProjectedActionKeyMatch(match) ? `partial-result reuse (${match.projector})` : "exact-action reuse";
-}
-
 function causeSummary(value: { readonly stage: string; readonly code: string; readonly detail?: string }): string {
 	return `${value.stage}:${value.code}${value.detail ? ` (${compactEventText(value.detail)})` : ""}`;
 }

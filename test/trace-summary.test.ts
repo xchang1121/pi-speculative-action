@@ -31,9 +31,9 @@ describe("speculative trace reduction", () => {
 			candidateTerminalCauses: { "control:preempted": 1 },
 			actorActions: 2,
 			speculativeHits: 1,
-			exactReuseHits: 1,
-			partialResultReuseHits: 0,
-			partialResultReuseByProjector: {},
+			exactReuseHits: 0,
+			partialResultReuseHits: 1,
+			partialResultReuseByProjector: { "read.range": 1 },
 			actorFallbacks: 1,
 			hitRate: 1 / 2,
 			actorCandidateRejections: { "compatibility:backend_indeterminate": 1 },
@@ -56,57 +56,14 @@ describe("speculative trace reduction", () => {
 			cache: { resultEntries: 2, cacheCold: 1, cacheHot: 1 },
 		});
 	});
-
-	test("classifies exact and projected adoptions as whole-action and partial-result reuse", () => {
-		const events = [
-			actorHit("exact", { kind: "exact", distance: 0 }),
-			actorHit("projected", { kind: "projected", projector: "read.range", distance: 40 }),
-		];
-
-		expect(summarizeSpeculativeTrace(events)).toMatchObject({
-			actorActions: 2,
-			speculativeHits: 2,
-			exactReuseHits: 1,
-			partialResultReuseHits: 1,
-			partialResultReuseByProjector: { "read.range": 1 },
-		});
-	});
 });
-
-function actorHit(
-	id: string,
-	match:
-		| { readonly kind: "exact"; readonly distance: 0 }
-		| { readonly kind: "projected"; readonly projector: string; readonly distance: number },
-): SpeculativeActionEvent<string> {
-	return {
-		sessionID: "session",
-		turnID: "turn",
-		timestamp: 1,
-		cache: cache(),
-		type: "actor_action",
-		actualAction: `read ${id}`,
-		settlement: {
-			actorAction: { id, sequence: 1, turnID: "turn" },
-			tool: "read",
-			matchedPredictions: [],
-			rejections: [],
-			provider: {
-				kind: "speculative",
-				candidateID: `candidate-${id}`,
-				match,
-				timing: { executionAheadMs: 1, attemptLeadMs: 2, hitLatencyMs: 0 },
-				toolExecution: { startedAt: 0, completedAt: 1 },
-			},
-		},
-	};
-}
 
 function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 	const base = { sessionID: "session", turnID: "turn", timestamp: 1, cache: cache() };
 	const actorAction = { id: "actor", sequence: 1, turnID: "turn" };
 	const prediction = { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" };
 	const exact = { kind: "exact" as const, distance: 0 as const };
+	const projected = { kind: "projected" as const, projector: "read.range", distance: 40 };
 	return [
 		{
 			...base,
@@ -221,7 +178,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 				provider: {
 					kind: "speculative",
 					candidateID: "candidate",
-					match: exact,
+					match: projected,
 					timing: { executionAheadMs: 30, attemptLeadMs: 80, hitLatencyMs: 10 },
 					toolExecution: { startedAt: 0, completedAt: 30 },
 				},

@@ -1,4 +1,3 @@
-import { isProjectedActionKeyMatch } from "./action-semantics.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import type { ResolutionCause } from "./settlement.ts";
 
@@ -177,7 +176,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			if (event.settlement.provider.kind === "speculative") {
 				next.speculativeHits++;
 				const match = event.settlement.provider.match;
-				if (isProjectedActionKeyMatch(match)) {
+				if (match.kind === "projected") {
 					next.partialResultReuseHits++;
 					increment(next.partialResultReuseByProjector, match.projector);
 				} else next.exactReuseHits++;
