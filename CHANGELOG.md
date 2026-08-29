@@ -22,6 +22,7 @@
 
 ### Added
 
+- Added authoritative observation capture: a successful read-only Actor fallback can transfer its pre-execution freshness evidence and one real output into the existing shared result cache without a duplicate tool invocation or a second cache implementation.
 - Added a target-verification ledger that calibrates decoder candidate order by model, endpoint, format, tool, and source while keeping token evidence separate from semantic action learning.
 - Added a policy-facing Actor settlement channel; the sidecar fork gate now credits only source-attributed, actually adopted `executionAheadMs` instead of intent-match wall-clock lead.
 - Sidecar fork handoff now preserves complete parallel tool-call batches and their candidate, provenance, score, call-format, timing, and logprob evidence instead of flattening the first call into an alternative.

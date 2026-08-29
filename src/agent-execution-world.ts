@@ -7,6 +7,7 @@ import type {
 	WorldBranchState,
 	WorldCheckpoint,
 	WorldCompatibilityEvidence,
+	WorldResultCapture,
 } from "./execution-world.ts";
 import {
 	captureResourceVersion,
@@ -38,16 +39,24 @@ export type SpeculativeAgentExecutionWorld = ExecutionWorld<SpeculativeToolExecu
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ): SpeculativeAgentExecutionWorld {
+	const capture = async (context: SpeculativeToolExecutionContext): Promise<WorldResultCapture<ToolSettlement>> => {
+		const setupStarted = performance.now();
+		const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
+		return new ResourceSnapshotCapture(
+			version,
+			context.action.executionFingerprint,
+			Math.max(0, performance.now() - setupStarted),
+		);
+	};
 	return {
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		supports: ({ tool, effect }) => effect === "observation" && actionSemantics.resourceScope(tool) !== undefined,
 		fingerprint: () => "resource-version:v1",
+		captureAuthoritativeResult: capture,
 		fork: async (context) => {
-			const setupStarted = performance.now();
-			const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
-			const setupMs = Math.max(0, performance.now() - setupStarted);
+			const captured = await capture(context);
 			let output: ToolSettlement;
 			try {
 				output = {
@@ -57,9 +66,35 @@ export function createResourceSnapshotExecutionWorld(
 			} catch (error) {
 				output = errorSettlement(error);
 			}
-			return new ResourceSnapshotBranch(output, version, context.action.executionFingerprint, setupMs);
+			return captured.seal(output);
 		},
 	};
+}
+
+class ResourceSnapshotCapture implements WorldResultCapture<ToolSettlement> {
+	private state: "open" | "sealed" | "disposed" = "open";
+	private readonly version: ResourceVersionToken;
+	private readonly executionFingerprint: string;
+	private readonly setupMs: number;
+
+	constructor(version: ResourceVersionToken, executionFingerprint: string, setupMs: number) {
+		this.version = version;
+		this.executionFingerprint = executionFingerprint;
+		this.setupMs = setupMs;
+	}
+
+	async seal(output: ToolSettlement): Promise<WorldBranch<ToolSettlement>> {
+		if (this.state !== "open") throw new Error(`resource snapshot capture is already ${this.state}`);
+		const branch = new ResourceSnapshotBranch(output, this.version, this.executionFingerprint, this.setupMs);
+		this.state = "sealed";
+		return branch;
+	}
+
+	dispose(): void {
+		if (this.state !== "open") return;
+		this.state = "disposed";
+		releaseResourceVersion(this.version);
+	}
 }
 
 class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {

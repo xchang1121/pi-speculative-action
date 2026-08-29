@@ -93,6 +93,7 @@ export type {
 	SpeculativeCacheSnapshot,
 } from "./events.ts";
 export {
+	type CapturedExecutionWorldResult,
 	type ActionReuseKind,
 	type ExecutionWorld,
 	type ExecutionWorldPreparation,
@@ -109,6 +110,7 @@ export {
 	type WorldCompatibilityEvidence,
 	type WorldExecutionMetrics,
 	type WorldReuseStrategy,
+	type WorldResultCapture,
 } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,
@@ -183,6 +185,7 @@ export {
 	watchResourceVersion,
 } from "./resource-version.ts";
 export {
+	type AuthoritativeResultCapture,
 	type CandidatePreflight,
 	type ActorActionFeedback,
 	type PredictionFeedback,

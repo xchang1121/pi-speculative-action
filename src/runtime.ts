@@ -2,7 +2,7 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { SpeculativeActionEvent } from "./events.ts";
-import type { SpeculativeExecutionRoute, WorldBranch } from "./execution-world.ts";
+import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PredictionSettlement } from "./settlement.ts";
@@ -66,6 +66,11 @@ export interface SpeculativeCandidate {
 	readonly conditionalProbability?: number;
 	readonly depth?: number;
 	readonly planDependencies?: PlanAction["dependsOn"];
+}
+
+/** A pre-Actor freshness baseline that can promote the Actor's own result into the shared cache. */
+export interface AuthoritativeResultCapture<Output> extends WorldResultCapture<Output> {
+	readonly route: SpeculativeExecutionRoute;
 }
 
 /** A validated, concrete prediction suitable for a target-model draft verifier. */
@@ -230,6 +235,18 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly action: ActionKey;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<SpeculativeExecutionRoute | undefined>;
+	/** Snapshot freshness before fallback execution; this callback must never execute the tool. */
+	readonly captureAuthoritativeResult?: (input: {
+		readonly startInput: StartInput;
+		readonly data: StateData;
+		readonly consumeInput: ConsumeInput;
+		readonly settings: SpeculativeActionSettings;
+		readonly tool: string;
+		readonly concrete: Record<string, unknown>;
+		readonly action: ActionKey;
+		readonly callID: string;
+		readonly signal: AbortSignal;
+	}) => MaybePromise<AuthoritativeResultCapture<Output> | undefined>;
 	readonly actual: (input: ConsumeInput) => { readonly id?: string; readonly tool: string; readonly input: unknown };
 	readonly preflightCandidate: (input: {
 		readonly startInput: StartInput;

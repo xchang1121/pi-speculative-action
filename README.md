@@ -33,6 +33,7 @@ This arrangement is intentional: a future OS-level agent runtime can provide one
 - Prediction sources never choose an execution backend.
 - `K(a)` never changes because a different isolation backend is available.
 - In-flight and cached work is reused only within an identical execution route.
+- On a read-only Actor fallback, a capture-capable world snapshots freshness before the host call and seals that same authoritative output into the shared cache. It never invokes the tool a second time; later turns still repeat authorization, exact freshness validation, compatibility, projection, and commit.
 - Actor adoption still requires action equivalence, permission, fresh resource evidence, compatible world evidence, successful projection, and successful commit.
 - A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
 - Same-name custom tools remain authoritative and are excluded unless the host explicitly supplies matching semantics and execution capability.

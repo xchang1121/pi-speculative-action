@@ -3,6 +3,7 @@ import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../s
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeExecutionRoute, WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
 import type {
+	AuthoritativeResultCapture,
 	CandidatePreflight,
 	MaterializedSpeculativeCandidate,
 	SpeculativeActionEvent,
@@ -83,6 +84,11 @@ function harness(input: {
 		context: { readonly type: "start" | "consume" },
 	) => ReturnType<typeof buildPiActionKey> | Promise<ReturnType<typeof buildPiActionKey>>;
 	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined;
+	readonly captureAuthoritativeResult?: (
+		action: NonNullable<ReturnType<typeof buildPiActionKey>>,
+		signal: AbortSignal,
+	) => AuthoritativeResultCapture<string> | undefined | Promise<AuthoritativeResultCapture<string> | undefined>;
+	readonly rejectCandidateOutput?: (output: string) => string | undefined;
 }) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	let executions = 0;
@@ -100,6 +106,15 @@ function harness(input: {
 					: tool === "write"
 						? MUTATION_ROUTE
 						: undefined,
+		...(input.captureAuthoritativeResult
+			? {
+					captureAuthoritativeResult: ({ action, signal }) =>
+						input.captureAuthoritativeResult!(action, signal),
+				}
+			: {}),
+		...(input.rejectCandidateOutput
+			? { rejectCandidateOutput: ({ output }) => input.rejectCandidateOutput!(output) }
+			: {}),
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: ({ signal }) => input.preflight?.(signal) ?? { ok: true },
 		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
@@ -574,6 +589,132 @@ describe("structural speculative runtime", () => {
 		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({
 			timing: { authoritativeToolCount: 1 },
 		});
+	});
+
+	it("promotes an authoritative observation into the shared cache without a second execution", async () => {
+		let resourceVersion = 1;
+		let captures = 0;
+		let seals = 0;
+		let disposedCaptures = 0;
+		const source: Source = { id: "disabled", enabled: () => false, propose: () => undefined };
+		const fixture = harness({
+			source,
+			captureAuthoritativeResult: (action) => {
+				captures++;
+				const capturedVersion = resourceVersion;
+				return {
+					route: RESOURCE_ROUTE,
+					seal: async (output) => {
+						seals++;
+						return world(output, {
+							executionFingerprint: action.executionFingerprint,
+							validate: async () =>
+								capturedVersion === resourceVersion
+									? { status: "valid", metrics: zeroValidationMetrics() }
+									: {
+											status: "stale",
+											cause: cause("freshness", "resource_changed"),
+											metrics: zeroValidationMetrics(),
+										},
+						});
+					},
+					dispose: () => {
+						disposedCaptures++;
+					},
+				};
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-1" });
+		const first = call("actor-result-1");
+		expect(await fixture.runtime.consume(first)).toBeUndefined();
+		expect(captures).toBe(1);
+		await fixture.runtime.actual({ ...first, durationMs: 4, output: "actor:1" });
+		expect(fixture.runtime.inspect()).toMatchObject({ sharedCandidates: 1 });
+		await fixture.runtime.finishTurn({ ...first, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-2" });
+		const second = call("actor-result-2");
+		await fixture.runtime.previewActorCall(second);
+		expect(fixture.executions()).toBe(0);
+		expect(await fixture.runtime.consume(second)).toBe("actor:1");
+		expect(captures).toBe(1);
+		await waitFor(() =>
+			fixture.events.some(
+				(event) =>
+					event.type === "actor_action" &&
+					event.turnID === "actor-result-2" &&
+					event.settlement.provider.kind === "speculative",
+			),
+		);
+		expect(
+			fixture.events.find(
+				(event) =>
+					event.type === "actor_action" &&
+					event.turnID === "actor-result-2" &&
+					event.settlement.provider.kind === "speculative",
+			),
+		).toMatchObject({ candidate: { origin: "actor_result" } });
+		await fixture.runtime.finishTurn({ ...second, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-write" });
+		const mutation: Call = {
+			sessionID: "session",
+			turnID: "actor-result-write",
+			id: "actor-result-write-call",
+			tool: "write",
+			input: { path: "other.txt", content: "changed" },
+		};
+		expect(await fixture.runtime.consume(mutation)).toBeUndefined();
+		expect(captures).toBe(1);
+		await fixture.runtime.actual({ ...mutation, durationMs: 1, output: "written" });
+		await fixture.runtime.finishTurn({ ...mutation, terminal: false });
+
+		resourceVersion++;
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-3" });
+		const third = call("actor-result-3");
+		expect(await fixture.runtime.consume(third)).toBeUndefined();
+		expect(captures).toBe(2);
+		await fixture.runtime.actual({ ...third, durationMs: 2, output: "actor:2" });
+		expect(seals).toBe(2);
+		expect(disposedCaptures).toBe(0);
+		await fixture.runtime.finishTurn({ ...third, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-abandoned" });
+		const abandoned = call("actor-result-abandoned", { path: "missing.txt" });
+		expect(await fixture.runtime.consume(abandoned)).toBeUndefined();
+		expect(captures).toBe(3);
+		await fixture.runtime.actual({ ...abandoned, durationMs: 1 });
+		expect(disposedCaptures).toBe(1);
+		await fixture.runtime.finishTurn({ ...abandoned, terminal: true });
+	});
+
+	it("keeps Actor settlement authoritative when optional result promotion fails", async () => {
+		let disposed = 0;
+		const fixture = harness({
+			source: { id: "disabled", enabled: () => false, propose: () => undefined },
+			captureAuthoritativeResult: (action) => ({
+				route: RESOURCE_ROUTE,
+				seal: (output) =>
+					world(output, {
+						executionFingerprint: action.executionFingerprint,
+						onDispose: () => disposed++,
+					}),
+				dispose: () => {
+					disposed++;
+				},
+			}),
+			rejectCandidateOutput: () => {
+				throw new Error("optional cache policy failed");
+			},
+		});
+		const actorCall = call("promotion-failure");
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: actorCall.turnID });
+		expect(await fixture.runtime.consume(actorCall)).toBeUndefined();
+		await expect(fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" })).resolves.toBeUndefined();
+		expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
+		expect(disposed).toBe(1);
+		await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
 	});
 
 	it("preserves task timing when an already-aborted next turn is skipped", async () => {

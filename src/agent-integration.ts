@@ -826,6 +826,33 @@ export function createSpeculativeActionHost(
 			);
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
+		captureAuthoritativeResult: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
+			const tool = data.tools.get(toolName);
+			if (!tool) return undefined;
+			const effect = actionSemantics.effect(toolName);
+			if (!effect) return undefined;
+			const args = validateCandidateArguments(tool, toolName, concrete, callID);
+			if (args === undefined) return undefined;
+			const captured = await executionRouter.captureAuthoritativeResult(
+				{ tool: toolName, effect, action },
+				{ cwd: options.cwd, signal },
+				{
+					cwd: options.cwd,
+					tool,
+					toolName,
+					args,
+					action,
+					callID,
+					signal,
+				},
+			);
+			if (!captured) return undefined;
+			return {
+				route: captured.route,
+				seal: (output) => captured.capture.seal(output),
+				dispose: () => captured.capture.dispose(),
+			};
+		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
 			const tool = data.tools.get(toolName);

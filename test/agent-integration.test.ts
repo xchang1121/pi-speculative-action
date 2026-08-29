@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -143,6 +143,78 @@ describe("speculative action host", () => {
 			events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
 		);
 		await host.dispose();
+	});
+
+	it("reuses the Actor's own read across turns and invalidates it on resource change", async () => {
+		const cwd = await temporaryWorkspace();
+		let executions = 0;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async (_id, input) => {
+				executions++;
+				const text = await readFile(path.join(cwd, input.path), "utf8");
+				return { content: [{ type: "text", text }], details: {} };
+			},
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: () => ({
+				enabled: true,
+				drafterEnabled: false,
+				candidateLimit: 1,
+				maxConcurrentActions: 1,
+				tools: ["read"],
+				patternAware: { enabled: false },
+				selfSpeculation: { enabled: false },
+			}),
+			complete: async () => assistant([], "stop"),
+			preflight: () => true,
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		try {
+			await host.startTurn(startInput(tool, "actor-cache-1"));
+			const firstCall = {
+				turnID: "actor-cache-1",
+				id: "actor-cache-call-1",
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: [tool],
+			};
+			expect(await host.consume(firstCall)).toBeUndefined();
+			const firstResult = await tool.execute(firstCall.id, firstCall.args, undefined);
+			await host.actual({ ...firstCall, durationMs: 2, output: { result: firstResult, isError: false } });
+			expect(executions).toBe(1);
+			expect(host.runtime.inspect("session").sharedCandidates).toBe(1);
+			await host.finishTurn(firstCall.turnID);
+
+			await host.startTurn(startInput(tool, "actor-cache-2"));
+			const secondCall = { ...firstCall, turnID: "actor-cache-2", id: "actor-cache-call-2" };
+			await host.previewActorCall(secondCall);
+			expect(executions).toBe(1);
+			const cached = await host.consume(secondCall);
+			expect(cached, JSON.stringify(events, undefined, 2)).toBeDefined();
+			expect(cached?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
+			expect(executions).toBe(1);
+			await host.finishTurn(secondCall.turnID);
+
+			await writeFile(path.join(cwd, "notes.txt"), "changed", "utf8");
+			await host.startTurn(startInput(tool, "actor-cache-3"));
+			const thirdCall = { ...firstCall, turnID: "actor-cache-3", id: "actor-cache-call-3" };
+			expect(await host.consume(thirdCall)).toBeUndefined();
+			const thirdResult = await tool.execute(thirdCall.id, thirdCall.args, undefined);
+			await host.actual({ ...thirdCall, durationMs: 2, output: { result: thirdResult, isError: false } });
+			expect(executions).toBe(2);
+			await host.finishTurn(thirdCall.turnID, true);
+		} finally {
+			await host.dispose();
+		}
 	});
 
 	it("matches Bash intent but leaves the only process execution to the Actor", async () => {
@@ -996,11 +1068,12 @@ describe("speculative action host", () => {
 		let completeCalls = 0;
 		let draftOptionsCalls = 0;
 		let exactDraft = false;
+		let actionOffset = 1;
 		let gateEnabled = true;
 		const complete: CreateComplete = async () => {
 			completeCalls++;
 			await new Promise((resolve) => setTimeout(resolve, 15));
-			return drafterCall({ path: exactDraft ? "notes.txt" : "wrong.txt" });
+			return drafterCall({ path: exactDraft ? "notes.txt" : "wrong.txt", offset: actionOffset });
 		};
 		const tool: AgentTool<typeof readSchema> = {
 			name: "read",
@@ -1030,6 +1103,8 @@ describe("speculative action host", () => {
 		const runTurn = async (index: number, providerExpected: boolean, exact: boolean) => {
 			const turnID = `gate-${index}`;
 			exactDraft = exact;
+			// Each gate sample needs new work; otherwise authoritative-result reuse correctly bypasses the Drafter.
+			actionOffset = index;
 			await host.startTurn(startInput(tool, turnID));
 			await waitFor(
 				() => events.filter((event) => event.type === "source_request" && event.turnID === turnID).length === 2,
@@ -1045,7 +1120,7 @@ describe("speculative action host", () => {
 				turnID,
 				id: `actor-${index}`,
 				tool: "read",
-				args: { path: "notes.txt" },
+				args: { path: "notes.txt", offset: actionOffset },
 				tools: [tool],
 			});
 			if (!hit) {
@@ -1053,7 +1128,7 @@ describe("speculative action host", () => {
 					turnID,
 					id: `actor-${index}`,
 					tool: "read",
-					args: { path: "notes.txt" },
+					args: { path: "notes.txt", offset: actionOffset },
 					tools: [tool],
 					durationMs: 0,
 					output: { result: { content: [], details: {} }, isError: false },

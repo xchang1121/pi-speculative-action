@@ -21,6 +21,7 @@ import { PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import type {
 	AdoptedAction,
+	AuthoritativeResultCapture,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionRuntimeAdapter,
@@ -332,6 +333,7 @@ function forgetActorAction<SessionID, Output, StartInput, StateData>(
 	callID: string | undefined,
 	action: ActorAction,
 ): void {
+	disposeActorCapture(session, action);
 	if (callID) {
 		session.actorCalls.delete(callKey(action.identity.turnID, callID));
 		return;
@@ -345,15 +347,40 @@ function clearActorActions<SessionID, Output, StartInput, StateData>(
 	turnID?: string,
 ): void {
 	if (turnID === undefined) {
+		for (const capture of session.authoritativeResultCaptures.values()) disposeAuthoritativeResultCapture(capture);
+		session.authoritativeResultCaptures.clear();
 		session.actorCalls.clear();
 		session.anonymousActorCalls.length = 0;
 		return;
 	}
 	for (const [key, action] of session.actorCalls) {
-		if (action.identity.turnID === turnID) session.actorCalls.delete(key);
+		if (action.identity.turnID !== turnID) continue;
+		disposeActorCapture(session, action);
+		session.actorCalls.delete(key);
 	}
 	for (let index = session.anonymousActorCalls.length - 1; index >= 0; index--) {
-		if (session.anonymousActorCalls[index]?.identity.turnID === turnID) session.anonymousActorCalls.splice(index, 1);
+		const action = session.anonymousActorCalls[index];
+		if (action?.identity.turnID !== turnID) continue;
+		disposeActorCapture(session, action);
+		session.anonymousActorCalls.splice(index, 1);
+	}
+}
+
+function disposeActorCapture<SessionID, Output, StartInput, StateData>(
+	session: SessionState<SessionID, Output, StartInput, StateData>,
+	action: ActorAction,
+): void {
+	const capture = session.authoritativeResultCaptures.get(action);
+	if (!capture) return;
+	session.authoritativeResultCaptures.delete(action);
+	disposeAuthoritativeResultCapture(capture);
+}
+
+function disposeAuthoritativeResultCapture<Output>(capture: AuthoritativeResultCapture<Output>): void {
+	try {
+		void Promise.resolve(capture.dispose()).catch(() => undefined);
+	} catch {
+		// Capture cleanup cannot alter Actor execution or settlement.
 	}
 }
 
@@ -562,7 +589,7 @@ interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> {
 
 interface CandidateRecord<Output, StartInput, StateData> {
 	readonly id: string;
-	readonly origin: "prediction" | "actor_preview";
+	readonly origin: "prediction" | "actor_preview" | "actor_result";
 	readonly key: ActionKey;
 	readonly route: SpeculativeExecutionRoute;
 	readonly work: CandidateExecution<WorldBranch<Output>>;
@@ -596,7 +623,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 
 type ActorPreviewState =
 	| { readonly status: "pending" }
-	| { readonly status: "candidate"; readonly candidateID: string; readonly origin: "prediction" | "preview" }
+	| { readonly status: "candidate"; readonly candidateID: string; readonly ownership: "existing" | "preview" }
 	| { readonly status: "cancelled" };
 
 interface ActorPreviewRecord {
@@ -618,6 +645,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly sourceTasks: Set<Promise<void>>;
 	readonly actorCalls: Map<string, ActorAction>;
 	readonly anonymousActorCalls: ActorAction[];
+	readonly authoritativeResultCaptures: Map<ActorAction, AuthoritativeResultCapture<Output>>;
 	readonly turns: Set<string>;
 	readonly actorPhaseIntervals: TimelineInterval[];
 	readonly authoritativeToolIntervals: TimelineInterval[];
@@ -735,6 +763,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			sourceTasks: new Set(),
 			actorCalls: new Map(),
 			anonymousActorCalls: [],
+			authoritativeResultCaptures: new Map(),
 			turns: new Set(),
 			actorPhaseIntervals: [],
 			authoritativeToolIntervals: [],
@@ -1658,11 +1687,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		const preferred = rankCandidates(
 			action,
 			allCandidates(state.sessionID).filter(
-				(candidate) => candidate.origin === "prediction" && candidateWorld(candidate) === undefined,
+				(candidate) => candidate.origin !== "actor_preview" && candidateWorld(candidate) === undefined,
 			),
 		)[0]?.candidate;
 		if (preferred) {
-			if (record) record.state = { status: "candidate", candidateID: preferred.id, origin: "prediction" };
+			if (record) record.state = { status: "candidate", candidateID: preferred.id, ownership: "existing" };
 			if (preferred.work.execution.status === "queued") {
 				startQueuedCandidates(state.session, preferred, true);
 			}
@@ -1734,7 +1763,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			projectionMs: 0,
 		};
 		jobs.insert(state.sessionID, candidate);
-		record.state = { status: "candidate", candidateID: candidate.id, origin: "preview" };
+		record.state = { status: "candidate", candidateID: candidate.id, ownership: "preview" };
 		startQueuedCandidates(state.session, candidate, true);
 	};
 
@@ -1746,10 +1775,54 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!record) return;
 		const current = record.state;
 		record.state = { status: "cancelled" };
-		if (current.status !== "candidate" || current.origin !== "preview") return;
+		if (current.status !== "candidate" || current.ownership !== "preview") return;
 		const candidate = candidateByID(state.sessionID, current.candidateID);
 		if (!candidate) return;
 		discardCandidate(state.session, candidate, failure, false);
+	};
+
+	const beginAuthoritativeResultCapture = async (
+		state: Turn,
+		input: ConsumeInput,
+		actualCall: ActualToolCall,
+		actorAction: ActorAction,
+		action: ActionKey,
+		signal?: AbortSignal,
+	): Promise<void> => {
+		if (!adapter.captureAuthoritativeResult) return;
+		const concrete = asConcreteInput(actualCall.input);
+		if (!concrete) return;
+		const captureSignal = signal ?? state.generation.signal;
+		if (captureSignal.aborted) return;
+		let capture: AuthoritativeResultCapture<Output> | undefined;
+		try {
+			capture = await adapter.captureAuthoritativeResult({
+				startInput: state.startInput,
+				data: state.data,
+				consumeInput: input,
+				settings: state.settings,
+				tool: actualCall.tool,
+				concrete,
+				action,
+				callID: actualCall.id ?? callKey(state.turnID, actualCall.tool),
+				signal: captureSignal,
+			});
+		} catch {
+			return;
+		}
+		if (!capture) return;
+		if (
+			capture.route.reuse !== "shared_result" ||
+			captureSignal.aborted ||
+			state.lifecycle !== "active" ||
+			turns.get(state.key) !== state ||
+			masterEnabled === false
+		) {
+			disposeAuthoritativeResultCapture(capture);
+			return;
+		}
+		disposeActorCapture(state.session, actorAction);
+		state.session.authoritativeResultCaptures.set(actorAction, capture);
 	};
 
 	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
@@ -2065,6 +2138,14 @@ export function makeStructuralSpeculativeActionRuntime<
 			confirmPredictions(state.session, matchingPredictions, identity, adoption);
 			preemptForActor(state.session, actorResourceProfile(actualKey.tool), state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
+			admission.release();
+			if (
+				adapter.captureAuthoritativeResult &&
+				semantics.effect(actualKey.tool) === "observation" &&
+				state.candidateNames.includes(actualCall.tool)
+			) {
+				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
+			}
 			return undefined;
 		} finally {
 			admission.release();
@@ -2088,6 +2169,71 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const actorResourceProfile = (tool: string) => actionResourceProfile(semantics.effect(tool));
 
+	const promoteAuthoritativeResult = async (
+		state: Turn,
+		action: ActionKey,
+		output: Output,
+		durationMs: number,
+		toolExecution: TimelineInterval,
+		capture: AuthoritativeResultCapture<Output>,
+	): Promise<void> => {
+		let branch: WorldBranch<Output> | undefined;
+		try {
+			branch = await capture.seal(output);
+		} catch {
+			disposeAuthoritativeResultCapture(capture);
+			return;
+		}
+		let retained = false;
+		try {
+			const sequence = ++state.session.candidateSequence;
+			const work = new CandidateExecution<WorldBranch<Output>>("shared");
+			work.start(toolExecution.startedAt);
+			if (!work.succeed(branch, toolExecution.completedAt, durationMs)) return;
+			const candidate: Candidate = {
+				id: `actor_result_${sequence}_${action.hash.slice(0, 12)}`,
+				origin: "actor_result",
+				key: action,
+				route: capture.route,
+				work,
+				actorAdopted: true,
+				owner: {
+					startInput: state.startInput,
+					data: state.data,
+					settings: state.settings,
+					draft: { type: "tool_call", tool: action.tool, input: action.input, source: "actor_result" },
+					index: sequence - 1,
+				},
+				createdAt: Date.now(),
+				attemptStartedAt: toolExecution.startedAt,
+				predictionLatencyMs: 0,
+				draftTokens: 0,
+				totalDraftTokens: state.session.tokenTotal,
+				expectedDurationMs: durationMs,
+				expectedDecisionSeq: state.decisionSequence,
+				criticalPathMs: durationMs,
+				priorityMs: durationMs,
+				background: false,
+				estimatedBytes: estimateValueBytes(output) + branch.capturedBytes,
+				projectionCoverage: captureCoverage(action, output, projectionRules),
+				validationMs: 0,
+				validationBytes: 0,
+				validationFiles: 0,
+				projectionMs: 0,
+			};
+			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
+			if (rejected) return;
+			results.insert(state.sessionID, candidate);
+			retained = true;
+			installWatcher(state.session, candidate);
+			trimResults(state.session, state.settings);
+		} catch {
+			// Optional cache promotion cannot alter an already completed Actor result.
+		} finally {
+			if (!retained) disposeBranch(branch);
+		}
+	};
+
 	const actual = async (
 		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },
 	): Promise<void> => {
@@ -2096,12 +2242,28 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actualCall = adapter.actual(input) as ActualToolCall;
 		const actorAction = takeActorAction(state.session, input.turnID, actualCall);
 		if (!actorAction) return;
+		const capture = state.session.authoritativeResultCaptures.get(actorAction);
+		state.session.authoritativeResultCaptures.delete(actorAction);
 		const durationMs = finiteMetric(input.durationMs);
-		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) return;
+		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) {
+			if (capture) disposeAuthoritativeResultCapture(capture);
+			return;
+		}
 		state.session.scheduler.observeService(actorAction.tool, durationMs);
 		const key = actorAction.actionKey;
 		if (key) reconcileAuthoritativeEffects(state.session, key);
+		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, input.output);
+		if (capture && key && input.output !== undefined && !outputIsError(input.output)) {
+			const provider = actorAction.settlement?.provider;
+			if (provider?.kind === "actor") {
+				await promoteAuthoritativeResult(state, key, input.output, durationMs, provider.toolExecution, capture);
+			} else {
+				disposeAuthoritativeResultCapture(capture);
+			}
+		} else if (capture) {
+			disposeAuthoritativeResultCapture(capture);
+		}
 	};
 
 	const queueActorSettlement = (
@@ -2409,7 +2571,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		]) {
 			const candidate = lookup.entry;
 			if (
-				candidate.origin !== "prediction" ||
+				candidate.origin === "actor_preview" ||
 				!activeExecution(candidate) ||
 				!sameSpeculativeExecutionRoute(candidate.route, route) ||
 				candidateWorld(candidate) !== parent
@@ -2703,7 +2865,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const candidate of results.trim(
 			session.id,
 			cacheLimits(settings),
-			(entry) => entry.origin === "prediction" && reservationAvailable(entry.work.reservation),
+			(entry) => entry.origin !== "actor_preview" && reservationAvailable(entry.work.reservation),
 		)) {
 			removeCandidate(session, candidate);
 		}

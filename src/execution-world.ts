@@ -104,6 +104,19 @@ export interface WorldBranch<Output> {
 	readonly dispose: () => void | Promise<void>;
 }
 
+/** Pre-execution evidence that can seal one externally executed authoritative result. */
+export interface WorldResultCapture<Output> {
+	/** Transfer the captured baseline into a normal branch. May be called at most once. */
+	readonly seal: (output: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;
+	/** Release an unsealed baseline. Idempotent; a sealed branch owns its own cleanup. */
+	readonly dispose: () => void | Promise<void>;
+}
+
+export interface CapturedExecutionWorldResult<Output> {
+	readonly route: SpeculativeExecutionRoute;
+	readonly capture: WorldResultCapture<Output>;
+}
+
 export interface ExecutionWorldPreparation {
 	readonly cwd: string;
 	readonly signal?: AbortSignal;
@@ -116,6 +129,8 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
+	/** Capture freshness before a host-authoritative execution without executing the tool again. */
+	readonly captureAuthoritativeResult?: (context: Context) => Promise<WorldResultCapture<Output>>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
@@ -155,32 +170,30 @@ export class ExecutionWorldRouter<Context, Output> {
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		for (const scope of ["runtime", "fallback"] as const) {
-			for (const world of this.worlds) {
-				if (world.scope !== scope) continue;
-				try {
-					if (world.scope === "fallback" && !world.supports(request)) continue;
-					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
-					await world.prepare?.(preparation);
-					return Object.freeze({
-						isolation: world.isolation,
-						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
-						scope,
-						backend: world.id,
-						fingerprint,
-					});
-				} catch (error) {
-					if (preparation.signal?.aborted) throw error;
-					// Unavailable sandbox or fallback: continue down the explicit capability order.
-				}
-			}
-		}
-		return undefined;
+		return this.select(request, preparation, (_world, route) => route);
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
 		const world = this.world(route);
 		return world.fork(context);
+	}
+
+	/** Select a capture-capable world and snapshot its baseline before host execution. */
+	async captureAuthoritativeResult(
+		request: ExecutionWorldRequest,
+		preparation: ExecutionWorldPreparation,
+		context: Context,
+	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
+		return this.select(
+			request,
+			preparation,
+			async (world, route) => {
+				if (!world.captureAuthoritativeResult) return undefined;
+				const capture = await world.captureAuthoritativeResult(context);
+				return Object.freeze({ route, capture });
+			},
+			(world) => world.captureAuthoritativeResult !== undefined,
+		);
 	}
 
 	async dispose(): Promise<void> {
@@ -194,4 +207,43 @@ export class ExecutionWorldRouter<Context, Output> {
 		}
 		return world;
 	}
+
+	private async select<Selected>(
+		request: ExecutionWorldRequest,
+		preparation: ExecutionWorldPreparation,
+		select: (
+			world: ExecutionWorld<Context, Output>,
+			route: SpeculativeExecutionRoute,
+		) => Selected | undefined | Promise<Selected | undefined>,
+		eligible: (world: ExecutionWorld<Context, Output>) => boolean = () => true,
+	): Promise<Selected | undefined> {
+		for (const scope of ["runtime", "fallback"] as const) {
+			for (const world of this.worlds) {
+				if (world.scope !== scope || !eligible(world)) continue;
+				try {
+					if (world.scope === "fallback" && !world.supports(request)) continue;
+					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
+					await world.prepare?.(preparation);
+					const route = Object.freeze({
+						isolation: world.isolation,
+						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
+						scope,
+						backend: world.id,
+						fingerprint,
+					});
+					const selection = select(world, route);
+					const selected = isPromiseLike(selection) ? await selection : selection;
+					if (selected !== undefined) return selected;
+				} catch (error) {
+					if (preparation.signal?.aborted) throw error;
+					// Unavailable worlds are skipped in explicit capability order.
+				}
+			}
+		}
+		return undefined;
+	}
+}
+
+function isPromiseLike<Value>(value: Value | Promise<Value>): value is Promise<Value> {
+	return Boolean(value && typeof value === "object" && "then" in value && typeof value.then === "function");
 }

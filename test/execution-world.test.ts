@@ -54,6 +54,33 @@ describe("ExecutionWorldRouter", () => {
 			() => new ExecutionWorldRouter([runtime("same"), fallback("same", "resource_snapshot", () => true)]),
 		).toThrow("duplicate execution world same");
 	});
+
+	it("captures an authoritative result with the first explicitly capable world", async () => {
+		const disposeCapture = vi.fn();
+		const resourceBase = fallback("resource", "resource_snapshot", ({ effect }) => effect === "observation");
+		const resource: TestWorld = {
+			...resourceBase,
+			captureAuthoritativeResult: vi.fn(async () => ({
+				seal: (output: string) => resourceBase.fork({ value: output }),
+				dispose: disposeCapture,
+			})),
+		};
+		const runtimeWithoutCapture = { ...runtime("runtime"), prepare: vi.fn(async () => {}) };
+		const router = new ExecutionWorldRouter([runtimeWithoutCapture, resource]);
+
+		const captured = await router.captureAuthoritativeResult(
+			{ tool: "read", effect: "observation" },
+			preparation,
+			{ value: "unused" },
+		);
+
+		expect(captured?.route).toMatchObject({ backend: "resource", reuse: "shared_result" });
+		expect(runtimeWithoutCapture.prepare).not.toHaveBeenCalled();
+		expect(resource.captureAuthoritativeResult).toHaveBeenCalledOnce();
+		const branch = await captured?.capture.seal("actor output");
+		expect(await branch?.commit()).toBe("actor output");
+		expect(disposeCapture).not.toHaveBeenCalled();
+	});
 });
 
 function runtime(id: string): TestWorld {
