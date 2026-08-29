@@ -5,9 +5,16 @@ import {
 	ForkBenefitGate,
 	type ForkBenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
-import type { MaterializedSpeculativeCandidate } from "./runtime.ts";
+import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { SelfSpeculationActionBridge, SelfSpeculationActionCandidate } from "./self-speculation-action-bridge.ts";
 import type { ActionKey } from "./action-semantics.ts";
+import type { ActorActionSettlement } from "./settlement.ts";
+import {
+	ActionAdoptionLedger,
+	DecoderVerificationLedger,
+	type ActionEvidenceContext,
+	type DecoderEvidenceContext,
+} from "./self-speculation-evidence.ts";
 import { stableStringify } from "./stable-json.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
@@ -197,6 +204,13 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly forkGateSkips: number;
 	readonly forkGateSamples: number;
 	readonly forkGateExpectedNetBenefitMs?: number;
+	readonly forkActionAdoptions: number;
+	readonly forkExecutionAheadMs: number;
+	readonly decoderEvidenceContexts: number;
+	readonly decoderVerificationSteps: number;
+	readonly actionEvidenceContexts: number;
+	readonly actionEvidenceObservations: number;
+	readonly actionEvidenceAdoptions: number;
 	readonly failures: number;
 	readonly lastError?: string;
 }
@@ -204,6 +218,7 @@ export interface SelfSpeculationCoordinatorSnapshot {
 export interface SelfSpeculationVerificationStep {
 	readonly candidateIndex: number;
 	readonly candidateID?: string;
+	readonly candidateIDs: readonly string[];
 	readonly sources: readonly string[];
 	readonly draftedTokens: number;
 	readonly acceptedTokens: number;
@@ -252,8 +267,9 @@ interface TurnState {
 	readonly agreedForkKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
 	readonly candidateSourcesByID: Map<string, Set<string>>;
-	readonly actorActionTimes: Map<string, number>;
+	readonly candidateToolsByID: Map<string, string>;
 	readonly gateKey: string;
+	forkExecutionAheadMs: number;
 	forkStartedAt?: number;
 	forkCompletedAt?: number;
 	forkFailed: boolean;
@@ -281,6 +297,12 @@ interface CandidateRecord {
 	expectedDurationMs: number;
 }
 
+interface CandidateCalibration {
+	readonly decoderProbability: number;
+	readonly actionProbability: number;
+	readonly jointProbability: number;
+}
+
 type ProviderRole = "actor" | "drafter";
 
 /**
@@ -293,6 +315,8 @@ export class SelfSpeculationCoordinator {
 	private readonly requestID: () => string;
 	private readonly actionBridge?: SelfSpeculationActionBridge;
 	private readonly forkGate = new ForkBenefitGate();
+	private readonly decoderEvidence = new DecoderVerificationLedger();
+	private readonly actionEvidence = new ActionAdoptionLedger();
 	private readonly background = new Set<Promise<void>>();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
@@ -320,6 +344,8 @@ export class SelfSpeculationCoordinator {
 	private totalForkLogprob = 0;
 	private totalForkLogprobTokens = 0;
 	private forkGateSkips = 0;
+	private forkActionAdoptions = 0;
+	private totalForkExecutionAheadMs = 0;
 	private latestGateKey?: string;
 	private failureCount = 0;
 	private lastFailure?: string;
@@ -364,8 +390,9 @@ export class SelfSpeculationCoordinator {
 			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
 			candidateSourcesByID: new Map(),
-			actorActionTimes: new Map(),
+			candidateToolsByID: new Map(),
 			gateKey: modelKey(model),
+			forkExecutionAheadMs: 0,
 			forkFailed: false,
 			ended: false,
 			gateSampleRecorded: false,
@@ -553,8 +580,31 @@ export class SelfSpeculationCoordinator {
 		if (!state) return;
 		const key = action.key;
 		state.actorActionKeys.add(key);
-		if (!state.actorActionTimes.has(key)) state.actorActionTimes.set(key, performance.now());
 		this.reconcileForkMatches(state);
+	}
+
+	/** Feed authoritative adoption into action utility without conflating it with token verification. */
+	observeActorSettlement(settlement: ActorActionSettlement): void {
+		const state = this.active;
+		if (!state) return;
+		const matchedSources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
+		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
+		const share = settlement.provider.timing.executionAheadMs / Math.max(1, matchedSources.size);
+		state.forkExecutionAheadMs += share;
+		this.totalForkExecutionAheadMs += share;
+		this.forkActionAdoptions++;
+	}
+
+	/** Feed semantic prediction adoption into decoder ranking without touching token evidence. */
+	observePredictionSettlement(feedback: PredictionFeedback<string>): void {
+		const state = this.active;
+		const settlement = feedback.settlement;
+		if (!state || settlement.observation !== "observed") return;
+		const adopted = settlement.match.matched && settlement.match.adoption.status === "adopted";
+		this.actionEvidence.observe(
+			actionEvidenceContext(state, feedback.tool, settlement.prediction.source),
+			adopted,
+		);
 	}
 
 	endTurn(): void {
@@ -601,6 +651,8 @@ export class SelfSpeculationCoordinator {
 
 	snapshot(): SelfSpeculationCoordinatorSnapshot {
 		const gate = this.latestGateKey ? this.forkGate.snapshot(this.latestGateKey) : undefined;
+		const decoderEvidence = this.decoderEvidence.snapshot();
+		const actionEvidence = this.actionEvidence.snapshot();
 		return {
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
 			bufferedCandidates:
@@ -636,6 +688,13 @@ export class SelfSpeculationCoordinator {
 			...(gate?.expectedNetBenefitMs === undefined
 				? {}
 				: { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
+			forkActionAdoptions: this.forkActionAdoptions,
+			forkExecutionAheadMs: this.totalForkExecutionAheadMs,
+			decoderEvidenceContexts: decoderEvidence.contexts,
+			decoderVerificationSteps: decoderEvidence.verificationSteps,
+			actionEvidenceContexts: actionEvidence.contexts,
+			actionEvidenceObservations: actionEvidence.observations,
+			actionEvidenceAdoptions: actionEvidence.adoptions,
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
@@ -664,9 +723,28 @@ export class SelfSpeculationCoordinator {
 			this.unresolvedDraftProposals += outcome.unresolvedProposals;
 			this.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
 			this.lastVerification = outcome;
+			this.observeVerificationEvidence(state, outcome);
 		} catch (error) {
 			this.failureCount++;
 			this.lastFailure = error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	private observeVerificationEvidence(state: TurnState, outcome: SelfSpeculationVerificationOutcome): void {
+		for (const step of outcome.steps) {
+			const records = [...state.candidates.values()].filter((candidate) => step.candidateIDs.includes(candidate.id));
+			const tool = records[0]?.tool ?? step.candidateIDs.map((id) => state.candidateToolsByID.get(id)).find(Boolean);
+			if (!tool) continue;
+			const sources = step.sources.length
+				? step.sources
+				: [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
+			for (const source of sources) {
+				this.decoderEvidence.observe(
+					decoderEvidenceContext(state, tool, source),
+					step.draftedTokens,
+					step.acceptedTokens,
+				);
+			}
 		}
 	}
 
@@ -688,7 +766,10 @@ export class SelfSpeculationCoordinator {
 		while (state.dirty && state.requestID) {
 			state.dirty = false;
 			const settings = state.settings;
-			const candidates = rankedCandidates(state.candidates.values()).slice(0, settings.maxCandidates);
+			const candidates = rankedCandidates(
+				state.candidates.values(),
+				(candidate) => this.candidateCalibration(state, candidate),
+			).slice(0, settings.maxCandidates);
 			if (!candidates.length) continue;
 			const receipt = await this.post(
 				settings.candidatePath,
@@ -699,13 +780,29 @@ export class SelfSpeculationCoordinator {
 					max_draft_tokens: settings.maxDraftTokens,
 					format: settings.draftFormat,
 					boundary: settings.draftBoundary,
-					candidates: candidates.map(candidatePayload),
+					candidates: candidates.map((candidate) =>
+						candidatePayload(candidate, this.candidateCalibration(state, candidate)),
+					),
 				},
 				settings,
 			);
 			this.recordReceipt(receipt, state, false);
 			this.submissions++;
 		}
+	}
+
+	private candidateCalibration(state: TurnState, candidate: CandidateRecord): CandidateCalibration {
+		const decoderProbability = this.decoderEvidence.probability(
+			[...candidate.sources].map((source) => decoderEvidenceContext(state, candidate.tool, source)),
+		);
+		const actionProbability = this.actionEvidence.probability(
+			[...candidate.sources].map((source) => actionEvidenceContext(state, candidate.tool, source)),
+		);
+		return {
+			decoderProbability,
+			actionProbability,
+			jointProbability: decoderProbability * actionProbability,
+		};
 	}
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
@@ -734,9 +831,17 @@ export class SelfSpeculationCoordinator {
 				for (const source of sources) knownSources.add(source);
 				state.candidateSourcesByID.set(candidateID, knownSources);
 			}
+			const observedCall = record(array(candidate.tool_calls)[0]);
+			const observedTool = nonEmptyString(observedCall?.name);
+			if (observedTool) {
+				for (const rawCandidateID of array(candidate.candidate_ids)) {
+					const candidateID = nonEmptyString(rawCandidateID);
+					if (candidateID) state.candidateToolsByID.set(candidateID, observedTool);
+				}
+			}
 			if (!fork) continue;
 			if (!sources.includes("self-speculation")) continue;
-			const call = record(array(candidate.tool_calls)[0]);
+			const call = observedCall;
 			const tool = nonEmptyString(call?.name);
 			const input = record(call?.arguments);
 			const fingerprint = tool && input ? toolCallFingerprint(tool, input) : undefined;
@@ -788,16 +893,11 @@ export class SelfSpeculationCoordinator {
 		)
 			return;
 		state.gateSampleRecorded = true;
-		const actorMatchAt = [...state.matchedForkKeys]
-			.map((key) => state.actorActionTimes.get(key))
-			.filter((value): value is number => value !== undefined)
-			.reduce<number | undefined>((earliest, value) => (earliest === undefined ? value : Math.min(earliest, value)), undefined);
 		this.forkGate.observe(
 			state.gateKey,
 			{
-				forkLatencyMs: state.forkCompletedAt - state.forkStartedAt,
-				exactLeadMs:
-					actorMatchAt === undefined ? 0 : Math.max(0, actorMatchAt - state.forkCompletedAt),
+				costMs: state.forkCompletedAt - state.forkStartedAt,
+				benefitMs: state.forkExecutionAheadMs,
 				...(state.forkFailed ? { failed: true } : {}),
 			},
 			forkGatePolicy(state.settings),
@@ -909,7 +1009,7 @@ function forkGatePolicy(settings: SelfSpeculationSettings): ForkBenefitGatePolic
 	};
 }
 
-function candidatePayload(candidate: CandidateRecord): Readonly<Record<string, unknown>> {
+function candidatePayload(candidate: CandidateRecord, calibration: CandidateCalibration): Readonly<Record<string, unknown>> {
 	return {
 		id: candidate.id,
 		action_identity: {
@@ -922,6 +1022,9 @@ function candidatePayload(candidate: CandidateRecord): Readonly<Record<string, u
 		provenance: candidate.provenance,
 		tool_call: { name: candidate.tool, arguments: candidate.input },
 		score: {
+			decoder_acceptance_probability: calibration.decoderProbability,
+			action_adoption_probability: calibration.actionProbability,
+			joint_speculation_probability: calibration.jointProbability,
 			depth: candidate.depth,
 			horizon: candidate.horizon,
 			expected_decision_sequence: candidate.expectedDecisionSequence,
@@ -967,17 +1070,25 @@ function mergeCandidateRecords(target: Map<string, CandidateRecord>, records: It
 	}
 }
 
-function rankedCandidates(candidates: Iterable<CandidateRecord>): CandidateRecord[] {
-	return [...candidates].sort(
-		(left, right) =>
-			left.horizon - right.horizon ||
-			right.conditionalProbability - left.conditionalProbability ||
-			right.empiricalProbability - left.empiricalProbability ||
-			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
-			right.expectedDurationMs - left.expectedDurationMs ||
-			left.depth - right.depth ||
-			left.sequence - right.sequence,
-	);
+function rankedCandidates(
+	candidates: Iterable<CandidateRecord>,
+	calibration: (candidate: CandidateRecord) => CandidateCalibration,
+): CandidateRecord[] {
+	return [...candidates]
+		.map((candidate) => ({ candidate, calibration: calibration(candidate) }))
+		.sort(
+			(left, right) =>
+				left.candidate.horizon - right.candidate.horizon ||
+				right.calibration.jointProbability - left.calibration.jointProbability ||
+				right.calibration.decoderProbability - left.calibration.decoderProbability ||
+				right.candidate.conditionalProbability - left.candidate.conditionalProbability ||
+				right.candidate.empiricalProbability - left.candidate.empiricalProbability ||
+				right.candidate.expectedLatencyBenefitMs - left.candidate.expectedLatencyBenefitMs ||
+				right.candidate.expectedDurationMs - left.candidate.expectedDurationMs ||
+				left.candidate.depth - right.candidate.depth ||
+				left.candidate.sequence - right.candidate.sequence,
+		)
+		.map(({ candidate }) => candidate);
 }
 
 function serializableContext(context: Context): Context {
@@ -1021,6 +1132,21 @@ function modelKey(model: Model<Api>): string {
 	return JSON.stringify([model.provider, model.api, model.id]);
 }
 
+function decoderEvidenceContext(state: TurnState, tool: string, source: string): DecoderEvidenceContext {
+	return {
+		model: state.gateKey,
+		endpoint: state.settings.endpoint,
+		format: state.settings.draftFormat,
+		boundary: state.settings.draftBoundary,
+		tool,
+		source,
+	};
+}
+
+function actionEvidenceContext(state: TurnState, tool: string, source: string): ActionEvidenceContext {
+	return { model: state.gateKey, tool, source };
+}
+
 function parseVerificationOutcome(
 	verification: Readonly<Record<string, unknown>>,
 	requestID: string,
@@ -1044,10 +1170,21 @@ function parseVerificationOutcome(
 			: nonEmptyString(step.candidate_id);
 		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
 			throw new Error("self-speculation verification candidate_id must be a non-empty string");
+		const candidateIDs = [...new Set([
+			...(candidateID ? [candidateID] : []),
+			...array(step.candidate_ids).map(nonEmptyString).filter((value): value is string => value !== undefined),
+		])];
+		const reportedSources = array(step.sources)
+			.map(nonEmptyString)
+			.filter((value): value is string => value !== undefined);
+		const sources = reportedSources.length
+			? [...new Set(reportedSources)]
+			: [...new Set(candidateIDs.flatMap((id) => sourcesByCandidateID.get(id) ?? []))];
 		return Object.freeze({
 			candidateIndex,
 			...(candidateID ? { candidateID } : {}),
-			sources: Object.freeze([...(candidateID ? sourcesByCandidateID.get(candidateID) ?? [] : [])]),
+			candidateIDs: Object.freeze(candidateIDs),
+			sources: Object.freeze(sources),
 			draftedTokens,
 			acceptedTokens,
 			rejectedTokens,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
-import type { MaterializedSpeculativeCandidate } from "../src/runtime.ts";
+import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "../src/runtime.ts";
 import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
 import {
 	normalizeSelfSpeculationSettings,
@@ -212,6 +212,110 @@ describe("self-speculation control plane", () => {
 					}),
 				],
 			},
+		});
+	});
+
+	it("uses target verification to calibrate the next decision without changing action probabilities", async () => {
+		const requests: CapturedRequest[] = [];
+		const coordinator = coordinatorFixture(
+			requests,
+			{ forkEnabled: false },
+			["actor-1", "actor-2"],
+			(request) =>
+				request.path === SELF_SPECULATION_DEFAULTS.clearPath && request.body.request_id === "actor-1"
+					? {
+							verification: {
+								num_spec_steps: 2,
+								num_draft_tokens: 20,
+								num_accepted_draft_tokens: 10,
+								num_rejected_draft_tokens: 10,
+								steps: [
+									{
+										candidate_index: 0,
+										candidate_id: actionIdentity("drafter-1"),
+										candidate_ids: [actionIdentity("drafter-1")],
+										sources: ["drafter"],
+										drafted_tokens: 10,
+										accepted_tokens: 0,
+										rejected_tokens: 10,
+									},
+									{
+										candidate_index: 1,
+										candidate_id: actionIdentity("pattern-1"),
+										candidate_ids: [actionIdentity("pattern-1")],
+										sources: ["pattern-aware"],
+										drafted_tokens: 10,
+										accepted_tokens: 10,
+										rejected_tokens: 0,
+									},
+								],
+							},
+						}
+					: { ok: true },
+		);
+
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.addCandidate(candidate("drafter", "drafter-1", "unused", "read", { path: "a.txt" }, 0.9));
+		coordinator.addCandidate(
+			candidate("pattern-aware", "pattern-1", "unused", "read", { path: "b.txt" }, 0.8),
+		);
+		coordinator.decorateActorPayload({ model: "actor" });
+		coordinator.endTurn();
+		await vi.waitFor(() => expect(coordinator.snapshot().decoderVerificationSteps).toBe(2));
+
+		coordinator.startTurn("turn-2", model(), context(), 2);
+		coordinator.addCandidate(
+			candidate("drafter", "drafter-2", "unused", "read", { path: "c.txt" }, 0.9, 2),
+		);
+		coordinator.addCandidate(
+			candidate("pattern-aware", "pattern-2", "unused", "read", { path: "d.txt" }, 0.8, 2),
+		);
+		coordinator.decorateActorPayload({ model: "actor" });
+		await coordinator.dispose();
+
+		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
+		expect(bundles.at(-1)?.body.candidates.map((item: Record<string, any>) => item.sources)).toEqual([
+			["pattern-aware"],
+			["drafter"],
+		]);
+		expect(bundles.at(-1)?.body.candidates[0].score.decoder_acceptance_probability).toBeGreaterThan(
+			bundles.at(-1)?.body.candidates[1].score.decoder_acceptance_probability,
+		);
+		expect(coordinator.snapshot()).toMatchObject({ decoderEvidenceContexts: 2, decoderVerificationSteps: 2 });
+	});
+
+	it("lets independent Actor adoption evidence feed decoder candidate ordering", async () => {
+		const requests: CapturedRequest[] = [];
+		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-2"]);
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		for (let index = 0; index < 3; index++) {
+			coordinator.observePredictionSettlement(predictionFeedback("drafter", false, index));
+			coordinator.observePredictionSettlement(predictionFeedback("pattern-aware", true, index));
+		}
+		coordinator.endTurn();
+
+		coordinator.startTurn("turn-2", model(), context(), 2);
+		coordinator.addCandidate(
+			candidate("drafter", "drafter-action", "unused", "read", { path: "a.txt" }, 0.95, 2),
+		);
+		coordinator.addCandidate(
+			candidate("pattern-aware", "pattern-action", "unused", "read", { path: "b.txt" }, 0.6, 2),
+		);
+		coordinator.decorateActorPayload({ model: "actor" });
+		await coordinator.dispose();
+
+		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
+		expect(bundle?.body.candidates.map((item: Record<string, any>) => item.sources)).toEqual([
+			["pattern-aware"],
+			["drafter"],
+		]);
+		expect(bundle?.body.candidates[0].score.action_adoption_probability).toBeGreaterThan(
+			bundle?.body.candidates[1].score.action_adoption_probability,
+		);
+		expect(coordinator.snapshot()).toMatchObject({
+			actionEvidenceContexts: 2,
+			actionEvidenceObservations: 6,
+			actionEvidenceAdoptions: 3,
 		});
 	});
 
@@ -623,6 +727,37 @@ function candidate(
 
 function actionIdentity(key: string): string {
 	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+function predictionFeedback(source: string, adopted: boolean, sequence: number): PredictionFeedback<string> {
+	const base = {
+		sessionID: "session-1",
+		turnID: "turn-1",
+		tool: "read",
+	};
+	const settlementBase = {
+		prediction: {
+			id: `${source}:${sequence}`,
+			source,
+			proposalID: `${source}:proposal`,
+			actionID: `${source}:action`,
+		},
+		observation: "observed" as const,
+		actorAction: { id: `actor:${sequence}`, sequence, decisionSequence: 1, turnID: "turn-1" },
+	};
+	return adopted
+		? {
+				...base,
+				settlement: {
+					...settlementBase,
+					match: {
+						matched: true,
+						relation: { kind: "exact", distance: 0 },
+						adoption: { status: "adopted", candidateID: `candidate:${sequence}` },
+					},
+				},
+			}
+		: { ...base, settlement: { ...settlementBase, match: { matched: false } } };
 }
 
 function action(key: string, hash: string, tool: string, input: Record<string, unknown>): ActionKey {

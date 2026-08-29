@@ -184,6 +184,8 @@ export {
 } from "./resource-version.ts";
 export {
 	type CandidatePreflight,
+	type ActorActionFeedback,
+	type PredictionFeedback,
 	candidateExecutionMs,
 	candidateToolNames,
 	diagnosticAction,

@@ -22,6 +22,8 @@
 
 ### Added
 
+- Added a target-verification ledger that calibrates decoder candidate order by model, endpoint, format, tool, and source while keeping token evidence separate from semantic action learning.
+- Added a policy-facing Actor settlement channel; the sidecar fork gate now credits only source-attributed, actually adopted `executionAheadMs` instead of intent-match wall-clock lead.
 - Added Runtime-owned Actor action materialization and collision-resistant SHA-256 decoder candidate IDs, removing the self-speculation coordinator's parallel K(a) reconstruction.
 - Added a configurable SPORK minimum-token confidence gate for sidecar action execution; the default 0.90 threshold fails closed on missing evidence without suppressing the underlying fork or decoder telemetry.
 - Added a bounded, turn-scoped handoff that admits complete sidecar-fork tool calls to the ordinary speculative-action Runtime without issuing another inference request.

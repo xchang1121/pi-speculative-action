@@ -1161,6 +1161,8 @@ describe("speculative action host", () => {
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
 			onCandidateMaterialized: (candidate) => coordinator.addCandidate(candidate),
 			onActorActionMaterialized: ({ action }) => coordinator.observeActorAction(action),
+			onActorActionSettled: ({ settlement }) => coordinator.observeActorSettlement(settlement),
+			onPredictionSettled: (feedback) => coordinator.observePredictionSettlement(feedback),
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -1246,6 +1248,8 @@ describe("speculative action host", () => {
 		expect(events.some((event) => event.type === "source_request" && event.turnID === "fork-disabled")).toBe(false);
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-disabled")).toBe(false);
 		await finishTurn("fork-disabled");
+		expect(coordinator.snapshot().forkActionAdoptions).toBe(1);
+		expect(coordinator.snapshot().forkExecutionAheadMs).toBeGreaterThan(50);
 		await host.dispose();
 		await coordinator.dispose();
 	}, 5_000);

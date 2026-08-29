@@ -46,8 +46,10 @@ import {
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type {
 	CandidatePreflight,
+	ActorActionFeedback,
 	MaterializedActorAction,
 	MaterializedSpeculativeCandidate,
+	PredictionFeedback,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
@@ -150,6 +152,10 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
 	/** Receives the exact Runtime-owned K(a) of each authoritative Actor call. */
 	readonly onActorActionMaterialized?: (action: MaterializedActorAction<string>) => void | Promise<void>;
+	/** Receives authoritative adoption and realized execution-ahead feedback. */
+	readonly onActorActionSettled?: (feedback: ActorActionFeedback<string>) => void | Promise<void>;
+	/** Receives observed prediction matches and adoption independently of decoder verification. */
+	readonly onPredictionSettled?: (feedback: PredictionFeedback<string>) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
@@ -923,6 +929,8 @@ export function createSpeculativeActionHost(
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
 		onActorActionMaterialized: options.onActorActionMaterialized,
+		onActorActionSettled: options.onActorActionSettled,
+		onPredictionSettled: options.onPredictionSettled,
 		onEvent: async (event) => {
 			if (
 				event.type === "actor_action" &&

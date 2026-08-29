@@ -370,6 +370,8 @@ async function installController(
 			selfSpeculation.startTurn(turnID, actorModel, actorContext, decisionSequence),
 		onCandidateMaterialized: (candidate) => selfSpeculation.addCandidate(candidate),
 		onActorActionMaterialized: ({ action }) => selfSpeculation.observeActorAction(action),
+		onActorActionSettled: ({ settlement }) => selfSpeculation.observeActorSettlement(settlement),
+		onPredictionSettled: (feedback) => selfSpeculation.observePredictionSettlement(feedback),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
 			recentEvents.push(formatSpeculativeActionEvent(event));

@@ -2141,6 +2141,16 @@ export function makeStructuralSpeculativeActionRuntime<
 			...(settledCandidate ? { candidate: candidateEventDescriptor(settledCandidate) } : {}),
 		};
 		state.session.effects.enqueue(async () => {
+			try {
+				await adapter.onActorActionSettled?.({
+					sessionID: state.sessionID,
+					turnID: state.turnID,
+					...(key ? { action: key } : {}),
+					settlement,
+				});
+			} catch {
+				// Policy feedback cannot alter authoritative settlement or source learning.
+			}
 			await emit(event);
 			const concrete = asConcreteInput(actualCall.input) ?? {};
 			for (const source of sources) {
@@ -2226,6 +2236,17 @@ export function makeStructuralSpeculativeActionRuntime<
 			settlement,
 		};
 		session.effects.enqueue(async () => {
+			try {
+				await adapter.onPredictionSettled?.({
+					sessionID: session.id,
+					turnID: context.startInput.turnID,
+					tool: node.action.tool,
+					...(node.actionKey ? { action: node.actionKey } : {}),
+					settlement,
+				});
+			} catch {
+				// Policy feedback is a projection of settlement, never its owner.
+			}
 			await emit(event);
 			try {
 				if (source?.onSettled) {

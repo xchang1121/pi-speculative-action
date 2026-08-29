@@ -5,7 +5,7 @@ import type { SpeculativeActionEvent } from "./events.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
-import type { ActorActionIdentity, PredictionSettlement } from "./settlement.ts";
+import type { ActorActionIdentity, ActorActionSettlement, PredictionSettlement } from "./settlement.ts";
 
 export { diagnosticAction, diagnosticJson, redactDiagnostics } from "./diagnostics.ts";
 
@@ -102,6 +102,23 @@ export interface MaterializedActorAction<SessionID> {
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly action: ActionKey;
+}
+
+/** Policy-facing authoritative settlement, kept separate from diagnostic events. */
+export interface ActorActionFeedback<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly action?: ActionKey;
+	readonly settlement: ActorActionSettlement;
+}
+
+/** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */
+export interface PredictionFeedback<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly tool: string;
+	readonly action?: ActionKey;
+	readonly settlement: PredictionSettlement;
 }
 
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
@@ -274,6 +291,10 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => MaybePromise<void>;
 	/** Best-effort identity side channel; failures cannot affect Actor matching or execution. */
 	readonly onActorActionMaterialized?: (action: MaterializedActorAction<SessionID>) => MaybePromise<void>;
+	/** Best-effort policy feedback; failures cannot affect Actor settlement or source learning. */
+	readonly onActorActionSettled?: (feedback: ActorActionFeedback<SessionID>) => MaybePromise<void>;
+	/** Best-effort policy feedback; failures cannot affect prediction or source settlement. */
+	readonly onPredictionSettled?: (feedback: PredictionFeedback<SessionID>) => MaybePromise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
 }
 
