@@ -419,6 +419,13 @@ describe("self-speculation control plane", () => {
 											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
 											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
 											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
+											{
+												sources: ["self-speculation"],
+												tool_calls: [
+													{ name: "read", arguments: { path: "partial.txt" } },
+													{ name: "read", arguments: "bad" },
+												],
+											},
 											{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
 											{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
 										],
@@ -438,6 +445,84 @@ describe("self-speculation control plane", () => {
 			{ tool: "read", input: { path: "a.txt" } },
 			{ tool: "write", input: { path: "b.txt" } },
 		]);
+		await coordinator.dispose();
+	});
+
+	it("publishes a complete sidecar call batch with candidate evidence intact", async () => {
+		const actionBridge = new SelfSpeculationActionBridge();
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar", forkActionMinConfidence: 0 }),
+			requestID: () => "actor-request",
+			actionBridge,
+			fetch: vi.fn(async (input) =>
+				Response.json(
+					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+						? {
+								details: {
+									bundle: {
+										candidates: [
+											{
+												candidate_ids: ["fork-candidate"],
+												sources: ["self-speculation", "drafter"],
+												provenance: [{ proposalID: "p", actionID: "a" }],
+												action_identities: [{ predicted_action_id: "predicted" }],
+												draft_token_count: 18,
+												score: { joint_speculation_probability: 0.72 },
+												tool_calls: [
+													{
+														name: "read",
+														arguments: { path: "a.txt" },
+														index: 0,
+														call_id: "call-a",
+														format: "structured",
+													},
+													{ name: "read", arguments: { path: "b.txt" }, index: 1 },
+												],
+												fork: {
+													total_ms: 25,
+													logprobs: {
+														token_count: 2,
+														mean: Math.log(0.96),
+														minimum: Math.log(0.96),
+													},
+												},
+											},
+										],
+									},
+								},
+							}
+						: {},
+				),
+			),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const batches = actionBridge.waitForBatches("turn-1", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+
+		const [batch] = await batches;
+		expect(batch.calls).toEqual([
+			{
+				id: "0:fork",
+				index: 0,
+				callID: "call-a",
+				format: "structured",
+				tool: "read",
+				input: { path: "a.txt" },
+			},
+			{ id: "1:fork", index: 1, tool: "read", input: { path: "b.txt" } },
+		]);
+		expect(batch.evidence).toHaveLength(1);
+		expect(batch.evidence[0]).toMatchObject({
+			candidateIDs: ["fork-candidate"],
+			sources: ["self-speculation", "drafter"],
+			provenance: [{ proposalID: "p", actionID: "a" }],
+			actionIdentities: [{ predicted_action_id: "predicted" }],
+			draftTokenCount: 18,
+			score: { joint_speculation_probability: 0.72 },
+			fork: { total_ms: 25 },
+		});
+		expect(batch.evidence[0]?.confidence).toBeCloseTo(0.96);
 		await coordinator.dispose();
 	});
 

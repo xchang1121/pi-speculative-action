@@ -1089,11 +1089,12 @@ describe("speculative action host", () => {
 		await host.dispose();
 	}, 5_000);
 
-	it("turns one sidecar fork batch into safe action alternatives with real execution ahead", async () => {
+	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
 		const cwd = await temporaryWorkspace();
 		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
 		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
 		const events: SpeculativeActionEvent<string>[] = [];
+		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 		const actionBridge = new SelfSpeculationActionBridge();
 		let forkPath = "notes.txt";
 		let forkMinimumLogprob = Math.log(0.95);
@@ -1118,8 +1119,12 @@ describe("speculative action host", () => {
 									bundle: {
 										candidates: [
 											{
+												candidate_ids: [`fork:${forkPath}`],
 												sources: ["self-speculation"],
-												tool_calls: [{ name: "read", arguments: { path: forkPath } }],
+												tool_calls: [
+													{ name: "read", arguments: { path: forkPath }, index: 0 },
+													{ name: "read", arguments: { path: `${forkPath}.sibling` }, index: 1 },
+												],
 												fork: {
 													logprobs: {
 														token_count: 1,
@@ -1159,7 +1164,10 @@ describe("speculative action host", () => {
 			preflight: () => true,
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
-			onCandidateMaterialized: (candidate) => coordinator.addCandidate(candidate),
+			onCandidateMaterialized: (candidate) => {
+				materialized.push(candidate);
+				coordinator.addCandidate(candidate);
+			},
 			onActorActionMaterialized: ({ action }) => coordinator.observeActorAction(action),
 			onActorActionSettled: ({ settlement }) => coordinator.observeActorSettlement(settlement),
 			onPredictionSettled: (feedback) => coordinator.observePredictionSettlement(feedback),
@@ -1183,6 +1191,14 @@ describe("speculative action host", () => {
 				(event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded",
 			),
 		);
+		await waitFor(
+			() => materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation").length === 2,
+		);
+		const forkBatch = materialized.filter(
+			(candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation",
+		);
+		expect(new Set(forkBatch.map((candidate) => candidate.proposalID)).size).toBe(1);
+		expect(forkBatch.map((candidate) => candidate.actionID)).toEqual(["0:fork", "1:fork"]);
 		const hit = await host.consume({
 			turnID: "fork-hit",
 			id: "actor-hit",

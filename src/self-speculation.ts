@@ -6,7 +6,11 @@ import {
 	type ForkBenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
-import type { SelfSpeculationActionBridge, SelfSpeculationActionCandidate } from "./self-speculation-action-bridge.ts";
+import type {
+	SelfSpeculationActionBatch,
+	SelfSpeculationActionBridge,
+	SelfSpeculationActionEvidence,
+} from "./self-speculation-action-bridge.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import {
@@ -267,7 +271,7 @@ interface TurnState {
 	readonly agreedForkKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
 	readonly candidateSourcesByID: Map<string, Set<string>>;
-	readonly candidateToolsByID: Map<string, string>;
+	readonly candidateToolsByID: Map<string, Set<string>>;
 	readonly gateKey: string;
 	forkExecutionAheadMs: number;
 	forkStartedAt?: number;
@@ -301,6 +305,14 @@ interface CandidateCalibration {
 	readonly decoderProbability: number;
 	readonly actionProbability: number;
 	readonly jointProbability: number;
+}
+
+interface ParsedSidecarActionCall {
+	readonly index: number;
+	readonly callID?: string;
+	readonly format?: string;
+	readonly tool: string;
+	readonly input: Readonly<Record<string, unknown>>;
 }
 
 type ProviderRole = "actor" | "drafter";
@@ -537,7 +549,7 @@ export class SelfSpeculationCoordinator {
 		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 		if (!gateDecision.allowed) {
 			this.forkGateSkips++;
-			this.actionBridge?.publish(state.turnID, []);
+			this.actionBridge?.publishBatches(state.turnID, []);
 			return;
 		}
 		this.forks++;
@@ -564,7 +576,7 @@ export class SelfSpeculationCoordinator {
 			.catch((error: unknown) => {
 				state.forkFailed = true;
 				state.forkCompletedAt = performance.now();
-				this.actionBridge?.publish(state.turnID, []);
+				this.actionBridge?.publishBatches(state.turnID, []);
 				this.finalizeGateSample(state);
 				throw error;
 			})
@@ -733,17 +745,22 @@ export class SelfSpeculationCoordinator {
 	private observeVerificationEvidence(state: TurnState, outcome: SelfSpeculationVerificationOutcome): void {
 		for (const step of outcome.steps) {
 			const records = [...state.candidates.values()].filter((candidate) => step.candidateIDs.includes(candidate.id));
-			const tool = records[0]?.tool ?? step.candidateIDs.map((id) => state.candidateToolsByID.get(id)).find(Boolean);
-			if (!tool) continue;
+			const tools = new Set(records.map((candidate) => candidate.tool));
+			for (const candidateID of step.candidateIDs) {
+				for (const tool of state.candidateToolsByID.get(candidateID) ?? []) tools.add(tool);
+			}
+			if (!tools.size) continue;
 			const sources = step.sources.length
 				? step.sources
 				: [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
-			for (const source of sources) {
-				this.decoderEvidence.observe(
-					decoderEvidenceContext(state, tool, source),
-					step.draftedTokens,
-					step.acceptedTokens,
-				);
+			for (const tool of tools) {
+				for (const source of sources) {
+					this.decoderEvidence.observe(
+						decoderEvidenceContext(state, tool, source),
+						step.draftedTokens,
+						step.acceptedTokens,
+					);
+				}
 			}
 		}
 	}
@@ -807,7 +824,7 @@ export class SelfSpeculationCoordinator {
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
 		if (!isRecord(receipt)) {
-			if (fork) this.actionBridge?.publish(state.turnID, []);
+			if (fork) this.actionBridge?.publishBatches(state.turnID, []);
 			return;
 		}
 		this.receipts++;
@@ -819,32 +836,26 @@ export class SelfSpeculationCoordinator {
 		}
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
-		const actionCandidates = new Map<string, SelfSpeculationActionCandidate>();
+		const actionBatches = new Map<string, SelfSpeculationActionBatch>();
 		for (const rawCandidate of array(bundle?.candidates)) {
 			const candidate = record(rawCandidate);
 			if (!candidate) continue;
-			const sources = array(candidate.sources).filter((value): value is string => typeof value === "string");
-			for (const rawCandidateID of array(candidate.candidate_ids)) {
-				const candidateID = nonEmptyString(rawCandidateID);
-				if (!candidateID) continue;
+			const sources = uniqueStrings(candidate.sources);
+			const candidateIDs = uniqueStrings(candidate.candidate_ids);
+			const rawCalls = array(candidate.tool_calls);
+			const calls = rawCalls
+				.map((value, index) => parsedSidecarActionCall(value, index))
+				.filter((value): value is ParsedSidecarActionCall => value !== undefined);
+			for (const candidateID of candidateIDs) {
 				const knownSources = state.candidateSourcesByID.get(candidateID) ?? new Set<string>();
 				for (const source of sources) knownSources.add(source);
 				state.candidateSourcesByID.set(candidateID, knownSources);
-			}
-			const observedCall = record(array(candidate.tool_calls)[0]);
-			const observedTool = nonEmptyString(observedCall?.name);
-			if (observedTool) {
-				for (const rawCandidateID of array(candidate.candidate_ids)) {
-					const candidateID = nonEmptyString(rawCandidateID);
-					if (candidateID) state.candidateToolsByID.set(candidateID, observedTool);
-				}
+				const knownTools = state.candidateToolsByID.get(candidateID) ?? new Set<string>();
+				for (const call of calls) knownTools.add(call.tool);
+				state.candidateToolsByID.set(candidateID, knownTools);
 			}
 			if (!fork) continue;
 			if (!sources.includes("self-speculation")) continue;
-			const call = observedCall;
-			const tool = nonEmptyString(call?.name);
-			const input = record(call?.arguments);
-			const fingerprint = tool && input ? toolCallFingerprint(tool, input) : undefined;
 			const forkObservation = record(candidate.fork);
 			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
@@ -853,24 +864,45 @@ export class SelfSpeculationCoordinator {
 			const minimumLogprob = finiteNumber(logprobs?.minimum);
 			const confidence =
 				minimumLogprob !== undefined && minimumLogprob <= 0 ? Math.exp(minimumLogprob) : undefined;
-			if (
-				fingerprint &&
-				tool &&
-				input &&
-				!actionCandidates.has(fingerprint) &&
-				(state.settings.forkActionMinConfidence === 0 ||
-					(confidence !== undefined && confidence >= state.settings.forkActionMinConfidence))
-			)
-				actionCandidates.set(fingerprint, { tool, input: structuredClone(input) });
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
 				this.totalForkLogprobTokens += logprobTokens;
 			}
+			if (
+				!rawCalls.length ||
+				calls.length !== rawCalls.length ||
+				(state.settings.forkActionMinConfidence > 0 &&
+					(confidence === undefined || confidence < state.settings.forkActionMinConfidence))
+			)
+				continue;
+			const fingerprint = sidecarActionBatchFingerprint(calls);
+			const score = record(candidate.score);
+			const evidence: SelfSpeculationActionEvidence = {
+				candidateIDs,
+				sources,
+				provenance: structuredClone(array(candidate.provenance)),
+				actionIdentities: structuredClone(array(candidate.action_identities)),
+				draftTokenCount: nonNegativeInteger(candidate.draft_token_count),
+				...(confidence !== undefined ? { confidence } : {}),
+				...(score ? { score: structuredClone(score) } : {}),
+				...(forkObservation ? { fork: structuredClone(forkObservation) } : {}),
+			};
+			const existing = actionBatches.get(fingerprint);
+			if (existing) {
+				actionBatches.set(fingerprint, { ...existing, evidence: [...existing.evidence, evidence] });
+				continue;
+			}
+			const batchID = sidecarActionBatchID(fingerprint);
+			actionBatches.set(fingerprint, {
+				id: batchID,
+				calls: calls.map((call, index) => ({ id: `${index}:fork`, ...call })),
+				evidence: [evidence],
+			});
 		}
 		if (!fork) return;
-		this.actionBridge?.publish(
+		this.actionBridge?.publishBatches(
 			state.turnID,
-			state.settings.forkActionEnabled ? [...actionCandidates.values()].slice(0, state.settings.maxCandidates) : [],
+			state.settings.forkActionEnabled ? [...actionBatches.values()].slice(0, state.settings.maxCandidates) : [],
 		);
 		this.reconcileForkMatches(state);
 		this.finalizeGateSample(state);
@@ -1321,6 +1353,43 @@ function actionIdentity(key: string): string {
 	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
 }
 
-function toolCallFingerprint(tool: string, input: Readonly<Record<string, unknown>>): string {
-	return stableStringify([tool, input]);
+function parsedSidecarActionCall(value: unknown, fallbackIndex: number): ParsedSidecarActionCall | undefined {
+	const call = record(value);
+	const tool = nonEmptyString(call?.name);
+	const input = record(call?.arguments);
+	if (!tool || !input) return undefined;
+	const observedIndex = finiteNumber(call?.index);
+	const index =
+		observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0
+			? observedIndex
+			: fallbackIndex;
+	const callID = nonEmptyString(call?.call_id);
+	const format = nonEmptyString(call?.format);
+	return {
+		index,
+		...(callID ? { callID } : {}),
+		...(format ? { format } : {}),
+		tool,
+		input: structuredClone(input),
+	};
+}
+
+function sidecarActionBatchFingerprint(calls: readonly ParsedSidecarActionCall[]): string {
+	return stableStringify(
+		calls.map((call) => ({
+			index: call.index,
+			...(call.callID ? { callID: call.callID } : {}),
+			...(call.format ? { format: call.format } : {}),
+			tool: call.tool,
+			input: call.input,
+		})),
+	);
+}
+
+function sidecarActionBatchID(fingerprint: string): string {
+	return `fork:v1:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 32)}`;
+}
+
+function uniqueStrings(value: unknown): string[] {
+	return [...new Set(array(value).map(nonEmptyString).filter((item): item is string => item !== undefined))];
 }

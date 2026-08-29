@@ -216,7 +216,10 @@ export {
 } from "./self-speculation.ts";
 export {
 	SelfSpeculationActionBridge,
+	type SelfSpeculationActionBatch,
 	type SelfSpeculationActionCandidate,
+	type SelfSpeculationActionCall,
+	type SelfSpeculationActionEvidence,
 } from "./self-speculation-action-bridge.ts";
 export {
 	type SpeculativeActionPackageSettings,
