@@ -209,7 +209,8 @@ describe("speculative action host", () => {
 				source: "drafter",
 				tool: "bash",
 				input: { command: "npm test" },
-				action: { tool: "bash", input: { command: "npm test" } },
+				predictedAction: { tool: "bash", input: { command: "npm test" } },
+				executionAction: { tool: "bash", input: { command: "npm test" } },
 			},
 		]);
 
@@ -1158,6 +1159,8 @@ describe("speculative action host", () => {
 			preflight: () => true,
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
+			onCandidateMaterialized: (candidate) => coordinator.addCandidate(candidate),
+			onActorActionMaterialized: ({ action }) => coordinator.observeActorAction(action),
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -1178,7 +1181,6 @@ describe("speculative action host", () => {
 				(event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded",
 			),
 		);
-		coordinator.observeActorAction("read", { path: "notes.txt" });
 		const hit = await host.consume({
 			turnID: "fork-hit",
 			id: "actor-hit",
@@ -1205,7 +1207,6 @@ describe("speculative action host", () => {
 				(event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded",
 			),
 		);
-		coordinator.observeActorAction("read", { path: "actor-miss.txt" });
 		expect(
 			await host.consume({
 				turnID: "fork-miss",

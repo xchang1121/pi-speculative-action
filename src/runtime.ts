@@ -5,7 +5,7 @@ import type { SpeculativeActionEvent } from "./events.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
-import type { PredictionSettlement } from "./settlement.ts";
+import type { ActorActionIdentity, PredictionSettlement } from "./settlement.ts";
 
 export { diagnosticAction, diagnosticJson, redactDiagnostics } from "./diagnostics.ts";
 
@@ -82,13 +82,26 @@ export interface MaterializedSpeculativeCandidate<SessionID> {
 	readonly tool: string;
 	/** Producer-facing arguments, before K(a) canonicalization or execution projection. */
 	readonly input: Readonly<Record<string, unknown>>;
-	readonly action: ActionKey;
+	/** Exact Actor-visible K(a) represented by the prediction and target-decoder draft. */
+	readonly predictedAction: ActionKey;
+	/** K(a) actually scheduled; it may cover the prediction through a lossless projection. */
+	readonly executionAction: ActionKey;
 	readonly depth?: number;
 	readonly horizon?: number;
 	readonly conditionalProbability?: number;
 	readonly empiricalProbability?: number;
 	readonly expectedLatencyBenefitMs?: number;
 	readonly expectedDurationMs?: number;
+}
+
+/** The exact K(a) Runtime assigned to an authoritative Actor tool call. */
+export interface MaterializedActorAction<SessionID> {
+	readonly sessionID: SessionID;
+	readonly turnID: string;
+	readonly identity: ActorActionIdentity;
+	readonly tool: string;
+	readonly input: Readonly<Record<string, unknown>>;
+	readonly action: ActionKey;
 }
 
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
@@ -259,6 +272,8 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => MaybePromise<void>;
 	/** Best-effort side channel; failures cannot affect candidate admission or Actor behavior. */
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => MaybePromise<void>;
+	/** Best-effort identity side channel; failures cannot affect Actor matching or execution. */
+	readonly onActorActionMaterialized?: (action: MaterializedActorAction<SessionID>) => MaybePromise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
 }
 

@@ -195,6 +195,7 @@ export {
 	type SpeculativeActionSettings,
 	type SpeculativeCandidate,
 	type SpeculativeDraftCandidate,
+	type MaterializedActorAction,
 	type MaterializedSpeculativeCandidate,
 	type SpeculativePlanSource,
 	type SpeculativeRuntimeInspection,

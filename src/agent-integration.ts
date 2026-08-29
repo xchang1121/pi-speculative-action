@@ -46,6 +46,7 @@ import {
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type {
 	CandidatePreflight,
+	MaterializedActorAction,
 	MaterializedSpeculativeCandidate,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
@@ -147,6 +148,8 @@ export interface CreateSpeculativeActionHostOptions {
 	}) => void | Promise<void>;
 	/** Receives every validated K(a) as a concrete tool call, independent of execution isolation. */
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
+	/** Receives the exact Runtime-owned K(a) of each authoritative Actor call. */
+	readonly onActorActionMaterialized?: (action: MaterializedActorAction<string>) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
@@ -919,6 +922,7 @@ export function createSpeculativeActionHost(
 			});
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
+		onActorActionMaterialized: options.onActorActionMaterialized,
 		onEvent: async (event) => {
 			if (
 				event.type === "actor_action" &&

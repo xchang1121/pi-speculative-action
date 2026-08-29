@@ -23,7 +23,6 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
-	buildPiActionKey,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	UNBOUNDED_ACTION_TOOLS,
@@ -298,7 +297,6 @@ async function installController(
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
-		actionKey: (tool, input) => buildPiActionKey(tool, input, context.cwd)?.key,
 		actionBridge: selfSpeculationActions,
 	});
 	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
@@ -371,6 +369,7 @@ async function installController(
 		onTurnStarted: ({ turnID, actorModel, context: actorContext, decisionSequence }) =>
 			selfSpeculation.startTurn(turnID, actorModel, actorContext, decisionSequence),
 		onCandidateMaterialized: (candidate) => selfSpeculation.addCandidate(candidate),
+		onActorActionMaterialized: ({ action }) => selfSpeculation.observeActorAction(action),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
 			recentEvents.push(formatSpeculativeActionEvent(event));
@@ -464,7 +463,6 @@ async function installController(
 		},
 		execute: async (tool, callID, input, signal, onUpdate, nextContext) => {
 			latestContext = nextContext;
-			selfSpeculation.observeActorAction(tool, input);
 			const definition = baseDefinitions.get(tool);
 			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
 			const turnID = currentTurnID;

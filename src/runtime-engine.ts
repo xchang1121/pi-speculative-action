@@ -1171,29 +1171,28 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("admission", concrete ? "tool_disabled" : "invalid_input"));
 			return;
 		}
-		let key: ActionKey | undefined;
+		let predictedAction: ActionKey | undefined;
 		try {
-			key = await adapter.actionKey(node.action.tool, concrete, {
+			predictedAction = await adapter.actionKey(node.action.tool, concrete, {
 				type: "start",
 				startInput: context.startInput,
 				data: context.data,
 			});
 		} catch {
-			key = undefined;
+			predictedAction = undefined;
 		}
-		if (!key) {
+		if (!predictedAction) {
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
-		key = coveringAction(key, projectionRules);
-		const executionInput = asConcreteInput(key.input);
+		const executionAction = coveringAction(predictedAction, projectionRules);
+		const executionInput = asConcreteInput(executionAction.input);
 		if (!executionInput) {
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
 		const onCandidateMaterialized = adapter.onCandidateMaterialized;
 		if (onCandidateMaterialized) {
-			const materializedKey = key;
 			session.effects.enqueue(() =>
 				onCandidateMaterialized({
 					sessionID: session.id,
@@ -1205,7 +1204,8 @@ export function makeStructuralSpeculativeActionRuntime<
 					actionID: node.action.id,
 					tool: node.action.tool,
 					input: structuredClone(concrete),
-					action: materializedKey,
+					predictedAction,
+					executionAction,
 					...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
 					...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
 					...(node.action.conditionalProbability !== undefined
@@ -1228,7 +1228,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			data: context.data,
 			settings: context.settings,
 			draft: context.draft,
-			action: key,
+			action: executionAction,
 			concrete: executionInput,
 			callID: `spec_${session.candidateSequence + 1}`,
 			index: session.candidateSequence,
@@ -1239,14 +1239,14 @@ export function makeStructuralSpeculativeActionRuntime<
 				failUnlaunchable(session, node, admission.cause);
 				return;
 			}
-			session.plan.bindActionKey(node.proposalID, node.action.id, key);
+			session.plan.bindActionKey(node.proposalID, node.action.id, executionAction);
 			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, admission.cause)) {
 				failUnlaunchable(session, node, cause("plan", "execution_route_state_invalid"));
 			}
 			return;
 		}
 		context.executionRoute = admission.route;
-		session.plan.bindActionKey(node.proposalID, node.action.id, key);
+		session.plan.bindActionKey(node.proposalID, node.action.id, executionAction);
 	};
 
 	const releaseActionContext = (session: Session, id: string, keepContinuation = false): void => {
@@ -1797,6 +1797,19 @@ export function makeStructuralSpeculativeActionRuntime<
 		});
 		registerActorAction(state.session, actualCall.id, actorAction);
 		state.actorActions.push(actorAction);
+		const onActorActionMaterialized = adapter.onActorActionMaterialized;
+		if (actualKey && onActorActionMaterialized) {
+			state.session.effects.enqueue(() =>
+				onActorActionMaterialized({
+					sessionID: state.session.id,
+					turnID: input.turnID,
+					identity,
+					tool: actualCall.tool,
+					input: structuredClone(actualKey.input),
+					action: actualKey,
+				}),
+			);
+		}
 
 		await admission.ready;
 		try {

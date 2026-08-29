@@ -115,7 +115,7 @@ Example:
 
 ### Target-decoder self-speculation bridge
 
-`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. After schema validation and argument materialization, every concrete Drafter or PatternAware `K(a)` is copied to one request-scoped candidate bundle. Identical keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
+`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. After schema validation and argument materialization, every concrete Drafter or PatternAware prediction is copied to one request-scoped candidate bundle. Decoder identity remains the exact Actor-visible `predictedAction`; a wider lossless `executionAction` is carried separately for scheduling and result reuse. Identical predicted keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
 
 The bridge binds one stable request ID to each Actor decision, submits the ranked bundle for that exact absolute decision sequence to `POST /self-speculation/candidates`, and clears it with `POST /self-speculation/clear` after all pending submissions and forks settle. Predictions for later decisions stay buffered until the matching Actor request starts; an unchanged decision retry inherits its bundle, while older predictions are discarded. Network and decoding failures are best-effort acceleration failures and never replace Actor behavior.
 

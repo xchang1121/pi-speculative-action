@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
@@ -54,7 +55,7 @@ describe("self-speculation control plane", () => {
 
 		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
 		expect(bundle?.body).toMatchObject({
-			version: 1,
+			version: 2,
 			request_id: "actor-request",
 			max_draft_tokens: SELF_SPECULATION_DEFAULTS.maxDraftTokens,
 			format: "tagged_json",
@@ -62,18 +63,56 @@ describe("self-speculation control plane", () => {
 		});
 		expect(bundle?.body.candidates).toEqual([
 			expect.objectContaining({
-				id: "hash-a",
+				id: actionIdentity("key-a"),
+				action_identity: {
+					version: 1,
+					predicted_action_id: actionIdentity("key-a"),
+					execution_action_id: actionIdentity("key-a"),
+					projected: false,
+				},
 				sources: ["drafter", "pattern-aware"],
 				tool_call: { name: "read", arguments: { path: "a.txt" } },
 				score: expect.objectContaining({ conditional_probability: 0.9 }),
 			}),
-			expect.objectContaining({ id: "hash-b", sources: ["drafter"] }),
+			expect.objectContaining({ id: actionIdentity("key-b"), sources: ["drafter"] }),
 		]);
 		expect(requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath)).toHaveLength(1);
 		expect(requests.at(-1)).toMatchObject({
 			path: SELF_SPECULATION_DEFAULTS.clearPath,
 			body: { version: 1, request_id: "actor-request" },
 		});
+	});
+
+	it("keeps distinct predicted actions when they share one covering execution", async () => {
+		const requests: CapturedRequest[] = [];
+		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-request"]);
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.addCandidate(
+			candidate("drafter", "predicted-a", "unused-a", "read", { path: "a.txt", offset: 1 }, 0.8, 1, 1, "covering"),
+		);
+		coordinator.addCandidate(
+			candidate("pattern-aware", "predicted-b", "unused-b", "read", { path: "a.txt", offset: 5 }, 0.7, 1, 1, "covering"),
+		);
+		coordinator.decorateActorPayload({ model: "actor" });
+		await coordinator.dispose();
+
+		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
+		expect(bundle?.body.candidates).toEqual([
+			expect.objectContaining({
+				id: actionIdentity("predicted-a"),
+				action_identity: expect.objectContaining({
+					execution_action_id: actionIdentity("covering"),
+					projected: true,
+				}),
+			}),
+			expect.objectContaining({
+				id: actionIdentity("predicted-b"),
+				action_identity: expect.objectContaining({
+					execution_action_id: actionIdentity("covering"),
+					projected: true,
+				}),
+			}),
+		]);
 	});
 
 	it("isolates Drafter request controls from the stable Actor request identity", async () => {
@@ -113,7 +152,7 @@ describe("self-speculation control plane", () => {
 								steps: [
 									{
 										candidate_index: 0,
-										candidate_id: "hash-a",
+										candidate_id: actionIdentity("key-a"),
 										drafted_tokens: 3,
 										accepted_tokens: 2,
 										rejected_tokens: 1,
@@ -131,7 +170,7 @@ describe("self-speculation control plane", () => {
 								bundle: {
 									candidates: [
 										{
-											candidate_ids: ["hash-a"],
+											candidate_ids: [actionIdentity("key-a")],
 											sources: ["drafter", "pattern-aware"],
 										},
 									],
@@ -168,7 +207,7 @@ describe("self-speculation control plane", () => {
 				steps: [
 					expect.objectContaining({
 						candidateIndex: 0,
-						candidateID: "hash-a",
+						candidateID: actionIdentity("key-a"),
 						sources: ["drafter", "pattern-aware"],
 					}),
 				],
@@ -214,6 +253,7 @@ describe("self-speculation control plane", () => {
 					: { registered: true, draft_token_count: 8 },
 		);
 		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.addCandidate(candidate("drafter", "fork-write", "unused", "write", { path: "out.txt" }, 0.9));
 		expect(coordinator.decorateActorPayload({ model: "actor", prompt: "PROMPT" })).toEqual({
 			model: "actor",
 			prompt: "PROMPT",
@@ -222,7 +262,11 @@ describe("self-speculation control plane", () => {
 		expect(coordinator.decorateDrafterPayload({ model: "drafter" })).toEqual({ model: "drafter" });
 		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 		coordinator.observeActorOutput(delta("text_delta", "later"));
-		coordinator.observeActorAction("write", { path: "out.txt" });
+		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));
+		coordinator.addCandidate(
+			candidate("self-speculation", "fork-write", "unused", "write", { path: "out.txt" }, 1),
+		);
+		coordinator.observeActorAction(action("fork-write", "unused", "write", { path: "out.txt" }));
 		await coordinator.dispose();
 
 		const forks = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath);
@@ -245,7 +289,7 @@ describe("self-speculation control plane", () => {
 				forkCandidates: 1,
 				forkAgreements: 1,
 				forkExactMatches: 1,
-				submittedDraftTokens: 12,
+				submittedDraftTokens: 28,
 				acceptedDraftTokens: 3,
 				forkLatencyMs: 25,
 				forkLogprobTokens: 2,
@@ -360,8 +404,12 @@ describe("self-speculation control plane", () => {
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		coordinator.decorateActorPayload({ prompt: "P" });
 		coordinator.observeActorOutput(delta("text_delta", "x"));
-		coordinator.observeActorAction("read", { path: "late.txt" });
 		release();
+		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));
+		coordinator.addCandidate(
+			candidate("self-speculation", "late-read", "unused", "read", { path: "late.txt" }, 1),
+		);
+		coordinator.observeActorAction(action("late-read", "unused", "read", { path: "late.txt" }));
 		await coordinator.dispose();
 
 		expect(coordinator.snapshot().forkExactMatches).toBe(1);
@@ -464,7 +512,7 @@ describe("self-speculation control plane", () => {
 			request_id: "actor-2",
 			candidates: [
 				expect.objectContaining({
-					id: "hash-a",
+					id: actionIdentity("key-a"),
 					score: expect.objectContaining({ expected_decision_sequence: 2, latest_decision_sequence: 2 }),
 				}),
 			],
@@ -550,6 +598,7 @@ function candidate(
 	conditionalProbability: number,
 	expectedDecisionSequence = 1,
 	latestDecisionSequence = expectedDecisionSequence,
+	executionKey = key,
 ): MaterializedSpeculativeCandidate<string> {
 	return {
 		sessionID: "session-1",
@@ -561,7 +610,8 @@ function candidate(
 		actionID: `action-${source}`,
 		tool,
 		input,
-		action: action(key, hash, tool, input),
+		predictedAction: action(key, hash, tool, input),
+		executionAction: action(executionKey, hash, tool, input),
 		depth: 0,
 		horizon: 0,
 		conditionalProbability,
@@ -569,6 +619,10 @@ function candidate(
 		expectedLatencyBenefitMs: 100,
 		expectedDurationMs: 200,
 	};
+}
+
+function actionIdentity(key: string): string {
+	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
 }
 
 function action(key: string, hash: string, tool: string, input: Record<string, unknown>): ActionKey {

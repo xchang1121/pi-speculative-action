@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Split materialized prediction identity into exact `predictedAction` and lossless covering `executionAction`; target-decoder candidates no longer inherit execution-projection identity.
 - Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
 - Added required `ActionKey.schemaHash`; canonical keys now include execution class and validated input schema, preventing reuse after an in-session tool contract change.
 - Removed the deprecated `ToolCache`, `maxCandidates`, `liveReadonly`, `minEmpiricalProbability`, and fixed single-step `mode` compatibility surfaces.
@@ -21,6 +22,7 @@
 
 ### Added
 
+- Added Runtime-owned Actor action materialization and collision-resistant SHA-256 decoder candidate IDs, removing the self-speculation coordinator's parallel K(a) reconstruction.
 - Added a configurable SPORK minimum-token confidence gate for sidecar action execution; the default 0.90 threshold fails closed on missing evidence without suppressing the underlying fork or decoder telemetry.
 - Added a bounded, turn-scoped handoff that admits complete sidecar-fork tool calls to the ordinary speculative-action Runtime without issuing another inference request.
 - Added a batch-atomic action-Drafter utility gate that charges all root proposal service, credits only realized Drafter-owned tool execution ahead, and retains bounded recovery probes; it is independently configurable from target-decoder self-speculation.

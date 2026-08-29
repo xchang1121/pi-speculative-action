@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_BENEFIT_GATE_POLICY,
@@ -7,6 +7,8 @@ import {
 } from "./fork-benefit-gate.ts";
 import type { MaterializedSpeculativeCandidate } from "./runtime.ts";
 import type { SelfSpeculationActionBridge, SelfSpeculationActionCandidate } from "./self-speculation-action-bridge.ts";
+import type { ActionKey } from "./action-semantics.ts";
+import { stableStringify } from "./stable-json.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
@@ -226,8 +228,6 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
 	readonly actionBridge?: SelfSpeculationActionBridge;
-	/** Resolve the same exact K(a) identity used by Actor execution. */
-	readonly actionKey?: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
 }
 
 interface TurnState {
@@ -249,6 +249,7 @@ interface TurnState {
 	providerPayload?: unknown;
 	readonly actorActionKeys: Set<string>;
 	readonly forkCandidateKeys: Set<string>;
+	readonly agreedForkKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
 	readonly candidateSourcesByID: Map<string, Set<string>>;
 	readonly actorActionTimes: Map<string, number>;
@@ -261,8 +262,10 @@ interface TurnState {
 }
 
 interface CandidateRecord {
+	readonly id: string;
 	readonly key: string;
-	readonly hash: string;
+	readonly executionKey: string;
+	readonly executionID: string;
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly sources: Set<string>;
@@ -288,7 +291,6 @@ export class SelfSpeculationCoordinator {
 	private readonly settings: () => SelfSpeculationSettings;
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
-	private readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>) => string | undefined;
 	private readonly actionBridge?: SelfSpeculationActionBridge;
 	private readonly forkGate = new ForkBenefitGate();
 	private readonly background = new Set<Promise<void>>();
@@ -326,7 +328,6 @@ export class SelfSpeculationCoordinator {
 		this.settings = options.settings;
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
-		this.actionKey = options.actionKey ?? fallbackActionKey;
 		this.actionBridge = options.actionBridge;
 	}
 
@@ -360,6 +361,7 @@ export class SelfSpeculationCoordinator {
 			dirty: candidates.size > 0,
 			actorActionKeys: new Set(),
 			forkCandidateKeys: new Set(),
+			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
 			candidateSourcesByID: new Map(),
 			actorActionTimes: new Map(),
@@ -413,7 +415,21 @@ export class SelfSpeculationCoordinator {
 				? state.candidates
 				: this.pendingCandidates.get(targetDecisionSequence) ?? new Map<string, CandidateRecord>();
 		if (candidates !== state?.candidates) this.pendingCandidates.set(targetDecisionSequence, candidates);
-		this.mergeCandidate(candidates, candidate);
+		const record = this.mergeCandidate(candidates, candidate);
+		if (state && candidates === state.candidates && record.sources.has("self-speculation")) {
+			if (!state.forkCandidateKeys.has(record.key)) {
+				state.forkCandidateKeys.add(record.key);
+				this.observedForkCandidates++;
+			}
+			if (
+				[...record.sources].some((source) => source !== "self-speculation") &&
+				!state.agreedForkKeys.has(record.key)
+			) {
+				state.agreedForkKeys.add(record.key);
+				this.agreedForkCandidates++;
+			}
+			this.reconcileForkMatches(state);
+		}
 		if (candidates !== state?.candidates || !state) return;
 		state.dirty = true;
 		this.scheduleFlush(state);
@@ -422,8 +438,10 @@ export class SelfSpeculationCoordinator {
 	private mergeCandidate(
 		candidates: Map<string, CandidateRecord>,
 		candidate: MaterializedSpeculativeCandidate<string>,
-	): void {
-		const existing = candidates.get(candidate.action.key);
+	): CandidateRecord {
+		const predictedAction = candidate.predictedAction;
+		const executionAction = candidate.executionAction;
+		const existing = candidates.get(predictedAction.key);
 		const source = candidate.source || "unknown";
 		if (existing) {
 			existing.sources.add(source);
@@ -452,10 +470,13 @@ export class SelfSpeculationCoordinator {
 				existing.expectedDurationMs,
 				metric(candidate.expectedDurationMs, 0),
 			);
+			return existing;
 		} else {
-			candidates.set(candidate.action.key, {
-				key: candidate.action.key,
-				hash: candidate.action.hash,
+			const record: CandidateRecord = {
+				id: actionIdentity(predictedAction.key),
+				key: predictedAction.key,
+				executionKey: executionAction.key,
+				executionID: actionIdentity(executionAction.key),
 				tool: candidate.tool,
 				input: structuredClone(candidate.input),
 				sources: new Set([source]),
@@ -469,7 +490,9 @@ export class SelfSpeculationCoordinator {
 				empiricalProbability: metric(candidate.empiricalProbability, 0),
 				expectedLatencyBenefitMs: metric(candidate.expectedLatencyBenefitMs, 0),
 				expectedDurationMs: metric(candidate.expectedDurationMs, 0),
-			});
+			};
+			candidates.set(predictedAction.key, record);
+			return record;
 		}
 	}
 
@@ -525,11 +548,10 @@ export class SelfSpeculationCoordinator {
 	}
 
 	/** Observe the authoritative Actor action regardless of fork completion order. */
-	observeActorAction(tool: string, input: unknown): void {
+	observeActorAction(action: ActionKey): void {
 		const state = this.active;
-		if (!state || !isRecord(input)) return;
-		const key = this.actionKey(tool, input);
-		if (!key) return;
+		if (!state) return;
+		const key = action.key;
 		state.actorActionKeys.add(key);
 		if (!state.actorActionTimes.has(key)) state.actorActionTimes.set(key, performance.now());
 		this.reconcileForkMatches(state);
@@ -671,7 +693,7 @@ export class SelfSpeculationCoordinator {
 			const receipt = await this.post(
 				settings.candidatePath,
 				{
-					version: 1,
+					version: 2,
 					request_id: state.requestID,
 					model: modelPayload(state.model),
 					max_draft_tokens: settings.maxDraftTokens,
@@ -717,12 +739,7 @@ export class SelfSpeculationCoordinator {
 			const call = record(array(candidate.tool_calls)[0]);
 			const tool = nonEmptyString(call?.name);
 			const input = record(call?.arguments);
-			const key = tool && input ? this.actionKey(tool, input) : undefined;
-			if (key && !state.forkCandidateKeys.has(key)) {
-				state.forkCandidateKeys.add(key);
-				this.observedForkCandidates++;
-				if (sources.some((source) => source !== "self-speculation")) this.agreedForkCandidates++;
-			}
+			const fingerprint = tool && input ? toolCallFingerprint(tool, input) : undefined;
 			const forkObservation = record(candidate.fork);
 			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
@@ -732,14 +749,14 @@ export class SelfSpeculationCoordinator {
 			const confidence =
 				minimumLogprob !== undefined && minimumLogprob <= 0 ? Math.exp(minimumLogprob) : undefined;
 			if (
-				key &&
+				fingerprint &&
 				tool &&
 				input &&
-				!actionCandidates.has(key) &&
+				!actionCandidates.has(fingerprint) &&
 				(state.settings.forkActionMinConfidence === 0 ||
 					(confidence !== undefined && confidence >= state.settings.forkActionMinConfidence))
 			)
-				actionCandidates.set(key, { tool, input: structuredClone(input) });
+				actionCandidates.set(fingerprint, { tool, input: structuredClone(input) });
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
 				this.totalForkLogprobTokens += logprobTokens;
@@ -894,7 +911,13 @@ function forkGatePolicy(settings: SelfSpeculationSettings): ForkBenefitGatePolic
 
 function candidatePayload(candidate: CandidateRecord): Readonly<Record<string, unknown>> {
 	return {
-		id: candidate.hash,
+		id: candidate.id,
+		action_identity: {
+			version: 1,
+			predicted_action_id: candidate.id,
+			execution_action_id: candidate.executionID,
+			projected: candidate.key !== candidate.executionKey,
+		},
 		sources: [...candidate.sources].sort(),
 		provenance: candidate.provenance,
 		tool_call: { name: candidate.tool, arguments: candidate.input },
@@ -1157,6 +1180,10 @@ function nonNegativeInteger(value: unknown): number {
 	return Math.floor(observedNonNegativeNumber(value));
 }
 
-function fallbackActionKey(tool: string, input: Readonly<Record<string, unknown>>): string {
-	return JSON.stringify([tool, input]);
+function actionIdentity(key: string): string {
+	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+function toolCallFingerprint(tool: string, input: Readonly<Record<string, unknown>>): string {
+	return stableStringify([tool, input]);
 }

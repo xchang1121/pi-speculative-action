@@ -4,6 +4,7 @@ import { buildPiActionKey } from "../src/action-semantics.ts";
 import type { SpeculativeExecutionRoute, WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
 import type {
 	CandidatePreflight,
+	MaterializedSpeculativeCandidate,
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
 	SpeculativePlanSource,
@@ -74,6 +75,7 @@ function harness(input: {
 	readonly preflight?: (signal: AbortSignal) => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly projection?: boolean;
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
+	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 	readonly actionKey?: (
 		tool: string,
@@ -134,6 +136,7 @@ function harness(input: {
 					},
 				]
 			: [],
+		onCandidateMaterialized: input.onCandidateMaterialized,
 		onEvent: async (event) => {
 			events.push(event);
 			await input.onEvent?.(event);
@@ -897,6 +900,46 @@ describe("structural speculative runtime", () => {
 		await waitFor(() => executed.length === 1);
 
 		expect(executed[0]).toMatchObject({ path: expect.stringMatching(/README\.md$/), offset: 2, limit: 2 });
+	});
+
+	it("keeps decoder identities distinct while deduplicating one covering execution", async () => {
+		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => ({
+				id: "covering",
+				source: "source",
+				revision: 0,
+				actions: [
+					{ id: "first", type: "tool_call", tool: "read", input: { path: "README.md", offset: 2, limit: 2 } },
+					{ id: "second", type: "tool_call", tool: "read", input: { path: "README.md", offset: 8, limit: 2 } },
+				],
+			}),
+		};
+		const fixture = harness({
+			source,
+			projection: true,
+			coveringAction: (predicted) =>
+				buildPiActionKey(
+					"read",
+					{ path: predicted.input.path, offset: 1, limit: 2_000 },
+					"/workspace",
+					predicted.schemaHash,
+				),
+			onCandidateMaterialized: (candidate) => {
+				materialized.push(candidate);
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "covering" });
+		await waitFor(() => materialized.length === 2);
+
+		expect(new Set(materialized.map((candidate) => candidate.predictedAction.key)).size).toBe(2);
+		expect(new Set(materialized.map((candidate) => candidate.executionAction.key)).size).toBe(1);
+		expect(materialized.map((candidate) => candidate.input.offset).sort()).toEqual([2, 8]);
+		expect(fixture.executions()).toBe(1);
+		await fixture.runtime.finishTurn({ ...call("covering"), terminal: true });
 	});
 
 	it("settles a K(a) match as incompatible without committing backend effects", async () => {

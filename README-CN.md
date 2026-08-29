@@ -115,7 +115,7 @@ pi install https://github.com/xchang1121/pi
 
 ### 目标解码器自投机桥接
 
-`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。候选通过 schema 校验并完成参数物化后，每个 Drafter 或 PatternAware 的具体 `K(a)` 都会复制到同一个 request-scoped 候选包；相同 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
+`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。候选通过 schema 校验并完成参数物化后，每个 Drafter 或 PatternAware 预测都会复制到同一个 request-scoped 候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
 
 桥接为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 fork 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 
