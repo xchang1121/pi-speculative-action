@@ -1143,6 +1143,30 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-13"), terminal: true });
 	});
 
+	it("retains an overlapping result after an authoritative observation", async () => {
+		const cachedInput = { path: "future.ts", offset: 1, limit: 10 };
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: ({ startInput }) =>
+				startInput.turnID === "turn-1"
+					? plan("source", "future", cachedInput)
+					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
+		};
+		const fixture = harness({ source, execute: () => "future" });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+		const observation = call("turn-1", { path: "future.ts", offset: 100, limit: 1 });
+		expect(await fixture.runtime.consume(observation)).toBeUndefined();
+		await fixture.runtime.actual({ ...observation, durationMs: 1, output: "other range" });
+		await fixture.runtime.finishTurn({ ...observation, terminal: false });
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		expect(await fixture.runtime.consume(call("turn-2", cachedInput))).toBe("future");
+		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+	});
+
 	it("keeps future launch deadlines phase-correct after an Actor action arrives", async () => {
 		let executions = 0;
 		const source: Source = {

@@ -2087,7 +2087,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) return;
 		state.session.scheduler.observeService(actorAction.tool, durationMs);
 		const key = actorAction.actionKey;
-		if (key) invalidateChangedResources(state.session, key);
+		if (key) reconcileAuthoritativeEffects(state.session, key);
 		queueActorSettlement(state, input, actualCall, actorAction, input.output);
 	};
 
@@ -2676,13 +2676,19 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const reconcileAdoptedCandidate = (session: Session, action: ActionKey, adopted: Candidate): void => {
-		invalidateChangedResources(session, action, adopted);
+		reconcileAuthoritativeEffects(session, action, adopted);
 		adopted.actorAdopted = true;
 	};
 
-	const invalidateChangedResources = (session: Session, action: ActionKey, adopted?: Candidate): void => {
-		const changed = adopted ? (candidateBranch(adopted)?.resources ?? action.resources) : action.resources;
-		if (!changed.length || (adopted && adopted.work.reservation.kind === "shared")) return;
+	const authoritativeMutationResources = (action: ActionKey, adopted?: Candidate): readonly string[] => {
+		if (semantics.effect(action.tool) === "observation") return [];
+		if (adopted?.work.reservation.kind === "shared") return [];
+		return adopted ? (candidateBranch(adopted)?.resources ?? action.resources) : action.resources;
+	};
+
+	const reconcileAuthoritativeEffects = (session: Session, action: ActionKey, adopted?: Candidate): void => {
+		const changed = authoritativeMutationResources(action, adopted);
+		if (!changed.length) return;
 		const candidates = allCandidates(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {

@@ -81,6 +81,7 @@
 
 ### Fixed
 
+- Authoritative observation fallbacks no longer invalidate overlapping reusable results; only actions whose semantics may mutate workspace resources advance cache invalidation.
 - Target-decoder candidate bundles are now routed by the Plan Runtime's absolute expected Actor decision sequence, so output-informed and multi-step predictions cannot be submitted to an already-finished request; same-decision retries retain the bundle and stale decisions are dropped.
 - Self-speculation cleanup now waits for in-flight candidate and sidecar-fork submissions, fences the package-level disabled state, and keeps Drafter request identities isolated from the Actor request.
 - Output-informed Drafter continuations now permit a terminal response instead of forcing an unrelated tool call after the speculative branch has completed.
