@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Candidate lifecycle events now include required execution-backend and route-fingerprint identity so utility accounting cannot merge work from different isolation worlds.
 - Split materialized prediction identity into exact `predictedAction` and lossless covering `executionAction`; target-decoder candidates no longer inherit execution-projection identity.
 - Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
 - Added required `ActionKey.schemaHash`; canonical keys now include execution class and validated input schema, preventing reuse after an in-session tool contract change.
@@ -22,6 +23,8 @@
 
 ### Added
 
+- Added a backend-scoped utility gate for unbounded speculative actions. It charges measured miss work, credits only realized execution-ahead, preserves suppressed predictions for lossless shadow matching, and uses bounded recovery probes instead of disabling Actor fallback.
+- Added lossless canonical/projected tape-opportunity reporting, an offline SWE-bench Bash corpus analyzer, validated per-instance dataset caching, and an OpenAI-compatible replay endpoint override for paired experiments without repeated paid requests.
 - Added authoritative observation capture: a successful read-only Actor fallback can transfer its pre-execution freshness evidence and one real output into the existing shared result cache without a duplicate tool invocation or a second cache implementation.
 - Added a target-verification ledger that calibrates decoder candidate order by model, endpoint, format, tool, and source while keeping token evidence separate from semantic action learning.
 - Added a policy-facing Actor settlement channel; the sidecar fork gate now credits only source-attributed, actually adopted `executionAheadMs` instead of intent-match wall-clock lead.

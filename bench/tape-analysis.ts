@@ -1,5 +1,11 @@
 import { stableStringify } from "../src/stable-json.ts";
 import { ForkBenefitGate, type ForkBenefitGatePolicy } from "../src/fork-benefit-gate.ts";
+import {
+	actionKeyCovers,
+	actionKeyMatch,
+	buildPiActionKey,
+	PI_ACTION_SEMANTICS,
+} from "../src/action-semantics.ts";
 
 interface TapeChunk {
 	readonly atMs?: number;
@@ -43,6 +49,12 @@ export interface TapeOpportunity {
 	readonly exactReadyBeforeActor: boolean;
 	readonly earliestExactReadyMs?: number;
 	readonly exactLeadMs: number;
+	/** Strictly canonical or projected coverage proven before tool output exists. */
+	readonly losslessHit: boolean;
+	readonly losslessMatchKind?: "exact" | "canonical" | "projected";
+	readonly losslessReadyBeforeActor: boolean;
+	readonly earliestLosslessReadyMs?: number;
+	readonly losslessLeadMs: number;
 	readonly drafterServiceMs: number;
 }
 
@@ -65,6 +77,13 @@ export interface TapeAnalysis {
 		readonly actorDecodeMs: number;
 		readonly drafterServiceMs: number;
 		readonly exactLeadMs: number;
+		readonly losslessHits: number;
+		readonly incrementalCanonicalHits: number;
+		readonly incrementalProjectedHits: number;
+		readonly losslessHitRate: number;
+		readonly losslessReadyBeforeActor: number;
+		readonly losslessEarlyHitRate: number;
+		readonly losslessLeadMs: number;
 	};
 }
 
@@ -176,6 +195,8 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 		);
 	const exactHits = opportunities.filter((value) => value.exactHit).length;
 	const earlyHits = opportunities.filter((value) => value.exactReadyBeforeActor).length;
+	const losslessHits = opportunities.filter((value) => value.losslessHit).length;
+	const losslessEarlyHits = opportunities.filter((value) => value.losslessReadyBeforeActor).length;
 	const candidateCount = sum(opportunities, (value) => value.candidateCount);
 	const uniqueCandidateCount = sum(opportunities, (value) => value.uniqueCandidateCount);
 	return {
@@ -197,6 +218,17 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 			actorDecodeMs: sum(opportunities, (value) => value.actorDecodeMs),
 			drafterServiceMs: sum(opportunities, (value) => value.drafterServiceMs),
 			exactLeadMs: sum(opportunities, (value) => value.exactLeadMs),
+			losslessHits,
+			incrementalCanonicalHits: opportunities.filter(
+				(value) => value.losslessMatchKind === "canonical",
+			).length,
+			incrementalProjectedHits: opportunities.filter(
+				(value) => value.losslessMatchKind === "projected",
+			).length,
+			losslessHitRate: ratio(losslessHits, opportunities.length),
+			losslessReadyBeforeActor: losslessEarlyHits,
+			losslessEarlyHitRate: ratio(losslessEarlyHits, opportunities.length),
+			losslessLeadMs: sum(opportunities, (value) => value.losslessLeadMs),
 		},
 	};
 }
@@ -587,6 +619,24 @@ function opportunity(
 	);
 	const earliestExactReadyMs = exact.length ? Math.min(...exact.map((exchange) => exchange.endedAtMs)) : undefined;
 	const exactLeadMs = earliestExactReadyMs === undefined ? 0 : Math.max(0, actor.endedAtMs - earliestExactReadyMs);
+	const lossless = drafters.flatMap((exchange) =>
+		exchange.calls.flatMap((candidate) => {
+			const match = losslessActionMatch(candidate, actorAction);
+			return match ? [{ exchange, match }] : [];
+		}),
+	);
+	const earliestLosslessReadyMs = lossless.length
+		? Math.min(...lossless.map(({ exchange }) => exchange.endedAtMs))
+		: undefined;
+	const losslessLeadMs =
+		earliestLosslessReadyMs === undefined ? 0 : Math.max(0, actor.endedAtMs - earliestLosslessReadyMs);
+	const incrementalMatchKind = exact.length
+		? "exact"
+		: lossless.some(({ match }) => match === "canonical")
+			? "canonical"
+			: lossless.some(({ match }) => match === "projected")
+				? "projected"
+				: undefined;
 	return {
 		actorSequence: actor.sequence,
 		actorAction,
@@ -600,8 +650,29 @@ function opportunity(
 		exactReadyBeforeActor: exactLeadMs > 0,
 		...(earliestExactReadyMs === undefined ? {} : { earliestExactReadyMs }),
 		exactLeadMs,
+		losslessHit: lossless.length > 0,
+		...(incrementalMatchKind ? { losslessMatchKind: incrementalMatchKind } : {}),
+		losslessReadyBeforeActor: losslessLeadMs > 0,
+		...(earliestLosslessReadyMs === undefined ? {} : { earliestLosslessReadyMs }),
+		losslessLeadMs,
 		drafterServiceMs: sum(drafters, (exchange) => exchange.endedAtMs),
 	};
+}
+
+/** Tape requests omit runtime fingerprints, so this only measures same-context semantic opportunity. */
+function losslessActionMatch(
+	speculativeCall: TapeToolCall,
+	actorCall: TapeToolCall,
+): "exact" | "canonical" | "projected" | undefined {
+	if (actionIdentity(speculativeCall) === actionIdentity(actorCall)) return "exact";
+	const speculative = buildPiActionKey(speculativeCall.name, speculativeCall.arguments, "/workspace");
+	const actor = buildPiActionKey(actorCall.name, actorCall.arguments, "/workspace");
+	if (!speculative || !actor) return undefined;
+	const projectors = PI_ACTION_SEMANTICS.projectors();
+	const match = actionKeyMatch(speculative, actor, projectors);
+	if (!match) return undefined;
+	if (match.kind === "exact") return "canonical";
+	return actionKeyCovers(speculative, actor, projectors) ? "projected" : undefined;
 }
 
 function decodeToolCalls(chunks: readonly TapeChunk[]): readonly TapeToolCall[] {

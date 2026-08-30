@@ -214,6 +214,8 @@ function candidate(id: string): CandidateEventDescriptor {
 		tool: "read",
 		actionKeyHash: `hash-${id}`,
 		execution: "resource_snapshot",
+		executionBackend: "resource_version",
+		executionFingerprint: "resource-version:v1",
 		source: "pattern_aware",
 		depth: 0,
 		predictedAction: "read README.md",

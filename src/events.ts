@@ -29,6 +29,10 @@ export interface CandidateEventDescriptor {
 	readonly tool: string;
 	readonly actionKeyHash: string;
 	readonly execution: SpeculativeExecution;
+	/** Concrete world identity used for source/tool/backend utility accounting. */
+	readonly executionBackend: string;
+	/** Route-local identity; a changed sandbox/runtime starts a separate utility history. */
+	readonly executionFingerprint: string;
 	readonly source: string;
 	readonly depth: number;
 	readonly predictedAction: string;

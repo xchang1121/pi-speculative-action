@@ -19,6 +19,7 @@ import {
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 import { DEFAULTS } from "../src/common.ts";
+import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	canPreviewIncompletePiCall,
@@ -28,9 +29,7 @@ import {
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
-
-const DATASET_ROWS =
-	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
+import { loadDatasetRow, type DatasetRow } from "./swebench-dataset.ts";
 
 const latencyProfiles = {
 	native: { read: 0, grep: 0, find: 0, ls: 0, bash: 0, edit: 0, write: 0 },
@@ -40,19 +39,6 @@ const latencyProfiles = {
 } as const;
 
 type LatencyProfile = keyof typeof latencyProfiles;
-
-interface DatasetRow {
-	readonly instance_id: string;
-	readonly repo: string;
-	readonly base_commit: string;
-	readonly patch: string;
-	readonly test_patch: string;
-	readonly problem_statement: string;
-	readonly language: string;
-	readonly source_dataset: string;
-	readonly FAIL_TO_PASS: readonly string[];
-	readonly PASS_TO_PASS: readonly string[];
-}
 
 interface PreparedTask {
 	readonly row: DatasetRow;
@@ -87,6 +73,7 @@ interface BenchmarkOptions {
 	readonly output?: string;
 	readonly patternState?: string;
 	readonly drafterEnabled: boolean;
+	readonly unboundedExecutionGateEnabled: boolean;
 	readonly patternAware: boolean;
 	readonly prepareOnly: boolean;
 }
@@ -101,6 +88,7 @@ const { values } = parseArgs({
 		instance: { type: "string" },
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
+		"api-base-url": { type: "string" },
 		"actor-max-tokens": { type: "string", default: "8192" },
 		"actor-temperature": { type: "string", default: "0" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
@@ -122,6 +110,7 @@ const { values } = parseArgs({
 		output: { type: "string" },
 		"pattern-state": { type: "string" },
 		"drafter-disabled": { type: "boolean", default: false },
+		"unbounded-execution-gate-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
 	},
@@ -135,10 +124,10 @@ const runRoot = path.resolve(values["run-root"] ?? path.join(os.tmpdir(), "pi-sp
 const options: BenchmarkOptions = {
 	instance,
 	label: values.label ?? "baseline",
-	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
+	actor: model(values.actor ?? "deepseek/deepseek-v4-pro", values["api-base-url"]),
 	actorMaxTokens: positiveInteger(values["actor-max-tokens"], "--actor-max-tokens"),
 	actorTemperature: nonNegativeNumber(values["actor-temperature"], "--actor-temperature"),
-	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
+	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash", values["api-base-url"]),
 	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
 	...(values["drafter-max-tokens"] !== undefined
@@ -159,6 +148,7 @@ const options: BenchmarkOptions = {
 	...(values.output ? { output: path.resolve(values.output) } : {}),
 	...(values["pattern-state"] ? { patternState: path.resolve(values["pattern-state"]) } : {}),
 	drafterEnabled: !(values["drafter-disabled"] ?? false),
+	unboundedExecutionGateEnabled: !(values["unbounded-execution-gate-disabled"] ?? false),
 	patternAware: values["pattern-aware"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 };
@@ -183,8 +173,9 @@ if (options.prepareOnly) {
 }
 
 async function prepareTask(input: BenchmarkOptions): Promise<PreparedTask> {
-	const row = await datasetRow(input.instance);
 	await Promise.all([mkdir(input.repoCache, { recursive: true }), mkdir(input.runRoot, { recursive: true })]);
+	const datasetCache = path.join(input.repoCache, "datasets", "claw-swe-bench-lite", `${safeName(input.instance)}.json`);
+	const row = await loadDatasetRow(input.instance, datasetCache);
 	const cache = path.join(input.repoCache, `${safeName(row.repo)}.git`);
 	if (!(await exists(cache))) {
 		await command("git", ["init", "--bare", cache]);
@@ -250,6 +241,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: true,
 		drafterEnabled: input.drafterEnabled,
+		unboundedExecutionGateEnabled: input.unboundedExecutionGateEnabled,
 		drafterMaxDepth: input.drafterMaxDepth,
 		drafterMaxTokens: input.drafterMaxTokens,
 		drafterDeterministicCandidates: input.drafterDeterministicCandidates,
@@ -292,7 +284,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		preflight: () => true,
 		resolveInvocation,
-		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
+		projectionRules: [PI_READ_RANGE_PROJECTION_RULE, PI_BASH_TAIL_LINES_PROJECTION_RULE],
 		executionWorlds: [sandbox],
 		patternStateDirectory: input.patternState ?? path.join(task.runDirectory, "patterns"),
 		...(input.patternState
@@ -431,6 +423,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const taskStartedAt = performance.now();
 	let taskCompletedAt: number | undefined;
 	let timedOut = false;
+	let unboundedExecutionGate = host.unboundedExecutionGateSnapshot();
 	const timeout = setTimeout(() => {
 		timedOut = true;
 		agent.abort();
@@ -441,6 +434,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		taskCompletedAt = performance.now();
 		clearTimeout(timeout);
 		if (lastTurnID) await host.finishTurn(lastTurnID, true);
+		unboundedExecutionGate = host.unboundedExecutionGateSnapshot();
 		await host.dispose();
 	}
 	const summary = summarizeSpeculativeTrace(events);
@@ -590,6 +584,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterTemperatureMin: input.drafterTemperatureMin,
 			drafterTemperatureMax: input.drafterTemperatureMax,
 			drafterEnabled: input.drafterEnabled,
+			unboundedExecutionGateEnabled: input.unboundedExecutionGateEnabled,
 			maxConcurrentActions: input.maxConcurrentActions,
 			maxTurns: input.maxTurns,
 			timeoutMs: input.timeoutMs,
@@ -661,6 +656,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			candidateFailed: summary.candidateFailed,
 			candidateCancelled: summary.candidateCancelled,
 			candidateTerminalCauses: summary.candidateTerminalCauses,
+			unboundedExecutionGate,
 			actorCandidateRejections: summary.actorCandidateRejections,
 			speculativeHitProvidersBySource,
 			actorActionMatchesByPredictionSource,
@@ -740,43 +736,7 @@ function benchmarkShellEnvironment(): Record<string, string> {
 	);
 }
 
-async function datasetRow(instanceID: string): Promise<DatasetRow> {
-	const response = await fetch(DATASET_ROWS);
-	if (!response.ok) throw new Error(`Dataset request failed with HTTP ${response.status}`);
-	const value: unknown = await response.json();
-	if (!value || typeof value !== "object" || !("rows" in value) || !Array.isArray(value.rows)) {
-		throw new Error("Dataset response has no rows");
-	}
-	for (const item of value.rows) {
-		if (!item || typeof item !== "object" || !("row" in item)) continue;
-		const row = validDatasetRow(item.row);
-		if (row?.instance_id === instanceID) return row;
-	}
-	throw new Error(`Claw-SWE-Bench Lite instance not found: ${instanceID}`);
-}
-
-function validDatasetRow(value: unknown): DatasetRow | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const row = value as Partial<Record<keyof DatasetRow, unknown>>;
-	for (const key of [
-		"instance_id",
-		"repo",
-		"base_commit",
-		"patch",
-		"test_patch",
-		"problem_statement",
-		"language",
-		"source_dataset",
-	] as const) {
-		if (typeof row[key] !== "string") return undefined;
-	}
-	for (const key of ["FAIL_TO_PASS", "PASS_TO_PASS"] as const) {
-		if (!Array.isArray(row[key]) || !row[key].every((item) => typeof item === "string")) return undefined;
-	}
-	return row as DatasetRow;
-}
-
-function model(value: string): Model<Api> {
+function model(value: string, baseUrl?: string): Model<Api> {
 	const separator = value.indexOf("/");
 	if (separator <= 0 || separator === value.length - 1) throw new Error(`Invalid model ${value}; expected provider/id`);
 	const providerName = value.slice(0, separator);
@@ -785,7 +745,8 @@ function model(value: string): Model<Api> {
 	const modelID = value.slice(separator + 1);
 	const resolved = getModels(provider).find((candidate) => candidate.id === modelID);
 	if (!resolved) throw new Error(`Unknown model ${value}`);
-	return resolved;
+	const endpoint = baseUrl?.trim().replace(/\/+$/u, "");
+	return endpoint ? { ...resolved, baseUrl: endpoint } : resolved;
 }
 
 function standardMessages(messages: readonly AgentMessage[]): Message[] {

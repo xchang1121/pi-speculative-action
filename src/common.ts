@@ -38,6 +38,7 @@ export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
 	drafterGateEnabled: true,
+	unboundedExecutionGateEnabled: true,
 	...DRAFTER_DEFAULTS,
 	candidateLimit: 2,
 	maxConcurrentActions: 8,
