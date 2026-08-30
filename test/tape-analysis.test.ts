@@ -36,84 +36,12 @@ describe("LLM tape action analysis", () => {
 			actorDecodeMs: 100,
 			drafterServiceMs: 90,
 			exactLeadMs: 70,
-			losslessHits: 1,
-			incrementalCanonicalHits: 0,
-			incrementalProjectedHits: 0,
-			losslessHitRate: 1,
-			losslessReadyBeforeActor: 1,
-			losslessEarlyHitRate: 1,
-			losslessLeadMs: 70,
 		});
 		expect(result.opportunities[0]).toMatchObject({
 			drafterSequences: [1, 2, 3],
 			exactReadyBeforeActor: true,
 			earliestExactReadyMs: 30,
 		});
-	});
-
-	it("reports directional Bash projection separately from strict exact hits", () => {
-		const messages = [{ role: "user", content: "test" }];
-		const result = analyzeTape(
-			{
-				exchanges: [
-					exchange(0, "actor", messages, 100, [
-						calls(
-							["bash", '{"command":"pytest -q 2>&1 | tail -20"}'],
-							["bash", '{"command":"other -q 2>&1 | tail -60"}'],
-						),
-					]),
-					exchange(1, "draft", messages, 30, [
-						call("bash", '{"command":"pytest -q 2>&1 | tail -60"}'),
-					]),
-					exchange(2, "draft", messages, 20, [
-						call("bash", '{"command":"other -q 2>&1 | tail -20"}'),
-					]),
-				],
-			},
-			"actor",
-			"draft",
-		);
-
-		expect(result.summary).toMatchObject({
-			opportunities: 2,
-			exactHits: 0,
-			losslessHits: 1,
-			incrementalCanonicalHits: 0,
-			incrementalProjectedHits: 1,
-			losslessReadyBeforeActor: 1,
-			losslessLeadMs: 70,
-		});
-		expect(result.opportunities).toMatchObject([
-			{
-				losslessHit: true,
-				losslessMatchKind: "projected",
-				earliestLosslessReadyMs: 30,
-				losslessLeadMs: 70,
-			},
-			{ losslessHit: false, losslessLeadMs: 0 },
-		]);
-	});
-
-	it("separates canonical default equivalence from a raw argument match", () => {
-		const messages = [{ role: "user", content: "read" }];
-		const result = analyzeTape(
-			{
-				exchanges: [
-					exchange(0, "actor", messages, 80, [call("read", '{"path":"/workspace/a"}')]),
-					exchange(1, "draft", messages, 10, [call("read", '{"path":"a"}')]),
-				],
-			},
-			"actor",
-			"draft",
-		);
-
-		expect(result.summary).toMatchObject({
-			exactHits: 0,
-			losslessHits: 1,
-			incrementalCanonicalHits: 1,
-			incrementalProjectedHits: 0,
-		});
-		expect(result.opportunities[0]?.losslessMatchKind).toBe("canonical");
 	});
 
 	it("ignores malformed, incomplete, and non-tool responses", () => {

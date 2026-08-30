@@ -533,13 +533,6 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		actual: vi.fn(),
 		finishTurn: vi.fn(),
 		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),
-		unboundedExecutionGateSnapshot: () => ({
-			candidateExecutions: 0,
-			suppressedCandidates: 0,
-			shadowMatches: 0,
-			samples: 0,
-			entries: [],
-		}),
 		dispose: vi.fn(),
 	};
 }
@@ -591,7 +584,6 @@ function effectiveSettings() {
 		enabled: true,
 		drafterEnabled: true,
 		drafterGateEnabled: true,
-		unboundedExecutionGateEnabled: true,
 		drafterMaxDepth: 1,
 		drafterMaxTokens: 128,
 		drafterDeterministicCandidates: 1,

@@ -19,30 +19,11 @@ npm run bench:tape -- \
   --drafter-model deepseek-v4-flash
 ```
 
-Analyze the Bash calls retained by a SWE-bench summary without issuing model or
-tool requests:
-
-```sh
-npm run bench:bash-corpus -- \
-  --summary /private/path/full_bash/summary.json \
-  --covering-buckets 20,40,80,200,500,1000,2000
-```
-
-The report separates terminal commands that merely look like `tail` pipelines
-from views accepted by the production lossless projector. Historical repeats
-and bucket-widening coverage are structural counterfactual upper bounds, not
-measured cache hits: intervening workspace mutations can still invalidate a
-prior result.
-
 The report distinguishes raw and unique K(a), duplicate Drafter work, exact
 hits, candidates ready before Actor completion, decode lead, and aggregate
-Drafter service time. It separately reports same-context canonical equivalence
-and directional in-flight coverage proved by the production projection
-registry. These are semantic opportunities rather than completed cache hits:
-the tape has no tool output, freshness evidence, or runtime executor
-fingerprint. It also replays static Drafter request widths 1, 2, 3, and 8 in
-request-dispatch order. Width costs are charged once per Actor turn while exact
-coverage remains action-scoped, so a multi-tool Actor response cannot
+Drafter service time. It also replays static Drafter request widths 1, 2, 3, and
+8 in request-dispatch order. Width costs are charged once per Actor turn while
+exact coverage remains action-scoped, so a multi-tool Actor response cannot
 artificially multiply Drafter work. Recordings remain private and are never
 copied into the repository.
 
@@ -85,17 +66,6 @@ increasingly remote or isolated tools. The runner uses resource-version routes
 for read-only tools and the production Git-worktree world for file mutations.
 No process sandbox is bundled, so Bash predictions are matched but execute only
 through the Actor path unless the embedding host injects a runtime-wide world.
-Consequently the stock runner's Bash corpus and tape reports establish semantic
-coverage, not an end-to-end Bash speedup.
-
-Unbounded speculative execution utility gating is enabled by default when such
-a runtime-wide world is present. Use `--unbounded-execution-gate-disabled` only
-for a paired ablation. Every result records its source/tool/backend partitions
-under `summary.unboundedExecutionGate`; a paused prediction remains
-structurally observable as `admission:candidate_utility_suppressed` and is never
-counted as a fabricated speculative hit. The snapshot is mechanism telemetry,
-not a wall-clock claim; compare gate-on and gate-off runs against the same tape,
-workspace, and execution backend.
 
 Use `--drafter-disabled --pattern-aware --pattern-state <directory>` to isolate
 PatternAware. The explicit state directory also selects a stable logical
@@ -145,23 +115,6 @@ Required ablation discipline:
 The API key is read only from `DEEPSEEK_API_KEY`; it is never written to an
 artifact or exposed to benchmark shell processes. Workspaces and JSON results
 default to the operating-system temporary directory.
-
-Use `--api-base-url http://127.0.0.1:4010` to route both Actor and Drafter
-requests through an OpenAI-compatible record/replay proxy. This lets one
-recorded trajectory be replayed against multiple scheduler and matching
-implementations without another paid request. For example, with
-`pi-llm-tape` running in replay mode:
-
-```sh
-DEEPSEEK_API_KEY=replay-only npm run bench:ablation -- \
-  --instance axios__axios-5316 \
-  --label tape-replay \
-  --api-base-url http://127.0.0.1:4010
-```
-
-Strict tape replay should remain enabled for comparisons. A 409 exhausted
-response then exposes a changed request trajectory instead of silently cycling
-an unrelated recorded occurrence.
 
 Use `--prepare-only` to verify dataset lookup and the fresh checkout without a
 model request. Patch cleanliness and changed-file overlap are integrity signals,

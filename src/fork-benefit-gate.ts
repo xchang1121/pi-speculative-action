@@ -116,11 +116,6 @@ export class BenefitGate {
 		this.states.clear();
 	}
 
-	/** Forget one independently calibrated partition. */
-	delete(key: string): void {
-		this.states.delete(key);
-	}
-
 	private probeDecision(
 		state: GateState,
 		policy: BenefitGatePolicy,

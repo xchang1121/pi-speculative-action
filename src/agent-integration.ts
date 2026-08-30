@@ -60,19 +60,12 @@ import type { SelfSpeculationActionBridge } from "./self-speculation-action-brid
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableStringify } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import {
-	UnboundedExecutionUtilityGate,
-	type UnboundedExecutionUtilityGateSnapshot,
-	unboundedExecutionUtilityDescriptor,
-} from "./unbounded-execution-utility-gate.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
 	/** Adaptively skip a root Drafter batch when its measured action-side utility is negative. */
 	readonly drafterGateEnabled?: boolean;
-	/** Adaptively pause negative-utility speculative execution for unbounded actions, without suppressing predictions. */
-	readonly unboundedExecutionGateEnabled?: boolean;
 	/** Output-informed successor actions retained after the first Drafter action. */
 	readonly drafterMaxDepth?: number;
 	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
@@ -190,12 +183,10 @@ export interface SpeculativeActionHost {
 	) => Promise<void>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
 	readonly drafterGateSnapshot: () => ActionDrafterGateSnapshot;
-	readonly unboundedExecutionGateSnapshot: () => ActionUnboundedExecutionGateSnapshot;
 	readonly dispose: () => Promise<void>;
 }
 
 export type ActionDrafterGateSnapshot = DrafterUtilityGateSnapshot;
-export type ActionUnboundedExecutionGateSnapshot = UnboundedExecutionUtilityGateSnapshot;
 
 interface AgentStartInput {
 	readonly sessionID: string;
@@ -272,7 +263,6 @@ export function createSpeculativeActionHost(
 	};
 	const drafterBatches = new Map<string, Promise<DrafterBatch>>();
 	const drafterGate = new DrafterUtilityGate();
-	const unboundedExecutionGate = new UnboundedExecutionUtilityGate();
 	let patternAnalysisTail: Promise<void> = Promise.resolve();
 	const queuePatternAnalysis = (analysis: () => void | Promise<void>) => {
 		patternAnalysisTail = patternAnalysisTail
@@ -325,10 +315,6 @@ export function createSpeculativeActionHost(
 					typeof settings.drafterGateEnabled === "boolean"
 						? settings.drafterGateEnabled
 						: DEFAULTS.drafterGateEnabled,
-				unboundedExecutionGateEnabled:
-					typeof settings.unboundedExecutionGateEnabled === "boolean"
-						? settings.unboundedExecutionGateEnabled
-						: DEFAULTS.unboundedExecutionGateEnabled,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 				selfSpeculationActionEnabled:
 					selfSpeculation.enabled &&
@@ -868,55 +854,17 @@ export function createSpeculativeActionHost(
 			};
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: async ({
-			startInput,
-			data,
-			settings,
-			candidate,
-			tool: toolName,
-			concrete,
-			action,
-			route,
-			callID,
-			signal,
-		}) => {
+		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
 			const result = await options.preflight({ tool, toolName, args, action, route, signal });
-			const preflight: CandidatePreflight =
-				typeof result === "boolean"
+			return typeof result === "boolean"
 				? result
 					? { ok: true }
 					: { ok: false, reason: "permission_or_policy" }
 				: result;
-			if (!preflight.ok) return preflight;
-			if (candidate.source === "actor_preview" || actionSemantics.effect(toolName) !== "unbounded") {
-				return preflight;
-			}
-			const decision = unboundedExecutionGate.decide({
-				sessionID: startInput.sessionID,
-				turnID: startInput.turnID,
-				prediction: {
-					source: candidate.source ?? "unknown",
-					proposalID: candidate.proposalID ?? "",
-					actionID: candidate.actionID ?? "",
-				},
-				descriptor: unboundedExecutionUtilityDescriptor({
-					source: candidate.source ?? "unknown",
-					tool: toolName,
-					route,
-				}),
-				enabled: settings.sourceConfig?.unboundedExecutionGateEnabled !== false,
-			});
-			return decision.allowed
-				? preflight
-				: {
-						ok: false,
-						reason: "candidate_utility_suppressed",
-						detail: `Rolling ${decision.reason.replaceAll("_", " ")}`,
-					};
 		},
 		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
 			const tool = stateData.tools.get(toolName);
@@ -981,7 +929,6 @@ export function createSpeculativeActionHost(
 			});
 		},
 		onTurnFinished: ({ startInput, settings, terminal }) => {
-			unboundedExecutionGate.finishTurn(startInput.sessionID, startInput.turnID);
 			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
 			const drafterBatch = drafterBatches.get(key);
 			drafterBatches.delete(key);
@@ -1017,11 +964,6 @@ export function createSpeculativeActionHost(
 		onActorActionSettled: options.onActorActionSettled,
 		onPredictionSettled: options.onPredictionSettled,
 		onEvent: async (event) => {
-			try {
-				unboundedExecutionGate.recordEvent(event);
-			} catch {
-				// Utility telemetry can suppress only future optional work.
-			}
 			if (
 				event.type === "actor_action" &&
 				event.candidate?.source === "drafter" &&
@@ -1056,7 +998,6 @@ export function createSpeculativeActionHost(
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		actual: (input) => runtime.actual({ ...input, sessionID }),
 		drafterGateSnapshot: () => drafterGate.snapshot(),
-		unboundedExecutionGateSnapshot: () => unboundedExecutionGate.snapshot(),
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
 			if (terminal) await finishPatternSession();

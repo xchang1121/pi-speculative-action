@@ -36,7 +36,6 @@
 		"bench:ablation": "tsx ./bench/run.ts",
 		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:tape": "tsx ./bench/tape.ts",
-		"bench:bash-corpus": "tsx ./bench/bash-corpus.ts",
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
 		"test": "vitest --run",
 		"prepack": "npm run build"

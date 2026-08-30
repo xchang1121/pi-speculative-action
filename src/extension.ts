@@ -83,7 +83,6 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
 	readonly drafterEnabled: boolean;
 	readonly drafterGateEnabled: boolean;
-	readonly unboundedExecutionGateEnabled: boolean;
 	readonly drafterMaxDepth: number;
 	readonly drafterMaxTokens?: number;
 	readonly drafterDeterministicCandidates: number;
@@ -161,10 +160,6 @@ export function normalizeSpeculativeActionSettings(
 		drafterEnabled: typeof input?.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
 		drafterGateEnabled:
 			typeof input?.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
-		unboundedExecutionGateEnabled:
-			typeof input?.unboundedExecutionGateEnabled === "boolean"
-				? input.unboundedExecutionGateEnabled
-				: DEFAULTS.unboundedExecutionGateEnabled,
 		...drafter,
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
@@ -192,7 +187,6 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Draft model: ${settings.draftModel ?? "active model"}`,
 		`Drafter requests: ${settings.candidateLimit}`,
-		`Unbounded execution utility gate: ${settings.unboundedExecutionGateEnabled ? "On" : "Off"}`,
 		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
 		`Resource cache: ${settings.resourceCacheMaxEntries}`,
@@ -522,8 +516,7 @@ async function installController(
 			const effective = settings();
 			const bridge = selfSpeculation.snapshot();
 			const drafterGate = host.drafterGateSnapshot();
-			const unboundedGate = host.unboundedExecutionGateSnapshot();
-			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nUnbounded execution gate: ${effective.unboundedExecutionGateEnabled ? "On" : "Off"}; ${unboundedGate.suppressedCandidates} candidates paused, ${unboundedGate.shadowMatches} shadow matches, ${unboundedGate.samples} samples across ${unboundedGate.entries.length} source/tool/backend partitions\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -1112,7 +1105,6 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		const choice = await ctx.ui.select("Scheduling & cache", [
 			`Drafter requests: ${settings.candidateLimit}`,
 			`Concurrent actions: ${settings.maxConcurrentActions}`,
-			`Unbounded execution gate: ${settings.unboundedExecutionGateEnabled ? "On" : "Off"}`,
 			`Resource cache entries: ${settings.resourceCacheMaxEntries}`,
 			`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
 			BACK,
@@ -1123,12 +1115,6 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		}
 		if (choice.startsWith("Concurrent actions:")) {
 			await editPositiveInteger(ctx, controller, settings, "maxConcurrentActions", "Concurrent actions");
-		}
-		if (choice.startsWith("Unbounded execution gate:")) {
-			controller.setSettings({
-				...settings,
-				unboundedExecutionGateEnabled: !settings.unboundedExecutionGateEnabled,
-			});
 		}
 		if (choice.startsWith("Resource cache entries:")) {
 			await editPositiveInteger(ctx, controller, settings, "resourceCacheMaxEntries", "Resource cache entries");

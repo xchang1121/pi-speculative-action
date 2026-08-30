@@ -439,8 +439,6 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 		tool: candidate.key.tool,
 		actionKeyHash: candidate.key.hash,
 		execution: candidate.route.isolation,
-		executionBackend: candidate.route.backend,
-		executionFingerprint: candidate.route.fingerprint,
 		predictedAction: diagnosticAction(candidate.key.tool, candidate.key.input, candidate.key),
 		predictionLatencyMs: candidate.predictionLatencyMs,
 		draftTokens: candidate.draftTokens,
@@ -1266,10 +1264,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			signal: context.admissionSignal,
 		});
 		if (!admission.ok) {
-			const structurallyMatchableWithoutExecution =
-				(admission.cause.stage === "execution" && admission.cause.code === "isolation_unavailable") ||
-				(admission.cause.stage === "admission" && admission.cause.code === "candidate_utility_suppressed");
-			if (!structurallyMatchableWithoutExecution) {
+			if (admission.cause.stage !== "execution" || admission.cause.code !== "isolation_unavailable") {
 				failUnlaunchable(session, node, admission.cause);
 				return;
 			}

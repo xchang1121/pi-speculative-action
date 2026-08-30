@@ -69,7 +69,6 @@ export {
 } from "./agent-execution-world.ts";
 export {
 	type ActionDrafterGateSnapshot,
-	type ActionUnboundedExecutionGateSnapshot,
 	type CreateSpeculativeActionHostOptions,
 	createSpeculativeActionHost,
 	type DraftOptionsContext,
@@ -78,14 +77,6 @@ export {
 	type SpeculativeAgentPreflightContext,
 	type SpeculativeAgentSettingsInput,
 } from "./agent-integration.ts";
-export {
-	UnboundedExecutionUtilityGate,
-	type UnboundedExecutionUtilityAdmission,
-	type UnboundedExecutionUtilityDescriptor,
-	type UnboundedExecutionUtilityGateEntrySnapshot,
-	type UnboundedExecutionUtilityGateSnapshot,
-	unboundedExecutionUtilityDescriptor,
-} from "./unbounded-execution-utility-gate.ts";
 export {
 	clampCandidateLimit,
 	DEFAULTS,
