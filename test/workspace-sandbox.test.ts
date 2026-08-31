@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -287,6 +287,136 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(values.map((value) => value.content).sort()).toEqual(["first\n", "second\n"]);
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("base\n");
 			for (const value of values) await expect(stat(value.root)).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("captures exact regular-file deltas through the generic workspace transaction driver", async () => {
+		const root = await temporaryRoot("transaction");
+		try {
+			await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
+			await writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8");
+			await writeFile(path.join(root, "untouched.txt"), "stable\n", "utf8");
+			await withSandboxWorkspace(root, async (workspace) => {
+				const capture = await workspace.transactions.begin();
+				await writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after!\n", "utf8");
+				await writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8");
+				await rm(path.join(workspace.sandboxRoot, "deleted.txt"));
+				const delta = await capture.finish();
+
+				expect(delta.complete).toBe(true);
+				if (!delta.complete) throw new Error(`workspace transaction was incomplete: ${delta.reason}`);
+				const beforeEntry = delta.before.entries.get("changed.txt");
+				const afterEntry = delta.after.entries.get("changed.txt");
+				if (beforeEntry?.kind !== "file" || afterEntry?.kind !== "file") throw new Error("change clock missing");
+				expect(afterEntry.changeTimeMs).toBeGreaterThan(beforeEntry.changeTimeMs);
+				expect(delta.changes.map((change) => change.relativePath)).toEqual([
+					"changed.txt",
+					"created.txt",
+					"deleted.txt",
+				]);
+				expect(
+					delta.changes.map((change) => ({
+						path: change.relativePath,
+						before: change.before ? Buffer.from(change.before).toString("utf8") : undefined,
+						after: change.after ? Buffer.from(change.after).toString("utf8") : undefined,
+					})),
+				).toEqual([
+					{ path: "changed.txt", before: "before\n", after: "after!\n" },
+					{ path: "created.txt", before: undefined, after: "created\n" },
+					{ path: "deleted.txt", before: "deleted\n", after: undefined },
+				]);
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("defers transaction observation until the first mutation interval", async () => {
+		const root = await temporaryRoot("transaction-deferred");
+		try {
+			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
+			await withSandboxWorkspace(root, async (workspace) => {
+				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
+				await expect(stat(clock)).rejects.toThrow();
+				const capture = await workspace.transactions.begin();
+				expect((await stat(clock)).isFile()).toBe(true);
+				await capture.abort();
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("poisons reuse if the private change-clock identity is replaced", async () => {
+		if (process.platform === "win32") return;
+		const root = await temporaryRoot("transaction-clock");
+		try {
+			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
+			await withSandboxWorkspace(root, async (workspace) => {
+				const first = await workspace.transactions.begin();
+				await first.abort();
+				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
+				await link(clock, path.join(workspace.processRoot, "workspace-transaction.alias"));
+				const second = await workspace.transactions.begin();
+				const delta = await second.finish();
+				expect(delta.complete).toBe(false);
+				if (delta.complete) throw new Error("replaced workspace clock was unexpectedly accepted");
+				expect(delta.reason).toContain("workspace transaction clock identity changed");
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("marks unsupported inode transitions incomplete without undoing the operation", async () => {
+		if (process.platform === "win32") return;
+		const root = await temporaryRoot("transaction-inode");
+		try {
+			await writeFile(path.join(root, "target.txt"), "target\n", "utf8");
+			await withSandboxWorkspace(root, async (workspace) => {
+				const capture = await workspace.transactions.begin();
+				const linkPath = path.join(workspace.sandboxRoot, "link.txt");
+				await symlink("target.txt", linkPath);
+				const delta = await capture.finish();
+				expect(delta.complete).toBe(false);
+				if (delta.complete) throw new Error("symlink transition was unexpectedly reusable");
+				expect(delta.reason).toContain("unsupported_workspace_transition:link.txt");
+				expect((await stat(linkPath)).isFile()).toBe(true);
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for overlapping workspace mutation intervals and recovers afterward", async () => {
+		const root = await temporaryRoot("transaction-overlap");
+		try {
+			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
+			await withSandboxWorkspace(root, async (workspace) => {
+				const first = await workspace.transactions.begin();
+				const second = await workspace.transactions.begin();
+				await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "overlap\n", "utf8");
+				const [firstDelta, secondDelta] = await Promise.all([first.finish(), second.finish()]);
+				expect(firstDelta).toMatchObject({
+					complete: false,
+					changes: [],
+					reason: "overlapping_workspace_transaction",
+				});
+				expect(secondDelta).toMatchObject({
+					complete: false,
+					changes: [],
+					reason: "overlapping_workspace_transaction",
+				});
+
+				const recovered = await workspace.transactions.begin();
+				await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "recovered\n", "utf8");
+				const recoveredDelta = await recovered.finish();
+				expect(recoveredDelta.complete).toBe(true);
+				expect(Buffer.from(recoveredDelta.changes[0]?.before ?? []).toString("utf8")).toBe("overlap\n");
+				expect(Buffer.from(recoveredDelta.changes[0]?.after ?? []).toString("utf8")).toBe("recovered\n");
+			});
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

@@ -34,6 +34,8 @@ Lookup follows a weak-exec-key / dynamic-pathset / strong-input-key hierarchy. H
 
 Before replay begins, the complete content-addressed output/effect closure is loaded and integrity checked once. Output wire data and all file-effect bytes are materialized before the transactional commit, so replay neither reopens a deleted CAS blob nor begins a fallback-prone partial adoption. The 128 MiB WSL2 qualification measures the resulting I/O reduction.
 
+Nested process misses use the same generic workspace-transaction outlet as the outer execution world. Fenced, content-free inode change tokens select candidate paths; immutable baseline/prior-frontier bytes and stable descriptor reads remain the exact authority. Overlap, a non-advancing filesystem clock, or unsupported inode semantics disables publication instead of guessing. The transaction driver initializes lazily, so replay-only branches do not pay its observation cost. This removed whole-tree content snapshots and reduced qualified cold Pi Bash latency by 7.4% on WSL2.
+
 ## Correctness boundaries
 
 - Prediction sources never choose an execution backend.

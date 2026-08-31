@@ -364,3 +364,9 @@ export {
 	forkSandboxWorkspace,
 	withSandboxWorkspace,
 } from "./workspace-sandbox.ts";
+export type {
+	WorkspaceRegularDelta,
+	WorkspaceTransactionCapture,
+	WorkspaceTransactionDelta,
+	WorkspaceTransactionDriver,
+} from "./workspace-transaction.ts";

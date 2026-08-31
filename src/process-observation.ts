@@ -3,6 +3,21 @@ import { lstat, readFile, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import type { DynamicDependency, Sha256Digest } from "./provenance-certificate.ts";
 import { digestObject, sha256Digest } from "./provenance-certificate.ts";
+import type {
+	WorkspaceStructureEntry,
+	WorkspaceStructureSnapshot,
+	WorkspaceSnapshot,
+	WorkspaceTreeEntry,
+	WorkspaceTreeSnapshot,
+} from "./workspace-state.ts";
+import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
+
+export type {
+	WorkspaceStructureEntry,
+	WorkspaceStructureSnapshot,
+	WorkspaceTreeEntry,
+	WorkspaceTreeSnapshot,
+} from "./workspace-state.ts";
 
 export interface ExecutionPathProjectionOptions {
 	readonly sourceRoot: string;
@@ -45,51 +60,6 @@ export class ExecutionPathProjection {
 		return pathContains(this.workspaceRoot, path.resolve(physicalPath));
 	}
 }
-
-export type WorkspaceTreeEntry =
-	| {
-			readonly kind: "file";
-			readonly digest: Sha256Digest;
-			readonly metadataDigest: Sha256Digest;
-			readonly mode: number;
-			readonly size: number;
-			readonly links: number;
-			readonly content?: Buffer;
-	  }
-	| {
-			readonly kind: "directory";
-			readonly entriesDigest: Sha256Digest;
-			readonly metadataDigest: Sha256Digest;
-			readonly mode: number;
-	  }
-	| {
-			readonly kind: "symlink";
-			readonly target: string;
-			readonly targetDigest: Sha256Digest;
-	  }
-	| { readonly kind: "unsupported"; readonly type: string };
-
-export type WorkspaceStructureEntry =
-	| {
-			readonly kind: "file";
-			readonly metadataDigest: Sha256Digest;
-			readonly mode: number;
-			readonly size: number;
-			readonly links: number;
-	  }
-	| Exclude<WorkspaceTreeEntry, { readonly kind: "file" }>;
-
-interface WorkspaceSnapshot<Entry> {
-	readonly root: string;
-	readonly entries: ReadonlyMap<string, Entry>;
-	readonly files: number;
-	readonly bytesRead: number;
-	readonly complete: boolean;
-}
-
-export interface WorkspaceTreeSnapshot extends WorkspaceSnapshot<WorkspaceTreeEntry> {}
-
-export interface WorkspaceStructureSnapshot extends WorkspaceSnapshot<WorkspaceStructureEntry> {}
 
 export interface WorkspaceTreeCaptureOptions {
 	readonly includeFileContent?: boolean;
@@ -135,6 +105,8 @@ async function captureWorkspaceSnapshot(
 		kind: "directory",
 		entriesDigest: directoryEntriesDigest(rootChildren.filter((entry) => !excludes.has(entry.name))),
 		metadataDigest: statMetadataDigest(rootStat),
+		changeDigest: statChangeDigest(rootStat),
+		changeTimeMs: rootStat.ctimeMs,
 		mode: rootStat.mode & 0o777,
 	});
 
@@ -156,6 +128,8 @@ async function captureWorkspaceSnapshot(
 					kind: "symlink",
 					target: linkTarget,
 					targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")),
+					changeDigest: statChangeDigest(stat),
+					changeTimeMs: stat.ctimeMs,
 				});
 				continue;
 			}
@@ -165,6 +139,8 @@ async function captureWorkspaceSnapshot(
 					kind: "directory",
 					entriesDigest: directoryEntriesDigest(names),
 					metadataDigest: statMetadataDigest(stat),
+					changeDigest: statChangeDigest(stat),
+					changeTimeMs: stat.ctimeMs,
 					mode: stat.mode & 0o777,
 				});
 				await visit(target, relative);
@@ -175,6 +151,8 @@ async function captureWorkspaceSnapshot(
 					entries.set(relative, {
 						kind: "file",
 						metadataDigest: statMetadataDigest(stat),
+						changeDigest: statChangeDigest(stat),
+						changeTimeMs: stat.ctimeMs,
 						mode: stat.mode & 0o777,
 						size: stat.size,
 						links: stat.nlink,
@@ -191,6 +169,8 @@ async function captureWorkspaceSnapshot(
 					kind: "file",
 					digest: sha256Digest(content),
 					metadataDigest: statMetadataDigest(stat),
+					changeDigest: statChangeDigest(stat),
+					changeTimeMs: stat.ctimeMs,
 					mode: stat.mode & 0o777,
 					size: content.byteLength,
 					links: stat.nlink,
@@ -198,20 +178,17 @@ async function captureWorkspaceSnapshot(
 				});
 				continue;
 			}
-			entries.set(relative, { kind: "unsupported", type: specialFileType(stat) });
+			entries.set(relative, {
+				kind: "unsupported",
+				type: specialFileType(stat),
+				changeDigest: statChangeDigest(stat),
+				changeTimeMs: stat.ctimeMs,
+			});
 		}
 	};
 
 	await visit(absoluteRoot, "");
 	return Object.freeze({ root: absoluteRoot, entries, files, bytesRead, complete });
-}
-
-export interface WorkspaceRegularDelta {
-	readonly relativePath: string;
-	readonly before?: Uint8Array;
-	readonly after?: Uint8Array;
-	readonly beforeMode?: number;
-	readonly afterMode?: number;
 }
 
 /** Effect shape used only to seal input evidence; replay bytes remain owned by the transaction. */
@@ -537,6 +514,20 @@ function statMetadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Dige
 		uid: stat.uid,
 		gid: stat.gid,
 		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
+		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
+	});
+}
+
+/** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */
+function statChangeDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Digest {
+	return digestObject({
+		dev: stat.dev,
+		ino: stat.ino,
+		ctimeMs: stat.ctimeMs,
+		mtimeMs: stat.mtimeMs,
+		mode: stat.mode,
+		size: stat.size,
+		links: stat.nlink,
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }

@@ -41,17 +41,12 @@ import {
 } from "./provenance-validation.ts";
 import {
 	captureWorkspaceStructure,
-	captureWorkspaceTree,
 	diffWorkspaceStructures,
-	diffWorkspaceTrees,
 	ExecutionPathProjection,
 	hydrateWorkspaceFileEntry,
-	parentSnapshotEntry,
-	relativeSnapshotEntry,
 	snapshotDependency,
 	type WorkspaceStructureSnapshot,
 	type WorkspaceTreeEntry,
-	type WorkspaceTreeSnapshot,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
@@ -60,9 +55,10 @@ import { observeStrace, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { commitSandboxDelta, type SandboxFileChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
+import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v4";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v4";
+const BACKEND_EPOCH = "pi-linux-process-v5";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v5";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -579,13 +575,11 @@ export class LinuxProcessReuseBackend {
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
-		const before = await captureWorkspaceTree(session.workspace.sandboxRoot, {
-			maxBytes: MAX_CAPTURE_BYTES,
-			maxFiles: MAX_CAPTURE_FILES,
-		});
+		const transaction = await session.workspace.transactions.begin();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
 		let outcome: SpawnOutcome | undefined;
+		let transactionFinishing = false;
 		try {
 			const command = [
 				ready.strace,
@@ -614,19 +608,23 @@ export class LinuxProcessReuseBackend {
 				environment: executionEnvironment(request.environment, executable),
 			});
 			try {
-				const after = await captureWorkspaceTree(session.workspace.sandboxRoot, {
-					includeFileContent: true,
-					maxBytes: MAX_CAPTURE_BYTES,
-					maxFiles: MAX_CAPTURE_FILES,
-				});
-				const observation = await observeStrace(tracePrefix, executable, request.cwd);
+				transactionFinishing = true;
+				const [delta, observation] = await Promise.all([
+					transaction.finish(),
+					observeStrace(tracePrefix, executable, request.cwd),
+				]);
 				if (observation.incompleteReasons.length) {
 					this.counters.lastError = `trace:${observation.incompleteReasons.join(",")}`;
 				}
-				const effects = diffWorkspaceTrees(before, after, session.projection);
+				if (!delta.complete) {
+					this.counters.lastError = `transaction:${delta.reason}`;
+					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
+				}
+				const { before, after } = delta;
+				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
 				const evidence = await captureDependencies(
 					session,
-					treeDependencySource(before),
+					transactionDependencySource(before, delta.changes),
 					observation.paths,
 					effects.effects,
 				);
@@ -636,14 +634,20 @@ export class LinuxProcessReuseBackend {
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				for (const taint of evidence.taints) taints.add(taint);
 				if (!effects.complete) taints.add("unsupported_syscall");
-				if (!before.complete || !after.complete || !observation.complete) taints.add("trace_incomplete");
+				if (!before.complete || !after.complete || !observation.complete) {
+					taints.add("trace_incomplete");
+				}
 				const journal: OrderedEffectEvent[] = [];
 				let sequence = 0;
+				const changes = new Map(delta.changes.map((change) => [path.normalize(change.relativePath), change]));
 				for (const effect of effects.effects) {
 					if (effect.kind === "delete") journal.push({ sequence: sequence++, kind: "delete", path: effect.logicalPath });
 					else {
-						const data = await this.store.artifacts.put(effect.after!.content!);
-						journal.push({ sequence: sequence++, kind: "write", path: effect.logicalPath, data, mode: effect.after!.mode });
+						const change = changes.get(path.normalize(effect.relativePath));
+						if (!change?.after) throw new Error(`transaction output is unavailable: ${effect.relativePath}`);
+						if (change.afterMode === undefined) throw new Error(`transaction output mode is unavailable: ${effect.relativePath}`);
+						const data = await this.store.artifacts.put(change.after);
+						journal.push({ sequence: sequence++, kind: "write", path: effect.logicalPath, data, mode: change.afterMode });
 					}
 				}
 				for (const event of outcome.output) {
@@ -651,7 +655,12 @@ export class LinuxProcessReuseBackend {
 					journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data });
 				}
 				const dependencyCertificate: DynamicDependencyCertificate = {
-					complete: before.complete && after.complete && observation.complete && evidence.complete,
+					complete:
+						before.complete &&
+						after.complete &&
+						observation.complete &&
+						effects.complete &&
+						evidence.complete,
 					dependencies: evidence.dependencies,
 					taints: [...taints],
 				};
@@ -674,6 +683,7 @@ export class LinuxProcessReuseBackend {
 			return { version: 1, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
 			this.counters.executionMs += Math.max(0, performance.now() - started);
+			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
 	}
@@ -765,7 +775,16 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 		);
 		const evidence = await captureDependencies(
 			session,
-			transactionDependencySource(capture.before, changes),
+			transactionDependencySource(
+				capture.before,
+				changes.map((change) => ({
+					relativePath: change.resource,
+					...(change.before ? { before: change.before } : {}),
+					...(change.after ? { after: change.after } : {}),
+					...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
+					...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
+				})),
+			),
 			capture.observation.paths,
 			effects.effects,
 		);
@@ -795,21 +814,14 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 	}
 }
 
-function treeDependencySource(snapshot: WorkspaceTreeSnapshot): WorkspaceDependencySource {
-	return {
-		entry: (physicalPath) => Promise.resolve(relativeSnapshotEntry(snapshot, physicalPath)),
-		parentEntry: (physicalPath) => Promise.resolve(parentSnapshotEntry(snapshot, physicalPath)),
-	};
-}
-
 function transactionDependencySource(
 	snapshot: WorkspaceStructureSnapshot,
-	changes: readonly SandboxFileChange[],
+	changes: readonly WorkspaceRegularDelta[],
 ): WorkspaceDependencySource {
-	const deltas = new Map<string, SandboxFileChange>();
+	const deltas = new Map<string, WorkspaceRegularDelta>();
 	for (const change of changes) {
-		const relative = path.normalize(change.resource);
-		if (deltas.has(relative)) throw new Error(`duplicate transaction delta: ${change.resource}`);
+		const relative = path.normalize(change.relativePath);
+		if (deltas.has(relative)) throw new Error(`duplicate transaction delta: ${change.relativePath}`);
 		deltas.set(relative, change);
 	}
 	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
@@ -825,7 +837,7 @@ function transactionDependencySource(
 			if (!structure || structure.kind !== "file") return structure;
 			const delta = deltas.get(relative);
 			if (delta && delta.before === undefined) {
-				throw new Error(`transaction baseline is missing file bytes: ${delta.resource || delta.target}`);
+				throw new Error(`transaction baseline is missing file bytes: ${delta.relativePath}`);
 			}
 			const bytes = delta?.before ?? (await readFile(path.resolve(snapshot.root, relative)));
 			const hydrated = hydrateWorkspaceFileEntry(structure, bytes);

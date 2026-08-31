@@ -15,9 +15,21 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
+import {
+	captureWorkspaceStructure,
+	type WorkspaceStructureEntry,
+	type WorkspaceStructureSnapshot,
+} from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
+import {
+	deferredWorkspaceTransactionDriver,
+	type WorkspaceRegularDelta,
+	type WorkspaceTransactionCapture,
+	type WorkspaceTransactionDelta,
+	type WorkspaceTransactionDriver,
+} from "./workspace-transaction.ts";
 
 export interface SandboxFileChange {
 	readonly root: string;
@@ -51,6 +63,8 @@ export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
+	/** Content-addressed mutation intervals, independent of any process or tool implementation. */
+	readonly transactions: WorkspaceTransactionDriver;
 }
 
 export interface SandboxWorkspaceBranchOptions {
@@ -100,11 +114,374 @@ interface PreparedGitWorkspace {
 	readonly commit: string;
 }
 
+class GitWorkspaceTransactionCapture implements WorkspaceTransactionCapture {
+	contaminated = false;
+	settled = false;
+	readonly owner: GitWorkspaceTransactionDriver;
+	readonly before?: WorkspaceStructureSnapshot;
+	readonly frontier?: ReadonlyMap<string, RegularFileState | undefined>;
+
+	constructor(
+		owner: GitWorkspaceTransactionDriver,
+		before?: WorkspaceStructureSnapshot,
+		frontier?: ReadonlyMap<string, RegularFileState | undefined>,
+	) {
+		this.owner = owner;
+		this.before = before;
+		this.frontier = frontier;
+	}
+
+	readonly finish = (): Promise<WorkspaceTransactionDelta> => this.owner.finish(this);
+	readonly abort = (): Promise<void> => this.owner.abort(this);
+}
+
+class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
+	private readonly active = new Set<GitWorkspaceTransactionCapture>();
+	private lock: Promise<void> = Promise.resolve();
+	private readonly gitBinary: string;
+	private readonly sandboxRoot: string;
+	private readonly baselineTree: string;
+	private readonly clockPath: string;
+	private lastStructure: WorkspaceStructureSnapshot;
+	private readonly frontier = new Map<string, RegularFileState | undefined>();
+	private poisonReason?: string;
+	private clockSequence = 0;
+	private clockDevice?: number;
+
+	constructor(
+		gitBinary: string,
+		sandboxRoot: string,
+		baselineTree: string,
+		clockPath: string,
+		initialStructure: WorkspaceStructureSnapshot,
+	) {
+		this.gitBinary = gitBinary;
+		this.sandboxRoot = sandboxRoot;
+		this.baselineTree = baselineTree;
+		this.clockPath = clockPath;
+		this.lastStructure = initialStructure;
+		if (!initialStructure.complete) this.poisonReason = "workspace_structure_limit";
+	}
+
+	async initialize(): Promise<void> {
+		if (this.poisonReason) return;
+		try {
+			await this.assertChangeClockFilesystem();
+			await this.advanceChangeClock(this.lastStructure);
+			const verified = await captureWorkspaceStructure(this.sandboxRoot, {
+				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+			});
+			if (!sameWorkspaceChangeSnapshot(this.lastStructure, verified)) {
+				throw new Error("workspace changed while initializing transaction clock");
+			}
+			this.lastStructure = verified;
+		} catch (error) {
+			this.poisonReason = `workspace_transaction_clock:${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	readonly begin = (): Promise<WorkspaceTransactionCapture> =>
+		this.withLock(async () => {
+			if (this.active.size > 0) {
+				for (const capture of this.active) capture.contaminated = true;
+				const capture = new GitWorkspaceTransactionCapture(this);
+				capture.contaminated = true;
+				this.active.add(capture);
+				return capture;
+			}
+			if (this.poisonReason) {
+				const capture = new GitWorkspaceTransactionCapture(this);
+				this.active.add(capture);
+				return capture;
+			}
+			let before: WorkspaceStructureSnapshot | undefined;
+			try {
+				before = await this.captureFencedBefore();
+			} catch (error) {
+				this.poisonReason = `workspace_transaction_sync:${error instanceof Error ? error.message : String(error)}`;
+			}
+			const capture = this.poisonReason || !before
+				? new GitWorkspaceTransactionCapture(this)
+				: new GitWorkspaceTransactionCapture(this, before, new Map(this.frontier));
+			this.active.add(capture);
+			return capture;
+		});
+
+	async finish(capture: GitWorkspaceTransactionCapture): Promise<WorkspaceTransactionDelta> {
+		return this.withLock(async () => {
+			if (capture.settled || !this.active.has(capture)) {
+				return { complete: false, changes: [], reason: "transaction_already_settled" };
+			}
+			capture.settled = true;
+			this.active.delete(capture);
+			if (capture.contaminated) {
+				return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
+			}
+			if (!capture.before || !capture.frontier) {
+				return { complete: false, changes: [], reason: this.poisonReason ?? "workspace_transaction_unavailable" };
+			}
+			try {
+				const observed = await captureWorkspaceStructure(this.sandboxRoot, {
+					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+				});
+				await this.advanceChangeClock(observed);
+				const after = await captureWorkspaceStructure(this.sandboxRoot, {
+					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+				});
+				if (!sameWorkspaceChangeSnapshot(observed, after)) {
+					throw new Error("workspace changed while fencing transaction endpoint");
+				}
+				const transitions = regularStructureTransitions(capture.before, after);
+				this.lastStructure = after;
+				if (!transitions.complete) {
+					this.poisonReason = transitions.reason;
+					return { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
+				}
+				const changes = await this.captureTransitions(transitions.paths, capture.frontier, after);
+				const verified = await captureWorkspaceStructure(this.sandboxRoot, {
+					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+				});
+				if (!sameWorkspaceChangeSnapshot(after, verified)) {
+					throw new Error("workspace changed while sealing transaction endpoint");
+				}
+				this.lastStructure = verified;
+				return {
+					complete: true,
+					changes,
+					before: capture.before,
+					after: verified,
+				};
+			} catch (error) {
+				const reason = `workspace_transaction_capture:${error instanceof Error ? error.message : String(error)}`;
+				this.poisonReason = reason;
+				return {
+					complete: false,
+					changes: [],
+					reason,
+					before: capture.before,
+				};
+			}
+		});
+	}
+
+	private async captureFencedBefore(): Promise<WorkspaceStructureSnapshot> {
+		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
+			const current = await captureWorkspaceStructure(this.sandboxRoot, {
+				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+			});
+			await this.advanceChangeClock(current);
+			const fenced = await captureWorkspaceStructure(this.sandboxRoot, {
+				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+			});
+			if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
+			await this.synchronizeFrontier(fenced);
+			if (this.poisonReason) throw new Error(this.poisonReason);
+			const verified = await captureWorkspaceStructure(this.sandboxRoot, {
+				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+			});
+			if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
+			this.lastStructure = verified;
+			return verified;
+		}
+		throw new Error("workspace did not stabilize before transaction execution");
+	}
+
+	private async assertChangeClockFilesystem(): Promise<void> {
+		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+		const handle = await open(
+			this.clockPath,
+			fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | noFollow,
+			0o600,
+		);
+		try {
+			const [workspace, clock] = await Promise.all([lstat(this.sandboxRoot), handle.stat()]);
+			if (!workspace.isDirectory() || !clock.isFile() || clock.nlink !== 1 || workspace.dev !== clock.dev) {
+				throw new Error("workspace transaction clock is not a private regular file on the workspace filesystem");
+			}
+			this.clockDevice = clock.dev;
+		} finally {
+			await handle.close();
+		}
+	}
+
+	private async advanceChangeClock(snapshot: WorkspaceStructureSnapshot): Promise<void> {
+		let boundary = Number.NEGATIVE_INFINITY;
+		for (const entry of snapshot.entries.values()) boundary = Math.max(boundary, entry.changeTimeMs);
+		if (!Number.isFinite(boundary)) throw new Error("workspace change clock boundary is unavailable");
+		const deadline = Date.now() + WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS;
+		for (;;) {
+			const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+			const handle = await open(this.clockPath, fsConstants.O_WRONLY | noFollow);
+			let changedAt: number;
+			try {
+				const identity = await handle.stat();
+				if (
+					!identity.isFile() ||
+					identity.nlink !== 1 ||
+					this.clockDevice === undefined ||
+					identity.dev !== this.clockDevice
+				) {
+					throw new Error("workspace transaction clock identity changed");
+				}
+				await handle.truncate(0);
+				await handle.writeFile(`${++this.clockSequence}\n`, "utf8");
+				changedAt = (await handle.stat()).ctimeMs;
+			} finally {
+				await handle.close();
+			}
+			if (changedAt > boundary) return;
+			if (Date.now() >= deadline) throw new Error("filesystem change clock did not advance");
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		}
+	}
+
+	async abort(capture: GitWorkspaceTransactionCapture): Promise<void> {
+		await this.withLock(async () => {
+			if (capture.settled) return;
+			capture.settled = true;
+			this.active.delete(capture);
+			for (const active of this.active) active.contaminated = true;
+		});
+	}
+
+	private async synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
+		const transitions = regularStructureTransitions(this.lastStructure, current);
+		this.lastStructure = current;
+		if (!transitions.complete) {
+			this.poisonReason = transitions.reason;
+			return;
+		}
+		let retainedBytes = stateMapBytes(this.frontier);
+		for (const relativePath of transitions.paths) {
+			const entry = current.entries.get(relativePath);
+			retainedBytes -= this.frontier.get(relativePath)?.content.byteLength ?? 0;
+			const state =
+				entry?.kind === "file"
+					? await readRegularState(
+							path.resolve(this.sandboxRoot, relativePath),
+							WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
+						)
+					: undefined;
+			retainedBytes += state?.content.byteLength ?? 0;
+			this.frontier.set(relativePath, state);
+		}
+	}
+
+	private async captureTransitions(
+		paths: readonly string[],
+		beforeFrontier: ReadonlyMap<string, RegularFileState | undefined>,
+		after: WorkspaceStructureSnapshot,
+	): Promise<readonly WorkspaceRegularDelta[]> {
+		const changes: WorkspaceRegularDelta[] = [];
+		let beforeBytes = 0;
+		let afterBytes = 0;
+		let retainedBytes = stateMapBytes(this.frontier);
+		for (const relativePath of paths) {
+			const previous = beforeFrontier.has(relativePath)
+				? beforeFrontier.get(relativePath)
+				: await readGitTreeRegularState(
+						this.gitBinary,
+						this.sandboxRoot,
+						this.baselineTree,
+						relativePath,
+						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
+					);
+			beforeBytes += previous?.content.byteLength ?? 0;
+			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) {
+				throw new Error("workspace transaction before-state exceeds capture limit");
+			}
+			const entry = after.entries.get(relativePath);
+			retainedBytes -= this.frontier.get(relativePath)?.content.byteLength ?? 0;
+			const current =
+				entry?.kind === "file"
+					? await readRegularState(
+							path.resolve(this.sandboxRoot, relativePath),
+							Math.min(
+								WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes,
+								WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
+							),
+						)
+					: undefined;
+			afterBytes += current?.content.byteLength ?? 0;
+			retainedBytes += current?.content.byteLength ?? 0;
+			this.frontier.set(relativePath, current);
+			if (!sameOptionalState(previous, current)) {
+				changes.push({
+					relativePath,
+					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
+					...(current ? { after: current.content, afterMode: current.mode } : {}),
+				});
+			}
+		}
+		return Object.freeze(changes);
+	}
+
+	private async withLock<T>(run: () => Promise<T>): Promise<T> {
+		const previous = this.lock;
+		let release: () => void = () => {};
+		this.lock = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await run();
+		} finally {
+			release();
+		}
+	}
+}
+
+function regularStructureTransitions(
+	before: WorkspaceStructureSnapshot,
+	after: WorkspaceStructureSnapshot,
+): { readonly complete: true; readonly paths: readonly string[] } | { readonly complete: false; readonly reason: string } {
+	if (!before.complete || !after.complete) return { complete: false, reason: "workspace_structure_limit" };
+	const paths: string[] = [];
+	for (const relativePath of [...new Set([...before.entries.keys(), ...after.entries.keys()])].sort()) {
+		if (!relativePath) continue;
+		const previous = before.entries.get(relativePath);
+		const current = after.entries.get(relativePath);
+		if (sameChangeIdentity(previous, current)) continue;
+		if ((previous === undefined || previous.kind === "file") && (current === undefined || current.kind === "file")) {
+			paths.push(relativePath);
+			continue;
+		}
+		if (previous?.kind === "directory" && current?.kind === "directory") continue;
+		return { complete: false, reason: `unsupported_workspace_transition:${relativePath}` };
+	}
+	return { complete: true, paths: Object.freeze(paths) };
+}
+
+function sameChangeIdentity(
+	left: WorkspaceStructureEntry | undefined,
+	right: WorkspaceStructureEntry | undefined,
+): boolean {
+	return left === right || (!!left && !!right && left.kind === right.kind && left.changeDigest === right.changeDigest);
+}
+
+function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: WorkspaceStructureSnapshot): boolean {
+	if (!left.complete || !right.complete || left.entries.size !== right.entries.size) return false;
+	for (const [relativePath, entry] of left.entries) {
+		if (!sameChangeIdentity(entry, right.entries.get(relativePath))) return false;
+	}
+	return true;
+}
+
+function stateMapBytes(states: ReadonlyMap<string, RegularFileState | undefined>): number {
+	let total = 0;
+	for (const state of states.values()) total += state?.content.byteLength ?? 0;
+	return total;
+}
+
 // The execution world mirrors everything the actor can read below cwd. Git metadata is
 // replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
+const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
+const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
+const WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS = 100;
+const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
@@ -421,21 +798,56 @@ async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promis
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
 	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
+	let attached: PreparedGitWorkspace | undefined;
 	try {
 		const commit = await acquireSandboxBaseline(pool, SANDBOX_AUTHOR_ENVIRONMENT);
 		const workspace = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit));
+		attached = workspace;
+		const transactions = deferredWorkspaceTransactionDriver(() =>
+			createGitWorkspaceTransactionDriver(gitBinary, workspace),
+		);
 		return {
 			sourceRoot,
 			sandboxRoot: workspace.sandboxRoot,
 			processRoot: workspace.processRoot,
+			transactions,
 			repository: pool.repository,
 			gitBinary,
 			pool,
 		};
 	} catch (error) {
+		if (attached) await discardPreparedSandbox(pool, attached).catch(() => undefined);
 		releaseSandboxRepository(pool);
 		throw error;
 	}
+}
+
+async function createGitWorkspaceTransactionDriver(
+	gitBinary: string,
+	workspace: PreparedGitWorkspace,
+): Promise<WorkspaceTransactionDriver> {
+	const baselineTree = (
+		await git(
+			gitBinary,
+			["-C", workspace.sandboxRoot, "rev-parse", "HEAD^{tree}"],
+			workspace.sandboxRoot,
+		)
+	)
+		.toString("utf8")
+		.trim();
+	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
+	const initialStructure = await captureWorkspaceStructure(workspace.sandboxRoot, {
+		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+	});
+	const driver = new GitWorkspaceTransactionDriver(
+		gitBinary,
+		workspace.sandboxRoot,
+		baselineTree,
+		path.join(workspace.processRoot, "workspace-transaction.clock"),
+		initialStructure,
+	);
+	await driver.initialize();
+	return driver;
 }
 
 async function acquireSandboxRepository(sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
@@ -1015,6 +1427,37 @@ async function readBaselineState(
 	};
 }
 
+async function readGitTreeRegularState(
+	gitBinary: string,
+	sandboxRoot: string,
+	tree: string,
+	resource: string,
+	maxBytes = WORKSPACE_TRANSACTION_MAX_BYTES,
+): Promise<RegularFileState | undefined> {
+	const entry = await git(gitBinary, ["-C", sandboxRoot, "ls-tree", "-z", tree, "--", resource], sandboxRoot);
+	if (entry.length === 0) return undefined;
+	const terminator = entry.indexOf(0);
+	if (terminator === -1) throw new Error(`invalid Git transaction entry: ${resource}`);
+	const metadata = entry.subarray(0, terminator).toString("utf8").split("\t", 1)[0];
+	const [mode, kind, hash] = metadata.split(" ");
+	if ((mode !== "100644" && mode !== "100755") || kind !== "blob") {
+		throw new Error(`workspace transaction resource is not a regular file: ${resource}`);
+	}
+	if (!hash) throw new Error(`invalid Git transaction blob: ${resource}`);
+	const content = await git(
+			gitBinary,
+			["-C", sandboxRoot, "cat-file", "blob", hash],
+			sandboxRoot,
+			{},
+			Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1),
+		);
+	if (content.byteLength > maxBytes) throw new Error(`Git transaction blob exceeds capture limit: ${resource}`);
+	return {
+		content,
+		mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644,
+	};
+}
+
 async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
 	const resolvedRoot = path.resolve(root);
 	const resolvedTarget = path.resolve(target);
@@ -1068,7 +1511,7 @@ async function assertCommitTarget(change: SandboxFileChange): Promise<void> {
 	await assertNoSymlinkPath(root, target);
 }
 
-async function readRegularState(target: string): Promise<RegularFileState | undefined> {
+async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
 	let handle: FileHandle;
 	try {
 		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
@@ -1081,15 +1524,33 @@ async function readRegularState(target: string): Promise<RegularFileState | unde
 		throw error;
 	}
 	try {
-		const info = await handle.stat();
-		if (!info.isFile()) throw new Error(`sandbox resource is not a regular file: ${target}`);
+		const before = await handle.stat();
+		if (!before.isFile()) throw new Error(`sandbox resource is not a regular file: ${target}`);
+		if (before.size > maxBytes) throw new Error(`sandbox resource exceeds capture limit: ${target}`);
+		const content = await handle.readFile();
+		const after = await handle.stat();
+		if (content.byteLength !== before.size || !sameOpenFileIdentity(before, after)) {
+			throw new Error(`sandbox resource changed while being captured: ${target}`);
+		}
 		return {
-			content: await handle.readFile(),
-			mode: process.platform === "win32" ? 0 : info.mode & 0o777,
+			content,
+			mode: process.platform === "win32" ? 0 : before.mode & 0o777,
 		};
 	} finally {
 		await handle.close();
 	}
+}
+
+function sameOpenFileIdentity(left: Awaited<ReturnType<FileHandle["stat"]>>, right: Awaited<ReturnType<FileHandle["stat"]>>): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeMs === right.mtimeMs &&
+		left.ctimeMs === right.ctimeMs
+	);
 }
 
 function sameBaselineState(current: RegularFileState | undefined, change: SandboxFileChange): boolean {
@@ -1322,6 +1783,7 @@ function git(
 	args: readonly string[],
 	cwd: string,
 	environment: Readonly<Record<string, string>> = {},
+	maxBuffer = 64 * 1024 * 1024,
 ): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
 		execFile(
@@ -1331,7 +1793,7 @@ function git(
 				cwd,
 				env: { ...process.env, ...environment },
 				encoding: "buffer",
-				maxBuffer: 64 * 1024 * 1024,
+				maxBuffer,
 			},
 			(error, stdout, stderr) => {
 				if (error) {

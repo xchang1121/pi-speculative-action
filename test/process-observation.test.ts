@@ -68,6 +68,8 @@ describe("process observation", () => {
 			expect(before.bytesRead).toBe(0);
 			expect(after.bytesRead).toBe(0);
 			expect("digest" in beforeEntry).toBe(false);
+			expect(beforeEntry.metadataDigest).toBe(afterEntry.metadataDigest);
+			expect(beforeEntry.changeDigest).not.toBe(afterEntry.changeDigest);
 			const diff = diffWorkspaceStructures(
 				before,
 				after,
