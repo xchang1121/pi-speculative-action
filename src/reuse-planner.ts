@@ -7,6 +7,7 @@ import {
 	processStrongKey,
 	processWeakKey,
 	type ProcessProvenanceCertificate,
+	referencedArtifacts,
 	type Sha256Digest,
 } from "./provenance-certificate.ts";
 import {
@@ -14,7 +15,7 @@ import {
 	type ProvenanceValidationContext,
 	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
-import { ProvenanceCertificateStore } from "./reuse-store.ts";
+import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
 export interface MemoryReuseProvider<Hit> {
 	/** Optional adapter over the Runtime-owned L1 ResultCache; the planner never owns a second L1. */
@@ -54,6 +55,8 @@ export interface ProcessReuseLookupMetrics {
 	readonly pathsetsValidated: number;
 	readonly filesRead: number;
 	readonly bytesRead: number;
+	readonly artifactsLoaded: number;
+	readonly artifactBytesRead: number;
 	readonly durationMs: number;
 }
 
@@ -71,6 +74,7 @@ export type ProcessReusePlan<MemoryHit = never> =
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
+			readonly artifacts: VerifiedArtifactClosure;
 			readonly lookup: ProcessReuseLookupMetrics;
 	  }
 	| {
@@ -80,6 +84,7 @@ export type ProcessReusePlan<MemoryHit = never> =
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly effects: readonly Exclude<OrderedEffectEvent, { kind: "output" }>[];
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
+			readonly artifacts: VerifiedArtifactClosure;
 			readonly lookup: ProcessReuseLookupMetrics;
 	  }
 	| {
@@ -109,6 +114,8 @@ export class ProcessReusePlanner<MemoryHit = never> {
 		let pathsetsValidated = 0;
 		let filesRead = 0;
 		let bytesRead = 0;
+		let artifactsLoaded = 0;
+		let artifactBytesRead = 0;
 		const lookup = (): ProcessReuseLookupMetrics =>
 			Object.freeze({
 				candidateCertificates,
@@ -116,6 +123,8 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				pathsetsValidated,
 				filesRead,
 				bytesRead,
+				artifactsLoaded,
+				artifactBytesRead,
 				durationMs: Math.max(0, performance.now() - startedAt),
 			});
 		const weakKey = processWeakKey(request.prototype);
@@ -178,10 +187,13 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				durationMs: observation.durationMs,
 			};
 			for (const certificate of matching) {
-				if (!(await artifactsAvailable(this.store, certificate))) {
+				const artifacts = await this.store.artifacts.load(referencedArtifacts(certificate));
+				if (!artifacts) {
 					reasons.add("artifact_missing");
 					continue;
 				}
+				artifactsLoaded += artifacts.artifacts;
+				artifactBytesRead += artifacts.bytes;
 				if (request.contract.mode === "completed_replay") {
 					return {
 						kind: "completed_replay",
@@ -189,6 +201,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 						weakKey,
 						certificate,
 						validation,
+						artifacts,
 						lookup: lookup(),
 					};
 				}
@@ -208,6 +221,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 					certificate,
 					effects,
 					validation,
+					artifacts,
 					lookup: lookup(),
 				};
 			}
@@ -239,14 +253,4 @@ function contractCompatible(
 		return false;
 	}
 	return certificate.result.replayProfile === "buffered_noninteractive";
-}
-
-async function artifactsAvailable(
-	store: ProvenanceCertificateStore,
-	certificate: ProcessProvenanceCertificate,
-): Promise<boolean> {
-	for (const event of certificate.result.journal) {
-		if ((event.kind === "output" || event.kind === "write") && !(await store.artifacts.has(event.data))) return false;
-	}
-	return true;
 }

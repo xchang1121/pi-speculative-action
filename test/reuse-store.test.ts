@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -64,6 +64,21 @@ describe("persistent provenance store", () => {
 
 		expect(await cas.has(reference)).toBe(true);
 		expect((await cas.get(reference))?.toString("utf8")).toBe("standalone");
+	});
+
+	it("leases a verified artifact closure before replay and survives backing-file removal", async () => {
+		const root = await temporaryRoot();
+		const cas = new ArtifactCAS(root);
+		const reference = await cas.put("leased bytes");
+		const closure = await cas.load([reference, reference]);
+		if (!closure) throw new Error("expected verified closure");
+		expect(closure).toMatchObject({ artifacts: 1, bytes: reference.size });
+
+		expect(closure.read(reference).toString("utf8")).toBe("leased bytes");
+		const hex = reference.digest.slice("sha256:".length);
+		await unlink(path.join(root, "sha256", hex.slice(0, 2), hex.slice(2)));
+		expect(closure.read(reference).toString("utf8")).toBe("leased bytes");
+		expect(await cas.load([reference])).toBeUndefined();
 	});
 });
 

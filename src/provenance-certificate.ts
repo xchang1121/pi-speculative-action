@@ -476,6 +476,7 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 	const journal = [...result.journal]
 		.map((event) => ({ ...event }))
 		.sort((left, right) => left.sequence - right.sequence);
+	const artifactSizes = new Map<Sha256Digest, number>();
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
 		if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) throw new Error("invalid effect sequence");
@@ -488,6 +489,13 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 			(!Number.isSafeInteger(event.data.size) || event.data.size < 0)
 		) {
 			throw new Error("invalid effect artifact size");
+		}
+		if (event.kind === "output" || event.kind === "write") {
+			const previousSize = artifactSizes.get(event.data.digest);
+			if (previousSize !== undefined && previousSize !== event.data.size) {
+				throw new Error("conflicting effect artifact sizes");
+			}
+			artifactSizes.set(event.data.digest, event.data.size);
 		}
 		for (const effectPath of effectPaths(event)) {
 			if (!validLogicalPath(effectPath)) throw new Error("invalid effect path");

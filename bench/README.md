@@ -40,6 +40,17 @@ dependency pathset once. This catches a common cache pathology where reverting a
 large input causes the validator to hash the same files once per historical
 certificate.
 
+Exercise artifact-closure verification and replay with a 128 MiB regular-file
+effect and three different parent Bash commands:
+
+```sh
+npm run bench:linux-artifacts -- --output bench/results/local-artifacts.json
+```
+
+Every replay must hit and reproduce the input digest. A closure-capable backend
+also reports the number and total size of artifacts integrity-checked before any
+workspace effect begins.
+
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
 contexts match; tool name and all parsed arguments must match exactly:

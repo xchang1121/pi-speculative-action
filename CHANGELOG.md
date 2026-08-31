@@ -22,6 +22,9 @@
 
 ### Added
 
+- Added verified artifact-closure leases: every referenced output/file blob is loaded and SHA-256
+  checked before replay side effects, duplicate references are deduplicated, and replay no longer
+  reopens CAS files after mutation begins.
 - Added a fail-closed Linux/WSL 2 process execution world using private Git branches, user/PID/network/IPC/UTS/mount namespaces, Sandlock Landlock/seccomp policy, and exact adoption-time provenance validation.
 - Added parent-independent, cross-turn process certificates with exact exec prototypes, dynamic file/directory/absence/symlink dependencies, ordered output/effect replay, at-most-once broker semantics, and single-flight publication.
 - Added transparent mount-namespace exec interposition that preserves the command-visible `PATH` and environment, plus a pinned `npm run setup:linux` installer for Sandlock.
@@ -61,6 +64,9 @@
 
 ### Changed
 
+- Large process effects now replay from their prevalidated artifact closure. A 128 MiB regular-file
+  effect reduced median complete Pi Bash hit latency from 2084.65 ms to 1928.33 ms (7.5%) while
+  closing the integrity-check/reopen race.
 - Process-certificate lookup now captures each distinct dynamic dependency pathset once and derives
   the current strong key against every historical state in that group. Reverting a 32 MiB input with
   eight cached states reduced median exact validation from 294.11 ms to 38.14 ms and complete Pi Bash

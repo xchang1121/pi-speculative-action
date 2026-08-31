@@ -259,6 +259,8 @@ function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProcessReuseM
 		validationPathsets: after.validationPathsets - before.validationPathsets,
 		validationFilesRead: after.validationFilesRead - before.validationFilesRead,
 		validationBytesRead: after.validationBytesRead - before.validationBytesRead,
+		validationArtifactsLoaded: after.validationArtifactsLoaded - before.validationArtifactsLoaded,
+		validationArtifactBytesRead: after.validationArtifactBytesRead - before.validationArtifactBytesRead,
 		executionMs: after.executionMs - before.executionMs,
 		...(after.lastError !== before.lastError && after.lastError ? { lastError: after.lastError } : {}),
 	};

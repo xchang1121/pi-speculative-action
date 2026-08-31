@@ -32,6 +32,8 @@ Each reusable result is a persisted provenance certificate containing dynamicall
 
 Lookup follows a weak-exec-key / dynamic-pathset / strong-input-key hierarchy. Historical certificates that observed the same pathset share one current-world capture; observation semantics such as dependency role, metadata policy, negative-parent enumeration, and private-entry exclusions remain part of the pathset identity. See the research and platform notes and the WSL2 multi-history qualification.
 
+Before replay begins, the complete content-addressed output/effect closure is loaded and integrity checked once. Output wire data and all file-effect bytes are materialized before the transactional commit, so replay neither reopens a deleted CAS blob nor begins a fallback-prone partial adoption. The 128 MiB WSL2 qualification measures the resulting I/O reduction.
+
 ## Correctness boundaries
 
 - Prediction sources never choose an execution backend.
@@ -198,6 +200,7 @@ npm run bench:check
 # Linux/WSL only: production Pi Bash tool + process-world qualification
 npm run bench:linux-process
 npm run bench:linux-pathset
+npm run bench:linux-artifacts
 npm pack --dry-run
 ```
 

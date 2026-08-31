@@ -192,6 +192,24 @@ describe("process provenance certificates", () => {
 		expect(key(fullDirectory)).not.toBe(key(projectedDirectory));
 		expect(key(absentWithParent)).not.toBe(key(absentWithoutParent));
 	});
+
+	it("rejects conflicting sizes for one content-addressed effect", () => {
+		const digest = sha256Digest("same digest");
+		expect(() =>
+			sealProcessCertificate({
+				prototype: prototype(),
+				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+				result: {
+					replayProfile: "buffered_noninteractive",
+					journal: [
+						{ sequence: 0, kind: "output", fd: 1, data: { digest, size: 11 } },
+						{ sequence: 1, kind: "write", path: "/workspace/out", data: { digest, size: 12 }, mode: 0o644 },
+					],
+					exit: { kind: "code", code: 0 },
+				},
+			}),
+		).toThrow("conflicting effect artifact sizes");
+	});
 });
 
 function prototype(environment: Readonly<Record<string, string | undefined>> = { MODE: "build" }) {

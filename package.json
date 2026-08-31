@@ -39,6 +39,7 @@
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
 		"bench:linux-process": "tsx ./bench/linux-process-reuse.ts",
 		"bench:linux-pathset": "tsx ./bench/linux-process-pathset.ts",
+		"bench:linux-artifacts": "tsx ./bench/linux-process-artifact-closure.ts",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"test": "vitest --run",
 		"prepack": "npm run build"

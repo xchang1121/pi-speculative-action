@@ -157,7 +157,7 @@ export {
 	type ProcessReuseRequest,
 	type ReplayObservationContract,
 } from "./reuse-planner.ts";
-export { ArtifactCAS, ProvenanceCertificateStore } from "./reuse-store.ts";
+export { ArtifactCAS, ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 export {
 	type CapturedExecutionWorldResult,
 	type ActionReuseKind,

@@ -65,6 +65,30 @@ describe("ProcessReusePlanner", () => {
 		expect(salvage).toMatchObject({ kind: "artifact_seed", effects: [{ kind: "write" }] });
 	});
 
+	it("loads each result artifact once into a verified closure before replay", async () => {
+		const fixture = await fixtureWithCertificate(true);
+		const get = vi.spyOn(fixture.store.artifacts, "get");
+		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
+			prototype: fixture.prototype,
+			contract: contract("completed_replay"),
+			validation: { resolvePath: () => fixture.input },
+		});
+		expect(plan).toMatchObject({
+			kind: "completed_replay",
+			lookup: { artifactsLoaded: 2, artifactBytesRead: 14 },
+		});
+		if (plan.kind !== "completed_replay") throw new Error("expected completed replay");
+		const references = plan.certificate.result.journal.flatMap((event) =>
+			event.kind === "output" || event.kind === "write" ? [event.data] : [],
+		);
+		expect(get).toHaveBeenCalledTimes(2);
+		for (const reference of references) {
+			plan.artifacts.read(reference);
+			plan.artifacts.read(reference);
+		}
+		expect(get).toHaveBeenCalledTimes(2);
+	});
+
 	it("consults an adapter over the existing L1 before persistent certificates", async () => {
 		const root = await temporaryRoot();
 		const lookup = vi.fn(async () => ({ resultEntry: "runtime-owned" }));

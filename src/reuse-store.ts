@@ -51,10 +51,60 @@ export class ArtifactCAS {
 		return (await this.get(reference)) !== undefined;
 	}
 
+	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
+	async load(references: readonly ArtifactReference[]): Promise<VerifiedArtifactClosure | undefined> {
+		const expected = new Map<Sha256Digest, ArtifactReference>();
+		for (const reference of references) {
+			const previous = expected.get(reference.digest);
+			if (previous && previous.size !== reference.size) {
+				throw new Error(`conflicting artifact sizes for ${reference.digest}`);
+			}
+			expected.set(reference.digest, reference);
+		}
+		const values = new Map<Sha256Digest, Buffer>();
+		for (const reference of expected.values()) {
+			const value = await this.get(reference);
+			if (!value) return undefined;
+			values.set(reference.digest, value);
+		}
+		return new LoadedArtifactClosure(values);
+	}
+
 	private artifactPath(digest: Sha256Digest): string {
 		const hex = digestHex(digest);
 		return path.join(this.root, "sha256", hex.slice(0, 2), hex.slice(2));
 	}
+}
+
+export interface VerifiedArtifactClosure {
+	readonly artifacts: number;
+	readonly bytes: number;
+	/** Borrow verified bytes. Trusted replay consumers must treat the returned buffer as read-only. */
+	readonly read: (reference: ArtifactReference) => Buffer;
+}
+
+class LoadedArtifactClosure implements VerifiedArtifactClosure {
+	readonly artifacts: number;
+	readonly bytes: number;
+	private readonly values: ReadonlyMap<Sha256Digest, Buffer>;
+
+	constructor(values: ReadonlyMap<Sha256Digest, Buffer>) {
+		this.values = new Map(values);
+		this.artifacts = values.size;
+		this.bytes = [...values.values()].reduce((total, value) => total + value.byteLength, 0);
+		Object.freeze(this);
+	}
+
+	readonly read = (reference: ArtifactReference): Buffer => {
+		if (!isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
+			throw new Error("invalid artifact reference");
+		}
+		const value = this.values.get(reference.digest);
+		if (!value || value.byteLength !== reference.size) {
+			throw new Error(`artifact is outside the verified closure: ${reference.digest}`);
+		}
+		return value;
+	};
 }
 
 /** Persistent L2 certificate/pathset index kept separate from the Runtime's in-memory ResultCache. */

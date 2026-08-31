@@ -49,8 +49,8 @@ import {
 	type WorkspaceTreeSnapshot,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
-import { ProcessReusePlanner } from "./reuse-planner.ts";
-import { ProvenanceCertificateStore } from "./reuse-store.ts";
+import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
+import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { observeStrace } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
@@ -94,6 +94,8 @@ export interface LinuxProcessReuseMetrics {
 	readonly validationPathsets: number;
 	readonly validationFilesRead: number;
 	readonly validationBytesRead: number;
+	readonly validationArtifactsLoaded: number;
+	readonly validationArtifactBytesRead: number;
 	readonly executionMs: number;
 	readonly lastError?: string;
 }
@@ -198,6 +200,8 @@ export class LinuxProcessReuseBackend {
 		validationPathsets: number;
 		validationFilesRead: number;
 		validationBytesRead: number;
+		validationArtifactsLoaded: number;
+		validationArtifactBytesRead: number;
 		executionMs: number;
 		lastError?: string;
 	} = {
@@ -212,6 +216,8 @@ export class LinuxProcessReuseBackend {
 		validationPathsets: 0,
 		validationFilesRead: 0,
 		validationBytesRead: 0,
+		validationArtifactsLoaded: 0,
+		validationArtifactBytesRead: 0,
 		executionMs: 0,
 	};
 
@@ -544,19 +550,22 @@ export class LinuxProcessReuseBackend {
 		this.counters.validationPathsets += plan.lookup.pathsetsValidated;
 		this.counters.validationFilesRead += plan.lookup.filesRead;
 		this.counters.validationBytesRead += plan.lookup.bytesRead;
-		return plan.kind === "completed_replay" ? plan.certificate : undefined;
+		this.counters.validationArtifactsLoaded += plan.lookup.artifactsLoaded;
+		this.counters.validationArtifactBytesRead += plan.lookup.artifactBytesRead;
+		return plan.kind === "completed_replay" ? plan : undefined;
 	}
 
 	private async replay(
 		session: ActiveSession,
-		certificate: Awaited<ReturnType<ProvenanceCertificateStore["get"]>> & {},
+		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
 	): Promise<DispatcherResponse> {
-		await replayFilesystemEffects(this.store, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
-		const output = await loadOutputEvents(this.store, certificate.result.journal);
+		const { artifacts, certificate } = plan;
+		const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
+		await replayFilesystemEffects(artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 		session.nestedEvidence.push(certificate.dependencyCertificate);
 		this.counters.hits++;
-		return { version: 1, kind: "hit", weakKey, output: wireOutput(output), exit: certificate.result.exit };
+		return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
 	}
 
 	private async executeAndPublish(
@@ -916,7 +925,7 @@ async function nearestMissingPath(target: string): Promise<string> {
 }
 
 async function replayFilesystemEffects(
-	store: ProvenanceCertificateStore,
+	artifacts: VerifiedArtifactClosure,
 	journal: readonly OrderedEffectEvent[],
 	projection: ExecutionPathProjection,
 	workspaceRoot: string,
@@ -934,8 +943,7 @@ async function replayFilesystemEffects(
 			changes.push({ root: workspaceRoot, target, resource: slash(path.relative(workspaceRoot, target)), ...before });
 			continue;
 		}
-		const after = await store.artifacts.get(event.data);
-		if (!after) throw new Error(`missing replay artifact ${event.data.digest}`);
+		const after = artifacts.read(event.data);
 		changes.push({
 			root: workspaceRoot,
 			target,
@@ -952,15 +960,14 @@ async function replayFilesystemEffects(
 	});
 }
 
-async function loadOutputEvents(
-	store: ProvenanceCertificateStore,
+function loadOutputEvents(
+	artifacts: VerifiedArtifactClosure,
 	journal: readonly OrderedEffectEvent[],
-): Promise<readonly BufferedOutput[]> {
+): readonly BufferedOutput[] {
 	const output: BufferedOutput[] = [];
 	for (const event of journal) {
 		if (event.kind !== "output") continue;
-		const data = await store.artifacts.get(event.data);
-		if (!data) throw new Error(`missing output artifact ${event.data.digest}`);
+		const data = artifacts.read(event.data);
 		output.push({ fd: event.fd, data });
 	}
 	return output;
