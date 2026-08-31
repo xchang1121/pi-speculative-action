@@ -143,8 +143,10 @@ export {
 	captureDirectoryDependency,
 	captureFileDependency,
 	captureSymlinkDependency,
+	type DynamicDependencyValidation,
 	type ProvenanceValidation,
 	type ProvenanceValidationContext,
+	validateDynamicDependencyCertificate,
 	validateProcessCertificate,
 } from "./provenance-validation.ts";
 export {
@@ -231,6 +233,25 @@ export {
 	withPiReadCoverage,
 } from "./pi-read-projection.ts";
 export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
+export {
+	LinuxProcessReuseBackend,
+	type LinuxProcessBackendOptions,
+	type LinuxProcessBackendStatus,
+	type LinuxProcessReuseMetrics,
+	type LinuxProcessSession,
+} from "./linux-process-backend.ts";
+export {
+	createLinuxProcessExecutionWorld,
+	type LinuxProcessExecutionWorldOptions,
+} from "./linux-process-world.ts";
+export {
+	adaptProcessToolOperations,
+	ProcessExecutionCoordinator,
+	type ProcessExecutionRequest,
+	type ProcessExecutionResult,
+	type ProcessExecutor,
+	type ProcessToolOperations,
+} from "./process-execution.ts";
 export type {
 	MaterializedPlan,
 	PlanAction,
@@ -338,6 +359,8 @@ export {
 	type SandboxExecutionDelta,
 	type SandboxFileChange,
 	type SandboxWorkspaceContext,
+	type SandboxWorkspaceBranchOptions,
 	type WorkspaceSandboxOptions,
+	forkSandboxWorkspace,
 	withSandboxWorkspace,
 } from "./workspace-sandbox.ts";

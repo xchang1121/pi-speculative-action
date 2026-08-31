@@ -43,19 +43,54 @@ export type ProvenanceValidation =
 			readonly durationMs: number;
 	  };
 
+export type DynamicDependencyValidation =
+	| {
+			readonly status: "valid";
+			readonly dependencies: readonly DynamicDependency[];
+			readonly filesRead: number;
+			readonly bytesRead: number;
+			readonly durationMs: number;
+	  }
+	| Extract<ProvenanceValidation, { readonly status: "stale" | "indeterminate" }>;
+
 export async function validateProcessCertificate(
 	certificate: ProcessProvenanceCertificate,
 	context: ProvenanceValidationContext = {},
 ): Promise<ProvenanceValidation> {
+	const validation = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, context);
+	if (validation.status !== "valid") return validation;
+	const dependencyCertificate: DynamicDependencyCertificate = {
+		complete: true,
+		dependencies: validation.dependencies,
+		taints: [],
+	};
+	const strongKey = processStrongKey(certificate.weakKey, dependencyCertificate);
+	if (strongKey !== certificate.strongKey) {
+		return {
+			status: "stale",
+			changed: Object.freeze(["strong_key"]),
+			filesRead: validation.filesRead,
+			bytesRead: validation.bytesRead,
+			durationMs: validation.durationMs,
+		};
+	}
+	return { ...validation, strongKey };
+}
+
+/** Validate reusable dynamic evidence without requiring a persisted process result. */
+export async function validateDynamicDependencyCertificate(
+	certificate: DynamicDependencyCertificate,
+	context: ProvenanceValidationContext = {},
+): Promise<DynamicDependencyValidation> {
 	const startedAt = performance.now();
 	let filesRead = 0;
 	let bytesRead = 0;
-	if (!certificate.dependencyCertificate.complete) {
+	if (!certificate.complete) {
 		return indeterminate("trace_incomplete", startedAt, filesRead, bytesRead);
 	}
-	if (certificate.dependencyCertificate.taints.length) {
+	if (certificate.taints.length) {
 		return indeterminate(
-			`tainted:${certificate.dependencyCertificate.taints.join(",")}`,
+			`tainted:${certificate.taints.join(",")}`,
 			startedAt,
 			filesRead,
 			bytesRead,
@@ -64,7 +99,7 @@ export async function validateProcessCertificate(
 
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];
-	for (const expected of certificate.dependencyCertificate.dependencies) {
+	for (const expected of certificate.dependencies) {
 		try {
 			if (expected.kind === "fd") {
 				const descriptor = context.fileDescriptors?.get(expected.fd);
@@ -97,9 +132,18 @@ export async function validateProcessCertificate(
 					break;
 				}
 				case "directory": {
-					const dependency = await captureDirectoryDependency(physicalPath, expected.path);
+					const dependency = await captureDirectoryDependency(
+						physicalPath,
+						expected.path,
+						expected.metadataDigest !== undefined,
+					);
 					current.push(dependency);
-					if (dependency.entriesDigest !== expected.entriesDigest) changed.push(expected.path);
+					if (
+						dependency.entriesDigest !== expected.entriesDigest ||
+						dependency.metadataDigest !== expected.metadataDigest
+					) {
+						changed.push(expected.path);
+					}
 					break;
 				}
 				case "absence": {
@@ -148,24 +192,8 @@ export async function validateProcessCertificate(
 			durationMs: elapsed(startedAt),
 		};
 	}
-	const dependencyCertificate: DynamicDependencyCertificate = {
-		complete: true,
-		dependencies: current,
-		taints: [],
-	};
-	const strongKey = processStrongKey(certificate.weakKey, dependencyCertificate);
-	if (strongKey !== certificate.strongKey) {
-		return {
-			status: "stale",
-			changed: Object.freeze(["strong_key"]),
-			filesRead,
-			bytesRead,
-			durationMs: elapsed(startedAt),
-		};
-	}
 	return {
 		status: "valid",
-		strongKey,
 		dependencies: Object.freeze(current),
 		filesRead,
 		bytesRead,
@@ -199,12 +227,21 @@ export async function captureFileDependency(
 export async function captureDirectoryDependency(
 	physicalPath: string,
 	logicalPath: string,
+	includeMetadata = false,
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
-	const entries = await readdir(physicalPath, { withFileTypes: true });
+	const [entries, stat] = await Promise.all([
+		readdir(physicalPath, { withFileTypes: true }),
+		includeMetadata ? lstat(physicalPath) : undefined,
+	]);
 	const normalized = entries
 		.map((entry) => `${directoryEntryType(entry)}\0${entry.name}`)
 		.sort();
-	return { kind: "directory", path: logicalPath, entriesDigest: digestObject(normalized) };
+	return {
+		kind: "directory",
+		path: logicalPath,
+		entriesDigest: digestObject(normalized),
+		...(stat ? { metadataDigest: metadataDigest(stat) } : {}),
+	};
 }
 
 export async function captureAbsenceDependency(

@@ -6,6 +6,7 @@ import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBashToolDefinition,
+	createLocalBashOperations,
 	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
@@ -45,6 +46,8 @@ import {
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
+import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
+import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import {
@@ -299,17 +302,31 @@ async function installController(
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 		actionBridge: selfSpeculationActions,
 	});
-	const executionWorlds = [...new Set(dependencies.createExecutionWorlds?.() ?? [createWorkspaceSandbox()])];
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
 		loadPiToolSettings(context.cwd),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
+	const localProcessOperations = createLocalBashOperations({
+		...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
+	});
+	const processCoordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localProcessOperations));
+	const executionWorlds = [
+		...new Set(
+			dependencies.createExecutionWorlds?.() ?? [
+				createLinuxProcessExecutionWorld({
+					coordinator: processCoordinator,
+					storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
+				}),
+				createWorkspaceSandbox(),
+			],
+		),
+	];
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
 	// wrappers can be intercepted without silently substituting different tool semantics.
 	const baseDefinitions = new Map(
-		[...createBaseToolDefinitions(context.cwd, piToolSettings)].filter(([name]) => {
+		[...createBaseToolDefinitions(context.cwd, piToolSettings, processCoordinator.operations)].filter(([name]) => {
 			const available = availableTools.get(name);
 			if (!available) return false;
 			const source = toolSourceFingerprint(available.sourceInfo);
@@ -563,12 +580,17 @@ interface PiToolSettings {
 	readonly autoResizeImages: boolean;
 }
 
-function createBaseToolDefinitions(cwd: string, settings: PiToolSettings): Map<string, BaseToolDefinition> {
+function createBaseToolDefinitions(
+	cwd: string,
+	settings: PiToolSettings,
+	processOperations: ProcessToolOperations,
+): Map<string, BaseToolDefinition> {
 	return new Map<string, BaseToolDefinition>([
 		["read", createReadToolDefinition(cwd, { autoResizeImages: settings.autoResizeImages })],
 		[
 			"bash",
 			createBashToolDefinition(cwd, {
+				operations: processOperations,
 				...(settings.shellPath ? { shellPath: settings.shellPath } : {}),
 				...(settings.shellCommandPrefix ? { commandPrefix: settings.shellCommandPrefix } : {}),
 			}),

@@ -10,12 +10,14 @@ import {
 	captureResourceVersion,
 	createSpeculativeActionExtension,
 	createSpeculativeActionHost,
+	createLinuxProcessExecutionWorld,
 	createWorkspaceSandbox,
 	EffectTransactionCoordinator,
 	ExecutionWorldRouter,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
 	ProcessReusePlanner,
+	ProcessExecutionCoordinator,
 	ProvenanceCertificateStore,
 	releaseResourceVersion,
 	ToolExecutionGateway,
@@ -29,6 +31,7 @@ describe("speculative action package boundary", () => {
 			makeSpeculativeActionRuntime,
 			createSpeculativeActionHost,
 			createSpeculativeActionExtension,
+			createLinuxProcessExecutionWorld,
 			acquirePatternAwareStore,
 			captureResourceVersion,
 			releaseResourceVersion,
@@ -38,6 +41,7 @@ describe("speculative action package boundary", () => {
 			ExecutionWorldRouter,
 			ToolExecutionGateway,
 			ProcessReusePlanner,
+			ProcessExecutionCoordinator,
 			ProvenanceCertificateStore,
 		]) {
 			expect(exported).toBeTypeOf("function");
@@ -75,7 +79,9 @@ describe("speculative action package boundary", () => {
 		};
 		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
 		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
-		expect(manifest.scripts?.build).toBe("shx rm -rf dist && tsc -p tsconfig.build.json");
+		expect(manifest.scripts?.build).toBe(
+			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs && shx cp src/process-namespace-launcher.mjs dist/process-namespace-launcher.mjs",
+		);
 		expect(Object.keys(manifest.scripts ?? {})).not.toEqual(
 			expect.arrayContaining(["build:native", "build:worker", "generate:native-manifest", "smoke:native"]),
 		);

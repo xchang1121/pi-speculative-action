@@ -66,6 +66,7 @@ export type DynamicDependency =
 			readonly kind: "directory";
 			readonly path: string;
 			readonly entriesDigest: Sha256Digest;
+			readonly metadataDigest?: Sha256Digest;
 	  }
 	| {
 			readonly kind: "absence";
@@ -403,7 +404,12 @@ function validateDependency(dependency: DynamicDependency): void {
 			}
 			break;
 		case "directory":
-			if (!isSha256Digest(dependency.entriesDigest)) throw new Error("invalid directory dependency");
+			if (
+				!isSha256Digest(dependency.entriesDigest) ||
+				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest))
+			) {
+				throw new Error("invalid directory dependency");
+			}
 			break;
 		case "absence":
 			if (dependency.parentEntriesDigest !== undefined && !isSha256Digest(dependency.parentEntriesDigest)) {

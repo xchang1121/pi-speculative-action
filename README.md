@@ -19,20 +19,25 @@ Execution routes use this fixed priority:
 
 | Priority | Route | Scope |
 |---|---|---|
-| 1 | `runtime_sandbox` | An injected runtime-wide sandbox; preferred for every enabled tool |
+| 1 | `runtime_sandbox` | The built-in Linux/WSL process world or an injected runtime-wide world; preferred when its probes pass |
 | 2 | `resource_snapshot` | Local fallback for `read`, `grep`, `find`, and `ls` using versioned resource evidence |
 | 2 | `workspace_branch` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
 | 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
 
-The package does **not** bundle a process sandbox. Consequently, the default Pi extension can predict and match `bash`, but it will not execute Bash speculatively. The Actor executes the command through Pi's normal path. An embedding runtime can enable Bash and all other tools by injecting one runtime-scoped `ExecutionWorld`.
+On Linux and WSL 2, the default extension includes a lightweight process world. It forks the operation into the same private Git workspace primitive used by mutation tools, then confines the process with user/PID/network/IPC/UTS and mount namespaces plus Sandlock's Landlock/seccomp policy. Failure of any kernel, binary, mount, or policy probe removes this route; Windows, macOS, WSL 1, and incomplete Linux installations therefore keep Pi's ordinary Actor execution rather than silently weakening isolation.
 
-This arrangement is intentional: a future OS-level agent runtime can provide one isolation world for the whole tool surface instead of requiring Pi to maintain a separate isolation implementation for each tool.
+Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, mount-namespace views leave the command's `PATH` and environment unchanged while routing PATH-resolved execs to one broker. The broker identifies an exec by executable bytes, argv, logical cwd, complete environment, descriptors, credentials, limits, platform, and policy—not by its parent Bash text or tool name. This lets different Bash parents reuse one completed child process.
+
+Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, or unsupported observations fail closed.
 
 ## Correctness boundaries
 
 - Prediction sources never choose an execution backend.
 - `K(a)` never changes because a different isolation backend is available.
 - In-flight and cached work is reused only within an identical execution route.
+- Cross-parent process results are reusable across turns only after exact prototype matching and full dynamic-dependency validation; the parent shell command is deliberately absent from that nested key.
+- The Linux world preserves the visible `PATH`, mounts the private workspace over its logical source path only inside the namespace, denies common credential stores and the certificate store, and permits persistent writes only in the private branch.
+- Broker uncertainty is at-most-once: after a request may have executed, a lost reply returns an error instead of re-running the command.
 - On a read-only Actor fallback, a capture-capable world snapshots freshness before the host call and seals that same authoritative output into the shared cache. It never invokes the tool a second time; later turns still repeat authorization, exact freshness validation, compatibility, projection, and commit.
 - Actor adoption still requires action equivalence, permission, fresh resource evidence, compatible world evidence, successful projection, and successful commit.
 - A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
@@ -54,6 +59,16 @@ Pi can install the repository directly:
 ```sh
 pi install https://github.com/xchang1121/pi
 ```
+
+To enable process reuse, run Pi and the project inside Linux or WSL 2. Install Rust stable, Git, `strace`, and `util-linux`, then build the pinned Sandlock revision:
+
+```sh
+sudo apt-get install git strace util-linux build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+npm run setup:linux
+```
+
+`setup:linux` installs only the pinned `sandlock` CLI under `~/.local`; it does not alter Pi or install a daemon. The runtime probes Landlock ABI 6+, unprivileged namespaces, bind mounts, Sandlock, and strace again on every host. WSL must be version 2. A WSL-native checkout is recommended for lower Git and snapshot overhead.
 
 The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.
 
@@ -141,7 +156,7 @@ The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted on
 
 ## Runtime sandbox integration
 
-Hosts provide execution worlds through `executionWorlds`. A runtime-scoped world is necessarily a universal `runtime_sandbox`; only fallback worlds expose tool/effect capability filters. The router confirms backend availability before returning a route, so an unavailable runtime sandbox naturally falls through to a compatible local fallback. Every successful backend—including the built-in resource snapshot and the Git worktree fallback—returns the same `WorldBranch`; that branch owns compatibility evidence, freshness checks, adoption, and cleanup. The host automatically supplies the resource-snapshot backend when none is registered.
+The Pi extension registers the Linux process world followed by the Git workspace fallback by default. Hosts may replace that list through `executionWorlds`. Every world advertises effect capabilities rather than tool names; the built-in runtime world covers process invocation, while a host may inject a broader runtime sandbox. The router confirms backend availability before returning a route, so an unavailable runtime sandbox naturally falls through to a compatible local fallback. Every successful backend—including process provenance, resource snapshots, and Git worktrees—returns the same `WorldBranch`; that branch owns compatibility evidence, freshness checks, adoption, and cleanup.
 
 ```ts
 createSpeculativeActionHost(sessionID, {
@@ -151,7 +166,7 @@ createSpeculativeActionHost(sessionID, {
 })
 ```
 
-The first available runtime-wide world wins for every tool. Without one, the router considers fallback worlds compatible with the action's declared effects. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback. Resolution, preparation, fork, and disposal all pass through the same router; tools cannot retain a direct backend handle.
+The first available runtime-wide world wins for every process-backed tool whose execution context can be proven. Without one, the router considers fallback worlds compatible with the action's declared effects. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback. Resolution, preparation, fork, and disposal all pass through the same router; tools cannot retain a direct backend handle. Persisted process certificates live under `<agent-dir>/speculative-action/process-reuse` and are content-addressed, policy-versioned, and safe to discard.
 
 ## Timing
 

@@ -16,6 +16,7 @@ import type {
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
+import type { ResourceValidation } from "./settlement.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 export interface SandboxFileChange {
@@ -50,6 +51,16 @@ export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
+}
+
+export interface SandboxWorkspaceBranchOptions {
+	readonly cwd: string;
+	readonly action: SpeculativeToolExecutionContext["action"];
+	readonly parentCheckpoint?: WorldCheckpoint;
+	readonly gitBinary?: string;
+	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement>;
+	/** Optional exact freshness proof captured by the operation-specific execution substrate. */
+	readonly validate?: () => Promise<ResourceValidation>;
 }
 
 export interface PrepareSandboxWorkspaceOptions {
@@ -145,9 +156,7 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 		fork: async (context) => {
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			const parent = resolveWorkspaceCheckpoint(context.parentCheckpoint, sourceRoot);
-			const snapshot = await executeMutation(context, parent, options.gitBinary);
-			return new GitWorldBranch(snapshot, sourceRoot, context.action.executionFingerprint, parent);
+			return executeMutation(context, options.gitBinary);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
@@ -165,6 +174,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
 	readonly compatibility: WorldCompatibilityEvidence;
+	readonly validate?: () => Promise<ResourceValidation>;
 	private readonly changes: readonly SandboxFileChange[];
 	private stateValue: WorldBranchState = "sealed";
 	private commitMetricsValue?: WorldCommitMetrics;
@@ -175,6 +185,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 		sourceRoot: string,
 		executionFingerprint: string,
 		parent?: GitWorldCheckpoint,
+		validate?: () => Promise<ResourceValidation>,
 	) {
 		this.output = snapshot.output;
 		this.changes = Object.freeze([...snapshot.changes]);
@@ -190,6 +201,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 			backend: this.backend,
 			executionFingerprint,
 		});
+		this.validate = validate;
 	}
 
 	get state(): WorldBranchState {
@@ -318,6 +330,36 @@ export async function withSandboxWorkspace<T>(
 	}
 }
 
+/**
+ * Fork one generic operation into a private workspace and seal its output together with the
+ * complete regular-file delta. Process and host-function worlds share this primitive.
+ */
+export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
+	const sourceRoot = path.resolve(options.cwd);
+	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
+	const setupStarted = performance.now();
+	const snapshot = await withPrivateGitWorkspace(
+		sourceRoot,
+		options.gitBinary ?? "git",
+		async (workspace) => {
+			const setupMs = Math.max(0, performance.now() - setupStarted);
+			const output = await options.execute(workspace);
+			const captureStarted = performance.now();
+			const changes = await collectSandboxChanges(workspace);
+			return {
+				output,
+				changes,
+				executionMetrics: {
+					setupMs,
+					captureMs: Math.max(0, performance.now() - captureStarted),
+				},
+			};
+		},
+		parent,
+	);
+	return new GitWorldBranch(snapshot, sourceRoot, options.action.executionFingerprint, parent, options.validate);
+}
+
 export async function prepareSandboxWorkspace(
 	cwd: string,
 	options: PrepareSandboxWorkspaceOptions = {},
@@ -336,9 +378,8 @@ export async function prepareSandboxWorkspace(
 
 async function executeMutation(
 	context: SpeculativeToolExecutionContext,
-	parent: GitWorldCheckpoint | undefined,
 	gitBinary?: string,
-): Promise<WorkspaceExecutionSnapshot> {
+): Promise<WorldBranch<ToolSettlement>> {
 	const args = asRecord(context.args);
 	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
 	const sourceRoot = path.resolve(context.cwd);
@@ -349,34 +390,25 @@ async function executeMutation(
 	await assertNoSymlinkPath(sourceRoot, target);
 	const resource = slash(path.relative(sourceRoot, target));
 	const requestedPath = args.path;
-	const setupStarted = performance.now();
-
-	return withPrivateGitWorkspace(
-		sourceRoot,
-		gitBinary ?? "git",
-		async (workspace) => {
-			const setupMs = Math.max(0, performance.now() - setupStarted);
+	return forkSandboxWorkspace({
+		cwd: sourceRoot,
+		action: context.action,
+		...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
+		...(gitBinary ? { gitBinary } : {}),
+		execute: async (workspace) => {
 			const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
 			await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
 			const redirected = { ...args, path: sandboxTarget };
 			const result = await context.tool.execute(context.callID, redirected as never, context.signal);
-			const collectionStarted = performance.now();
-			const changes = await collectSandboxChanges(workspace);
-			const changeCollectionMs = Math.max(0, performance.now() - collectionStarted);
 			return {
-				output: {
-					result: replacePaths(result, [
-						[sandboxTarget, requestedPath],
-						[workspace.sandboxRoot, sourceRoot],
-					]),
-					isError: false,
-				},
-				changes,
-				executionMetrics: { setupMs, captureMs: changeCollectionMs },
+				result: replacePaths(result, [
+					[sandboxTarget, requestedPath],
+					[workspace.sandboxRoot, sourceRoot],
+				]),
+				isError: false,
 			};
 		},
-		parent,
-	);
+	});
 }
 
 async function createPrivateGitWorkspace(cwd: string, gitBinary: string): Promise<PrivateGitWorkspace> {

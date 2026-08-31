@@ -19,20 +19,25 @@ Runtime 分为四个相互独立的层次：
 
 | 优先级 | 路线 | 范围 |
 |---|---|---|
-| 1 | `runtime_sandbox` | 注入的 Runtime 全局沙箱；对所有启用工具优先 |
+| 1 | `runtime_sandbox` | 内置 Linux/WSL 进程世界或宿主注入的 Runtime 全局世界；探测通过时优先 |
 | 2 | `resource_snapshot` | `read`、`grep`、`find`、`ls` 的本地后备，通过资源版本证据保证新鲜度 |
 | 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
-本 package **不再内置进程沙箱**。因此默认 Pi 扩展仍可预测并匹配 `bash`，但不会投机执行 Bash；命令由 Actor 通过 Pi 正常路径执行。嵌入式 Runtime 可以注入一个 runtime scope 的 `ExecutionWorld`，一次性为 Bash 和其余工具提供隔离。
+在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有 Git 工作区原语，再用 user/PID/network/IPC/UTS/mount namespace 以及 Sandlock 的 Landlock/seccomp 策略限制进程。任何内核能力、binary、挂载或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
-这样，未来 OS 层面的 Agent Runtime 只需接入一个完整执行世界，不需要 Pi 针对每种工具分别维护隔离实现。
+进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只替换动态作用域内的进程启动。mount namespace 中的可执行文件视图不改写命令可见的 `PATH` 和环境，却能把 PATH 解析出的 exec 统一送到 broker。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
+
+每个可复用结果都是持久化 provenance certificate，包含动态观察到的文件、目录、负查找、symlink、executable/DSO 身份、有序 stdout/stderr、退出状态和原子 regular-file 效果。每次复用都会重新验证全部依赖。外层投机 branch 还会独立记录顶层进程 provenance，并在 Actor 采纳前再次验证；tainted、不完整、过期、交互式、可变宿主输入、网络、IPC 或不支持的观察一律关闭复用。
 
 ## 正确性边界
 
 - 投机源不能选择执行后端。
 - 隔离后端变化不会改变 `K(a)`。
 - 进行中任务和缓存只在相同执行 route 内复用。
+- 跨父进程、跨轮次复用必须同时通过精确 exec prototype 与全部动态依赖验证；父 shell 命令刻意不进入子进程 key。
+- Linux 世界保留用户可见 `PATH`，只在 mount namespace 内把私有工作区映射到逻辑源码路径，拒绝读取常见 credential store 与证书仓，并只允许向私有 branch 写入持久效果。
+- Broker 遵守 at-most-once：请求可能已经执行后若响应丢失，会返回错误而不是再次运行命令。
 - 只读 Actor 回退时，支持结果捕获的 World 会在宿主调用前记录新鲜度基线，再把这一次权威输出封装进共享缓存；它不会再次调用工具。后续轮次仍须重新通过权限、精确新鲜度、兼容性、投影与提交检查。
 - Actor 采纳仍必须依次通过动作等价、权限、资源新鲜度、World 兼容性、投影与提交检查。
 - 同时缺少 Runtime 沙箱和已注册本地后备的工具会被标记为 execution-blocked，但仍可参与匹配、学习和反事实计时。
@@ -54,6 +59,16 @@ Pi 可以直接安装该仓库：
 ```sh
 pi install https://github.com/xchang1121/pi
 ```
+
+如需启用进程复用，请在 Linux 或 WSL 2 内运行 Pi 与项目。安装 Rust stable、Git、`strace` 和 `util-linux`，然后构建固定 revision 的 Sandlock：
+
+```sh
+sudo apt-get install git strace util-linux build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+npm run setup:linux
+```
+
+`setup:linux` 只会把固定版本的 `sandlock` CLI 安装到 `~/.local`，不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、非特权 namespace、bind mount、Sandlock 和 strace。WSL 必须为版本 2；为降低 Git 与 snapshot 开销，建议使用 WSL 原生文件系统中的 checkout。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 
@@ -141,7 +156,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## 接入 Runtime 沙箱
 
-宿主通过 `executionWorlds` 提供执行世界。runtime scope 的 World 在类型上就是覆盖全部工具的 `runtime_sandbox`；只有 fallback World 才按工具效果声明有限能力。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括内置资源快照和 Git worktree 后备——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。宿主在未注册资源快照后端时会自动补上内置实现。
+Pi 扩展默认先注册 Linux 进程世界，再注册 Git 工作区 fallback；宿主也可以通过 `executionWorlds` 替换这组世界。所有 World 都按 effect capability 而不是工具名声明能力；内置 runtime world 覆盖进程调用，宿主仍可注入覆盖范围更大的 runtime sandbox。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。
 
 ```ts
 createSpeculativeActionHost(sessionID, {
@@ -151,7 +166,7 @@ createSpeculativeActionHost(sessionID, {
 })
 ```
 
-第一个可用的 Runtime 全局沙箱对所有工具生效；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。
+第一个可用的 Runtime 全局沙箱会覆盖所有能够证明 execution context 的进程型工具；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。持久进程证书位于 `<agent-dir>/speculative-action/process-reuse`，使用 content address 与策略版本隔离，可以随时删除。
 
 ## 计时口径
 
