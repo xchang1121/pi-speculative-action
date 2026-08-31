@@ -15,6 +15,8 @@ import {
 	ExecutionWorldRouter,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
+	ProcessReusePlanner,
+	ProvenanceCertificateStore,
 	releaseResourceVersion,
 	ToolExecutionGateway,
 } from "../src/index.ts";
@@ -35,6 +37,8 @@ describe("speculative action package boundary", () => {
 			EffectTransactionCoordinator,
 			ExecutionWorldRouter,
 			ToolExecutionGateway,
+			ProcessReusePlanner,
+			ProvenanceCertificateStore,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}

@@ -111,6 +111,52 @@ export {
 	type EffectTransactionState,
 } from "./effect-transaction.ts";
 export {
+	type ArtifactReference,
+	certificateReplayable,
+	createExecPrototype,
+	dependencyPathsetKey,
+	type DependencyRole,
+	digestObject,
+	type DynamicDependency,
+	type DynamicDependencyCertificate,
+	type ExecPrototype,
+	type ExitOutcome,
+	type InheritedFileDescriptor,
+	isSha256Digest,
+	type OrderedEffectEvent,
+	parseProcessCertificate,
+	type ProcessPrototypeInput,
+	type ProcessProvenanceCertificate,
+	type ProcessResultRecord,
+	PROCESS_CERTIFICATE_VERSION,
+	processStrongKey,
+	processWeakKey,
+	type ProvenanceTaint,
+	referencedArtifacts,
+	sealProcessCertificate,
+	type SemanticEnvironmentEntry,
+	sha256Digest,
+	type Sha256Digest,
+} from "./provenance-certificate.ts";
+export {
+	captureAbsenceDependency,
+	captureDirectoryDependency,
+	captureFileDependency,
+	captureSymlinkDependency,
+	type ProvenanceValidation,
+	type ProvenanceValidationContext,
+	validateProcessCertificate,
+} from "./provenance-validation.ts";
+export {
+	type MemoryReuseProvider,
+	type ProcessReuseMissReason,
+	type ProcessReusePlan,
+	ProcessReusePlanner,
+	type ProcessReuseRequest,
+	type ReplayObservationContract,
+} from "./reuse-planner.ts";
+export { ArtifactCAS, ProvenanceCertificateStore } from "./reuse-store.ts";
+export {
 	type CapturedExecutionWorldResult,
 	type ActionReuseKind,
 	type ExecutionWorld,
