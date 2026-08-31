@@ -19,6 +19,8 @@ export type WorkspaceTreeEntry =
 			readonly changeDigest: Sha256Digest;
 			readonly changeTimeMs: number;
 			readonly mode: number;
+			readonly uid: number;
+			readonly gid: number;
 	  }
 	| {
 			readonly kind: "symlink";

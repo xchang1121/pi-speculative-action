@@ -17,6 +17,7 @@ import type {
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureWorkspaceStructure,
+	directoryEntriesDigest,
 	type WorkspaceStructureEntry,
 	type WorkspaceStructureSnapshot,
 } from "./process-observation.ts";
@@ -32,6 +33,7 @@ import {
 } from "./workspace-transaction.ts";
 
 export interface SandboxFileChange {
+	readonly kind?: "file";
 	readonly root: string;
 	readonly target: string;
 	readonly resource: string;
@@ -41,6 +43,24 @@ export interface SandboxFileChange {
 	readonly afterMode?: number;
 }
 
+export interface SandboxDirectoryState {
+	readonly entriesDigest: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>["entriesDigest"];
+	readonly mode: number;
+	readonly uid: number;
+	readonly gid: number;
+}
+
+export interface SandboxDirectoryChange {
+	readonly kind: "directory";
+	readonly root: string;
+	readonly target: string;
+	readonly resource: string;
+	readonly before?: SandboxDirectoryState;
+	readonly after?: SandboxDirectoryState;
+}
+
+export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
+
 interface RegularFileState {
 	readonly content: Uint8Array;
 	readonly mode: number;
@@ -48,7 +68,7 @@ interface RegularFileState {
 
 export interface SandboxExecutionDelta {
 	readonly output: ToolSettlement;
-	readonly changes: readonly SandboxFileChange[];
+	readonly changes: readonly SandboxWorkspaceChange[];
 }
 
 interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
@@ -77,7 +97,7 @@ export interface SandboxWorkspaceBranchOptions {
 	readonly afterCapture?: (
 		workspace: SandboxWorkspaceContext,
 		capture: SandboxExecutionDelta,
-	) => Promise<void>;
+	) => Promise<readonly SandboxDirectoryChange[] | void>;
 	/** Optional exact freshness proof captured by the operation-specific execution substrate. */
 	readonly validate?: () => Promise<ResourceValidation>;
 }
@@ -446,7 +466,12 @@ function regularStructureTransitions(
 			paths.push(relativePath);
 			continue;
 		}
-		if (previous?.kind === "directory" && current?.kind === "directory") continue;
+		if (
+			(previous === undefined || previous.kind === "directory") &&
+			(current === undefined || current.kind === "directory")
+		) {
+			continue;
+		}
 		return { complete: false, reason: `unsupported_workspace_transition:${relativePath}` };
 	}
 	return { complete: true, paths: Object.freeze(paths) };
@@ -498,9 +523,9 @@ class GitWorldCheckpoint implements WorldCheckpoint {
 	readonly depth: number;
 	readonly sourceRoot: string;
 	readonly parent?: GitWorldCheckpoint;
-	readonly changes: readonly SandboxFileChange[];
+	readonly changes: readonly SandboxWorkspaceChange[];
 
-	constructor(sourceRoot: string, parent: GitWorldCheckpoint | undefined, changes: readonly SandboxFileChange[]) {
+	constructor(sourceRoot: string, parent: GitWorldCheckpoint | undefined, changes: readonly SandboxWorkspaceChange[]) {
 		this.sourceRoot = path.resolve(sourceRoot);
 		this.lineage = parent?.lineage ?? this.id;
 		this.depth = (parent?.depth ?? -1) + 1;
@@ -557,7 +582,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly validate?: () => Promise<ResourceValidation>;
-	private readonly changes: readonly SandboxFileChange[];
+	private readonly changes: readonly SandboxWorkspaceChange[];
 	private stateValue: WorldBranchState = "sealed";
 	private commitMetricsValue?: WorldCommitMetrics;
 	private commitPromise?: Promise<ToolSettlement>;
@@ -574,7 +599,10 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 		this.checkpoint = new GitWorldCheckpoint(sourceRoot, parent, this.changes);
 		this.resources = Object.freeze([...new Set(this.changes.map((change) => change.resource))]);
 		this.capturedBytes = this.changes.reduce(
-			(total, change) => total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
+			(total, change) =>
+				change.kind === "directory"
+					? total
+					: total + (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0),
 			0,
 		);
 		this.executionMetrics = Object.freeze({ ...snapshot.executionMetrics });
@@ -627,12 +655,12 @@ async function commitSandboxExecution(
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
 	return withTargetLocks(
-		changes.map((change) => change.target),
+		commitLockTargets(changes),
 		async () => {
 			const staged = new Map<SandboxFileChange, string>();
-			const baselines = new Map<SandboxFileChange, RegularFileState | undefined>();
+			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
 			const commitModes = new Map<SandboxFileChange, number | undefined>();
-			const applied: SandboxFileChange[] = [];
+			const applied: SandboxWorkspaceChange[] = [];
 			const createdDirectories: string[] = [];
 			let bytesValidated = 0;
 			let validationMs = 0;
@@ -640,23 +668,44 @@ async function commitSandboxExecution(
 			try {
 				for (const change of changes) await assertCommitTarget(change);
 				for (const change of changes) {
-					if (change.after !== undefined) {
+					if (change.kind !== "directory" && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				}
 				const validationStarted = performance.now();
 				for (const change of changes) {
-					const current = await readRegularState(change.target);
+					const current =
+						change.kind === "directory"
+							? await readSandboxDirectoryState(change.target)
+							: await readRegularState(change.target);
 					baselines.set(change, current);
-					bytesValidated += current?.content.byteLength ?? 0;
-					if (!sameBaselineState(current, change)) {
+					if (change.kind !== "directory") bytesValidated += (current as RegularFileState | undefined)?.content.byteLength ?? 0;
+					if (!sameSandboxBaseline(current, change)) {
 						throw new Error(`resource changed before commit: ${change.resource}`);
 					}
-					commitModes.set(change, resolveCommitMode(current, change));
+					if (change.kind !== "directory") {
+						commitModes.set(change, resolveCommitMode(current as RegularFileState | undefined, change));
+					}
 				}
 				validationMs = Math.max(0, performance.now() - validationStarted);
-				for (const change of changes) {
+				for (const change of orderSandboxChanges(changes)) {
 					await assertCommitTarget(change);
+					if (change.kind === "directory") {
+						if (!change.after) {
+							await rmdir(change.target);
+							applied.push(change);
+						} else if (!change.before) {
+							createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+							await mkdir(change.target, { mode: change.after.mode });
+							applied.push(change);
+							if (process.platform !== "win32") await chmod(change.target, change.after.mode);
+						} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
+							await chmod(change.target, change.after.mode);
+							applied.push(change);
+						}
+						resourcesCommitted++;
+						continue;
+					}
 					applied.push(change);
 					const temporary = staged.get(change);
 					if (temporary) {
@@ -667,6 +716,12 @@ async function commitSandboxExecution(
 						await rm(change.target, { force: true });
 					}
 					resourcesCommitted++;
+				}
+				for (const change of changes) {
+					if (change.kind !== "directory" || !change.after) continue;
+					if (!sameDirectoryState(await readSandboxDirectoryState(change.target), change.after)) {
+						throw new Error(`directory changed while committing: ${change.resource}`);
+					}
 				}
 			} catch (error) {
 				try {
@@ -727,8 +782,9 @@ export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOption
 			const setupMs = Math.max(0, performance.now() - setupStarted);
 			const output = await options.execute(workspace);
 			const captureStarted = performance.now();
-			const changes = await collectSandboxChanges(workspace);
-			await options.afterCapture?.(workspace, { output, changes });
+			const fileChanges = await collectSandboxChanges(workspace);
+			const directoryChanges = (await options.afterCapture?.(workspace, { output, changes: fileChanges })) ?? [];
+			const changes = deduplicateChanges([...fileChanges, ...directoryChanges]);
 			return {
 				output,
 				changes,
@@ -1311,14 +1367,32 @@ async function materializeCheckpoint(workspace: PrivateGitWorkspace, checkpoint:
 		lineage.push(current);
 	}
 	for (const ancestor of lineage.reverse()) {
-		for (const change of ancestor.changes) {
+		for (const change of orderSandboxChanges(ancestor.changes)) {
 			const target = path.resolve(workspace.sandboxRoot, change.resource);
 			if (!contains(workspace.sandboxRoot, target) || target === workspace.sandboxRoot) {
 				throw new Error(`execution checkpoint escapes workspace: ${change.resource}`);
 			}
 			await assertNoSymlinkPath(workspace.sandboxRoot, target);
+			if (change.kind === "directory") {
+				if (!change.after) await rmdir(target);
+				else if (!change.before) {
+					await createParentDirectories(workspace.sandboxRoot, target);
+					await mkdir(target, { mode: change.after.mode });
+					if (process.platform !== "win32") await chmod(target, change.after.mode);
+				} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
+					await chmod(target, change.after.mode);
+				}
+				continue;
+			}
 			if (change.after === undefined) await rm(target, { force: true });
 			else await atomicWrite(target, change.after, change.afterMode, workspace.sandboxRoot);
+		}
+		for (const change of ancestor.changes) {
+			if (change.kind !== "directory") continue;
+			const target = path.resolve(workspace.sandboxRoot, change.resource);
+			if (!sameDirectoryState(await readSandboxDirectoryState(target), change.after)) {
+				throw new Error(`execution checkpoint directory mismatch: ${change.resource}`);
+			}
 		}
 	}
 	if (!lineage.some((ancestor) => ancestor.changes.length > 0)) return;
@@ -1502,7 +1576,7 @@ async function assertNoDirectoryLinks(root: string, relative: string): Promise<v
 	}
 }
 
-async function assertCommitTarget(change: SandboxFileChange): Promise<void> {
+async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void> {
 	const root = path.resolve(change.root);
 	const target = path.resolve(change.target);
 	if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
@@ -1541,6 +1615,48 @@ async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFIN
 	}
 }
 
+/** Capture a directory without following links and reject concurrent namespace changes. */
+export async function readSandboxDirectoryState(target: string): Promise<SandboxDirectoryState | undefined> {
+	let before: Awaited<ReturnType<typeof lstat>>;
+	try {
+		before = await lstat(target);
+	} catch (error) {
+		if (isMissing(error)) return undefined;
+		throw error;
+	}
+	if (before.isSymbolicLink() || !before.isDirectory()) {
+		throw new Error(`sandbox resource is not a real directory: ${target}`);
+	}
+	const entries = await readdir(target, { withFileTypes: true });
+	const after = await lstat(target);
+	if (!after.isDirectory() || after.isSymbolicLink() || !sameDirectoryCaptureIdentity(before, after)) {
+		throw new Error(`sandbox directory changed while being captured: ${target}`);
+	}
+	return {
+		entriesDigest: directoryEntriesDigest(entries),
+		mode: before.mode & 0o777,
+		uid: before.uid,
+		gid: before.gid,
+	};
+}
+
+function sameDirectoryCaptureIdentity(
+	left: Awaited<ReturnType<typeof lstat>>,
+	right: Awaited<ReturnType<typeof lstat>>,
+): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.uid === right.uid &&
+		left.gid === right.gid &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeMs === right.mtimeMs &&
+		left.ctimeMs === right.ctimeMs
+	);
+}
+
 function sameOpenFileIdentity(left: Awaited<ReturnType<FileHandle["stat"]>>, right: Awaited<ReturnType<FileHandle["stat"]>>): boolean {
 	return (
 		left.dev === right.dev &&
@@ -1563,14 +1679,36 @@ function sameBaselineState(current: RegularFileState | undefined, change: Sandbo
 	);
 }
 
+function sameDirectoryState(
+	left: SandboxDirectoryState | undefined,
+	right: SandboxDirectoryState | undefined,
+): boolean {
+	if (!left || !right) return left === right;
+	return (
+		left.entriesDigest === right.entriesDigest &&
+		left.mode === right.mode &&
+		left.uid === right.uid &&
+		left.gid === right.gid
+	);
+}
+
+function sameSandboxBaseline(
+	current: RegularFileState | SandboxDirectoryState | undefined,
+	change: SandboxWorkspaceChange,
+): boolean {
+	return change.kind === "directory"
+		? sameDirectoryState(current as SandboxDirectoryState | undefined, change.before)
+		: sameBaselineState(current as RegularFileState | undefined, change);
+}
+
 function sameOptionalState(left: RegularFileState | undefined, right: RegularFileState | undefined): boolean {
 	if (!left || !right) return left === right;
 	if (!sameBytes(left.content, right.content)) return false;
 	return right.mode === 0 || sameExecutableMode(left.mode, right.mode);
 }
 
-function deduplicateChanges(changes: readonly SandboxFileChange[]): SandboxFileChange[] {
-	const result = new Map<string, SandboxFileChange>();
+function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
+	const result = new Map<string, SandboxWorkspaceChange>();
 	for (const change of changes) {
 		const key = pathKey(change.target);
 		const previous = result.get(key);
@@ -1580,33 +1718,80 @@ function deduplicateChanges(changes: readonly SandboxFileChange[]): SandboxFileC
 		}
 		if (
 			pathKey(previous.root) !== pathKey(change.root) ||
-			!sameOptionalBytes(previous.before, change.before) ||
-			(previous.beforeMode !== undefined &&
-				change.beforeMode !== undefined &&
-				!sameExecutableMode(previous.beforeMode, change.beforeMode))
+			(previous.kind === "directory") !== (change.kind === "directory")
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
-		result.set(key, {
-			...change,
-			before: previous.before,
-			beforeMode: previous.beforeMode,
-		});
+		if (previous.kind === "directory" && change.kind === "directory") {
+			if (!sameDirectoryState(previous.before, change.before)) {
+				throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
+			}
+			result.set(key, { ...change, before: previous.before });
+			continue;
+		}
+		const previousFile = previous as SandboxFileChange;
+		const changeFile = change as SandboxFileChange;
+		if (
+			!sameOptionalBytes(previousFile.before, changeFile.before) ||
+			(previousFile.beforeMode !== undefined &&
+				changeFile.beforeMode !== undefined &&
+				!sameExecutableMode(previousFile.beforeMode, changeFile.beforeMode))
+		) {
+			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
+		}
+		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode });
 	}
 	return [...result.values()].sort((left, right) => pathKey(left.target).localeCompare(pathKey(right.target)));
 }
 
 async function restoreChanges(
-	changes: readonly SandboxFileChange[],
-	baselines: ReadonlyMap<SandboxFileChange, RegularFileState | undefined>,
+	changes: readonly SandboxWorkspaceChange[],
+	baselines: ReadonlyMap<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>,
 ): Promise<void> {
 	const errors: unknown[] = [];
 	for (const change of [...changes].reverse()) {
 		try {
 			await assertCommitTarget(change);
 			const baseline = baselines.get(change);
-			if (!baseline) await rm(change.target, { force: true });
-			else await atomicWrite(change.target, baseline.content, baseline.mode, change.root);
+			if (change.kind === "directory") {
+				const directory = baseline as SandboxDirectoryState | undefined;
+				if (!directory) {
+					try {
+						await rmdir(change.target);
+					} catch (error) {
+						if (!isMissing(error)) throw error;
+					}
+				} else {
+					const current = await readSandboxDirectoryState(change.target);
+					if (!current) {
+						await createParentDirectories(change.root, change.target);
+						await mkdir(change.target, { mode: directory.mode });
+					}
+					if (process.platform !== "win32") await chmod(change.target, directory.mode);
+				}
+				continue;
+			}
+			const file = baseline as RegularFileState | undefined;
+			if (!file) await rm(change.target, { force: true });
+			else await atomicWrite(change.target, file.content, file.mode, change.root);
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	for (const change of changes) {
+		try {
+			const baseline = baselines.get(change);
+			const current =
+				change.kind === "directory"
+					? await readSandboxDirectoryState(change.target)
+					: await readRegularState(change.target);
+			if (
+				change.kind === "directory"
+					? !sameDirectoryState(current as SandboxDirectoryState | undefined, baseline as SandboxDirectoryState | undefined)
+					: !sameOptionalState(current as RegularFileState | undefined, baseline as RegularFileState | undefined)
+			) {
+				throw new Error(`sandbox rollback did not restore: ${change.resource}`);
+			}
 		} catch (error) {
 			errors.push(error);
 		}
@@ -1702,6 +1887,29 @@ async function removeCreatedDirectories(directories: readonly string[]): Promise
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
 	await rename(temporary, target);
 	if (mode !== undefined && process.platform !== "win32") await chmod(target, mode);
+}
+
+function orderSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
+	const phase = (change: SandboxWorkspaceChange): number => {
+		if (change.kind !== "directory") return change.after === undefined ? 0 : 3;
+		return change.after === undefined ? 1 : 2;
+	};
+	const depth = (change: SandboxWorkspaceChange): number =>
+		slash(change.resource).split("/").filter(Boolean).length;
+	return [...changes].sort((left, right) => {
+		const phaseDifference = phase(left) - phase(right);
+		if (phaseDifference !== 0) return phaseDifference;
+		const depthDifference = depth(left) - depth(right);
+		if (phase(left) <= 1) {
+			if (depthDifference !== 0) return -depthDifference;
+		} else if (depthDifference !== 0) return depthDifference;
+		return pathKey(left.target).localeCompare(pathKey(right.target));
+	});
+}
+
+/** Root locks make namespace changes conflict with every file commit below the same workspace. */
+function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[] {
+	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))];
 }
 
 const targetLocks = new Map<string, Promise<void>>();

@@ -18,6 +18,7 @@ import {
 	createWorkspaceSandbox,
 	forkSandboxWorkspace,
 	prepareSandboxWorkspace,
+	readSandboxDirectoryState,
 	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
 
@@ -106,7 +107,9 @@ describe("workspace-branch ExecutionWorld", () => {
 				},
 				afterCapture: async (workspace, capture) => {
 					const change = capture.changes[0];
-					if (!change?.before || !change.after) throw new Error("captured change missing");
+					if (!change || change.kind === "directory" || !change.before || !change.after) {
+						throw new Error("captured change missing");
+					}
 					observed = {
 						content: await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8"),
 						before: Buffer.from(change.before).toString("utf8"),
@@ -161,6 +164,109 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(await readFile(target, "utf8")).toBe("parent\n");
 			await child.commit();
 			expect(await readFile(target, "utf8")).toBe("child\n");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("materializes an empty-directory checkpoint before a child file delta", async () => {
+		const root = await temporaryRoot("directory-lineage");
+		const directory = path.join(root, "generated");
+		try {
+			const parent = await forkSandboxWorkspace({
+				cwd: root,
+				action: requiredAction("write", { path: "generated", content: "" }, root),
+				execute: async (workspace) => {
+					await mkdir(path.join(workspace.sandboxRoot, "generated"));
+					return settlement("directory");
+				},
+				afterCapture: async (workspace) => {
+					const after = await readSandboxDirectoryState(path.join(workspace.sandboxRoot, "generated"));
+					if (!after) throw new Error("directory state missing");
+					return [{ kind: "directory", root, target: directory, resource: "generated", after }];
+				},
+			});
+			const child = await forkSandboxWorkspace({
+				cwd: root,
+				action: requiredAction("write", { path: "generated/value.txt", content: "child\n" }, root),
+				parentCheckpoint: parent.checkpoint,
+				execute: async (workspace) => {
+					await writeFile(path.join(workspace.sandboxRoot, "generated", "value.txt"), "child\n");
+					return settlement("child");
+				},
+			});
+
+			expect(parent.resources).toEqual(["generated"]);
+			expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
+			await expect(stat(directory)).rejects.toThrow();
+			await parent.commit();
+			expect((await stat(directory)).isDirectory()).toBe(true);
+			await child.commit();
+			expect(await readFile(path.join(directory, "value.txt"), "utf8")).toBe("child\n");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back files and directories when final topology verification fails", async () => {
+		const root = await temporaryRoot("directory-rollback");
+		const template = await temporaryRoot("directory-template");
+		const directory = path.join(root, "generated");
+		const target = path.join(directory, "value.txt");
+		try {
+			await mkdir(path.join(template, "generated"));
+			const expectedEmpty = await readSandboxDirectoryState(path.join(template, "generated"));
+			if (!expectedEmpty) throw new Error("template directory state missing");
+			await expect(
+				commitSandboxDelta({
+					output: settlement("unused"),
+					changes: [
+						{ kind: "directory", root, target: directory, resource: "generated", after: expectedEmpty },
+						{ root, target, resource: "generated/value.txt", after: Buffer.from("unexpected child\n") },
+					],
+				}),
+			).rejects.toThrow("directory changed while committing: generated");
+			await expect(stat(target)).rejects.toThrow();
+			await expect(stat(directory)).rejects.toThrow();
+		} finally {
+			await Promise.all([
+				rm(root, { recursive: true, force: true }),
+				rm(template, { recursive: true, force: true }),
+			]);
+		}
+	});
+
+	it("deletes a typed directory tree in child-before-parent order", async () => {
+		const root = await temporaryRoot("directory-delete");
+		const outer = path.join(root, "generated");
+		const inner = path.join(outer, "nested");
+		const target = path.join(inner, "value.txt");
+		try {
+			await mkdir(inner, { recursive: true });
+			await writeFile(target, "remove me\n");
+			const [outerBefore, innerBefore, fileBefore] = await Promise.all([
+				readSandboxDirectoryState(outer),
+				readSandboxDirectoryState(inner),
+				stat(target),
+			]);
+			if (!outerBefore || !innerBefore) throw new Error("directory baseline missing");
+			await commitSandboxDelta({
+				output: settlement("deleted"),
+				changes: [
+					{ kind: "directory", root, target: outer, resource: "generated", before: outerBefore },
+					{
+						root,
+						target,
+						resource: "generated/nested/value.txt",
+						before: Buffer.from("remove me\n"),
+						beforeMode: fileBefore.mode & 0o777,
+					},
+					{ kind: "directory", root, target: inner, resource: "generated/nested", before: innerBefore },
+				],
+			});
+			await expect(stat(target)).rejects.toThrow();
+			await expect(stat(inner)).rejects.toThrow();
+			await expect(stat(outer)).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

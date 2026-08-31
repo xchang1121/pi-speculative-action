@@ -108,6 +108,8 @@ async function captureWorkspaceSnapshot(
 		changeDigest: statChangeDigest(rootStat),
 		changeTimeMs: rootStat.ctimeMs,
 		mode: rootStat.mode & 0o777,
+		uid: rootStat.uid,
+		gid: rootStat.gid,
 	});
 
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
@@ -142,6 +144,8 @@ async function captureWorkspaceSnapshot(
 					changeDigest: statChangeDigest(stat),
 					changeTimeMs: stat.ctimeMs,
 					mode: stat.mode & 0o777,
+					uid: stat.uid,
+					gid: stat.gid,
 				});
 				await visit(target, relative);
 				continue;
@@ -192,12 +196,25 @@ async function captureWorkspaceSnapshot(
 }
 
 /** Effect shape used only to seal input evidence; replay bytes remain owned by the transaction. */
-export interface WorkspaceTransactionEffect {
-	readonly kind: "write" | "delete";
-	readonly logicalPath: string;
-	readonly relativePath: string;
-	readonly before?: WorkspaceTreeEntry;
-}
+export type WorkspaceTransactionEffect =
+	| {
+			readonly kind: "write" | "delete";
+			readonly logicalPath: string;
+			readonly relativePath: string;
+			readonly before?: WorkspaceTreeEntry;
+	  }
+	| {
+			readonly kind: "mkdir";
+			readonly logicalPath: string;
+			readonly relativePath: string;
+			readonly after: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
+	  }
+	| {
+			readonly kind: "rmdir";
+			readonly logicalPath: string;
+			readonly relativePath: string;
+			readonly before: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
+	  };
 
 export interface WorkspaceTransactionDiff {
 	readonly effects: readonly WorkspaceTransactionEffect[];
@@ -250,13 +267,38 @@ export function diffWorkspaceStructures(
 				}
 				continue;
 			}
-			// Git cannot represent empty directories or preserve created-directory metadata. Until a
-			// directory delta driver is installed, fail closed instead of silently approximating it.
-			return { effects: [], complete: false, reason: `unsupported_directory_transition:${relativePath}` };
+			const logicalPath = projection.toLogical(path.join(after.root, relativePath));
+			if (previous === undefined && current?.kind === "directory") {
+				effects.push({ kind: "mkdir", logicalPath, relativePath, after: current });
+				continue;
+			}
+			if (previous?.kind === "directory" && current === undefined) {
+				effects.push({ kind: "rmdir", logicalPath, relativePath, before: previous });
+				continue;
+			}
+			return { effects: [], complete: false, reason: `unsupported_directory_type_change:${relativePath}` };
 		}
 		return { effects: [], complete: false, reason: `untracked_inode_transition:${relativePath}` };
 	}
-	return { effects: Object.freeze(effects), complete: true };
+	return { effects: Object.freeze(orderWorkspaceTransactionEffects(effects)), complete: true };
+}
+
+function orderWorkspaceTransactionEffects(
+	effects: readonly WorkspaceTransactionEffect[],
+): WorkspaceTransactionEffect[] {
+	const phase = (effect: WorkspaceTransactionEffect): number =>
+		effect.kind === "delete" ? 0 : effect.kind === "rmdir" ? 1 : effect.kind === "mkdir" ? 2 : 3;
+	const depth = (effect: WorkspaceTransactionEffect): number =>
+		effect.relativePath.split(path.sep).filter(Boolean).length;
+	return [...effects].sort((left, right) => {
+		const phaseDifference = phase(left) - phase(right);
+		if (phaseDifference !== 0) return phaseDifference;
+		const depthDifference = depth(left) - depth(right);
+		if (left.kind === "delete" || left.kind === "rmdir") {
+			if (depthDifference !== 0) return -depthDifference;
+		} else if (depthDifference !== 0) return depthDifference;
+		return left.relativePath.localeCompare(right.relativePath);
+	});
 }
 
 export function hydrateWorkspaceFileEntry(
@@ -482,7 +524,7 @@ function changedRootMetadata(
 	return before.metadataDigest === after.metadataDigest ? undefined : "unsupported_workspace_root_metadata";
 }
 
-function directoryEntriesDigest(entries: readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; isSocket(): boolean; isFIFO(): boolean; isCharacterDevice(): boolean; isBlockDevice(): boolean }[]): Sha256Digest {
+export function directoryEntriesDigest(entries: readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; isSocket(): boolean; isFIFO(): boolean; isCharacterDevice(): boolean; isBlockDevice(): boolean }[]): Sha256Digest {
 	return digestObject(
 		entries
 			.map((entry) => `${direntType(entry)}\0${entry.name}`)

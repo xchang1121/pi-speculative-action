@@ -54,11 +54,18 @@ import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reus
 import { observeStrace, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { commitSandboxDelta, type SandboxFileChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
+import {
+	commitSandboxDelta,
+	readSandboxDirectoryState,
+	type SandboxDirectoryChange,
+	type SandboxFileChange,
+	type SandboxWorkspaceChange,
+	type SandboxWorkspaceContext,
+} from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v5";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v5";
+const BACKEND_EPOCH = "pi-linux-process-v6";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v6";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -104,7 +111,7 @@ export interface LinuxProcessReuseMetrics {
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
 	/** Join the outer workspace transaction delta to the process observation before validation. */
-	readonly seal: (changes: readonly SandboxFileChange[]) => Promise<void>;
+	readonly seal: (changes: readonly SandboxWorkspaceChange[]) => Promise<readonly SandboxDirectoryChange[]>;
 	/** Revalidate every observed input immediately before Actor adoption. */
 	readonly validate: () => Promise<ResourceValidation>;
 	readonly close: () => Promise<void>;
@@ -175,7 +182,7 @@ interface ActiveSession {
 	readonly incompleteReasons: Set<string>;
 	topLevelCapture?: TopLevelCapture;
 	topLevelEvidence?: DynamicDependencyCertificate;
-	sealPromise?: Promise<void>;
+	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
 
@@ -641,13 +648,32 @@ export class LinuxProcessReuseBackend {
 				let sequence = 0;
 				const changes = new Map(delta.changes.map((change) => [path.normalize(change.relativePath), change]));
 				for (const effect of effects.effects) {
-					if (effect.kind === "delete") journal.push({ sequence: sequence++, kind: "delete", path: effect.logicalPath });
-					else {
-						const change = changes.get(path.normalize(effect.relativePath));
-						if (!change?.after) throw new Error(`transaction output is unavailable: ${effect.relativePath}`);
-						if (change.afterMode === undefined) throw new Error(`transaction output mode is unavailable: ${effect.relativePath}`);
-						const data = await this.store.artifacts.put(change.after);
-						journal.push({ sequence: sequence++, kind: "write", path: effect.logicalPath, data, mode: change.afterMode });
+					switch (effect.kind) {
+						case "delete":
+							journal.push({ sequence: sequence++, kind: "delete", path: effect.logicalPath });
+							break;
+						case "rmdir":
+							journal.push({ sequence: sequence++, kind: "rmdir", path: effect.logicalPath });
+							break;
+						case "mkdir":
+							journal.push({
+								sequence: sequence++,
+								kind: "mkdir",
+								path: effect.logicalPath,
+								entriesDigest: effect.after.entriesDigest,
+								mode: effect.after.mode,
+								uid: effect.after.uid,
+								gid: effect.after.gid,
+							});
+							break;
+						case "write": {
+							const change = changes.get(path.normalize(effect.relativePath));
+							if (!change?.after) throw new Error(`transaction output is unavailable: ${effect.relativePath}`);
+							if (change.afterMode === undefined) throw new Error(`transaction output mode is unavailable: ${effect.relativePath}`);
+							const data = await this.store.artifacts.put(change.after);
+							journal.push({ sequence: sequence++, kind: "write", path: effect.logicalPath, data, mode: change.afterMode });
+							break;
+						}
 					}
 				}
 				for (const event of outcome.output) {
@@ -753,38 +779,40 @@ export class LinuxProcessReuseBackend {
 	}
 }
 
-async function sealSessionEvidence(session: ActiveSession, changes: readonly SandboxFileChange[]): Promise<void> {
+async function sealSessionEvidence(
+	session: ActiveSession,
+	changes: readonly SandboxWorkspaceChange[],
+): Promise<readonly SandboxDirectoryChange[]> {
 	const capture = session.topLevelCapture;
 	if (!capture) {
 		session.incompleteReasons.add("top_capture_missing");
 		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
-		return;
+		throw new Error("top-level workspace capture is missing");
 	}
+	const fileChanges = changes.filter((change): change is SandboxFileChange => change.kind !== "directory");
+	const regularDeltas: WorkspaceRegularDelta[] = fileChanges.map((change) => ({
+		relativePath: change.resource,
+		...(change.before ? { before: change.before } : {}),
+		...(change.after ? { after: change.after } : {}),
+		...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
+		...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
+	}));
+	const effects = diffWorkspaceStructures(
+		capture.before,
+		capture.after,
+		regularDeltas,
+		session.projection,
+	);
+	if (!effects.complete) {
+		session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
+		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
+		throw new Error(`top-level workspace effects are incomplete: ${effects.reason ?? "unknown"}`);
+	}
+	const directoryChanges = await sourceDirectoryChanges(session, effects.effects);
 	try {
-		const effects = diffWorkspaceStructures(
-			capture.before,
-			capture.after,
-			changes.map((change) => ({
-				relativePath: change.resource,
-				...(change.before ? { before: change.before } : {}),
-				...(change.after ? { after: change.after } : {}),
-				...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
-				...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
-			})),
-			session.projection,
-		);
 		const evidence = await captureDependencies(
 			session,
-			transactionDependencySource(
-				capture.before,
-				changes.map((change) => ({
-					relativePath: change.resource,
-					...(change.before ? { before: change.before } : {}),
-					...(change.after ? { after: change.after } : {}),
-					...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
-					...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
-				})),
-			),
+			transactionDependencySource(capture.before, regularDeltas),
 			capture.observation.paths,
 			effects.effects,
 		);
@@ -812,6 +840,69 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
 		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 	}
+	return directoryChanges;
+}
+
+async function sourceDirectoryChanges(
+	session: ActiveSession,
+	effects: ReturnType<typeof diffWorkspaceStructures>["effects"],
+): Promise<readonly SandboxDirectoryChange[]> {
+	const changes: SandboxDirectoryChange[] = [];
+	for (const effect of effects) {
+		if (effect.kind !== "mkdir" && effect.kind !== "rmdir") continue;
+		const resource = slash(path.normalize(effect.relativePath));
+		const target = path.resolve(session.sourceRoot, resource);
+		if (!pathContains(session.sourceRoot, target) || target === path.resolve(session.sourceRoot)) {
+			throw new Error(`directory effect escapes source workspace: ${effect.relativePath}`);
+		}
+		const sourceBefore = await readSandboxDirectoryState(target);
+		if (effect.kind === "mkdir") {
+			if (sourceBefore !== undefined) throw new Error(`directory creation baseline changed: ${resource}`);
+			changes.push({
+				kind: "directory",
+				root: session.sourceRoot,
+				target,
+				resource,
+				after: {
+					entriesDigest: effect.after.entriesDigest,
+					mode: effect.after.mode,
+					uid: effect.after.uid,
+					gid: effect.after.gid,
+				},
+			});
+			continue;
+		}
+		const sandboxBefore = {
+			entriesDigest: effect.before.entriesDigest,
+			mode: effect.before.mode,
+			uid: effect.before.uid,
+			gid: effect.before.gid,
+		};
+		if (!sameDirectoryStateValue(sourceBefore, sandboxBefore)) {
+			throw new Error(`source directory differs from execution baseline: ${resource}`);
+		}
+		changes.push({
+			kind: "directory",
+			root: session.sourceRoot,
+			target,
+			resource,
+			before: sandboxBefore,
+		});
+	}
+	return Object.freeze(changes);
+}
+
+function sameDirectoryStateValue(
+	left: Awaited<ReturnType<typeof readSandboxDirectoryState>>,
+	right: NonNullable<Awaited<ReturnType<typeof readSandboxDirectoryState>>>,
+): boolean {
+	return (
+		left !== undefined &&
+		left.entriesDigest === right.entriesDigest &&
+		left.mode === right.mode &&
+		left.uid === right.uid &&
+		left.gid === right.gid
+	);
 }
 
 function transactionDependencySource(
@@ -1051,24 +1142,51 @@ async function replayFilesystemEffects(
 	projection: ExecutionPathProjection,
 	workspaceRoot: string,
 ): Promise<void> {
-	const changes: SandboxFileChange[] = [];
+	const changes: SandboxWorkspaceChange[] = [];
 	for (const event of journal) {
 		if (event.kind === "output") continue;
-		if (event.kind !== "write" && event.kind !== "delete") throw new Error(`unsupported replay effect ${event.kind}`);
+		if (event.kind !== "write" && event.kind !== "delete" && event.kind !== "mkdir" && event.kind !== "rmdir") {
+			throw new Error(`unsupported replay effect ${event.kind}`);
+		}
 		const target = projection.toPhysical(event.path);
 		if (!target || !pathContains(workspaceRoot, target) || target === path.resolve(workspaceRoot)) {
 			throw new Error(`replay effect escapes workspace: ${event.path}`);
 		}
+		const resource = slash(path.relative(workspaceRoot, target));
+		if (event.kind === "mkdir") {
+			if ((await readSandboxDirectoryState(target)) !== undefined) {
+				throw new Error(`replay directory already exists: ${event.path}`);
+			}
+			changes.push({
+				kind: "directory",
+				root: workspaceRoot,
+				target,
+				resource,
+				after: {
+					entriesDigest: event.entriesDigest,
+					mode: event.mode,
+					uid: event.uid,
+					gid: event.gid,
+				},
+			});
+			continue;
+		}
+		if (event.kind === "rmdir") {
+			const before = await readSandboxDirectoryState(target);
+			if (!before) throw new Error(`replay directory is missing: ${event.path}`);
+			changes.push({ kind: "directory", root: workspaceRoot, target, resource, before });
+			continue;
+		}
 		const before = await readRegularState(target);
 		if (event.kind === "delete") {
-			changes.push({ root: workspaceRoot, target, resource: slash(path.relative(workspaceRoot, target)), ...before });
+			changes.push({ root: workspaceRoot, target, resource, ...before });
 			continue;
 		}
 		const after = artifacts.read(event.data);
 		changes.push({
 			root: workspaceRoot,
 			target,
-			resource: slash(path.relative(workspaceRoot, target)),
+			resource,
 			...before,
 			after,
 			afterMode: event.mode,

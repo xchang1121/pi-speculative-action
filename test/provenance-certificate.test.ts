@@ -210,6 +210,45 @@ describe("process provenance certificates", () => {
 			}),
 		).toThrow("conflicting effect artifact sizes");
 	});
+
+	it("seals exact typed directory state and rejects malformed topology effects", () => {
+		const entriesDigest = sha256Digest("empty directory");
+		const certificate = sealProcessCertificate({
+			prototype: prototype(),
+			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+			result: {
+				replayProfile: "buffered_noninteractive",
+				journal: [
+					{ sequence: 0, kind: "mkdir", path: "/workspace/generated", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
+					{ sequence: 1, kind: "rmdir", path: "/workspace/obsolete" },
+				],
+				exit: { kind: "code", code: 0 },
+			},
+		});
+		expect(certificate.result.journal[0]).toMatchObject({ kind: "mkdir", entriesDigest, mode: 0o750 });
+
+		expect(() =>
+			sealProcessCertificate({
+				prototype: prototype(),
+				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+				result: {
+					replayProfile: "buffered_noninteractive",
+					journal: [
+						{
+							sequence: 0,
+							kind: "mkdir",
+							path: "/workspace/generated",
+							entriesDigest: "not-a-digest",
+							mode: 0o750,
+							uid: -1,
+							gid: 1000,
+						},
+					] as never,
+					exit: { kind: "code", code: 0 },
+				},
+			}),
+		).toThrow("invalid mkdir effect state");
+	});
 });
 
 function prototype(environment: Readonly<Record<string, string | undefined>> = { MODE: "build" }) {

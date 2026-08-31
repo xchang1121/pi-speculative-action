@@ -119,7 +119,16 @@ export type OrderedEffectEvent =
 			readonly mode: number;
 	  }
 	| { readonly sequence: number; readonly kind: "delete"; readonly path: string }
-	| { readonly sequence: number; readonly kind: "mkdir"; readonly path: string; readonly mode: number }
+	| {
+			readonly sequence: number;
+			readonly kind: "mkdir";
+			readonly path: string;
+			readonly entriesDigest: Sha256Digest;
+			readonly mode: number;
+			readonly uid: number;
+			readonly gid: number;
+	  }
+	| { readonly sequence: number; readonly kind: "rmdir"; readonly path: string }
 	| { readonly sequence: number; readonly kind: "rename"; readonly from: string; readonly to: string }
 	| { readonly sequence: number; readonly kind: "symlink"; readonly path: string; readonly target: string }
 	| { readonly sequence: number; readonly kind: "hardlink"; readonly from: string; readonly to: string };
@@ -496,6 +505,22 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 				throw new Error("conflicting effect artifact sizes");
 			}
 			artifactSizes.set(event.data.digest, event.data.size);
+		}
+		if (event.kind === "write" && (!Number.isSafeInteger(event.mode) || event.mode < 0 || event.mode > 0o777)) {
+			throw new Error("invalid write effect mode");
+		}
+		if (
+			event.kind === "mkdir" &&
+			(!isSha256Digest(event.entriesDigest) ||
+				!Number.isSafeInteger(event.mode) ||
+				event.mode < 0 ||
+				event.mode > 0o777 ||
+				!Number.isSafeInteger(event.uid) ||
+				event.uid < 0 ||
+				!Number.isSafeInteger(event.gid) ||
+				event.gid < 0)
+		) {
+			throw new Error("invalid mkdir effect state");
 		}
 		for (const effectPath of effectPaths(event)) {
 			if (!validLogicalPath(effectPath)) throw new Error("invalid effect path");

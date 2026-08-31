@@ -51,6 +51,32 @@ Every replay must hit and reproduce the input digest. A closure-capable backend
 also reports the number and total size of artifacts integrity-checked before any
 workspace effect begins.
 
+Exercise typed directory topology plus a regular-file artifact from one child
+process, either through completed replay or the direct stock Pi Bash control:
+
+```sh
+npm run bench:linux-topology -- --mode direct --output bench/results/local-topology-direct.json
+npm run bench:linux-topology -- --mode reuse --output bench/results/local-topology-reuse.json
+```
+
+The helper creates two directories and deterministically transforms a 32 MiB
+input. Reuse mode requires three different parent Bash commands to hit the same
+child certificate, restore exact directory states and artifact bytes, validate
+the outer branch, and commit it. Direct mode is the profitability control; the
+checked-in qualification also preserves shorter workloads for which replay is
+neutral or slower.
+
+Probe whether the Linux host supports unprivileged OverlayFS in a private user
+and mount namespace:
+
+```sh
+npm run bench:overlay-probe
+```
+
+This is only a capability probe. Its upperdir contains whiteouts and other
+OverlayFS-specific records; it is not an adoption implementation and must not
+be merged into a workspace as an ordinary directory tree.
+
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
 contexts match; tool name and all parsed arguments must match exactly:

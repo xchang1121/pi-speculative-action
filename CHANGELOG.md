@@ -22,6 +22,10 @@
 
 ### Added
 
+- Added typed directory creation/removal across process observation, provenance journals, parent
+  checkpoints, completed replay, atomic workspace adoption, final-state verification, and rollback.
+  Directory records preserve entry digests, mode, uid, and gid; metadata/type/link transitions outside
+  the modeled subset continue to fail closed.
 - Added verified artifact-closure leases: every referenced output/file blob is loaded and SHA-256
   checked before replay side effects, duplicate references are deduplicated, and replay no longer
   reopens CAS files after mutation begins.
@@ -64,6 +68,11 @@
 
 ### Changed
 
+- A five-pair WSL2 stock Pi Bash qualification of a child that creates two directories and a 32 MiB
+  deterministic artifact reduced median-of-medians from 2686.65 ms direct to 936.26 ms replayed
+  (65.1%, 2.87x), with 15/15 hits and zero taints. Preserved short-task results also show a 384.56 ms
+  direct task regressing to 937.24 ms under replay, establishing cost-aware admission as required
+  follow-up rather than treating every valid certificate as profitable.
 - Large process effects now replay from their prevalidated artifact closure. A 128 MiB regular-file
   effect reduced median complete Pi Bash hit latency from 2084.65 ms to 1928.33 ms (7.5%) while
   closing the integrity-check/reopen race.

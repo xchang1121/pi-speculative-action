@@ -88,13 +88,15 @@ describe("process observation", () => {
 			expect(diff.effects).toHaveLength(1);
 			expect(diff.effects[0]).toMatchObject({ kind: "write", relativePath: "value.bin" });
 			expect(diff.effects[0]).not.toHaveProperty("after");
-			expect(diff.effects[0]?.before).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
+			const effect = diff.effects[0];
+			if (effect?.kind !== "write") throw new Error("write effect missing");
+			expect(effect.before).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
 	});
 
-	test("fails closed when the regular-file delta cannot represent a directory transition", async () => {
+	test("models empty-directory creation and deletion as typed topology effects", async () => {
 		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pi-process-directory-"));
 		const source = path.join(parent, "source");
 		const workspace = path.join(parent, "private", "workspace");
@@ -108,14 +110,24 @@ describe("process observation", () => {
 			const afterTree = await captureWorkspaceTree(workspace, { includeFileContent: true });
 			const diff = diffWorkspaceStructures(before, after, [], projection);
 
-			expect(diff).toMatchObject({
-				complete: false,
-				reason: expect.stringContaining("unsupported_directory_transition"),
-			});
+			expect(diff.complete).toBe(true);
+			expect(diff.effects).toHaveLength(1);
+			expect(diff.effects[0]).toMatchObject({ kind: "mkdir", relativePath: "empty" });
+			const created = diff.effects[0];
+			if (created?.kind !== "mkdir") throw new Error("mkdir effect missing");
+			expect(created.after).toMatchObject({ kind: "directory", mode: expect.any(Number) });
 			expect(diffWorkspaceTrees(beforeTree, afterTree, projection)).toMatchObject({
 				complete: false,
 				reason: expect.stringContaining("unsupported_directory"),
 			});
+
+			await fs.rmdir(path.join(workspace, "empty"));
+			const removed = diffWorkspaceStructures(after, await captureWorkspaceStructure(workspace), [], projection);
+			expect(removed.complete).toBe(true);
+			expect(removed.effects).toHaveLength(1);
+			expect(removed.effects[0]).toMatchObject({ kind: "rmdir", relativePath: "empty" });
+			if (removed.effects[0]?.kind !== "rmdir") throw new Error("rmdir effect missing");
+			expect(removed.effects[0].before.entriesDigest).toBe(created.after.entriesDigest);
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
