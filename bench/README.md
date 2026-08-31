@@ -27,6 +27,19 @@ dynamic input and requires a miss. This is a substrate benchmark, not a model
 quality benchmark; avoiding an LLM request makes the command identity and cache
 decision deterministic and repeatable.
 
+Exercise the weak-key / dynamic-pathset / strong-key lookup with eight historical
+contents for one 32 MiB input, then return to the oldest state under a different
+parent Bash command:
+
+```sh
+npm run bench:linux-pathset -- --output bench/results/local-pathset.json
+```
+
+The hit must consider all eight certificates while capturing their shared
+dependency pathset once. This catches a common cache pathology where reverting a
+large input causes the validator to hash the same files once per historical
+certificate.
+
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
 contexts match; tool name and all parsed arguments must match exactly:

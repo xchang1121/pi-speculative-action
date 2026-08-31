@@ -1,7 +1,10 @@
 import {
 	certificateReplayable,
+	dependencyPathsetKey,
+	type DynamicDependencyCertificate,
 	type ExecPrototype,
 	type OrderedEffectEvent,
+	processStrongKey,
 	processWeakKey,
 	type ProcessProvenanceCertificate,
 	type Sha256Digest,
@@ -9,7 +12,7 @@ import {
 import {
 	type ProvenanceValidation,
 	type ProvenanceValidationContext,
-	validateProcessCertificate,
+	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore } from "./reuse-store.ts";
 
@@ -45,14 +48,30 @@ export type ProcessReuseMissReason =
 	| "observation_contract_incompatible"
 	| "no_seedable_effects";
 
+export interface ProcessReuseLookupMetrics {
+	readonly candidateCertificates: number;
+	readonly eligibleCertificates: number;
+	readonly pathsetsValidated: number;
+	readonly filesRead: number;
+	readonly bytesRead: number;
+	readonly durationMs: number;
+}
+
 export type ProcessReusePlan<MemoryHit = never> =
-	| { readonly kind: "memory_hit"; readonly source: "l1"; readonly weakKey: Sha256Digest; readonly hit: MemoryHit }
+	| {
+			readonly kind: "memory_hit";
+			readonly source: "l1";
+			readonly weakKey: Sha256Digest;
+			readonly hit: MemoryHit;
+			readonly lookup: ProcessReuseLookupMetrics;
+	  }
 	| {
 			readonly kind: "completed_replay";
 			readonly source: "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
+			readonly lookup: ProcessReuseLookupMetrics;
 	  }
 	| {
 			readonly kind: "artifact_seed";
@@ -61,11 +80,13 @@ export type ProcessReusePlan<MemoryHit = never> =
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly effects: readonly Exclude<OrderedEffectEvent, { kind: "output" }>[];
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
+			readonly lookup: ProcessReuseLookupMetrics;
 	  }
 	| {
 			readonly kind: "miss";
 			readonly weakKey: Sha256Digest;
 			readonly reasons: readonly ProcessReuseMissReason[];
+			readonly lookup: ProcessReuseLookupMetrics;
 	  };
 
 /** BuildXL-style weak pathset lookup followed by eager current-world strong validation. */
@@ -82,13 +103,32 @@ export class ProcessReusePlanner<MemoryHit = never> {
 	}
 
 	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan<MemoryHit>> {
+		const startedAt = performance.now();
+		let candidateCertificates = 0;
+		let eligibleCertificates = 0;
+		let pathsetsValidated = 0;
+		let filesRead = 0;
+		let bytesRead = 0;
+		const lookup = (): ProcessReuseLookupMetrics =>
+			Object.freeze({
+				candidateCertificates,
+				eligibleCertificates,
+				pathsetsValidated,
+				filesRead,
+				bytesRead,
+				durationMs: Math.max(0, performance.now() - startedAt),
+			});
 		const weakKey = processWeakKey(request.prototype);
 		const memoryHit = await this.memory?.lookup(weakKey);
-		if (memoryHit !== undefined) return { kind: "memory_hit", source: "l1", weakKey, hit: memoryHit };
+		if (memoryHit !== undefined) return { kind: "memory_hit", source: "l1", weakKey, hit: memoryHit, lookup: lookup() };
 
 		const certificates = await this.store.findByWeakKey(weakKey);
-		if (!certificates.length) return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"] };
+		candidateCertificates = certificates.length;
+		if (!certificates.length) {
+			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
+		}
 		const reasons = new Set<ProcessReuseMissReason>();
+		const pathsets = new Map<Sha256Digest, ProcessProvenanceCertificate[]>();
 		for (const certificate of certificates) {
 			if (!certificateReplayable(certificate)) {
 				reasons.add("certificate_tainted");
@@ -98,37 +138,85 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				reasons.add("observation_contract_incompatible");
 				continue;
 			}
-			const validation = await validateProcessCertificate(certificate, request.validation);
-			if (validation.status === "stale") {
-				reasons.add("dependency_changed");
-				continue;
-			}
-			if (validation.status === "indeterminate") {
+			eligibleCertificates++;
+			const pathset = dependencyPathsetKey(certificate.dependencyCertificate);
+			const grouped = pathsets.get(pathset);
+			if (grouped) grouped.push(certificate);
+			else pathsets.set(pathset, [certificate]);
+		}
+
+		for (const grouped of pathsets.values()) {
+			const representative = grouped[0]!;
+			pathsetsValidated++;
+			const observation = await validateDynamicDependencyCertificate(
+				representative.dependencyCertificate,
+				request.validation,
+			);
+			filesRead += observation.filesRead;
+			bytesRead += observation.bytesRead;
+			if (observation.status === "indeterminate") {
 				reasons.add("validation_indeterminate");
 				continue;
 			}
-			if (!(await artifactsAvailable(this.store, certificate))) {
-				reasons.add("artifact_missing");
+			const current: DynamicDependencyCertificate = {
+				complete: true,
+				dependencies: observation.dependencies,
+				taints: [],
+			};
+			const strongKey = processStrongKey(weakKey, current);
+			const matching = grouped.filter((certificate) => certificate.strongKey === strongKey);
+			if (!matching.length) {
+				reasons.add("dependency_changed");
 				continue;
 			}
-			if (request.contract.mode === "completed_replay") {
-				return { kind: "completed_replay", source: "l2", weakKey, certificate, validation };
+			const validation: Extract<ProvenanceValidation, { status: "valid" }> = {
+				status: "valid",
+				strongKey,
+				dependencies: observation.dependencies,
+				filesRead: observation.filesRead,
+				bytesRead: observation.bytesRead,
+				durationMs: observation.durationMs,
+			};
+			for (const certificate of matching) {
+				if (!(await artifactsAvailable(this.store, certificate))) {
+					reasons.add("artifact_missing");
+					continue;
+				}
+				if (request.contract.mode === "completed_replay") {
+					return {
+						kind: "completed_replay",
+						source: "l2",
+						weakKey,
+						certificate,
+						validation,
+						lookup: lookup(),
+					};
+				}
+				const accepted = new Set(request.contract.seed?.acceptedPaths ?? []);
+				const effects = certificate.result.journal.filter(
+					(event): event is Extract<OrderedEffectEvent, { kind: "write" }> =>
+						event.kind === "write" && accepted.has(event.path),
+				);
+				if (!effects.length) {
+					reasons.add("no_seedable_effects");
+					continue;
+				}
+				return {
+					kind: "artifact_seed",
+					source: "l2",
+					weakKey,
+					certificate,
+					effects,
+					validation,
+					lookup: lookup(),
+				};
 			}
-			const accepted = new Set(request.contract.seed?.acceptedPaths ?? []);
-			const effects = certificate.result.journal.filter(
-				(event): event is Extract<OrderedEffectEvent, { kind: "write" }> =>
-					event.kind === "write" && accepted.has(event.path),
-			);
-			if (!effects.length) {
-				reasons.add("no_seedable_effects");
-				continue;
-			}
-			return { kind: "artifact_seed", source: "l2", weakKey, certificate, effects, validation };
 		}
 		return {
 			kind: "miss",
 			weakKey,
 			reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
+			lookup: lookup(),
 		};
 	}
 

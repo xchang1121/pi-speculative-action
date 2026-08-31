@@ -61,6 +61,10 @@
 
 ### Changed
 
+- Process-certificate lookup now captures each distinct dynamic dependency pathset once and derives
+  the current strong key against every historical state in that group. Reverting a 32 MiB input with
+  eight cached states reduced median exact validation from 294.11 ms to 38.14 ms and complete Pi Bash
+  hit latency from 1259.85 ms to 1003.94 ms on the qualified WSL2 host.
 - Width-two Drafter requests now use first-valid hedged admission: the first schema-valid enabled action cancels only still-running initial-proposal siblings through their existing provider signals. Empty, failed, and invalid responses cannot win; explicitly wider sampling still admits all responses. Recorded strict hits, lead, and D3 verifier work are unchanged while 7.78% of width-two service is removable residual work.
 - Reduced the default independent Drafter request width from eight to the tape-derived Pareto point of two; explicit `candidateLimit` settings remain uncapped, while the retained width preserves all recorded exact hits and lead with 30% fewer requests than the full recorded cohort.
 - Raised the default target-decoder action draft cap from 20 to the tape-derived Pareto saturation point of 28 tokens; explicit user and engine caps still win.

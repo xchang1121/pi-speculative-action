@@ -78,6 +78,50 @@ describe("ProcessReusePlanner", () => {
 		expect(plan).toMatchObject({ kind: "memory_hit", source: "l1", hit: { resultEntry: "runtime-owned" } });
 		expect(lookup).toHaveBeenCalledOnce();
 	});
+
+	it("captures one dynamic pathset once when matching several historical input states", async () => {
+		const root = await temporaryRoot();
+		const input = path.join(root, "input.txt");
+		const store = new ProvenanceCertificateStore(path.join(root, "cache"));
+		const prototype = processPrototype();
+		let oldestID: string | undefined;
+		for (const [index, value] of ["one", "two", "three"].entries()) {
+			await writeFile(input, value);
+			const dependency = await captureFileDependency(input, "/workspace/input.txt");
+			const output = await store.artifacts.put(`result:${value}`);
+			const certificate = sealProcessCertificate({
+				prototype,
+				dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints: [] },
+				result: {
+					replayProfile: "buffered_noninteractive",
+					journal: [{ sequence: 0, kind: "output", fd: 1, data: output }],
+					exit: { kind: "code", code: 0 },
+				},
+				createdAt: index + 1,
+			});
+			oldestID ??= certificate.id;
+			await store.put(certificate);
+		}
+		await writeFile(input, "one");
+
+		const plan = await new ProcessReusePlanner({ store }).plan({
+			prototype,
+			contract: contract("completed_replay"),
+			validation: { resolvePath: () => input },
+		});
+
+		expect(plan).toMatchObject({
+			kind: "completed_replay",
+			certificate: { id: oldestID },
+			lookup: {
+				candidateCertificates: 3,
+				eligibleCertificates: 3,
+				pathsetsValidated: 1,
+				filesRead: 1,
+				bytesRead: 3,
+			},
+		});
+	});
 });
 
 async function fixtureWithCertificate(withFileEffect = false) {

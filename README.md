@@ -30,6 +30,8 @@ Process interception is structural. A single async process outlet preserves each
 
 Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, or unsupported observations fail closed.
 
+Lookup follows a weak-exec-key / dynamic-pathset / strong-input-key hierarchy. Historical certificates that observed the same pathset share one current-world capture; observation semantics such as dependency role, metadata policy, negative-parent enumeration, and private-entry exclusions remain part of the pathset identity. See the research and platform notes and the WSL2 multi-history qualification.
+
 ## Correctness boundaries
 
 - Prediction sources never choose an execution backend.
@@ -195,6 +197,7 @@ npm test
 npm run bench:check
 # Linux/WSL only: production Pi Bash tool + process-world qualification
 npm run bench:linux-process
+npm run bench:linux-pathset
 npm pack --dry-run
 ```
 

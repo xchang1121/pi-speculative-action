@@ -178,10 +178,31 @@ export function dependencyPathsetKey(certificate: DynamicDependencyCertificate):
 	return digestObject(
 		normalizeDependencies(certificate.dependencies).map((dependency) => {
 			switch (dependency.kind) {
+				case "file":
+					return {
+						kind: dependency.kind,
+						path: dependency.path,
+						role: dependency.role,
+						metadata: dependency.metadataDigest !== undefined,
+					};
+				case "directory":
+					return {
+						kind: dependency.kind,
+						path: dependency.path,
+						metadata: dependency.metadataDigest !== undefined,
+						excludedEntries: dependency.excludedEntries ?? [],
+					};
+				case "absence":
+					return {
+						kind: dependency.kind,
+						path: dependency.path,
+						captureParent: dependency.parentEntriesDigest !== undefined,
+						parentExcludedEntries: dependency.parentExcludedEntries ?? [],
+					};
+				case "symlink":
+					return { kind: dependency.kind, path: dependency.path };
 				case "fd":
 					return { kind: dependency.kind, fd: dependency.fd };
-				default:
-					return { kind: dependency.kind, path: dependency.path };
 			}
 		}),
 	);

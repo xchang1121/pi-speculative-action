@@ -90,6 +90,10 @@ export interface LinuxProcessReuseMetrics {
 	readonly published: number;
 	readonly tainted: number;
 	readonly validationMs: number;
+	readonly validationCandidates: number;
+	readonly validationPathsets: number;
+	readonly validationFilesRead: number;
+	readonly validationBytesRead: number;
 	readonly executionMs: number;
 	readonly lastError?: string;
 }
@@ -190,6 +194,10 @@ export class LinuxProcessReuseBackend {
 		published: number;
 		tainted: number;
 		validationMs: number;
+		validationCandidates: number;
+		validationPathsets: number;
+		validationFilesRead: number;
+		validationBytesRead: number;
 		executionMs: number;
 		lastError?: string;
 	} = {
@@ -200,6 +208,10 @@ export class LinuxProcessReuseBackend {
 		published: 0,
 		tainted: 0,
 		validationMs: 0,
+		validationCandidates: 0,
+		validationPathsets: 0,
+		validationFilesRead: 0,
+		validationBytesRead: 0,
 		executionMs: 0,
 	};
 
@@ -528,6 +540,10 @@ export class LinuxProcessReuseBackend {
 			validation: { resolvePath: (logicalPath) => session.projection.toPhysical(logicalPath) },
 		});
 		this.counters.validationMs += Math.max(0, performance.now() - started);
+		this.counters.validationCandidates += plan.lookup.candidateCertificates;
+		this.counters.validationPathsets += plan.lookup.pathsetsValidated;
+		this.counters.validationFilesRead += plan.lookup.filesRead;
+		this.counters.validationBytesRead += plan.lookup.bytesRead;
 		return plan.kind === "completed_replay" ? plan.certificate : undefined;
 	}
 

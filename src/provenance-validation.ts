@@ -31,6 +31,8 @@ export type ProvenanceValidation =
 	| {
 			readonly status: "stale";
 			readonly changed: readonly string[];
+			/** Current evidence, when the original observation shape could still be captured. */
+			readonly dependencies: readonly DynamicDependency[];
 			readonly filesRead: number;
 			readonly bytesRead: number;
 			readonly durationMs: number;
@@ -69,6 +71,7 @@ export async function validateProcessCertificate(
 		return {
 			status: "stale",
 			changed: Object.freeze(["strong_key"]),
+			dependencies: validation.dependencies,
 			filesRead: validation.filesRead,
 			bytesRead: validation.bytesRead,
 			durationMs: validation.durationMs,
@@ -189,6 +192,7 @@ export async function validateDynamicDependencyCertificate(
 		return {
 			status: "stale",
 			changed: Object.freeze([...new Set(changed)]),
+			dependencies: Object.freeze(current),
 			filesRead,
 			bytesRead,
 			durationMs: elapsed(startedAt),

@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createExecPrototype,
+	dependencyPathsetKey,
+	type DynamicDependency,
 	processWeakKey,
 	sealProcessCertificate,
 	sha256Digest,
@@ -151,6 +153,44 @@ describe("process provenance certificates", () => {
 			status: "stale",
 			changed: expect.arrayContaining(["/workspace", "/workspace/artifact.txt"]),
 		});
+	});
+
+	it("keeps dependency capture semantics in the dynamic pathset identity", async () => {
+		const root = await workspace();
+		const target = path.join(root, "input.txt");
+		await writeFile(target, "content");
+		const contentOnly = await captureFileDependency(target, "/workspace/input.txt", "input");
+		const withMetadata = await captureFileDependency(target, "/workspace/input.txt", "input", {
+			includeMetadata: true,
+		});
+		const executable = await captureFileDependency(target, "/workspace/input.txt", "executable");
+		await mkdir(path.join(root, "directory"));
+		await mkdir(path.join(root, "directory", ".private"));
+		const fullDirectory = await captureDirectoryDependency(path.join(root, "directory"), "/workspace/directory");
+		const projectedDirectory = await captureDirectoryDependency(
+			path.join(root, "directory"),
+			"/workspace/directory",
+			false,
+			[".private"],
+		);
+		const absentWithParent = await captureAbsenceDependency(
+			path.join(root, "missing"),
+			"/workspace/missing",
+			true,
+		);
+		const absentWithoutParent = await captureAbsenceDependency(
+			path.join(root, "missing"),
+			"/workspace/missing",
+			false,
+		);
+		if (!absentWithParent || !absentWithoutParent) throw new Error("expected absence evidence");
+		const key = (dependency: DynamicDependency) =>
+			dependencyPathsetKey({ complete: true, dependencies: [dependency], taints: [] });
+
+		expect(key(contentOnly.dependency)).not.toBe(key(withMetadata.dependency));
+		expect(key(contentOnly.dependency)).not.toBe(key(executable.dependency));
+		expect(key(fullDirectory)).not.toBe(key(projectedDirectory));
+		expect(key(absentWithParent)).not.toBe(key(absentWithoutParent));
 	});
 });
 
