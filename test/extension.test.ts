@@ -530,6 +530,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		previewActorTool: vi.fn(),
 		previewActorCall: vi.fn(),
 		consume: vi.fn(consume),
+		executeAuthoritative: vi.fn(async (operation, executor) => executor(operation)),
 		actual: vi.fn(),
 		finishTurn: vi.fn(),
 		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),

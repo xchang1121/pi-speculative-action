@@ -22,7 +22,7 @@ import {
 	type SpeculativeToolSelectionInput,
 	usageTokenCount,
 } from "./common.ts";
-import { ExecutionWorldRouter, type SpeculativeExecutionRoute } from "./execution-world.ts";
+import type { SpeculativeExecutionRoute } from "./execution-world.ts";
 import {
 	DrafterUtilityGate,
 	type DrafterUtilityBatch,
@@ -60,6 +60,7 @@ import type { SelfSpeculationActionBridge } from "./self-speculation-action-brid
 import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableStringify } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
@@ -178,6 +179,11 @@ export interface SpeculativeActionHost {
 		input: Omit<AgentConsumeInput, "sessionID">,
 		signal?: AbortSignal,
 	) => Promise<ToolSettlement | undefined>;
+	/** Common execution boundary shared by authoritative and speculative tool calls. */
+	readonly executeAuthoritative: <Output>(
+		operation: ToolOperation,
+		executor: (operation: ToolOperation) => Promise<Output>,
+	) => Promise<Output>;
 	readonly actual: (
 		input: Omit<AgentConsumeInput, "sessionID"> & { readonly durationMs: number; readonly output?: ToolSettlement },
 	) => Promise<void>;
@@ -234,12 +240,20 @@ export function createSpeculativeActionHost(
 	) {
 		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
 	}
-	const executionRouter = new ExecutionWorldRouter(executionWorlds);
+	const executionGateway = new ToolExecutionGateway(executionWorlds);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
 		const effect = actionSemantics.effect(tool);
 		return effect
-			? executionRouter.resolve(
-					{ tool, effect, ...(action ? { action } : {}) },
+			? executionGateway.resolve(
+					{
+						operation: {
+							tool,
+							input: undefined,
+							...(signal ? { signal } : {}),
+							...(action ? { action } : {}),
+						},
+						effect,
+					},
 					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
 				)
 			: undefined;
@@ -833,18 +847,19 @@ export function createSpeculativeActionHost(
 			if (!effect) return undefined;
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return undefined;
-			const captured = await executionRouter.captureAuthoritativeResult(
-				{ tool: toolName, effect, action },
+			const operation: ToolOperation = { tool: toolName, callID, input: args, signal, action };
+			const captured = await executionGateway.captureAuthoritativeResult(
+				{ operation, effect },
 				{ cwd: options.cwd, signal },
-				{
+				(operation) => ({
 					cwd: options.cwd,
 					tool,
-					toolName,
-					args,
-					action,
-					callID,
-					signal,
-				},
+					toolName: operation.tool,
+					args: operation.input,
+					action: operation.action ?? action,
+					callID: operation.callID ?? callID,
+					signal: operation.signal ?? signal,
+				}),
 			);
 			if (!captured) return undefined;
 			return {
@@ -889,16 +904,20 @@ export function createSpeculativeActionHost(
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) throw new Error(`Invalid arguments for tool ${toolName}`);
-			return executionRouter.fork(route, {
-				cwd: options.cwd,
-				tool,
-				toolName,
-				args,
-				action,
-				callID,
-				signal,
-				...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
-			});
+			return executionGateway.executeSpeculative(
+				{ tool: toolName, callID, input: args, signal, action },
+				route,
+				(operation) => ({
+					cwd: options.cwd,
+					tool,
+					toolName: operation.tool,
+					args: operation.input,
+					action: operation.action ?? action,
+					callID: operation.callID ?? callID,
+					signal: operation.signal ?? signal,
+					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
+				}),
+			);
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
@@ -996,6 +1015,7 @@ export function createSpeculativeActionHost(
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
+		executeAuthoritative: (operation, executor) => executionGateway.executeAuthoritative(operation, executor),
 		actual: (input) => runtime.actual({ ...input, sessionID }),
 		drafterGateSnapshot: () => drafterGate.snapshot(),
 		finishTurn: async (turnID, terminal = false) => {
@@ -1016,7 +1036,7 @@ export function createSpeculativeActionHost(
 						}
 					}
 				} finally {
-					await executionRouter.dispose();
+					await executionGateway.dispose();
 				}
 			}
 		},

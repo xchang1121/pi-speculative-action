@@ -113,6 +113,13 @@ export {
 	type WorldResultCapture,
 } from "./execution-world.ts";
 export {
+	type AuthoritativeToolExecutor,
+	ToolExecutionGateway,
+	type ToolExecutionContextFactory,
+	type ToolExecutionRequirement,
+	type ToolOperation,
+} from "./tool-execution-gateway.ts";
+export {
 	createSpeculativeActionExtension,
 	type EffectiveSpeculativeActionSettings,
 	formatSpeculativeActionEvent,

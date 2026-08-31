@@ -15,6 +15,7 @@ import {
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
 	releaseResourceVersion,
+	ToolExecutionGateway,
 } from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -31,6 +32,7 @@ describe("speculative action package boundary", () => {
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
 			ExecutionWorldRouter,
+			ToolExecutionGateway,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}

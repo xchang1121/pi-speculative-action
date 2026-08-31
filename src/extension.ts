@@ -476,10 +476,20 @@ async function installController(
 			}
 			const startedAt = performance.now();
 			try {
-				const result = withPiProjectionCoverage(
-					tool,
-					input,
-					await definition.execute(callID, input as never, signal, onUpdate as never, nextContext),
+				const result = await host.executeAuthoritative(
+					{ tool, callID, input, ...(signal ? { signal } : {}) },
+					async (operation) =>
+						withPiProjectionCoverage(
+							operation.tool,
+							operation.input,
+							await definition.execute(
+								callID,
+								operation.input as never,
+								operation.signal,
+								onUpdate as never,
+								nextContext,
+							),
+						),
 				);
 				if (turnID) {
 					await recoverSpeculation(() =>
