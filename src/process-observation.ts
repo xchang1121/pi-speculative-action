@@ -214,6 +214,20 @@ export interface WorkspaceRegularDelta {
 	readonly afterMode?: number;
 }
 
+/** Effect shape used only to seal input evidence; replay bytes remain owned by the transaction. */
+export interface WorkspaceTransactionEffect {
+	readonly kind: "write" | "delete";
+	readonly logicalPath: string;
+	readonly relativePath: string;
+	readonly before?: WorkspaceTreeEntry;
+}
+
+export interface WorkspaceTransactionDiff {
+	readonly effects: readonly WorkspaceTransactionEffect[];
+	readonly complete: boolean;
+	readonly reason?: string;
+}
+
 /**
  * Join a content-addressed transaction delta with content-free inode snapshots. The delta is the
  * authority for regular-file bytes; the snapshots prove that no unsupported inode or metadata
@@ -224,7 +238,7 @@ export function diffWorkspaceStructures(
 	after: WorkspaceStructureSnapshot,
 	deltas: readonly WorkspaceRegularDelta[],
 	projection: ExecutionPathProjection,
-): WorkspaceEffectDiff {
+): WorkspaceTransactionDiff {
 	if (!before.complete || !after.complete) return { effects: [], complete: false, reason: "snapshot_limit" };
 	const rootReason = changedRootMetadata(before.entries.get(""), after.entries.get(""));
 	if (rootReason) return { effects: [], complete: false, reason: rootReason };
@@ -238,7 +252,7 @@ export function diffWorkspaceStructures(
 		byPath.set(relativePath, delta);
 	}
 
-	const effects: WorkspaceRegularEffect[] = [];
+	const effects: WorkspaceTransactionEffect[] = [];
 	const names = [...new Set([...before.entries.keys(), ...after.entries.keys(), ...byPath.keys()])].sort();
 	for (const relativePath of names) {
 		if (!relativePath) continue;
@@ -289,7 +303,7 @@ function joinRegularDelta(
 	delta: WorkspaceRegularDelta,
 	projection: ExecutionPathProjection,
 	root: string,
-): { readonly effect: WorkspaceRegularEffect } | { readonly reason: string } {
+): { readonly effect: WorkspaceTransactionEffect } | { readonly reason: string } {
 	let beforeEntry: Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined;
 	if (delta.before === undefined) {
 		if (previous !== undefined) return { reason: `delta_before_missing:${relativePath}` };
@@ -313,15 +327,13 @@ function joinRegularDelta(
 	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) {
 		return { reason: `delta_after_mode:${relativePath}` };
 	}
-	const afterEntry = hydrateWorkspaceFileEntry(current, delta.after, true);
-	if (!afterEntry) return { reason: `delta_after_size:${relativePath}` };
+	if (delta.after.byteLength !== current.size) return { reason: `delta_after_size:${relativePath}` };
 	return {
 		effect: {
 			kind: "write",
 			logicalPath,
 			relativePath,
 			...(beforeEntry ? { before: beforeEntry } : {}),
-			after: afterEntry,
 		},
 	};
 }

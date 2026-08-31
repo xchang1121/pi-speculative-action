@@ -85,7 +85,8 @@ describe("process observation", () => {
 			expect(diff.complete).toBe(true);
 			expect(diff.effects).toHaveLength(1);
 			expect(diff.effects[0]).toMatchObject({ kind: "write", relativePath: "value.bin" });
-			expect(diff.effects[0]?.after?.content).toBe(afterBytes);
+			expect(diff.effects[0]).not.toHaveProperty("after");
+			expect(diff.effects[0]?.before).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
