@@ -14,6 +14,11 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
+import {
+	RESOURCE_OBSERVATION_EFFECTS,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "../src/effect-model.ts";
 
 describe("ActionSemanticsRegistry", () => {
 	it("defines K(a), resource evidence, and effects without choosing an execution backend", () => {
@@ -33,9 +38,11 @@ describe("ActionSemanticsRegistry", () => {
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
 			effect: "unbounded",
+			requirements: UNRESTRICTED_PROCESS_EFFECTS,
 		});
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
 			effect: "workspace_mutation",
+			requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		});
 		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
 	});
@@ -248,6 +255,7 @@ describe("ActionSemanticsRegistry", () => {
 						...definition,
 						tool: "bad_observer",
 						effect: "unbounded",
+						requirements: UNRESTRICTED_PROCESS_EFFECTS,
 						resourceScope: undefined,
 					},
 				]),
@@ -308,6 +316,7 @@ function resourceDefinition(
 		tool,
 		epoch,
 		effect: "observation",
+		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "content",
 		canonicalize,
 	};

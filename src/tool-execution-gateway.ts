@@ -1,4 +1,5 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
+import type { EffectRequirements } from "./effect-model.ts";
 import {
 	type CapturedExecutionWorldResult,
 	ExecutionWorldRouter,
@@ -29,6 +30,7 @@ export interface ToolOperation {
 export interface ToolExecutionRequirement {
 	readonly operation: ToolOperation;
 	readonly effect: ActionEffect;
+	readonly requirements: EffectRequirements;
 }
 
 export type AuthoritativeToolExecutor<Output> = (operation: ToolOperation) => Promise<Output>;
@@ -52,11 +54,11 @@ export class ToolExecutionGateway<Context, Output> {
 		requirement: ToolExecutionRequirement,
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		const { operation, effect } = requirement;
+		const { operation, effect, requirements } = requirement;
 		return this.router.resolve(
 			{
-				tool: operation.tool,
 				effect,
+				requirements,
 				...(operation.action ? { action: operation.action } : {}),
 			},
 			preparation,
@@ -68,11 +70,11 @@ export class ToolExecutionGateway<Context, Output> {
 		preparation: ExecutionWorldPreparation,
 		context: ToolExecutionContextFactory<Context>,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
-		const { operation, effect } = requirement;
+		const { operation, effect, requirements } = requirement;
 		return this.router.captureAuthoritativeResult(
 			{
-				tool: operation.tool,
 				effect,
+				requirements,
 				...(operation.action ? { action: operation.action } : {}),
 			},
 			preparation,

@@ -9,6 +9,7 @@ import type {
 	WorldCompatibilityEvidence,
 	WorldResultCapture,
 } from "./execution-world.ts";
+import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureResourceVersion,
 	type ResourceVersionToken,
@@ -52,7 +53,7 @@ export function createResourceSnapshotExecutionWorld(
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		supports: ({ tool, effect }) => effect === "observation" && actionSemantics.resourceScope(tool) !== undefined,
+		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version:v1",
 		captureAuthoritativeResult: capture,
 		fork: async (context) => {

@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ExecutionWorld, ExecutionWorldRequest, SpeculativeExecution } from "../src/execution-world.ts";
+import {
+	type EffectCapabilities,
+	RESOURCE_OBSERVATION_EFFECTS,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "../src/effect-model.ts";
+import type { ExecutionWorld, SpeculativeExecution } from "../src/execution-world.ts";
 import { ExecutionWorldRouter, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
 
 type TestWorld = ExecutionWorld<{ readonly value: string }, string>;
@@ -7,13 +13,13 @@ const preparation = { cwd: "/workspace" };
 
 describe("ExecutionWorldRouter", () => {
 	it("uses one runtime sandbox for every effect, then exact local fallbacks, then blocks", async () => {
-		const resource = fallback("resource", "resource_snapshot", ({ effect }) => effect === "observation");
-		const workspace = fallback("workspace", "workspace_branch", ({ effect }) => effect === "workspace_mutation");
+		const resource = fallback("resource", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
+		const workspace = fallback("workspace", "workspace_branch", WORKSPACE_PATH_MUTATION_EFFECTS.capabilities);
 		const runtimeRouter = new ExecutionWorldRouter([resource, workspace, runtime("runtime")]);
 		const requests = [
-			{ tool: "read", effect: "observation" },
-			{ tool: "write", effect: "workspace_mutation" },
-			{ tool: "bash", effect: "unbounded" },
+			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
+			{ effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
+			{ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
 		] as const;
 
 		for (const request of requests) {
@@ -37,9 +43,12 @@ describe("ExecutionWorldRouter", () => {
 				throw new Error("unavailable");
 			}),
 		};
-		const resource = fallback("resource", "resource_snapshot", () => true);
+		const resource = fallback("resource", "resource_snapshot", "all");
 		const router = new ExecutionWorldRouter([unavailable, resource, resource]);
-		const route = await router.resolve({ tool: "read", effect: "observation" }, preparation);
+		const route = await router.resolve(
+			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
+			preparation,
+		);
 
 		expect(route).toMatchObject({ backend: "resource", scope: "fallback" });
 		expect(unavailable.prepare).toHaveBeenCalledOnce();
@@ -51,13 +60,13 @@ describe("ExecutionWorldRouter", () => {
 		expect(resource.dispose).toHaveBeenCalledOnce();
 
 		expect(
-			() => new ExecutionWorldRouter([runtime("same"), fallback("same", "resource_snapshot", () => true)]),
+			() => new ExecutionWorldRouter([runtime("same"), fallback("same", "resource_snapshot", "all")]),
 		).toThrow("duplicate execution world same");
 	});
 
 	it("captures an authoritative result with the first explicitly capable world", async () => {
 		const disposeCapture = vi.fn();
-		const resourceBase = fallback("resource", "resource_snapshot", ({ effect }) => effect === "observation");
+		const resourceBase = fallback("resource", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
 		const resource: TestWorld = {
 			...resourceBase,
 			captureAuthoritativeResult: vi.fn(async () => ({
@@ -69,7 +78,7 @@ describe("ExecutionWorldRouter", () => {
 		const router = new ExecutionWorldRouter([runtimeWithoutCapture, resource]);
 
 		const captured = await router.captureAuthoritativeResult(
-			{ tool: "read", effect: "observation" },
+			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
 			preparation,
 			{ value: "unused" },
 		);
@@ -84,15 +93,15 @@ describe("ExecutionWorldRouter", () => {
 });
 
 function runtime(id: string): TestWorld {
-	return { ...lifecycle(id), scope: "runtime", isolation: "runtime_sandbox" };
+	return { ...lifecycle(id), scope: "runtime", isolation: "runtime_sandbox", capabilities: "all" };
 }
 
 function fallback(
 	id: string,
 	isolation: Exclude<SpeculativeExecution, "runtime_sandbox">,
-	supports: (request: ExecutionWorldRequest) => boolean,
+	capabilities: EffectCapabilities,
 ): TestWorld {
-	return { ...lifecycle(id), scope: "fallback", isolation, supports };
+	return { ...lifecycle(id), scope: "fallback", isolation, capabilities };
 }
 
 function lifecycle(id: string) {

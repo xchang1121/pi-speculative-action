@@ -93,6 +93,17 @@ export type {
 	SpeculativeCacheSnapshot,
 } from "./events.ts";
 export {
+	effectCapabilitiesCover,
+	effectRequirements,
+	type EffectCapabilities,
+	type EffectCapability,
+	type EffectRequirements,
+	normalizeEffectRequirements,
+	RESOURCE_OBSERVATION_EFFECTS,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "./effect-model.ts";
+export {
 	type CapturedExecutionWorldResult,
 	type ActionReuseKind,
 	type ExecutionWorld,

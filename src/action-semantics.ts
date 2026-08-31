@@ -1,4 +1,11 @@
 import path from "node:path";
+import {
+	type EffectRequirements,
+	normalizeEffectRequirements,
+	RESOURCE_OBSERVATION_EFFECTS,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "./effect-model.ts";
 import { stableStringify } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
@@ -82,6 +89,8 @@ export interface ActionSemanticsDefinition {
 	readonly epoch: string;
 	/** Effects an isolation backend must contain or validate. */
 	readonly effect: ActionEffect;
+	/** Atomic execution guarantees required independently of any concrete backend. */
+	readonly requirements: EffectRequirements;
 	/** Filesystem evidence required to prove that a completed action is still current. */
 	readonly resourceScope?: ResourceDependencyScope;
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
@@ -100,13 +109,14 @@ export class ActionSemanticsRegistry {
 			if (!tool) throw new Error("action semantics tool must not be empty");
 			if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
 			if (this.definitionsByTool.has(tool)) throw new Error(`duplicate action semantics for ${tool}`);
-			assertDefinitionCoherence({ ...source, tool, epoch });
 			const definition: ActionSemanticsDefinition = Object.freeze({
 				...source,
 				tool,
 				epoch,
+				requirements: normalizeEffectRequirements(source.requirements),
 				projectors: Object.freeze([...(source.projectors ?? [])]),
 			});
+			assertDefinitionCoherence(definition);
 			this.definitionsByTool.set(tool, definition);
 			for (const projector of definition.projectors ?? []) {
 				const existing = this.projectorsByID.get(projector.id);
@@ -130,6 +140,10 @@ export class ActionSemanticsRegistry {
 
 	effect(tool: string): ActionEffect | undefined {
 		return this.definition(tool)?.effect;
+	}
+
+	requirements(tool: string): EffectRequirements | undefined {
+		return this.definition(tool)?.requirements;
 	}
 
 	resourceScope(tool: string): ResourceDependencyScope | undefined {
@@ -223,6 +237,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "read",
 		epoch: "pi.read.v2",
 		effect: "observation",
+		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "content",
 		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
@@ -231,6 +246,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "grep",
 		epoch: "pi.grep.v2",
 		effect: "observation",
+		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_content",
 		canonicalize: canonicalGrep,
 	},
@@ -238,6 +254,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "find",
 		epoch: "pi.find.v2",
 		effect: "observation",
+		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_query",
 		canonicalize: canonicalFind,
 	},
@@ -245,6 +262,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "ls",
 		epoch: "pi.ls.v1",
 		effect: "observation",
+		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_entries",
 		canonicalize: canonicalLs,
 	},
@@ -252,6 +270,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "bash",
 		epoch: "pi.bash.v3",
 		effect: "unbounded",
+		requirements: UNRESTRICTED_PROCESS_EFFECTS,
 		canonicalize: canonicalBash,
 		projectors: [BASH_TAIL_LINES_ACTION_KEY_PROJECTOR],
 	},
@@ -259,12 +278,14 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		tool: "write",
 		epoch: "pi.write.v1",
 		effect: "workspace_mutation",
+		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
 		epoch: "pi.edit.v1",
 		effect: "workspace_mutation",
+		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalEdit,
 	},
 ]);
@@ -721,10 +742,27 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 		if (definition.resourceScope === undefined) {
 			throw new Error(`observation action ${definition.tool} requires resource evidence`);
 		}
+		if (!definition.requirements.capabilities.includes("validation.resource_snapshot")) {
+			throw new Error(`observation action ${definition.tool} requires snapshot-validation capability`);
+		}
 		return;
 	}
 	if (definition.resourceScope !== undefined) {
 		throw new Error(`non-observation action ${definition.tool} cannot declare resource evidence`);
+	}
+	if (
+		definition.effect === "workspace_mutation" &&
+		(!definition.requirements.capabilities.includes("filesystem.write") ||
+			!definition.requirements.capabilities.includes("invocation.workspace_path"))
+	) {
+		throw new Error(`workspace mutation ${definition.tool} requires path-mutation capabilities`);
+	}
+	if (
+		definition.effect === "unbounded" &&
+		(!definition.requirements.capabilities.includes("invocation.process") ||
+			!definition.requirements.capabilities.includes("output.gate"))
+	) {
+		throw new Error(`unbounded action ${definition.tool} requires process and external-output capabilities`);
 	}
 }
 

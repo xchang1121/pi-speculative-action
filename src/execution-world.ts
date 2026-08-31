@@ -1,4 +1,9 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
+import {
+	effectCapabilitiesCover,
+	type EffectCapabilities,
+	type EffectRequirements,
+} from "./effect-model.ts";
 import type { ResourceValidation } from "./settlement.ts";
 
 /** Concrete isolation used for one speculative execution. */
@@ -10,8 +15,8 @@ export type ExecutionWorldScope = "runtime" | "fallback";
 
 /** Tool effects are resolved independently from K(a) and prediction source. */
 export interface ExecutionWorldRequest {
-	readonly tool: string;
 	readonly effect: ActionEffect;
+	readonly requirements: EffectRequirements;
 	/** Present for concrete candidates; omitted for best-effort turn warm-up. */
 	readonly action?: ActionKey;
 }
@@ -124,6 +129,8 @@ export interface ExecutionWorldPreparation {
 
 interface ExecutionWorldLifecycle<Context, Output> {
 	readonly id: string;
+	/** Atomic effects this backend can safely contain, virtualize, or validate. */
+	readonly capabilities: EffectCapabilities;
 	/** Stable identity of the concrete isolation backend used for route-local reuse. */
 	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
 	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
@@ -139,15 +146,14 @@ interface ExecutionWorldLifecycle<Context, Output> {
 export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, Output> &
 	(
 		| {
-				/** A runtime world contains every tool and therefore has no tool-specific capability filter. */
+				/** A runtime world is preferred when its advertised guarantees cover the operation. */
 				readonly scope: "runtime";
 				readonly isolation: "runtime_sandbox";
 		  }
 		| {
-				/** A host-local fallback must prove exactly which action effects it can isolate. */
+				/** A host-local fallback advertises the same source-neutral effect guarantees. */
 				readonly scope: "fallback";
 				readonly isolation: Exclude<SpeculativeExecution, "runtime_sandbox">;
-				readonly supports: (request: ExecutionWorldRequest) => boolean;
 		  }
 	);
 
@@ -221,7 +227,7 @@ export class ExecutionWorldRouter<Context, Output> {
 			for (const world of this.worlds) {
 				if (world.scope !== scope || !eligible(world)) continue;
 				try {
-					if (world.scope === "fallback" && !world.supports(request)) continue;
+					if (!effectCapabilitiesCover(world.capabilities, request.requirements)) continue;
 					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await world.prepare?.(preparation);
 					const route = Object.freeze({

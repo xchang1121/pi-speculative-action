@@ -6,6 +6,11 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/action-semantics.ts";
+import {
+	effectCapabilitiesCover,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "../src/effect-model.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	closeWorkspaceSandboxPools,
@@ -61,10 +66,14 @@ describe("workspace-branch ExecutionWorld", () => {
 			const world = createWorkspaceSandbox();
 			expect(world.scope).toBe("fallback");
 			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
-			expect(world.supports({ tool: "write", effect: "workspace_mutation" })).toBe(true);
-			expect(world.supports({ tool: "custom", effect: "workspace_mutation" })).toBe(false);
-			expect(world.supports({ tool: "bash", effect: "unbounded" })).toBe(false);
-			expect(await world.fingerprint?.({ tool: "write", effect: "workspace_mutation" })).toBe("git-worktree:v1");
+			expect(effectCapabilitiesCover(world.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
+			expect(effectCapabilitiesCover(world.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
+			expect(
+				await world.fingerprint?.({
+					effect: "workspace_mutation",
+					requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
+				}),
+			).toBe("git-worktree:v1");
 			const branch = await world.fork(context(root, "write", writeTool, args));
 
 			expect(branch.state).toBe("sealed");

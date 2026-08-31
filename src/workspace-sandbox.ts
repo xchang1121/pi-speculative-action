@@ -14,6 +14,7 @@ import type {
 	WorldCompatibilityEvidence,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
+import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
@@ -135,7 +136,7 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 		id: "git_worktree",
 		scope: "fallback",
 		isolation: "workspace_branch",
-		supports: ({ tool, effect }) => effect === "workspace_mutation" && (tool === "write" || tool === "edit"),
+		capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
 		fingerprint: () => "git-worktree:v1",
 		prepare: async ({ cwd, signal }) => {
 			roots.add(path.resolve(cwd));

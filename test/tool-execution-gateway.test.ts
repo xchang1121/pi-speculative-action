@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import {
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "../src/effect-model.ts";
 import type { ExecutionWorld } from "../src/execution-world.ts";
 import { ToolExecutionGateway, type ToolOperation } from "../src/tool-execution-gateway.ts";
 
@@ -12,7 +16,7 @@ describe("ToolExecutionGateway", () => {
 			id: "workspace",
 			scope: "fallback",
 			isolation: "workspace_branch",
-			supports: ({ effect }) => effect === "workspace_mutation",
+			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
 			fork: async ({ value }) => branch("workspace", value),
 			captureAuthoritativeResult: async ({ value }) => ({
 				seal: async (output) => branch("workspace", `${value}:${output}`),
@@ -22,7 +26,11 @@ describe("ToolExecutionGateway", () => {
 		};
 		const gateway = new ToolExecutionGateway([world]);
 		const operation = { tool: "custom_process", callID: "spec-1", input: { any: "shape" } };
-		const requirement = { operation, effect: "workspace_mutation" as const };
+		const requirement = {
+			operation,
+			effect: "workspace_mutation" as const,
+			requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
+		};
 		const route = await gateway.resolve(requirement, { cwd: "/workspace" });
 
 		expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });
@@ -36,7 +44,10 @@ describe("ToolExecutionGateway", () => {
 		);
 		expect((await capture?.capture.seal("actor"))?.output).toBe("baseline:actor");
 		expect(
-			await gateway.resolve({ operation, effect: "unbounded" }, { cwd: "/workspace" }),
+			await gateway.resolve(
+				{ operation, effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
+				{ cwd: "/workspace" },
+			),
 		).toBeUndefined();
 		await gateway.dispose();
 		expect(dispose).toHaveBeenCalledOnce();

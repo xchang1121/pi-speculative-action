@@ -242,8 +242,8 @@ export function createSpeculativeActionHost(
 	}
 	const executionGateway = new ToolExecutionGateway(executionWorlds);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
-		const effect = actionSemantics.effect(tool);
-		return effect
+		const definition = actionSemantics.definition(tool);
+		return definition
 			? executionGateway.resolve(
 					{
 						operation: {
@@ -252,7 +252,8 @@ export function createSpeculativeActionHost(
 							...(signal ? { signal } : {}),
 							...(action ? { action } : {}),
 						},
-						effect,
+						effect: definition.effect,
+						requirements: definition.requirements,
 					},
 					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
 				)
@@ -843,13 +844,13 @@ export function createSpeculativeActionHost(
 		captureAuthoritativeResult: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return undefined;
-			const effect = actionSemantics.effect(toolName);
-			if (!effect) return undefined;
+			const definition = actionSemantics.definition(toolName);
+			if (!definition) return undefined;
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return undefined;
 			const operation: ToolOperation = { tool: toolName, callID, input: args, signal, action };
 			const captured = await executionGateway.captureAuthoritativeResult(
-				{ operation, effect },
+				{ operation, effect: definition.effect, requirements: definition.requirements },
 				{ cwd: options.cwd, signal },
 				(operation) => ({
 					cwd: options.cwd,

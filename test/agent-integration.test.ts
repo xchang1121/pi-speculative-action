@@ -330,6 +330,7 @@ describe("speculative action host", () => {
 			id: "runtime",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
+			capabilities: "all",
 			fingerprint: () => "runtime:v1",
 			fork: async (context) => {
 				sandboxExecutions++;
@@ -443,6 +444,7 @@ describe("speculative action host", () => {
 			id: "runtime",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
+			capabilities: "all",
 			fork,
 		};
 		const tool: AgentTool<typeof readSchema> = {
@@ -495,6 +497,7 @@ describe("speculative action host", () => {
 			id: "broken",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
+			capabilities: "all",
 			fingerprint: () => {
 				throw new Error("backend unavailable");
 			},
@@ -507,6 +510,7 @@ describe("speculative action host", () => {
 			id: "unavailable",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
+			capabilities: "all",
 			prepare: unavailablePrepare,
 			fork: async () => {
 				throw new Error("must not execute");
@@ -577,6 +581,7 @@ describe("speculative action host", () => {
 			id: "unavailable",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
+			capabilities: "all",
 			fingerprint: () => {
 				throw new Error("unavailable");
 			},
