@@ -32,7 +32,11 @@ import type {
 	SpeculativePlanSource,
 	SpeculativeRuntimeInspection,
 } from "./runtime.ts";
-import { type PredictionForecast, SpeculationScheduler } from "./scheduler.ts";
+import {
+	type PredictionForecast,
+	type ServiceTimingIdentity,
+	SpeculationScheduler,
+} from "./scheduler.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,
@@ -143,6 +147,9 @@ function forecastFor(
 	return {
 		tool: node.action.tool,
 		execution: route.isolation,
+		...(node.actionKey
+			? { executionFingerprint: node.actionKey.executionFingerprint, actionKeyHash: node.actionKey.hash }
+			: {}),
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
 		decisionBatchesUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
@@ -288,16 +295,33 @@ async function projectOutput<Output, StartInput, StateData>(
 	}
 }
 
-async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
-	if (!signal) return promise;
-	if (signal.aborted) return undefined;
+type CandidateWaitResult<T> =
+	| { readonly status: "completed"; readonly value: T }
+	| { readonly status: "aborted" }
+	| { readonly status: "deadline" };
+
+async function waitForCandidate<T>(
+	promise: Promise<T>,
+	signal?: AbortSignal,
+	waitBudgetMs?: number,
+): Promise<CandidateWaitResult<T>> {
+	if (signal?.aborted) return { status: "aborted" };
+	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
+	if (!signal && !bounded) return { status: "completed", value: await promise };
 	return new Promise((resolve) => {
-		const aborted = () => resolve(undefined);
-		signal.addEventListener("abort", aborted, { once: true });
-		void promise.then((value) => {
-			signal.removeEventListener("abort", aborted);
-			resolve(value);
-		});
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (result: CandidateWaitResult<T>) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", aborted);
+			resolve(result);
+		};
+		const aborted = () => finish({ status: "aborted" });
+		signal?.addEventListener("abort", aborted, { once: true });
+		if (bounded) timer = setTimeout(() => finish({ status: "deadline" }), Math.max(0, waitBudgetMs!));
+		void promise.then((value) => finish({ status: "completed", value }));
 	});
 }
 
@@ -534,6 +558,14 @@ function maybe<T>(value: T | undefined): T[] {
 
 function finiteMetric(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function actionTimingIdentity(action: ActionKey): ServiceTimingIdentity {
+	return {
+		tool: action.tool,
+		executionFingerprint: action.executionFingerprint,
+		actionKeyHash: action.hash,
+	};
 }
 
 function errorDetail(error: unknown): string {
@@ -1574,7 +1606,10 @@ export function makeStructuralSpeculativeActionRuntime<
 				disposeBranch(branch);
 				return;
 			}
-			session.scheduler.observeService(candidate.key.tool, completedAt - startedAt);
+			session.scheduler.observeSpeculativeService(
+				actionTimingIdentity(candidate.key),
+				completedAt - startedAt,
+			);
 			session.scheduler.complete(candidate);
 			jobs.delete(session.id, candidate);
 			if (candidate.work.reservation.kind === "shared") results.insert(session.id, candidate);
@@ -1724,6 +1759,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		const forecast: PredictionForecast = {
 			tool: actualCall.tool,
 			execution: route.isolation,
+			executionFingerprint: action.executionFingerprint,
+			actionKeyHash: action.hash,
 			decisionBatchesUntilCall: 0,
 			actorPhase: actorPhaseFor(state.session),
 		};
@@ -1946,6 +1983,37 @@ export function makeStructuralSpeculativeActionRuntime<
 
 			for (const choice of ranked) {
 				const candidate = choice.candidate;
+				const executionAtDecision = candidate.work.execution;
+				const join = state.session.scheduler.assessCandidateJoin({
+					identity: actionTimingIdentity(candidate.key),
+					state:
+						executionAtDecision.status === "succeeded"
+							? "succeeded"
+							: executionAtDecision.status === "running"
+								? "running"
+								: "queued",
+					expectedSpeculativeDurationMs: candidate.expectedDurationMs,
+					actorElapsedMs: Math.max(0, performance.now() - actorArrivedAt),
+					...(executionAtDecision.status === "running"
+						? { elapsedMs: Math.max(0, actorArrivedAt - executionAtDecision.startedAt) }
+						: {}),
+				});
+				if (!join.allowed) {
+					const failure = cause(
+						"matching",
+						"candidate_join_not_profitable",
+						JSON.stringify({
+							expectedRemainingMs: join.expectedRemainingMs,
+							expectedAdoptionMs: join.expectedAdoptionMs,
+							expectedActorMs: join.expectedActorMs,
+							expectedNetBenefitMs: join.expectedNetBenefitMs,
+						}),
+					);
+					actorAction.reject(candidate.id, choice.match, failure);
+					rejection = failure;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
 				const reservationOwner = identity.id;
 				if (!candidate.work.reserve(reservationOwner)) {
 					const failure = cause("matching", "candidate_reserved");
@@ -1987,13 +2055,30 @@ export function makeStructuralSpeculativeActionRuntime<
 						continue;
 					}
 				}
-				const execution = await waitForCandidate(candidate.work.completion, signal);
+				const waiting = await waitForCandidate(
+					candidate.work.completion,
+					signal,
+					join.reason === "ready" ? undefined : join.waitBudgetMs,
+				);
 				if (stopCandidate(candidate, reservationOwner)) break;
-				if (!execution) {
+				if (waiting.status === "aborted") {
 					candidate.work.release(reservationOwner);
 					rejection = cause("control", "actor_aborted");
 					break;
 				}
+				if (waiting.status === "deadline") {
+					const failure = cause(
+						"matching",
+						"candidate_join_deadline",
+						JSON.stringify({ waitBudgetMs: join.waitBudgetMs, reason: join.reason }),
+					);
+					candidate.work.release(reservationOwner);
+					actorAction.reject(candidate.id, choice.match, failure);
+					rejection = failure;
+					rejectedCandidateID = candidate.id;
+					continue;
+				}
+				const execution = waiting.value;
 				if (execution.status !== "succeeded") {
 					candidate.work.release(reservationOwner);
 					actorAction.reject(candidate.id, choice.match, execution.cause);
@@ -2053,11 +2138,16 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 
+				const adoptedAt = performance.now();
+				state.session.scheduler.observeAdoption(
+					actionTimingIdentity(candidate.key),
+					Math.max(0, adoptedAt - Math.max(actorArrivedAt, execution.completedAt)),
+				);
 				const executionAheadMs = Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.startedAt));
 				const timing = {
 					executionAheadMs,
 					attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
-					hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
+					hitLatencyMs: Math.max(0, adoptedAt - actorArrivedAt),
 				};
 				if (candidate.work.reservation.kind === "exclusive") {
 					candidate.work.consume(reservationOwner);
@@ -2249,8 +2339,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (capture) disposeAuthoritativeResultCapture(capture);
 			return;
 		}
-		state.session.scheduler.observeService(actorAction.tool, durationMs);
 		const key = actorAction.actionKey;
+		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key), durationMs);
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, input.output);
@@ -2651,6 +2741,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			{
 				tool: candidate.key.tool,
 				execution: candidate.route.isolation,
+				executionFingerprint: candidate.key.executionFingerprint,
+				actionKeyHash: candidate.key.hash,
 				expectedDurationMs: candidate.expectedDurationMs,
 				decisionBatchesUntilCall: Math.max(0, candidate.expectedDecisionSeq - session.decisionSequence),
 				...(actorPhase ? { actorPhase } : {}),

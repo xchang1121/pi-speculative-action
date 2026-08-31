@@ -1,4 +1,5 @@
 import type { SpeculativeExecution, WorldCompatibilityEvidence } from "./execution-world.ts";
+import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
 import type {
 	SpeculativeResourceBudget,
 	SpeculativeResourceClass,
@@ -9,6 +10,10 @@ import { resourceProfile, speculativeResourceBudget } from "./resource-budget.ts
 export interface PredictionForecast {
 	readonly tool: string;
 	readonly execution: SpeculativeExecution;
+	/** Stable execution environment shared by comparable Actor and speculative samples. */
+	readonly executionFingerprint?: string;
+	/** Exact K(a), used before falling back to the wider tool/environment timing class. */
+	readonly actionKeyHash?: string;
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
@@ -30,6 +35,52 @@ export interface ScheduledWork {
 	readonly criticalPathMs: number;
 	readonly priorityMs: number;
 	readonly background: boolean;
+}
+
+export interface ServiceTimingIdentity {
+	readonly tool: string;
+	readonly executionFingerprint?: string;
+	readonly actionKeyHash?: string;
+}
+
+export interface CandidateJoinPolicy {
+	/** Required estimated Actor critical-path saving before waiting for unfinished work. */
+	readonly minNetBenefitMs: number;
+	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
+	readonly warmupWaitMs: number;
+	/** Slack applied to a high-quantile remaining-time estimate. */
+	readonly durationSlack: number;
+}
+
+export const DEFAULT_CANDIDATE_JOIN_POLICY: CandidateJoinPolicy = Object.freeze({
+	minNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
+	warmupWaitMs: 25,
+	durationSlack: 1.25,
+});
+
+export interface CandidateJoinRequest {
+	readonly identity: ServiceTimingIdentity;
+	readonly state: "queued" | "running" | "succeeded";
+	readonly expectedSpeculativeDurationMs: number;
+	readonly elapsedMs?: number;
+	/** Actor-side time already spent trying earlier candidates for this action. */
+	readonly actorElapsedMs?: number;
+}
+
+export type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
+
+export interface CandidateJoinDecision {
+	readonly allowed: boolean;
+	readonly reason: CandidateJoinReason;
+	/** Zero for a completed candidate. A finite positive value is an Actor-side deadline. */
+	readonly waitBudgetMs: number;
+	readonly speculativeSamples: number;
+	readonly actorSamples: number;
+	readonly adoptionSamples: number;
+	readonly expectedRemainingMs: number;
+	readonly expectedAdoptionMs: number;
+	readonly expectedActorMs?: number;
+	readonly expectedNetBenefitMs?: number;
 }
 
 export type SchedulerAdmission =
@@ -57,10 +108,17 @@ interface SchedulerEntry<Job> {
 /** Owns forecast aggregation, timing observations, capacity, and preemption. */
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
-	private readonly serviceTimes = new Map<string, SampleWindow>();
+	private readonly speculativeServiceTimes = new Map<string, SampleWindow>();
+	private readonly actorServiceTimes = new Map<string, SampleWindow>();
+	private readonly adoptionTimes = new Map<string, SampleWindow>();
 	private readonly actorDecisionDurations = new SampleWindow();
 	private readonly actorCycles = new SampleWindow();
+	private readonly candidateJoinPolicy: CandidateJoinPolicy;
 	private sequence = 0;
+
+	constructor(options: { readonly candidateJoinPolicy?: Partial<CandidateJoinPolicy> } = {}) {
+		this.candidateJoinPolicy = normalizeCandidateJoinPolicy(options.candidateJoinPolicy);
+	}
 
 	admit(
 		job: Job,
@@ -163,10 +221,96 @@ export class SpeculationScheduler<Job extends object> {
 		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
 	}
 
+	/** Backward-compatible alias for speculative service observations. */
 	observeService(tool: string, durationMs: number): void {
-		const samples = this.serviceTimes.get(tool) ?? new SampleWindow();
-		samples.observe(durationMs);
-		this.serviceTimes.set(tool, samples);
+		this.observeSpeculativeService({ tool }, durationMs);
+	}
+
+	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number): void {
+		this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
+	}
+
+	observeActorService(identity: ServiceTimingIdentity, durationMs: number): void {
+		this.observeTiming(this.actorServiceTimes, identity, durationMs);
+	}
+
+	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void {
+		this.observeTiming(this.adoptionTimes, identity, durationMs);
+	}
+
+	/**
+	 * Decide whether the Actor should adopt speculative work. A rejected candidate keeps
+	 * running until ordinary invalidation, so both sides of the comparison can continue learning.
+	 */
+	assessCandidateJoin(request: CandidateJoinRequest): CandidateJoinDecision {
+		const policy = this.candidateJoinPolicy;
+		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
+		const actorExact = this.exactTimingEstimate(this.actorServiceTimes, request.identity, 0.25);
+		const actorClass = this.classTimingEstimate(this.actorServiceTimes, request.identity, 0.25);
+		const adoption = this.timingEstimate(this.adoptionTimes, request.identity, 0.75, "upper");
+		const actor = actorExact ?? actorClass;
+		const expectedActorMs = actor?.value;
+		const expectedSpeculativeMs =
+			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, 1);
+		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0;
+		const actorElapsedMs = finite(request.actorElapsedMs);
+		const expectedRemainingMs =
+			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs);
+		const expectedAdoptionMs = adoption?.value ?? 0;
+		const expectedNetBenefitMs =
+			expectedActorMs === undefined
+				? undefined
+				: expectedActorMs - actorElapsedMs - expectedRemainingMs - expectedAdoptionMs;
+		const base = {
+			speculativeSamples: speculative?.samples ?? 0,
+			actorSamples: actor?.samples ?? 0,
+			adoptionSamples: adoption?.samples ?? 0,
+			expectedRemainingMs,
+			expectedAdoptionMs,
+			...(expectedActorMs === undefined ? {} : { expectedActorMs }),
+			...(expectedNetBenefitMs === undefined ? {} : { expectedNetBenefitMs }),
+		};
+
+		if (request.state === "succeeded") {
+			// No execution wait remains, but measured validation/projection/commit can still exceed fallback.
+			if (
+				expectedActorMs !== undefined &&
+				adoption !== undefined &&
+				expectedNetBenefitMs !== undefined &&
+				expectedNetBenefitMs < 0
+			) {
+				return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
+			}
+			return { allowed: true, reason: "ready", waitBudgetMs: 0, ...base };
+		}
+
+		if (expectedActorMs === undefined) {
+			return {
+				allowed: true,
+				reason: "warmup_probe",
+				// No counterfactual evidence exists yet, so preserve the established join behavior.
+				waitBudgetMs: Number.POSITIVE_INFINITY,
+				...base,
+			};
+		}
+		if (expectedNetBenefitMs === undefined || expectedNetBenefitMs < policy.minNetBenefitMs) {
+			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
+		}
+		const actorDeadlineMs = Math.max(
+			0,
+			expectedActorMs - actorElapsedMs - expectedAdoptionMs - policy.minNetBenefitMs,
+		);
+		const estimatedDeadlineMs = expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
+		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
+		if (waitBudgetMs <= 0) {
+			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
+		}
+		return {
+			allowed: true,
+			reason: speculative ? "profitable" : "warmup_probe",
+			waitBudgetMs,
+			...base,
+		};
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
@@ -226,12 +370,71 @@ export class SpeculationScheduler<Job extends object> {
 
 	private duration(forecast: PredictionForecast, quantile = 0.5): number {
 		const actionDuration = positive(forecast.expectedDurationMs, 1);
-		return Math.max(actionDuration, this.serviceTimes.get(forecast.tool)?.quantile(quantile, actionDuration) ?? 0);
+		const observed = this.timingEstimate(
+			this.speculativeServiceTimes,
+			timingIdentity(forecast),
+			quantile,
+		)?.value;
+		// A source's action-specific estimate remains a lower bound. Wider timing classes can
+		// conservatively raise scheduling cost, but must not make an explicitly long action look short.
+		return Math.max(actionDuration, observed ?? 0);
 	}
+
+	private observeTiming(
+		windows: Map<string, SampleWindow>,
+		identity: ServiceTimingIdentity,
+		durationMs: number,
+	): void {
+		for (const key of timingKeys(identity)) {
+			const samples = windows.get(key) ?? new SampleWindow();
+			samples.observe(durationMs);
+			windows.set(key, samples);
+		}
+	}
+
+	private timingEstimate(
+		windows: ReadonlyMap<string, SampleWindow>,
+		identity: ServiceTimingIdentity,
+		quantile: number,
+		selection: QuantileSelection = "lower",
+	): TimingEstimate | undefined {
+		return (
+			this.exactTimingEstimate(windows, identity, quantile, selection) ??
+			this.classTimingEstimate(windows, identity, quantile, selection)
+		);
+	}
+
+	private exactTimingEstimate(
+		windows: ReadonlyMap<string, SampleWindow>,
+		identity: ServiceTimingIdentity,
+		quantile: number,
+		selection: QuantileSelection = "lower",
+	): TimingEstimate | undefined {
+		const key = exactTimingKey(identity);
+		return key ? windowEstimate(windows.get(key), quantile, selection) : undefined;
+	}
+
+	private classTimingEstimate(
+		windows: ReadonlyMap<string, SampleWindow>,
+		identity: ServiceTimingIdentity,
+		quantile: number,
+		selection: QuantileSelection = "lower",
+	): TimingEstimate | undefined {
+		return windowEstimate(windows.get(classTimingKey(identity)), quantile, selection);
+	}
+}
+
+interface TimingEstimate {
+	readonly value: number;
+	readonly samples: number;
 }
 
 class SampleWindow {
 	private readonly values: number[] = [];
+
+	get count(): number {
+		return this.values.length;
+	}
 
 	observe(value: number): void {
 		const normalized = finite(value);
@@ -249,6 +452,55 @@ class SampleWindow {
 		const sorted = [...this.values].sort((left, right) => left - right);
 		return sorted[Math.floor((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
 	}
+
+	estimateUpper(value: number): number | undefined {
+		if (!this.values.length) return undefined;
+		const sorted = [...this.values].sort((left, right) => left - right);
+		return sorted[Math.ceil((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
+	}
+}
+
+type QuantileSelection = "lower" | "upper";
+
+function timingIdentity(forecast: PredictionForecast): ServiceTimingIdentity {
+	return {
+		tool: forecast.tool,
+		...(forecast.executionFingerprint ? { executionFingerprint: forecast.executionFingerprint } : {}),
+		...(forecast.actionKeyHash ? { actionKeyHash: forecast.actionKeyHash } : {}),
+	};
+}
+
+function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
+	const exact = exactTimingKey(identity);
+	const wider = classTimingKey(identity);
+	return exact && exact !== wider ? [exact, wider] : [wider];
+}
+
+function exactTimingKey(identity: ServiceTimingIdentity): string | undefined {
+	return identity.actionKeyHash
+		? JSON.stringify(["action", identity.tool, identity.executionFingerprint ?? "", identity.actionKeyHash])
+		: undefined;
+}
+
+function classTimingKey(identity: ServiceTimingIdentity): string {
+	return JSON.stringify(["class", identity.tool, identity.executionFingerprint ?? ""]);
+}
+
+function windowEstimate(
+	window: SampleWindow | undefined,
+	quantile: number,
+	selection: QuantileSelection = "lower",
+): TimingEstimate | undefined {
+	const value = selection === "upper" ? window?.estimateUpper(quantile) : window?.estimate(quantile);
+	return value === undefined || !window ? undefined : { value, samples: window.count };
+}
+
+function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | undefined): CandidateJoinPolicy {
+	return Object.freeze({
+		minNetBenefitMs: finite(policy?.minNetBenefitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.minNetBenefitMs),
+		warmupWaitMs: finite(policy?.warmupWaitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.warmupWaitMs),
+		durationSlack: Math.max(1, finite(policy?.durationSlack ?? DEFAULT_CANDIDATE_JOIN_POLICY.durationSlack)),
+	});
 }
 
 function emptyWork(): ScheduledWork {

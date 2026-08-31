@@ -66,6 +66,25 @@ the outer branch, and commit it. Direct mode is the profitability control; the
 checked-in qualification also preserves shorter workloads for which replay is
 neutral or slower.
 
+Use `--rounds N` (0 through 4096, default 96) on both commands to sweep the
+execution/replay crossover. Feed the paired reports through the production
+candidate-adoption policy rather than inventing a Bash-specific duration gate:
+
+```sh
+npm run bench:linux-admission -- \
+  --direct bench/results/local-topology-direct.json \
+  --reuse bench/results/local-topology-reuse.json \
+  --expect join \
+  --expect-ready join \
+  --output bench/results/local-admission.json
+```
+
+`--elapsed-ms N` evaluates a partially completed speculative execution. The
+analyzer learns separate direct Actor, speculative-world, and adoption-cost
+distributions from every measured run and fails if an optional expected
+decision differs. The checked-in WSL2 report includes both retained wins and
+negative boundary results.
+
 Probe whether the Linux host supports unprivileged OverlayFS in a private user
 and mount namespace:
 

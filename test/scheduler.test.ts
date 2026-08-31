@@ -91,6 +91,168 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([withoutPhase]).priorityMs).toBe(240);
 	});
 
+	it("keeps Actor, speculative-world, and adoption timing distributions separate", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const identity = {
+			tool: "bash",
+			executionFingerprint: "linux-world:v1",
+			actionKeyHash: "action-a",
+		};
+		scheduler.observeActorService(identity, 380);
+		scheduler.observeSpeculativeService(identity, 920);
+		scheduler.observeAdoption(identity, 70);
+
+		expect(
+			scheduler.evaluate([
+				forecast({
+					tool: "bash",
+					executionFingerprint: identity.executionFingerprint,
+					actionKeyHash: identity.actionKeyHash,
+					expectedDurationMs: 380,
+				}),
+			]),
+		).toMatchObject({ expectedDurationMs: 920 });
+		expect(
+			scheduler.assessCandidateJoin({
+				identity,
+				state: "running",
+				expectedSpeculativeDurationMs: 920,
+				elapsedMs: 100,
+			}),
+		).toMatchObject({
+			allowed: false,
+			reason: "fallback_faster",
+			expectedRemainingMs: 820,
+			expectedActorMs: 380,
+			expectedAdoptionMs: 70,
+		});
+		expect(
+			scheduler.assessCandidateJoin({
+				identity,
+				state: "succeeded",
+				expectedSpeculativeDurationMs: 920,
+			}),
+		).toMatchObject({ allowed: true, reason: "ready" });
+
+		const tiny = new SpeculationScheduler<object>();
+		tiny.observeActorService(identity, 30);
+		tiny.observeAdoption(identity, 70);
+		expect(
+			tiny.assessCandidateJoin({
+				identity,
+				state: "succeeded",
+				expectedSpeculativeDurationMs: 920,
+			}),
+		).toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: -40 });
+	});
+
+	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {
+		const heavy = new SpeculationScheduler<object>();
+		const identity = { tool: "bash", executionFingerprint: "linux-world:v1" };
+		heavy.observeActorService(identity, 2_687);
+		heavy.observeSpeculativeService(identity, 936);
+		heavy.observeAdoption(identity, 70);
+		const profitable = heavy.assessCandidateJoin({
+			identity,
+			state: "running",
+			expectedSpeculativeDurationMs: 2_687,
+			elapsedMs: 0,
+		});
+		expect(profitable).toMatchObject({
+			allowed: true,
+			reason: "profitable",
+			expectedRemainingMs: 936,
+			expectedNetBenefitMs: 1_681,
+		});
+		expect(profitable.waitBudgetMs).toBeGreaterThan(936);
+
+		const boundary = new SpeculationScheduler<object>();
+		boundary.observeActorService(identity, 994);
+		boundary.observeSpeculativeService(identity, 973);
+		expect(
+			boundary.assessCandidateJoin({
+				identity,
+				state: "running",
+				expectedSpeculativeDurationMs: 994,
+			}),
+		).toMatchObject({
+			allowed: false,
+			reason: "fallback_faster",
+			expectedNetBenefitMs: 21,
+		});
+	});
+
+	it("uses upper empirical speculative and adoption quantiles against a lower Actor quantile", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const identity = { tool: "bash", executionFingerprint: "linux-world:v1" };
+		for (const duration of [100, 110, 120]) scheduler.observeActorService(identity, duration);
+		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
+		for (const duration of [5, 10, 20]) scheduler.observeAdoption(identity, duration);
+
+		expect(
+			scheduler.assessCandidateJoin({
+				identity,
+				state: "running",
+				expectedSpeculativeDurationMs: 50,
+			}),
+		).toMatchObject({
+			allowed: false,
+			reason: "fallback_faster",
+			expectedActorMs: 100,
+			expectedRemainingMs: 90,
+			expectedAdoptionMs: 20,
+			expectedNetBenefitMs: -10,
+		});
+	});
+
+	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
+		const scheduler = new SpeculationScheduler<object>({
+			candidateJoinPolicy: { warmupWaitMs: 17 },
+		});
+		const first = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "parent-a" };
+		const second = { ...first, actionKeyHash: "parent-b" };
+		expect(
+			scheduler.assessCandidateJoin({
+				identity: first,
+				state: "running",
+				expectedSpeculativeDurationMs: 1,
+			}),
+		).toMatchObject({
+			allowed: true,
+			reason: "warmup_probe",
+			waitBudgetMs: Number.POSITIVE_INFINITY,
+			actorSamples: 0,
+		});
+		scheduler.observeActorService(first, 100);
+		expect(
+			scheduler.assessCandidateJoin({
+				identity: first,
+				state: "running",
+				expectedSpeculativeDurationMs: 1,
+			}),
+		).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25 });
+		expect(
+			scheduler.assessCandidateJoin({
+				identity: first,
+				state: "running",
+				expectedSpeculativeDurationMs: 1,
+				actorElapsedMs: 80,
+			}),
+		).toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: 19 });
+
+		scheduler.observeSpeculativeService(first, 900);
+		expect(
+			scheduler.evaluate([
+				forecast({
+					tool: "bash",
+					executionFingerprint: second.executionFingerprint,
+					actionKeyHash: second.actionKeyHash,
+					expectedDurationMs: 200,
+				}),
+			]),
+		).toMatchObject({ expectedDurationMs: 900 });
+	});
+
 	it("promotes shared work on foreground evidence and lets background work yield", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		expect(scheduler.evaluate([forecast({ background: true }), forecast({ background: true })]).background).toBe(

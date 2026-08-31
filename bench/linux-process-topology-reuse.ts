@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     if (length < 0) { if (errno == EINTR) continue; return 66; }
     for (ssize_t index = 0; index < length; index++, offset++) {
       unsigned int value = (unsigned int)buffer[index] ^ (unsigned int)offset;
-      for (unsigned int round = 0; round < 96U; round++) {
+      for (unsigned int round = 0; round < TRANSFORM_ROUNDS; round++) {
         value = (value * 1664525U + 1013904223U) ^ (value >> 13U);
       }
       buffer[index] = (unsigned char)(value ^ (value >> 8U) ^ (value >> 16U) ^ (value >> 24U));
@@ -84,6 +84,7 @@ interface MeasuredRun {
 if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const mode = argument("--mode") ?? "reuse";
 if (mode !== "reuse" && mode !== "direct") throw new Error("--mode must be reuse or direct");
+const transformRounds = integerArgument("--rounds", 96, 0, 4_096);
 const outputPath = argument("--output");
 const root = await mkdtemp(path.join(os.tmpdir(), "pi-topology-reuse-bench-"));
 const workspace = path.join(root, "workspace");
@@ -162,7 +163,7 @@ try {
 				: {}),
 		},
 		subject: "stock Pi createBashTool running one process that creates two directories and a transformed artifact",
-		fixture: { inputBytes: INPUT_BYTES, transformRoundsPerByte: 96, measuredRuns: MEASURED_RUNS },
+		fixture: { inputBytes: INPUT_BYTES, transformRoundsPerByte: transformRounds, measuredRuns: MEASURED_RUNS },
 		assertions: {
 			allArtifactsEqual: true,
 			...(mode === "reuse" ? { warmupPublished: true, typedTopologyCaptured: true, allCrossParentHits: true } : {}),
@@ -244,7 +245,19 @@ try {
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-topology-helper.c"), HELPER_SOURCE, "utf8");
 	await writeFile(path.join(workspace, "input.bin"), Buffer.alloc(INPUT_BYTES, 0x31));
-	await commandOutput("cc", ["-O2", "-Wall", "-Wextra", "-o", "pi-topology-helper", "pi-topology-helper.c"], workspace);
+	await commandOutput(
+		"cc",
+		[
+			"-O2",
+			"-Wall",
+			"-Wextra",
+			`-DTRANSFORM_ROUNDS=${transformRounds}U`,
+			"-o",
+			"pi-topology-helper",
+			"pi-topology-helper.c",
+		],
+		workspace,
+	);
 	await commandOutput("git", ["init", "--quiet"], workspace);
 	await commandOutput("git", ["config", "user.name", "Pi Topology Benchmark"], workspace);
 	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);
@@ -292,6 +305,16 @@ function argument(name: string): string | undefined {
 	if (index < 0) return undefined;
 	const value = process.argv[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
+	return value;
+}
+
+function integerArgument(name: string, fallback: number, minimum: number, maximum: number): number {
+	const raw = argument(name);
+	if (raw === undefined) return fallback;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+		throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+	}
 	return value;
 }
 

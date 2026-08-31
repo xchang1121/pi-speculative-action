@@ -295,6 +295,56 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
+	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
+		let enabled = false;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const source: Source = {
+			id: "source",
+			enabled: () => enabled,
+			propose: () => plan("source", "bounded-join", { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			execute: async () => {
+				await gate;
+				return "learned";
+			},
+		});
+
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "calibration" });
+		const calibration = call("calibration");
+		expect(await fixture.runtime.consume(calibration)).toBeUndefined();
+		await fixture.runtime.actual({ ...calibration, durationMs: 100, output: "actor" });
+		await fixture.runtime.finishTurn({ ...calibration, terminal: false });
+
+		enabled = true;
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "prediction" });
+		await waitFor(() => fixture.executions() === 1);
+		const startedAt = performance.now();
+		expect(await fixture.runtime.consume(call("prediction"))).toBeUndefined();
+		const waitedMs = performance.now() - startedAt;
+		expect(waitedMs).toBeGreaterThanOrEqual(15);
+		expect(waitedMs).toBeLessThan(150);
+
+		release();
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+		await fixture.runtime.actual({ ...call("prediction"), durationMs: 100, output: "actor" });
+		await fixture.runtime.finishTurn({ ...call("prediction"), terminal: true });
+		expect(
+			fixture.events.find(
+				(event) => event.type === "actor_action" && event.turnID === "prediction",
+			),
+		).toMatchObject({
+			settlement: {
+				provider: { kind: "actor" },
+				rejections: [{ cause: { code: "candidate_join_deadline" } }],
+			},
+		});
+	});
+
 	it("keeps a fresh exact generation reachable when an older version is indeterminate", async () => {
 		let captures = 0;
 		let runs = 0;

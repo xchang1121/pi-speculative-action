@@ -22,6 +22,10 @@
 
 ### Added
 
+- Added generic cost-aware candidate adoption to the Runtime scheduler. Exact-action and
+  tool/execution-world timing classes now keep Actor execution, speculative execution, and
+  validation/projection/commit distributions separate; unfinished joins receive measured deadlines
+  and completed hits can fall back when adoption itself is slower.
 - Added typed directory creation/removal across process observation, provenance journals, parent
   checkpoints, completed replay, atomic workspace adoption, final-state verification, and rollback.
   Directory records preserve entry digests, mode, uid, and gid; metadata/type/link transitions outside
@@ -68,6 +72,10 @@
 
 ### Changed
 
+- A five-point WSL2 stock Pi Bash sweep now retains both sides of the measured adoption crossover.
+  Zero-, 40-, and 43-round in-flight candidates fall back, while 48- and 96-round candidates join;
+  the conservative 96-round estimate saves 1705.23 ms. A completed zero-round hit also falls back
+  because its 70.41 ms median adoption cost exceeds 28.72 ms median direct execution.
 - A five-pair WSL2 stock Pi Bash qualification of a child that creates two directories and a 32 MiB
   deterministic artifact reduced median-of-medians from 2686.65 ms direct to 936.26 ms replayed
   (65.1%, 2.87x), with 15/15 hits and zero taints. Preserved short-task results also show a 384.56 ms
