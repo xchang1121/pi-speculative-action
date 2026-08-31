@@ -56,8 +56,8 @@ import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { commitSandboxDelta, type SandboxFileChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v2";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v2";
+const BACKEND_EPOCH = "pi-linux-process-v3";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v3";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -439,6 +439,7 @@ export class LinuxProcessReuseBackend {
 						...session.nestedEvidence,
 					],
 					session.incompleteReasons,
+					new Set(effects.effects.map((effect) => path.posix.dirname(effect.logicalPath.replaceAll("\\", "/")))),
 				);
 				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
 				for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
@@ -757,6 +758,10 @@ async function captureDependencies(
 					relativeSnapshotEntry(before, physical),
 					parentSnapshotEntry(before, physical),
 					item.role,
+					{
+						excludedEntries: workspaceMetadataExclusions(session, physical),
+						parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
+					},
 				),
 			);
 			continue;
@@ -785,6 +790,11 @@ async function captureDependencies(
 				effect.logicalPath,
 				relativeSnapshotEntry(before, physical),
 				parentSnapshotEntry(before, physical),
+				"input",
+				{
+					excludedEntries: workspaceMetadataExclusions(session, physical),
+					parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
+				},
 			),
 		);
 	}
@@ -802,6 +812,10 @@ function interposedDirectoryFor(session: ActiveSession, target: string): Interpo
 	return session.interposition.directories.find(
 		(directory) => path.resolve(path.dirname(target)) === path.resolve(directory.target),
 	);
+}
+
+function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
+	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? [".git"] : undefined;
 }
 
 async function captureHostPath(
@@ -1045,7 +1059,14 @@ async function createProcessInterposition(input: {
 				await symlink(path.join(directory.shadow, name), viewEntry).catch(() => undefined);
 			}
 		}
-		dependencies.push(await captureDirectoryDependency(directory.source, slash(directory.target), true));
+		dependencies.push(
+			await captureDirectoryDependency(
+				directory.source,
+				slash(directory.target),
+				true,
+				path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? [".git"] : [],
+			),
+		);
 	}
 	const planPath = path.join(root, "mount-plan.json");
 	await writeFile(
@@ -1362,6 +1383,7 @@ async function validateSessionEvidence(session: ActiveSession): Promise<Resource
 function mergeDependencyEvidence(
 	certificates: readonly DynamicDependencyCertificate[],
 	incompleteReasons: Set<string>,
+	mutatedDirectories: ReadonlySet<string> = new Set(),
 ): DynamicDependencyCertificate {
 	const dependencies = new Map<string, DynamicDependency>();
 	const encodings = new Map<string, Sha256Digest>();
@@ -1388,6 +1410,9 @@ function mergeDependencyEvidence(
 			const encoding = digestObject(dependency);
 			const previous = encodings.get(identity);
 			if (previous && previous !== encoding) {
+				if (dependency.kind === "directory" && mutatedDirectories.has(dependency.path.replaceAll("\\", "/"))) {
+					continue;
+				}
 				complete = false;
 				incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
 				continue;

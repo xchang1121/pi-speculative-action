@@ -193,6 +193,8 @@ npm run check
 npm run build
 npm test
 npm run bench:check
+# 仅 Linux/WSL：真实 Pi Bash 工具与 process world 资格测试
+npm run bench:linux-process
 npm pack --dry-run
 ```
 

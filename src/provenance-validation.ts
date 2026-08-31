@@ -136,6 +136,7 @@ export async function validateDynamicDependencyCertificate(
 						physicalPath,
 						expected.path,
 						expected.metadataDigest !== undefined,
+						expected.excludedEntries,
 					);
 					current.push(dependency);
 					if (
@@ -151,6 +152,7 @@ export async function validateDynamicDependencyCertificate(
 						physicalPath,
 						expected.path,
 						expected.parentEntriesDigest !== undefined,
+						expected.parentExcludedEntries,
 					);
 					if (!dependency) {
 						changed.push(expected.path);
@@ -228,12 +230,15 @@ export async function captureDirectoryDependency(
 	physicalPath: string,
 	logicalPath: string,
 	includeMetadata = false,
+	excludedEntries: readonly string[] = [],
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
+	const excluded = new Set(excludedEntries);
 	const [entries, stat] = await Promise.all([
 		readdir(physicalPath, { withFileTypes: true }),
 		includeMetadata ? lstat(physicalPath) : undefined,
 	]);
 	const normalized = entries
+		.filter((entry) => !excluded.has(entry.name))
 		.map((entry) => `${directoryEntryType(entry)}\0${entry.name}`)
 		.sort();
 	return {
@@ -241,6 +246,7 @@ export async function captureDirectoryDependency(
 		path: logicalPath,
 		entriesDigest: digestObject(normalized),
 		...(stat ? { metadataDigest: metadataDigest(stat) } : {}),
+		...(excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
 	};
 }
 
@@ -248,6 +254,7 @@ export async function captureAbsenceDependency(
 	physicalPath: string,
 	logicalPath: string,
 	captureParent = true,
+	parentExcludedEntries: readonly string[] = [],
 ): Promise<Extract<DynamicDependency, { kind: "absence" }> | undefined> {
 	try {
 		await lstat(physicalPath);
@@ -258,8 +265,13 @@ export async function captureAbsenceDependency(
 	if (!captureParent) return { kind: "absence", path: logicalPath };
 	const parentPhysical = path.dirname(physicalPath);
 	const parentLogical = path.posix.dirname(logicalPath.replaceAll("\\", "/"));
-	const parent = await captureDirectoryDependency(parentPhysical, parentLogical);
-	return { kind: "absence", path: logicalPath, parentEntriesDigest: parent.entriesDigest };
+	const parent = await captureDirectoryDependency(parentPhysical, parentLogical, false, parentExcludedEntries);
+	return {
+		kind: "absence",
+		path: logicalPath,
+		parentEntriesDigest: parent.entriesDigest,
+		...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}),
+	};
 }
 
 export async function captureSymlinkDependency(
@@ -280,7 +292,7 @@ function metadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Digest {
 		mode: stat.mode,
 		uid: stat.uid,
 		gid: stat.gid,
-		size: stat.size,
+		...(stat.isFile() ? { size: stat.size } : {}),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }

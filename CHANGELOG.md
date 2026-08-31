@@ -26,6 +26,7 @@
 - Added parent-independent, cross-turn process certificates with exact exec prototypes, dynamic file/directory/absence/symlink dependencies, ordered output/effect replay, at-most-once broker semantics, and single-flight publication.
 - Added transparent mount-namespace exec interposition that preserves the command-visible `PATH` and environment, plus a pinned `npm run setup:linux` installer for Sandlock.
 - Added a generic async process outlet and effect-capability routing so process-backed tools retain their own validation and formatting without tool-name-specific sandbox implementations.
+- Added a reproducible real-machine Pi Bash qualification that proves cross-parent hits, ordered output/effect equality, adoption freshness, and dependency-change invalidation.
 - Added authoritative observation capture: a successful read-only Actor fallback can transfer its pre-execution freshness evidence and one real output into the existing shared result cache without a duplicate tool invocation or a second cache implementation.
 - Added a target-verification ledger that calibrates decoder candidate order by model, endpoint, format, tool, and source while keeping token evidence separate from semantic action learning.
 - Added a policy-facing Actor settlement channel; the sidecar fork gate now credits only source-attributed, actually adopted `executionAheadMs` instead of intent-match wall-clock lead.

@@ -67,12 +67,15 @@ export type DynamicDependency =
 			readonly path: string;
 			readonly entriesDigest: Sha256Digest;
 			readonly metadataDigest?: Sha256Digest;
+			/** Backend-private names omitted from both capture and validation. */
+			readonly excludedEntries?: readonly string[];
 	  }
 	| {
 			readonly kind: "absence";
 			readonly path: string;
 			/** Optional parent enumeration observed at lookup time. */
 			readonly parentEntriesDigest?: Sha256Digest;
+			readonly parentExcludedEntries?: readonly string[];
 	  }
 	| {
 			readonly kind: "symlink";
@@ -364,6 +367,15 @@ function normalizeDependencyCertificate(certificate: DynamicDependencyCertificat
 function normalizeDependencies(dependencies: readonly DynamicDependency[]): DynamicDependency[] {
 	const normalized = dependencies.map((dependency) => {
 		validateDependency(dependency);
+		if (dependency.kind === "directory" && dependency.excludedEntries) {
+			return { ...dependency, excludedEntries: Object.freeze([...new Set(dependency.excludedEntries)].sort()) };
+		}
+		if (dependency.kind === "absence" && dependency.parentExcludedEntries) {
+			return {
+				...dependency,
+				parentExcludedEntries: Object.freeze([...new Set(dependency.parentExcludedEntries)].sort()),
+			};
+		}
 		return { ...dependency };
 	});
 	normalized.sort((left, right) => dependencyIdentity(left).localeCompare(dependencyIdentity(right)));
@@ -406,13 +418,17 @@ function validateDependency(dependency: DynamicDependency): void {
 		case "directory":
 			if (
 				!isSha256Digest(dependency.entriesDigest) ||
-				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest))
+				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest)) ||
+				!validExcludedEntries(dependency.excludedEntries)
 			) {
 				throw new Error("invalid directory dependency");
 			}
 			break;
 		case "absence":
-			if (dependency.parentEntriesDigest !== undefined && !isSha256Digest(dependency.parentEntriesDigest)) {
+			if (
+				(dependency.parentEntriesDigest !== undefined && !isSha256Digest(dependency.parentEntriesDigest)) ||
+				!validExcludedEntries(dependency.parentExcludedEntries)
+			) {
 				throw new Error("invalid negative dependency");
 			}
 			break;
@@ -422,6 +438,16 @@ function validateDependency(dependency: DynamicDependency): void {
 			}
 			break;
 	}
+}
+
+function validExcludedEntries(entries: readonly string[] | undefined): boolean {
+	return (
+		entries === undefined ||
+		(Array.isArray(entries) &&
+			entries.every(
+				(entry) => typeof entry === "string" && entry.length > 0 && entry !== "." && entry !== ".." && !entry.includes("/") && !entry.includes("\0"),
+			))
+	);
 }
 
 function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {

@@ -220,12 +220,19 @@ export function snapshotDependency(
 	entry: WorkspaceTreeEntry | undefined,
 	parent: WorkspaceTreeEntry | undefined,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
+	options: {
+		readonly excludedEntries?: readonly string[];
+		readonly parentExcludedEntries?: readonly string[];
+	} = {},
 ): DynamicDependency | undefined {
 	if (!entry) {
 		return {
 			kind: "absence",
 			path: logicalPath,
 			...(parent?.kind === "directory" ? { parentEntriesDigest: parent.entriesDigest } : {}),
+			...(parent?.kind === "directory" && options.parentExcludedEntries?.length
+				? { parentExcludedEntries: Object.freeze([...options.parentExcludedEntries].sort()) }
+				: {}),
 		};
 	}
 	switch (entry.kind) {
@@ -243,6 +250,9 @@ export function snapshotDependency(
 				path: logicalPath,
 				entriesDigest: entry.entriesDigest,
 				metadataDigest: entry.metadataDigest,
+				...(options.excludedEntries?.length
+					? { excludedEntries: Object.freeze([...options.excludedEntries].sort()) }
+					: {}),
 			};
 		case "symlink":
 			return { kind: "symlink", path: logicalPath, target: entry.target, targetDigest: entry.targetDigest };
@@ -315,7 +325,7 @@ function statMetadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Dige
 		mode: stat.mode,
 		uid: stat.uid,
 		gid: stat.gid,
-		size: stat.size,
+		...(stat.isFile() ? { size: stat.size } : {}),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }

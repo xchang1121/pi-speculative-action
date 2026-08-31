@@ -6,7 +6,26 @@ a separately generated Actor trajectory.
 
 Ablation reports, preregistrations, and private recordings are intentionally
 kept outside this repository. The checked-in runner and suites remain the
-reproducible measurement surface.
+reproducible measurement surface. Machine-qualification results for the Linux
+process substrate contain no prompts or model data and live under `results/`.
+
+## Linux/WSL process reuse qualification
+
+Run the production `createBashTool`, generic process outlet, Linux execution
+world, private Git branch, adoption-time freshness validation, and commit path
+against real Linux processes:
+
+```sh
+npm run setup:linux
+npm run bench:linux-process -- --output bench/results/local.json
+```
+
+The fixture uses three different parent Bash commands around an identical
+compiled child exec. It requires the second parent to hit the first process
+certificate, compares ordered output and a regular-file effect, then changes a
+dynamic input and requires a miss. This is a substrate benchmark, not a model
+quality benchmark; avoiding an LLM request makes the command identity and cache
+decision deterministic and repeatable.
 
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message

@@ -193,6 +193,8 @@ npm run check
 npm run build
 npm test
 npm run bench:check
+# Linux/WSL only: production Pi Bash tool + process-world qualification
+npm run bench:linux-process
 npm pack --dry-run
 ```
 

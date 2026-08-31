@@ -128,6 +128,30 @@ describe("process provenance certificates", () => {
 		expect(first).not.toHaveProperty("argv");
 		expect(Object.isFrozen(first.environment)).toBe(true);
 	});
+
+	it("projects backend-private directory entries consistently during validation", async () => {
+		const root = await workspace();
+		await writeFile(path.join(root, "tracked.txt"), "base");
+		const directory = await captureDirectoryDependency(root, "/workspace", true, [".git"]);
+		const absent = await captureAbsenceDependency(path.join(root, "artifact.txt"), "/workspace/artifact.txt", true, [
+			".git",
+		]);
+		if (!absent) throw new Error("expected absence");
+		const certificate = sealProcessCertificate({
+			prototype: prototype(),
+			dependencyCertificate: { complete: true, dependencies: [directory, absent], taints: [] },
+			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
+		});
+		await mkdir(path.join(root, ".git"));
+		const resolvePath = (logical: string) => path.join(root, path.posix.relative("/workspace", logical));
+		expect(await validateProcessCertificate(certificate, { resolvePath })).toMatchObject({ status: "valid" });
+
+		await writeFile(path.join(root, "other.txt"), "changed");
+		expect(await validateProcessCertificate(certificate, { resolvePath })).toMatchObject({
+			status: "stale",
+			changed: expect.arrayContaining(["/workspace", "/workspace/artifact.txt"]),
+		});
+	});
 });
 
 function prototype(environment: Readonly<Record<string, string | undefined>> = { MODE: "build" }) {
