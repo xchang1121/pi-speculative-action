@@ -16,6 +16,7 @@ import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
 	createWorkspaceSandbox,
+	forkSandboxWorkspace,
 	prepareSandboxWorkspace,
 	withSandboxWorkspace,
 } from "../src/workspace-sandbox.ts";
@@ -84,6 +85,39 @@ describe("workspace-branch ExecutionWorld", () => {
 			await first;
 			expect(branch.state).toBe("committed");
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("isolated\n");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("makes the exact transaction delta available while the private workspace is still sealed", async () => {
+		const root = await temporaryRoot("after-capture");
+		try {
+			await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
+			const action = buildPiActionKey("write", { path: "value.txt", content: "after\n" }, root);
+			if (!action) throw new Error("action key missing");
+			let observed: { readonly content: string; readonly before: string; readonly after: string } | undefined;
+			const branch = await forkSandboxWorkspace({
+				cwd: root,
+				action,
+				execute: async (workspace) => {
+					await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "after\n", "utf8");
+					return settlement("done");
+				},
+				afterCapture: async (workspace, capture) => {
+					const change = capture.changes[0];
+					if (!change?.before || !change.after) throw new Error("captured change missing");
+					observed = {
+						content: await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8"),
+						before: Buffer.from(change.before).toString("utf8"),
+						after: Buffer.from(change.after).toString("utf8"),
+					};
+				},
+			});
+
+			expect(observed).toEqual({ content: "after\n", before: "before\n", after: "after\n" });
+			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("before\n");
+			branch.dispose();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

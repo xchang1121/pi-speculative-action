@@ -59,6 +59,11 @@ export interface SandboxWorkspaceBranchOptions {
 	readonly parentCheckpoint?: WorldCheckpoint;
 	readonly gitBinary?: string;
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement>;
+	/** Seal operation-specific evidence after the generic transaction has captured its exact delta. */
+	readonly afterCapture?: (
+		workspace: SandboxWorkspaceContext,
+		capture: SandboxExecutionDelta,
+	) => Promise<void>;
 	/** Optional exact freshness proof captured by the operation-specific execution substrate. */
 	readonly validate?: () => Promise<ResourceValidation>;
 }
@@ -346,6 +351,7 @@ export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOption
 			const output = await options.execute(workspace);
 			const captureStarted = performance.now();
 			const changes = await collectSandboxChanges(workspace);
+			await options.afterCapture?.(workspace, { output, changes });
 			return {
 				output,
 				changes,

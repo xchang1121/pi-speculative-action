@@ -40,24 +40,29 @@ import {
 	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
 import {
+	captureWorkspaceStructure,
 	captureWorkspaceTree,
+	diffWorkspaceStructures,
 	diffWorkspaceTrees,
 	ExecutionPathProjection,
+	hydrateWorkspaceFileEntry,
 	parentSnapshotEntry,
 	relativeSnapshotEntry,
 	snapshotDependency,
+	type WorkspaceStructureSnapshot,
+	type WorkspaceTreeEntry,
 	type WorkspaceTreeSnapshot,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
-import { observeStrace } from "./strace-observer.ts";
+import { observeStrace, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { commitSandboxDelta, type SandboxFileChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v3";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v3";
+const BACKEND_EPOCH = "pi-linux-process-v4";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v4";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -102,6 +107,8 @@ export interface LinuxProcessReuseMetrics {
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	/** Join the outer workspace transaction delta to the process observation before validation. */
+	readonly seal: (changes: readonly SandboxFileChange[]) => Promise<void>;
 	/** Revalidate every observed input immediately before Actor adoption. */
 	readonly validate: () => Promise<ResourceValidation>;
 	readonly close: () => Promise<void>;
@@ -170,8 +177,21 @@ interface ActiveSession {
 	readonly server: net.Server;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
 	readonly incompleteReasons: Set<string>;
+	topLevelCapture?: TopLevelCapture;
 	topLevelEvidence?: DynamicDependencyCertificate;
+	sealPromise?: Promise<void>;
 	closed: boolean;
+}
+
+interface TopLevelCapture {
+	readonly before: WorkspaceStructureSnapshot;
+	readonly after: WorkspaceStructureSnapshot;
+	readonly observation: StraceObservation;
+}
+
+interface WorkspaceDependencySource {
+	readonly entry: (physicalPath: string) => Promise<WorkspaceTreeEntry | undefined>;
+	readonly parentEntry: (physicalPath: string) => Promise<WorkspaceTreeEntry | undefined>;
 }
 
 interface SpawnOutcome {
@@ -319,6 +339,10 @@ export class LinuxProcessReuseBackend {
 		};
 		return {
 			executor: { execute: (request) => this.executeTopLevel(session, request) },
+			seal: (changes) => {
+				session.sealPromise ??= sealSessionEvidence(session, changes);
+				return session.sealPromise;
+			},
 			validate: () => validateSessionEvidence(session),
 			close,
 		};
@@ -397,8 +421,7 @@ export class LinuxProcessReuseBackend {
 			command: [session.invocation.shell, ...shellArguments],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
-		const before = await captureWorkspaceTree(session.workspace.sandboxRoot, {
-			maxBytes: MAX_CAPTURE_BYTES,
+		const before = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
 			maxFiles: MAX_CAPTURE_FILES,
 		});
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
@@ -436,35 +459,14 @@ export class LinuxProcessReuseBackend {
 				},
 			);
 			try {
-				const after = await captureWorkspaceTree(session.workspace.sandboxRoot, {
-					includeFileContent: true,
-					maxBytes: MAX_CAPTURE_BYTES,
+				const after = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
 					maxFiles: MAX_CAPTURE_FILES,
 				});
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
 					ignoredExecutablePaths: session.interposition.executablePaths,
 				});
-				const effects = diffWorkspaceTrees(before, after, session.projection);
-				const evidence = await captureDependencies(session, before, observation.paths, effects.effects);
-				session.topLevelEvidence = mergeDependencyEvidence(
-					[
-						{
-							complete: before.complete && after.complete && observation.complete && effects.complete && evidence.complete,
-							dependencies: evidence.dependencies,
-							taints: [...new Set([...observation.taints, ...evidence.taints])],
-						},
-						{ complete: true, dependencies: session.interposition.dependencies, taints: [] },
-						...session.nestedEvidence,
-					],
-					session.incompleteReasons,
-					new Set(effects.effects.map((effect) => path.posix.dirname(effect.logicalPath.replaceAll("\\", "/")))),
-				);
+				session.topLevelCapture = { before, after, observation };
 				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
-				for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
-				if (!effects.complete) session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
-				if (session.incompleteReasons.size) {
-					session.topLevelEvidence = { ...session.topLevelEvidence, complete: false };
-				}
 			} catch (error) {
 				session.incompleteReasons.add(`top_capture:${errorMessage(error)}`);
 				session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
@@ -622,7 +624,12 @@ export class LinuxProcessReuseBackend {
 					this.counters.lastError = `trace:${observation.incompleteReasons.join(",")}`;
 				}
 				const effects = diffWorkspaceTrees(before, after, session.projection);
-				const evidence = await captureDependencies(session, before, observation.paths, effects.effects);
+				const evidence = await captureDependencies(
+					session,
+					treeDependencySource(before),
+					observation.paths,
+					effects.effects,
+				);
 				if (evidence.incompleteReasons.length) {
 					this.counters.lastError = `evidence:${evidence.incompleteReasons.join(",")}`;
 				}
@@ -736,9 +743,110 @@ export class LinuxProcessReuseBackend {
 	}
 }
 
+async function sealSessionEvidence(session: ActiveSession, changes: readonly SandboxFileChange[]): Promise<void> {
+	const capture = session.topLevelCapture;
+	if (!capture) {
+		session.incompleteReasons.add("top_capture_missing");
+		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
+		return;
+	}
+	try {
+		const effects = diffWorkspaceStructures(
+			capture.before,
+			capture.after,
+			changes.map((change) => ({
+				relativePath: change.resource,
+				...(change.before ? { before: change.before } : {}),
+				...(change.after ? { after: change.after } : {}),
+				...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
+				...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
+			})),
+			session.projection,
+		);
+		const evidence = await captureDependencies(
+			session,
+			transactionDependencySource(capture.before, changes),
+			capture.observation.paths,
+			effects.effects,
+		);
+		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
+		if (!effects.complete) session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
+		session.topLevelEvidence = mergeDependencyEvidence(
+			[
+				{
+					complete:
+						capture.before.complete &&
+						capture.after.complete &&
+						capture.observation.complete &&
+						effects.complete &&
+						evidence.complete,
+					dependencies: evidence.dependencies,
+					taints: [...new Set([...capture.observation.taints, ...evidence.taints])],
+				},
+				{ complete: true, dependencies: session.interposition.dependencies, taints: [] },
+				...session.nestedEvidence,
+			],
+			session.incompleteReasons,
+			new Set(effects.effects.map((effect) => path.posix.dirname(effect.logicalPath.replaceAll("\\", "/")))),
+		);
+	} catch (error) {
+		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
+		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
+	}
+}
+
+function treeDependencySource(snapshot: WorkspaceTreeSnapshot): WorkspaceDependencySource {
+	return {
+		entry: (physicalPath) => Promise.resolve(relativeSnapshotEntry(snapshot, physicalPath)),
+		parentEntry: (physicalPath) => Promise.resolve(parentSnapshotEntry(snapshot, physicalPath)),
+	};
+}
+
+function transactionDependencySource(
+	snapshot: WorkspaceStructureSnapshot,
+	changes: readonly SandboxFileChange[],
+): WorkspaceDependencySource {
+	const deltas = new Map<string, SandboxFileChange>();
+	for (const change of changes) {
+		const relative = path.normalize(change.resource);
+		if (deltas.has(relative)) throw new Error(`duplicate transaction delta: ${change.resource}`);
+		deltas.set(relative, change);
+	}
+	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
+	const entry = (physicalPath: string): Promise<WorkspaceTreeEntry | undefined> => {
+		const relative = path.relative(snapshot.root, path.resolve(physicalPath));
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
+		}
+		const existing = cached.get(relative);
+		if (existing) return existing;
+		const pending = (async () => {
+			const structure = snapshot.entries.get(relative);
+			if (!structure || structure.kind !== "file") return structure;
+			const delta = deltas.get(relative);
+			if (delta && delta.before === undefined) {
+				throw new Error(`transaction baseline is missing file bytes: ${delta.resource || delta.target}`);
+			}
+			const bytes = delta?.before ?? (await readFile(path.resolve(snapshot.root, relative)));
+			const hydrated = hydrateWorkspaceFileEntry(structure, bytes);
+			if (!hydrated) throw new Error(`transaction baseline size changed: ${relative}`);
+			return hydrated;
+		})();
+		cached.set(relative, pending);
+		return pending;
+	};
+	return {
+		entry,
+		parentEntry: (physicalPath) =>
+			path.resolve(physicalPath) === path.resolve(snapshot.root)
+				? Promise.resolve(undefined)
+				: entry(path.dirname(physicalPath)),
+	};
+}
+
 async function captureDependencies(
 	session: ActiveSession,
-	before: WorkspaceTreeSnapshot,
+	before: WorkspaceDependencySource,
 	observed: readonly { readonly path: string; readonly role: "input" | "executable" | "shared_object" | "metadata" }[],
 	effects: readonly { readonly logicalPath: string; readonly relativePath: string; readonly before?: unknown }[],
 ): Promise<{
@@ -777,11 +885,12 @@ async function captureDependencies(
 			: observedPath;
 		if (session.projection.isWorkspacePhysical(physical)) {
 			const logical = session.projection.toLogical(physical);
+			const [entry, parentEntry] = await Promise.all([before.entry(physical), before.parentEntry(physical)]);
 			add(
 				snapshotDependency(
 					logical,
-					relativeSnapshotEntry(before, physical),
-					parentSnapshotEntry(before, physical),
+					entry,
+					parentEntry,
 					item.role,
 					{
 						excludedEntries: workspaceMetadataExclusions(session, physical),
@@ -813,8 +922,8 @@ async function captureDependencies(
 		add(
 			snapshotDependency(
 				effect.logicalPath,
-				relativeSnapshotEntry(before, physical),
-				parentSnapshotEntry(before, physical),
+				await before.entry(physical),
+				await before.parentEntry(physical),
 				"input",
 				{
 					excludedEntries: workspaceMetadataExclusions(session, physical),

@@ -53,6 +53,7 @@ export type WorkspaceTreeEntry =
 			readonly metadataDigest: Sha256Digest;
 			readonly mode: number;
 			readonly size: number;
+			readonly links: number;
 			readonly content?: Buffer;
 	  }
 	| {
@@ -68,13 +69,27 @@ export type WorkspaceTreeEntry =
 	  }
 	| { readonly kind: "unsupported"; readonly type: string };
 
-export interface WorkspaceTreeSnapshot {
+export type WorkspaceStructureEntry =
+	| {
+			readonly kind: "file";
+			readonly metadataDigest: Sha256Digest;
+			readonly mode: number;
+			readonly size: number;
+			readonly links: number;
+	  }
+	| Exclude<WorkspaceTreeEntry, { readonly kind: "file" }>;
+
+interface WorkspaceSnapshot<Entry> {
 	readonly root: string;
-	readonly entries: ReadonlyMap<string, WorkspaceTreeEntry>;
+	readonly entries: ReadonlyMap<string, Entry>;
 	readonly files: number;
 	readonly bytesRead: number;
 	readonly complete: boolean;
 }
+
+export interface WorkspaceTreeSnapshot extends WorkspaceSnapshot<WorkspaceTreeEntry> {}
+
+export interface WorkspaceStructureSnapshot extends WorkspaceSnapshot<WorkspaceStructureEntry> {}
 
 export interface WorkspaceTreeCaptureOptions {
 	readonly includeFileContent?: boolean;
@@ -83,13 +98,31 @@ export interface WorkspaceTreeCaptureOptions {
 	readonly exclude?: readonly string[];
 }
 
+export type WorkspaceStructureCaptureOptions = Pick<WorkspaceTreeCaptureOptions, "maxFiles" | "exclude">;
+
 /** Bounded, symlink-preserving snapshot used only for nested-process effect attribution. */
 export async function captureWorkspaceTree(
 	root: string,
 	options: WorkspaceTreeCaptureOptions = {},
 ): Promise<WorkspaceTreeSnapshot> {
+	return captureWorkspaceSnapshot(root, options, options.includeFileContent ? "content" : "digest") as Promise<WorkspaceTreeSnapshot>;
+}
+
+/** Capture inode and directory semantics without reading regular-file contents. */
+export async function captureWorkspaceStructure(
+	root: string,
+	options: WorkspaceStructureCaptureOptions = {},
+): Promise<WorkspaceStructureSnapshot> {
+	return captureWorkspaceSnapshot(root, options, "none") as Promise<WorkspaceStructureSnapshot>;
+}
+
+async function captureWorkspaceSnapshot(
+	root: string,
+	options: WorkspaceTreeCaptureOptions,
+	fileCapture: "none" | "digest" | "content",
+): Promise<WorkspaceSnapshot<WorkspaceTreeEntry | WorkspaceStructureEntry>> {
 	const absoluteRoot = path.resolve(root);
-	const entries = new Map<string, WorkspaceTreeEntry>();
+	const entries = new Map<string, WorkspaceTreeEntry | WorkspaceStructureEntry>();
 	const excludes = new Set(options.exclude ?? [".git"]);
 	const maxFiles = Math.max(1, options.maxFiles ?? 100_000);
 	const maxBytes = Math.max(0, options.maxBytes ?? 512 * 1024 * 1024);
@@ -138,6 +171,16 @@ export async function captureWorkspaceTree(
 				continue;
 			}
 			if (stat.isFile()) {
+				if (fileCapture === "none") {
+					entries.set(relative, {
+						kind: "file",
+						metadataDigest: statMetadataDigest(stat),
+						mode: stat.mode & 0o777,
+						size: stat.size,
+						links: stat.nlink,
+					});
+					continue;
+				}
 				if (bytesRead + stat.size > maxBytes) {
 					complete = false;
 					return;
@@ -150,7 +193,8 @@ export async function captureWorkspaceTree(
 					metadataDigest: statMetadataDigest(stat),
 					mode: stat.mode & 0o777,
 					size: content.byteLength,
-					...(options.includeFileContent ? { content } : {}),
+					links: stat.nlink,
+					...(fileCapture === "content" ? { content } : {}),
 				});
 				continue;
 			}
@@ -160,6 +204,126 @@ export async function captureWorkspaceTree(
 
 	await visit(absoluteRoot, "");
 	return Object.freeze({ root: absoluteRoot, entries, files, bytesRead, complete });
+}
+
+export interface WorkspaceRegularDelta {
+	readonly relativePath: string;
+	readonly before?: Uint8Array;
+	readonly after?: Uint8Array;
+	readonly beforeMode?: number;
+	readonly afterMode?: number;
+}
+
+/**
+ * Join a content-addressed transaction delta with content-free inode snapshots. The delta is the
+ * authority for regular-file bytes; the snapshots prove that no unsupported inode or metadata
+ * transition was hidden by a content-only change detector.
+ */
+export function diffWorkspaceStructures(
+	before: WorkspaceStructureSnapshot,
+	after: WorkspaceStructureSnapshot,
+	deltas: readonly WorkspaceRegularDelta[],
+	projection: ExecutionPathProjection,
+): WorkspaceEffectDiff {
+	if (!before.complete || !after.complete) return { effects: [], complete: false, reason: "snapshot_limit" };
+	const rootReason = changedRootMetadata(before.entries.get(""), after.entries.get(""));
+	if (rootReason) return { effects: [], complete: false, reason: rootReason };
+	const byPath = new Map<string, WorkspaceRegularDelta>();
+	for (const delta of deltas) {
+		const relativePath = path.normalize(delta.relativePath);
+		if (!relativePath || path.isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${path.sep}`)) {
+			return { effects: [], complete: false, reason: `invalid_delta:${delta.relativePath}` };
+		}
+		if (byPath.has(relativePath)) return { effects: [], complete: false, reason: `duplicate_delta:${delta.relativePath}` };
+		byPath.set(relativePath, delta);
+	}
+
+	const effects: WorkspaceRegularEffect[] = [];
+	const names = [...new Set([...before.entries.keys(), ...after.entries.keys(), ...byPath.keys()])].sort();
+	for (const relativePath of names) {
+		if (!relativePath) continue;
+		const previous = before.entries.get(relativePath);
+		const current = after.entries.get(relativePath);
+		const delta = byPath.get(relativePath);
+		if (delta) {
+			const joined = joinRegularDelta(relativePath, previous, current, delta, projection, after.root);
+			if ("reason" in joined) return { effects: [], complete: false, reason: joined.reason };
+			effects.push(joined.effect);
+			continue;
+		}
+		if (sameStructureEntry(previous, current)) continue;
+		if (previous?.kind === "directory" || current?.kind === "directory") {
+			if (previous?.kind === "directory" && current?.kind === "directory") {
+				if (previous.metadataDigest !== current.metadataDigest) {
+					return { effects: [], complete: false, reason: `unsupported_directory_metadata:${relativePath}` };
+				}
+				continue;
+			}
+			// Git cannot represent empty directories or preserve created-directory metadata. Until a
+			// directory delta driver is installed, fail closed instead of silently approximating it.
+			return { effects: [], complete: false, reason: `unsupported_directory_transition:${relativePath}` };
+		}
+		return { effects: [], complete: false, reason: `untracked_inode_transition:${relativePath}` };
+	}
+	return { effects: Object.freeze(effects), complete: true };
+}
+
+export function hydrateWorkspaceFileEntry(
+	entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
+	bytes: Uint8Array,
+	includeContent = false,
+): Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined {
+	if (bytes.byteLength !== entry.size) return undefined;
+	const content = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	return {
+		...entry,
+		digest: sha256Digest(content),
+		...(includeContent ? { content } : {}),
+	};
+}
+
+function joinRegularDelta(
+	relativePath: string,
+	previous: WorkspaceStructureEntry | undefined,
+	current: WorkspaceStructureEntry | undefined,
+	delta: WorkspaceRegularDelta,
+	projection: ExecutionPathProjection,
+	root: string,
+): { readonly effect: WorkspaceRegularEffect } | { readonly reason: string } {
+	let beforeEntry: Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined;
+	if (delta.before === undefined) {
+		if (previous !== undefined) return { reason: `delta_before_missing:${relativePath}` };
+	} else {
+		if (previous?.kind !== "file") return { reason: `delta_before_type:${relativePath}` };
+		if (previous.links !== 1) return { reason: `unsupported_hardlink:${relativePath}` };
+		if (delta.beforeMode !== undefined && delta.beforeMode !== previous.mode) {
+			return { reason: `delta_before_mode:${relativePath}` };
+		}
+		beforeEntry = hydrateWorkspaceFileEntry(previous, delta.before);
+		if (!beforeEntry) return { reason: `delta_before_size:${relativePath}` };
+	}
+
+	const logicalPath = projection.toLogical(path.join(root, relativePath));
+	if (delta.after === undefined) {
+		if (!beforeEntry || current !== undefined) return { reason: `delta_delete_shape:${relativePath}` };
+		return { effect: { kind: "delete", logicalPath, relativePath, before: beforeEntry } };
+	}
+	if (current?.kind !== "file") return { reason: `delta_after_type:${relativePath}` };
+	if (current.links !== 1) return { reason: `unsupported_hardlink:${relativePath}` };
+	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) {
+		return { reason: `delta_after_mode:${relativePath}` };
+	}
+	const afterEntry = hydrateWorkspaceFileEntry(current, delta.after, true);
+	if (!afterEntry) return { reason: `delta_after_size:${relativePath}` };
+	return {
+		effect: {
+			kind: "write",
+			logicalPath,
+			relativePath,
+			...(beforeEntry ? { before: beforeEntry } : {}),
+			after: afterEntry,
+		},
+	};
 }
 
 export interface WorkspaceRegularEffect {
@@ -183,6 +347,8 @@ export function diffWorkspaceTrees(
 	projection: ExecutionPathProjection,
 ): WorkspaceEffectDiff {
 	if (!before.complete || !after.complete) return { effects: [], complete: false, reason: "snapshot_limit" };
+	const rootReason = changedRootMetadata(before.entries.get(""), after.entries.get(""));
+	if (rootReason) return { effects: [], complete: false, reason: rootReason };
 	const effects: WorkspaceRegularEffect[] = [];
 	const names = [...new Set([...before.entries.keys(), ...after.entries.keys()])].sort();
 	for (const relativePath of names) {
@@ -190,18 +356,27 @@ export function diffWorkspaceTrees(
 		const previous = before.entries.get(relativePath);
 		const current = after.entries.get(relativePath);
 		if (sameTreeEntry(previous, current)) continue;
+		if (
+			(previous?.kind === "file" && previous.links !== 1) ||
+			(current?.kind === "file" && current.links !== 1)
+		) {
+			return { effects: [], complete: false, reason: `unsupported_hardlink:${relativePath}` };
+		}
 		const logicalPath = projection.toLogical(path.join(after.root, relativePath));
 		if (!current) {
 			if (previous?.kind === "file") {
 				effects.push({ kind: "delete", logicalPath, relativePath, before: previous });
 				continue;
 			}
-			if (previous?.kind === "directory" && directoryHasChildren(before, relativePath)) continue;
 			return { effects: [], complete: false, reason: `unsupported_delete:${relativePath}` };
 		}
 		if (current.kind === "directory") {
-			if (!previous && directoryHasChildren(after, relativePath)) continue;
-			if (previous?.kind === "directory") continue;
+			if (previous?.kind === "directory") {
+				if (previous.metadataDigest !== current.metadataDigest) {
+					return { effects: [], complete: false, reason: `unsupported_directory_metadata:${relativePath}` };
+				}
+				continue;
+			}
 			return { effects: [], complete: false, reason: `unsupported_directory:${relativePath}` };
 		}
 		if (current.kind !== "file" || !current.content) {
@@ -289,9 +464,33 @@ function sameTreeEntry(left: WorkspaceTreeEntry | undefined, right: WorkspaceTre
 	}
 }
 
-function directoryHasChildren(snapshot: WorkspaceTreeSnapshot, relativePath: string): boolean {
-	const prefix = `${relativePath}${path.sep}`;
-	return [...snapshot.entries.keys()].some((name) => name.startsWith(prefix));
+function sameStructureEntry(
+	left: WorkspaceStructureEntry | undefined,
+	right: WorkspaceStructureEntry | undefined,
+): boolean {
+	if (!left || !right || left.kind !== right.kind) return left === right;
+	switch (left.kind) {
+		case "file": {
+			const value = right as Extract<WorkspaceStructureEntry, { kind: "file" }>;
+			return left.size === value.size && left.metadataDigest === value.metadataDigest;
+		}
+		case "directory": {
+			const value = right as Extract<WorkspaceStructureEntry, { kind: "directory" }>;
+			return left.entriesDigest === value.entriesDigest && left.metadataDigest === value.metadataDigest;
+		}
+		case "symlink":
+			return left.targetDigest === (right as Extract<WorkspaceStructureEntry, { kind: "symlink" }>).targetDigest;
+		case "unsupported":
+			return left.type === (right as Extract<WorkspaceStructureEntry, { kind: "unsupported" }>).type;
+	}
+}
+
+function changedRootMetadata(
+	before: WorkspaceTreeEntry | WorkspaceStructureEntry | undefined,
+	after: WorkspaceTreeEntry | WorkspaceStructureEntry | undefined,
+): string | undefined {
+	if (before?.kind !== "directory" || after?.kind !== "directory") return "unsupported_workspace_root_transition";
+	return before.metadataDigest === after.metadataDigest ? undefined : "unsupported_workspace_root_metadata";
 }
 
 function directoryEntriesDigest(entries: readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; isSocket(): boolean; isFIFO(): boolean; isCharacterDevice(): boolean; isBlockDevice(): boolean }[]): Sha256Digest {
@@ -325,7 +524,7 @@ function statMetadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Dige
 		mode: stat.mode,
 		uid: stat.uid,
 		gid: stat.gid,
-		...(stat.isFile() ? { size: stat.size } : {}),
+		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }

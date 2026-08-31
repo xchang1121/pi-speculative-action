@@ -43,6 +43,7 @@ export function createLinuxProcessExecutionWorld(
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			let validate: LinuxProcessSession["validate"] | undefined;
+			let seal: LinuxProcessSession["seal"] | undefined;
 			return forkSandboxWorkspace({
 				cwd: sourceRoot,
 				action: context.action,
@@ -56,6 +57,10 @@ export function createLinuxProcessExecutionWorld(
 								cause: { stage: "freshness", code: "process_evidence_missing" },
 								metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
 							},
+				afterCapture: async (_workspace, capture) => {
+					if (!seal) throw new Error("process evidence sealer is missing");
+					await seal(capture.changes);
+				},
 				execute: async (workspace) => {
 					const session = await backend.open({
 						sourceRoot,
@@ -64,6 +69,7 @@ export function createLinuxProcessExecutionWorld(
 						signal: context.signal,
 					});
 					validate = session.validate;
+					seal = session.seal;
 					let launches = 0;
 					try {
 						const result = await options.coordinator.runWith(

@@ -296,7 +296,7 @@ function metadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Digest {
 		mode: stat.mode,
 		uid: stat.uid,
 		gid: stat.gid,
-		...(stat.isFile() ? { size: stat.size } : {}),
+		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }
