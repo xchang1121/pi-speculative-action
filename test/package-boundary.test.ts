@@ -11,6 +11,7 @@ import {
 	createSpeculativeActionExtension,
 	createSpeculativeActionHost,
 	createWorkspaceSandbox,
+	EffectTransactionCoordinator,
 	ExecutionWorldRouter,
 	makeSpeculativeActionRuntime,
 	prepareSandboxWorkspace,
@@ -31,6 +32,7 @@ describe("speculative action package boundary", () => {
 			releaseResourceVersion,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
+			EffectTransactionCoordinator,
 			ExecutionWorldRouter,
 			ToolExecutionGateway,
 		]) {

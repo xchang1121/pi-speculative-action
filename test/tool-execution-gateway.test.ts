@@ -34,9 +34,11 @@ describe("ToolExecutionGateway", () => {
 		const route = await gateway.resolve(requirement, { cwd: "/workspace" });
 
 		expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });
-		expect(route && (await gateway.executeSpeculative(operation, route, () => ({ value: "sealed" }))).output).toBe(
-			"sealed",
-		);
+		const transaction = route
+			? await gateway.executeSpeculative(operation, route, () => ({ value: "sealed" }))
+			: undefined;
+		expect(transaction?.output).toBe("sealed");
+		expect(transaction?.transactionState).toBe("sealed");
 		const capture = await gateway.captureAuthoritativeResult(
 			requirement,
 			{ cwd: "/workspace" },

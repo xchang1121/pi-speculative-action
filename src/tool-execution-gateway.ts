@@ -1,12 +1,15 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
 import {
+	EffectTransactionCoordinator,
+	type EffectTransaction,
+} from "./effect-transaction.ts";
+import {
 	type CapturedExecutionWorldResult,
 	ExecutionWorldRouter,
 	type ExecutionWorld,
 	type ExecutionWorldPreparation,
 	type SpeculativeExecutionRoute,
-	type WorldBranch,
 } from "./execution-world.ts";
 
 /**
@@ -45,6 +48,7 @@ export type ToolExecutionContextFactory<Context> = (operation: ToolOperation) =>
  */
 export class ToolExecutionGateway<Context, Output> {
 	private readonly router: ExecutionWorldRouter<Context, Output>;
+	private readonly transactions = new EffectTransactionCoordinator<Output>();
 
 	constructor(worlds: readonly ExecutionWorld<Context, Output>[]) {
 		this.router = new ExecutionWorldRouter(worlds);
@@ -79,6 +83,16 @@ export class ToolExecutionGateway<Context, Output> {
 			},
 			preparation,
 			context(operation),
+		).then((captured) =>
+			captured
+				? Object.freeze({
+						route: captured.route,
+						capture: this.transactions.capture(
+							this.transactions.begin(descriptor(operation, captured.route)),
+							captured.capture,
+						),
+					})
+				: undefined,
 		);
 	}
 
@@ -93,11 +107,20 @@ export class ToolExecutionGateway<Context, Output> {
 		operation: ToolOperation,
 		route: SpeculativeExecutionRoute,
 		context: ToolExecutionContextFactory<Context>,
-	): Promise<WorldBranch<Output>> {
-		return this.router.fork(route, context(operation));
+	): Promise<EffectTransaction<Output>> {
+		const attempt = this.transactions.begin(descriptor(operation, route));
+		return this.transactions.execute(attempt, () => this.router.fork(route, context(operation)));
 	}
 
 	dispose(): Promise<void> {
 		return this.router.dispose();
 	}
+}
+
+function descriptor(operation: ToolOperation, route: SpeculativeExecutionRoute) {
+	return {
+		tool: operation.tool,
+		...(operation.callID ? { callID: operation.callID } : {}),
+		route,
+	};
 }

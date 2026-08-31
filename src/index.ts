@@ -104,6 +104,13 @@ export {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
 export {
+	type EffectTransaction,
+	EffectTransactionCoordinator,
+	type EffectTransactionAttempt,
+	type EffectTransactionDescriptor,
+	type EffectTransactionState,
+} from "./effect-transaction.ts";
+export {
 	type CapturedExecutionWorldResult,
 	type ActionReuseKind,
 	type ExecutionWorld,
