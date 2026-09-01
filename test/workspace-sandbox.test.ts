@@ -58,8 +58,12 @@ const editTool: AgentTool<typeof editParameters> = {
 	},
 };
 
+const testRoots = new Set<string>();
+
 afterEach(async () => {
-	await closeWorkspaceSandboxPools();
+	const roots = [...testRoots];
+	testRoots.clear();
+	await closeWorkspaceSandboxPools(roots);
 });
 
 describe("workspace-branch ExecutionWorld", () => {
@@ -70,9 +74,16 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
 			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
 			await Promise.all(
-				Array.from({ length: 520 }, (_value, index) =>
+				Array.from({ length: 100 }, (_value, index) =>
 					writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
 				),
+			);
+			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+			await Promise.all(
+				Array.from({ length: 160 }, (_value, index) => {
+					const ordinal = index + 100;
+					return writeFile(path.join(root, `${ordinal.toString().padStart(4, "0")}.txt`), `${ordinal}\n`, "utf8");
+				}),
 			);
 			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v1:/);
 		} finally {
@@ -690,8 +701,10 @@ function settlement(text: string): ToolSettlement {
 	return { result: { content: [{ type: "text", text }], details: undefined }, isError: false };
 }
 
-function temporaryRoot(label: string): Promise<string> {
-	return mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
+async function temporaryRoot(label: string): Promise<string> {
+	const root = await mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
+	testRoots.add(root);
+	return root;
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {

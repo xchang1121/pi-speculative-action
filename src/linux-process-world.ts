@@ -9,6 +9,7 @@ import {
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import {
+	closeWorkspaceSandboxPools,
 	forkSandboxWorkspace,
 	prepareSandboxWorkspace,
 	qualifyWorkspaceSandboxDriver,
@@ -114,8 +115,10 @@ export function createLinuxProcessExecutionWorld(
 			});
 		},
 		dispose: async () => {
+			const ownedRoots = [...roots];
 			roots.clear();
 			await backend.dispose();
+			await closeWorkspaceSandboxPools(ownedRoots);
 		},
 	};
 }

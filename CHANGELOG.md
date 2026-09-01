@@ -26,11 +26,13 @@
   transactions. OverlayFS now prewarms one immutable lower snapshot per content commit and
   reconstructs each logical tree from only typed upper paths and ancestors.
 - Added cost-qualified COW selection for the trace-guarded Linux process world: exact Git baseline
-  trees below the measured 512-entry crossover retain Git, while larger trees may use a fully
+  trees below the conservative measured 256-entry boundary retain Git, while larger trees may use a fully
   probed `clone_fd` OverlayFS mount. Generic mutation fallbacks remain on portable Git.
 - Added fail-closed observation of workspace-driver semantic gaps. `EXDEV`, `EOPNOTSUPP`, `ENOTSUP`,
   and `ENOSYS` results on workspace resources make provenance indeterminate, including a handled
   lower-directory rename that would otherwise produce a different result from the Actor filesystem.
+- Made the Linux process world drain its backend and then reclaim only its owned workspace pools on
+  disposal; parallel worlds and tests no longer delete one another's live upper layers.
 - Added a capability-selected Linux/WSL workspace driver using hash-pinned `fuse-overlayfs`, one
   immutable Git lower tree shared across forks, private upper/work layers outside the sandbox's
   writable process area, and exact Git fallback whenever the complete mount lifecycle is unavailable.

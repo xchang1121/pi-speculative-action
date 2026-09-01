@@ -583,9 +583,9 @@ const WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS = 100;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";
-// Same-machine qualification crosses over near 500 immutable entries. Keep the small-tree path on
-// Git and require a complete exact baseline before paying for a long-lived FUSE mount.
-const AUTO_OVERLAY_MIN_TREE_ENTRIES = 512;
+// After lower-structure sharing, repeated same-machine A/B crosses between 100 and 250 source files.
+// Use the next conservative power-of-two boundary and require an exact immutable baseline.
+const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_AUTHOR_NAME: "Pi Speculative Action",

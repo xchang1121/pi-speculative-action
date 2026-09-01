@@ -24,7 +24,7 @@ Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
 and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
 after its binary, FUSE device, copy-up, 0/0 whiteout, opaque-directory, private
 anonymous clock, cross-view timestamp ordering, namespace visibility, and unmount
-lifecycle all pass and the exact baseline contains at least 512 entries. Small
+lifecycle all pass and the exact baseline contains at least 256 entries. Small
 trees retain Git. Use `--source-files N` with `bench:linux-topology` to reproduce
 the storage-driver crossover; driver-induced unsupported filesystem results are
 trace-tainted and cannot be adopted. Reports include the one-time
