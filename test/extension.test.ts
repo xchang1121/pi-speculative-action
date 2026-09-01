@@ -35,6 +35,7 @@ import {
 } from "../src/extension.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
+import { toolErrorSettlement } from "../src/tool-settlement.ts";
 import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
 
 const roots: string[] = [];
@@ -511,7 +512,9 @@ function sourceInfo(path: string, source = "test"): SourceInfo {
 }
 
 function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefined): SpeculativeActionHost {
-	return {
+	const consumeMock = vi.fn(consume);
+	const actual = vi.fn();
+	const host: SpeculativeActionHost = {
 		sessionID: "session",
 		runtime: {
 			settingsChanged: vi.fn(),
@@ -529,13 +532,58 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		startTurn: vi.fn(),
 		previewActorTool: vi.fn(),
 		previewActorCall: vi.fn(),
-		consume: vi.fn(consume),
-		executeAuthoritative: vi.fn(async (operation, executor) => executor(operation)),
-		actual: vi.fn(),
+		consume: consumeMock,
+		execute: vi.fn(async (input, signal, executor) => {
+			if (input.turnID) {
+				try {
+					const cached = await consumeMock(
+						{ ...input, turnID: input.turnID },
+						signal,
+					);
+					if (cached) return cached.result;
+				} catch {
+					// Match the production gateway's best-effort reuse contract.
+				}
+			}
+			const startedAt = performance.now();
+			try {
+				const result = await executor({
+					tool: input.tool,
+					input: input.args,
+					...(input.id ? { callID: input.id } : {}),
+					...(signal ? { signal } : {}),
+				});
+				if (input.turnID) {
+					try {
+						await actual({
+							...input,
+							turnID: input.turnID,
+							durationMs: performance.now() - startedAt,
+							output: { result, isError: false },
+						});
+					} catch {}
+				}
+				return result;
+			} catch (error) {
+				if (input.turnID) {
+					try {
+						await actual({
+							...input,
+							turnID: input.turnID,
+							durationMs: performance.now() - startedAt,
+							output: toolErrorSettlement(error),
+						});
+					} catch {}
+				}
+				throw error;
+			}
+		}),
+		actual,
 		finishTurn: vi.fn(),
 		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),
 		dispose: vi.fn(),
 	};
+	return host;
 }
 
 function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabled: false }): SpeculativeSettingsStore {

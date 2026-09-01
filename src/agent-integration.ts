@@ -1,4 +1,4 @@
-import type { AgentTool, AgentToolCall } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
@@ -43,7 +43,7 @@ import type { SelfSpeculationActionBridge } from "./self-speculation-action-brid
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { createSelfSpeculationPlanSource } from "./self-speculation-plan-source.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
-import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
 export interface SpeculativeAgentSettingsInput {
@@ -158,17 +158,26 @@ export interface SpeculativeActionHost {
 		input: Omit<AgentConsumeInput, "sessionID">,
 		signal?: AbortSignal,
 	) => Promise<ToolSettlement | undefined>;
-	/** Common execution boundary shared by authoritative and speculative tool calls. */
-	readonly executeAuthoritative: <Output>(
-		operation: ToolOperation,
-		executor: (operation: ToolOperation) => Promise<Output>,
-	) => Promise<Output>;
+	/** One tool outlet: reuse lookup, Actor fallback, timing, and settlement reporting. */
+	readonly execute: (
+		input: SpeculativeToolExecutionInput,
+		signal: AbortSignal | undefined,
+		executor: (operation: ToolOperation) => Promise<AgentToolResult<unknown>>,
+	) => Promise<AgentToolResult<unknown>>;
 	readonly actual: (
 		input: Omit<AgentConsumeInput, "sessionID"> & { readonly durationMs: number; readonly output?: ToolSettlement },
 	) => Promise<void>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
 	readonly drafterGateSnapshot: () => ActionDrafterGateSnapshot;
 	readonly dispose: () => Promise<void>;
+}
+
+export interface SpeculativeToolExecutionInput {
+	readonly turnID?: string;
+	readonly id?: string;
+	readonly tool: string;
+	readonly args: unknown;
+	readonly tools: readonly AgentTool[];
 }
 
 export type ActionDrafterGateSnapshot = DrafterUtilityGateSnapshot;
@@ -439,7 +448,41 @@ export function createSpeculativeActionHost(
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
-		executeAuthoritative: (operation, executor) => executionGateway.executeAuthoritative(operation, executor),
+		execute: (input, signal, executor) => {
+			const operation: ToolOperation = {
+				tool: input.tool,
+				input: input.args,
+				...(input.id ? { callID: input.id } : {}),
+				...(signal ? { signal } : {}),
+			};
+			const actorCall = input.turnID
+				? {
+						turnID: input.turnID,
+						id: input.id,
+						tool: input.tool,
+						args: input.args,
+						tools: input.tools,
+					}
+				: undefined;
+			return executionGateway.executeAuthoritative(operation, executor, {
+				...(actorCall
+					? {
+							reuse: async () => (await runtime.consume({ ...actorCall, sessionID }, signal))?.result,
+							settled: async (settlement) => {
+								await runtime.actual({
+									...actorCall,
+									sessionID,
+									durationMs: settlement.durationMs,
+									output:
+										settlement.status === "succeeded"
+											? { result: settlement.output, isError: false }
+											: toolErrorSettlement(settlement.error),
+								});
+							},
+						}
+					: {}),
+			});
+		},
 		actual: (input) => runtime.actual({ ...input, sessionID }),
 		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {

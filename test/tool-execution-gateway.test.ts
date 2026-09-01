@@ -66,6 +66,57 @@ describe("ToolExecutionGateway", () => {
 		expect(executor).toHaveBeenCalledOnce();
 		expect(executor).toHaveBeenCalledWith(operation);
 	});
+
+	it("owns reuse, Actor fallback timing, and failure-isolated observation", async () => {
+		const gateway = new ToolExecutionGateway<TestContext, string>([]);
+		const operation = { tool: "read", callID: "actor", input: { path: "file" } };
+		const executor = vi.fn(async () => 42);
+		const settled = vi.fn(async () => {
+			throw new Error("observer failed");
+		});
+
+		expect(
+			await gateway.executeAuthoritative(operation, executor, {
+				reuse: async () => {
+					throw new Error("cache failed");
+				},
+				settled,
+			}),
+		).toBe(42);
+		expect(executor).toHaveBeenCalledOnce();
+		expect(settled).toHaveBeenCalledWith(
+			expect.objectContaining({ status: "succeeded", output: 42, durationMs: expect.any(Number) }),
+		);
+
+		executor.mockClear();
+		settled.mockClear();
+		expect(
+			await gateway.executeAuthoritative(operation, executor, { reuse: async () => 7, settled }),
+		).toBe(7);
+		expect(executor).not.toHaveBeenCalled();
+		expect(settled).not.toHaveBeenCalled();
+	});
+
+	it("reports the original Actor error without letting observation replace it", async () => {
+		const gateway = new ToolExecutionGateway<TestContext, string>([]);
+		const failure = new Error("actor failed");
+		const observer = vi.fn(async () => {
+			throw new Error("observer failed");
+		});
+
+		await expect(
+			gateway.executeAuthoritative(
+				{ tool: "bash", input: "exit 1" },
+				async () => {
+					throw failure;
+				},
+				{ settled: observer },
+			),
+		).rejects.toBe(failure);
+		expect(observer).toHaveBeenCalledWith(
+			expect.objectContaining({ status: "failed", error: failure, durationMs: expect.any(Number) }),
+		);
+	});
 });
 
 function branch(backend: string, output: string) {

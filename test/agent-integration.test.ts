@@ -126,15 +126,19 @@ describe("speculative action host", () => {
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
-		const hit = await host.consume({
-			turnID: "turn-1",
-			id: "actor-1",
-			tool: "read",
-			args: { path: "notes.txt" },
-			tools: [tool],
-		});
+		const hit = await host.execute(
+			{
+				turnID: "turn-1",
+				id: "actor-1",
+				tool: "read",
+				args: { path: "notes.txt" },
+				tools: [tool],
+			},
+			undefined,
+			async () => tool.execute("actor-1", { path: "notes.txt" }),
+		);
 
-		expect(hit?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
+		expect(hit.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
 		expect(executions).toBe(1);
 		expect(events.find((event) => event.type === "candidate")).toMatchObject({
 			candidate: { execution: "resource_snapshot" },

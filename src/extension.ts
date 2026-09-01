@@ -61,7 +61,6 @@ import {
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
 } from "./settings-store.ts";
-import type { ToolSettlement } from "./tool-settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
 import { createWorkspaceSandbox } from "./workspace-sandbox.ts";
@@ -485,59 +484,22 @@ async function installController(
 			const definition = baseDefinitions.get(tool);
 			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
 			const turnID = currentTurnID;
-			if (turnID) {
-				const cached = await recoverSpeculation(() =>
-					host.consume({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
-				);
-				if (cached) return cached.result;
-			}
-			const startedAt = performance.now();
-			try {
-				const result = await host.executeAuthoritative(
-					{ tool, callID, input, ...(signal ? { signal } : {}) },
-					async (operation) =>
-						withPiProjectionCoverage(
-							operation.tool,
-							operation.input,
-							await definition.execute(
-								callID,
-								operation.input as never,
-								operation.signal,
-								onUpdate as never,
-								nextContext,
-							),
+			return host.execute(
+				{ ...(turnID ? { turnID } : {}), id: callID, tool, args: input, tools: turnTools },
+				signal,
+				async (operation) =>
+					withPiProjectionCoverage(
+						operation.tool,
+						operation.input,
+						await definition.execute(
+							callID,
+							operation.input as never,
+							operation.signal,
+							onUpdate as never,
+							nextContext,
 						),
-				);
-				if (turnID) {
-					await recoverSpeculation(() =>
-						host.actual({
-							turnID,
-							id: callID,
-							tool,
-							args: input,
-							tools: turnTools,
-							durationMs: performance.now() - startedAt,
-							output: { result, isError: false },
-						}),
-					);
-				}
-				return result;
-			} catch (error) {
-				if (turnID) {
-					await recoverSpeculation(() =>
-						host.actual({
-							turnID,
-							id: callID,
-							tool,
-							args: input,
-							tools: turnTools,
-							durationMs: performance.now() - startedAt,
-							output: errorToolSettlement(error),
-						}),
-					);
-				}
-				throw error;
-			}
+					),
+			);
 		},
 		statusText: () => {
 			const effective = settings();
@@ -649,14 +611,6 @@ function toAgentTool(base: BaseToolDefinition, context: () => ExtensionContext):
 				input,
 				await base.execute(callID, input as never, signal, onUpdate as never, context()),
 			),
-	};
-}
-
-function errorToolSettlement(error: unknown): ToolSettlement {
-	const message = error instanceof Error ? error.message : String(error);
-	return {
-		result: { content: [{ type: "text", text: message }], details: {} },
-		isError: true,
 	};
 }
 

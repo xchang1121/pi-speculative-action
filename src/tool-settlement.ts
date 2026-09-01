@@ -6,6 +6,14 @@ export interface ToolSettlement<TDetails = unknown> {
 	readonly isError: boolean;
 }
 
+export function toolErrorSettlement(error: unknown): ToolSettlement {
+	const message = error instanceof Error ? error.message : String(error);
+	return {
+		result: { content: [{ type: "text", text: message }], details: {} },
+		isError: true,
+	};
+}
+
 /** Exact process invocation accepted by an optional isolated-process backend. */
 export interface ToolProcessInvocation {
 	readonly command: string;
