@@ -56,6 +56,4 @@ export interface WorkspaceSnapshot<Entry> {
 	readonly complete: boolean;
 }
 
-export interface WorkspaceTreeSnapshot extends WorkspaceSnapshot<WorkspaceTreeEntry> {}
-
 export interface WorkspaceStructureSnapshot extends WorkspaceSnapshot<WorkspaceStructureEntry> {}

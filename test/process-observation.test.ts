@@ -4,49 +4,12 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
 	captureWorkspaceStructure,
-	captureWorkspaceTree,
 	diffWorkspaceStructures,
-	diffWorkspaceTrees,
 	ExecutionPathProjection,
-	parentSnapshotEntry,
-	relativeSnapshotEntry,
 	snapshotDependency,
 } from "../src/process-observation.ts";
 
 describe("process observation", () => {
-	test("projects disposable paths and seals regular final-state effects", async () => {
-		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pi-process-observation-"));
-		const source = path.join(parent, "source");
-		const workspace = path.join(parent, "private", "workspace");
-		await fs.mkdir(workspace, { recursive: true });
-		await fs.writeFile(path.join(workspace, "input.txt"), "before");
-		const projection = new ExecutionPathProjection({ sourceRoot: source, workspaceRoot: workspace });
-		try {
-			const before = await captureWorkspaceTree(workspace);
-			await Promise.all([
-				fs.writeFile(path.join(workspace, "input.txt"), "after"),
-				fs.writeFile(path.join(workspace, "created.txt"), "created"),
-			]);
-			const after = await captureWorkspaceTree(workspace, { includeFileContent: true });
-			const diff = diffWorkspaceTrees(before, after, projection);
-
-			expect(diff.complete).toBe(true);
-			expect(diff.effects.map((effect) => [effect.kind, effect.logicalPath])).toEqual([
-				["write", path.join(source, "created.txt").replaceAll("\\", "/")],
-				["write", path.join(source, "input.txt").replaceAll("\\", "/")],
-			]);
-			expect(projection.toPhysical(path.join(source, "input.txt"))).toBe(path.join(workspace, "input.txt"));
-			const dependency = snapshotDependency(
-				projection.toLogical(path.join(workspace, "input.txt")),
-				relativeSnapshotEntry(before, path.join(workspace, "input.txt")),
-				parentSnapshotEntry(before, path.join(workspace, "input.txt")),
-			);
-			expect(dependency).toMatchObject({ kind: "file", role: "input" });
-		} finally {
-			await fs.rm(parent, { recursive: true, force: true });
-		}
-	});
-
 	test("joins content-free structure snapshots with an authoritative regular-file delta", async () => {
 		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pi-process-structure-"));
 		const source = path.join(parent, "source");
@@ -92,6 +55,13 @@ describe("process observation", () => {
 			const effect = diff.effects[0];
 			if (effect?.kind !== "write") throw new Error("write effect missing");
 			expect(effect.before).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
+			const parentEntry = before.entries.get("");
+			if (parentEntry?.kind !== "directory") throw new Error("workspace root structure missing");
+			expect(projection.toPhysical(path.join(source, "value.bin"))).toBe(target);
+			expect(snapshotDependency(projection.toLogical(target), effect.before, parentEntry)).toMatchObject({
+				kind: "file",
+				role: "input",
+			});
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
@@ -105,10 +75,8 @@ describe("process observation", () => {
 		const projection = new ExecutionPathProjection({ sourceRoot: source, workspaceRoot: workspace });
 		try {
 			const before = await captureWorkspaceStructure(workspace);
-			const beforeTree = await captureWorkspaceTree(workspace);
 			await fs.mkdir(path.join(workspace, "empty"));
 			const after = await captureWorkspaceStructure(workspace);
-			const afterTree = await captureWorkspaceTree(workspace, { includeFileContent: true });
 			const diff = diffWorkspaceStructures(before, after, [], projection);
 
 			expect(diff.complete).toBe(true);
@@ -117,10 +85,6 @@ describe("process observation", () => {
 			const created = diff.effects[0];
 			if (created?.kind !== "mkdir") throw new Error("mkdir effect missing");
 			expect(created.after).toMatchObject({ kind: "directory", mode: expect.any(Number) });
-			expect(diffWorkspaceTrees(beforeTree, afterTree, projection)).toMatchObject({
-				complete: false,
-				reason: expect.stringContaining("unsupported_directory"),
-			});
 
 			await fs.rmdir(path.join(workspace, "empty"));
 			const removed = diffWorkspaceStructures(after, await captureWorkspaceStructure(workspace), [], projection);
@@ -146,10 +110,8 @@ describe("process observation", () => {
 		const projection = new ExecutionPathProjection({ sourceRoot: source, workspaceRoot: workspace });
 		try {
 			const before = await captureWorkspaceStructure(workspace);
-			const beforeTree = await captureWorkspaceTree(workspace);
 			await fs.link(original, linked);
 			const after = await captureWorkspaceStructure(workspace);
-			const afterTree = await captureWorkspaceTree(workspace, { includeFileContent: true });
 			const linkedEntry = after.entries.get("linked.txt");
 			if (linkedEntry?.kind !== "file") throw new Error("hard link structure missing");
 			const diff = diffWorkspaceStructures(
@@ -166,10 +128,6 @@ describe("process observation", () => {
 			);
 
 			expect(diff).toMatchObject({ complete: false, reason: expect.stringContaining("unsupported_hardlink") });
-			expect(diffWorkspaceTrees(beforeTree, afterTree, projection)).toMatchObject({
-				complete: false,
-				reason: expect.stringContaining("unsupported_hardlink"),
-			});
 		} finally {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
