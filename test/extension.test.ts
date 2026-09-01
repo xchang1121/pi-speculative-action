@@ -407,6 +407,47 @@ describe("zero-modification Pi extension", () => {
 			]),
 		);
 	});
+
+	it("binds typed setting descriptors across root, self-speculation, and PatternAware settings", async () => {
+		const fixture = await createFixture();
+		const selections = new Map<string, string[]>([
+			["Speculative action", ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"]],
+			["Scheduling & cache", ["Resource cache memory", "Back"]],
+			["Self-speculation", ["Endpoint", "Fork action confidence", "Back"]],
+			["Prediction sources", ["PatternAware", "Back"]],
+			["PatternAware", ["Learning", "Back"]],
+			["PatternAware learning", ["Future gap coverage", "Back"]],
+		]);
+		fixture.ui.select = async (title, options) => {
+			const prefix = selections.get(title)?.shift();
+			return prefix === "Back" || prefix === "Close"
+				? prefix
+				: options.find((option) => option.startsWith(prefix ?? ""));
+		};
+		fixture.ui.input = async (title) =>
+			({
+				"Resource cache memory (MiB)": "96",
+				"Self-speculation endpoint": "file:///unsafe",
+				"Fork action minimum confidence": "0.75",
+				"Future gap coverage (0-1)": "0.8",
+			} as Readonly<Record<string, string>>)[title];
+
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+
+		expect(fixture.store.effective()).toMatchObject({
+			resourceCacheMaxBytes: 96 * 1024 * 1024,
+			selfSpeculation: {
+				endpoint: "http://127.0.0.1:8000",
+				forkActionMinConfidence: 0.75,
+			},
+			patternAware: { futureGapCoverage: 0.8 },
+		});
+		expect(fixture.ui.notify).toHaveBeenCalledWith(
+			"Endpoint must be an absolute HTTP(S) URL.",
+			"warning",
+		);
+	});
 });
 
 interface FixtureOptions {
@@ -453,7 +494,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const ui = {
 		select: async (_title: string, _options: string[]) => undefined as string | undefined,
 		confirm: async () => false,
-		input: async () => undefined as string | undefined,
+		input: async (_title: string, _placeholder?: string) => undefined as string | undefined,
 		notify: vi.fn(),
 		setStatus: vi.fn(),
 	};

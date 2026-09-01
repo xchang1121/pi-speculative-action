@@ -51,6 +51,17 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessTo
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import {
+	nonEmptyTextInput,
+	nonNegativeIntegerInput,
+	nonNegativeNumberInput,
+	optionalPositiveIntegerInput,
+	optionalTextInput,
+	positiveIntegerInput,
+	probabilityInput,
+	settingInput,
+	type SettingInputDescriptor,
+} from "./setting-input.ts";
+import {
 	normalizeSelfSpeculationSettings,
 	SelfSpeculationCoordinator,
 	type SelfSpeculationCoordinatorSnapshot,
@@ -100,6 +111,85 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly selfSpeculation: SelfSpeculationSettings;
 	readonly tools: readonly string[];
 }
+
+type SettingInputDescriptors<T, K extends keyof T> = {
+	readonly [Field in K]: SettingInputDescriptor<T[Field]>;
+};
+
+const ROOT_SETTING_INPUTS = {
+	candidateLimit: positiveIntegerInput("Drafter requests per turn", { transform: clampCandidateLimit }),
+	maxConcurrentActions: positiveIntegerInput("Concurrent actions", { transform: clampCandidateLimit }),
+	resourceCacheMaxEntries: positiveIntegerInput("Resource cache entries"),
+	resourceCacheMaxBytes: positiveIntegerInput("Resource cache memory (MiB)", {
+		error: "Resource cache memory must be a positive integer in MiB.",
+		format: (bytes) => String(Math.max(1, Math.round(bytes / (1024 * 1024)))),
+		transform: (mebibytes) => mebibytes * 1024 * 1024,
+	}),
+	predictionTimeoutMs: positiveIntegerInput("Prediction timeout (ms)"),
+	drafterMaxTokens: optionalPositiveIntegerInput("Drafter output tokens (blank for provider default)"),
+	drafterMaxDepth: nonNegativeIntegerInput("Drafter rollout depth"),
+	drafterDeterministicCandidates: nonNegativeIntegerInput("Deterministic Drafter requests"),
+} satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
+type RootInputField = keyof typeof ROOT_SETTING_INPUTS;
+
+const SELF_SPECULATION_INPUTS = {
+	endpoint: settingInput("Self-speculation endpoint", String, (input) => {
+		const value = input.trim();
+		return /^https?:\/\/[^\s]+$/u.test(value)
+			? { ok: true, value }
+			: { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
+	}),
+	forkActionMinConfidence: probabilityInput("Fork action minimum confidence"),
+	forkGateMinSamples: positiveIntegerInput("Gate warm-up samples"),
+	forkGateWindowSize: positiveIntegerInput("Gate rolling window"),
+	forkGateMinNetBenefitMs: nonNegativeNumberInput("Gate minimum net benefit (ms)"),
+	forkGateProbeInterval: positiveIntegerInput("Gate probe interval"),
+	forkGateFailureThreshold: positiveIntegerInput("Gate failure threshold"),
+	maxCandidates: positiveIntegerInput("Candidate bundle size"),
+	maxDraftTokens: positiveIntegerInput("Draft tokens"),
+	draftFormat: nonEmptyTextInput("Draft format"),
+	draftBoundary: nonEmptyTextInput("Draft boundary"),
+	forkMaxTokens: positiveIntegerInput("Fork tokens"),
+	timeoutMs: positiveIntegerInput("Control timeout (ms)"),
+	forkTemperature: nonNegativeNumberInput("Fork temperature"),
+	forkDecoder: nonEmptyTextInput("Fork decoder"),
+	forkForcedPrefix: nonEmptyTextInput("Forced prefix"),
+	apiKeyEnv: optionalTextInput("Bearer-token environment variable"),
+} satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
+type SelfSpeculationInputField = keyof typeof SELF_SPECULATION_INPUTS;
+
+const PATTERN_SETTING_INPUTS = {
+	maxContextLength: positiveIntegerInput("Pattern context events"),
+	maxFutureGap: nonNegativeIntegerInput("Pattern future gap"),
+	futureGapCoverage: probabilityInput("Future gap coverage (0-1)", {
+		error: "Future gap coverage must be between 0 and 1.",
+	}),
+	decayHalfLifeEvents: positiveIntegerInput("Pattern half-life (events)", {
+		error: "Pattern half-life must be a positive integer.",
+	}),
+	minOccurrences: positiveIntegerInput("Promotion occurrences"),
+	maxPatterns: positiveIntegerInput("Pattern capacity"),
+	beamWidth: positiveIntegerInput("Pattern beam width per tool"),
+	maxPredictionDepth: positiveIntegerInput("Pattern prediction depth"),
+	minBindingReplayProbability: probabilityInput("Minimum binding replay probability (0-1)", {
+		error: "Minimum binding replay probability must be between 0 and 1.",
+	}),
+} satisfies Partial<SettingInputDescriptors<PatternAwareSettings, keyof PatternAwareSettings>>;
+type PatternInputField = keyof typeof PATTERN_SETTING_INPUTS;
+
+const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
+	"Drafter temperature range",
+	([lower, upper]) => `${formatNumber(lower)},${formatNumber(upper)}`,
+	(input) => {
+		const [lower, upper, ...extra] = input.split(",").map((item) => Number(item.trim()));
+		return extra.length === 0 && Number.isFinite(lower) && Number.isFinite(upper) && lower >= 0 && upper >= lower
+			? { ok: true, value: [lower, upper] as const }
+			: {
+					ok: false,
+					error: "Drafter temperature range must be two non-negative comma-separated numbers in ascending order.",
+				};
+	},
+);
 
 export type SpeculativeActionMetrics = SpeculativeTraceSummary;
 
@@ -888,7 +978,8 @@ async function openSelfSpeculationSettings(
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Enabled:")) updateSelfSpeculation(controller, settings, { enabled: !self.enabled });
-		if (choice.startsWith("Endpoint:")) await editSelfSpeculationEndpoint(ctx, controller, settings);
+		if (choice.startsWith("Endpoint:"))
+			await editSelfSpeculationSetting(ctx, controller, settings, "endpoint");
 		if (choice.startsWith("Fork transport:")) {
 			const selected = await ctx.ui.select("Fork transport", ["provider", "sidecar", BACK]);
 			if (selected === "provider" || selected === "sidecar")
@@ -899,61 +990,43 @@ async function openSelfSpeculationSettings(
 		if (choice.startsWith("Fork action source:"))
 			updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled });
 		if (choice.startsWith("Fork action confidence:"))
-			await editSelfSpeculationProbability(
-				ctx,
-				controller,
-				settings,
-				"forkActionMinConfidence",
-				"Fork action minimum confidence",
-			);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkActionMinConfidence");
 		if (choice.startsWith("Drafter fork:"))
 			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
 		if (choice.startsWith("Fork gate:"))
 			updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled });
 		if (choice.startsWith("Gate warm-up:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateMinSamples", "Gate warm-up samples");
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateMinSamples");
 		if (choice.startsWith("Gate window:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateWindowSize", "Gate rolling window");
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateWindowSize");
 		if (choice.startsWith("Gate minimum net:"))
-			await editSelfSpeculationNonNegativeNumber(
-				ctx,
-				controller,
-				settings,
-				"forkGateMinNetBenefitMs",
-				"Gate minimum net benefit (ms)",
-			);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateMinNetBenefitMs");
 		if (choice.startsWith("Gate probe interval:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "forkGateProbeInterval", "Gate probe interval");
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateProbeInterval");
 		if (choice.startsWith("Gate failure threshold:"))
-			await editSelfSpeculationInteger(
-				ctx,
-				controller,
-				settings,
-				"forkGateFailureThreshold",
-				"Gate failure threshold",
-			);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateFailureThreshold");
 		if (choice.startsWith("Candidate bundle:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "maxCandidates", "Candidate bundle size");
+			await editSelfSpeculationSetting(ctx, controller, settings, "maxCandidates");
 		if (choice.startsWith("Draft tokens:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "maxDraftTokens", "Draft tokens");
+			await editSelfSpeculationSetting(ctx, controller, settings, "maxDraftTokens");
 		if (choice.startsWith("Draft format:"))
-			await editSelfSpeculationString(ctx, controller, settings, "draftFormat", "Draft format", false);
+			await editSelfSpeculationSetting(ctx, controller, settings, "draftFormat");
 		if (choice.startsWith("Draft boundary:"))
-			await editSelfSpeculationString(ctx, controller, settings, "draftBoundary", "Draft boundary", false);
+			await editSelfSpeculationSetting(ctx, controller, settings, "draftBoundary");
 		if (choice.startsWith("Fork tokens:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "forkMaxTokens", "Fork tokens");
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkMaxTokens");
 		if (choice.startsWith("Control timeout:"))
-			await editSelfSpeculationInteger(ctx, controller, settings, "timeoutMs", "Control timeout (ms)");
+			await editSelfSpeculationSetting(ctx, controller, settings, "timeoutMs");
 		if (choice.startsWith("Fork temperature:"))
-			await editSelfSpeculationTemperature(ctx, controller, settings);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkTemperature");
 		if (choice.startsWith("Decoder:"))
-			await editSelfSpeculationString(ctx, controller, settings, "forkDecoder", "Fork decoder", false);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkDecoder");
 		if (choice.startsWith("Forced prefix:"))
-			await editSelfSpeculationString(ctx, controller, settings, "forkForcedPrefix", "Forced prefix", false);
+			await editSelfSpeculationSetting(ctx, controller, settings, "forkForcedPrefix");
 		if (choice.startsWith("Require logprobs:"))
 			updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs });
 		if (choice.startsWith("Bearer-token env:"))
-			await editSelfSpeculationString(ctx, controller, settings, "apiKeyEnv", "Bearer-token environment variable", true);
+			await editSelfSpeculationSetting(ctx, controller, settings, "apiKeyEnv");
 	}
 }
 
@@ -978,31 +1051,19 @@ async function openDrafterSettings(ctx: ExtensionContext, controller: Speculativ
 			controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled });
 		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
 		if (choice.startsWith("Rollout depth:")) {
-			await editDrafterNonNegativeInteger(ctx, controller, settings, "drafterMaxDepth", "Drafter rollout depth");
+			await editRootSetting(ctx, controller, settings, "drafterMaxDepth");
 		}
 		if (choice.startsWith("Output tokens:")) {
-			await editPositiveInteger(
-				ctx,
-				controller,
-				settings,
-				"drafterMaxTokens",
-				"Drafter output tokens (blank for provider default)",
-			);
+			await editRootSetting(ctx, controller, settings, "drafterMaxTokens");
 		}
 		if (choice.startsWith("Deterministic requests:")) {
-			await editDrafterNonNegativeInteger(
-				ctx,
-				controller,
-				settings,
-				"drafterDeterministicCandidates",
-				"Deterministic Drafter requests",
-			);
+			await editRootSetting(ctx, controller, settings, "drafterDeterministicCandidates");
 		}
 		if (choice.startsWith("Temperature range:")) {
 			await editDrafterTemperatureRange(ctx, controller, settings);
 		}
 		if (choice.startsWith("Prediction timeout:")) {
-			await editPositiveInteger(ctx, controller, settings, "predictionTimeoutMs", "Prediction timeout (ms)");
+			await editRootSetting(ctx, controller, settings, "predictionTimeoutMs");
 		}
 	}
 }
@@ -1043,18 +1104,20 @@ async function openPatternLearning(ctx: ExtensionContext, controller: Speculativ
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Context events:")) {
-			await editPatternInteger(ctx, controller, settings, "maxContextLength", "Pattern context events", false);
+			await editPatternSetting(ctx, controller, settings, "maxContextLength");
 		}
 		if (choice.startsWith("Future gap:")) {
-			await editPatternInteger(ctx, controller, settings, "maxFutureGap", "Pattern future gap", true);
+			await editPatternSetting(ctx, controller, settings, "maxFutureGap");
 		}
-		if (choice.startsWith("Future gap coverage:")) await editFutureGapCoverage(ctx, controller, settings);
-		if (choice.startsWith("Decay half-life:")) await editPatternHalfLife(ctx, controller, settings);
+		if (choice.startsWith("Future gap coverage:"))
+			await editPatternSetting(ctx, controller, settings, "futureGapCoverage");
+		if (choice.startsWith("Decay half-life:"))
+			await editPatternSetting(ctx, controller, settings, "decayHalfLifeEvents");
 		if (choice.startsWith("Promotion occurrences:")) {
-			await editPatternInteger(ctx, controller, settings, "minOccurrences", "Promotion occurrences", false);
+			await editPatternSetting(ctx, controller, settings, "minOccurrences");
 		}
 		if (choice.startsWith("Pattern capacity:")) {
-			await editPatternInteger(ctx, controller, settings, "maxPatterns", "Pattern capacity", false);
+			await editPatternSetting(ctx, controller, settings, "maxPatterns");
 		}
 	}
 }
@@ -1078,19 +1141,13 @@ async function openPatternMultiStep(ctx: ExtensionContext, controller: Speculati
 			});
 		}
 		if (choice.startsWith("Beam width per tool:")) {
-			await editPatternInteger(ctx, controller, settings, "beamWidth", "Pattern beam width per tool", false);
+			await editPatternSetting(ctx, controller, settings, "beamWidth");
 		}
 		if (choice.startsWith("Prediction depth:")) {
-			await editPatternInteger(ctx, controller, settings, "maxPredictionDepth", "Pattern prediction depth", false);
+			await editPatternSetting(ctx, controller, settings, "maxPredictionDepth");
 		}
 		if (choice.startsWith("Minimum binding replay:")) {
-			await editPatternProbability(
-				ctx,
-				controller,
-				settings,
-				"minBindingReplayProbability",
-				"Minimum binding replay probability",
-			);
+			await editPatternSetting(ctx, controller, settings, "minBindingReplayProbability");
 		}
 	}
 }
@@ -1107,15 +1164,16 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Drafter requests:")) {
-			await editPositiveInteger(ctx, controller, settings, "candidateLimit", "Drafter requests per turn");
+			await editRootSetting(ctx, controller, settings, "candidateLimit");
 		}
 		if (choice.startsWith("Concurrent actions:")) {
-			await editPositiveInteger(ctx, controller, settings, "maxConcurrentActions", "Concurrent actions");
+			await editRootSetting(ctx, controller, settings, "maxConcurrentActions");
 		}
 		if (choice.startsWith("Resource cache entries:")) {
-			await editPositiveInteger(ctx, controller, settings, "resourceCacheMaxEntries", "Resource cache entries");
+			await editRootSetting(ctx, controller, settings, "resourceCacheMaxEntries");
 		}
-		if (choice.startsWith("Resource cache memory:")) await editCacheBytes(ctx, controller, settings);
+		if (choice.startsWith("Resource cache memory:"))
+			await editRootSetting(ctx, controller, settings, "resourceCacheMaxBytes");
 	}
 }
 
@@ -1196,159 +1254,85 @@ function updateSelfSpeculation(
 	});
 }
 
-async function editSelfSpeculationEndpoint(
+async function promptSetting<T>(
 	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const value = await ctx.ui.input("Self-speculation endpoint", settings.selfSpeculation.endpoint);
-	if (value === undefined) return;
-	const endpoint = value.trim();
-	if (!/^https?:\/\/[^\s]+$/u.test(endpoint)) {
-		ctx.ui.notify("Endpoint must be an absolute HTTP(S) URL.", "warning");
-		return;
+	current: T,
+	descriptor: SettingInputDescriptor<T>,
+): Promise<{ readonly accepted: false } | { readonly accepted: true; readonly value: T }> {
+	const input = await ctx.ui.input(descriptor.title, descriptor.format(current));
+	if (input === undefined) return { accepted: false };
+	const parsed = descriptor.parse(input);
+	if (!parsed.ok) {
+		ctx.ui.notify(parsed.error, "warning");
+		return { accepted: false };
 	}
-	updateSelfSpeculation(controller, settings, { endpoint });
+	return { accepted: true, value: parsed.value };
 }
 
-async function editSelfSpeculationInteger(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field:
-		| "maxCandidates"
-		| "maxDraftTokens"
-		| "forkMaxTokens"
-		| "timeoutMs"
-		| "forkGateMinSamples"
-		| "forkGateWindowSize"
-		| "forkGateProbeInterval"
-		| "forkGateFailureThreshold",
-	title: string,
-): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed <= 0) {
-		ctx.ui.notify(`${title} must be a positive integer.`, "warning");
-		return;
-	}
-	updateSelfSpeculation(controller, settings, { [field]: parsed });
+function replaceSetting<T extends object, Field extends keyof T>(current: T, field: Field, value: T[Field]): T {
+	const next = { ...current };
+	if (value === undefined) Reflect.deleteProperty(next, field);
+	else Object.assign(next, { [field]: value });
+	return next;
 }
 
-async function editSelfSpeculationNonNegativeNumber(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "forkGateMinNetBenefitMs",
-	title: string,
-): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isFinite(parsed) || parsed < 0) {
-		ctx.ui.notify(`${title} must be a non-negative number.`, "warning");
-		return;
-	}
-	updateSelfSpeculation(controller, settings, { [field]: parsed });
+function inputDescriptor<T, Field extends keyof T>(
+	descriptors: Partial<SettingInputDescriptors<T, keyof T>>,
+	field: Field,
+): SettingInputDescriptor<T[Field]> {
+	return descriptors[field] as SettingInputDescriptor<T[Field]>;
 }
 
-async function editSelfSpeculationProbability(
+async function editRootSetting<Field extends RootInputField>(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
-	field: "forkActionMinConfidence",
-	title: string,
+	field: Field,
 ): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings.selfSpeculation[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-		ctx.ui.notify(`${title} must be between 0 and 1.`, "warning");
-		return;
-	}
-	updateSelfSpeculation(controller, settings, { [field]: parsed });
+	const edited = await promptSetting(
+		ctx,
+		settings[field],
+		inputDescriptor<EffectiveSpeculativeActionSettings, Field>(ROOT_SETTING_INPUTS, field),
+	);
+	if (edited.accepted) controller.setSettings(replaceSetting(settings, field, edited.value));
 }
 
-async function editSelfSpeculationTemperature(
+async function editSelfSpeculationSetting<Field extends SelfSpeculationInputField>(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
+	field: Field,
 ): Promise<void> {
-	const value = await ctx.ui.input("Fork temperature", String(settings.selfSpeculation.forkTemperature));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isFinite(parsed) || parsed < 0) {
-		ctx.ui.notify("Fork temperature must be a non-negative number.", "warning");
-		return;
+	const edited = await promptSetting(
+		ctx,
+		settings.selfSpeculation[field],
+		inputDescriptor<SelfSpeculationSettings, Field>(SELF_SPECULATION_INPUTS, field),
+	);
+	if (edited.accepted) {
+		controller.setSettings({
+			...settings,
+			selfSpeculation: replaceSetting(settings.selfSpeculation, field, edited.value),
+		});
 	}
-	updateSelfSpeculation(controller, settings, { forkTemperature: parsed });
 }
 
-async function editSelfSpeculationString(
+async function editPatternSetting<Field extends PatternInputField>(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
-	field: "draftFormat" | "draftBoundary" | "forkDecoder" | "forkForcedPrefix" | "apiKeyEnv",
-	title: string,
-	allowEmpty: boolean,
+	field: Field,
 ): Promise<void> {
-	const current = settings.selfSpeculation[field] ?? "";
-	const value = await ctx.ui.input(title, current);
-	if (value === undefined) return;
-	const normalized = value.trim();
-	if (!allowEmpty && !normalized) {
-		ctx.ui.notify(`${title} cannot be empty.`, "warning");
-		return;
+	const edited = await promptSetting(
+		ctx,
+		settings.patternAware[field],
+		inputDescriptor<PatternAwareSettings, Field>(PATTERN_SETTING_INPUTS, field),
+	);
+	if (edited.accepted) {
+		controller.setSettings({
+			...settings,
+			patternAware: replaceSetting(settings.patternAware, field, edited.value),
+		});
 	}
-	updateSelfSpeculation(controller, settings, { [field]: normalized || undefined });
-}
-
-async function editPositiveInteger(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field:
-		| "candidateLimit"
-		| "maxConcurrentActions"
-		| "resourceCacheMaxEntries"
-		| "predictionTimeoutMs"
-		| "drafterMaxTokens",
-	title: string,
-): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings[field] ?? ""));
-	if (value === undefined) return;
-	if (field === "drafterMaxTokens" && value.trim() === "") {
-		const { drafterMaxTokens: _removed, ...next } = settings;
-		controller.setSettings(next);
-		return;
-	}
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed <= 0) {
-		ctx.ui.notify(`${title} must be a positive integer.`, "warning");
-		return;
-	}
-	controller.setSettings({
-		...settings,
-		[field]: field === "candidateLimit" || field === "maxConcurrentActions" ? clampCandidateLimit(parsed) : parsed,
-	});
-}
-
-async function editDrafterNonNegativeInteger(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "drafterMaxDepth" | "drafterDeterministicCandidates",
-	title: string,
-): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed < 0) {
-		ctx.ui.notify(`${title} must be a non-negative integer.`, "warning");
-		return;
-	}
-	controller.setSettings({ ...settings, [field]: parsed });
 }
 
 async function editDrafterTemperatureRange(
@@ -1356,20 +1340,14 @@ async function editDrafterTemperatureRange(
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
 ): Promise<void> {
-	const value = await ctx.ui.input(
-		"Drafter temperature range",
-		`${formatNumber(settings.drafterTemperatureMin)},${formatNumber(settings.drafterTemperatureMax)}`,
+	const edited = await promptSetting(
+		ctx,
+		[settings.drafterTemperatureMin, settings.drafterTemperatureMax] as const,
+		DRAFTER_TEMPERATURE_INPUT,
 	);
-	if (value === undefined) return;
-	const [lower, upper, ...extra] = value.split(",").map((item) => Number(item.trim()));
-	if (extra.length > 0 || !Number.isFinite(lower) || !Number.isFinite(upper) || lower < 0 || upper < lower) {
-		ctx.ui.notify(
-			"Drafter temperature range must be two non-negative comma-separated numbers in ascending order.",
-			"warning",
-		);
-		return;
-	}
-	controller.setSettings({ ...settings, drafterTemperatureMin: lower, drafterTemperatureMax: upper });
+	if (!edited.accepted) return;
+	const [drafterTemperatureMin, drafterTemperatureMax] = edited.value;
+	controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
 }
 
 async function editDraftModel(
@@ -1416,101 +1394,6 @@ async function editDraftModel(
 	if (!selected || selected === BACK) return;
 	const draftModel = labels.get(selected);
 	if (draftModel) controller.setSettings({ ...baseSettings, draftModel });
-}
-
-async function editCacheBytes(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const value = await ctx.ui.input(
-		"Resource cache memory (MiB)",
-		String(Math.max(1, Math.round(settings.resourceCacheMaxBytes / (1024 * 1024)))),
-	);
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed <= 0) {
-		ctx.ui.notify("Resource cache memory must be a positive integer in MiB.", "warning");
-		return;
-	}
-	controller.setSettings({ ...settings, resourceCacheMaxBytes: parsed * 1024 * 1024 });
-}
-
-async function editFutureGapCoverage(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const value = await ctx.ui.input("Future gap coverage (0-1)", String(settings.patternAware.futureGapCoverage));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-		ctx.ui.notify("Future gap coverage must be between 0 and 1.", "warning");
-		return;
-	}
-	controller.setSettings({
-		...settings,
-		patternAware: { ...settings.patternAware, futureGapCoverage: parsed },
-	});
-}
-
-async function editPatternHalfLife(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const value = await ctx.ui.input("Pattern half-life (events)", String(settings.patternAware.decayHalfLifeEvents));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || parsed <= 0) {
-		ctx.ui.notify("Pattern half-life must be a positive integer.", "warning");
-		return;
-	}
-	controller.setSettings({
-		...settings,
-		patternAware: { ...settings.patternAware, decayHalfLifeEvents: parsed },
-	});
-}
-
-async function editPatternInteger(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "maxContextLength" | "beamWidth" | "maxPredictionDepth" | "maxFutureGap" | "minOccurrences" | "maxPatterns",
-	title: string,
-	allowZero: boolean,
-): Promise<void> {
-	const value = await ctx.ui.input(title, String(settings.patternAware[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isInteger(parsed) || (allowZero ? parsed < 0 : parsed <= 0)) {
-		ctx.ui.notify(`${title} must be ${allowZero ? "a non-negative" : "a positive"} integer.`, "warning");
-		return;
-	}
-	controller.setSettings({
-		...settings,
-		patternAware: { ...settings.patternAware, [field]: parsed },
-	});
-}
-
-async function editPatternProbability(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: "minBindingReplayProbability",
-	title: string,
-): Promise<void> {
-	const value = await ctx.ui.input(`${title} (0-1)`, String(settings.patternAware[field]));
-	if (value === undefined) return;
-	const parsed = Number(value.trim());
-	if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-		ctx.ui.notify(`${title} must be between 0 and 1.`, "warning");
-		return;
-	}
-	controller.setSettings({
-		...settings,
-		patternAware: { ...settings.patternAware, [field]: parsed },
-	});
 }
 
 function showRecentEvents(ctx: ExtensionContext, controller: SpeculativeActionController): void {
