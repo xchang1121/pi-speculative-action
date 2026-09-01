@@ -1,13 +1,21 @@
-import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
-import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import {
+	argument,
+	assert,
+	commitBenchmarkFixture,
+	compileBenchmarkHelper,
+	createLinuxProcessBenchmark,
+	executeReusableBash,
+	linuxBenchmarkHost,
+	median,
+	numericMetrics,
+	prepareLinuxProcessReuse,
+	subtractMetrics,
+	textOutput,
+	type NumericMetrics,
+	writeBenchmarkReport,
+} from "./linux-process-harness.ts";
 
 const HISTORY = 8;
 const INPUT_BYTES = 32 * 1024 * 1024;
@@ -54,8 +62,6 @@ int main(int argc, char **argv) {
 }
 `;
 
-type NumericMetrics = Readonly<Record<string, number>>;
-
 interface MeasuredRun {
 	readonly label: string;
 	readonly forkMs: number;
@@ -67,35 +73,13 @@ interface MeasuredRun {
 	readonly metricDelta: NumericMetrics;
 }
 
-if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const outputPath = argument("--output");
-const root = await mkdtemp(path.join(os.tmpdir(), "pi-bash-pathset-bench-"));
-const workspace = path.join(root, "workspace");
-const storeRoot = path.join(root, "process-reuse");
-await mkdir(workspace);
-const shellPath = "/bin/bash";
-const environment = Object.freeze({
-	PATH: `${workspace}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
-	HOME: os.homedir(),
-	LANG: "C.UTF-8",
-});
-const localOperations = createLocalBashOperations({ shellPath });
-const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localOperations));
-const backend = new LinuxProcessReuseBackend({ storeRoot });
-const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
-const tool = createBashTool(workspace, {
-	operations: coordinator.operations,
-	shellPath,
-	exposeSessionEnvironment: false,
-	spawnHook: (context) => ({ ...context, env: { ...environment } }),
-});
+const fixture = await createLinuxProcessBenchmark("pi-bash-pathset-bench-");
+const { backend, workspace } = fixture;
 
 try {
 	await prepareWorkspace(workspace);
-	const status = await backend.check(true);
-	if (status.state !== "ready") throw new Error(status.detail);
-	await world.prepare?.({ cwd: workspace });
-	const executionFingerprint = await backend.fingerprint();
+	const { status, executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 	const histories: MeasuredRun[] = [];
 	for (let index = 0; index < HISTORY; index++) {
 		await writeInput(workspace, index);
@@ -126,14 +110,7 @@ try {
 	const result = {
 		schemaVersion: 1,
 		measuredAt: new Date().toISOString(),
-		host: {
-			platform: process.platform,
-			arch: process.arch,
-			node: process.version,
-			kernel: (await commandOutput("uname", ["-srm"])).trim(),
-			sandlock: (await commandOutput(status.sandlockBinary!, ["--version"])).trim(),
-			strace: (await commandOutput(status.straceBinary!, ["-V"])).split(/\r?\n/)[0]?.trim(),
-		},
+		host: await linuxBenchmarkHost(status),
 		subject: "stock Pi createBashTool with eight historical strong keys sharing one dynamic pathset",
 		fixture: { histories: HISTORY, inputBytes: INPUT_BYTES, helperDelayMs: 500 },
 		assertions: {
@@ -152,115 +129,44 @@ try {
 			metrics: numericMetrics(backend.metrics()),
 		},
 	};
-	const rendered = `${JSON.stringify(result, null, 2)}\n`;
-	if (outputPath) {
-		await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-		await writeFile(path.resolve(outputPath), rendered, "utf8");
-	}
-	process.stdout.write(rendered);
+	await writeBenchmarkReport(result, outputPath);
 
 	async function runTask(label: string, command: string, executionFingerprint: string): Promise<MeasuredRun> {
-		const args = { command };
-		const invocation = resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath });
-		if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-		const action = PI_ACTION_SEMANTICS.buildKey("bash", args, workspace, "pi-bash-pathset-benchmark.v1", {
-			fingerprint: executionFingerprint,
-			context: invocation,
+		const execution = await executeReusableBash(fixture, {
+			label,
+			command,
+			actionNamespace: "pi-bash-pathset-benchmark.v1",
+			executionFingerprint,
 		});
-		if (!action) throw new Error("Pi Bash action could not be keyed");
-		const metricsBefore = numericMetrics(backend.metrics());
-		const started = performance.now();
-		const forkStarted = performance.now();
-		const branch = await world.fork({
-			cwd: workspace,
-			tool,
-			toolName: "bash",
-			args,
-			action,
-			callID: `bench-${label}`,
-			signal: new AbortController().signal,
-		});
-		const forkMs = performance.now() - forkStarted;
-		if (branch.output.isError) throw new Error(textOutput(branch.output.result));
-		const validationStarted = performance.now();
-		const validation = await branch.validate?.();
-		const validationMs = performance.now() - validationStarted;
-		if (validation?.status !== "valid") throw new Error(`branch validation failed: ${JSON.stringify(validation)}`);
-		const commitStarted = performance.now();
-		const committed = await branch.commit();
-		const commitMs = performance.now() - commitStarted;
-		branch.dispose();
 		return {
 			label,
-			forkMs,
-			validationMs,
-			commitMs,
-			totalMs: performance.now() - started,
-			output: textOutput(committed.result),
+			forkMs: execution.forkMs,
+			validationMs: execution.validationMs,
+			commitMs: execution.commitMs,
+			totalMs: execution.totalMs,
+			output: textOutput(execution.output.result),
 			artifact: (await readFile(path.join(workspace, "artifact.txt"), "utf8")).trim(),
-			metricDelta: subtractMetrics(metricsBefore, numericMetrics(backend.metrics())),
+			metricDelta: subtractMetrics(
+				numericMetrics(execution.metricsBefore),
+				numericMetrics(execution.metricsAfter),
+			),
 		};
 	}
 } finally {
-	await world.dispose?.();
-	await rm(root, { recursive: true, force: true });
+	await fixture.dispose();
 }
 
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-pathset-helper.c"), HELPER_SOURCE, "utf8");
 	await writeInput(workspace, 0);
-	await commandOutput("cc", ["-O2", "-Wall", "-Wextra", "-o", "pi-pathset-helper", "pi-pathset-helper.c"], workspace);
-	await commandOutput("git", ["init", "--quiet"], workspace);
-	await commandOutput("git", ["config", "user.name", "Pi Bash Pathset Benchmark"], workspace);
-	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);
-	await commandOutput("git", ["add", "pi-pathset-helper.c", "pi-pathset-helper", "input.bin"], workspace);
-	await commandOutput("git", ["commit", "--quiet", "-m", "benchmark fixture"], workspace);
-	await access(path.join(workspace, "pi-pathset-helper"));
+	await compileBenchmarkHelper(workspace, { source: "pi-pathset-helper.c", output: "pi-pathset-helper" });
+	await commitBenchmarkFixture(workspace, "Pi Bash Pathset Benchmark", [
+		"pi-pathset-helper.c",
+		"pi-pathset-helper",
+		"input.bin",
+	]);
 }
 
 function writeInput(workspace: string, version: number): Promise<void> {
 	return writeFile(path.join(workspace, "input.bin"), Buffer.alloc(INPUT_BYTES, version + 1));
-}
-
-function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));
-			else resolve(`${stdout}${stderr}`);
-		});
-	});
-}
-
-function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {
-	return result.content
-		.filter((item): item is { readonly type: "text"; readonly text: string } => item.type === "text" && typeof item.text === "string")
-		.map((item) => item.text)
-		.join("\n");
-}
-
-function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetrics {
-	return Object.fromEntries(
-		Object.entries(metrics).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
-	);
-}
-
-function subtractMetrics(before: NumericMetrics, after: NumericMetrics): NumericMetrics {
-	return Object.fromEntries(Object.entries(after).map(([name, value]) => [name, value - (before[name] ?? 0)]));
-}
-
-function median(values: readonly number[]): number {
-	const sorted = [...values].sort((left, right) => left - right);
-	return sorted[Math.floor(sorted.length / 2)]!;
-}
-
-function argument(name: string): string | undefined {
-	const index = process.argv.indexOf(name);
-	if (index < 0) return undefined;
-	const value = process.argv[index + 1];
-	if (!value || value.startsWith("--")) throw new Error(`${name} requires a path`);
-	return value;
-}
-
-function assert(condition: unknown, message: string): asserts condition {
-	if (!condition) throw new Error(message);
 }

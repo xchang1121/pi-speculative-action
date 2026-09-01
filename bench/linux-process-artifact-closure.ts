@@ -1,15 +1,21 @@
-import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
-import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import {
+	argument,
+	assert,
+	commitBenchmarkFixture,
+	compileBenchmarkHelper,
+	createLinuxProcessBenchmark,
+	executeReusableBash,
+	fileDigest,
+	linuxBenchmarkHost,
+	median,
+	numericMetrics,
+	prepareLinuxProcessReuse,
+	subtractMetrics,
+	type NumericMetrics,
+	writeBenchmarkReport,
+} from "./linux-process-harness.ts";
 
 const INPUT_BYTES = 128 * 1024 * 1024;
 const HIT_RUNS = 3;
@@ -48,8 +54,6 @@ int main(int argc, char **argv) {
 }
 `;
 
-type NumericMetrics = Readonly<Record<string, number>>;
-
 interface MeasuredRun {
 	readonly label: string;
 	readonly totalMs: number;
@@ -59,35 +63,13 @@ interface MeasuredRun {
 	readonly metricDelta: NumericMetrics;
 }
 
-if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const outputPath = argument("--output");
-const root = await mkdtemp(path.join(os.tmpdir(), "pi-artifact-closure-bench-"));
-const workspace = path.join(root, "workspace");
-const storeRoot = path.join(root, "process-reuse");
-await mkdir(workspace);
-const shellPath = "/bin/bash";
-const environment = Object.freeze({
-	PATH: `${workspace}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
-	HOME: os.homedir(),
-	LANG: "C.UTF-8",
-});
-const localOperations = createLocalBashOperations({ shellPath });
-const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localOperations));
-const backend = new LinuxProcessReuseBackend({ storeRoot });
-const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
-const tool = createBashTool(workspace, {
-	operations: coordinator.operations,
-	shellPath,
-	exposeSessionEnvironment: false,
-	spawnHook: (context) => ({ ...context, env: { ...environment } }),
-});
+const fixture = await createLinuxProcessBenchmark("pi-artifact-closure-bench-");
+const { backend, workspace } = fixture;
 
 try {
 	await prepareWorkspace(workspace);
-	const status = await backend.check(true);
-	if (status.state !== "ready") throw new Error(status.detail);
-	await world.prepare?.({ cwd: workspace });
-	const executionFingerprint = await backend.fingerprint();
+	const { status, executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 	const cold = await runTask("cold", "pi-artifact-helper input.bin artifact.bin", executionFingerprint);
 	assert(cold.metricDelta.misses === 1 && cold.metricDelta.hits === 0, "cold execution was not published");
 	const expectedDigest = await fileDigest(path.join(workspace, "input.bin"));
@@ -109,14 +91,7 @@ try {
 	const result = {
 		schemaVersion: 1,
 		measuredAt: new Date().toISOString(),
-		host: {
-			platform: process.platform,
-			arch: process.arch,
-			node: process.version,
-			kernel: (await commandOutput("uname", ["-srm"])).trim(),
-			sandlock: (await commandOutput(status.sandlockBinary!, ["--version"])).trim(),
-			strace: (await commandOutput(status.straceBinary!, ["-V"])).split(/\r?\n/)[0]?.trim(),
-		},
+		host: await linuxBenchmarkHost(status),
 		subject: "stock Pi createBashTool replaying one verified 128 MiB regular-file effect",
 		fixture: { inputBytes: INPUT_BYTES, helperDelayMs: 300, hitRuns: HIT_RUNS },
 		assertions: {
@@ -134,112 +109,38 @@ try {
 			metrics: numericMetrics(backend.metrics()),
 		},
 	};
-	const rendered = `${JSON.stringify(result, null, 2)}\n`;
-	if (outputPath) {
-		await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-		await writeFile(path.resolve(outputPath), rendered, "utf8");
-	}
-	process.stdout.write(rendered);
+	await writeBenchmarkReport(result, outputPath);
 
 	async function runTask(label: string, command: string, executionFingerprint: string): Promise<MeasuredRun> {
-		const args = { command };
-		const invocation = resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath });
-		if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-		const action = PI_ACTION_SEMANTICS.buildKey("bash", args, workspace, "pi-artifact-closure-benchmark.v1", {
-			fingerprint: executionFingerprint,
-			context: invocation,
+		const execution = await executeReusableBash(fixture, {
+			label,
+			command,
+			actionNamespace: "pi-artifact-closure-benchmark.v1",
+			executionFingerprint,
 		});
-		if (!action) throw new Error("Pi Bash action could not be keyed");
-		const metricsBefore = numericMetrics(backend.metrics());
-		const started = performance.now();
-		const forkStarted = performance.now();
-		const branch = await world.fork({
-			cwd: workspace,
-			tool,
-			toolName: "bash",
-			args,
-			action,
-			callID: `bench-${label}`,
-			signal: new AbortController().signal,
-		});
-		const forkMs = performance.now() - forkStarted;
-		if (branch.output.isError) throw new Error(JSON.stringify(branch.output.result));
-		const validationStarted = performance.now();
-		const validation = await branch.validate?.();
-		const validationMs = performance.now() - validationStarted;
-		if (validation?.status !== "valid") throw new Error(`branch validation failed: ${JSON.stringify(validation)}`);
-		const commitStarted = performance.now();
-		await branch.commit();
-		const commitMs = performance.now() - commitStarted;
-		branch.dispose();
 		return {
 			label,
-			totalMs: performance.now() - started,
-			forkMs,
-			validationMs,
-			commitMs,
-			metricDelta: subtractMetrics(metricsBefore, numericMetrics(backend.metrics())),
+			totalMs: execution.totalMs,
+			forkMs: execution.forkMs,
+			validationMs: execution.validationMs,
+			commitMs: execution.commitMs,
+			metricDelta: subtractMetrics(
+				numericMetrics(execution.metricsBefore),
+				numericMetrics(execution.metricsAfter),
+			),
 		};
 	}
 } finally {
-	await world.dispose?.();
-	await rm(root, { recursive: true, force: true });
+	await fixture.dispose();
 }
 
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-artifact-helper.c"), HELPER_SOURCE, "utf8");
 	await writeFile(path.join(workspace, "input.bin"), Buffer.alloc(INPUT_BYTES, 0x5a));
-	await commandOutput("cc", ["-O2", "-Wall", "-Wextra", "-o", "pi-artifact-helper", "pi-artifact-helper.c"], workspace);
-	await commandOutput("git", ["init", "--quiet"], workspace);
-	await commandOutput("git", ["config", "user.name", "Pi Artifact Benchmark"], workspace);
-	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);
-	await commandOutput("git", ["add", "pi-artifact-helper.c", "pi-artifact-helper", "input.bin"], workspace);
-	await commandOutput("git", ["commit", "--quiet", "-m", "benchmark fixture"], workspace);
-	await access(path.join(workspace, "pi-artifact-helper"));
-}
-
-function fileDigest(target: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const hash = createHash("sha256");
-		const stream = createReadStream(target);
-		stream.on("data", (chunk) => hash.update(chunk));
-		stream.once("error", reject);
-		stream.once("end", () => resolve(hash.digest("hex")));
-	});
-}
-
-function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));
-			else resolve(`${stdout}${stderr}`);
-		});
-	});
-}
-
-function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetrics {
-	return Object.fromEntries(
-		Object.entries(metrics).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
-	);
-}
-
-function subtractMetrics(before: NumericMetrics, after: NumericMetrics): NumericMetrics {
-	return Object.fromEntries(Object.entries(after).map(([name, value]) => [name, value - (before[name] ?? 0)]));
-}
-
-function median(values: readonly number[]): number {
-	const sorted = [...values].sort((left, right) => left - right);
-	return sorted[Math.floor(sorted.length / 2)]!;
-}
-
-function argument(name: string): string | undefined {
-	const index = process.argv.indexOf(name);
-	if (index < 0) return undefined;
-	const value = process.argv[index + 1];
-	if (!value || value.startsWith("--")) throw new Error(`${name} requires a path`);
-	return value;
-}
-
-function assert(condition: unknown, message: string): asserts condition {
-	if (!condition) throw new Error(message);
+	await compileBenchmarkHelper(workspace, { source: "pi-artifact-helper.c", output: "pi-artifact-helper" });
+	await commitBenchmarkFixture(workspace, "Pi Artifact Benchmark", [
+		"pi-artifact-helper.c",
+		"pi-artifact-helper",
+		"input.bin",
+	]);
 }

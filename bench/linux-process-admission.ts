@@ -1,6 +1,13 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { SpeculationScheduler } from "../src/scheduler.ts";
+import {
+	argument,
+	median,
+	numberArgument,
+	requiredArgument,
+	writeBenchmarkReport,
+} from "./linux-process-harness.ts";
 
 interface MeasuredRun {
 	readonly totalMs: number;
@@ -95,12 +102,7 @@ const result = {
 		...(expectedReady === undefined ? {} : { expectedReady: true, readyPolicy: expectedReady }),
 	},
 };
-const rendered = `${JSON.stringify(result, null, 2)}\n`;
-if (outputPath) {
-	await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-	await writeFile(path.resolve(outputPath), rendered, "utf8");
-}
-process.stdout.write(rendered);
+await writeBenchmarkReport(result, outputPath);
 
 async function readReport(filePath: string, mode: TopologyReport["mode"]): Promise<TopologyReport> {
 	const value = JSON.parse(await readFile(path.resolve(filePath), "utf8")) as Partial<TopologyReport>;
@@ -115,31 +117,4 @@ async function readReport(filePath: string, mode: TopologyReport["mode"]): Promi
 		}
 	}
 	return value as TopologyReport;
-}
-
-function median(values: readonly number[]): number {
-	const sorted = [...values].sort((left, right) => left - right);
-	return sorted[Math.floor(sorted.length / 2)]!;
-}
-
-function requiredArgument(name: string): string {
-	const value = argument(name);
-	if (value === undefined) throw new Error(`${name} is required`);
-	return value;
-}
-
-function numberArgument(name: string, fallback: number): number {
-	const raw = argument(name);
-	if (raw === undefined) return fallback;
-	const value = Number(raw);
-	if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a non-negative number`);
-	return value;
-}
-
-function argument(name: string): string | undefined {
-	const index = process.argv.indexOf(name);
-	if (index < 0) return undefined;
-	const value = process.argv[index + 1];
-	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-	return value;
 }
