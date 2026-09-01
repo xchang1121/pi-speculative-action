@@ -402,12 +402,13 @@ describe("zero-modification Pi extension", () => {
 
 	it("binds typed setting descriptors across root, self-speculation, and PatternAware settings", async () => {
 		const configure = vi.fn();
+		const maintain = vi.fn(async () => ({ removedEntries: 2, removedArtifacts: 3, removedBytes: 4096 }));
 		const fixture = await createFixture({
-			executionWorlds: [{ storage: { configure } } as unknown as SpeculativeAgentExecutionWorld],
+			executionWorlds: [{ storage: { configure, maintain } } as unknown as SpeculativeAgentExecutionWorld],
 		});
 		driveSettingsMenus(fixture, {
 			"Speculative action": ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"],
-			"Scheduling & cache": ["Resource cache memory", "Validated reuse entries", "Validated reuse memory", "Back"],
+			"Scheduling & cache": ["Resource cache memory", "Validated reuse entries", "Validated reuse memory", "Reclaim", "Clear", "Back"],
 			"Self-speculation": ["Endpoint", "Fork action confidence", "Back"],
 			"Prediction sources": ["PatternAware", "Back"],
 			PatternAware: ["Learning", "Back"],
@@ -422,6 +423,7 @@ describe("zero-modification Pi extension", () => {
 				"Fork action minimum confidence": "0.75",
 				"Future gap coverage (0-1)": "0.8",
 			} as Readonly<Record<string, string>>)[title];
+		fixture.ui.confirm = async (title) => title === "Clear validated reuse storage?";
 
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
@@ -437,6 +439,11 @@ describe("zero-modification Pi extension", () => {
 			patternAware: { futureGapCoverage: 0.8 },
 		});
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
+		expect(maintain.mock.calls).toEqual([["gc"], ["clear"]]);
+		expect(fixture.ui.notify).toHaveBeenCalledWith(
+			"Validated reuse storage cleared: 2 entries, 3 artifacts, 4 KiB.",
+			"info",
+		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			"Endpoint must be an absolute HTTP(S) URL.",
 			"warning",
@@ -488,7 +495,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const host = mockHost(options.consume);
 	const ui = {
 		select: async (_title: string, _options: string[]) => undefined as string | undefined,
-		confirm: async () => false,
+		confirm: async (_title: string, _message?: string) => false,
 		input: async (_title: string, _placeholder?: string) => undefined as string | undefined,
 		notify: vi.fn(),
 		setStatus: vi.fn(),

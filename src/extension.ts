@@ -218,6 +218,7 @@ interface SpeculativeActionController {
 	readonly recentEvents: () => readonly string[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
 	readonly executionSummary: () => string;
+	readonly maintainExecutionStorage: (operation: "gc" | "clear") => Promise<{ text: string; failed: boolean }>;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => void;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
 	readonly detachUI: () => void;
@@ -520,6 +521,23 @@ async function installController(
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
 		executionSummary: () => executionWorldSummary(executionDiagnostics),
+		maintainExecutionStorage: async (operation) => {
+			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
+			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
+			let entries = 0, artifacts = 0, bytes = 0, failed = 0;
+			for (const control of controls) {
+				try {
+					const result = await control.maintain(operation);
+					entries += result.removedEntries;
+					artifacts += result.removedArtifacts;
+					bytes += result.removedBytes;
+				} catch {
+					failed++;
+				}
+			}
+			await recoverSpeculation(() => refreshExecutionDiagnostics(true));
+			return { text: `Validated reuse storage ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
+		},
 		setSettings: (value) => {
 			if (value)
 				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
@@ -976,84 +994,39 @@ async function openSelfSpeculationSettings(
 	while (true) {
 		const settings = controller.settings();
 		const self = settings.selfSpeculation;
-		const choice = await ctx.ui.select("Self-speculation", [
-			`Enabled: ${self.enabled ? "On" : "Off"}`,
-			`Endpoint: ${self.endpoint}`,
-			`Fork transport: ${self.forkTransport}`,
-			`Actor fork: ${self.forkEnabled ? "On" : "Off"}`,
-			`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`,
-			`Fork action confidence: ${formatNumber(self.forkActionMinConfidence)}`,
-			`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`,
-			`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`,
-			`Gate warm-up: ${self.forkGateMinSamples}`,
-			`Gate window: ${self.forkGateWindowSize}`,
-			`Gate minimum net: ${formatDuration(self.forkGateMinNetBenefitMs)}`,
-			`Gate probe interval: ${self.forkGateProbeInterval}`,
-			`Gate failure threshold: ${self.forkGateFailureThreshold}`,
-			`Candidate bundle: ${self.maxCandidates}`,
-			`Draft tokens: ${self.maxDraftTokens}`,
-			`Draft format: ${self.draftFormat}`,
-			`Draft boundary: ${self.draftBoundary}`,
-			`Fork tokens: ${self.forkMaxTokens}`,
-			`Fork temperature: ${formatNumber(self.forkTemperature)}`,
-			`Decoder: ${self.forkDecoder}`,
-			`Forced prefix: ${self.forkForcedPrefix}`,
-			`Require logprobs: ${self.requireLogprobs ? "On" : "Off"}`,
-			`Control timeout: ${formatDuration(self.timeoutMs)}`,
-			`Bearer-token env: ${self.apiKeyEnv ?? "none"}`,
-			BACK,
+		const edit = (field: SelfSpeculationInputField) => editSelfSpeculationSetting(ctx, controller, settings, field);
+		const actions = new Map<string, () => void | Promise<void>>([
+			[`Enabled: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled })],
+			[`Endpoint: ${self.endpoint}`, () => edit("endpoint")],
+			[`Fork transport: ${self.forkTransport}`, async () => {
+				const selected = await ctx.ui.select("Fork transport", ["provider", "sidecar", BACK]);
+				if (selected === "provider" || selected === "sidecar") updateSelfSpeculation(controller, settings, { forkTransport: selected });
+			}],
+			[`Actor fork: ${self.forkEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled })],
+			[`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled })],
+			[`Fork action confidence: ${formatNumber(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence")],
+			[`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled })],
+			[`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled })],
+			[`Gate warm-up: ${self.forkGateMinSamples}`, () => edit("forkGateMinSamples")],
+			[`Gate window: ${self.forkGateWindowSize}`, () => edit("forkGateWindowSize")],
+			[`Gate minimum net: ${formatDuration(self.forkGateMinNetBenefitMs)}`, () => edit("forkGateMinNetBenefitMs")],
+			[`Gate probe interval: ${self.forkGateProbeInterval}`, () => edit("forkGateProbeInterval")],
+			[`Gate failure threshold: ${self.forkGateFailureThreshold}`, () => edit("forkGateFailureThreshold")],
+			[`Candidate bundle: ${self.maxCandidates}`, () => edit("maxCandidates")],
+			[`Draft tokens: ${self.maxDraftTokens}`, () => edit("maxDraftTokens")],
+			[`Draft format: ${self.draftFormat}`, () => edit("draftFormat")],
+			[`Draft boundary: ${self.draftBoundary}`, () => edit("draftBoundary")],
+			[`Fork tokens: ${self.forkMaxTokens}`, () => edit("forkMaxTokens")],
+			[`Fork temperature: ${formatNumber(self.forkTemperature)}`, () => edit("forkTemperature")],
+			[`Decoder: ${self.forkDecoder}`, () => edit("forkDecoder")],
+			[`Forced prefix: ${self.forkForcedPrefix}`, () => edit("forkForcedPrefix")],
+			[`Require logprobs: ${self.requireLogprobs ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs })],
+			[`Control timeout: ${formatDuration(self.timeoutMs)}`, () => edit("timeoutMs")],
+			[`Bearer-token env: ${self.apiKeyEnv ?? "none"}`, () => edit("apiKeyEnv")],
 		]);
+		const choice = await ctx.ui.select("Self-speculation", [...actions.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Enabled:")) updateSelfSpeculation(controller, settings, { enabled: !self.enabled });
-		if (choice.startsWith("Endpoint:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "endpoint");
-		if (choice.startsWith("Fork transport:")) {
-			const selected = await ctx.ui.select("Fork transport", ["provider", "sidecar", BACK]);
-			if (selected === "provider" || selected === "sidecar")
-				updateSelfSpeculation(controller, settings, { forkTransport: selected });
-		}
-		if (choice.startsWith("Actor fork:"))
-			updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled });
-		if (choice.startsWith("Fork action source:"))
-			updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled });
-		if (choice.startsWith("Fork action confidence:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkActionMinConfidence");
-		if (choice.startsWith("Drafter fork:"))
-			updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled });
-		if (choice.startsWith("Fork gate:"))
-			updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled });
-		if (choice.startsWith("Gate warm-up:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateMinSamples");
-		if (choice.startsWith("Gate window:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateWindowSize");
-		if (choice.startsWith("Gate minimum net:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateMinNetBenefitMs");
-		if (choice.startsWith("Gate probe interval:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateProbeInterval");
-		if (choice.startsWith("Gate failure threshold:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkGateFailureThreshold");
-		if (choice.startsWith("Candidate bundle:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "maxCandidates");
-		if (choice.startsWith("Draft tokens:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "maxDraftTokens");
-		if (choice.startsWith("Draft format:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "draftFormat");
-		if (choice.startsWith("Draft boundary:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "draftBoundary");
-		if (choice.startsWith("Fork tokens:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkMaxTokens");
-		if (choice.startsWith("Control timeout:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "timeoutMs");
-		if (choice.startsWith("Fork temperature:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkTemperature");
-		if (choice.startsWith("Decoder:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkDecoder");
-		if (choice.startsWith("Forced prefix:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "forkForcedPrefix");
-		if (choice.startsWith("Require logprobs:"))
-			updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs });
-		if (choice.startsWith("Bearer-token env:"))
-			await editSelfSpeculationSetting(ctx, controller, settings, "apiKeyEnv");
+		await actions.get(choice)?.();
 	}
 }
 
@@ -1190,8 +1163,20 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 			[`Validated reuse entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
 			[`Validated reuse memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
 		]);
-		const choice = await ctx.ui.select("Scheduling & cache", [...fields.keys(), BACK]);
+		const reclaim = "Reclaim validated reuse storage";
+		const clear = "Clear validated reuse storage";
+		const choice = await ctx.ui.select("Scheduling & cache", [...fields.keys(), reclaim, clear, BACK]);
 		if (!choice || choice === BACK) return;
+		if (choice === clear && !(await ctx.ui.confirm("Clear validated reuse storage?", "Delete all reusable execution certificates and artifacts? This cannot be undone."))) continue;
+		const operation = choice === reclaim ? "gc" : choice === clear ? "clear" : undefined;
+		if (operation) {
+			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
+			ctx.ui.notify(
+				report?.text ?? "Validated reuse storage maintenance failed.",
+				report && !report.failed ? "info" : "warning",
+			);
+			continue;
+		}
 		const field = fields.get(choice);
 		if (field) await editRootSetting(ctx, controller, settings, field);
 	}
@@ -1667,6 +1652,9 @@ function formatSpeculativeFooter(
 	if (!settings.enabled) return "spec: off";
 	const ready = worlds.filter((world) => world.state === "ready").length;
 	const reuse = metrics.processReuse;
+	const storageWorlds = worlds.filter((world) => world.storage);
+	const storedEntries = storageWorlds.reduce((total, world) => total + (world.storage?.entries ?? 0), 0);
+	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
 		`actions ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
@@ -1675,6 +1663,7 @@ function formatSpeculativeFooter(
 			: "L2 idle",
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`L1 ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
+		...(storageWorlds.length ? [`L2 store ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
 		worlds.length > 0 ? `worlds ${ready}/${worlds.length} ready` : "worlds probing",
 		"unsafe→Actor",
 		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
