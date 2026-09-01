@@ -182,20 +182,46 @@ export interface ExecutionWorldPreparation {
 
 export type ExecutionWorldHealthState = "registered" | "ready" | "degraded" | "unavailable";
 
+export interface ExecutionWorldStorageLimits {
+	readonly maxEntries: number;
+	readonly maxBytes: number;
+}
+
+export interface ExecutionWorldStorageSnapshot extends ExecutionWorldStorageLimits {
+	readonly entries: number;
+	readonly bytes: number;
+	readonly orphanArtifacts?: number;
+	readonly overBudget: boolean;
+}
+
+export type ExecutionWorldStorageOperation = "gc" | "clear";
+
+export interface ExecutionWorldStorageMaintenance {
+	readonly removedEntries: number;
+	readonly removedArtifacts: number;
+	readonly removedBytes: number;
+}
+
+export interface ExecutionWorldStorageMaintenanceSnapshot extends ExecutionWorldStorageMaintenance {
+	readonly id: string;
+	readonly operation: ExecutionWorldStorageOperation;
+	readonly status: "completed" | "failed";
+	readonly detail?: string;
+}
+
+export interface ExecutionWorldStorageControl {
+	/** Applies the retention policy synchronously; reclamation remains an explicit maintenance action. */
+	readonly configure: (limits: ExecutionWorldStorageLimits) => void;
+	readonly maintain: (operation: ExecutionWorldStorageOperation) => Promise<ExecutionWorldStorageMaintenance>;
+}
+
 /** Backend-owned health independent from whether one concrete action has selected this world. */
 export interface ExecutionWorldDiagnosticReport {
 	readonly state: ExecutionWorldHealthState;
 	readonly detail: string;
 	readonly fingerprint?: string;
 	readonly attributes?: Readonly<Record<string, string | number | boolean>>;
-	readonly storage?: {
-		readonly entries: number;
-		readonly maxEntries: number;
-		readonly bytes: number;
-		readonly maxBytes: number;
-		readonly orphanArtifacts?: number;
-		readonly overBudget: boolean;
-	};
+	readonly storage?: ExecutionWorldStorageSnapshot;
 }
 
 export interface ExecutionWorldDiagnosticsContext extends ExecutionWorldPreparation {
@@ -223,6 +249,8 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly diagnostics?: (
 		input: ExecutionWorldDiagnosticsContext,
 	) => ExecutionWorldDiagnosticReport | Promise<ExecutionWorldDiagnosticReport>;
+	/** Optional persistent storage capability, independent from tool or action syntax. */
+	readonly storage?: ExecutionWorldStorageControl;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
 	/** Capture freshness before a host-authoritative execution without executing the tool again. */
 	readonly captureAuthoritativeResult?: (context: Context) => Promise<WorldResultCapture<Output>>;
@@ -293,6 +321,35 @@ export class ExecutionWorldRouter<Context, Output> {
 
 	async dispose(): Promise<void> {
 		await Promise.allSettled(this.worlds.map((world) => world.dispose?.()));
+	}
+
+	configureStorage(limits: ExecutionWorldStorageLimits): void {
+		for (const world of this.worlds) world.storage?.configure(limits);
+	}
+
+	async maintainStorage(
+		operation: ExecutionWorldStorageOperation,
+	): Promise<readonly ExecutionWorldStorageMaintenanceSnapshot[]> {
+		return Promise.all(
+			this.worlds.flatMap((world) =>
+				world.storage
+					? [
+							world.storage.maintain(operation).then(
+								(result) => ({ id: world.id, operation, status: "completed" as const, ...result }),
+								(error) => ({
+									id: world.id,
+									operation,
+									status: "failed" as const,
+									removedEntries: 0,
+									removedArtifacts: 0,
+									removedBytes: 0,
+									detail: errorDetail(error),
+								}),
+							),
+						]
+					: [],
+			),
+		);
 	}
 
 	/** Inspect every registered world without attempting a speculative action. */

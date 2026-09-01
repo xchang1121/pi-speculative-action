@@ -621,6 +621,8 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 	const host: SpeculativeActionHost = {
 		sessionID: "session",
 		executionWorldDiagnostics: vi.fn(async () => []),
+		configureExecutionWorldStorage: vi.fn(),
+		maintainExecutionWorldStorage: vi.fn(async () => []),
 		runtime: {
 			settingsChanged: vi.fn(),
 			inspect: () => ({

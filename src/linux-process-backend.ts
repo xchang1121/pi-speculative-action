@@ -48,7 +48,14 @@ import {
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
-import { emptyWorldReuseMetrics, type ExecutionScope, type WorldReuseMetrics } from "./execution-world.ts";
+import {
+	emptyWorldReuseMetrics,
+	type ExecutionScope,
+	type ExecutionWorldStorageLimits,
+	type ExecutionWorldStorageMaintenance,
+	type ExecutionWorldStorageOperation,
+	type WorldReuseMetrics,
+} from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import {
 	ProvenanceCertificateStore,
@@ -239,6 +246,20 @@ export class LinuxProcessReuseBackend {
 
 	metrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.counters });
+	}
+
+	configureStorage(limits: ExecutionWorldStorageLimits): void {
+		this.store.configure({ maxCertificates: limits.maxEntries, maxBytes: limits.maxBytes });
+	}
+
+	async maintainStorage(operation: ExecutionWorldStorageOperation): Promise<ExecutionWorldStorageMaintenance> {
+		const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
+		if (operation === "clear") this.certificateScopes.clear();
+		return {
+			removedEntries: result.removedCertificates,
+			removedArtifacts: result.removedArtifacts,
+			removedBytes: result.removedBytes,
+		};
 	}
 
 	async open(input: {

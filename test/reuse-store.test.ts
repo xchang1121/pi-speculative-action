@@ -64,6 +64,8 @@ describe("persistent provenance store", () => {
 		expect(await store.get(first.id)).toBeUndefined();
 		expect(await store.get(second.id)).toEqual(second);
 		const closure = await store.artifacts.load([secondArtifact]);
+		store.configure({ maxCertificates: 2, maxBytes: 2 * 1024 * 1024 });
+		expect(store.limits).toEqual({ maxCertificates: 2, maxBytes: 2 * 1024 * 1024 });
 		await store.clear();
 		expect(await store.stats()).toMatchObject({ certificates: 0, artifacts: 0, totalBytes: 0 });
 		expect(closure?.read(secondArtifact).toString("utf8")).toBe("second");

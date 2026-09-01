@@ -42,6 +42,10 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+		storage: {
+			configure: (limits) => backend.configureStorage(limits),
+			maintain: (operation) => backend.maintainStorage(operation),
+		},
 		fingerprint: async (request) => {
 			const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
 			const [processFingerprint, workspaceFingerprint] = await Promise.all([

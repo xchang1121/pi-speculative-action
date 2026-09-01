@@ -151,7 +151,7 @@ class LoadedArtifactClosure implements VerifiedArtifactClosure {
 export class ProvenanceCertificateStore {
 	readonly root: string;
 	readonly artifacts: ArtifactCAS;
-	readonly limits: ProvenanceStoreLimits;
+	private limitsValue: ProvenanceStoreLimits;
 	private readonly gcIntervalMs: number;
 	private readonly orphanGraceMs: number;
 	private maintenance: Promise<void> = Promise.resolve();
@@ -161,13 +161,25 @@ export class ProvenanceCertificateStore {
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root);
 		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"));
-		this.limits = Object.freeze({
+		this.limitsValue = Object.freeze({
 			maxCertificates: positiveInteger(options.maxCertificates, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 			maxBytes: positiveInteger(options.maxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
 		});
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
 		this.gcDueAt = Date.now() + this.gcIntervalMs;
+	}
+
+	get limits(): ProvenanceStoreLimits {
+		return this.limitsValue;
+	}
+
+	configure(limits: Partial<ProvenanceStoreLimits>): void {
+		this.limitsValue = Object.freeze({
+			maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates),
+			maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes),
+		});
+		this.gcDueAt = 0;
 	}
 
 	put(certificate: ProcessProvenanceCertificate): Promise<boolean> {

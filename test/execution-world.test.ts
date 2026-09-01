@@ -43,7 +43,12 @@ describe("ExecutionWorldRouter", () => {
 				throw new Error("unavailable");
 			}),
 		};
-		const resource = fallback("resource", "resource_snapshot", "all");
+		const configureStorage = vi.fn();
+		const maintainStorage = vi.fn(async () => ({ removedEntries: 2, removedArtifacts: 3, removedBytes: 4 }));
+		const resource = {
+			...fallback("resource", "resource_snapshot", "all"),
+			storage: { configure: configureStorage, maintain: maintainStorage },
+		};
 		const router = new ExecutionWorldRouter([unavailable, resource, resource]);
 		const route = await router.resolve(
 			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
@@ -69,6 +74,18 @@ describe("ExecutionWorldRouter", () => {
 				}),
 			]),
 		);
+		router.configureStorage({ maxEntries: 5, maxBytes: 6 });
+		expect(configureStorage).toHaveBeenCalledWith({ maxEntries: 5, maxBytes: 6 });
+		expect(await router.maintainStorage("gc")).toEqual([
+			{
+				id: "resource",
+				operation: "gc",
+				status: "completed",
+				removedEntries: 2,
+				removedArtifacts: 3,
+				removedBytes: 4,
+			},
+		]);
 		await router.dispose();
 		expect(unavailable.dispose).toHaveBeenCalledOnce();
 		expect(resource.dispose).toHaveBeenCalledOnce();
