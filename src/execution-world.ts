@@ -148,7 +148,7 @@ export interface ExecutionWorldPreparation {
 	readonly signal?: AbortSignal;
 }
 
-export type ExecutionWorldHealthState = "registered" | "ready" | "degraded" | "unavailable";
+export type ExecutionWorldHealthState = "registered" | "ready" | "unavailable";
 
 export interface ExecutionWorldStorageSnapshot {
 	readonly entries: number;
@@ -324,14 +324,7 @@ export class ExecutionWorldRouter<Context, Output> {
 					if (!effectCapabilitiesCover(world.capabilities, request.requirements)) continue;
 					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await world.prepare?.(preparation);
-					this.routeObservations.set(
-						world.id,
-						Object.freeze({
-							state: "ready",
-							cwd: preparation.cwd,
-							detail: "Route prepared successfully",
-						}),
-					);
+					this.observeRoute(world.id, preparation.cwd, "ready", "Route prepared successfully");
 					const route = Object.freeze({
 						isolation: world.isolation,
 						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
@@ -344,19 +337,16 @@ export class ExecutionWorldRouter<Context, Output> {
 					if (selected !== undefined) return selected;
 				} catch (error) {
 					if (preparation.signal?.aborted) throw error;
-					this.routeObservations.set(
-						world.id,
-						Object.freeze({
-							state: "unavailable",
-							cwd: preparation.cwd,
-							detail: errorDetail(error),
-						}),
-					);
+					this.observeRoute(world.id, preparation.cwd, "unavailable", errorDetail(error));
 					// Unavailable worlds are skipped in explicit capability order.
 				}
 			}
 		}
 		return undefined;
+	}
+
+	private observeRoute(id: string, cwd: string, state: ExecutionWorldHealthState, detail: string): void {
+		this.routeObservations.set(id, { state, cwd, detail });
 	}
 }
 
