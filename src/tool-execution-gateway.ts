@@ -6,6 +6,8 @@ import {
 } from "./effect-transaction.ts";
 import {
 	type CapturedExecutionWorldResult,
+	type ExecutionWorldDiagnosticSnapshot,
+	type ExecutionWorldDiagnosticsContext,
 	ExecutionWorldRouter,
 	type ExecutionWorld,
 	type ExecutionWorldPreparation,
@@ -78,6 +80,10 @@ export class ToolExecutionGateway<Context, Output> {
 			},
 			preparation,
 		);
+	}
+
+	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+		return this.router.diagnostics(input);
 	}
 
 	captureAuthoritativeResult(

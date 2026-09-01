@@ -311,6 +311,27 @@ describe("zero-modification Pi extension", () => {
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
 	});
 
+	it("reports execution-world health instead of treating registration as availability", async () => {
+		const fixture = await createFixture();
+		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([
+			{
+				id: "linux_process_reuse",
+				scope: "runtime",
+				isolation: "runtime_sandbox",
+				state: "unavailable",
+				detail: "Linux host required",
+				observedAt: 1,
+			},
+		]);
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
+
+		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining("linux_process_reuse [runtime/runtime_sandbox]: unavailable — Linux host required"),
+			"warning",
+		);
+	});
+
 	it("labels an adopted read projection as partial-result reuse", () => {
 		const event = {
 			sessionID: "session",
@@ -541,6 +562,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 	const actual = vi.fn();
 	const host: SpeculativeActionHost = {
 		sessionID: "session",
+		executionWorldDiagnostics: vi.fn(async () => []),
 		runtime: {
 			settingsChanged: vi.fn(),
 			inspect: () => ({

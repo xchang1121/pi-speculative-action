@@ -55,6 +55,20 @@ describe("ExecutionWorldRouter", () => {
 		expect(route && (await router.fork(route, { value: "captured" })).output).toBe("captured");
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route })).toBe(true);
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "changed" })).toBe(false);
+		expect(await router.diagnostics(preparation)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "unavailable",
+					state: "unavailable",
+					detail: "unavailable",
+				}),
+				expect.objectContaining({
+					id: "resource",
+					state: "ready",
+					detail: "Route prepared successfully",
+				}),
+			]),
+		);
 		await router.dispose();
 		expect(unavailable.dispose).toHaveBeenCalledOnce();
 		expect(resource.dispose).toHaveBeenCalledOnce();

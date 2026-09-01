@@ -12,6 +12,22 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 
 describe("Linux process ExecutionWorld", () => {
+	test("reports backend health without claiming that registration is availability", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
+		const backend = new LinuxProcessReuseBackend({ storeRoot: path.join(root, "store") });
+		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
+		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot: path.join(root, "store") });
+		try {
+			const expected = await backend.check(true);
+			const actual = await world.diagnostics?.({ cwd: root, refresh: true });
+			expect(actual?.state).toBe(expected.state === "ready" ? "ready" : "unavailable");
+			expect(actual?.detail).toContain(expected.detail);
+		} finally {
+			await world.dispose?.();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("rejects adoption when the COW driver forces a handled cross-device rename", async () => {
 		if (process.platform !== "linux" || !(await linuxOverlayfsCapability()).available) return;
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-driver-semantics-"));

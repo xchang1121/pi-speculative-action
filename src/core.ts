@@ -53,6 +53,10 @@ export {
 export {
 	type CapturedExecutionWorldResult,
 	type ExecutionWorld,
+	type ExecutionWorldDiagnosticReport,
+	type ExecutionWorldDiagnosticSnapshot,
+	type ExecutionWorldDiagnosticsContext,
+	type ExecutionWorldHealthState,
 	type ExecutionWorldPreparation,
 	type ExecutionWorldRequest,
 	ExecutionWorldRouter,

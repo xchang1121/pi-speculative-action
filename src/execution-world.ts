@@ -124,6 +124,29 @@ export interface ExecutionWorldPreparation {
 	readonly signal?: AbortSignal;
 }
 
+export type ExecutionWorldHealthState = "registered" | "ready" | "degraded" | "unavailable";
+
+/** Backend-owned health independent from whether one concrete action has selected this world. */
+export interface ExecutionWorldDiagnosticReport {
+	readonly state: ExecutionWorldHealthState;
+	readonly detail: string;
+	readonly fingerprint?: string;
+	readonly attributes?: Readonly<Record<string, string | number | boolean>>;
+}
+
+export interface ExecutionWorldDiagnosticsContext extends ExecutionWorldPreparation {
+	/** Re-run backend capability probes instead of using their cached result. */
+	readonly refresh?: boolean;
+}
+
+/** Source-neutral world status consumed by hosts and UIs. */
+export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnosticReport {
+	readonly id: string;
+	readonly scope: ExecutionWorldScope;
+	readonly isolation: SpeculativeExecution;
+	readonly observedAt: number;
+}
+
 interface ExecutionWorldLifecycle<Context, Output> {
 	readonly id: string;
 	/** Atomic effects this backend can safely contain, virtualize, or validate. */
@@ -132,6 +155,10 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
 	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
+	/** Read-only health and diagnostics. It must not weaken or bypass route preparation. */
+	readonly diagnostics?: (
+		input: ExecutionWorldDiagnosticsContext,
+	) => ExecutionWorldDiagnosticReport | Promise<ExecutionWorldDiagnosticReport>;
 	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
 	/** Capture freshness before a host-authoritative execution without executing the tool again. */
 	readonly captureAuthoritativeResult?: (context: Context) => Promise<WorldResultCapture<Output>>;
@@ -158,6 +185,7 @@ export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, O
 export class ExecutionWorldRouter<Context, Output> {
 	private readonly worlds: readonly ExecutionWorld<Context, Output>[];
 	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output>>();
+	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
 
 	constructor(worlds: readonly ExecutionWorld<Context, Output>[]) {
 		this.worlds = [...new Set(worlds)];
@@ -203,6 +231,34 @@ export class ExecutionWorldRouter<Context, Output> {
 		await Promise.allSettled(this.worlds.map((world) => world.dispose?.()));
 	}
 
+	/** Inspect every registered world without attempting a speculative action. */
+	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+		return Promise.all(
+			this.worlds.map(async (world) => {
+				const observedAt = Date.now();
+				let report: ExecutionWorldDiagnosticReport | undefined;
+				try {
+					report = await world.diagnostics?.(input);
+				} catch (error) {
+					report = { state: "unavailable", detail: errorDetail(error) };
+				}
+				const route = this.routeObservations.get(world.id);
+				if (route?.cwd === input.cwd && route.state === "unavailable") report = route;
+				return Object.freeze({
+					id: world.id,
+					scope: world.scope,
+					isolation: world.isolation,
+					...(report ??
+						(route?.cwd === input.cwd ? route : undefined) ?? {
+							state: "registered",
+							detail: "Registered; availability is checked during route preparation",
+						}),
+					observedAt,
+				});
+			}),
+		);
+	}
+
 	private world(route: SpeculativeExecutionRoute): ExecutionWorld<Context, Output> {
 		const world = this.worldsByID.get(route.backend);
 		if (!world || world.scope !== route.scope || world.isolation !== route.isolation) {
@@ -227,6 +283,15 @@ export class ExecutionWorldRouter<Context, Output> {
 					if (!effectCapabilitiesCover(world.capabilities, request.requirements)) continue;
 					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await world.prepare?.(preparation);
+					this.routeObservations.set(
+						world.id,
+						Object.freeze({
+							state: "ready",
+							cwd: preparation.cwd,
+							detail: "Route prepared successfully",
+							fingerprint,
+						}),
+					);
 					const route = Object.freeze({
 						isolation: world.isolation,
 						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
@@ -239,12 +304,24 @@ export class ExecutionWorldRouter<Context, Output> {
 					if (selected !== undefined) return selected;
 				} catch (error) {
 					if (preparation.signal?.aborted) throw error;
+					this.routeObservations.set(
+						world.id,
+						Object.freeze({
+							state: "unavailable",
+							cwd: preparation.cwd,
+							detail: errorDetail(error),
+						}),
+					);
 					// Unavailable worlds are skipped in explicit capability order.
 				}
 			}
 		}
 		return undefined;
 	}
+}
+
+function errorDetail(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function isPromiseLike<Value>(value: Value | Promise<Value>): value is Promise<Value> {

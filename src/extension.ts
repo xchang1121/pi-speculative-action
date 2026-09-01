@@ -47,6 +47,7 @@ import {
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
+import type { ExecutionWorldDiagnosticSnapshot } from "./execution-world.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
@@ -212,6 +213,8 @@ interface SpeculativeActionController {
 	readonly registeredTools: () => ReadonlySet<string>;
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
+	readonly executionDiagnostics: () => readonly ExecutionWorldDiagnosticSnapshot[];
+	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
 	readonly executionSummary: () => string;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => void;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
@@ -416,6 +419,7 @@ async function installController(
 	const executionWorlds = [
 		...new Set(configuredExecutionWorlds),
 	];
+	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
@@ -491,6 +495,10 @@ async function installController(
 			renderFooter();
 		},
 	});
+	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
+		executionDiagnostics = await host.executionWorldDiagnostics(refresh);
+		renderFooter();
+	};
 
 	const controller: SpeculativeActionController = {
 		settings,
@@ -500,7 +508,9 @@ async function installController(
 		registeredTools: () => new Set(baseDefinitions.keys()),
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
-		executionSummary: () => executionWorldSummary(executionWorlds),
+		executionDiagnostics: () => executionDiagnostics,
+		refreshExecutionDiagnostics,
+		executionSummary: () => executionWorldSummary(executionDiagnostics),
 		setSettings: (value) => {
 			if (value) settingsStore.setEffective(value);
 			else settingsStore.clear();
@@ -512,6 +522,7 @@ async function installController(
 		attachUI: (nextUI) => {
 			ui = nextUI;
 			renderFooter();
+			void recoverSpeculation(() => refreshExecutionDiagnostics());
 		},
 		detachUI: () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -543,6 +554,7 @@ async function installController(
 					},
 					nextContext.signal,
 				);
+				void recoverSpeculation(() => refreshExecutionDiagnostics());
 			} catch {
 				// Speculation is optional; the actor request remains authoritative.
 			}
@@ -601,7 +613,7 @@ async function installController(
 			const effective = settings();
 			const bridge = selfSpeculation.snapshot();
 			const drafterGate = host.drafterGateSnapshot();
-			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionWorlds)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionDiagnostics)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -625,6 +637,7 @@ async function installController(
 		const registered = registeredTools.get(name);
 		if (registered) wrapperSources.set(name, toolSourceFingerprint(registered.sourceInfo));
 	}
+	await recoverSpeculation(() => refreshExecutionDiagnostics());
 	return controller;
 }
 
@@ -805,6 +818,7 @@ async function runCommand(
 		return;
 	}
 	if (command === "status" || (command === "" && ctx.mode !== "tui")) {
+		await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 		ctx.ui.notify(controller.statusText(), controller.settings().enabled ? "info" : "warning");
 		return;
 	}
@@ -896,6 +910,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			continue;
 		}
 		if (choice === "Status") {
+			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(controller.statusText(), "info");
 			continue;
 		}
@@ -1193,6 +1208,7 @@ async function openToolsAndExecution(
 		if (choice.startsWith("Tool policy"))
 			await editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts());
 		if (choice === "Execution guarantees") {
+			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(
 				`Every speculative tool first uses a runtime-wide sandbox when one is available. Otherwise read-only tools use resource snapshots, write/edit use private Git worktrees, and tools without a safe isolation route are matched but executed only by the Actor.\n${controller.executionSummary()}`,
 				"info",
@@ -1603,11 +1619,14 @@ function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
 }
 
-function executionWorldSummary(worlds: readonly SpeculativeAgentExecutionWorld[]): string {
-	const supporting = (isolation: SpeculativeAgentExecutionWorld["isolation"]) =>
-		worlds.filter((world) => world.isolation === isolation).map((world) => world.id);
-	const snapshots = [...new Set(["resource_version", ...supporting("resource_snapshot")])];
-	return `Execution capabilities: runtime sandbox ${toolsSummary(supporting("runtime_sandbox"))}; resource snapshot ${toolsSummary(snapshots)}; workspace branch ${toolsSummary(supporting("workspace_branch"))}`;
+function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): string {
+	if (!worlds.length) return "Execution worlds: unavailable";
+	return [
+		"Execution worlds:",
+		...worlds.map(
+			(world) => `- ${world.id} [${world.scope}/${world.isolation}]: ${world.state} — ${world.detail}`,
+		),
+	].join("\n");
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {

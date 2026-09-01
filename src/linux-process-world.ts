@@ -29,6 +29,13 @@ export function createLinuxProcessExecutionWorld(
 	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
 	const workspaceOptions = pickWorkspaceOptions(options);
 	const roots = new Set<string>();
+	const qualifiedDrivers = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>();
+	const qualify = async (sourceRoot: string) => {
+		const root = path.resolve(sourceRoot);
+		const selected = await workspaceSandbox.qualify(workspaceOptions, root);
+		qualifiedDrivers.set(root, selected);
+		return selected;
+	};
 	return {
 		id: "linux_process_reuse",
 		scope: "runtime",
@@ -39,16 +46,34 @@ export function createLinuxProcessExecutionWorld(
 			const [processFingerprint, workspaceFingerprint] = await Promise.all([
 				backend.fingerprint(),
 				invocation?.cwd
-					? workspaceSandbox.qualify(workspaceOptions, invocation.cwd).then((selected) => selected.fingerprint)
+					? qualify(invocation.cwd).then((selected) => selected.fingerprint)
 					: workspaceSandbox.fingerprint(workspaceOptions),
 			]);
 			return `${processFingerprint}:${workspaceFingerprint}`;
+		},
+		diagnostics: async ({ cwd, refresh }) => {
+			const status = await backend.check(refresh);
+			if (status.state !== "ready") return { state: "unavailable", detail: status.detail };
+			const selected = qualifiedDrivers.get(path.resolve(cwd));
+			return {
+				state: "ready",
+				detail: selected
+					? `${status.detail}; ${selected.driver} workspace driver selected`
+					: `${status.detail}; workspace route not prepared yet`,
+				...(status.fingerprint ? { fingerprint: status.fingerprint } : {}),
+				attributes: {
+					workspaceDriver: selected?.driver ?? "not_prepared",
+					...(status.sandlockBinary ? { sandlock: status.sandlockBinary } : {}),
+					...(status.straceBinary ? { strace: status.straceBinary } : {}),
+					...(status.unshareBinary ? { unshare: status.unshareBinary } : {}),
+				},
+			};
 		},
 		prepare: async ({ cwd, signal }) => {
 			const status = await backend.check();
 			if (status.state !== "ready") throw new Error(status.detail);
 			roots.add(path.resolve(cwd));
-			const selected = await workspaceSandbox.qualify(workspaceOptions, cwd);
+			const selected = await qualify(cwd);
 			await workspaceSandbox.prepare(cwd, {
 				...workspaceOptions,
 				driver: selected.driver,
@@ -60,7 +85,7 @@ export function createLinuxProcessExecutionWorld(
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			const selected = await workspaceSandbox.qualify(workspaceOptions, sourceRoot);
+			const selected = await qualify(sourceRoot);
 			let validate: LinuxProcessSession["validate"] | undefined;
 			let seal: LinuxProcessSession["seal"] | undefined;
 			return workspaceSandbox.fork({
@@ -117,6 +142,7 @@ export function createLinuxProcessExecutionWorld(
 		dispose: async () => {
 			const ownedRoots = [...roots];
 			roots.clear();
+			qualifiedDrivers.clear();
 			try {
 				await backend.dispose();
 			} finally {

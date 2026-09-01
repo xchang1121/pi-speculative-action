@@ -54,6 +54,11 @@ export function createResourceSnapshotExecutionWorld(
 		isolation: "resource_snapshot",
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version:v1",
+		diagnostics: () => ({
+			state: "ready",
+			detail: "Resource-version snapshots are available",
+			fingerprint: "resource-version:v1",
+		}),
 		captureAuthoritativeResult: capture,
 		fork: async (context) => {
 			const captured = await capture(context);
