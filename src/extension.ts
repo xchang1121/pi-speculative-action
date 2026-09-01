@@ -1033,59 +1033,34 @@ async function openSelfSpeculationSettings(
 async function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
-		const choice = await ctx.ui.select("Drafter", [
-			`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`,
-			`Action utility gate: ${settings.drafterGateEnabled ? "On" : "Off"}`,
-			`Model › ${settings.draftModel ?? activeModelReference(ctx)}`,
-			`Rollout depth: ${settings.drafterMaxDepth}`,
-			`Output tokens: ${settings.drafterMaxTokens ?? "provider default"}`,
-			`Deterministic requests: ${settings.drafterDeterministicCandidates}`,
-			`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
-			`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
-			BACK,
+		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
+		const actions = new Map<string, () => void | Promise<void>>([
+			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
+			[`Action utility gate: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
+			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
+			[`Rollout depth: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
+			[`Output tokens: ${settings.drafterMaxTokens ?? "provider default"}`, () => edit("drafterMaxTokens")],
+			[`Deterministic requests: ${settings.drafterDeterministicCandidates}`, () => edit("drafterDeterministicCandidates")],
+			[`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
+			[`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`, () => edit("predictionTimeoutMs")],
 		]);
+		const choice = await ctx.ui.select("Drafter", [...actions.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Enabled:"))
-			controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled });
-		if (choice.startsWith("Action utility gate:"))
-			controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled });
-		if (choice.startsWith("Model")) await editDraftModel(ctx, controller, settings);
-		if (choice.startsWith("Rollout depth:")) {
-			await editRootSetting(ctx, controller, settings, "drafterMaxDepth");
-		}
-		if (choice.startsWith("Output tokens:")) {
-			await editRootSetting(ctx, controller, settings, "drafterMaxTokens");
-		}
-		if (choice.startsWith("Deterministic requests:")) {
-			await editRootSetting(ctx, controller, settings, "drafterDeterministicCandidates");
-		}
-		if (choice.startsWith("Temperature range:")) {
-			await editDrafterTemperatureRange(ctx, controller, settings);
-		}
-		if (choice.startsWith("Prediction timeout:")) {
-			await editRootSetting(ctx, controller, settings, "predictionTimeoutMs");
-		}
+		await actions.get(choice)?.();
 	}
 }
 
 async function openPatternAwareSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
-		const choice = await ctx.ui.select("PatternAware", [
-			`Enabled: ${settings.patternAware.enabled ? "On" : "Off"}`,
-			`Learning › context ${settings.patternAware.maxContextLength}, promotion ${settings.patternAware.minOccurrences}`,
-			`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`,
-			BACK,
+		const actions = new Map<string, () => void | Promise<void>>([
+			[`Enabled: ${settings.patternAware.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...settings.patternAware, enabled: !settings.patternAware.enabled } })],
+			[`Learning › context ${settings.patternAware.maxContextLength}, promotion ${settings.patternAware.minOccurrences}`, () => openPatternLearning(ctx, controller)],
+			[`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`, () => openPatternMultiStep(ctx, controller)],
 		]);
+		const choice = await ctx.ui.select("PatternAware", [...actions.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Enabled:")) {
-			controller.setSettings({
-				...settings,
-				patternAware: { ...settings.patternAware, enabled: !settings.patternAware.enabled },
-			});
-		}
-		if (choice.startsWith("Learning")) await openPatternLearning(ctx, controller);
-		if (choice.startsWith("Multi-step prediction")) await openPatternMultiStep(ctx, controller);
+		await actions.get(choice)?.();
 	}
 }
 
@@ -1093,32 +1068,18 @@ async function openPatternLearning(ctx: ExtensionContext, controller: Speculativ
 	while (true) {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
-		const choice = await ctx.ui.select("PatternAware learning", [
-			`Context events: ${pattern.maxContextLength}`,
-			`Future gap: ${pattern.maxFutureGap}`,
-			`Future gap coverage: ${formatPercent(pattern.futureGapCoverage)}`,
-			`Decay half-life: ${pattern.decayHalfLifeEvents} events`,
-			`Promotion occurrences: ${pattern.minOccurrences}`,
-			`Pattern capacity: ${pattern.maxPatterns}`,
-			BACK,
+		const edit = (field: PatternInputField) => editPatternSetting(ctx, controller, settings, field);
+		const actions = new Map<string, () => Promise<void>>([
+			[`Context events: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
+			[`Future gap: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
+			[`Future gap coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
+			[`Decay half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
+			[`Promotion occurrences: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
+			[`Pattern capacity: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
 		]);
+		const choice = await ctx.ui.select("PatternAware learning", [...actions.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Context events:")) {
-			await editPatternSetting(ctx, controller, settings, "maxContextLength");
-		}
-		if (choice.startsWith("Future gap:")) {
-			await editPatternSetting(ctx, controller, settings, "maxFutureGap");
-		}
-		if (choice.startsWith("Future gap coverage:"))
-			await editPatternSetting(ctx, controller, settings, "futureGapCoverage");
-		if (choice.startsWith("Decay half-life:"))
-			await editPatternSetting(ctx, controller, settings, "decayHalfLifeEvents");
-		if (choice.startsWith("Promotion occurrences:")) {
-			await editPatternSetting(ctx, controller, settings, "minOccurrences");
-		}
-		if (choice.startsWith("Pattern capacity:")) {
-			await editPatternSetting(ctx, controller, settings, "maxPatterns");
-		}
+		await actions.get(choice)?.();
 	}
 }
 
@@ -1126,29 +1087,16 @@ async function openPatternMultiStep(ctx: ExtensionContext, controller: Speculati
 	while (true) {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
-		const choice = await ctx.ui.select("PatternAware multi-step", [
-			`Enabled: ${pattern.multiStepEnabled ? "On" : "Off"}`,
-			`Beam width per tool: ${pattern.beamWidth}`,
-			`Prediction depth: ${pattern.maxPredictionDepth}`,
-			`Minimum binding replay: ${formatPercent(pattern.minBindingReplayProbability)}`,
-			BACK,
+		const edit = (field: PatternInputField) => editPatternSetting(ctx, controller, settings, field);
+		const actions = new Map<string, () => void | Promise<void>>([
+			[`Enabled: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
+			[`Beam width per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
+			[`Prediction depth: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
+			[`Minimum binding replay: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
 		]);
+		const choice = await ctx.ui.select("PatternAware multi-step", [...actions.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Enabled:")) {
-			controller.setSettings({
-				...settings,
-				patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled },
-			});
-		}
-		if (choice.startsWith("Beam width per tool:")) {
-			await editPatternSetting(ctx, controller, settings, "beamWidth");
-		}
-		if (choice.startsWith("Prediction depth:")) {
-			await editPatternSetting(ctx, controller, settings, "maxPredictionDepth");
-		}
-		if (choice.startsWith("Minimum binding replay:")) {
-			await editPatternSetting(ctx, controller, settings, "minBindingReplayProbability");
-		}
+		await actions.get(choice)?.();
 	}
 }
 
