@@ -5,6 +5,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, patternPlanActionID } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
@@ -12,6 +13,7 @@ import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
+import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -26,6 +28,16 @@ const readSchema = Type.Object({
 });
 const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
+const mockToolSchema = Type.Any();
+const mockToolCalls = [
+	["read", { path: "notes.txt" }],
+	["grep", { pattern: "one", path: "." }],
+	["find", { pattern: "*.txt", path: "." }],
+	["ls", { path: "." }],
+	["bash", { command: "printf ready" }],
+	["write", { path: "generated.txt", content: "ready" }],
+	["edit", { path: "notes.txt", edits: [{ oldText: "one", newText: "ready" }] }],
+] as const;
 
 function model(id = "actor"): Model<"openai-responses"> {
 	return {
@@ -100,54 +112,87 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
-	it("satisfies an actor call without modifying or wrapping an Agent instance", async () => {
-		const cwd = await temporaryWorkspace();
-		let executions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => {
-				executions++;
-				return { content: [{ type: "text", text: "one\ntwo\nthree\nfour" }], details: {} };
-			},
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: settings,
-			draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt" }),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
-
-		await host.startTurn(startInput(tool));
-		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
-		const hit = await host.execute(
-			{
-				turnID: "turn-1",
-				id: "actor-1",
-				tool: "read",
-				args: { path: "notes.txt" },
-				tools: [tool],
-			},
-			undefined,
-			async () => tool.execute("actor-1", { path: "notes.txt" }),
-		);
-
-		expect(hit.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
-		expect(executions).toBe(1);
-		expect(events.find((event) => event.type === "candidate")).toMatchObject({
-			candidate: { execution: "resource_snapshot" },
-		});
-		await waitFor(() =>
-			events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
-		);
-		await host.dispose();
+	it("reuses running and completed results for every keyable Pi tool", async () => {
+		expect(mockToolCalls.map(([tool]) => tool)).toEqual(KEYABLE_TOOLS);
+		for (const phase of ["running", "completed"] as const) {
+			for (const [toolName, args] of mockToolCalls) {
+				const cwd = await temporaryWorkspace();
+				const turnID = `${phase}-${toolName}`;
+				const expected = `${phase}:${toolName}`;
+				let release!: () => void;
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const speculativeExecution = vi.fn(async () => {
+					await gate;
+					return { content: [{ type: "text" as const, text: expected }], details: {} };
+				});
+				const actorExecution = vi.fn(async () => speculativeExecution());
+				const tool: AgentTool<typeof mockToolSchema> = {
+					name: toolName,
+					label: toolName,
+					description: toolName,
+					parameters: mockToolSchema,
+					execute: speculativeExecution,
+				};
+				const events: SpeculativeActionEvent<string>[] = [];
+				const sandbox = mockRuntimeWorld(async (context) => ({
+					result: await context.tool.execute(context.callID, context.args as never, context.signal),
+					isError: false,
+				}));
+				const host = createSpeculativeActionHost(`session-${turnID}`, {
+					cwd,
+					getSettings: () => ({ ...settings(), tools: [toolName] }),
+					draftModel: model("draft"),
+					complete: async () =>
+						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: args }], "toolUse"),
+					preflight: () => true,
+					executionWorlds: [sandbox],
+					onEvent: (event) => {
+						events.push(event);
+					},
+				});
+				try {
+					await host.startTurn(startInput(tool, turnID));
+					await waitFor(() => speculativeExecution.mock.calls.length === 1);
+					if (phase === "completed") {
+						release();
+						await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+					}
+					let settled = false;
+					const result = host.execute(
+						{ turnID, id: `actor-${toolName}`, tool: toolName, args, tools: [tool] },
+						undefined,
+						actorExecution,
+					).then((value) => {
+						settled = true;
+						return value;
+					});
+					if (phase === "running") {
+						await new Promise<void>((resolve) => setImmediate(resolve));
+						expect(settled, `${toolName} should join its running candidate`).toBe(false);
+						expect(actorExecution, `${toolName} should not start Actor fallback`).not.toHaveBeenCalled();
+						release();
+					}
+					expect((await result).content).toEqual([{ type: "text", text: expected }]);
+					expect(speculativeExecution).toHaveBeenCalledOnce();
+					expect(actorExecution).not.toHaveBeenCalled();
+					await waitFor(() =>
+						events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
+					);
+					expect(events.find((event) => event.type === "actor_action")).toMatchObject({
+						settlement: { provider: { kind: "speculative", match: { kind: "exact" } } },
+					});
+					expect(events.find((event) => event.type === "candidate" && event.state.status === "succeeded")).toMatchObject({
+						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
+					});
+					await host.finishTurn(turnID, true);
+				} finally {
+					release();
+					await host.dispose();
+				}
+			}
+		}
 	});
 
 	it("reuses the Actor's own read across turns and invalidates it on resource change", async () => {
@@ -331,13 +376,8 @@ describe("speculative action host", () => {
 				return { content: [{ type: "text", text: "actor" }], details: {} };
 			},
 		};
-		const sandbox: SpeculativeAgentExecutionWorld = {
-			id: "runtime",
-			scope: "runtime",
-			isolation: "runtime_sandbox",
-			capabilities: "all",
-			fingerprint: () => "runtime:v1",
-			fork: async (context) => {
+		const sandbox = mockRuntimeWorld(
+			async (context) => {
 				sandboxExecutions++;
 				await sandboxGate;
 				const text = `${Array.from({ length: 60 }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
@@ -345,23 +385,10 @@ describe("speculative action host", () => {
 					result: { content: [{ type: "text" as const, text }], details: {} },
 					isError: false,
 				};
-				return {
-					output,
-					backend: "runtime",
-					resources: [],
-					capturedBytes: 0,
-					executionMetrics: {},
-					compatibility: {
-						status: "compatible",
-						backend: "runtime",
-						executionFingerprint: context.action.executionFingerprint,
-					},
-					commit: async () => output,
-					dispose: () => {},
-				};
+				return output;
 			},
 			dispose,
-		};
+		);
 		const events: SpeculativeActionEvent<string>[] = [];
 		const host = createSpeculativeActionHost("session", {
 			cwd,
@@ -422,33 +449,13 @@ describe("speculative action host", () => {
 
 	it("prefers a runtime-wide sandbox over a read tool's resource-snapshot fallback", async () => {
 		const cwd = await temporaryWorkspace();
-		const fork = vi.fn(async (context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => {
-			const output = {
+		const fork = vi.fn(async (_context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => {
+			return {
 				result: { content: [{ type: "text" as const, text: "runtime read" }], details: {} },
 				isError: false,
 			};
-			return {
-				output,
-				backend: "runtime",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: {
-					status: "compatible" as const,
-					backend: "runtime",
-					executionFingerprint: context.action.executionFingerprint,
-				},
-				commit: async () => output,
-				dispose: () => {},
-			};
 		});
-		const runtimeWorld: SpeculativeAgentExecutionWorld = {
-			id: "runtime",
-			scope: "runtime",
-			isolation: "runtime_sandbox",
-			capabilities: "all",
-			fork,
-		};
+		const runtimeWorld = mockRuntimeWorld(fork);
 		const { tool, events, host, hostExecutions } = readWorldHost(cwd, [runtimeWorld], "host read");
 
 		await host.startTurn(startInput(tool));
@@ -501,9 +508,13 @@ describe("speculative action host", () => {
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		const hit = await host.consume({
+			turnID: "turn-1", id: "actor-read", tool: "read", args: { path: "notes.txt" }, tools: [tool],
+		});
 		expect(brokenPrepare).not.toHaveBeenCalled();
 		expect(unavailablePrepare).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
 		expect(hostExecutions()).toBe(1);
+		expect(hit?.result.content).toEqual([{ type: "text", text: "fallback" }]);
 		expect(events.find((event) => event.type === "candidate")).toMatchObject({
 			candidate: { execution: "resource_snapshot" },
 		});
@@ -1373,6 +1384,37 @@ function readWorldHost(
 		},
 	});
 	return { tool, events, host, hostExecutions: () => executions };
+}
+
+function mockRuntimeWorld(
+	execute: (context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => ToolSettlement | Promise<ToolSettlement>,
+	dispose?: SpeculativeAgentExecutionWorld["dispose"],
+): SpeculativeAgentExecutionWorld {
+	return {
+		id: "runtime",
+		scope: "runtime",
+		isolation: "runtime_sandbox",
+		capabilities: "all",
+		fingerprint: () => "runtime:v1",
+		fork: async (context) => {
+			const output = await execute(context);
+			return {
+				output,
+				backend: "runtime",
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: {
+					status: "compatible",
+					backend: "runtime",
+					executionFingerprint: context.action.executionFingerprint,
+				},
+				commit: async () => output,
+				dispose: () => {},
+			};
+		},
+		...(dispose ? { dispose } : {}),
+	};
 }
 
 function concurrentDrafterHost(
