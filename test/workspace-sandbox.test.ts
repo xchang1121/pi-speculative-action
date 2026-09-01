@@ -21,6 +21,7 @@ import {
 	prepareSandboxWorkspace,
 	readSandboxDirectoryState,
 	withSandboxWorkspace,
+	workspaceSandboxFingerprint,
 } from "../src/workspace-sandbox.ts";
 
 const writeParameters = Type.Object({ path: Type.String(), content: Type.String() });
@@ -62,6 +63,23 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
+	it("qualifies auto OverlayFS by the exact immutable baseline size", async () => {
+		if (!(await linuxOverlayfsCapability()).available) return;
+		const root = await temporaryRoot("overlay-auto-cost");
+		try {
+			await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
+			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+			await Promise.all(
+				Array.from({ length: 520 }, (_value, index) =>
+					writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
+				),
+			);
+			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v1:/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts workspace mutations and commits a sealed write exactly once", async () => {
 		const root = await temporaryRoot("write");
 		try {

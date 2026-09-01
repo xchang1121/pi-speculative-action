@@ -74,7 +74,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
-`setup:linux` 会把固定版本的 `sandlock` CLI 安装到 `~/.local`；在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、非特权 namespace、bind mount、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。探测成功后使用“共享不可变 Git 基线 + 私有 COW 挂载 + 类型化 upper journal”；事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
+`setup:linux` 会把固定版本的 `sandlock` CLI 安装到 `~/.local`；在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、非特权 namespace、bind mount、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。Linux 进程世界只有在探测通过且精确不可变基线至少包含 512 个条目（本机实测交叉点）时才自动选择 host-visible COW；小工作区以及通用 `write`/`edit` 后备继续使用 Git。每个 content commit 只预热并共享一份驱动原生 lower 结构快照；外层观察和嵌套事务用它与各自的类型化 upper journal 重建 merged tree。事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。若工作区内出现驱动导致的 `EXDEV`、`EOPNOTSUPP`、`ENOTSUP` 或 `ENOSYS`，完整 trace 会使该分支不可采纳；这覆盖 FUSE 无法透明复现的 lower 目录 rename 等操作。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 

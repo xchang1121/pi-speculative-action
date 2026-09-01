@@ -18,6 +18,11 @@ export interface StraceObservation {
 export interface StraceObservationOptions {
 	/** Exec paths replaced by the process outlet. Their implementation subtree is not workload provenance. */
 	readonly ignoredExecutablePaths?: readonly string[];
+	/**
+	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
+	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
+	 */
+	readonly guardFilesystemSemanticsWithin?: readonly string[];
 }
 
 interface TraceFile {
@@ -101,6 +106,7 @@ export async function observeStrace(
 	const ignoredExecutables = new Set(
 		(options.ignoredExecutablePaths ?? []).map((value) => path.posix.resolve(value)),
 	);
+	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
 	const ignoredAfter = ignoredProcessSegments(selected, byPID, ignoredExecutables);
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
@@ -143,6 +149,11 @@ export async function observeStrace(
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
 				taints.add("unsupported_syscall");
+			}
+			if (semanticRoots.length && workspaceDriverSemanticGap(line, syscall, cwd, semanticRoots)) {
+				complete = false;
+				taints.add("unsupported_syscall");
+				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
 			if (syscall === "chdir" && syscallSucceeded(line)) {
 				const value = quotedStrings(line)[0];
@@ -257,12 +268,30 @@ const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
 ]);
 
 const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC_SETFLAGS|FS_IOC_SETVERSION|FS_IOC_FSSETXATTR)\b/;
+const DRIVER_SEMANTIC_GAP_RESULT = /=\s*-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
 
 function unmodeledFileIoctl(line: string): boolean {
 	if (!syscallSucceeded(line)) return false;
 	if (UNMODELED_MUTATING_IOCTL.test(line)) return true;
 	const descriptorPath = /^\s*ioctl\(\d+<([^>]+)>/.exec(line)?.[1];
 	return descriptorPath?.startsWith("/") ?? false;
+}
+
+function workspaceDriverSemanticGap(
+	line: string,
+	syscall: string,
+	cwd: string,
+	roots: readonly string[],
+): boolean {
+	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line)) return false;
+	const referenced = new Set(syscallPaths(line, syscall, cwd));
+	for (const match of line.matchAll(/\d+<(\/[^>]+)>/g)) referenced.add(path.posix.normalize(match[1]!));
+	return [...referenced].some((candidate) => roots.some((root) => posixContains(root, candidate)));
+}
+
+function posixContains(root: string, candidate: string): boolean {
+	const relative = path.posix.relative(path.posix.resolve(root), path.posix.resolve(candidate));
+	return relative === "" || (relative !== ".." && !relative.startsWith("../") && !path.posix.isAbsolute(relative));
 }
 
 const NETWORK_SYSCALLS = new Set([

@@ -40,7 +40,6 @@ import {
 	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
 import {
-	captureWorkspaceStructure,
 	diffWorkspaceStructures,
 	ExecutionPathProjection,
 	hydrateWorkspaceFileEntry,
@@ -64,13 +63,12 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v7";
+const BACKEND_EPOCH = "pi-linux-process-v8";
 const POLICY_ID = "sandlock-namespaced-transparent-exec-v6";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
-const MAX_CAPTURE_FILES = 100_000;
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
@@ -425,10 +423,7 @@ export class LinuxProcessReuseBackend {
 			command: [session.invocation.shell, ...shellArguments],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
-		const before = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
-			maxFiles: MAX_CAPTURE_FILES,
-			exclude: session.workspace.observationExcludes,
-		});
+		const before = await session.workspace.structure.capture();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
 		const traced = [
@@ -464,12 +459,10 @@ export class LinuxProcessReuseBackend {
 				},
 			);
 			try {
-				const after = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
-					maxFiles: MAX_CAPTURE_FILES,
-					exclude: session.workspace.observationExcludes,
-				});
+				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
 					ignoredExecutablePaths: session.interposition.executablePaths,
+					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
 				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
@@ -626,10 +619,13 @@ export class LinuxProcessReuseBackend {
 				transactionFinishing = true;
 				const [delta, observation] = await Promise.all([
 					transaction.finish(),
-					observeStrace(tracePrefix, executable, request.cwd),
+					observeStrace(tracePrefix, executable, request.cwd, {
+						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+					}),
 				]);
 				if (observation.incompleteReasons.length) {
 					this.counters.lastError = `trace:${observation.incompleteReasons.join(",")}`;
+					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
 				}
 				if (!delta.complete) {
 					this.counters.lastError = `transaction:${delta.reason}`;

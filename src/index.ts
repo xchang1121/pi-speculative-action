@@ -356,6 +356,8 @@ export {
 	createWorkspaceSandbox,
 	type PrepareSandboxWorkspaceOptions,
 	prepareSandboxWorkspace,
+	qualifyWorkspaceSandboxDriver,
+	type QualifiedWorkspaceSandboxDriver,
 	readSandboxDirectoryState,
 	type SandboxDirectoryChange,
 	type SandboxDirectoryState,
@@ -379,6 +381,7 @@ export {
 } from "./linux-overlayfs.ts";
 export type {
 	WorkspaceRegularDelta,
+	WorkspaceStructureDriver,
 	WorkspaceTransactionCapture,
 	WorkspaceTransactionDelta,
 	WorkspaceTransactionDriver,

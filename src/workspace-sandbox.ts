@@ -25,6 +25,7 @@ import {
 } from "./linux-overlayfs.ts";
 import {
 	captureWorkspaceStructure,
+	captureWorkspaceStructureEntry,
 	directoryEntriesDigest,
 	type WorkspaceStructureEntry,
 	type WorkspaceStructureSnapshot,
@@ -35,6 +36,7 @@ import type { ToolSettlement } from "./tool-settlement.ts";
 import {
 	deferredWorkspaceTransactionDriver,
 	type WorkspaceRegularDelta,
+	type WorkspaceStructureDriver,
 	type WorkspaceTransactionCapture,
 	type WorkspaceTransactionDelta,
 	type WorkspaceTransactionDriver,
@@ -87,7 +89,7 @@ export type WorkspaceSandboxDriver = "auto" | "git" | "overlayfs";
 
 export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
 	readonly gitBinary?: string;
-	/** Auto selects a fully probed host-visible OverlayFS and otherwise retains the Git worktree backend. */
+	/** Auto is portable Git unless a trace-guarded runtime explicitly qualifies a COW driver. */
 	readonly driver?: WorkspaceSandboxDriver;
 }
 
@@ -97,6 +99,8 @@ export interface SandboxWorkspaceContext {
 	readonly processRoot: string;
 	/** Root entry names owned by the isolation substrate and invisible to effect observation. */
 	readonly observationExcludes: readonly string[];
+	/** Driver-native content-free structure view shared by outer and nested process observers. */
+	readonly structure: WorkspaceStructureDriver;
 	/** Content-addressed mutation intervals, independent of any process or tool implementation. */
 	readonly transactions: WorkspaceTransactionDriver;
 }
@@ -156,6 +160,7 @@ interface PooledGitRepository {
 	lock: Promise<void>;
 	prepared?: Promise<PreparedGitWorkspace>;
 	readonly overlayBaselines: Map<string, Promise<SharedOverlayBaseline>>;
+	autoDriverDecision?: AutoWorkspaceDriverDecision;
 	/** Unsafe live-mount storage is detached from allocation and retained for OS-level recovery. */
 	quarantined: boolean;
 	registration?: Promise<PooledGitRepository>;
@@ -174,7 +179,15 @@ interface SharedOverlayBaseline {
 	readonly privateRoot: string;
 	readonly gitDirectory: string;
 	readonly commit: string;
+	structure?: Promise<WorkspaceStructureSnapshot>;
 	active: number;
+}
+
+interface AutoWorkspaceDriverDecision {
+	readonly commit: string;
+	readonly capabilityFingerprint: string;
+	readonly treeEntries: number;
+	readonly resolved: QualifiedWorkspaceSandboxDriver;
 }
 
 class GitWorkspaceTransactionCapture implements WorkspaceTransactionCapture {
@@ -205,10 +218,10 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 	private readonly gitRoot: string;
 	private readonly sandboxRoot: string;
 	private readonly baselineTree: string;
+	private readonly captureStructure: () => Promise<WorkspaceStructureSnapshot>;
 	private readonly openClock: () => Promise<FileHandle>;
 	private readonly expectedClockLinks: 0 | 1;
 	private readonly clockRoots: readonly string[];
-	private readonly observationExcludes: readonly string[];
 	private lastStructure: WorkspaceStructureSnapshot;
 	private readonly frontier: Map<string, RegularFileState | undefined>;
 	private poisonReason?: string;
@@ -222,22 +235,22 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 		gitRoot: string,
 		sandboxRoot: string,
 		baselineTree: string,
+		captureStructure: () => Promise<WorkspaceStructureSnapshot>,
 		openClock: () => Promise<FileHandle>,
 		expectedClockLinks: 0 | 1,
 		clockRoots: readonly string[],
 		initialStructure: WorkspaceStructureSnapshot,
-		observationExcludes: readonly string[],
 		initialFrontier: ReadonlyMap<string, RegularFileState | undefined>,
 	) {
 		this.gitBinary = gitBinary;
 		this.gitRoot = gitRoot;
 		this.sandboxRoot = sandboxRoot;
 		this.baselineTree = baselineTree;
+		this.captureStructure = captureStructure;
 		this.openClock = openClock;
 		this.expectedClockLinks = expectedClockLinks;
 		this.clockRoots = clockRoots;
 		this.lastStructure = initialStructure;
-		this.observationExcludes = observationExcludes;
 		this.frontier = new Map(initialFrontier);
 		if (!initialStructure.complete) this.poisonReason = "workspace_structure_limit";
 	}
@@ -247,10 +260,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 		try {
 			await this.assertChangeClockFilesystem();
 			await this.advanceChangeClock(this.lastStructure);
-			const verified = await captureWorkspaceStructure(this.sandboxRoot, {
-				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-				exclude: this.observationExcludes,
-			});
+			const verified = await this.captureStructure();
 			if (!sameWorkspaceChangeSnapshot(this.lastStructure, verified)) {
 				throw new Error("workspace changed while initializing transaction clock");
 			}
@@ -302,15 +312,9 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 				return { complete: false, changes: [], reason: this.poisonReason ?? "workspace_transaction_unavailable" };
 			}
 			try {
-				const observed = await captureWorkspaceStructure(this.sandboxRoot, {
-					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-					exclude: this.observationExcludes,
-				});
+				const observed = await this.captureStructure();
 				await this.advanceChangeClock(observed);
-				const after = await captureWorkspaceStructure(this.sandboxRoot, {
-					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-					exclude: this.observationExcludes,
-				});
+				const after = await this.captureStructure();
 				if (!sameWorkspaceChangeSnapshot(observed, after)) {
 					throw new Error("workspace changed while fencing transaction endpoint");
 				}
@@ -321,10 +325,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 					return { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
 				}
 				const changes = await this.captureTransitions(transitions.paths, capture.frontier, after);
-				const verified = await captureWorkspaceStructure(this.sandboxRoot, {
-					maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-					exclude: this.observationExcludes,
-				});
+				const verified = await this.captureStructure();
 				if (!sameWorkspaceChangeSnapshot(after, verified)) {
 					throw new Error("workspace changed while sealing transaction endpoint");
 				}
@@ -350,22 +351,13 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 
 	private async captureFencedBefore(): Promise<WorkspaceStructureSnapshot> {
 		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
-			const current = await captureWorkspaceStructure(this.sandboxRoot, {
-				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-				exclude: this.observationExcludes,
-			});
+			const current = await this.captureStructure();
 			await this.advanceChangeClock(current);
-			const fenced = await captureWorkspaceStructure(this.sandboxRoot, {
-				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-				exclude: this.observationExcludes,
-			});
+			const fenced = await this.captureStructure();
 			if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
 			await this.synchronizeFrontier(fenced);
 			if (this.poisonReason) throw new Error(this.poisonReason);
-			const verified = await captureWorkspaceStructure(this.sandboxRoot, {
-				maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-				exclude: this.observationExcludes,
-			});
+			const verified = await this.captureStructure();
 			if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
 			this.lastStructure = verified;
 			return verified;
@@ -591,6 +583,9 @@ const WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS = 100;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";
+// Same-machine qualification crosses over near 500 immutable entries. Keep the small-tree path on
+// Git and require a complete exact baseline before paying for a long-lived FUSE mount.
+const AUTO_OVERLAY_MIN_TREE_ENTRIES = 512;
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_AUTHOR_NAME: "Pi Speculative Action",
@@ -630,7 +625,7 @@ function resolveWorkspaceCheckpoint(
 	return checkpoint;
 }
 
-interface ResolvedWorkspaceDriver {
+export interface QualifiedWorkspaceSandboxDriver {
 	readonly driver: Exclude<WorkspaceSandboxDriver, "auto">;
 	readonly fingerprint: string;
 }
@@ -638,40 +633,93 @@ interface ResolvedWorkspaceDriver {
 /** Concrete storage identity is part of route compatibility, never an implicit implementation detail. */
 export async function workspaceSandboxFingerprint(
 	options: WorkspaceSandboxOptions = {},
+	sourceRoot?: string,
 ): Promise<string> {
-	return (await resolveWorkspaceDriver(options)).fingerprint;
+	return sourceRoot
+		? (await qualifyWorkspaceSandboxDriver(options, sourceRoot)).fingerprint
+		: (await resolveWorkspaceDriver(options)).fingerprint;
 }
 
-async function resolveWorkspaceDriver(options: WorkspaceSandboxOptions): Promise<ResolvedWorkspaceDriver> {
-	if ((options.driver ?? "auto") === "git") return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
+/**
+ * Qualify the capability- and cost-selected COW driver for a runtime that traces driver-specific
+ * filesystem errors and rejects adoption. Generic host-function branches deliberately do not call
+ * this function and retain portable Git semantics.
+ */
+export function qualifyWorkspaceSandboxDriver(
+	options: WorkspaceSandboxOptions,
+	sourceRoot: string,
+): Promise<QualifiedWorkspaceSandboxDriver> {
+	return resolveWorkspaceDriver(options, sourceRoot);
+}
+
+async function resolveWorkspaceDriver(
+	options: WorkspaceSandboxOptions,
+	sourceRoot?: string,
+	acquiredRepository?: PooledGitRepository,
+): Promise<QualifiedWorkspaceSandboxDriver> {
+	const requested = options.driver ?? "auto";
+	if (requested === "git") return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 	const capability = await linuxOverlayfsCapability({
 		...(options.overlayfsBinary ? { overlayfsBinary: options.overlayfsBinary } : {}),
 		...(options.fusermountBinary ? { fusermountBinary: options.fusermountBinary } : {}),
 	});
-	if (capability.available) {
-		return { driver: "overlayfs", fingerprint: `linux-overlayfs:v1:${capability.fingerprint}` };
+	if (!capability.available) {
+		if (requested === "overlayfs") throw new Error(capability.detail);
+		return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 	}
-	if (options.driver === "overlayfs") throw new Error(capability.detail);
-	return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
+	const overlay = { driver: "overlayfs", fingerprint: `linux-overlayfs:v1:${capability.fingerprint}` } as const;
+	if (requested === "overlayfs") return overlay;
+	if (!sourceRoot) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
+
+	const ownedRepository = acquiredRepository
+		? undefined
+		: await acquireSandboxRepository(path.resolve(sourceRoot), options.gitBinary ?? "git");
+	const repository = acquiredRepository ?? ownedRepository;
+	if (!repository) throw new Error("workspace repository is unavailable");
+	try {
+		const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
+		const cached = repository.autoDriverDecision;
+		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) {
+			return cached.resolved;
+		}
+		const treeEntries = await countGitBaselineEntries(repository, commit);
+		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES
+			? overlay
+			: { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
+		repository.autoDriverDecision = {
+			commit,
+			capabilityFingerprint: capability.fingerprint,
+			treeEntries,
+			resolved,
+		};
+		return resolved;
+	} finally {
+		if (ownedRepository) releaseSandboxRepository(ownedRepository);
+	}
 }
 
 /** Create a copy-on-write execution world with transactional multi-file commit. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
+	// Generic mutation routes have no workspace root at fingerprint time. Their short, targeted
+	// branches retain Git unless OverlayFS was explicitly requested; Linux process routes can make
+	// the exact baseline-qualified auto decision from their invocation context.
+	const resolvedOptions: WorkspaceSandboxOptions =
+		options.driver === "overlayfs" ? options : { ...options, driver: "git" };
 	const roots = new Set<string>();
 	return {
 		id: "git_worktree",
 		scope: "fallback",
 		isolation: "workspace_branch",
 		capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-		fingerprint: () => workspaceSandboxFingerprint(options),
+		fingerprint: () => workspaceSandboxFingerprint(resolvedOptions),
 		prepare: async ({ cwd, signal }) => {
 			roots.add(path.resolve(cwd));
-			await prepareSandboxWorkspace(cwd, { ...options, signal });
+			await prepareSandboxWorkspace(cwd, { ...resolvedOptions, signal });
 		},
 		fork: async (context) => {
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			return executeMutation(context, options);
+			return executeMutation(context, resolvedOptions);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
@@ -882,7 +930,9 @@ export async function withSandboxWorkspace<T>(
 export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
 	const sourceRoot = path.resolve(options.cwd);
 	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
-	const resolvedDriver = await resolveWorkspaceDriver(options);
+	const resolvedDriver = await resolveWorkspaceDriver(
+		options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options,
+	);
 	const setupStarted = performance.now();
 	const snapshot = await withPrivateSandboxWorkspace(
 		sourceRoot,
@@ -919,11 +969,17 @@ export async function prepareSandboxWorkspace(
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
 	const repository = await acquireSandboxRepository(sourceRoot, options.gitBinary ?? "git");
 	try {
-		const resolved = await resolveWorkspaceDriver(options);
+		const concreteOptions =
+			options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" as const } : options;
+		const resolved = await resolveWorkspaceDriver(concreteOptions, sourceRoot, repository);
 		if (resolved.driver === "overlayfs") {
 			const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
 			const baseline = await acquireOverlayBaseline(repository, commit);
-			releaseOverlayBaseline(baseline);
+			try {
+				await overlayBaselineStructure(baseline);
+			} finally {
+				releaseOverlayBaseline(baseline);
+			}
 		} else await ensurePreparedSandbox(repository);
 		throwIfAborted(options.signal);
 	} finally {
@@ -1028,12 +1084,27 @@ async function createPrivateSandboxWorkspace(
 		}
 		const baselineFrontier = new Map<string, RegularFileState | undefined>();
 		let workspace!: PrivateSandboxWorkspace;
+		const structure: WorkspaceStructureDriver = {
+			capture: () => {
+				if (!workspace.overlay) {
+					return captureWorkspaceStructure(workspace.sandboxRoot, {
+						maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+						exclude: workspace.observationExcludes,
+					});
+				}
+				if (!workspace.sharedBaseline) throw new Error("OverlayFS shared baseline is unavailable");
+				return overlayBaselineStructure(workspace.sharedBaseline).then((baseline) =>
+					captureOverlayWorkspaceStructure(workspace, baseline),
+				);
+			},
+		};
 		const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
 		workspace = {
 			sourceRoot,
 			sandboxRoot,
 			processRoot,
 			observationExcludes,
+			structure,
 			transactions,
 			repository: pool.repository,
 			gitDirectory,
@@ -1089,20 +1160,17 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		.toString("utf8")
 		.trim();
 	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
-	const initialStructure = await captureWorkspaceStructure(workspace.sandboxRoot, {
-		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-		exclude: workspace.observationExcludes,
-	});
+	const initialStructure = await workspace.structure.capture();
 	const driver = new GitWorkspaceTransactionDriver(
 		workspace.gitBinary,
 		workspace.baselineRoot,
 		workspace.sandboxRoot,
 		baselineTree,
+		workspace.structure.capture,
 		workspace.openTransactionClock,
 		workspace.transactionClockLinks,
 		workspace.transactionClockRoots,
 		initialStructure,
-		workspace.observationExcludes,
 		workspace.baselineFrontier,
 	);
 	await driver.initialize();
@@ -1279,6 +1347,15 @@ async function acquireSandboxBaseline(
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
 	});
+}
+
+async function countGitBaselineEntries(repository: PooledGitRepository, commit: string): Promise<number> {
+	const tree = await git(
+		repository.gitBinary,
+		["--git-dir", repository.repository, "ls-tree", "-r", "-z", "--name-only", commit],
+		repository.parent,
+	);
+	return parseNullList(tree).length;
 }
 
 async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: readonly string[]): Promise<void> {
@@ -1459,6 +1536,14 @@ async function createOverlayBaseline(
 		commit,
 		active: 0,
 	};
+}
+
+function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<WorkspaceStructureSnapshot> {
+	baseline.structure ??= captureWorkspaceStructure(baseline.root, {
+		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
+		exclude: SNAPSHOT_EXCLUDES,
+	});
+	return baseline.structure;
 }
 
 function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void {
@@ -1793,6 +1878,111 @@ async function collectGitChangeResources(workspace: PrivateSandboxWorkspace): Pr
 		}
 	}
 	return Object.freeze([...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]);
+}
+
+interface OverlayStructureRemoval {
+	readonly resource: string;
+	readonly descendantsOnly: boolean;
+}
+
+interface OverlayStructureFrontier {
+	readonly refresh: ReadonlySet<string>;
+	readonly removals: readonly OverlayStructureRemoval[];
+}
+
+/**
+ * Reconstruct the complete logical structure from one immutable lower snapshot plus the typed upper
+ * journal. Only upper paths and their ancestor directories require fresh merged-view syscalls.
+ */
+async function captureOverlayWorkspaceStructure(
+	workspace: PrivateSandboxWorkspace,
+	baseline: WorkspaceStructureSnapshot,
+): Promise<WorkspaceStructureSnapshot> {
+	if (!workspace.overlay) throw new Error("OverlayFS structure frontier is unavailable");
+	const frontier = await inspectOverlayStructureFrontier(workspace.overlay.upperRoot);
+	const entries = new Map(baseline.entries);
+	for (const removal of frontier.removals) {
+		const normalized = path.normalize(removal.resource);
+		const prefix = normalized ? `${normalized}${path.sep}` : "";
+		for (const candidate of [...entries.keys()]) {
+			if (
+				(removal.descendantsOnly && prefix && candidate.startsWith(prefix)) ||
+				(!removal.descendantsOnly && (candidate === normalized || (prefix && candidate.startsWith(prefix))))
+			) {
+				entries.delete(candidate);
+			}
+		}
+	}
+	for (const resource of [...frontier.refresh].sort(comparePathDepth)) {
+		const target = resource ? path.resolve(workspace.sandboxRoot, resource) : workspace.sandboxRoot;
+		if (!contains(workspace.sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
+		const entry = await captureWorkspaceStructureEntry(
+			target,
+			resource ? [] : workspace.observationExcludes,
+		);
+		if (entry) entries.set(resource, entry);
+		else entries.delete(resource);
+	}
+	const files = Math.max(0, entries.size - 1);
+	return Object.freeze({
+		root: workspace.sandboxRoot,
+		entries,
+		files,
+		bytesRead: 0,
+		complete: baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES,
+	});
+}
+
+async function inspectOverlayStructureFrontier(upperRoot: string): Promise<OverlayStructureFrontier> {
+	const refresh = new Set<string>([""]);
+	const removals: OverlayStructureRemoval[] = [];
+	let entries = 0;
+	const addAncestors = (resource: string, includeSelf: boolean) => {
+		let current = includeSelf ? path.normalize(resource) : path.dirname(path.normalize(resource));
+		for (;;) {
+			const relative = current === "." ? "" : current;
+			refresh.add(relative);
+			if (!relative) break;
+			current = path.dirname(relative);
+		}
+	};
+	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+		for (const child of await readdir(directory, { withFileTypes: true })) {
+			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error("OverlayFS structure frontier exceeds file limit");
+			if (child.name === ".wh..wh..opq") {
+				removals.push({ resource: relativeDirectory, descendantsOnly: true });
+				addAncestors(relativeDirectory, true);
+				continue;
+			}
+			if (child.name.startsWith(".wh.")) {
+				throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
+			}
+			const resource = slash(relativeDirectory ? path.join(relativeDirectory, child.name) : child.name);
+			if (isSnapshotExcluded(resource)) continue;
+			const target = path.join(directory, child.name);
+			const stats = await lstat(target);
+			if (stats.isDirectory()) {
+				addAncestors(resource, true);
+				await visit(target, resource);
+				continue;
+			}
+			if (stats.isCharacterDevice()) {
+				if (stats.rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
+				removals.push({ resource, descendantsOnly: false });
+				addAncestors(resource, false);
+				continue;
+			}
+			if (!stats.isFile()) throw new Error(`unsupported OverlayFS upper inode: ${resource}`);
+			addAncestors(resource, true);
+		}
+	};
+	await visit(upperRoot, "");
+	return { refresh, removals: Object.freeze(removals) };
+}
+
+function comparePathDepth(left: string, right: string): number {
+	const depth = (value: string) => value.split(path.sep).filter(Boolean).length;
+	return depth(left) - depth(right) || left.localeCompare(right);
 }
 
 /**

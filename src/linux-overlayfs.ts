@@ -16,7 +16,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v3";
+const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
 const OVERLAY_EXIT_TIMEOUT_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
@@ -290,7 +290,7 @@ async function startLinuxOverlayfs(input: {
 		[
 			"-f",
 			"-o",
-			`lowerdir=${input.lowerRoot},upperdir=${input.upperRoot},workdir=${input.workRoot}`,
+			`clone_fd,lowerdir=${input.lowerRoot},upperdir=${input.upperRoot},workdir=${input.workRoot}`,
 			input.root,
 		],
 		{ stdio: ["pipe", "pipe", "pipe"] },

@@ -19,6 +19,7 @@ import {
 	ProcessReusePlanner,
 	ProcessExecutionCoordinator,
 	ProvenanceCertificateStore,
+	qualifyWorkspaceSandboxDriver,
 	releaseResourceVersion,
 	ToolExecutionGateway,
 } from "../src/index.ts";
@@ -37,6 +38,7 @@ describe("speculative action package boundary", () => {
 			releaseResourceVersion,
 			createWorkspaceSandbox,
 			prepareSandboxWorkspace,
+			qualifyWorkspaceSandboxDriver,
 			EffectTransactionCoordinator,
 			ExecutionWorldRouter,
 			ToolExecutionGateway,

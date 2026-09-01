@@ -86,6 +86,61 @@ export async function captureWorkspaceStructure(
 	return captureWorkspaceSnapshot(root, options, "none") as Promise<WorkspaceStructureSnapshot>;
 }
 
+/** Capture one path without walking its descendants; used by typed mutation-frontier drivers. */
+export async function captureWorkspaceStructureEntry(
+	target: string,
+	excludeEntries: readonly string[] = [],
+): Promise<WorkspaceStructureEntry | undefined> {
+	let stat: Awaited<ReturnType<typeof lstat>>;
+	try {
+		stat = await lstat(target);
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+		throw error;
+	}
+	if (stat.isSymbolicLink()) {
+		const linkTarget = await readlink(target);
+		return {
+			kind: "symlink",
+			target: linkTarget,
+			targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")),
+			changeDigest: statChangeDigest(stat),
+			changeTimeMs: stat.ctimeMs,
+		};
+	}
+	if (stat.isDirectory()) {
+		const excluded = new Set(excludeEntries);
+		const entries = (await readdir(target, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name));
+		return {
+			kind: "directory",
+			entriesDigest: directoryEntriesDigest(entries),
+			metadataDigest: statMetadataDigest(stat),
+			changeDigest: statChangeDigest(stat),
+			changeTimeMs: stat.ctimeMs,
+			mode: stat.mode & 0o777,
+			uid: stat.uid,
+			gid: stat.gid,
+		};
+	}
+	if (stat.isFile()) {
+		return {
+			kind: "file",
+			metadataDigest: statMetadataDigest(stat),
+			changeDigest: statChangeDigest(stat),
+			changeTimeMs: stat.ctimeMs,
+			mode: stat.mode & 0o777,
+			size: stat.size,
+			links: stat.nlink,
+		};
+	}
+	return {
+		kind: "unsupported",
+		type: specialFileType(stat),
+		changeDigest: statChangeDigest(stat),
+		changeTimeMs: stat.ctimeMs,
+	};
+}
+
 async function captureWorkspaceSnapshot(
 	root: string,
 	options: WorkspaceTreeCaptureOptions,

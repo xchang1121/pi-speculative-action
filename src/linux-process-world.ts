@@ -11,6 +11,7 @@ import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import {
 	forkSandboxWorkspace,
 	prepareSandboxWorkspace,
+	qualifyWorkspaceSandboxDriver,
 	type WorkspaceSandboxOptions,
 	workspaceSandboxFingerprint,
 } from "./workspace-sandbox.ts";
@@ -32,10 +33,13 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-		fingerprint: async () => {
+		fingerprint: async (request) => {
+			const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
 			const [processFingerprint, workspaceFingerprint] = await Promise.all([
 				backend.fingerprint(),
-				workspaceSandboxFingerprint(workspaceOptions),
+				invocation?.cwd
+					? qualifyWorkspaceSandboxDriver(workspaceOptions, invocation.cwd).then((selected) => selected.fingerprint)
+					: workspaceSandboxFingerprint(workspaceOptions),
 			]);
 			return `${processFingerprint}:${workspaceFingerprint}`;
 		},
@@ -43,13 +47,19 @@ export function createLinuxProcessExecutionWorld(
 			const status = await backend.check();
 			if (status.state !== "ready") throw new Error(status.detail);
 			roots.add(path.resolve(cwd));
-			await prepareSandboxWorkspace(cwd, { ...workspaceOptions, ...(signal ? { signal } : {}) });
+			const selected = await qualifyWorkspaceSandboxDriver(workspaceOptions, cwd);
+			await prepareSandboxWorkspace(cwd, {
+				...workspaceOptions,
+				driver: selected.driver,
+				...(signal ? { signal } : {}),
+			});
 		},
 		fork: async (context) => {
 			const invocation = processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
+			const selected = await qualifyWorkspaceSandboxDriver(workspaceOptions, sourceRoot);
 			let validate: LinuxProcessSession["validate"] | undefined;
 			let seal: LinuxProcessSession["seal"] | undefined;
 			return forkSandboxWorkspace({
@@ -57,6 +67,7 @@ export function createLinuxProcessExecutionWorld(
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 				...workspaceOptions,
+				driver: selected.driver,
 				validate: async () =>
 					validate
 						? validate()

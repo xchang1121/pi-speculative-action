@@ -40,6 +40,11 @@ export interface WorkspaceTransactionDriver {
 	readonly dispose: () => Promise<void>;
 }
 
+/** Content-free structure view supplied by the concrete workspace storage driver. */
+export interface WorkspaceStructureDriver {
+	readonly capture: () => Promise<WorkspaceStructureSnapshot>;
+}
+
 /**
  * Keep transaction machinery off read-only/replay paths. Concurrent first users share one driver,
  * and a failed construction remains failed rather than silently changing observation policy.

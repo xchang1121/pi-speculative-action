@@ -24,7 +24,11 @@ Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
 and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
 after its binary, FUSE device, copy-up, 0/0 whiteout, opaque-directory, private
 anonymous clock, cross-view timestamp ordering, namespace visibility, and unmount
-lifecycle all pass; otherwise it uses Git worktrees.
+lifecycle all pass and the exact baseline contains at least 512 entries. Small
+trees retain Git. Use `--source-files N` with `bench:linux-topology` to reproduce
+the storage-driver crossover; driver-induced unsupported filesystem results are
+trace-tainted and cannot be adopted. Reports include the one-time
+`routePreparationMs` separately from fork/hit latency.
 
 The fixture uses three different parent Bash commands around an identical
 compiled child exec. It requires the second parent to hit the first process

@@ -156,4 +156,31 @@ describe("strace provenance decoder", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test("fails closed on COW-driver semantic gaps inside the workspace only", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-driver-gap-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(
+				`${prefix}.502`,
+				[
+					'execve("/usr/bin/example", ["example"], 0x0) = 0',
+					'rename("source", "moved") = -1 EXDEV (Invalid cross-device link)',
+					'openat(AT_FDCWD, ".", O_RDWR|O_TMPFILE, 0600) = -1 EOPNOTSUPP (Operation not supported)',
+					'rename("/outside/source", "/outside/moved") = -1 EXDEV (Invalid cross-device link)',
+				].join("\n"),
+			);
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work", {
+				guardFilesystemSemanticsWithin: ["/work"],
+			});
+			expect(observation.complete).toBe(false);
+			expect(observation.taints).toEqual(expect.arrayContaining(["unsupported_syscall", "trace_incomplete"]));
+			expect(observation.incompleteReasons).toEqual([
+				"filesystem_semantics:openat:502",
+				"filesystem_semantics:rename:502",
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

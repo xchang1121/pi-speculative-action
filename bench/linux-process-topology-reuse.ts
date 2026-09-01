@@ -86,6 +86,7 @@ if (process.platform !== "linux") throw new Error("Run this benchmark inside Lin
 const mode = argument("--mode") ?? "reuse";
 if (mode !== "reuse" && mode !== "direct") throw new Error("--mode must be reuse or direct");
 const transformRounds = integerArgument("--rounds", 96, 0, 4_096);
+const sourceFiles = integerArgument("--source-files", 0, 0, 20_000);
 const outputPath = argument("--output");
 const workspaceDriver = workspaceDriverArgument(argument("--workspace-driver"));
 const root = await mkdtemp(path.join(os.tmpdir(), "pi-topology-reuse-bench-"));
@@ -118,12 +119,15 @@ try {
 	let status: Awaited<ReturnType<LinuxProcessReuseBackend["check"]>> | undefined;
 	let executionFingerprint: string | undefined;
 	let workspaceFingerprint: string | undefined;
+	let routePreparationMs: number | undefined;
 	if (backend && world) {
 		status = await backend.check(true);
 		if (status.state !== "ready") throw new Error(status.detail);
+		const routePreparationStarted = performance.now();
+		workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver }, workspace);
 		await world.prepare?.({ cwd: workspace });
-		workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver });
 		executionFingerprint = `${await backend.fingerprint()}:${workspaceFingerprint}`;
+		routePreparationMs = performance.now() - routePreparationStarted;
 	}
 
 	const warmup = await runTask("warmup", "pi-topology-helper input.bin generated/nested/artifact.bin");
@@ -171,7 +175,12 @@ try {
 				: {}),
 		},
 		subject: "stock Pi createBashTool running one process that creates two directories and a transformed artifact",
-		fixture: { inputBytes: INPUT_BYTES, transformRoundsPerByte: transformRounds, measuredRuns: MEASURED_RUNS },
+		fixture: {
+			inputBytes: INPUT_BYTES,
+			transformRoundsPerByte: transformRounds,
+			sourceFiles,
+			measuredRuns: MEASURED_RUNS,
+		},
 		assertions: {
 			allArtifactsEqual: true,
 			...(mode === "reuse" ? { warmupPublished: true, typedTopologyCaptured: true, allCrossParentHits: true } : {}),
@@ -179,6 +188,7 @@ try {
 		warmup,
 		runs,
 		summary: {
+			...(routePreparationMs !== undefined ? { routePreparationMs } : {}),
 			medianMs: median(runs.map((run) => run.totalMs)),
 			...(backend ? { metrics: numericMetrics(backend.metrics()) } : {}),
 		},
@@ -253,6 +263,18 @@ try {
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-topology-helper.c"), HELPER_SOURCE, "utf8");
 	await writeFile(path.join(workspace, "input.bin"), Buffer.alloc(INPUT_BYTES, 0x31));
+	if (sourceFiles > 0) {
+		const fixtureRoot = path.join(workspace, "fixture-files");
+		await mkdir(fixtureRoot);
+		for (let offset = 0; offset < sourceFiles; offset += 256) {
+			await Promise.all(
+				Array.from({ length: Math.min(256, sourceFiles - offset) }, (_value, index) => {
+					const ordinal = offset + index;
+					return writeFile(path.join(fixtureRoot, `${ordinal.toString().padStart(5, "0")}.txt`), `${ordinal}\n`, "utf8");
+				}),
+			);
+		}
+	}
 	await commandOutput(
 		"cc",
 		[
@@ -269,7 +291,7 @@ async function prepareWorkspace(workspace: string): Promise<void> {
 	await commandOutput("git", ["init", "--quiet"], workspace);
 	await commandOutput("git", ["config", "user.name", "Pi Topology Benchmark"], workspace);
 	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);
-	await commandOutput("git", ["add", "pi-topology-helper.c", "pi-topology-helper", "input.bin"], workspace);
+	await commandOutput("git", ["add", "."], workspace);
 	await commandOutput("git", ["commit", "--quiet", "-m", "benchmark fixture"], workspace);
 	await access(path.join(workspace, "pi-topology-helper"));
 }

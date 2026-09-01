@@ -88,9 +88,11 @@ try {
 	await prepareWorkspace(workspace);
 	const status = await backend.check(true);
 	if (status.state !== "ready") throw new Error(status.detail);
+	const routePreparationStarted = performance.now();
+	const workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver }, workspace);
 	await world.prepare?.({ cwd: workspace });
-	const workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver });
 	const executionFingerprint = `${await backend.fingerprint()}:${workspaceFingerprint}`;
+	const routePreparationMs = performance.now() - routePreparationStarted;
 	const runs: MeasuredRun[] = [];
 
 	runs.push(
@@ -158,6 +160,7 @@ try {
 		},
 		runs,
 		summary: {
+			routePreparationMs,
 			coldToCrossParentHitSpeedup: cold.totalMs / hit.totalMs,
 			coldForkToCrossParentHitForkSpeedup: cold.forkMs / hit.forkMs,
 			latencySavedMs: cold.totalMs - hit.totalMs,
