@@ -15,6 +15,7 @@ import {
 import {
 	agentBatchKey,
 	type AgentPlanSource,
+	type DraftModelSelection,
 	type DraftOptionsContext,
 } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
@@ -47,9 +48,7 @@ export interface DrafterPlanSourceController {
 
 export function createDrafterPlanSource(input: {
 	readonly sessionID: string;
-	readonly draftModel?:
-		| Model<Api>
-		| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
+	readonly draftModel?: DraftModelSelection;
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
 	readonly validateArguments: (

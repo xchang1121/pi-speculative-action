@@ -11,6 +11,10 @@ export interface DraftOptionsContext {
 	readonly signal: AbortSignal;
 }
 
+export type DraftModelSelection =
+	| Model<Api>
+	| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
+
 export interface AgentStartInput {
 	readonly sessionID: string;
 	readonly turnID: string;

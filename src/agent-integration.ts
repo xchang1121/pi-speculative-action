@@ -15,6 +15,7 @@ import type {
 	AgentConsumeInput,
 	AgentStartInput,
 	AgentStateData,
+	DraftModelSelection,
 	DraftOptionsContext,
 } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
@@ -88,9 +89,7 @@ export interface CreateSpeculativeActionHostOptions {
 	/** Runtime settings. The feature remains disabled when omitted. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
 	/** Drafter model. Defaults to the actor model when omitted or unresolved. */
-	readonly draftModel?:
-		| Model<Api>
-		| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
+	readonly draftModel?: DraftModelSelection;
 	/** Resolve drafter request options, including credentials when using a different provider. */
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	/** Provider completion used by the drafter. */

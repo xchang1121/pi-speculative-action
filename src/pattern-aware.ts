@@ -1921,62 +1921,39 @@ function inferCandidateBindings(
 	if (!includeComposites) return indexedBindings(context, target, targetIsPath);
 	const result: PatternAwareBinding[] = [];
 	const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
-	for (let index = context.length - 1; index >= 0; index--) {
-		const event = context[index]!;
-		const relativeEvent = index - context.length;
-		const fields = [
-			["input", event.input],
-			["output", event.output],
-			["outputPaths", event.outputPaths],
-		] as const;
-		for (const [field, value] of fields) {
-			for (const [sourcePath, source] of leaves(value)) {
-				const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
-				const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
-				if (sameValue(source, target) && (!targetIsPath || pathSource)) result.push(direct);
-				if (typeof source !== "string" || typeof target !== "string") continue;
-				const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
-					{ binding: direct, value: source },
-				];
-				if (pathSource) {
-					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
-					for (const operation of ["dirname", "basename", "normalize_path"] as const) {
-						const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
-						const value = transform(operation, source);
-						if (value === target) result.push(transformed);
-						if (operation !== "basename") sources.push({ binding: transformed, value });
-						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
-					}
-				}
-				if (targetIsPath) continue;
-				for (const { binding, value } of sources) {
-					if (value.length < 3) continue;
-					const offset = target.indexOf(value);
-					if (offset < 0) continue;
-					result.push({
-						type: "template",
-						source: binding,
-						prefix: target.slice(0, offset),
-						suffix: target.slice(offset + value.length),
-					});
+	for (const [relativeEvent, field, value] of reverseContextFields(context)) {
+		for (const [sourcePath, source] of leaves(value)) {
+			const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
+			const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
+			if (sameValue(source, target) && (!targetIsPath || pathSource)) result.push(direct);
+			if (typeof source !== "string" || typeof target !== "string") continue;
+			const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
+				{ binding: direct, value: source },
+			];
+			if (pathSource) {
+				if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
+				for (const operation of ["dirname", "basename", "normalize_path"] as const) {
+					const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
+					const value = transform(operation, source);
+					if (value === target) result.push(transformed);
+					if (operation !== "basename") sources.push({ binding: transformed, value });
+					if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 				}
 			}
-			for (const item of collectionBindings(value, target)) {
-				if (
-					targetIsPath &&
-					typeof target === "string" &&
-					!isPathSource(field, [...item.path, ...item.itemPath], target)
-				)
-					continue;
+			if (targetIsPath) continue;
+			for (const { binding, value } of sources) {
+				if (value.length < 3) continue;
+				const offset = target.indexOf(value);
+				if (offset < 0) continue;
 				result.push({
-					type: "each",
-					relativeEvent,
-					field,
-					path: item.path,
-					itemPath: item.itemPath,
+					type: "template",
+					source: binding,
+					prefix: target.slice(0, offset),
+					suffix: target.slice(offset + value.length),
 				});
 			}
 		}
+		appendCollectionBindings(result, collectionBindings(value, target), relativeEvent, field, target, targetIsPath);
 	}
 	if (targetIsPath && typeof target === "string") {
 		const sources = uniquePathSources(pathSources);
@@ -2006,37 +1983,26 @@ function indexedBindings(
 	targetIsPath: boolean,
 ): PatternAwareBinding[] {
 	const result: PatternAwareBinding[] = [];
+	for (const [relativeEvent, field, value] of reverseContextFields(context)) {
+		for (const sourcePath of indexedLeaves(value, target)) {
+			if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
+			result.push({ type: "event", relativeEvent, field, path: sourcePath });
+		}
+		appendCollectionBindings(result, indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
+	}
+	return uniqueBindings(result);
+}
+
+function* reverseContextFields(
+	context: ReadonlyArray<PatternAwareEvent>,
+): Generator<readonly [number, PatternAwareDependencySource["field"], unknown]> {
 	for (let index = context.length - 1; index >= 0; index--) {
 		const event = context[index]!;
 		const relativeEvent = index - context.length;
-		const fields = [
-			["input", event.input],
-			["output", event.output],
-			["outputPaths", event.outputPaths],
-		] as const;
-		for (const [field, value] of fields) {
-			for (const sourcePath of indexedLeaves(value, target)) {
-				if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
-				result.push({ type: "event", relativeEvent, field, path: sourcePath });
-			}
-			for (const item of indexedCollections(value, target)) {
-				if (
-					targetIsPath &&
-					typeof target === "string" &&
-					!isPathSource(field, [...item.path, ...item.itemPath], target)
-				)
-					continue;
-				result.push({
-					type: "each",
-					relativeEvent,
-					field,
-					path: item.path,
-					itemPath: item.itemPath,
-				});
-			}
-		}
+		yield [relativeEvent, "input", event.input];
+		yield [relativeEvent, "output", event.output];
+		yield [relativeEvent, "outputPaths", event.outputPaths];
 	}
-	return uniqueBindings(result);
 }
 
 type ValueIndex = ReadonlyMap<string, ReadonlyArray<PatternAwarePath>>;
@@ -2047,17 +2013,15 @@ function indexedLeaves(value: unknown, target: unknown): ReadonlyArray<PatternAw
 	return valueIndex(value, leaves, leafIndexCache).get(stableStringify(target)) ?? [];
 }
 
-type CollectionValueIndex = ReadonlyMap<
-	string,
-	ReadonlyArray<{ readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath }>
->;
+type CollectionLocation = { readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath };
+type CollectionValueIndex = ReadonlyMap<string, ReadonlyArray<CollectionLocation>>;
 
 const collectionIndexCache = new WeakMap<object, CollectionValueIndex>();
 
 function indexedCollections(
 	value: unknown,
 	target: unknown,
-): ReadonlyArray<{ readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath }> {
+): ReadonlyArray<CollectionLocation> {
 	if (isObject(value)) {
 		const cached = collectionIndexCache.get(value);
 		if (cached) return cached.get(stableStringify(target)) ?? [];
@@ -2096,7 +2060,7 @@ function valueIndex(
 function collectionBindings(
 	value: unknown,
 	target: unknown,
-): Array<{ readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath }> {
+): CollectionLocation[] {
 	const paths = new Map<string, PatternAwarePath>();
 	const result: Array<{ readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath }> = [];
 	for (const item of collectionEntries(value)) {
@@ -2107,6 +2071,21 @@ function collectionBindings(
 		result.push({ path: item.path, itemPath: item.itemPath });
 	}
 	return result;
+}
+
+function appendCollectionBindings(
+	result: PatternAwareBinding[],
+	items: ReadonlyArray<CollectionLocation>,
+	relativeEvent: number,
+	field: PatternAwareDependencySource["field"],
+	target: unknown,
+	targetIsPath: boolean,
+): void {
+	for (const item of items) {
+		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target))
+			continue;
+		result.push({ type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath });
+	}
 }
 
 type CollectionEntry = {
