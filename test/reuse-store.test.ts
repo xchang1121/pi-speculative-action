@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createExecPrototype,
+	digestObject,
+	parseProcessCertificate,
 	sealProcessCertificate,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
@@ -22,22 +24,49 @@ describe("persistent provenance store", () => {
 		const first = await store.artifacts.put("output bytes");
 		const second = await store.artifacts.put(Buffer.from("output bytes"));
 		expect(second).toEqual(first);
-		const certificate = sealProcessCertificate({
-			prototype: prototype(),
-			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-			result: {
-				replayProfile: "buffered_noninteractive",
-				journal: [{ sequence: 0, kind: "output", fd: 1, data: first }],
-				exit: { kind: "code", code: 0 },
-			},
-			createdAt: 123,
-		});
-		await store.put(certificate);
+		const certificate = completed(first, 123);
+		const duplicate = completed(first, 456);
+		expect(duplicate.id).toBe(certificate.id);
+		const { id: _id, ...legacyBody } = certificate;
+		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
+		expect(parseProcessCertificate(legacy)?.id).toBe(legacy.id);
+		expect(await store.put(certificate)).toBe(true);
+		expect(await store.put(duplicate)).toBe(false);
 
 		const reopened = new ProvenanceCertificateStore(root);
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
 		expect(await reopened.get(certificate.id)).toEqual(certificate);
 		expect(await reopened.findByWeakKey(certificate.weakKey)).toEqual([certificate]);
+		expect(await reopened.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
+	});
+
+	it("enforces a shared artifact budget and atomically clears only the managed store", async () => {
+		const root = await temporaryRoot();
+		const store = new ProvenanceCertificateStore(root, {
+			maxCertificates: 1,
+			maxBytes: 1024 * 1024,
+			orphanGraceMs: 0,
+		});
+		const firstArtifact = await store.artifacts.put("first");
+		const first = completed(firstArtifact, 1, "first");
+		await store.put(first);
+		const secondArtifact = await store.artifacts.put("second");
+		await store.artifacts.put("orphan");
+		const second = completed(secondArtifact, 2, "second");
+		await store.put(second);
+
+		const collected = await store.gc();
+		expect(collected).toMatchObject({
+			removedCertificates: 1,
+			removedArtifacts: 2,
+			stats: { certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false },
+		});
+		expect(await store.get(first.id)).toBeUndefined();
+		expect(await store.get(second.id)).toEqual(second);
+		const closure = await store.artifacts.load([secondArtifact]);
+		await store.clear();
+		expect(await store.stats()).toMatchObject({ certificates: 0, artifacts: 0, totalBytes: 0 });
+		expect(closure?.read(secondArtifact).toString("utf8")).toBe("second");
 	});
 
 	it("rejects a certificate whose effect bundle is absent from the CAS", async () => {
@@ -82,14 +111,27 @@ describe("persistent provenance store", () => {
 	});
 });
 
-function prototype() {
+function completed(reference: { readonly digest: `sha256:${string}`; readonly size: number }, createdAt: number, mode = "test") {
+	return sealProcessCertificate({
+		prototype: prototype(mode),
+		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+		result: {
+			replayProfile: "buffered_noninteractive",
+			journal: [{ sequence: 0, kind: "output", fd: 1, data: reference }],
+			exit: { kind: "code", code: 0 },
+		},
+		createdAt,
+	});
+}
+
+function prototype(mode = "test") {
 	const digest = (value: string) => sha256Digest(value);
 	return createExecPrototype({
 		executablePath: "/bin/tool",
 		executableDigest: digest("tool"),
 		argv: ["tool"],
 		logicalCwd: "/workspace",
-		environment: { MODE: "test" },
+		environment: { MODE: mode },
 		umask: 0o22,
 		rlimitsDigest: digest("rlimits"),
 		signalDispositionsDigest: digest("signals"),

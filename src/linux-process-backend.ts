@@ -50,7 +50,11 @@ import {
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
-import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
+import {
+	ProvenanceCertificateStore,
+	type ProvenanceStoreOptions,
+	type VerifiedArtifactClosure,
+} from "./reuse-store.ts";
 import { observeStrace, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
@@ -73,6 +77,7 @@ const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
+	readonly store?: ProvenanceStoreOptions;
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly unshareBinary?: string;
@@ -204,7 +209,7 @@ export class LinuxProcessReuseBackend {
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
-		this.store = new ProvenanceCertificateStore(options.storeRoot);
+		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
 	}
 
@@ -670,8 +675,7 @@ export class LinuxProcessReuseBackend {
 					result: { replayProfile: "buffered_noninteractive", journal, exit },
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				await this.planner.publishCompleted(certificate);
-				this.add(session, "published");
+				if (await this.planner.publishCompleted(certificate)) this.add(session, "published");
 				if (taints.size) this.add(session, "tainted");
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.

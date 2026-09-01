@@ -53,8 +53,16 @@ export function createLinuxProcessExecutionWorld(
 			return `${processFingerprint}:${workspaceFingerprint}`;
 		},
 		diagnostics: async ({ cwd, refresh }) => {
-			const status = await backend.check(refresh);
-			if (status.state !== "ready") return { state: "unavailable", detail: status.detail };
+			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats()]);
+			const storage = {
+				storeCertificates: store.certificates,
+				storeArtifacts: store.artifacts,
+				storeBytes: store.totalBytes,
+				storeMaxCertificates: store.limits.maxCertificates,
+				storeMaxBytes: store.limits.maxBytes,
+				storeOverBudget: store.overBudget,
+			};
+			if (status.state !== "ready") return { state: "unavailable", detail: status.detail, attributes: storage };
 			const selected = qualifiedDrivers.get(path.resolve(cwd));
 			return {
 				state: "ready",
@@ -63,6 +71,7 @@ export function createLinuxProcessExecutionWorld(
 					: `${status.detail}; workspace route not prepared yet`,
 				...(status.fingerprint ? { fingerprint: status.fingerprint } : {}),
 				attributes: {
+					...storage,
 					workspaceDriver: selected?.driver ?? "not_prepared",
 					...(status.sandlockBinary ? { sandlock: status.sandlockBinary } : {}),
 					...(status.straceBinary ? { strace: status.straceBinary } : {}),

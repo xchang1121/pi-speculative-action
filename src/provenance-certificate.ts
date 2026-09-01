@@ -266,7 +266,7 @@ export function sealProcessCertificate(input: {
 		result,
 		createdAt,
 	};
-	return deepFreeze({ ...body, id: digestObject(body) });
+	return deepFreeze({ ...body, id: certificateContentKey(body) });
 }
 
 export function parseProcessCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
@@ -288,12 +288,26 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 			result: candidate.result,
 			createdAt: candidate.createdAt,
 		});
-		return sealed.id === candidate.id && sealed.weakKey === candidate.weakKey && sealed.strongKey === candidate.strongKey
-			? sealed
-			: undefined;
+		const { id: _id, ...legacyBody } = sealed;
+		const legacyID = digestObject(legacyBody);
+		if (
+			(sealed.id !== candidate.id && legacyID !== candidate.id) ||
+			sealed.weakKey !== candidate.weakKey ||
+			sealed.strongKey !== candidate.strongKey
+		) {
+			return undefined;
+		}
+		return sealed.id === candidate.id ? sealed : deepFreeze({ ...sealed, id: candidate.id });
 	} catch {
 		return undefined;
 	}
+}
+
+function certificateContentKey(
+	certificate: Omit<ProcessProvenanceCertificate, "id">,
+): Sha256Digest {
+	const { createdAt: _createdAt, ...content } = certificate;
+	return digestObject(content);
 }
 
 export function referencedArtifacts(certificate: ProcessProvenanceCertificate): readonly ArtifactReference[] {

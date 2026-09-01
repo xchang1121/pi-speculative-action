@@ -84,6 +84,8 @@ describe("Linux process ExecutionWorld", () => {
 			expect(branch.executionMetrics.reuse?.requests).toBeGreaterThan(0);
 			expect(branch.executionMetrics.reuse?.executionMs).toBeGreaterThan(0);
 			expect(backend.metrics().tainted).toBeGreaterThan(0);
+			expect(backend.metrics().published).toBe(0);
+			expect((await backend.store.stats()).certificates).toBe(0);
 			expect((await stat(path.join(workspace, "source"))).isDirectory()).toBe(true);
 			await expect(stat(path.join(workspace, "moved"))).rejects.toThrow();
 		} finally {

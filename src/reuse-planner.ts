@@ -242,8 +242,9 @@ export class ProcessReusePlanner<MemoryHit = never> {
 		};
 	}
 
-	/** Publish even unmatched speculative executions so useful work survives branch discard. */
-	publishCompleted(certificate: ProcessProvenanceCertificate): Promise<void> {
+	/** Publish unmatched replayable executions so useful work survives branch discard. */
+	async publishCompleted(certificate: ProcessProvenanceCertificate): Promise<boolean> {
+		if (!certificateReplayable(certificate)) return false;
 		return this.store.put(certificate);
 	}
 }

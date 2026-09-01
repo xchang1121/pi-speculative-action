@@ -47,4 +47,13 @@ export {
 	type ProcessReuseRequest,
 	type ReplayObservationContract,
 } from "./reuse-planner.ts";
-export { ArtifactCAS, ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
+export {
+	ArtifactCAS,
+	DEFAULT_PROVENANCE_STORE_LIMITS,
+	ProvenanceCertificateStore,
+	type ProvenanceStoreGCResult,
+	type ProvenanceStoreLimits,
+	type ProvenanceStoreOptions,
+	type ProvenanceStoreStats,
+	type VerifiedArtifactClosure,
+} from "./reuse-store.ts";
