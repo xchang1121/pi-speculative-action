@@ -1,14 +1,5 @@
-import { createHash } from "node:crypto";
-import path from "node:path";
-import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	SimpleStreamOptions,
-	ToolResultMessage,
-} from "@earendil-works/pi-ai";
+import type { AgentTool, AgentToolCall } from "@earendil-works/pi-agent-core";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
@@ -16,34 +7,27 @@ import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWor
 import {
 	clampCandidateLimit,
 	DEFAULTS,
-	drafterRequestTemperature,
 	normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection,
 	type SpeculativeToolSelectionInput,
-	usageTokenCount,
 } from "./common.ts";
+import type {
+	AgentConsumeInput,
+	AgentStartInput,
+	AgentStateData,
+	DraftOptionsContext,
+} from "./agent-runtime-types.ts";
+import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { SpeculativeExecutionRoute } from "./execution-world.ts";
+import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
+import { createDrafterPlanSource } from "./drafter-plan-source.ts";
 import {
-	DrafterUtilityGate,
-	type DrafterUtilityBatch,
-	type DrafterUtilityGateSnapshot,
-} from "./drafter-utility-gate.ts";
-import {
-	acquirePatternAwareStore,
-	asPatternAwareRuntimeContext,
 	PATTERN_AWARE_DEFAULTS,
-	type PatternAwareCandidate,
-	type PatternAwareEventInput,
-	type PatternAwareRuntimeContext,
 	type PatternAwareSettings,
 	type PatternAwareStore,
-	type PatternAwareStoreLease,
-	patternAwareAnalyzerKey,
-	patternAwareRuntimeContext,
 	patternAwareSettings,
-	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
-import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
+import { createPatternPlanSource, patternPlanActionID } from "./pattern-plan-source.ts";
 import type {
 	CandidatePreflight,
 	ActorActionFeedback,
@@ -53,12 +37,12 @@ import type {
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
-	SpeculativePlanSource,
 } from "./runtime.ts";
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import type { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
-import { candidateExecutionMs, candidateToolNames, makeSpeculativeActionRuntime } from "./runtime.ts";
-import { stableStringify } from "./stable-json.ts";
+import { makeSpeculativeActionRuntime } from "./runtime.ts";
+import { createSelfSpeculationPlanSource } from "./self-speculation-plan-source.ts";
+import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
@@ -96,12 +80,7 @@ export interface SpeculativeAgentPreflightContext {
 	readonly signal: AbortSignal;
 }
 
-export interface DraftOptionsContext {
-	readonly actorModel: Model<Api>;
-	readonly draftModel: Model<Api>;
-	readonly actorOptions: SimpleStreamOptions | undefined;
-	readonly signal: AbortSignal;
-}
+export type { DraftOptionsContext } from "./agent-runtime-types.ts";
 
 export interface CreateSpeculativeActionHostOptions {
 	/** Workspace root used for action canonicalization and resource validation. */
@@ -194,33 +173,7 @@ export interface SpeculativeActionHost {
 
 export type ActionDrafterGateSnapshot = DrafterUtilityGateSnapshot;
 
-interface AgentStartInput {
-	readonly sessionID: string;
-	readonly turnID: string;
-	readonly actorModel: Model<Api>;
-	readonly context: Context;
-	readonly actorOptions: SimpleStreamOptions | undefined;
-	readonly tools: readonly AgentTool[];
-}
-
-interface AgentConsumeInput {
-	readonly sessionID: string;
-	readonly turnID: string;
-	readonly id?: string;
-	readonly tool: string;
-	readonly args: unknown;
-	readonly tools: readonly AgentTool[];
-	readonly terminal?: boolean;
-}
-
-interface AgentStateData {
-	readonly tools: ReadonlyMap<string, AgentTool>;
-	readonly schemaHashes: Readonly<Record<string, string>>;
-}
-
-export function patternPlanActionID(actionIdentity: string, parentActionID = "root"): string {
-	return `pattern:${stableHash({ actionIdentity, parentActionID }).slice(0, 16)}`;
-}
+export { patternPlanActionID } from "./pattern-plan-source.ts";
 
 /**
  * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
@@ -259,52 +212,6 @@ export function createSpeculativeActionHost(
 				)
 			: undefined;
 	};
-	const patternActionSemantics = {
-		namespace: "pi-action-semantics-v1",
-		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) =>
-			actionSemantics.buildKey(tool, input, options.cwd, schemaHash),
-		projectors: projectionRules,
-	};
-	let openedPatternStore: Promise<PatternAwareStoreLease> | undefined;
-	let openedPatternStoreKey: string | undefined;
-	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
-	const patternRevisions = new Map<string, number>();
-	const carriedPatternPredictions = new Map<string, string>();
-	type DrafterBatch = {
-		readonly model: Model<Api>;
-		readonly context: Context;
-		readonly options: SimpleStreamOptions;
-		readonly utility: DrafterUtilityBatch;
-	};
-	const drafterBatches = new Map<string, Promise<DrafterBatch>>();
-	const drafterGate = new DrafterUtilityGate();
-	let patternAnalysisTail: Promise<void> = Promise.resolve();
-	const queuePatternAnalysis = (analysis: () => void | Promise<void>) => {
-		patternAnalysisTail = patternAnalysisTail
-			.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
-			.then(analysis)
-			.catch(() => {
-				// Optional learning cannot poison later observations or the Actor lifecycle.
-			});
-	};
-	const authoritativeBatchKey = (batchSessionID: string, turnID: string) => JSON.stringify([batchSessionID, turnID]);
-	const nextPatternRevision = (batchSessionID: string, turnID: string) => {
-		const key = authoritativeBatchKey(batchSessionID, turnID);
-		const revision = (patternRevisions.get(key) ?? -1) + 1;
-		patternRevisions.set(key, revision);
-		return revision;
-	};
-	const patternPredictionSignature = (candidates: readonly PatternAwareCandidate[]) =>
-		JSON.stringify(
-			candidates
-				.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
-				.sort(([left], [right]) => left.localeCompare(right)),
-		);
-	const clearAuthoritativeSession = (batchSessionID: string) => {
-		for (const [key, batch] of authoritativeBatches) {
-			if (batch.values().next().value?.sessionID === batchSessionID) authoritativeBatches.delete(key);
-		}
-	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const settings = (await options.getSettings?.()) ?? {};
 		const drafter = normalizeDrafterRequestSettings(settings);
@@ -340,453 +247,26 @@ export function createSpeculativeActionHost(
 			tools: normalizeSpeculativeToolSelection(settings.tools, actionSemantics.toolNames()),
 		};
 	};
-	const sourcePatternSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
-		patternAwareSettings(settings.sourceConfig?.patternAware);
-	const sourceDrafterSettings = (settings: SpeculativeActionSettings) =>
-		normalizeDrafterRequestSettings(settings.sourceConfig);
-	const drafterModelKey = (model: Model<Api>): string => JSON.stringify([model.provider, model.api, model.id]);
-	const selfSpeculationActionEnabled = (settings: SpeculativeActionSettings): boolean =>
-		settings.sourceConfig?.selfSpeculationActionEnabled === true;
-	const resolvePatternStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
-		if (options.patternStore) {
-			return options.patternStore;
-		}
-		const patternSettings = sourcePatternSettings(settings);
-		const configurationKey = patternAwareAnalyzerKey(patternSettings);
-		if (openedPatternStore && openedPatternStoreKey !== configurationKey) {
-			const previous = await openedPatternStore;
-			previous.store.finishSession(sessionID);
-			await previous.release();
-			openedPatternStore = undefined;
-		}
-		openedPatternStoreKey = configurationKey;
-		openedPatternStore ??= acquirePatternAwareStore(
-			options.patternWorkspaceIdentity ?? options.cwd,
-			patternSettings,
-			options.patternStateDirectory,
-			patternActionSemantics,
-		);
-		return (await openedPatternStore).store;
-	};
-	const finishPatternSession = async (): Promise<void> => {
-		drafterBatches.clear();
-		drafterGate.reset();
-		patternRevisions.clear();
-		carriedPatternPredictions.clear();
-		clearAuthoritativeSession(sessionID);
-		await patternAnalysisTail;
-		const store = options.patternStore
-			? await options.patternStore
-			: openedPatternStore
-				? (await openedPatternStore).store
-				: undefined;
-		if (!store) return;
-		store.finishSession(sessionID);
-		try {
-			await store.flush();
-		} catch {
-			// Persistence failure must not change Agent lifecycle semantics.
-		}
-	};
 	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
 		await Promise.all([...new Set(tools)].map((tool) => resolveExecutionRoute(tool, signal)));
 	};
-	type AgentPlanSource = SpeculativePlanSource<
-		string,
-		ToolSettlement,
-		AgentStartInput,
-		AgentConsumeInput,
-		AgentStateData
-	>;
-	type DrafterPlanFeedback = {
-		readonly kind: "drafter_plan";
-		readonly model: Model<Api>;
-		readonly context: Context;
-		readonly options: SimpleStreamOptions;
-		readonly message: AssistantMessage;
-		readonly depth: number;
-	};
-	const asDrafterPlanFeedback = (value: unknown): DrafterPlanFeedback | undefined =>
-		value && typeof value === "object" && (value as { kind?: unknown }).kind === "drafter_plan"
-			? (value as DrafterPlanFeedback)
-			: undefined;
-	const drafterPlanAction = (
-		id: string,
-		call: AgentToolCall,
-		feedback: DrafterPlanFeedback,
-		dependsOn?: PlanAction["dependsOn"],
-	): PlanAction => ({
-		id,
-		type: "tool_call",
-		tool: call.name,
-		input: call.arguments,
-		diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
-		depth: feedback.depth,
-		feedback,
-		...(dependsOn?.length ? { dependsOn } : {}),
+	const drafterPlans = createDrafterPlanSource({
+		sessionID,
+		draftModel: options.draftModel,
+		getDraftOptions: options.getDraftOptions,
+		complete: options.complete,
+		validateArguments: validateCandidateArguments,
 	});
-	const drafterFeedback = (
-		model: Model<Api>,
-		context: Context,
-		requestOptions: SimpleStreamOptions,
-		message: AssistantMessage,
-		call: AgentToolCall,
-		depth: number,
-	): DrafterPlanFeedback => ({
-		kind: "drafter_plan",
-		model,
-		context,
-		options: requestOptions,
-		message: { ...message, content: message.content.filter((item) => item.type !== "toolCall" || item === call) },
-		depth,
+	const patternPlans = createPatternPlanSource({
+		sessionID,
+		cwd: options.cwd,
+		actionSemantics,
+		projectionRules,
+		stateDirectory: options.patternStateDirectory,
+		workspaceIdentity: options.patternWorkspaceIdentity,
+		store: options.patternStore,
 	});
-	const drafterToolResult = (call: AgentToolCall, output: ToolSettlement): ToolResultMessage => ({
-		...output.result,
-		role: "toolResult",
-		toolCallId: call.id,
-		toolName: call.name,
-		isError: output.isError,
-		timestamp: Date.now(),
-	});
-	type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternIDs: ReadonlyArray<string> };
-	const asPatternPlanFeedback = (value: unknown): PatternPlanFeedback | undefined => {
-		const context = asPatternAwareRuntimeContext(value);
-		const patternIDs = (value as { patternIDs?: unknown })?.patternIDs;
-		if (!context || !Array.isArray(patternIDs) || !patternIDs.every((item) => typeof item === "string"))
-			return undefined;
-		return { ...context, patternIDs };
-	};
-	const patternPlanAction = (
-		candidate: PatternAwareCandidate,
-		store: PatternAwareStore,
-		id: string,
-		dependsOn?: PlanAction["dependsOn"],
-	): PlanAction => ({
-		id,
-		type: "tool_call",
-		tool: candidate.tool,
-		input: candidate.input,
-		diagnostic: candidate.diagnostic,
-		horizon: candidate.horizon,
-		latestHorizon: candidate.latestHorizon,
-		empiricalProbability: candidate.empiricalProbability,
-		conditionalProbability: candidate.conditionalProbability,
-		expectedDurationMs: candidate.expectedDurationMs,
-		expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs,
-		...(candidate.background ? { background: true } : {}),
-		depth: candidate.depth,
-		...(dependsOn?.length ? { dependsOn } : {}),
-		feedback: { ...patternAwareRuntimeContext(store, candidate), patternIDs: candidate.supportingPatternIDs },
-	});
-	const drafterSource: AgentPlanSource = {
-		id: "drafter",
-		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
-		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		requestLifetime: "actor_decision",
-		multiStepEnabled: (settings, feedback) => {
-			const maxDepth = sourceDrafterSettings(settings).drafterMaxDepth;
-			if (maxDepth === 0) return false;
-			if (feedback === undefined) return true;
-			const previous = asDrafterPlanFeedback(feedback);
-			return previous !== undefined && previous.depth < maxDepth;
-		},
-		continueOn: ["execution_succeeded"],
-		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-		concurrentProposalPolicy: (settings) =>
-			clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit) === 2 ? "first_produced" : "all",
-		propose: async ({
-			startInput: input,
-			data,
-			candidateNames,
-			proposalIndex,
-			proposalCount,
-			signal,
-			settings,
-		}): Promise<PlanProposal | undefined> => {
-			const proposalID = `drafter:${input.turnID}:${proposalIndex}`;
-			const batchKey = authoritativeBatchKey(input.sessionID, input.turnID);
-			let batch = drafterBatches.get(batchKey);
-			if (!batch) {
-				batch = (async () => {
-					const configuredDraftModel =
-						typeof options.draftModel === "function"
-							? await options.draftModel(input.actorModel)
-							: options.draftModel;
-					const model = configuredDraftModel ?? input.actorModel;
-					const utility = drafterGate.start(
-						drafterModelKey(model),
-						proposalCount,
-						settings.sourceConfig?.drafterGateEnabled !== false,
-					);
-					let configuredDraftOptions: SimpleStreamOptions | undefined;
-					if (utility.allowed) {
-						configuredDraftOptions = options.getDraftOptions
-							? await options.getDraftOptions({
-								actorModel: input.actorModel,
-								draftModel: model,
-								actorOptions: input.actorOptions,
-								signal,
-								})
-							: input.actorOptions;
-					}
-					return {
-						model,
-						context: input.context,
-						options: configuredDraftOptions ?? {},
-						utility,
-					};
-				})();
-				drafterBatches.set(batchKey, batch);
-			}
-			const prepared = await batch;
-			if (!prepared.utility.allowed) return undefined;
-			const drafter = sourceDrafterSettings(settings);
-			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
-			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
-				...requestOptions,
-				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
-				...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
-				toolChoice: "required",
-				reasoning: undefined,
-				deferred: false,
-				sessionId: prepared.options.sessionId ?? sessionID,
-				cacheRetention: prepared.options.cacheRetention ?? "short",
-			};
-			const requestStartedAt = performance.now();
-			let requestFailed = false;
-			let message: AssistantMessage;
-			try {
-				message = await options.complete(prepared.model, prepared.context, { ...draftOptions, signal });
-				if (message.stopReason === "error" || message.stopReason === "aborted") {
-					requestFailed = message.stopReason === "error" || !signal.aborted;
-					throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-				}
-			} catch (error) {
-				if (!signal.aborted) requestFailed = true;
-				throw error;
-			} finally {
-				drafterGate.requestSettled(prepared.utility, performance.now() - requestStartedAt, requestFailed);
-			}
-			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			if (!call) return undefined;
-			const tool = data.tools.get(call.name);
-			if (
-				!tool ||
-				!candidateNames.includes(call.name) ||
-				validateCandidateArguments(tool, call.name, call.arguments, call.id) === undefined
-			)
-				return undefined;
-			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
-			return {
-				id: proposalID,
-				source: "drafter",
-				revision: 0,
-				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)],
-				draftTokens: usageTokenCount(message.usage),
-			};
-		},
-		continue: async ({ proposalID, actionID, revision, feedback, output, signal }) => {
-			const previous = asDrafterPlanFeedback(feedback);
-			if (!previous || signal.aborted) return undefined;
-			const previousCall = previous.message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			if (!previousCall) return undefined;
-			const context: Context = {
-				...previous.context,
-				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
-			};
-			const continuationOptions = { ...previous.options, toolChoice: "auto" as const };
-			const message = await options.complete(previous.model, context, { ...continuationOptions, signal });
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-			}
-			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			if (!call) return undefined;
-			const next = drafterFeedback(previous.model, context, continuationOptions, message, call, previous.depth + 1);
-			return {
-				proposalID,
-				source: "drafter",
-				revision,
-				upsert: [
-					drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next, [
-						{ actionID, condition: "execution_succeeded" },
-					]),
-				],
-				draftTokens: usageTokenCount(message.usage),
-			};
-		},
-	};
-	const selfSpeculationSource: AgentPlanSource = {
-		id: "self-speculation",
-		enabled: (settings) =>
-			options.selfSpeculationActionBridge !== undefined && selfSpeculationActionEnabled(settings),
-		timeoutMs: (settings) => settings.predictionTimeoutMs,
-		requestLifetime: "actor_decision",
-		propose: async ({ startInput, candidateNames, signal }) => {
-			const batches =
-				(await options.selfSpeculationActionBridge?.waitForBatches(startInput.turnID, signal)) ?? [];
-			const allowed = new Set(candidateNames);
-			return batches
-				.filter((batch) => batch.calls.length > 0 && batch.calls.every((call) => allowed.has(call.tool)))
-				.map((batch) => ({
-					id: `self-speculation:${startInput.turnID}:${batch.id}`,
-					source: "self-speculation",
-					revision: 0,
-					actions: batch.calls.map((call) => ({
-						id: call.id,
-						type: "tool_call" as const,
-						tool: call.tool,
-						input: call.input,
-						feedback: {
-							batchID: batch.id,
-							callID: call.id,
-							callIndex: call.index,
-							evidence: batch.evidence,
-						},
-					})),
-				}));
-		},
-	};
-	const patternSource: AgentPlanSource = {
-		id: "pattern_aware",
-		enabled: (settings) => sourcePatternSettings(settings).enabled,
-		multiStepEnabled: (settings) => sourcePatternSettings(settings).multiStepEnabled,
-		requestLifetime: "actor_decision",
-		propose: async ({ startInput, settings, definitions }) => {
-			const patternSettings = sourcePatternSettings(settings);
-			if (!patternSettings.enabled) return undefined;
-			await patternAnalysisTail;
-			const store = await resolvePatternStore(settings);
-			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
-			const signature = patternPredictionSignature(candidates);
-			const carried = carriedPatternPredictions.get(startInput.sessionID);
-			carriedPatternPredictions.delete(startInput.sessionID);
-			// The previous authoritative observation already issued these candidates early for this decision.
-			// Re-issuing an unchanged K(a) set at the provider boundary creates duplicate prediction
-			// opportunities and can restart a losing alternative after the shared winner is adopted.
-			if (carried === signature) return undefined;
-			if (!candidates.length) return undefined;
-			return {
-				id: `pattern:${startInput.turnID}`,
-				source: "pattern_aware",
-				revision: nextPatternRevision(startInput.sessionID, startInput.turnID),
-				actions: candidates.map((candidate) =>
-					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
-				),
-			};
-		},
-		continue: async ({
-			startInput,
-			data,
-			settings,
-			candidate,
-			adoptedAction,
-			proposalID,
-			actionID,
-			revision,
-			feedback,
-			output,
-			trigger,
-			signal,
-		}) => {
-			if (signal.aborted) return undefined;
-			const context = asPatternPlanFeedback(feedback);
-			if (!context) return undefined;
-			const action = adoptedAction ?? candidate;
-			const observation = projectPatternAwareObservation(
-				output.result,
-				extractOutputPaths(action.key.tool, action.input, output.result),
-				options.cwd,
-			);
-			const next = context.store.continue(
-				context.continuation,
-				{
-					sessionID: startInput.sessionID,
-					turnID: startInput.turnID,
-					tool: action.key.tool,
-					input: structuredClone(action.input) as Record<string, unknown>,
-					outcome: output.isError ? "failure" : "success",
-					...observation,
-					durationMs: candidateExecutionMs(candidate),
-					schemaHash: action.key.schemaHash,
-					...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
-					learnTarget: false,
-				},
-				data.schemaHashes,
-				trigger === "actor_adopted",
-				sourcePatternSettings(settings),
-			);
-			if (!next.length) return undefined;
-			return {
-				proposalID,
-				source: "pattern_aware",
-				revision,
-				upsert: next.map((item) =>
-					patternPlanAction(item, context.store, patternPlanActionID(item.actionIdentity, actionID), [
-						{ actionID, condition: "execution_succeeded" },
-					]),
-				),
-			};
-		},
-		observe: async ({ startInput, data, settings, consumeInput, tool, concrete, output, durationMs, order }) => {
-			const patternSettings = sourcePatternSettings(settings);
-			if (!patternSettings.enabled) return undefined;
-			const definition = startInput.tools.find((item) => item.name === tool);
-			const observation = projectPatternAwareObservation(
-				output?.result,
-				extractOutputPaths(tool, concrete, output?.result),
-				options.cwd,
-			);
-			const key = authoritativeBatchKey(consumeInput.sessionID, consumeInput.turnID);
-			const batch = authoritativeBatches.get(key) ?? new Map();
-			const event: PatternAwareEventInput = {
-				sessionID: consumeInput.sessionID,
-				turnID: consumeInput.turnID,
-				tool,
-				input: structuredClone(concrete),
-				outcome: output?.isError ? "failure" : "success",
-				...observation,
-				durationMs,
-				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
-				...(definition ? { schemaHash: stableHash(definition.parameters) } : {}),
-				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
-			};
-			batch.set(order, event);
-			authoritativeBatches.set(key, batch);
-			if (!patternSettings.multiStepEnabled) return undefined;
-			await patternAnalysisTail;
-			const store = await resolvePatternStore(settings);
-			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-			const candidates = store.predictAfterBatch(
-				consumeInput.sessionID,
-				ordered,
-				data.schemaHashes,
-				patternSettings,
-			);
-			carriedPatternPredictions.set(consumeInput.sessionID, patternPredictionSignature(candidates));
-			return {
-				id: `pattern:${consumeInput.turnID}`,
-				source: "pattern_aware",
-				revision: nextPatternRevision(consumeInput.sessionID, consumeInput.turnID),
-				actions: candidates.map((candidate) =>
-					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
-				),
-			};
-		},
-		onIssued: ({ feedback }) => {
-			const context = asPatternPlanFeedback(feedback);
-			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
-		},
-		onSettled: ({ feedback, settlement }) => {
-			const context = asPatternPlanFeedback(feedback);
-			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
-		},
-		flush: async () => {
-			await patternAnalysisTail;
-			if (openedPatternStore) await (await openedPatternStore).store.flush();
-			if (options.patternStore) await (await options.patternStore).flush();
-		},
-	};
-
+	const selfSpeculationSource = createSelfSpeculationPlanSource(options.selfSpeculationActionBridge);
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		ToolSettlement,
@@ -796,7 +276,7 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources: [patternSource, drafterSource, selfSpeculationSource],
+		sources: [patternPlans.source, drafterPlans.source, selfSpeculationSource],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
@@ -826,7 +306,7 @@ export function createSpeculativeActionHost(
 				return undefined;
 			}
 			const schemaHash =
-				context.type === "consume" ? stableHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
+				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
 			return actionSemantics.buildKey(
 				toolName,
 				validated,
@@ -834,7 +314,7 @@ export function createSpeculativeActionHost(
 				schemaHash,
 				invocation
 					? {
-							fingerprint: stableHash(invocation.identity ?? invocation),
+							fingerprint: stableValueHash(invocation.identity ?? invocation),
 							context: invocation,
 						}
 					: undefined,
@@ -923,9 +403,6 @@ export function createSpeculativeActionHost(
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
 		onTurnStarted: async ({ startInput, decisionSequence, settings, signal }) => {
-			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
-			authoritativeBatches.delete(key);
-			patternRevisions.delete(key);
 			try {
 				await options.onTurnStarted?.({
 					turnID: startInput.turnID,
@@ -939,70 +416,16 @@ export function createSpeculativeActionHost(
 			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
 				// Turn warm-up is best-effort; route resolution remains authoritative.
 			});
-			if (!settings.enabled || !sourcePatternSettings(settings).enabled) {
-				carriedPatternPredictions.delete(startInput.sessionID);
-				return;
-			}
-			queuePatternAnalysis(async () => {
-				const store = await resolvePatternStore(settings);
-				store.observeTurn();
-			});
+			patternPlans.turnStarted(startInput, settings);
 		},
 		onTurnFinished: ({ startInput, settings, terminal }) => {
-			const key = authoritativeBatchKey(startInput.sessionID, startInput.turnID);
-			const drafterBatch = drafterBatches.get(key);
-			drafterBatches.delete(key);
-			if (drafterBatch) {
-				void drafterBatch
-					.then((batch) => {
-						drafterGate.finish(batch.utility);
-					})
-					.catch(() => {
-						// Model/auth resolution failures are already represented by source request events.
-					});
-			}
-			const batch = authoritativeBatches.get(key);
-			authoritativeBatches.delete(key);
-			patternRevisions.delete(key);
-			if (terminal) carriedPatternPredictions.delete(startInput.sessionID);
-			if (!settings.enabled || !sourcePatternSettings(settings).enabled) {
-				carriedPatternPredictions.delete(startInput.sessionID);
-				return;
-			}
-			const events = batch?.size
-				? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
-				: [];
-			queuePatternAnalysis(async () => {
-				const store = await resolvePatternStore(settings);
-				if (events.length) store.observeBatch(events);
-				store.observeTurn();
-				if (terminal) store.finishSession(startInput.sessionID);
-			});
+			drafterPlans.finishTurn(startInput.sessionID, startInput.turnID);
+			patternPlans.turnFinished(startInput, settings, terminal);
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
 		onActorActionMaterialized: options.onActorActionMaterialized,
 		onActorActionSettled: async (feedback) => {
-			const { settlement } = feedback;
-			if (
-				feedback.candidate?.source === "drafter" &&
-				settlement.provider.kind === "speculative" &&
-				settlement.matchedPredictions.some(
-					(prediction) =>
-						prediction.source === "drafter" && prediction.proposalID.startsWith(`drafter:${feedback.turnID}:`),
-				)
-			) {
-				const batch = drafterBatches.get(authoritativeBatchKey(feedback.sessionID, feedback.turnID));
-				if (batch) {
-					try {
-						drafterGate.creditExecutionAhead(
-							(await batch).utility,
-							settlement.provider.timing.executionAheadMs,
-						);
-					} catch {
-						// Source resolution failures cannot own an adopted speculative candidate.
-					}
-				}
-			}
+			await drafterPlans.actorActionSettled(feedback);
 			await options.onActorActionSettled?.(feedback);
 		},
 		onPredictionSettled: options.onPredictionSettled,
@@ -1018,24 +441,22 @@ export function createSpeculativeActionHost(
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		executeAuthoritative: (operation, executor) => executionGateway.executeAuthoritative(operation, executor),
 		actual: (input) => runtime.actual({ ...input, sessionID }),
-		drafterGateSnapshot: () => drafterGate.snapshot(),
+		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
-			if (terminal) await finishPatternSession();
+			if (terminal) {
+				drafterPlans.finishSession();
+				await patternPlans.finishSession();
+			}
 		},
 		dispose: async () => {
 			try {
 				await runtime.releaseSession(sessionID);
-				await finishPatternSession();
+				drafterPlans.finishSession();
+				await patternPlans.finishSession();
 			} finally {
 				try {
-					if (openedPatternStore) {
-						try {
-							await (await openedPatternStore).release();
-						} catch {
-							// Persistence failure must not change Agent uninstall semantics.
-						}
-					}
+					await patternPlans.dispose();
 				} finally {
 					await executionGateway.dispose();
 				}
@@ -1062,46 +483,6 @@ function validateCandidateArguments(
 	} catch {
 		return undefined;
 	}
-}
-
-function definitionSchemaHashes(
-	definitions: readonly { readonly name: string; readonly inputSchema?: unknown }[],
-): Readonly<Record<string, string>> {
-	return Object.fromEntries(
-		definitions.map((definition) => [definition.name, stableHash(definition.inputSchema ?? null)]),
-	);
-}
-
-function stableHash(value: unknown): string {
-	return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 32);
-}
-
-function extractOutputPaths(
-	tool: string,
-	input: Readonly<Record<string, unknown>>,
-	result: AgentToolResult<unknown> | undefined,
-): readonly string[] | undefined {
-	if ((tool !== "find" && tool !== "grep") || !result) return undefined;
-	const searchRoot = typeof input.path === "string" && input.path ? input.path : ".";
-	const text = result.content
-		.filter((item): item is Extract<(typeof result.content)[number], { type: "text" }> => item.type === "text")
-		.map((item) => item.text)
-		.join("\n");
-	const paths = text
-		.split(/\r?\n/)
-		.map((line) => {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("[") || /^No files found\b/.test(trimmed)) return undefined;
-			if (tool === "find") return trimmed;
-			return /^(.*?):\d+(?::\d+)?:/.exec(trimmed)?.[1];
-		})
-		.filter((item): item is string => typeof item === "string" && item.length > 0)
-		.map((item) => {
-			if (path.isAbsolute(item)) return item;
-			if (tool === "grep" && path.basename(searchRoot) === item) return searchRoot;
-			return path.join(searchRoot, item);
-		});
-	return paths.length ? [...new Set(paths)] : undefined;
 }
 
 function normalizeTimeout(value: unknown): number {
