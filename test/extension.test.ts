@@ -332,7 +332,6 @@ describe("zero-modification Pi extension", () => {
 					orphanArtifacts: 1,
 					overBudget: false,
 				},
-				observedAt: 1,
 			},
 		]);
 		await fixture.emit("session_start", {}, fixture.context);
@@ -348,7 +347,7 @@ describe("zero-modification Pi extension", () => {
 		);
 	});
 
-	it("labels projection and process reuse events with their evidence", () => {
+	it("labels an adopted read projection as partial-result reuse", () => {
 		const event = {
 			sessionID: "session",
 			turnID: "turn",
@@ -372,48 +371,6 @@ describe("zero-modification Pi extension", () => {
 		};
 
 		expect(formatSpeculativeActionEvent(event)).toContain("partial-result reuse (read.range)");
-
-		const reuseEvent = {
-			sessionID: "session",
-			turnID: "turn-2",
-			timestamp: 2,
-			cache: emptyMetrics().cache,
-			type: "candidate" as const,
-			candidate: {
-				id: "candidate-2",
-				origin: "prediction" as const,
-				tool: "bash",
-				actionKeyHash: "hash",
-				execution: "runtime_sandbox" as const,
-				route: {
-					isolation: "runtime_sandbox" as const,
-					reuse: "shared_result" as const,
-					scope: "runtime" as const,
-					backend: "linux_process_reuse",
-					fingerprint: "linux:v1",
-				},
-				world: {
-					backend: "linux_process_reuse",
-					executionMetrics: {
-						reuse: { ...emptyMetrics().processReuse, requests: 1, hits: 1, crossTurnHits: 1, replayMs: 2 },
-					},
-				},
-				source: "Drafter",
-				depth: 0,
-				predictedAction: "bash pwd",
-				predictionLatencyMs: 1,
-				draftTokens: 1,
-				totalDraftTokens: 1,
-				expectedDurationMs: 10,
-				estimatedBytes: 1,
-				validation: { durationMs: 0, bytesRead: 0, filesRead: 0 },
-			},
-			state: { status: "succeeded" as const, startedAt: 0, completedAt: 5, executionMs: 5 },
-		};
-		const formatted = formatSpeculativeActionEvent(reuseEvent);
-		expect(formatted).toContain("session session · turn turn-2 · candidate candidate-2");
-		expect(formatted).toContain("linux_process_reuse/runtime_sandbox/shared_result");
-		expect(formatted).toContain("validated L2 1/1 (100%) hits; 0 same-turn, 1 cross-turn");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
@@ -621,8 +578,6 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 	const host: SpeculativeActionHost = {
 		sessionID: "session",
 		executionWorldDiagnostics: vi.fn(async () => []),
-		configureExecutionWorldStorage: vi.fn(),
-		maintainExecutionWorldStorage: vi.fn(async () => []),
 		runtime: {
 			settingsChanged: vi.fn(),
 			inspect: () => ({

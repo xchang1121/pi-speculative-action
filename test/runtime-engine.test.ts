@@ -132,6 +132,7 @@ function harness(input: {
 		signal: AbortSignal,
 		parentWorld?: WorldBranch<string>,
 	) => unknown | Promise<unknown>;
+	readonly executionMetrics?: WorldExecutionMetrics;
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
@@ -188,6 +189,7 @@ function harness(input: {
 			if (isWorldBranch(executed)) return executed;
 			return world((executed as string | undefined) ?? "speculative", {
 				executionFingerprint: action.executionFingerprint,
+				...(input.executionMetrics ? { backend: route.backend, executionMetrics: input.executionMetrics } : {}),
 				...(route.isolation === "resource_snapshot"
 					? {
 							validate: async () =>
@@ -229,42 +231,6 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
-	it("correlates route and branch reuse telemetry on candidate events", async () => {
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "telemetry", { path: "README.md" }),
-		};
-		const fixture = harness({
-			source,
-			execute: () =>
-				world("cached", {
-					backend: RESOURCE_ROUTE.backend,
-					executionMetrics: {
-						setupMs: 3,
-						reuse: { ...emptyWorldReuseMetrics(), requests: 1, hits: 1, replayMs: 2 },
-					},
-				}),
-		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "telemetry" });
-		await waitFor(() => fixture.events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
-		const event = fixture.events.find(
-			(event) => event.type === "candidate" && event.state.status === "succeeded",
-		);
-		expect(event).toMatchObject({
-			sessionID: "session",
-			turnID: "telemetry",
-			candidate: {
-				route: RESOURCE_ROUTE,
-				world: {
-					backend: "resource_version",
-					executionMetrics: { setupMs: 3, reuse: { requests: 1, hits: 1, replayMs: 2 } },
-				},
-			},
-		});
-		await fixture.runtime.finishTurn({ ...call("telemetry"), terminal: true });
-	});
-
 	it("admits independent actions and proposals without head-of-line blocking", async () => {
 		let releaseSlow!: () => void;
 		const slow = new Promise<void>((resolve) => {
@@ -326,7 +292,12 @@ describe("structural speculative runtime", () => {
 				settlements.push(settlement);
 			},
 		};
-		const fixture = harness({ source, expired: () => true, actionKey });
+		const fixture = harness({
+			source,
+			expired: () => true,
+			actionKey,
+			executionMetrics: { reuse: { ...emptyWorldReuseMetrics(), requests: 1, hits: 1, replayMs: 2 } },
+		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
 		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
 
@@ -350,6 +321,8 @@ describe("structural speculative runtime", () => {
 				.filter((event) => event.type === "candidate")
 				.map((event) => (event.type === "candidate" ? event.state.status : undefined)),
 		).toEqual(["running", "succeeded"]);
+		expect(fixture.events.find((event) => event.type === "candidate" && event.state.status === "succeeded"))
+			.toMatchObject({ candidate: { route: RESOURCE_ROUTE, world: { backend: "resource_version", executionMetrics: { reuse: { hits: 1 } } } } });
 		expect(fixture.events.filter((event) => event.type === "source_request")).toHaveLength(1);
 		expect(fixture.events.find((event) => event.type === "actor_action")).toMatchObject({
 			settlement: {

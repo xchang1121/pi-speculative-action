@@ -49,52 +49,20 @@ export function sameSpeculativeExecutionRoute(
 	);
 }
 
+const WORLD_REUSE_COUNTERS = [
+	"requests", "hits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
+	"misses", "bypasses", "published", "tainted", "validationMs", "validationCandidates",
+	"validationPathsets", "validationFilesRead", "validationBytesRead", "validationArtifactsLoaded",
+	"validationArtifactBytesRead", "replayMs", "executionMs",
+] as const;
+
+type WorldReuseCounter = typeof WORLD_REUSE_COUNTERS[number];
 /** Backend-neutral accounting for validated result reuse inside one execution world. */
-export interface WorldReuseMetrics {
-	readonly requests: number;
-	readonly hits: number;
-	readonly joinedHits: number;
-	readonly sameTurnHits: number;
-	readonly crossTurnHits: number;
-	readonly unattributedHits: number;
-	readonly misses: number;
-	readonly bypasses: number;
-	readonly published: number;
-	readonly tainted: number;
-	readonly validationMs: number;
-	readonly validationCandidates: number;
-	readonly validationPathsets: number;
-	readonly validationFilesRead: number;
-	readonly validationBytesRead: number;
-	readonly validationArtifactsLoaded: number;
-	readonly validationArtifactBytesRead: number;
-	readonly replayMs: number;
-	readonly executionMs: number;
-	readonly lastError?: string;
-}
+export type WorldReuseMetrics = Readonly<Record<WorldReuseCounter, number>> & { readonly lastError?: string };
+const EMPTY_WORLD_REUSE_METRICS = Object.fromEntries(WORLD_REUSE_COUNTERS.map((key) => [key, 0])) as unknown as WorldReuseMetrics;
 
 export function emptyWorldReuseMetrics(): WorldReuseMetrics {
-	return {
-		requests: 0,
-		hits: 0,
-		joinedHits: 0,
-		sameTurnHits: 0,
-		crossTurnHits: 0,
-		unattributedHits: 0,
-		misses: 0,
-		bypasses: 0,
-		published: 0,
-		tainted: 0,
-		validationMs: 0,
-		validationCandidates: 0,
-		validationPathsets: 0,
-		validationFilesRead: 0,
-		validationBytesRead: 0,
-		validationArtifactsLoaded: 0,
-		validationArtifactBytesRead: 0,
-		replayMs: 0,
-		executionMs: 0,
-	};
+	return { ...EMPTY_WORLD_REUSE_METRICS };
 }
 
 export interface WorldExecutionMetrics {
@@ -202,13 +170,6 @@ export interface ExecutionWorldStorageMaintenance {
 	readonly removedBytes: number;
 }
 
-export interface ExecutionWorldStorageMaintenanceSnapshot extends ExecutionWorldStorageMaintenance {
-	readonly id: string;
-	readonly operation: ExecutionWorldStorageOperation;
-	readonly status: "completed" | "failed";
-	readonly detail?: string;
-}
-
 export interface ExecutionWorldStorageControl {
 	/** Applies the retention policy synchronously; reclamation remains an explicit maintenance action. */
 	readonly configure: (limits: ExecutionWorldStorageLimits) => void;
@@ -234,7 +195,6 @@ export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnost
 	readonly id: string;
 	readonly scope: ExecutionWorldScope;
 	readonly isolation: SpeculativeExecution;
-	readonly observedAt: number;
 }
 
 interface ExecutionWorldLifecycle<Context, Output> {
@@ -323,40 +283,10 @@ export class ExecutionWorldRouter<Context, Output> {
 		await Promise.allSettled(this.worlds.map((world) => world.dispose?.()));
 	}
 
-	configureStorage(limits: ExecutionWorldStorageLimits): void {
-		for (const world of this.worlds) world.storage?.configure(limits);
-	}
-
-	async maintainStorage(
-		operation: ExecutionWorldStorageOperation,
-	): Promise<readonly ExecutionWorldStorageMaintenanceSnapshot[]> {
-		return Promise.all(
-			this.worlds.flatMap((world) =>
-				world.storage
-					? [
-							world.storage.maintain(operation).then(
-								(result) => ({ id: world.id, operation, status: "completed" as const, ...result }),
-								(error) => ({
-									id: world.id,
-									operation,
-									status: "failed" as const,
-									removedEntries: 0,
-									removedArtifacts: 0,
-									removedBytes: 0,
-									detail: errorDetail(error),
-								}),
-							),
-						]
-					: [],
-			),
-		);
-	}
-
 	/** Inspect every registered world without attempting a speculative action. */
 	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return Promise.all(
 			this.worlds.map(async (world) => {
-				const observedAt = Date.now();
 				let report: ExecutionWorldDiagnosticReport | undefined;
 				try {
 					report = await world.diagnostics?.(input);
@@ -374,7 +304,6 @@ export class ExecutionWorldRouter<Context, Output> {
 							state: "registered",
 							detail: "Registered; availability is checked during route preparation",
 						}),
-					observedAt,
 				});
 			}),
 		);

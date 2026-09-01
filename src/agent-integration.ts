@@ -21,9 +21,6 @@ import type {
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type {
 	ExecutionWorldDiagnosticSnapshot,
-	ExecutionWorldStorageLimits,
-	ExecutionWorldStorageMaintenanceSnapshot,
-	ExecutionWorldStorageOperation,
 	SpeculativeExecutionRoute,
 } from "./execution-world.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
@@ -156,10 +153,6 @@ export interface SpeculativeActionHost {
 	readonly executionWorldDiagnostics: (
 		refresh?: boolean,
 	) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
-	readonly configureExecutionWorldStorage: (limits: ExecutionWorldStorageLimits) => void;
-	readonly maintainExecutionWorldStorage: (
-		operation: ExecutionWorldStorageOperation,
-	) => Promise<readonly ExecutionWorldStorageMaintenanceSnapshot[]>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	readonly previewActorTool: (
 		input: { readonly turnID: string; readonly tool: string },
@@ -460,8 +453,6 @@ export function createSpeculativeActionHost(
 		runtime,
 		executionWorldDiagnostics: (refresh = false) =>
 			executionGateway.diagnostics({ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) }),
-		configureExecutionWorldStorage: (limits) => executionGateway.configureStorage(limits),
-		maintainExecutionWorldStorage: (operation) => executionGateway.maintainStorage(operation),
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),

@@ -8,9 +8,6 @@ import {
 	type CapturedExecutionWorldResult,
 	type ExecutionWorldDiagnosticSnapshot,
 	type ExecutionWorldDiagnosticsContext,
-	type ExecutionWorldStorageLimits,
-	type ExecutionWorldStorageMaintenanceSnapshot,
-	type ExecutionWorldStorageOperation,
 	ExecutionWorldRouter,
 	type ExecutionWorld,
 	type ExecutionWorldPreparation,
@@ -87,16 +84,6 @@ export class ToolExecutionGateway<Context, Output> {
 
 	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return this.router.diagnostics(input);
-	}
-
-	configureStorage(limits: ExecutionWorldStorageLimits): void {
-		this.router.configureStorage(limits);
-	}
-
-	maintainStorage(
-		operation: ExecutionWorldStorageOperation,
-	): Promise<readonly ExecutionWorldStorageMaintenanceSnapshot[]> {
-		return this.router.maintainStorage(operation);
 	}
 
 	captureAuthoritativeResult(

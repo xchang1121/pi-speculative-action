@@ -65,7 +65,6 @@ export {
 	type ExecutionWorldStorageControl,
 	type ExecutionWorldStorageLimits,
 	type ExecutionWorldStorageMaintenance,
-	type ExecutionWorldStorageMaintenanceSnapshot,
 	type ExecutionWorldStorageOperation,
 	type ExecutionWorldStorageSnapshot,
 	type ExecutionWorldScope,
