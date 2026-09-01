@@ -295,13 +295,19 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 	});
 
-	it("states the unified execution boundary without claiming a bundled process sandbox", () => {
+	it("keeps mixed-tool reuse primary and Bash child reuse secondary", () => {
 		const settings = effectiveSettings();
 		settings.selfSpeculation = { ...settings.selfSpeculation, enabled: true, forkTransport: "sidecar" };
 		const status = formatSpeculativeActionStatus({
 			settings,
 			metrics: {
 				...emptyMetrics(),
+				actorActions: 4,
+				speculativeHits: 2,
+				exactReuseHits: 1,
+				partialResultReuseHits: 1,
+				executionAheadMs: 300,
+				hitLatencyMs: 40,
 				processReuse: {
 					...emptyWorldReuseMetrics(), requests: 3, hits: 1, timedHits: 1, crossTurnHits: 1,
 					avoidedProcessMs: 1200, timedHitOverheadMs: 200,
@@ -314,15 +320,11 @@ describe("zero-modification Pi extension", () => {
 			"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
-		expect(status).toContain("Actor actions: 0/0 (n/a)");
-		expect(status).toContain("Bash reuse this session: 1/3 (33%) commands launched by Bash reused");
-		expect(status).toContain("Bash time saved this session: ~1s estimated saved (83% less) across 1/1 reuses with timing");
-		expect(status).toContain("1.2s prior execution vs 200ms reuse overhead");
+		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
+		expect(status).toContain("Bash child commands: 1/3 (33%) reused; ~1s estimated time saved (83%); 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
-		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
-		expect(status).toContain("Reuse: 0 exact actions; 0 partial results (none)");
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
-		expect(status).toContain("not whole-agent speedup");
+		expect(status).not.toContain("prior execution");
 		expect(status).not.toMatch(/\bL[12]\b/);
 	});
 
@@ -385,7 +387,10 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
-		expect(fixture.ui.setStatus).toHaveBeenCalledWith("speculative-action", expect.stringContaining("reuse history 3 entries (2 KiB)"));
+		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
+		expect(footer).toContain("tools reused 0/0 (n/a)");
+		expect(footer).toContain("reuse history 3 entries (2 KiB)");
+		expect(footer).not.toContain("Bash");
 		expect(fixture.store.effective()).toEqual({ enabled: true });
 		expect(fixture.store.scope).toBe("project");
 	});

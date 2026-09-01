@@ -299,20 +299,15 @@ export function formatSpeculativeActionStatus(input: {
 		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
-		`Actor actions: ${formatRatio(metrics.speculativeHits, metrics.actorActions)} speculative result reuse; previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
-		`Reuse: ${metrics.exactReuseHits} exact actions; ${metrics.partialResultReuseHits} partial results (${countSummary(metrics.partialResultReuseByProjector)})`,
-		`Bash reuse this session: ${formatCommandReuse(processReuse)}`,
-		`Bash time saved this session: ${formatReuseBenefit(processReuse)}`,
-		"Bash timing scope: estimates compare a matched child command's prior runtime with its nested reuse-request overhead; shell, sandbox, and model time are excluded, so this is not whole-agent speedup.",
-		`Bash diagnostics: ${formatDuration(processReuse.validationMs)} lookup; ${formatDuration(processReuse.replayMs)} replay; ${formatDuration(processReuse.executionMs)} observed cold execution.`,
+		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
+		...(processReuse.requests > 0 ? [`Bash child commands: ${formatBashReuse(processReuse)}`] : []),
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate, and Bash command reuse is reported separately.`
+			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
 		`Isolation-blocked potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
@@ -1403,8 +1398,8 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
 				const reuse = event.candidate.world?.executionMetrics.reuse;
-				if (reuse) {
-					parts.push(`Bash reuse ${formatCommandReuse(reuse)}; ${formatReuseBenefit(reuse)}`);
+				if (reuse?.requests) {
+					parts.push(`Bash child commands ${formatBashReuse(reuse)}`);
 				}
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
@@ -1604,17 +1599,13 @@ function formatSpeculativeFooter(
 	if (!settings.enabled) return "spec: off";
 	const ready = worlds.filter((world) => world.state === "ready").length;
 	const reuse = metrics.processReuse;
-	const benefit = formatReuseDelta(reuse);
 	const storageWorlds = worlds.filter((world) => world.storage);
 	const storedEntries = storageWorlds.reduce((total, world) => total + (world.storage?.entries ?? 0), 0);
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		`actions ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
-		reuse.requests > 0
-			? `Bash reuse ${formatRatio(reuse.hits, reuse.requests)}${reuse.crossTurnHits ? `, ${reuse.crossTurnHits} earlier turns` : ""}${reuse.unattributedHits ? `, ${reuse.unattributedHits} stored` : ""}`
-			: "Bash reuse idle",
-		...(benefit ? [`${benefit} child time`] : []),
+		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
+		...(reuse.requests > 0 ? [`Bash child ${formatBashReuse(reuse)}`] : []),
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
@@ -1684,17 +1675,21 @@ function measuredReuseDelta(reuse: WorldReuseMetrics): number | undefined {
 function formatReuseDelta(reuse: WorldReuseMetrics): string | undefined {
 	const delta = measuredReuseDelta(reuse);
 	if (delta === undefined) return undefined;
-	if (delta === 0) return "no estimated change";
-	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "saved" : "slower"} (${formatPercent(Math.abs(delta) / reuse.avoidedProcessMs)} ${delta > 0 ? "less" : "more"})`;
+	if (delta === 0) return "no estimated time change";
+	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "time saved" : "extra time"} (${formatPercent(Math.abs(delta) / reuse.avoidedProcessMs)})`;
 }
 
-function formatCommandReuse(reuse: WorldReuseMetrics): string {
-	return `${formatRatio(reuse.hits, reuse.requests)} commands launched by Bash reused; ${reuse.sameTurnHits} same turn, ${reuse.crossTurnHits} from earlier turns, ${reuse.unattributedHits} from stored history, ${reuse.joinedHits} joined running work`;
-}
-
-function formatReuseBenefit(reuse: WorldReuseMetrics): string {
+function formatBashReuse(reuse: WorldReuseMetrics): string {
 	const benefit = formatReuseDelta(reuse);
-	return benefit
-		? `${benefit} across ${reuse.timedHits}/${reuse.hits} reuses with timing (${formatDuration(reuse.avoidedProcessMs)} prior execution vs ${formatDuration(reuse.timedHitOverheadMs)} reuse overhead)`
-		: `n/a (${reuse.hits > 0 ? "original duration unavailable" : "no reuse yet"})`;
+	const origins = [
+		reuse.sameTurnHits ? `${reuse.sameTurnHits} same-turn` : "",
+		reuse.crossTurnHits ? `${reuse.crossTurnHits} earlier-turn` : "",
+		reuse.unattributedHits ? `${reuse.unattributedHits} stored` : "",
+		reuse.joinedHits ? `${reuse.joinedHits} joined` : "",
+	].filter(Boolean);
+	return [
+		`${formatRatio(reuse.hits, reuse.requests)} reused`,
+		...(benefit ? [benefit] : []),
+		...origins,
+	].join("; ");
 }
