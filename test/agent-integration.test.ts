@@ -355,7 +355,6 @@ describe("speculative action host", () => {
 						backend: "runtime",
 						executionFingerprint: context.action.executionFingerprint,
 					},
-					state: "sealed",
 					commit: async () => output,
 					dispose: () => {},
 				};
@@ -439,7 +438,6 @@ describe("speculative action host", () => {
 					backend: "runtime",
 					executionFingerprint: context.action.executionFingerprint,
 				},
-				state: "sealed" as const,
 				commit: async () => output,
 				dispose: () => {},
 			};

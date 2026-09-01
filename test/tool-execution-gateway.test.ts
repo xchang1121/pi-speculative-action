@@ -38,7 +38,7 @@ describe("ToolExecutionGateway", () => {
 			? await gateway.executeSpeculative(operation, route, () => ({ value: "sealed" }))
 			: undefined;
 		expect(transaction?.output).toBe("sealed");
-		expect(transaction?.transactionState).toBe("sealed");
+		expect(transaction?.state).toBe("sealed");
 		const capture = await gateway.captureAuthoritativeResult(
 			requirement,
 			{ cwd: "/workspace" },
@@ -127,7 +127,6 @@ function branch(backend: string, output: string) {
 		capturedBytes: 0,
 		executionMetrics: {},
 		compatibility: { status: "compatible" as const, backend, executionFingerprint: `${backend}:v1` },
-		state: "sealed" as const,
 		commit: async () => output,
 		dispose: () => {},
 	};

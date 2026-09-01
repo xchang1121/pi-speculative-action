@@ -8,7 +8,6 @@ import { asRecord, contains, slash } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,
-	WorldBranchState,
 	WorldCheckpoint,
 	WorldCommitMetrics,
 	WorldCompatibilityEvidence,
@@ -833,7 +832,6 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly validate?: () => Promise<ResourceValidation>;
 	private readonly changes: readonly SandboxWorkspaceChange[];
 	private readonly owner: WorkspaceSandboxState;
-	private stateValue: WorldBranchState = "sealed";
 	private commitMetricsValue?: WorldCommitMetrics;
 	private commitPromise?: Promise<ToolSettlement>;
 
@@ -866,26 +864,16 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 		this.validate = validate;
 	}
 
-	get state(): WorldBranchState {
-		return this.stateValue;
-	}
-
 	get commitMetrics(): WorldCommitMetrics | undefined {
 		return this.commitMetricsValue;
 	}
 
 	readonly commit = (): Promise<ToolSettlement> => {
 		if (this.commitPromise) return this.commitPromise;
-		this.stateValue = "committing";
 		this.commitPromise = commitSandboxExecution(this.owner, { output: this.output, changes: this.changes }).then(
 			({ output, metrics }) => {
 				this.commitMetricsValue = metrics;
-				this.stateValue = "committed";
 				return output;
-			},
-			(error) => {
-				this.stateValue = "failed";
-				throw error;
 			},
 		);
 		return this.commitPromise;

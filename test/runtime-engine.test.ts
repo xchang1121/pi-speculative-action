@@ -1109,7 +1109,6 @@ describe("structural speculative runtime", () => {
 				capturedBytes: 0,
 				executionMetrics: {},
 				compatibility: { status: "compatible", backend: "test", executionFingerprint: "" },
-				state: "sealed",
 				commit,
 				dispose: () => {},
 			}),
@@ -1204,7 +1203,6 @@ describe("structural speculative runtime", () => {
 				capturedBytes: 0,
 				executionMetrics: {},
 				compatibility: { status: "indeterminate", backend: "test", code: "attestation_missing" },
-				state: "sealed",
 				commit,
 				dispose: () => {},
 			}),
@@ -2168,7 +2166,6 @@ function world(
 		readonly validate?: () => Promise<ResourceValidation>;
 	} = {},
 ): WorldBranch<string> {
-	let state = "sealed" as "sealed" | "committing" | "committed" | "failed";
 	return {
 		output,
 		backend: "test",
@@ -2182,13 +2179,8 @@ function world(
 			executionFingerprint: options.executionFingerprint ?? "",
 		},
 		...(options.validate ? { validate: options.validate } : {}),
-		get state() {
-			return state;
-		},
 		commit: async () => {
-			state = "committing";
 			options.onCommit?.();
-			state = "committed";
 			return output;
 		},
 		dispose: () => options.onDispose?.(),

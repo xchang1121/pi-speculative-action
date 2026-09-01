@@ -25,18 +25,53 @@ describe("EffectTransactionCoordinator", () => {
 				dispose,
 			}),
 		);
-		expect(transaction.transactionState).toBe("sealed");
+		expect(transaction.state).toBe("sealed");
+		expect(attempt.state).toBe(transaction.state);
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 		expect(await transaction.validate()).toMatchObject({ status: "valid" });
-		expect(transaction.transactionState).toBe("validated");
+		expect(transaction.state).toBe("validated");
+		expect(attempt.state).toBe(transaction.state);
 
 		const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
 		expect([first, second]).toEqual(["committed", "committed"]);
 		expect(commit).toHaveBeenCalledOnce();
-		expect(transaction.transactionState).toBe("committed");
+		expect(transaction.state).toBe("committed");
+		expect(attempt.state).toBe(transaction.state);
 		await transaction.abort();
 		expect(dispose).toHaveBeenCalledOnce();
-		expect(transaction.transactionState).toBe("committed");
+		expect(transaction.state).toBe("committed");
+	});
+
+	it("coordinates validation and abort through one lifecycle", async () => {
+		let releaseValidation: (() => void) | undefined;
+		const validationGate = new Promise<void>((resolve) => {
+			releaseValidation = resolve;
+		});
+		const dispose = vi.fn();
+		const coordinator = new EffectTransactionCoordinator<string>();
+		const attempt = coordinator.begin({ tool: "write", route });
+		const transaction = await coordinator.execute(attempt, async () =>
+			branch({
+				validate: async () => {
+					await validationGate;
+					return { status: "valid", metrics: metrics() };
+				},
+				dispose,
+			}),
+		);
+
+		const validation = transaction.validate();
+		expect(transaction.state).toBe("validating");
+		expect(attempt.state).toBe(transaction.state);
+		const aborted = transaction.abort();
+		expect(transaction.state).toBe("aborting");
+		releaseValidation?.();
+		await validation;
+		await aborted;
+
+		expect(transaction.state).toBe("aborted");
+		expect(attempt.state).toBe(transaction.state);
+		expect(dispose).toHaveBeenCalledOnce();
 	});
 
 	it("fails closed on stale validation and aborts captured authoritative state", async () => {
@@ -64,7 +99,7 @@ describe("EffectTransactionCoordinator", () => {
 		await transaction.abort();
 		expect(disposeBranch).toHaveBeenCalledOnce();
 		expect(disposeCapture).not.toHaveBeenCalled();
-		expect(transaction.transactionState).toBe("aborted");
+		expect(transaction.state).toBe("aborted");
 
 		const abandonedAttempt = coordinator.begin({ tool: "custom", route });
 		const abandoned = coordinator.capture(abandonedAttempt, {
@@ -86,7 +121,6 @@ function branch(overrides: Partial<WorldBranch<string>> = {}): WorldBranch<strin
 		capturedBytes: 0,
 		executionMetrics: {},
 		compatibility: { status: "compatible", backend: "test", executionFingerprint: "executor" },
-		state: "sealed",
 		commit: async () => output,
 		dispose: () => {},
 		...overrides,

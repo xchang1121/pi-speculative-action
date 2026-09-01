@@ -142,13 +142,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			).toBe("git-worktree:v1");
 			const branch = await world.fork(context(root, "write", writeTool, args));
 
-			expect(branch.state).toBe("sealed");
+			expect(branch.commitMetrics).toBeUndefined();
 			expect(branch.resources).toEqual(["nested/created.txt"]);
 			await expect(stat(path.join(root, args.path))).rejects.toThrow();
 			const first = branch.commit();
 			expect(branch.commit()).toBe(first);
 			await first;
-			expect(branch.state).toBe("committed");
+			expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
 			expect(await readFile(path.join(root, args.path), "utf8")).toBe("isolated\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -298,8 +298,10 @@ describe("workspace-branch ExecutionWorld", () => {
 			const branch = await createWorkspaceSandbox().fork(context(root, "edit", editTool, args));
 			await writeFile(target, "actor\n", "utf8");
 
-			await expect(branch.commit()).rejects.toThrow("resource changed before commit: value.txt");
-			expect(branch.state).toBe("failed");
+			const failed = branch.commit();
+			expect(branch.commit()).toBe(failed);
+			await expect(failed).rejects.toThrow("resource changed before commit: value.txt");
+			expect(branch.commitMetrics).toBeUndefined();
 			expect(await readFile(target, "utf8")).toBe("actor\n");
 		} finally {
 			await rm(root, { recursive: true, force: true });

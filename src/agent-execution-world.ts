@@ -4,7 +4,6 @@ import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
 	ExecutionWorld,
 	WorldBranch,
-	WorldBranchState,
 	WorldCheckpoint,
 	WorldCompatibilityEvidence,
 	WorldResultCapture,
@@ -106,7 +105,6 @@ class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly output: ToolSettlement;
 	private readonly version: ResourceVersionToken;
-	private stateValue: WorldBranchState = "sealed";
 	private stopWatcher?: () => void;
 	private disposed = false;
 
@@ -119,10 +117,6 @@ class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 			backend: this.backend,
 			executionFingerprint,
 		});
-	}
-
-	get state(): WorldBranchState {
-		return this.stateValue;
 	}
 
 	async validate(): Promise<ResourceValidation> {
@@ -148,7 +142,6 @@ class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 	}
 
 	async commit(): Promise<ToolSettlement> {
-		this.stateValue = "committed";
 		return this.output;
 	}
 

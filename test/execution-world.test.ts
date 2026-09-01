@@ -116,7 +116,6 @@ function lifecycle(id: string) {
 			capturedBytes: 0,
 			executionMetrics: {},
 			compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
-			state: "sealed" as const,
 			commit: async () => value,
 			dispose: () => {},
 		}),

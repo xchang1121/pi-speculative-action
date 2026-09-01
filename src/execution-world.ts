@@ -43,8 +43,6 @@ export function sameSpeculativeExecutionRoute(
 	);
 }
 
-export type WorldBranchState = "sealed" | "committing" | "committed" | "failed";
-
 export interface WorldExecutionMetrics {
 	/** Time spent materializing an isolated world before the tool could start. */
 	readonly setupMs?: number;
@@ -83,11 +81,11 @@ export interface WorldCheckpoint {
 }
 
 /**
- * A sealed speculative execution.
+ * A sealed speculative execution artifact.
  *
  * The tool output and promotable persistent effects are captured together. Ephemeral process,
- * environment, and network state never crosses the branch boundary. Commit is lossless,
- * conflict-checked, and at most once; callers may safely join the same in-progress commit.
+ * environment, and network state never crosses the branch boundary. Backends provide an
+ * idempotent commit primitive; EffectTransaction exclusively owns validation and adoption state.
  */
 export interface WorldBranch<Output> {
 	readonly output: Output;
@@ -98,7 +96,6 @@ export interface WorldBranch<Output> {
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorldExecutionMetrics;
 	readonly compatibility: WorldCompatibilityEvidence;
-	readonly state: WorldBranchState;
 	readonly commitMetrics?: WorldCommitMetrics;
 	/** Optional freshness proof owned by the backend that captured the branch. */
 	readonly validate?: () => Promise<ResourceValidation>;

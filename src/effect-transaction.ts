@@ -36,7 +36,8 @@ export interface EffectTransactionAttempt {
  */
 export interface EffectTransaction<Output> extends WorldBranch<Output> {
 	readonly transactionID: string;
-	readonly transactionState: EffectTransactionState;
+	/** The sole public lifecycle for validation, adoption, and disposal. */
+	readonly state: EffectTransactionState;
 	readonly latestValidation?: ResourceValidation;
 	readonly validate: () => Promise<ResourceValidation>;
 	readonly abort: () => Promise<void>;
@@ -164,7 +165,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 		return this.attempt.id;
 	}
 
-	get transactionState(): EffectTransactionState {
+	get state(): EffectTransactionState {
 		return this.attempt.stateValue;
 	}
 
@@ -198,21 +199,6 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 
 	get compatibility() {
 		return this.branch.compatibility;
-	}
-
-	get state(): WorldBranch<Output>["state"] {
-		switch (this.attempt.stateValue) {
-			case "committing":
-				return "committing";
-			case "committed":
-				return "committed";
-			case "failed":
-			case "aborted":
-			case "aborting":
-				return "failed";
-			default:
-				return "sealed";
-		}
 	}
 
 	get commitMetrics() {

@@ -170,7 +170,6 @@ export {
 	type SpeculativeExecutionRoute,
 	sameSpeculativeExecutionRoute,
 	type WorldBranch,
-	type WorldBranchState,
 	type WorldCheckpoint,
 	type WorldCommitMetrics,
 	type WorldCompatibilityEvidence,
