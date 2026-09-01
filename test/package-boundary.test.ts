@@ -84,6 +84,14 @@ describe("speculative action package boundary", () => {
 		expect(processReuseApi).not.toHaveProperty("makeSpeculativeActionRuntime");
 	});
 
+	test("keeps runtime contracts below the implementation facade", async () => {
+		const contracts = await fs.readFile(path.join(packageRoot, "src", "runtime-contracts.ts"), "utf8");
+		const engine = await fs.readFile(path.join(packageRoot, "src", "runtime-engine.ts"), "utf8");
+		expect(contracts).not.toMatch(/runtime-engine|["']\.\/runtime\.ts["']/);
+		expect(engine).toMatch(/from ["']\.\/runtime-contracts\.ts["']/);
+		expect(engine).not.toMatch(/from ["']\.\/runtime\.ts["']/);
+	});
+
 	test("declares a source-loadable Pi package with only public host peers", async () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;

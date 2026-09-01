@@ -33,7 +33,7 @@ import type {
 	SpeculativeDraftCandidate,
 	SpeculativePlanSource,
 	SpeculativeRuntimeInspection,
-} from "./runtime.ts";
+} from "./runtime-contracts.ts";
 import {
 	type PredictionForecast,
 	type ServiceTimingIdentity,
