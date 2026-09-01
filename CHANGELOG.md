@@ -22,6 +22,8 @@
 
 ### Added
 
+- Added capability-derived tool policy: startup diagnostics now keep unroutable preferences inactive,
+  prediction sources receive only safe current tools, and the TUI reuses this result without per-tool probes.
 - Added user-facing reuse accounting led by all tool calls. Bash child-command hit rate and matched-command
   savings appear only when relevant, as a separate secondary measure that is never added to tool-call reuse.
   TUI cache tiers are named by purpose.

@@ -24,10 +24,14 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SpeculativeActionHost } from "../src/agent-integration.ts";
+import type { CreateSpeculativeActionHostOptions, SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
-import { UNRESTRICTED_PROCESS_EFFECTS } from "../src/effect-model.ts";
-import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
+import {
+	RESOURCE_OBSERVATION_EFFECTS,
+	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
+} from "../src/effect-model.ts";
+import { emptyWorldReuseMetrics, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
 	formatSpeculativeActionEvent,
@@ -318,9 +322,10 @@ describe("zero-modification Pi extension", () => {
 
 		expect(status).toContain("Prediction tools: read write edit bash");
 		expect(status).toContain(
-			"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
+			"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
+		expect(status).not.toContain("sandbox");
 		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
 		expect(status).toContain("Bash child commands: 1/3 (33%) reused; ~1s estimated time saved (83%); 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
@@ -357,15 +362,13 @@ describe("zero-modification Pi extension", () => {
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture({ settings: { enabled: true } });
-		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([{
-			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
-			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-			state: "unavailable", detail: "Linux host required",
-			storage: { entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false },
-		}]);
+		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
+			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
+		}));
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Target decoding", "Enabled", "Discard changes", "Configuration scope", "Close"],
-			"Tools & execution": ["Execution guarantees", "Back"],
+			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
+			"Tool policy": ["[~] bash", "[ ] bash", "Back"],
 			"Self-speculation": ["Back"],
 			"Configuration scope": ["project"],
 		});
@@ -382,13 +385,20 @@ describe("zero-modification Pi extension", () => {
 			]),
 		);
 		expect(menus.get("Tools & execution")).toEqual(
-			expect.arrayContaining([expect.stringMatching(/^Tool policy/), "Execution guarantees"]),
+			expect.arrayContaining(["Tool policy › 6/6 active", "Execution routes"]),
 		);
+		expect(menus.get("Tool policy")).toEqual(expect.arrayContaining([
+			expect.stringMatching(/^\[ \] bash · unavailable · Linux host required/),
+		]));
 		expect(menus.get("Self-speculation")).toEqual(expect.arrayContaining(["Fork action confidence: 0.9"]));
-		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("runtime-wide sandbox"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
+		expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(2);
+		expect(JSON.stringify([...menus.values()])).not.toContain("sandbox");
+		expect(await fixture.hostSettings()).toMatchObject({ tools: ["read", "grep", "find", "ls", "write", "edit"] });
 		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
 		expect(footer).toContain("tools reused 0/0 (n/a)");
 		expect(footer).toContain("reuse history 3 entries (2 KiB)");
@@ -538,6 +548,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		thinkingLevel: "off",
 	} as unknown as ExtensionContext;
 	const store = memorySettingsStore(options.settings);
+	let getHostSettings: CreateSpeculativeActionHostOptions["getSettings"];
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -557,7 +568,10 @@ async function createFixture(options: FixtureOptions = {}) {
 			})),
 	} as unknown as ExtensionAPI;
 	const factory = createSpeculativeActionExtension({
-		createHost: () => host,
+		createHost: (_sessionID, hostOptions) => {
+			getHostSettings = hostOptions.getSettings;
+			return host;
+		},
 		createSettingsStore: () => store,
 		createExecutionWorlds: () => options.executionWorlds ?? [],
 	});
@@ -565,7 +579,10 @@ async function createFixture(options: FixtureOptions = {}) {
 	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, eventContext);
 	};
-	return { actorTools, baseTools, commands, context, customTools, cwd, emit, handlers, host, store, tools, ui };
+	return {
+		actorTools, baseTools, commands, context, customTools, cwd, emit, handlers, host,
+		hostSettings: async () => getHostSettings?.(), store, tools, ui,
+	};
 }
 
 function driveSettingsMenus(
@@ -591,7 +608,7 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 	const actual = vi.fn();
 	const host: SpeculativeActionHost = {
 		sessionID: "session",
-		executionWorldDiagnostics: vi.fn(async () => []),
+		executionWorldDiagnostics: vi.fn(async () => portableDiagnostics()),
 		runtime: {
 			settingsChanged: vi.fn(),
 			inspect: () => ({
@@ -660,6 +677,28 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		dispose: vi.fn(),
 	};
 	return host;
+}
+
+function portableDiagnostics(
+	storage?: NonNullable<ExecutionWorldDiagnosticSnapshot["storage"]>,
+): readonly ExecutionWorldDiagnosticSnapshot[] {
+	return [
+		{
+			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
+			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+			state: "unavailable", detail: "Linux host required", ...(storage ? { storage } : {}),
+		},
+		{
+			id: "git_worktree", scope: "fallback", isolation: "workspace_branch",
+			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			state: "registered", detail: "Checked on first use",
+		},
+		{
+			id: "resource_version", scope: "fallback", isolation: "resource_snapshot",
+			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+			state: "ready", detail: "Resource validation ready",
+		},
+	];
 }
 
 function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabled: false }): SpeculativeSettingsStore {

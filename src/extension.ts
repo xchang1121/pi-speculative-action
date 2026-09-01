@@ -26,6 +26,7 @@ import {
 import {
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
+	PI_ACTION_SEMANTICS,
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
@@ -48,7 +49,13 @@ import {
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
-import type { ExecutionWorldDiagnosticSnapshot, WorldReuseMetrics } from "./execution-world.ts";
+import {
+	executionCapabilityStatus,
+	type ExecutionCapabilityStatus,
+	type ExecutionWorldDiagnosticSnapshot,
+	type SpeculativeExecution,
+	type WorldReuseMetrics,
+} from "./execution-world.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
@@ -214,6 +221,7 @@ interface SpeculativeActionController {
 	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
 	readonly metrics: () => SpeculativeActionMetrics;
 	readonly registeredTools: () => ReadonlySet<string>;
+	readonly toolCapabilities: () => ReadonlyMap<string, ExecutionCapabilityStatus>;
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
@@ -298,7 +306,7 @@ export function formatSpeculativeActionStatus(input: {
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
-		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
+		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(processReuse.requests > 0 ? [`Bash child commands: ${formatBashReuse(processReuse)}`] : []),
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
@@ -308,7 +316,7 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Isolation-blocked potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
+		`No-safe-route potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
@@ -436,6 +444,7 @@ async function installController(
 	};
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
+	let executionDiagnosticsKnown = false;
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
@@ -453,6 +462,11 @@ async function installController(
 	const agentTools = new Map(
 		[...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]),
 	);
+	const toolCapabilities = () => resolveToolCapabilities(executionDiagnostics, executionDiagnosticsKnown);
+	const runtimeSettings = () => ({
+		...currentSettings,
+		tools: activeTools(currentSettings, baseDefinitions.keys(), toolCapabilities()),
+	});
 	function renderFooter(): void {
 		if (!ui) return;
 		ui.setStatus(
@@ -462,7 +476,7 @@ async function installController(
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
 		cwd: context.cwd,
-		getSettings: settings,
+		getSettings: runtimeSettings,
 		complete: (model, llmContext, options) =>
 			providerRole.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
 		draftModel: (actorModel) =>
@@ -506,6 +520,8 @@ async function installController(
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
 		executionDiagnostics = await host.executionWorldDiagnostics(refresh);
+		executionDiagnosticsKnown = true;
+		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 		renderFooter();
 	};
 
@@ -516,6 +532,7 @@ async function installController(
 		setSettingsScope: (scope) => settingsStore.setScope(scope),
 		metrics: () => currentMetrics,
 		registeredTools: () => new Set(baseDefinitions.keys()),
+		toolCapabilities,
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
@@ -544,7 +561,7 @@ async function installController(
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
-			void recoverSpeculation(() => host.runtime.settingsChanged(currentSettings));
+			void recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 			renderFooter();
 		},
 		attachUI: (nextUI) => {
@@ -639,7 +656,7 @@ async function installController(
 		statusText: () => {
 			const effective = settings();
 			return [
-				formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics }),
+				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: currentMetrics }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationBridgeStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(executionDiagnostics),
@@ -876,13 +893,14 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	};
 	while (true) {
 		const dirty = !sameSettings(draft, applied);
+		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools(), controller.toolCapabilities());
 		const choice = await ctx.ui.select("Speculative action", [
 			`Enabled: ${draft.enabled ? "On" : "Off"}`,
 			`Configuration scope: ${controller.settingsScope()}${sameSettings(applied, controller.settings()) ? "" : " (project overrides active)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
 			`Target decoding › ${selfSpeculationSummary(draft.selfSpeculation)}`,
 			`Scheduling & cache › ${draft.candidateLimit} drafts, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} live, ${draft.executionStoreMaxEntries} reusable commands`,
-			`Tools & execution › ${enabledToolCount(draft)} tools`,
+			`Tools & execution › ${toolPolicy.active}/${toolPolicy.available} active`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
 			"Status",
@@ -1136,18 +1154,25 @@ async function openToolsAndExecution(
 ): Promise<void> {
 	while (true) {
 		const settings = editor.settings();
+		const policy = toolPolicyCounts(settings, controller.registeredTools(), controller.toolCapabilities());
 		const choice = await ctx.ui.select("Tools & execution", [
-			`Tool policy › ${enabledToolCount(settings)} enabled`,
-			"Execution guarantees",
+			`Tool policy › ${policy.active}/${policy.available} active`,
+			"Execution routes",
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Tool policy"))
-			await editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts());
-		if (choice === "Execution guarantees") {
+			await editToolPolicy(
+				ctx,
+				editor,
+				controller.registeredTools(),
+				controller.toolConflicts(),
+				controller.toolCapabilities(),
+			);
+		if (choice === "Execution routes") {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(
-				`Every speculative tool first uses a runtime-wide sandbox when one is available. Otherwise read-only tools use resource snapshots, write/edit use private Git worktrees, and tools without a safe isolation route are matched but executed only by the Actor.\n${controller.executionSummary()}`,
+				`Each tool uses the first ready execution route whose guarantees cover its effects. Read-only tools can use validated results, write/edit can use private Git workspaces, and tools without a safe route remain with the Actor.\n${controller.executionSummary()}`,
 				"info",
 			);
 		}
@@ -1159,6 +1184,7 @@ async function editToolPolicy(
 	controller: SpeculativeActionController,
 	registered: ReadonlySet<string>,
 	conflicts: ReadonlyMap<string, string>,
+	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
 ): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
@@ -1169,8 +1195,15 @@ async function editToolPolicy(
 		for (const tool of tools) {
 			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
 			const selected = supported && settings.tools.includes(tool);
-			const availability = conflicts.has(tool) ? " · custom override" : registered.has(tool) ? "" : " · unavailable";
-			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${toolIsolationLabel(tool)}${availability}`, tool);
+			const route = capabilities.get(tool);
+			const active = selected && registered.has(tool) && route?.state !== "unavailable" && !conflicts.has(tool);
+			const marker = active ? "[x]" : selected ? "[~]" : "[ ]";
+			const availability = conflicts.has(tool)
+				? "custom override"
+				: !registered.has(tool)
+					? "not registered"
+					: routeLabel(route);
+			labels.set(`${marker} ${tool} · ${availability}`, tool);
 		}
 		const choice = await ctx.ui.select("Tool policy", [...labels.keys(), BACK]);
 		if (!choice || choice === BACK) return;
@@ -1181,6 +1214,10 @@ async function editToolPolicy(
 			continue;
 		}
 		const selected = settings.tools.includes(tool);
+		if (!selected && capabilities.get(tool)?.state === "unavailable") {
+			ctx.ui.notify(`${tool} cannot be enabled here: ${routeLabel(capabilities.get(tool))}.`, "warning");
+			continue;
+		}
 		if (!selected && !registered.has(tool)) {
 			const conflict = conflicts.get(tool);
 			ctx.ui.notify(
@@ -1387,8 +1424,8 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				event.candidate.tool,
 				event.candidate.source,
 				route
-					? `${route.backend}/${route.isolation}/${route.reuse}`
-					: `${event.candidate.world?.backend ?? "unknown backend"}/${event.candidate.execution}`,
+					? `${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`
+					: `${event.candidate.world?.backend ?? "unknown backend"}/${executionRouteKind(event.candidate.execution)}`,
 				event.state.status,
 			);
 			if (event.state.status === "running") {
@@ -1568,15 +1605,59 @@ function activeModelReference(ctx: ExtensionContext): string {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "active model";
 }
 
-function enabledToolCount(settings: EffectiveSpeculativeActionSettings): number {
-	return new Set(settings.tools).size;
+function resolveToolCapabilities(
+	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+	known = true,
+): ReadonlyMap<string, ExecutionCapabilityStatus> {
+	return new Map(
+		KEYABLE_TOOLS.map((tool) => {
+			const requirements = PI_ACTION_SEMANTICS.requirements(tool);
+			const status = requirements && known
+				? executionCapabilityStatus(requirements, worlds)
+				: { state: "registered" as const, candidates: [] };
+			return [tool, status];
+		}),
+	);
 }
 
-function toolIsolationLabel(tool: string): string {
-	if ((OBSERVATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "resource snapshot fallback";
-	if ((WORKSPACE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return "Git worktree fallback";
-	if ((UNBOUNDED_ACTION_TOOLS as readonly string[]).includes(tool)) return "requires runtime sandbox";
-	return "unsupported";
+function activeTools(
+	settings: EffectiveSpeculativeActionSettings,
+	registered: Iterable<string>,
+	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
+): readonly string[] {
+	const available = new Set(registered);
+	return [...new Set(settings.tools)].filter(
+		(tool) => available.has(tool) && capabilities.get(tool)?.state !== "unavailable",
+	);
+}
+
+function toolPolicyCounts(
+	settings: EffectiveSpeculativeActionSettings,
+	registered: ReadonlySet<string>,
+	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
+): { readonly active: number; readonly available: number } {
+	return {
+		active: activeTools(settings, registered, capabilities).length,
+		available: [...registered].filter((tool) => capabilities.get(tool)?.state !== "unavailable").length,
+	};
+}
+
+function executionRouteKind(isolation: SpeculativeExecution): string {
+	switch (isolation) {
+		case "runtime_sandbox": return "isolated runtime";
+		case "resource_snapshot": return "validated read";
+		case "workspace_branch": return "private workspace";
+	}
+}
+
+function routeLabel(status: ExecutionCapabilityStatus | undefined): string {
+	if (!status) return "unsupported";
+	if (status.primary && status.state === "ready") return `ready · ${executionRouteKind(status.primary.isolation)}`;
+	if (status.primary && status.state === "registered")
+		return `available · ${executionRouteKind(status.primary.isolation)} (checked on first use)`;
+	if (status.state === "registered") return "availability pending";
+	const reasons = [...new Set(status.candidates.map((candidate) => candidate.detail))];
+	return `unavailable · ${reasons.join("; ") || "no safe execution route"}`;
 }
 
 function toolCategory(tool: string): number {
@@ -1609,19 +1690,19 @@ function formatSpeculativeFooter(
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
-		worlds.length > 0 ? `worlds ${ready}/${worlds.length} ready` : "worlds probing",
+		worlds.length > 0 ? `routes ${ready}/${worlds.length} ready` : "routes probing",
 		"unsafe→Actor",
 		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
 	].join(" · ");
 }
 
 function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): string {
-	if (!worlds.length) return "Execution worlds: unavailable";
+	if (!worlds.length) return "Execution routes: unavailable";
 	return [
-		"Execution worlds:",
+		"Execution routes:",
 		...worlds.map(
 			(world) =>
-				`- ${world.id} [${world.scope}/${world.isolation}]: ${world.state} — ${world.detail}${
+				`- ${executionRouteKind(world.isolation)} (${world.id}): ${world.state} — ${world.detail}${
 					world.storage
 						? `; storage ${world.storage.entries}/${world.storage.maxEntries}, ${formatBytes(world.storage.bytes)}/${formatBytes(world.storage.maxBytes)}, ${world.storage.orphanArtifacts ?? 0} orphan artifacts${world.storage.overBudget ? "; over budget" : ""}`
 						: ""

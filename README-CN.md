@@ -26,6 +26,8 @@ Runtime 分为四个相互独立的层次：
 
 在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有 Git 工作区原语，再用 user/PID/network/IPC/UTS/mount namespace 以及 Sandlock 的 Landlock/seccomp 策略限制进程。任何内核能力、binary、挂载或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
+工具策略不按平台或工具名硬编码。启动诊断会把每个执行世界声明的效果保证与工具要求相交：Windows、macOS、WSL 1 和探测不完整的 Linux 默认可配置 `read`、`grep`、`find`、`ls`、`write`、`edit`；Linux/WSL 2 进程世界就绪后再加入 `bash`；宿主注入覆盖全部效果的世界时则可启用全部工具。设置中已选但当前无安全路线的工具会保留偏好但处于 inactive，不会发送给投机源。
+
 进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只替换动态作用域内的进程启动。mount namespace 中的可执行文件视图不改写命令可见的 `PATH` 和环境，却能把 PATH 解析出的 exec 统一送到 broker。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
 
 每个可复用结果都是持久化 provenance certificate，包含动态观察到的文件、目录、负查找、symlink、executable/DSO 身份、有序 stdout/stderr、退出状态和原子 regular-file 效果。每次复用都会重新验证全部依赖。外层投机 branch 还会独立记录顶层进程 provenance，并在 Actor 采纳前再次验证；tainted、不完整、过期、交互式、可变宿主输入、网络、IPC 或不支持的观察一律关闭复用。
@@ -80,7 +82,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。菜单不再暴露 L1/L2 分层术语，而是按用途显示“实时投机结果”和“可复用命令历史”，并暴露两者容量及回收/清空动作；清空必须确认。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换全局/项目作用域会重新载入该层，而项目文件只保存相对规范化全局配置的差异。Footer/状态首先显示所有工具调用的复用情况；仅当 Bash 实际启动了可复用子命令时，才追加一条子命令命中率、来源和估算省时，两套分母不会相加。同次运行的重叠时间明确标为 observed overlap。JSON 容量单位是字节，TUI 内存输入单位是 MiB。工具标签会说明本地后备机制；不存在隔离路线时始终回退 Actor。
+在 TUI 中打开 `/speculative-action`。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是按用途显示“实时投机结果”“可复用命令历史”和当前执行路线。会话启动时完成的能力诊断会被直接复用，打开工具菜单不会再次运行重探测；只有显式打开“Execution routes”才刷新后端。工具策略只把当前已注册且有安全路线的工具交给投机源，`[~]` 表示偏好已保存但在当前 Pi 环境中 inactive。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换全局/项目作用域会重新载入该层，而项目文件只保存相对规范化全局配置的差异。Footer/状态首先显示所有工具调用的复用情况；仅当 Bash 实际启动了可复用子命令时，才追加一条子命令命中率、来源和估算省时，两套分母不会相加。同次运行的重叠时间明确标为 observed overlap。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线时始终由 Actor 执行。
 
 配置由 package 自己管理：
 
