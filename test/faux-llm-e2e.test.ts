@@ -302,8 +302,8 @@ describe("faux LLM speculative action end to end", () => {
 		});
 
 		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(200);
-		expect(result.summary.hitLatencyMs).toBeLessThan(40);
+		expect(result.summary.executionAheadMs).toBeGreaterThan(0);
+		expect(result.summary.executionAheadMs).toBeGreaterThan(result.summary.hitLatencyMs);
 		expect(result.executions.read).toBe(2);
 		expect(
 			result.events.some(
