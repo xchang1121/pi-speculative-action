@@ -1,7 +1,7 @@
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
-import type { SpeculativeActionEvent } from "./events.ts";
+import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
 import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
@@ -115,6 +115,8 @@ export interface ActorActionFeedback<SessionID> {
 	readonly turnID: string;
 	readonly action?: ActionKey;
 	readonly settlement: ActorActionSettlement;
+	/** Frozen candidate attribution supplied without routing policy through the event sink. */
+	readonly candidate?: CandidateEventDescriptor;
 }
 
 /** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */
@@ -324,6 +326,9 @@ export interface SpeculativeRuntimeInspection {
 	readonly activePlanActions: number;
 	readonly executionBlockedPlanActions: number;
 	readonly blockedPlanActions: number;
+	readonly pendingTelemetryEvents: number;
+	readonly droppedTelemetryEvents: number;
+	readonly oldestTelemetryEventMs: number;
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {

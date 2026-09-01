@@ -981,32 +981,32 @@ export function createSpeculativeActionHost(
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
 		onActorActionMaterialized: options.onActorActionMaterialized,
-		onActorActionSettled: options.onActorActionSettled,
-		onPredictionSettled: options.onPredictionSettled,
-		onEvent: async (event) => {
+		onActorActionSettled: async (feedback) => {
+			const { settlement } = feedback;
 			if (
-				event.type === "actor_action" &&
-				event.candidate?.source === "drafter" &&
-				event.settlement.provider.kind === "speculative" &&
-				event.settlement.matchedPredictions.some(
+				feedback.candidate?.source === "drafter" &&
+				settlement.provider.kind === "speculative" &&
+				settlement.matchedPredictions.some(
 					(prediction) =>
-						prediction.source === "drafter" && prediction.proposalID.startsWith(`drafter:${event.turnID}:`),
+						prediction.source === "drafter" && prediction.proposalID.startsWith(`drafter:${feedback.turnID}:`),
 				)
 			) {
-				const batch = drafterBatches.get(authoritativeBatchKey(event.sessionID, event.turnID));
+				const batch = drafterBatches.get(authoritativeBatchKey(feedback.sessionID, feedback.turnID));
 				if (batch) {
 					try {
 						drafterGate.creditExecutionAhead(
 							(await batch).utility,
-							event.settlement.provider.timing.executionAheadMs,
+							settlement.provider.timing.executionAheadMs,
 						);
 					} catch {
 						// Source resolution failures cannot own an adopted speculative candidate.
 					}
 				}
 			}
-			await options.onEvent?.(event);
+			await options.onActorActionSettled?.(feedback);
 		},
+		onPredictionSettled: options.onPredictionSettled,
+		onEvent: options.onEvent,
 	});
 
 	return {

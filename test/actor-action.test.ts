@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
-import { PostSettlementQueue } from "../src/post-settlement.ts";
+import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
 
 const identity = { id: "call-1", sequence: 7, turnID: "turn-1" } as const;
@@ -108,5 +108,36 @@ describe("PostSettlementQueue", () => {
 		expect(failures).toHaveBeenCalledOnce();
 		await queue.close();
 		expect(queue.enqueue(() => {})).toBe(false);
+	});
+});
+
+describe("BoundedEventQueue", () => {
+	it("bounds stalled observers, preserves order, and resumes after failures", async () => {
+		let release!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const delivered: number[] = [];
+		const failures = vi.fn();
+		const queue = new BoundedEventQueue<number>(4, async (event) => {
+			delivered.push(event);
+			if (event === 1) await blocked;
+			if (event === 2) throw new Error("observer failed");
+		}, failures);
+
+		expect(queue.enqueue(1)).toBe(true);
+		expect(queue.enqueue(2)).toBe(true);
+		expect(queue.enqueue(3)).toBe(true);
+		expect(queue.enqueue(4)).toBe(true);
+		expect(queue.enqueue(5)).toBe(false);
+		expect(queue.snapshot()).toMatchObject({ capacity: 4, pending: 4, dropped: 1 });
+
+		release();
+		await queue.flush();
+		expect(delivered).toEqual([1, 2, 3, 4]);
+		expect(failures).toHaveBeenCalledOnce();
+		expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: 1, oldestPendingMs: 0 });
+		await queue.close();
+		expect(queue.enqueue(6)).toBe(false);
 	});
 });

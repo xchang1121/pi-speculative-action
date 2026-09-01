@@ -380,7 +380,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
-	it("keeps slow observers off the hit path and freezes event attribution before cleanup", async () => {
+	it("keeps slow observers off the hit path and later turn lifecycle", async () => {
 		let release!: () => void;
 		const blocked = new Promise<void>((resolve) => {
 			release = resolve;
@@ -399,6 +399,19 @@ describe("structural speculative runtime", () => {
 			new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
 		]);
 		expect(result).toBe("speculative");
+		const finished = await Promise.race([
+			fixture.runtime.finishTurn({ ...call("turn"), terminal: false }).then(() => "finished" as const),
+			new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+		]);
+		expect(finished).toBe("finished");
+		const started = await Promise.race([
+			fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" }).then(() => "started" as const),
+			new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+		]);
+		expect(started).toBe("started");
+		const inspection = fixture.runtime.inspect();
+		expect(inspection).toMatchObject({ activeTurns: 1, droppedTelemetryEvents: 0 });
+		expect(inspection.pendingTelemetryEvents).toBeGreaterThan(0);
 		const disabled = fixture.runtime.settingsChanged({ ...settings, enabled: false });
 		release();
 		await disabled;

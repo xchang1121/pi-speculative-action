@@ -17,7 +17,7 @@ import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./e
 import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
-import { PostSettlementQueue } from "./post-settlement.ts";
+import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import type {
 	AdoptedAction,
@@ -671,6 +671,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly plan: PlanRuntime;
 	readonly scheduler: SpeculationScheduler<CandidateRecord<Output, StartInput, StateData>>;
 	readonly effects: PostSettlementQueue;
+	readonly events: BoundedEventQueue<SpeculativeActionEvent<SessionID>>;
 	readonly actionContexts: Map<string, PlanActionContext<StartInput, StateData>>;
 	readonly launchTimers: Map<string, ReturnType<typeof setTimeout>>;
 	readonly sourceSlots: Set<SourceRequestSlot>;
@@ -735,6 +736,8 @@ type ProjectionResult<Output> =
 	| { readonly ok: true; readonly output: Output; readonly durationMs: number }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
+const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
+
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
 export function makeStructuralSpeculativeActionRuntime<
 	SessionID,
@@ -789,6 +792,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			plan: new PlanRuntime(),
 			scheduler: new SpeculationScheduler<Candidate>(),
 			effects: new PostSettlementQueue(),
+			events: new BoundedEventQueue(RUNTIME_EVENT_QUEUE_CAPACITY, emit),
 			actionContexts: new Map(),
 			launchTimers: new Map(),
 			sourceSlots: new Set(),
@@ -2381,6 +2385,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			(settlement.provider.kind === "speculative"
 				? candidateByID(state.sessionID, settlement.provider.candidateID)
 				: undefined);
+		const settledCandidateDescriptor = settledCandidate
+			? Object.freeze(candidateEventDescriptor(settledCandidate))
+			: undefined;
 		const event: SpeculativeActionEvent<SessionID> = {
 			type: "actor_action",
 			sessionID: state.sessionID,
@@ -2390,7 +2397,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			settlement,
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
 			...(settledCandidate ? { execution: settledCandidate.route.isolation } : {}),
-			...(settledCandidate ? { candidate: candidateEventDescriptor(settledCandidate) } : {}),
+			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 		};
 		state.session.effects.enqueue(async () => {
 			try {
@@ -2399,11 +2406,12 @@ export function makeStructuralSpeculativeActionRuntime<
 					turnID: state.turnID,
 					...(key ? { action: key } : {}),
 					settlement,
+					...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 				});
 			} catch {
 				// Policy feedback cannot alter authoritative settlement or source learning.
 			}
-			await emit(event);
+			state.session.events.enqueue(event);
 			const concrete = asConcreteInput(actualCall.input) ?? {};
 			for (const source of sources) {
 				if (!source.observe || !source.enabled(state.settings)) continue;
@@ -2499,7 +2507,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			} catch {
 				// Policy feedback is a projection of settlement, never its owner.
 			}
-			await emit(event);
+			session.events.enqueue(event);
 			try {
 				if (source?.onSettled) {
 					await source.onSettled({
@@ -3044,6 +3052,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		queueTaskEvent(state.session, state.turnID, completedAt);
 		await state.session.effects.flush();
+		await state.session.events.flush();
 		for (const source of sources) {
 			try {
 				await source.flush?.();
@@ -3074,6 +3083,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			clearLaunchTimers(session);
 			queueTaskEvent(session, input.turnID, completedAt);
 			await session.effects.flush();
+			await session.events.flush();
 			session.plan.clear();
 			pruneActionContexts(session);
 			clearActorActions(session);
@@ -3114,6 +3124,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.authoritativeToolIntervals.length = 0;
 		session.authoritativeCandidateIDs.clear();
 		await session.effects.flush();
+		await session.events.flush();
 		pruneActionContexts(session);
 	};
 
@@ -3123,6 +3134,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.disposed = true;
 		await disableSession(sessionID, cause("control", "session_disposed"));
 		await session.effects.close();
+		await session.events.close();
 		sessions.delete(sessionID);
 		for (const source of sources) {
 			try {
@@ -3151,6 +3163,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				? uniqueCandidates([...jobs.allValues(), ...results.allValues(), ...branches.allValues()])
 				: allCandidates(sessionID);
 		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
+		const telemetry = selectedSessions.map((session) => session.events.snapshot());
 		return {
 			activeTurns: selectedTurns.length,
 			exclusiveCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "exclusive").length,
@@ -3168,6 +3181,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			).length,
 			executionBlockedPlanActions: planNodes.filter((node) => node.execution.status === "execution_blocked").length,
 			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,
+			pendingTelemetryEvents: telemetry.reduce((total, item) => total + item.pending, 0),
+			droppedTelemetryEvents: telemetry.reduce((total, item) => total + item.dropped, 0),
+			oldestTelemetryEventMs: telemetry.reduce((oldest, item) => Math.max(oldest, item.oldestPendingMs), 0),
 		};
 	};
 
@@ -3220,7 +3236,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			cache: cacheSnapshot(session, session.settings),
 			timing,
 		};
-		session.effects.enqueue(() => emit(event));
+		session.events.enqueue(event);
 	};
 
 	const queueSourceRequestEvent = (
@@ -3243,7 +3259,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			cache: cacheSnapshot(session, settings),
 			request,
 		};
-		session.effects.enqueue(() => emit(event));
+		session.events.enqueue(event);
 	};
 
 	const queueCandidateEvent = (session: Session, candidate: Candidate): void => {
@@ -3259,7 +3275,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			candidate: descriptor,
 			state,
 		};
-		session.effects.enqueue(() => emit(event));
+		session.events.enqueue(event);
 	};
 
 	const emit = async (event: SpeculativeActionEvent<SessionID>): Promise<void> => {
