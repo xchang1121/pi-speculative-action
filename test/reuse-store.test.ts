@@ -53,8 +53,8 @@ describe("persistent provenance store", () => {
 		expect(collected).toMatchObject({
 			removedCertificates: 1,
 			removedArtifacts: 2,
-			stats: { certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false },
 		});
+		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false });
 		expect(await store.get(certificate.id)).toBeUndefined();
 		expect(await store.get(second.id)).toEqual(second);
 		const closure = await store.artifacts.load([secondArtifact]);

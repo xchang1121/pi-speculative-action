@@ -29,14 +29,12 @@ export interface ProvenanceStoreStats {
 	readonly orphanArtifacts: number;
 	readonly totalBytes: number;
 	readonly overBudget: boolean;
-	readonly limits: ProvenanceStoreLimits;
 }
 
 export interface ProvenanceStoreGCResult {
 	readonly removedCertificates: number;
 	readonly removedArtifacts: number;
 	readonly removedBytes: number;
-	readonly stats: ProvenanceStoreStats;
 }
 
 export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({
@@ -262,12 +260,10 @@ export class ProvenanceCertificateStore {
 				});
 			}
 			await rm(tomb, { recursive: true, force: true });
-			const stats = inventoryStats(await this.inventory(), this.limits);
 			return {
-				removedCertificates: Math.max(0, before.certificates - stats.certificates),
-				removedArtifacts: Math.max(0, before.artifacts - stats.artifacts),
-				removedBytes: Math.max(0, before.totalBytes - stats.totalBytes),
-				stats,
+				removedCertificates: before.certificates,
+				removedArtifacts: before.artifacts,
+				removedBytes: before.totalBytes,
 			};
 		});
 	}
@@ -311,7 +307,6 @@ export class ProvenanceCertificateStore {
 			removedBytes:
 				removed.reduce((total, record) => total + record.bytes, 0) +
 				orphans.reduce((total, artifact) => total + artifact.bytes, 0),
-			stats: inventoryStats(await this.inventory(), this.limits),
 		};
 	}
 
@@ -400,7 +395,6 @@ function inventoryStats(
 		overBudget:
 			inventory.certificates.length > limits.maxCertificates ||
 			certificateBytes + artifactBytes > limits.maxBytes,
-		limits,
 	});
 }
 

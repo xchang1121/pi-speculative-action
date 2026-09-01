@@ -57,9 +57,9 @@ export function createLinuxProcessExecutionWorld(
 			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats()]);
 			const storage = {
 				entries: store.certificates,
-				maxEntries: store.limits.maxCertificates,
+				maxEntries: backend.store.limits.maxCertificates,
 				bytes: store.totalBytes,
-				maxBytes: store.limits.maxBytes,
+				maxBytes: backend.store.limits.maxBytes,
 				orphanArtifacts: store.orphanArtifacts,
 				overBudget: store.overBudget,
 			};
