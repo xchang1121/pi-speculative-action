@@ -80,7 +80,7 @@ The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads throug
 
 Programmatic consumers should use the narrow npm entry matching their layer: `./core` for the host-neutral runtime and effect transaction contracts, `./process-reuse` for provenance certificates/planning/CAS, `./pattern-aware` for learning, and `./extension` for Pi integration. The root entry remains as a compatibility aggregate. The dependency closure of `./core` and `./process-reuse` is tested to contain no Pi package.
 
-Open `/speculative-action` in the TUI. The menu is grouped into prediction sources, scheduling/cache, and tools/execution. Tool labels describe the available local fallback; an unavailable isolation route always falls back to Actor execution.
+Open `/speculative-action` in the TUI. The menu separates runtime L1 results from validated persistent L2 reuse; scheduling/cache exposes both capacities plus generic L2 reclaim/clear actions, and clear requires confirmation. Every edit—including Enabled and Restore defaults—is staged until Apply; switching global/project scope reloads that layer, while a project file stores only differences from normalized global settings. Footer/status show L2 hit origin and actual store occupancy, but same-run overlap remains labelled as observed overlap and L2 makes no saved-time claim without a paired cold baseline. JSON byte limits use bytes; TUI memory inputs use MiB. Tool labels describe the available local fallback, and an unavailable isolation route always falls back to Actor execution.
 
 Settings are owned by the package:
 
@@ -96,6 +96,10 @@ Example:
   "drafterGateEnabled": true,
   "candidateLimit": 2,
   "maxConcurrentActions": 8,
+  "resourceCacheMaxEntries": 512,
+  "resourceCacheMaxBytes": 268435456,
+  "executionStoreMaxEntries": 4096,
+  "executionStoreMaxBytes": 2147483648,
   "drafterMaxDepth": 1,
   "tools": ["read", "grep", "find", "ls", "bash", "write", "edit"],
   "patternAware": {

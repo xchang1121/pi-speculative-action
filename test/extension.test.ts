@@ -343,7 +343,7 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
-		const fixture = await createFixture();
+		const fixture = await createFixture({ settings: { enabled: true } });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([{
 			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
 			state: "unavailable", detail: "Linux host required",
@@ -375,7 +375,8 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
-		expect(fixture.store.effective()).toEqual({ enabled: false });
+		expect(fixture.ui.setStatus).toHaveBeenCalledWith("speculative-action", expect.stringContaining("L2 store 3 entries (2 KiB)"));
+		expect(fixture.store.effective()).toEqual({ enabled: true });
 		expect(fixture.store.scope).toBe("project");
 	});
 
