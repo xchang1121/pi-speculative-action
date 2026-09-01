@@ -110,9 +110,10 @@ export class BoundedEventQueue<Event> {
 		});
 	}
 
-	async close(): Promise<void> {
+	/** Seal delivery; callers may detach from an already bounded backlog during runtime disposal. */
+	async close(options: { readonly drain?: boolean } = {}): Promise<void> {
 		this.closed = true;
-		await this.flush();
+		if (options.drain !== false) await this.flush();
 	}
 
 	private async drain(): Promise<void> {

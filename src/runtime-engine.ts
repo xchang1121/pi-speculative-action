@@ -19,6 +19,7 @@ import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type {
 	AdoptedAction,
 	AuthoritativeResultCapture,
@@ -668,6 +669,7 @@ interface ActorPreviewRecord {
 
 interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly id: SessionID;
+	readonly lifecycle: RuntimeLifecycleLane;
 	readonly plan: PlanRuntime;
 	readonly scheduler: SpeculationScheduler<CandidateRecord<Output, StartInput, StateData>>;
 	readonly effects: PostSettlementQueue;
@@ -695,7 +697,6 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	sourceRequestSequence: number;
 	pendingSourceRequests: number;
 	pendingAdmissions: number;
-	disposed: boolean;
 }
 
 interface TurnState<SessionID, Output, StartInput, StateData> {
@@ -753,6 +754,13 @@ export function makeStructuralSpeculativeActionRuntime<
 	type Candidate = CandidateRecord<Output, StartInput, StateData>;
 	type Session = SessionState<SessionID, Output, StartInput, StateData>;
 	type Turn = TurnState<SessionID, Output, StartInput, StateData>;
+	type TurnClosure = {
+		readonly state: Turn;
+		readonly completedAt: number;
+		readonly terminal: boolean;
+		readonly notifyHost: boolean;
+	};
+	type SessionClosureMode = "terminal" | "disabled" | "disposed";
 
 	const semantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const sources = adapter.sources ?? [];
@@ -771,6 +779,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const turns = new Map<string, Turn>();
 	const disposedBranches = new WeakSet<WorldBranch<Output>>();
 	let masterEnabled: boolean | undefined;
+	const masterDisabled = (): boolean => masterEnabled === false;
 	const disposeBranch = (branch: WorldBranch<Output> | undefined): void => {
 		if (!branch || disposedBranches.has(branch)) return;
 		disposedBranches.add(branch);
@@ -783,12 +792,10 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const sessionFor = (sessionID: SessionID, settings: SpeculativeActionSettings): Session => {
 		const current = sessions.get(sessionID);
-		if (current) {
-			current.settings = settings;
-			return current;
-		}
+		if (current) return current;
 		const created: Session = {
 			id: sessionID,
+			lifecycle: new RuntimeLifecycleLane(),
 			plan: new PlanRuntime(),
 			scheduler: new SpeculationScheduler<Candidate>(),
 			effects: new PostSettlementQueue(),
@@ -814,7 +821,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			sourceRequestSequence: 0,
 			pendingSourceRequests: 0,
 			pendingAdmissions: 0,
-			disposed: false,
 		};
 		sessions.set(sessionID, created);
 		return created;
@@ -832,8 +838,8 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
 		const settings = await adapter.settings();
-		if (!settings.enabled || masterEnabled === false) {
-			await disableSession(input.sessionID, cause("control", "disabled"));
+		if (!settings.enabled || masterDisabled()) {
+			await disableSession(input.sessionID);
 			return;
 		}
 		if (signal?.aborted) return;
@@ -844,54 +850,60 @@ export function makeStructuralSpeculativeActionRuntime<
 		const previous = turns.get(key);
 		if (previous) await finishState(previous, false);
 		const session = sessionFor(input.sessionID, settings);
-		const generation = new SourceGeneration(signal);
-		const startedAt = performance.now();
-		if (session.taskStartedAt === undefined) {
-			session.taskStartedAt = startedAt;
-			session.actorPhaseIntervals.length = 0;
-			session.authoritativeToolIntervals.length = 0;
-			session.authoritativeCandidateIDs.clear();
-		}
-		const state: Turn = {
-			key,
-			session,
-			sessionID: input.sessionID,
-			turnID: input.turnID,
-			startInput: input,
-			startedAt,
-			data: await adapter.stateData(input),
-			settings,
-			definitions,
-			candidateNames: names,
-			generation,
-			decisionSequence: session.decisionSequence + 1,
-			actorActions: [],
-			actorToolHints: new Set(),
-			actorPreviews: new Map(),
-			actorDecisionStartedAt: startedAt,
-			lifecycle: "active",
-		};
-		turns.set(key, state);
-		session.turns.add(key);
-		await reconcileStores(state);
-		try {
-			await adapter.onTurnStarted?.({
+		await session.lifecycle.run(async () => {
+			if (signal?.aborted || masterDisabled()) return;
+			const data = await adapter.stateData(input);
+			if (signal?.aborted || masterDisabled() || session.lifecycle.sealed) return;
+			session.settings = settings;
+			const generation = new SourceGeneration(signal);
+			const startedAt = performance.now();
+			if (session.taskStartedAt === undefined) {
+				session.taskStartedAt = startedAt;
+				session.actorPhaseIntervals.length = 0;
+				session.authoritativeToolIntervals.length = 0;
+				session.authoritativeCandidateIDs.clear();
+			}
+			const state: Turn = {
+				key,
+				session,
+				sessionID: input.sessionID,
+				turnID: input.turnID,
 				startInput: input,
-				decisionSequence: state.decisionSequence,
+				startedAt,
+				data,
 				settings,
 				definitions,
 				candidateNames: names,
-				...(signal ? { signal } : {}),
-			});
-		} catch {
-			// Host analysis does not own runtime state.
-		}
-		state.actorDecisionStartedAt = performance.now();
-		dispatchReady(session);
-		setTimeout(() => {
-			if (state.lifecycle === "active" && state.actorArrivedAt === undefined && !state.generation.signal.aborted)
-				launchSourceRequests(state);
-		}, 0);
+				generation,
+				decisionSequence: session.decisionSequence + 1,
+				actorActions: [],
+				actorToolHints: new Set(),
+				actorPreviews: new Map(),
+				actorDecisionStartedAt: startedAt,
+				lifecycle: "active",
+			};
+			turns.set(key, state);
+			session.turns.add(key);
+			await reconcileStores(state);
+			try {
+				await adapter.onTurnStarted?.({
+					startInput: input,
+					decisionSequence: state.decisionSequence,
+					settings,
+					definitions,
+					candidateNames: names,
+					...(signal ? { signal } : {}),
+				});
+			} catch {
+				// Host analysis does not own runtime state.
+			}
+			state.actorDecisionStartedAt = performance.now();
+			dispatchReady(session);
+			setTimeout(() => {
+				if (state.lifecycle === "active" && state.actorArrivedAt === undefined && !state.generation.signal.aborted)
+					launchSourceRequests(state);
+			}, 0);
+		});
 	};
 
 	const claimSourceSlot = (
@@ -1077,7 +1089,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				return;
 			}
 			for (const update of asUpdates(request.value)) {
-				if (session.disposed || !slot.active || scope.signal.aborted) break;
+				if (session.lifecycle.sealed || !slot.active || scope.signal.aborted) break;
 				await admitUpdate(scope, source, update, request);
 			}
 		} finally {
@@ -1117,7 +1129,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
-		if (session.disposed || scope.signal.aborted) return;
+		if (session.lifecycle.sealed || scope.signal.aborted) return;
 		if (updateSource(update) !== source.id) return;
 		const acceptedUpdate = source.multiStepEnabled?.(scope.settings) === false ? immediateOnly(update) : update;
 		const applied = session.plan.apply(acceptedUpdate, session.decisionSequence);
@@ -1366,7 +1378,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
-		if (session.disposed) return;
+		if (session.lifecycle.sealed) return;
 		settleBlockedPlanActions(session);
 		const now = performance.now();
 		const actorPhase = actorPhaseFor(session, now);
@@ -2584,7 +2596,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				if (!slot) return;
 				context.continuationSlots.add(slot);
 				retainSourceRequest(slot);
-				if (session.disposed || !slot.active) {
+				if (session.lifecycle.sealed || !slot.active) {
 					releaseSourceRequest(session, slot);
 					return;
 				}
@@ -3011,48 +3023,52 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const finishState = async (state: Turn, terminal: boolean): Promise<void> => {
-		if (state.lifecycle !== "active") return;
+	const resetTaskTimeline = (session: Session): void => {
+		session.taskStartedAt = undefined;
+		session.lastActorArrivedAt = undefined;
+		session.actorPhaseIntervals.length = 0;
+		session.authoritativeToolIntervals.length = 0;
+		session.authoritativeCandidateIDs.clear();
+	};
+
+	const beginTurnClosure = (
+		state: Turn,
+		input: { readonly failure: ResolutionCause; readonly terminal: boolean; readonly notifyHost: boolean },
+	): TurnClosure | undefined => {
+		if (state.lifecycle !== "active") return undefined;
 		const completedAt = performance.now();
 		closeActorPhase(state, completedAt);
 		settlePredictionFrontier(state);
 		state.lifecycle = "closing";
-		state.generation.expire(cause("control", terminal ? "terminal_turn" : "turn_finished"));
+		state.generation.expire(input.failure);
 		for (const preview of state.actorPreviews.values()) {
-			abandonActorPreview(state, preview, cause("control", terminal ? "terminal_turn" : "turn_finished"));
+			abandonActorPreview(state, preview, input.failure);
 		}
 		state.actorPreviews.clear();
-		if (terminal) {
-			releaseAllSourceSlots(state.session, cause("control", "terminal_turn"));
-			await waitForSourceTasks(state.session);
-		}
-		await state.session.effects.flush();
+		return { state, completedAt, terminal: input.terminal, notifyHost: input.notifyHost };
+	};
+
+	const completeTurnClosure = async (closure: TurnClosure): Promise<void> => {
+		const { state } = closure;
 		state.lifecycle = "finished";
-		try {
-			await adapter.onTurnFinished?.({
-				startInput: state.startInput,
-				settings: state.settings,
-				terminal,
-				durationMs: Math.max(0, completedAt - state.startedAt),
-			});
-		} catch {
-			// Host lifecycle is outside authoritative settlement.
+		if (closure.notifyHost) {
+			try {
+				await adapter.onTurnFinished?.({
+					startInput: state.startInput,
+					settings: state.settings,
+					terminal: closure.terminal,
+					durationMs: Math.max(0, closure.completedAt - state.startedAt),
+				});
+			} catch {
+				// Host lifecycle is outside authoritative settlement.
+			}
 		}
 		turns.delete(state.key);
 		state.session.turns.delete(state.key);
 		clearActorActions(state.session, state.turnID);
-		if (!terminal) return;
-		for (const node of state.session.plan.unsettled()) {
-			settleUnobserved(state.session, node, cause("control", "session_terminal"));
-		}
-		clearLaunchTimers(state.session);
-		for (const candidate of allCandidates(state.sessionID)) {
-			if (candidate.work.reservation.kind === "exclusive")
-				discardCandidate(state.session, candidate, cause("control", "session_terminal"));
-		}
-		queueTaskEvent(state.session, state.turnID, completedAt);
-		await state.session.effects.flush();
-		await state.session.events.flush();
+	};
+
+	const flushSources = async (): Promise<void> => {
 		for (const source of sources) {
 			try {
 				await source.flush?.();
@@ -3060,33 +3076,73 @@ export function makeStructuralSpeculativeActionRuntime<
 				// Persistence failure is isolated per source.
 			}
 		}
-		state.session.plan.clear();
-		pruneActionContexts(state.session);
-		clearActorActions(state.session);
 	};
 
-	const finishTurn = async (input: FinishInput): Promise<void> => {
-		const state = turns.get(turnKey(input.sessionID, input.turnID));
-		if (state) await finishState(state, input.terminal === true);
-		else if (input.terminal === true) {
-			const session = sessions.get(input.sessionID);
-			if (!session) return;
-			const completedAt = performance.now();
-			releaseAllSourceSlots(session, cause("control", "session_terminal"));
-			await waitForSourceTasks(session);
-			for (const node of session.plan.unsettled())
-				settleUnobserved(session, node, cause("control", "session_terminal"));
-			for (const candidate of allCandidates(input.sessionID)) {
-				if (candidate.work.reservation.kind === "exclusive")
-					discardCandidate(session, candidate, cause("control", "session_terminal"));
+	const closeSessionState = async (session: Session, mode: SessionClosureMode, turnID: string): Promise<void> => {
+		const terminal = mode === "terminal";
+		if (terminal && session.taskStartedAt === undefined && session.turns.size === 0) return;
+		const failure = cause(
+			"control",
+			terminal ? "terminal_turn" : mode === "disposed" ? "session_disposed" : "disabled",
+		);
+		const closures = [...session.turns].flatMap((key) => {
+			const state = turns.get(key);
+			if (!state) return [];
+			const closure = beginTurnClosure(state, { failure, terminal, notifyHost: terminal });
+			return closure ? [closure] : [];
+		});
+
+		releaseAllSourceSlots(session, failure);
+		await waitForSourceTasks(session);
+		await session.effects.flush();
+		for (const closure of closures) await completeTurnClosure(closure);
+		for (const key of session.turns) turns.delete(key);
+		session.turns.clear();
+
+		const planFailure = terminal ? cause("control", "session_terminal") : failure;
+		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
+		clearLaunchTimers(session);
+		for (const candidate of allCandidates(session.id)) {
+			if (!terminal || candidate.work.reservation.kind === "exclusive") {
+				discardCandidate(session, candidate, planFailure);
 			}
-			clearLaunchTimers(session);
-			queueTaskEvent(session, input.turnID, completedAt);
-			await session.effects.flush();
-			await session.events.flush();
-			session.plan.clear();
-			pruneActionContexts(session);
-			clearActorActions(session);
+		}
+		if (terminal) {
+			queueTaskEvent(session, turnID, performance.now());
+		} else {
+			resetTaskTimeline(session);
+		}
+		await session.effects.flush();
+		if (terminal || mode === "disposed") await flushSources();
+		session.plan.clear();
+		pruneActionContexts(session);
+		clearActorActions(session);
+	};
+
+	const finishState = (state: Turn, terminal: boolean): Promise<void> =>
+		state.session.lifecycle.run(async () => {
+			if (terminal) {
+				await closeSessionState(state.session, "terminal", state.turnID);
+				return;
+			}
+			const closure = beginTurnClosure(state, {
+				failure: cause("control", "turn_finished"),
+				terminal: false,
+				notifyHost: true,
+			});
+			if (!closure) return;
+			await state.session.effects.flush();
+			await completeTurnClosure(closure);
+		});
+
+	const finishTurn = async (input: FinishInput): Promise<void> => {
+		const session = sessions.get(input.sessionID);
+		if (!session) return;
+		const state = turns.get(turnKey(input.sessionID, input.turnID));
+		if (state) {
+			await finishState(state, input.terminal === true);
+		} else if (input.terminal === true) {
+			await session.lifecycle.run(() => closeSessionState(session, "terminal", input.turnID));
 		}
 	};
 
@@ -3094,55 +3150,25 @@ export function makeStructuralSpeculativeActionRuntime<
 		masterEnabled = settings.enabled;
 		if (settings.enabled) return;
 		await Promise.all(
-			[...sessions.keys()].map((sessionID) => disableSession(sessionID, cause("control", "disabled"))),
+			[...sessions.keys()].map((sessionID) => disableSession(sessionID)),
 		);
 	};
 
-	const disableSession = async (sessionID: SessionID, failure: ResolutionCause): Promise<void> => {
+	const disableSession = async (sessionID: SessionID): Promise<void> => {
 		const session = sessions.get(sessionID);
 		if (!session) return;
-		for (const key of [...session.turns]) {
-			const state = turns.get(key);
-			if (!state) continue;
-			state.lifecycle = "finished";
-			state.generation.expire(failure);
-			for (const preview of state.actorPreviews.values()) abandonActorPreview(state, preview, failure);
-			state.actorPreviews.clear();
-			turns.delete(key);
-		}
-		session.turns.clear();
-		releaseAllSourceSlots(session, failure);
-		await waitForSourceTasks(session);
-		for (const node of session.plan.unsettled()) settleUnobserved(session, node, failure);
-		clearLaunchTimers(session);
-		for (const candidate of allCandidates(sessionID)) discardCandidate(session, candidate, failure);
-		session.plan.clear();
-		clearActorActions(session);
-		session.taskStartedAt = undefined;
-		session.lastActorArrivedAt = undefined;
-		session.actorPhaseIntervals.length = 0;
-		session.authoritativeToolIntervals.length = 0;
-		session.authoritativeCandidateIDs.clear();
-		await session.effects.flush();
-		await session.events.flush();
-		pruneActionContexts(session);
+		await session.lifecycle.run(() => closeSessionState(session, "disabled", String(sessionID)));
 	};
 
 	const disposeSession = async (sessionID: SessionID): Promise<void> => {
 		const session = sessions.get(sessionID);
 		if (!session) return;
-		session.disposed = true;
-		await disableSession(sessionID, cause("control", "session_disposed"));
-		await session.effects.close();
-		await session.events.close();
-		sessions.delete(sessionID);
-		for (const source of sources) {
-			try {
-				await source.flush?.();
-			} catch {
-				// Persistence failure is isolated per source.
-			}
-		}
+		await session.lifecycle.close(async () => {
+			await closeSessionState(session, "disposed", String(sessionID));
+			await session.effects.close();
+			await session.events.close({ drain: false });
+			sessions.delete(sessionID);
+		});
 	};
 
 	const releaseSession = async (sessionID: SessionID): Promise<void> => {
@@ -3150,7 +3176,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const dispose = async (): Promise<void> => {
-		for (const sessionID of [...sessions.keys()]) await disposeSession(sessionID);
+		await Promise.all([...sessions.keys()].map((sessionID) => disposeSession(sessionID)));
 	};
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
@@ -3223,11 +3249,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			actorPhases: session.actorPhaseIntervals,
 			authoritativeTools: session.authoritativeToolIntervals,
 		});
-		session.taskStartedAt = undefined;
-		session.lastActorArrivedAt = undefined;
-		session.actorPhaseIntervals.length = 0;
-		session.authoritativeToolIntervals.length = 0;
-		session.authoritativeCandidateIDs.clear();
+		resetTaskTimeline(session);
 		const event: SpeculativeActionEvent<SessionID> = {
 			type: "task",
 			sessionID: session.id,

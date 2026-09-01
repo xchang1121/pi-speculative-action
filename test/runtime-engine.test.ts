@@ -77,6 +77,7 @@ function harness(input: {
 	readonly projection?: boolean;
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
+	readonly onTurnFinished?: (input: { readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 	readonly actionKey?: (
 		tool: string,
@@ -152,6 +153,7 @@ function harness(input: {
 				]
 			: [],
 		onCandidateMaterialized: input.onCandidateMaterialized,
+		onTurnFinished: input.onTurnFinished,
 		onEvent: async (event) => {
 			events.push(event);
 			await input.onEvent?.(event);
@@ -413,11 +415,47 @@ describe("structural speculative runtime", () => {
 		expect(inspection).toMatchObject({ activeTurns: 1, droppedTelemetryEvents: 0 });
 		expect(inspection.pendingTelemetryEvents).toBeGreaterThan(0);
 		const disabled = fixture.runtime.settingsChanged({ ...settings, enabled: false });
+		expect(
+			await Promise.race([
+				disabled.then(() => "disabled" as const),
+				new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+			]),
+		).toBe("disabled");
+		expect(fixture.runtime.inspect().activeTurns).toBe(0);
+		const disposed = fixture.runtime.disposeSession("session");
+		expect(
+			await Promise.race([
+				disposed.then(() => "disposed" as const),
+				new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+			]),
+		).toBe("disposed");
 		release();
-		await disabled;
+		await waitFor(() => fixture.events.some((event) => event.type === "actor_action"));
 		expect(fixture.events.find((event) => event.type === "actor_action")).toMatchObject({
 			settlement: { matchedPredictions: [{ source: "source" }] },
 		});
+	});
+
+	it("coalesces concurrent terminal cleanup for one task", async () => {
+		const flushed = vi.fn();
+		const turnFinished = vi.fn();
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "concurrent-close", { path: "README.md" }),
+			flush: flushed,
+		};
+		const fixture = harness({ source, onTurnFinished: turnFinished });
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+
+		await Promise.all([
+			fixture.runtime.finishTurn({ ...call("turn"), terminal: true }),
+			fixture.runtime.finishTurn({ ...call("turn"), terminal: true }),
+		]);
+
+		expect(turnFinished).toHaveBeenCalledOnce();
+		expect(flushed).toHaveBeenCalledOnce();
+		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0 });
 	});
 
 	it("disposes a sealed backend branch that arrives after its candidate was cancelled", async () => {
