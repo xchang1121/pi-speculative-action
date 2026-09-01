@@ -25,6 +25,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeculativeActionHost } from "../src/agent-integration.ts";
+import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import {
 	createSpeculativeActionExtension,
 	formatSpeculativeActionEvent,
@@ -349,9 +350,10 @@ describe("zero-modification Pi extension", () => {
 			storage: { entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false },
 		}]);
 		const menus = driveSettingsMenus(fixture, {
-			"Speculative action": ["Tools & execution", "Target decoding", "Close"],
+			"Speculative action": ["Tools & execution", "Target decoding", "Enabled", "Discard changes", "Configuration scope", "Close"],
 			"Tools & execution": ["Execution guarantees", "Back"],
 			"Self-speculation": ["Back"],
+			"Configuration scope": ["project"],
 		});
 		await fixture.emit("session_start", {}, fixture.context);
 		const command = fixture.commands.get("speculative-action");
@@ -373,6 +375,8 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
+		expect(fixture.store.effective()).toEqual({ enabled: false });
+		expect(fixture.store.scope).toBe("project");
 	});
 
 	it("exposes Drafter request policy in the Drafter submenu", async () => {
@@ -397,10 +401,13 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("binds typed setting descriptors across root, self-speculation, and PatternAware settings", async () => {
-		const fixture = await createFixture();
+		const configure = vi.fn();
+		const fixture = await createFixture({
+			executionWorlds: [{ storage: { configure } } as unknown as SpeculativeAgentExecutionWorld],
+		});
 		driveSettingsMenus(fixture, {
 			"Speculative action": ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"],
-			"Scheduling & cache": ["Resource cache memory", "Back"],
+			"Scheduling & cache": ["Resource cache memory", "Validated reuse entries", "Validated reuse memory", "Back"],
 			"Self-speculation": ["Endpoint", "Fork action confidence", "Back"],
 			"Prediction sources": ["PatternAware", "Back"],
 			PatternAware: ["Learning", "Back"],
@@ -409,6 +416,8 @@ describe("zero-modification Pi extension", () => {
 		fixture.ui.input = async (title) =>
 			({
 				"Resource cache memory (MiB)": "96",
+				"Validated reuse entries": "2048",
+				"Validated reuse memory (MiB)": "768",
 				"Self-speculation endpoint": "file:///unsafe",
 				"Fork action minimum confidence": "0.75",
 				"Future gap coverage (0-1)": "0.8",
@@ -419,12 +428,15 @@ describe("zero-modification Pi extension", () => {
 
 		expect(fixture.store.effective()).toMatchObject({
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
+			executionStoreMaxEntries: 2048,
+			executionStoreMaxBytes: 768 * 1024 * 1024,
 			selfSpeculation: {
 				endpoint: "http://127.0.0.1:8000",
 				forkActionMinConfidence: 0.75,
 			},
 			patternAware: { futureGapCoverage: 0.8 },
 		});
+		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			"Endpoint must be an absolute HTTP(S) URL.",
 			"warning",
@@ -434,6 +446,7 @@ describe("zero-modification Pi extension", () => {
 
 interface FixtureOptions {
 	readonly consume?: SpeculativeActionHost["consume"];
+	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	readonly overriddenTools?: readonly string[];
 	readonly settings?: SpeculativeActionPackageSettings;
 }
@@ -521,7 +534,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const factory = createSpeculativeActionExtension({
 		createHost: () => host,
 		createSettingsStore: () => store,
-		createExecutionWorlds: () => [],
+		createExecutionWorlds: () => options.executionWorlds ?? [],
 	});
 	await factory(pi);
 	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {
@@ -633,7 +646,7 @@ function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabl
 		},
 		load: async () => undefined,
 		effective: () => value,
-		overlay: () => value as unknown as Readonly<Record<string, unknown>> | undefined,
+		editable: () => value,
 		setEffective: (next) => {
 			value = next;
 		},
@@ -680,6 +693,8 @@ function effectiveSettings() {
 		maxConcurrentActions: 1,
 		resourceCacheMaxEntries: 8,
 		resourceCacheMaxBytes: 1024,
+		executionStoreMaxEntries: 32,
+		executionStoreMaxBytes: 4096,
 		predictionTimeoutMs: 1000,
 		patternAware: {
 			enabled: false,

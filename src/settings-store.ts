@@ -5,6 +5,8 @@ import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 
 export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettingsInput {
 	readonly draftModel?: string;
+	readonly executionStoreMaxEntries?: number;
+	readonly executionStoreMaxBytes?: number;
 }
 
 export type SpeculativeSettingsScope = "global" | "project";
@@ -42,12 +44,12 @@ export class SpeculativeActionSettingsStore {
 		return mergeSettings(this.global, this.project);
 	}
 
-	overlay(): Readonly<Record<string, unknown>> | undefined {
-		return clone(this.scopeValue === "project" ? this.project : this.global);
+	editable(scope = this.scopeValue): SpeculativeActionPackageSettings | undefined {
+		return mergeSettings(this.global, scope === "project" ? this.project : undefined);
 	}
 
-	setEffective(value: SpeculativeActionPackageSettings): void {
-		if (this.scopeValue === "project") this.project = settingsDiff(this.global, value);
+	setEffective(value: SpeculativeActionPackageSettings, inherited = this.editable("global")): void {
+		if (this.scopeValue === "project") this.project = settingsDiff(inherited as SettingsOverlay | undefined, value);
 		else this.global = clone(value) as SettingsOverlay;
 		this.persistSelected();
 	}

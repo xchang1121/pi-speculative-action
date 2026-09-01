@@ -50,6 +50,7 @@ import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import type { ExecutionWorldDiagnosticSnapshot, WorldReuseMetrics } from "./execution-world.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
+import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import {
@@ -108,6 +109,8 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly maxConcurrentActions: number;
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes: number;
+	readonly executionStoreMaxEntries: number;
+	readonly executionStoreMaxBytes: number;
 	readonly predictionTimeoutMs: number;
 	readonly patternAware: PatternAwareSettings;
 	readonly selfSpeculation: SelfSpeculationSettings;
@@ -122,11 +125,9 @@ const ROOT_SETTING_INPUTS = {
 	candidateLimit: positiveIntegerInput("Drafter requests per turn", { transform: clampCandidateLimit }),
 	maxConcurrentActions: positiveIntegerInput("Concurrent actions", { transform: clampCandidateLimit }),
 	resourceCacheMaxEntries: positiveIntegerInput("Resource cache entries"),
-	resourceCacheMaxBytes: positiveIntegerInput("Resource cache memory (MiB)", {
-		error: "Resource cache memory must be a positive integer in MiB.",
-		format: (bytes) => String(Math.max(1, Math.round(bytes / (1024 * 1024)))),
-		transform: (mebibytes) => mebibytes * 1024 * 1024,
-	}),
+	resourceCacheMaxBytes: mebibyteInput("Resource cache memory"),
+	executionStoreMaxEntries: positiveIntegerInput("Validated reuse entries"),
+	executionStoreMaxBytes: mebibyteInput("Validated reuse memory"),
 	predictionTimeoutMs: positiveIntegerInput("Prediction timeout (ms)"),
 	drafterMaxTokens: optionalPositiveIntegerInput("Drafter output tokens (blank for provider default)"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter rollout depth"),
@@ -199,8 +200,8 @@ export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
 	readonly load: () => Promise<void>;
 	readonly effective: () => SpeculativeActionPackageSettings | undefined;
-	readonly overlay: () => Readonly<Record<string, unknown>> | undefined;
-	readonly setEffective: (settings: SpeculativeActionPackageSettings) => void;
+	readonly editable: (scope?: SpeculativeSettingsScope) => SpeculativeActionPackageSettings | undefined;
+	readonly setEffective: (settings: SpeculativeActionPackageSettings, inherited?: SpeculativeActionPackageSettings) => void;
 	readonly clear: () => void;
 	readonly setScope: (scope: SpeculativeSettingsScope) => void;
 	readonly flush: () => Promise<void>;
@@ -208,6 +209,7 @@ export interface SpeculativeSettingsStore {
 
 interface SpeculativeActionController {
 	readonly settings: () => EffectiveSpeculativeActionSettings;
+	readonly editableSettings: () => EffectiveSpeculativeActionSettings;
 	readonly settingsScope: () => SpeculativeSettingsScope;
 	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
 	readonly metrics: () => SpeculativeActionMetrics;
@@ -264,6 +266,11 @@ export function normalizeSpeculativeActionSettings(
 		maxConcurrentActions: clampCandidateLimit(input?.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input?.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input?.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
+		executionStoreMaxEntries: positiveInteger(
+			input?.executionStoreMaxEntries,
+			DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates,
+		),
+		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
 		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
 		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input?.selfSpeculation),
@@ -284,8 +291,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter requests: ${settings.candidateLimit}`,
 		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
-		`Resource cache: ${settings.resourceCacheMaxEntries}`,
-		`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
+		`Storage policy: runtime L1 ${settings.resourceCacheMaxEntries} entries/${formatBytes(settings.resourceCacheMaxBytes)}; validated L2 ${settings.executionStoreMaxEntries} entries/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
@@ -421,6 +427,14 @@ async function installController(
 	const executionWorlds = [
 		...new Set(configuredExecutionWorlds),
 	];
+	const configureExecutionStorage = () => {
+		for (const world of executionWorlds)
+			world.storage?.configure({
+				maxEntries: currentSettings.executionStoreMaxEntries,
+				maxBytes: currentSettings.executionStoreMaxBytes,
+			});
+	};
+	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -497,6 +511,7 @@ async function installController(
 
 	const controller: SpeculativeActionController = {
 		settings,
+		editableSettings: () => normalizeSpeculativeActionSettings(settingsStore.editable()),
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope) => settingsStore.setScope(scope),
 		metrics: () => currentMetrics,
@@ -506,9 +521,11 @@ async function installController(
 		refreshExecutionDiagnostics,
 		executionSummary: () => executionWorldSummary(executionDiagnostics),
 		setSettings: (value) => {
-			if (value) settingsStore.setEffective(value);
+			if (value)
+				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
 			void recoverSpeculation(() => host.runtime.settingsChanged(currentSettings));
 			renderFooter();
@@ -827,7 +844,7 @@ async function runCommand(
 }
 
 async function openSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	let applied = cloneSettings(controller.settings());
+	let applied = cloneSettings(controller.editableSettings());
 	let draft = cloneSettings(applied);
 	const editor: SpeculativeActionController = {
 		...controller,
@@ -837,17 +854,17 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 		},
 	};
 	const reload = () => {
-		applied = cloneSettings(controller.settings());
+		applied = cloneSettings(controller.editableSettings());
 		draft = cloneSettings(applied);
 	};
 	while (true) {
 		const dirty = !sameSettings(draft, applied);
 		const choice = await ctx.ui.select("Speculative action", [
-			`Enabled: ${applied.enabled ? "On" : "Off"}`,
-			`Configuration scope: ${controller.settingsScope()}`,
+			`Enabled: ${draft.enabled ? "On" : "Off"}`,
+			`Configuration scope: ${controller.settingsScope()}${sameSettings(applied, controller.settings()) ? "" : " (project overrides active)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
 			`Target decoding › ${selfSpeculationSummary(draft.selfSpeculation)}`,
-			`Scheduling & cache › ${draft.candidateLimit} draft requests, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} entries`,
+			`Scheduling & cache › ${draft.candidateLimit} drafts, ${draft.maxConcurrentActions} concurrent, L1 ${draft.resourceCacheMaxEntries}, L2 ${draft.executionStoreMaxEntries}`,
 			`Tools & execution › ${enabledToolCount(draft)} tools`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
@@ -865,15 +882,18 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			continue;
 		}
 		if (choice.startsWith("Enabled:")) {
-			const enabled = !applied.enabled;
-			controller.setSettings({ ...applied, enabled });
-			applied = cloneSettings(controller.settings());
-			draft = { ...draft, enabled };
+			editor.setSettings({ ...draft, enabled: !draft.enabled });
 			continue;
 		}
 		if (choice.startsWith("Configuration scope:")) {
 			const selected = await ctx.ui.select("Configuration scope", ["global", "project", BACK]);
-			if (selected === "global" || selected === "project") controller.setSettingsScope(selected);
+			if (
+				(selected === "global" || selected === "project") &&
+				(!dirty || (await ctx.ui.confirm("Discard changes?", "Switch configuration scope without applying?")))
+			) {
+				controller.setSettingsScope(selected);
+				reload();
+			}
 			continue;
 		}
 		if (choice.startsWith("Prediction sources")) {
@@ -924,18 +944,13 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			)
 				continue;
 			const defaults = normalizeSpeculativeActionSettings(undefined);
-			controller.setSettings({
+			editor.setSettings({
 				...defaults,
-				enabled: applied.enabled,
-				drafterEnabled: applied.drafterEnabled,
-				patternAware: { ...defaults.patternAware, enabled: applied.patternAware.enabled },
-				selfSpeculation: {
-					...defaults.selfSpeculation,
-					enabled: applied.selfSpeculation.enabled,
-				},
+				enabled: draft.enabled,
+				drafterEnabled: draft.drafterEnabled,
+				patternAware: { ...defaults.patternAware, enabled: draft.patternAware.enabled },
+				selfSpeculation: { ...defaults.selfSpeculation, enabled: draft.selfSpeculation.enabled },
 			});
-			reload();
-			ctx.ui.notify("Speculative-action defaults restored.", "info");
 		}
 	}
 }
@@ -1167,25 +1182,18 @@ async function openPatternMultiStep(ctx: ExtensionContext, controller: Speculati
 async function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
-		const choice = await ctx.ui.select("Scheduling & cache", [
-			`Drafter requests: ${settings.candidateLimit}`,
-			`Concurrent actions: ${settings.maxConcurrentActions}`,
-			`Resource cache entries: ${settings.resourceCacheMaxEntries}`,
-			`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`,
-			BACK,
+		const fields = new Map<string, RootInputField>([
+			[`Drafter requests: ${settings.candidateLimit}`, "candidateLimit"],
+			[`Concurrent actions: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
+			[`Resource cache entries: ${settings.resourceCacheMaxEntries}`, "resourceCacheMaxEntries"],
+			[`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`, "resourceCacheMaxBytes"],
+			[`Validated reuse entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
+			[`Validated reuse memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
 		]);
+		const choice = await ctx.ui.select("Scheduling & cache", [...fields.keys(), BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Drafter requests:")) {
-			await editRootSetting(ctx, controller, settings, "candidateLimit");
-		}
-		if (choice.startsWith("Concurrent actions:")) {
-			await editRootSetting(ctx, controller, settings, "maxConcurrentActions");
-		}
-		if (choice.startsWith("Resource cache entries:")) {
-			await editRootSetting(ctx, controller, settings, "resourceCacheMaxEntries");
-		}
-		if (choice.startsWith("Resource cache memory:"))
-			await editRootSetting(ctx, controller, settings, "resourceCacheMaxBytes");
+		const field = fields.get(choice);
+		if (field) await editRootSetting(ctx, controller, settings, field);
 	}
 }
 
@@ -1568,13 +1576,16 @@ function positiveInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function mebibyteInput(title: string): SettingInputDescriptor<number> {
+	return positiveIntegerInput(`${title} (MiB)`, {
+		error: `${title} must be a positive integer in MiB.`,
+		format: (bytes) => String(Math.max(1, Math.round(bytes / (1024 * 1024)))),
+		transform: (mebibytes) => mebibytes * 1024 * 1024,
+	});
+}
+
 function cloneSettings(settings: EffectiveSpeculativeActionSettings): EffectiveSpeculativeActionSettings {
-	return {
-		...settings,
-		patternAware: { ...settings.patternAware },
-		selfSpeculation: { ...settings.selfSpeculation },
-		tools: [...settings.tools],
-	};
+	return structuredClone(settings);
 }
 
 function sameSettings(left: EffectiveSpeculativeActionSettings, right: EffectiveSpeculativeActionSettings): boolean {

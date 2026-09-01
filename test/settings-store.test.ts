@@ -45,7 +45,12 @@ describe("extension-owned speculative settings", () => {
 		store.setScope("project");
 		store.setEffective({ enabled: false, candidateLimit: 6 });
 		await store.flush();
-		expect(store.overlay()).toEqual({ enabled: false, draftModel: null });
+		expect(store.editable()).toEqual({ enabled: false, candidateLimit: 6 });
+		expect(store.editable("global")).toEqual({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
+		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
+			enabled: false,
+			draftModel: null,
+		});
 		expect(store.effective()).toEqual({ enabled: false, candidateLimit: 6 });
 		store.clear();
 		await store.flush();
