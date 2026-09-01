@@ -3,6 +3,26 @@ import { CandidateExecution } from "../src/candidate-execution.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("CandidateExecution", () => {
+	it("owns reservation cleanup through an idempotent lease", () => {
+		const candidate = new CandidateExecution<string>("exclusive");
+		candidate.start(1);
+		candidate.succeed("ok", 2, 1);
+		const lease = candidate.acquire("actor");
+		expect(lease).toMatchObject({ owner: "actor", kind: "exclusive", state: "active", active: true });
+		expect(lease?.adopt()).toBe(true);
+		expect(lease).toMatchObject({ state: "consumed", active: false });
+		expect(lease?.release()).toBe(false);
+		expect(candidate.reservation).toEqual({ kind: "exclusive", status: "consumed" });
+	});
+
+	it("releases shared leases without consuming the reusable result", () => {
+		const candidate = new CandidateExecution<string>("shared");
+		const lease = candidate.acquire("actor");
+		expect(lease?.adopt()).toBe(true);
+		expect(lease?.state).toBe("released");
+		expect(candidate.reservation).toEqual({ kind: "shared", owners: [] });
+	});
+
 	it("keeps execution success immutable when an exclusive result is consumed", async () => {
 		const candidate = new CandidateExecution<string>("exclusive");
 

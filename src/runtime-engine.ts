@@ -1984,14 +1984,13 @@ export function makeStructuralSpeculativeActionRuntime<
 					? blockedPrediction.execution.cause
 					: cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate");
 			let rejectedCandidateID: string | undefined;
-			const stopCandidate = (candidate: Candidate, reservationOwner: string): boolean => {
+			const stopCandidate = (candidate: Candidate): boolean => {
 				const failure = signal?.aborted
 					? cause("control", "actor_aborted")
 					: masterEnabled === false || state.lifecycle !== "active" || turns.get(state.key) !== state
 						? cause("control", "disabled")
 						: undefined;
 				if (!failure) return false;
-				candidate.work.release(reservationOwner);
 				rejection = failure;
 				rejectedCandidateID = candidate.id;
 				return true;
@@ -2030,157 +2029,155 @@ export function makeStructuralSpeculativeActionRuntime<
 					rejectedCandidateID = candidate.id;
 					continue;
 				}
-				const reservationOwner = identity.id;
-				if (!candidate.work.reserve(reservationOwner)) {
+				const reservation = candidate.work.acquire(identity.id);
+				if (!reservation) {
 					const failure = cause("matching", "candidate_reserved");
 					actorAction.reject(candidate.id, choice.match, failure);
 					rejection = failure;
 					rejectedCandidateID = candidate.id;
 					continue;
 				}
-				if (candidate.work.execution.status === "queued") {
-					preemptForActor(
-						state.session,
-						resourceProfile(candidate.route.isolation),
-						state.settings,
-						matchingCandidates,
-					);
-					startQueuedCandidates(state.session, candidate, true);
-				}
-				admission.release();
-				const authorization = await authorize(state, input, actualKey, actualCall, candidate, signal);
-				if (stopCandidate(candidate, reservationOwner)) break;
-				if (authorization) {
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, authorization);
-					rejection = authorization;
-					rejectedCandidateID = candidate.id;
-					continue;
-				}
-				const wasRunning =
-					candidate.work.execution.status === "queued" || candidate.work.execution.status === "running";
-				if (!wasRunning) {
-					const before = await validateCandidate(candidate);
-					if (stopCandidate(candidate, reservationOwner)) break;
-					if (before.status !== "valid") {
-						candidate.work.release(reservationOwner);
-						actorAction.reject(candidate.id, choice.match, before.cause);
-						rejection = before.cause;
-						rejectedCandidateID = candidate.id;
-						if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
-						continue;
-					}
-				}
-				const waiting = await waitForCandidate(
-					candidate.work.completion,
-					signal,
-					join.reason === "ready" ? undefined : join.waitBudgetMs,
-				);
-				if (stopCandidate(candidate, reservationOwner)) break;
-				if (waiting.status === "aborted") {
-					candidate.work.release(reservationOwner);
-					rejection = cause("control", "actor_aborted");
-					break;
-				}
-				if (waiting.status === "deadline") {
-					const failure = cause(
-						"matching",
-						"candidate_join_deadline",
-						JSON.stringify({ waitBudgetMs: join.waitBudgetMs, reason: join.reason }),
-					);
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, failure);
-					rejection = failure;
-					rejectedCandidateID = candidate.id;
-					continue;
-				}
-				const execution = waiting.value;
-				if (execution.status !== "succeeded") {
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, execution.cause);
-					rejection = execution.cause;
-					rejectedCandidateID = candidate.id;
-					continue;
-				}
-				if (wasRunning) {
-					const after = await validateCandidate(candidate);
-					if (stopCandidate(candidate, reservationOwner)) break;
-					if (after.status !== "valid") {
-						candidate.work.release(reservationOwner);
-						actorAction.reject(candidate.id, choice.match, after.cause);
-						rejection = after.cause;
-						rejectedCandidateID = candidate.id;
-						if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
-						continue;
-					}
-				}
-				const branch = execution.output;
-				const compatibility = state.session.scheduler.assessCompatibility(
-					branch.compatibility,
-					actualKey.executionFingerprint,
-				);
-				if (!compatibility.compatible) {
-					const failure = cause("compatibility", compatibility.code, compatibility.detail);
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, failure);
-					rejection = failure;
-					rejectedCandidateID = candidate.id;
-					discardCandidate(state.session, candidate, failure);
-					continue;
-				}
-
-				// Projection is pure and must succeed before the irreversible world commit.
-				const projection = await projectOutput(candidate, actualKey, branch.output, choice.match, projectionRules);
-				if (stopCandidate(candidate, reservationOwner)) break;
-				if (!projection.ok) {
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, projection.cause);
-					rejection = projection.cause;
-					rejectedCandidateID = candidate.id;
-					continue;
-				}
-				candidate.projectionMs += projection.durationMs;
-				let output = projection.output;
 				try {
-					const committed = await branch.commit();
-					if (choice.match.kind === "exact") output = committed;
-				} catch (error) {
-					const failure = cause("commit", "world_commit_failed", errorDetail(error));
-					candidate.work.release(reservationOwner);
-					actorAction.reject(candidate.id, choice.match, failure);
-					rejection = failure;
-					rejectedCandidateID = candidate.id;
-					discardCandidate(state.session, candidate, failure);
-					continue;
-				}
+					if (candidate.work.execution.status === "queued") {
+						preemptForActor(
+							state.session,
+							resourceProfile(candidate.route.isolation),
+							state.settings,
+							matchingCandidates,
+						);
+						startQueuedCandidates(state.session, candidate, true);
+					}
+					admission.release();
+					const authorization = await authorize(state, input, actualKey, actualCall, candidate, signal);
+					if (stopCandidate(candidate)) break;
+					if (authorization) {
+						actorAction.reject(candidate.id, choice.match, authorization);
+						rejection = authorization;
+						rejectedCandidateID = candidate.id;
+						continue;
+					}
+					const wasRunning =
+						candidate.work.execution.status === "queued" || candidate.work.execution.status === "running";
+					if (!wasRunning) {
+						const before = await validateCandidate(candidate);
+						if (stopCandidate(candidate)) break;
+						if (before.status !== "valid") {
+							actorAction.reject(candidate.id, choice.match, before.cause);
+							rejection = before.cause;
+							rejectedCandidateID = candidate.id;
+							if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
+							continue;
+						}
+					}
+					const waiting = await waitForCandidate(
+						candidate.work.completion,
+						signal,
+						join.reason === "ready" ? undefined : join.waitBudgetMs,
+					);
+					if (stopCandidate(candidate)) break;
+					if (waiting.status === "aborted") {
+						rejection = cause("control", "actor_aborted");
+						break;
+					}
+					if (waiting.status === "deadline") {
+						const failure = cause(
+							"matching",
+							"candidate_join_deadline",
+							JSON.stringify({ waitBudgetMs: join.waitBudgetMs, reason: join.reason }),
+						);
+						actorAction.reject(candidate.id, choice.match, failure);
+						rejection = failure;
+						rejectedCandidateID = candidate.id;
+						continue;
+					}
+					const execution = waiting.value;
+					if (execution.status !== "succeeded") {
+						actorAction.reject(candidate.id, choice.match, execution.cause);
+						rejection = execution.cause;
+						rejectedCandidateID = candidate.id;
+						continue;
+					}
+					if (wasRunning) {
+						const after = await validateCandidate(candidate);
+						if (stopCandidate(candidate)) break;
+						if (after.status !== "valid") {
+							actorAction.reject(candidate.id, choice.match, after.cause);
+							rejection = after.cause;
+							rejectedCandidateID = candidate.id;
+							if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
+							continue;
+						}
+					}
+					const branch = execution.output;
+					const compatibility = state.session.scheduler.assessCompatibility(
+						branch.compatibility,
+						actualKey.executionFingerprint,
+					);
+					if (!compatibility.compatible) {
+						const failure = cause("compatibility", compatibility.code, compatibility.detail);
+						actorAction.reject(candidate.id, choice.match, failure);
+						rejection = failure;
+						rejectedCandidateID = candidate.id;
+						discardCandidate(state.session, candidate, failure);
+						continue;
+					}
 
-				const adoptedAt = performance.now();
-				state.session.scheduler.observeAdoption(
-					actionTimingIdentity(candidate.key),
-					Math.max(0, adoptedAt - Math.max(actorArrivedAt, execution.completedAt)),
-				);
-				const executionAheadMs = Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.startedAt));
-				const timing = {
-					executionAheadMs,
-					attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
-					hitLatencyMs: Math.max(0, adoptedAt - actorArrivedAt),
-				};
-				if (candidate.work.reservation.kind === "exclusive") {
-					candidate.work.consume(reservationOwner);
-					removeCandidate(state.session, candidate);
-				} else {
-					candidate.work.release(reservationOwner);
-					if (candidate.origin === "actor_preview") removeCandidate(state.session, candidate);
-					else results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					// Projection is pure and must succeed before the irreversible world commit.
+					const projection = await projectOutput(candidate, actualKey, branch.output, choice.match, projectionRules);
+					if (stopCandidate(candidate)) break;
+					if (!projection.ok) {
+						actorAction.reject(candidate.id, choice.match, projection.cause);
+						rejection = projection.cause;
+						rejectedCandidateID = candidate.id;
+						continue;
+					}
+					candidate.projectionMs += projection.durationMs;
+					let output = projection.output;
+					try {
+						const committed = await branch.commit();
+						if (choice.match.kind === "exact") output = committed;
+					} catch (error) {
+						const failure = cause("commit", "world_commit_failed", errorDetail(error));
+						actorAction.reject(candidate.id, choice.match, failure);
+						rejection = failure;
+						rejectedCandidateID = candidate.id;
+						discardCandidate(state.session, candidate, failure);
+						continue;
+					}
+
+					const adoptedAt = performance.now();
+					state.session.scheduler.observeAdoption(
+						actionTimingIdentity(candidate.key),
+						Math.max(0, adoptedAt - Math.max(actorArrivedAt, execution.completedAt)),
+					);
+					const executionAheadMs = Math.min(
+						execution.executionMs,
+						Math.max(0, actorArrivedAt - execution.startedAt),
+					);
+					const timing = {
+						executionAheadMs,
+						attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
+						hitLatencyMs: Math.max(0, adoptedAt - actorArrivedAt),
+					};
+					reservation.adopt();
+					if (reservation.kind === "exclusive") {
+						removeCandidate(state.session, candidate);
+					} else if (candidate.origin === "actor_preview") {
+						removeCandidate(state.session, candidate);
+					} else {
+						results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					}
+					selected = {
+						candidate,
+						match: choice.match,
+						output,
+						timing,
+						toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
+					};
+					break;
+				} finally {
+					reservation.release();
 				}
-				selected = {
-					candidate,
-					match: choice.match,
-					output,
-					timing,
-					toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
-				};
-				break;
 			}
 
 			if (selected) {

@@ -31,6 +31,58 @@ export type CandidateExecutionSettlement<Output> = Extract<
 	{ readonly status: "succeeded" | "failed" | "cancelled" }
 >;
 
+export type CandidateReservationLeaseState = "active" | "released" | "consumed";
+
+/** One acquired reservation. Every exit can safely call `release`; adoption makes it a no-op. */
+export interface CandidateReservationLease {
+	readonly owner: string;
+	readonly kind: CandidateReservation["kind"];
+	readonly state: CandidateReservationLeaseState;
+	readonly active: boolean;
+	release(): boolean;
+	adopt(): boolean;
+}
+
+class CandidateReservationLeaseHandle implements CandidateReservationLease {
+	readonly owner: string;
+	readonly kind: CandidateReservation["kind"];
+	private stateValue: CandidateReservationLeaseState = "active";
+	private readonly releaseReservation: () => boolean;
+	private readonly adoptReservation: () => boolean;
+
+	constructor(
+		owner: string,
+		kind: CandidateReservation["kind"],
+		releaseReservation: () => boolean,
+		adoptReservation: () => boolean,
+	) {
+		this.owner = owner;
+		this.kind = kind;
+		this.releaseReservation = releaseReservation;
+		this.adoptReservation = adoptReservation;
+	}
+
+	get state(): CandidateReservationLeaseState {
+		return this.stateValue;
+	}
+
+	get active(): boolean {
+		return this.stateValue === "active";
+	}
+
+	release(): boolean {
+		if (!this.active || !this.releaseReservation()) return false;
+		this.stateValue = "released";
+		return true;
+	}
+
+	adopt(): boolean {
+		if (!this.active || !this.adoptReservation()) return false;
+		this.stateValue = this.kind === "exclusive" ? "consumed" : "released";
+		return true;
+	}
+}
+
 /** Owns execution and reservation as independent, monotonic facts. */
 export class CandidateExecution<Output> {
 	readonly controller: AbortController;
@@ -101,6 +153,17 @@ export class CandidateExecution<Output> {
 		if (this.reservationValue.status !== "available") return false;
 		this.reservationValue = Object.freeze({ kind: "exclusive", status: "reserved", turnID });
 		return true;
+	}
+
+	acquire(owner: string): CandidateReservationLease | undefined {
+		if (!this.reserve(owner)) return undefined;
+		const kind = this.reservationValue.kind;
+		return new CandidateReservationLeaseHandle(
+			owner,
+			kind,
+			() => this.release(owner),
+			() => (kind === "exclusive" ? this.consume(owner) : this.release(owner)),
+		);
 	}
 
 	release(turnID: string): boolean {
