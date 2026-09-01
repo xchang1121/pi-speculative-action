@@ -1,3 +1,7 @@
+/** Compatibility aggregate. Prefer the narrow ./core and ./process-reuse package entries. */
+export * from "./core.ts";
+export * from "./process-reuse.ts";
+
 export {
 	BenefitGate,
 	type BenefitDecision,
@@ -14,34 +18,14 @@ export {
 	type ForkBenefitObservation,
 } from "./fork-benefit-gate.ts";
 export {
-	type ActionProjectionCoverage,
-	type ActionProjectionRule,
-	READ_RANGE_ACTION_KEY_PROJECTOR,
-	READ_RANGE_COVERAGE_DETAILS_KEY,
-	type ReadRangeCoverage,
-	readRangesShareInFlight,
-} from "./action-key-projection.ts";
-export {
-	type ActionEffect,
-	type ActionKey,
-	type ActionKeyMatch,
 	type ActionKeyMismatchReason,
-	type ActionKeyProjector,
-	type ActionSemanticsDefinition,
-	ActionSemanticsRegistry,
-	actionKeyCovers,
-	actionKeyMatch,
-	actionKeyMatches,
 	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
 	actionKeyProjects,
 	BASH_TAIL_LINES_ACTION_KEY_PROJECTOR,
 	type BashTailLinesView,
 	bashTailLinesView,
-	buildActionKey,
 	buildPiActionKey,
-	type CanonicalAction,
-	type ExactActionKeyMatch,
 	FIND_DEFAULT_LIMIT,
 	GREP_DEFAULT_LIMIT,
 	inferredActionEffect,
@@ -51,13 +35,9 @@ export {
 	normalizeReadOffset,
 	normalizeRelativeRoot,
 	OBSERVATION_ACTION_TOOLS,
-	PI_ACTION_SEMANTICS,
-	type ProjectedActionKey,
-	type ProjectedActionKeyMatch,
 	READ_DEFAULT_LIMIT,
 	READ_DEFAULT_OFFSET,
 	type ReadActionRange,
-	type ResourceDependencyScope,
 	readActionRange,
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
@@ -80,110 +60,12 @@ export {
 export {
 	clampCandidateLimit,
 	DEFAULTS,
-	type DrafterToolDefinition,
 	type LegacySpeculativeToolGroups,
 	normalizeSpeculativeToolSelection,
 	type SpeculativeToolSelectionInput,
 	usageTokenCount,
 } from "./common.ts";
-export type {
-	CandidateEventDescriptor,
-	CandidateExecutionProjection,
-	SpeculativeActionEvent,
-	SpeculativeCacheSnapshot,
-} from "./events.ts";
-export {
-	effectCapabilitiesCover,
-	effectRequirements,
-	type EffectCapabilities,
-	type EffectCapability,
-	type EffectRequirements,
-	normalizeEffectRequirements,
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "./effect-model.ts";
-export {
-	type EffectTransaction,
-	EffectTransactionCoordinator,
-	type EffectTransactionAttempt,
-	type EffectTransactionDescriptor,
-	type EffectTransactionState,
-} from "./effect-transaction.ts";
-export {
-	type ArtifactReference,
-	certificateReplayable,
-	createExecPrototype,
-	dependencyPathsetKey,
-	type DependencyRole,
-	digestObject,
-	type DynamicDependency,
-	type DynamicDependencyCertificate,
-	type ExecPrototype,
-	type ExitOutcome,
-	type InheritedFileDescriptor,
-	isSha256Digest,
-	type OrderedEffectEvent,
-	parseProcessCertificate,
-	type ProcessPrototypeInput,
-	type ProcessProvenanceCertificate,
-	type ProcessResultRecord,
-	PROCESS_CERTIFICATE_VERSION,
-	processStrongKey,
-	processWeakKey,
-	type ProvenanceTaint,
-	referencedArtifacts,
-	sealProcessCertificate,
-	type SemanticEnvironmentEntry,
-	sha256Digest,
-	type Sha256Digest,
-} from "./provenance-certificate.ts";
-export {
-	captureAbsenceDependency,
-	captureDirectoryDependency,
-	captureFileDependency,
-	captureSymlinkDependency,
-	type DynamicDependencyValidation,
-	type ProvenanceValidation,
-	type ProvenanceValidationContext,
-	validateDynamicDependencyCertificate,
-	validateProcessCertificate,
-} from "./provenance-validation.ts";
-export {
-	type MemoryReuseProvider,
-	type ProcessReuseMissReason,
-	type ProcessReusePlan,
-	ProcessReusePlanner,
-	type ProcessReuseRequest,
-	type ReplayObservationContract,
-} from "./reuse-planner.ts";
-export { ArtifactCAS, ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
-export {
-	type CapturedExecutionWorldResult,
-	type ActionReuseKind,
-	type ExecutionWorld,
-	type ExecutionWorldPreparation,
-	type ExecutionWorldRequest,
-	ExecutionWorldRouter,
-	type ExecutionWorldScope,
-	type SpeculativeExecution,
-	type SpeculativeExecutionRoute,
-	sameSpeculativeExecutionRoute,
-	type WorldBranch,
-	type WorldCheckpoint,
-	type WorldCommitMetrics,
-	type WorldCompatibilityEvidence,
-	type WorldExecutionMetrics,
-	type WorldReuseStrategy,
-	type WorldResultCapture,
-} from "./execution-world.ts";
-export {
-	type AuthoritativeToolExecutor,
-	ToolExecutionGateway,
-	type ToolExecutionContextFactory,
-	type ToolExecutionRequirement,
-	type ToolOperation,
-} from "./tool-execution-gateway.ts";
+export type { ActionReuseKind } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,
 	type EffectiveSpeculativeActionSettings,
@@ -251,51 +133,7 @@ export {
 	type ProcessExecutor,
 	type ProcessToolOperations,
 } from "./process-execution.ts";
-export type {
-	MaterializedPlan,
-	PlanAction,
-	PlanActionDependency,
-	PlanActionDependencyCondition,
-	PlanDelta,
-	PlanProposal,
-	PlanUpdate,
-} from "./plan-proposal.ts";
-export {
-	captureResourceVersion,
-	closeResourceVersionManagers,
-	isResourceVersionToken,
-	type ResourceChangeSet,
-	type ResourceDependency,
-	type ResourceValidationMetrics,
-	ResourceVersionManager,
-	type ResourceVersionToken,
-	type ResourceVersionValidation,
-	releaseResourceVersion,
-	resourceDependencies,
-	validateResourceVersion,
-	watchResourceVersion,
-} from "./resource-version.ts";
-export {
-	type AuthoritativeResultCapture,
-	type CandidatePreflight,
-	type ActorActionFeedback,
-	type PredictionFeedback,
-	candidateExecutionMs,
-	candidateToolNames,
-	diagnosticAction,
-	diagnosticJson,
-	makeSpeculativeActionRuntime,
-	redactDiagnostics,
-	type SpeculativeActionRuntime,
-	type SpeculativeActionRuntimeAdapter,
-	type SpeculativeActionSettings,
-	type SpeculativeCandidate,
-	type SpeculativeDraftCandidate,
-	type MaterializedActorAction,
-	type MaterializedSpeculativeCandidate,
-	type SpeculativePlanSource,
-	type SpeculativeRuntimeInspection,
-} from "./runtime.ts";
+export { isResourceVersionToken } from "./resource-version.ts";
 export {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -320,35 +158,7 @@ export {
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
 } from "./settings-store.ts";
-export {
-	type ActorActionIdentity,
-	type ActorActionProvider,
-	type ActorActionSettlement,
-	type ActorHitTiming,
-	type CandidateRejection,
-	cause,
-	type PlanActionIdentity,
-	type PredictionAdoption,
-	type PredictionIdentity,
-	type PredictionSettlement,
-	type ResolutionCause,
-	type ResolutionStage,
-	type ResourceValidation,
-	type SettledSourceRequest,
-	type SourceRequestIdentity,
-	type SourceRequestKind,
-	type SourceRequestSettlement,
-	type ValidationMetrics,
-	zeroValidationMetrics,
-} from "./settlement.ts";
-export { measureSpeculativeTask, type SpeculativeTaskTiming, type TimelineInterval } from "./task-timing.ts";
 export type { ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
-export {
-	emptySpeculativeTraceSummary,
-	reduceSpeculativeTrace,
-	type SpeculativeTraceSummary,
-	summarizeSpeculativeTrace,
-} from "./trace-summary.ts";
 export {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,

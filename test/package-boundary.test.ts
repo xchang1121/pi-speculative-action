@@ -65,6 +65,12 @@ describe("speculative action package boundary", () => {
 		}
 	});
 
+	test("keeps the root entry as a compatibility aggregate of the narrow APIs", () => {
+		for (const api of [coreApi, processReuseApi]) {
+			for (const [name, exported] of Object.entries(api)) expect(packageApi[name]).toBe(exported);
+		}
+	});
+
 	test("keeps source implementations and Pi dependencies outside the host-neutral runtime", async () => {
 		const core = await readModuleClosure(path.join(packageRoot, "src", "core.ts"));
 		const processReuse = await readModuleClosure(path.join(packageRoot, "src", "process-reuse.ts"));
