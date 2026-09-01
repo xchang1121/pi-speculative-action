@@ -4,7 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test } from "vitest";
+import * as coreApi from "../src/core.ts";
 import * as packageApi from "../src/index.ts";
+import * as processReuseApi from "../src/process-reuse.ts";
 import {
 	acquirePatternAwareStore,
 	captureResourceVersion,
@@ -64,12 +66,15 @@ describe("speculative action package boundary", () => {
 	});
 
 	test("keeps source implementations and Pi dependencies outside the host-neutral runtime", async () => {
-		const core = await Promise.all(
-			["runtime.ts", "runtime-engine.ts", "settlement.ts"].map((file) =>
-				fs.readFile(path.join(packageRoot, "src", file), "utf8"),
-			),
-		);
-		expect(core.join("\n")).not.toMatch(/pattern-aware|@earendil-works\/pi-/);
+		const core = await readModuleClosure(path.join(packageRoot, "src", "core.ts"));
+		const processReuse = await readModuleClosure(path.join(packageRoot, "src", "process-reuse.ts"));
+		expect(core).not.toMatch(/pattern-aware|@earendil-works\/pi-/);
+		expect(processReuse).not.toMatch(/@earendil-works\/pi-/);
+		expect(coreApi.makeSpeculativeActionRuntime).toBeTypeOf("function");
+		expect(coreApi).not.toHaveProperty("createSpeculativeActionHost");
+		expect(coreApi).not.toHaveProperty("PatternAwareStore");
+		expect(processReuseApi.ProcessReusePlanner).toBeTypeOf("function");
+		expect(processReuseApi).not.toHaveProperty("makeSpeculativeActionRuntime");
 	});
 
 	test("declares a source-loadable Pi package with only public host peers", async () => {
@@ -81,7 +86,14 @@ describe("speculative action package boundary", () => {
 			pi?: { extensions?: string[] };
 			peerDependencies?: Record<string, string>;
 		};
-		expect(Object.keys(manifest.exports).sort()).toEqual([".", "./extension", "./package.json"]);
+		expect(Object.keys(manifest.exports).sort()).toEqual([
+			".",
+			"./core",
+			"./extension",
+			"./package.json",
+			"./pattern-aware",
+			"./process-reuse",
+		]);
 		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
 		expect(manifest.scripts?.build).toBe(
 			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs && shx cp src/process-namespace-launcher.mjs dist/process-namespace-launcher.mjs",
@@ -142,4 +154,21 @@ async function readTypeScript(directory: string): Promise<string> {
 		}),
 	);
 	return contents.join("\n");
+}
+
+async function readModuleClosure(entry: string, seen = new Set<string>()): Promise<string> {
+	const target = path.resolve(entry);
+	if (seen.has(target)) return "";
+	seen.add(target);
+	const source = await fs.readFile(target, "utf8");
+	const dependencies: string[] = [];
+	for (const match of source.matchAll(/(?:from\s+|import\s*\()\s*["'](\.[^"']+)["']/g)) {
+		const specifier = match[1];
+		if (!specifier) continue;
+		const dependency = path.resolve(path.dirname(target), specifier);
+		if (dependency.startsWith(path.join(packageRoot, "src"))) dependencies.push(dependency);
+	}
+	return [source, ...(await Promise.all(dependencies.map((dependency) => readModuleClosure(dependency, seen))))].join(
+		"\n",
+	);
 }

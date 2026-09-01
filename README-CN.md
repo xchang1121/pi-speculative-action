@@ -13,7 +13,7 @@ Runtime 分为四个相互独立的层次：
 1. **投机源**：Drafter 与 PatternAware 只产生与执行方式无关的 `PlanAction`。
 2. **动作身份**：`K(a)` 规范化工具语义、已验证 schema、参数、资源与实际执行器身份；无损投影规则可以证明一个结果覆盖另一个动作。
 3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
-4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 管理隔离执行和采纳；唯一的结算生命周期记录匹配、采纳、回退与计时。
+4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 只产生封存后的效果载体，由唯一的 `EffectTransaction` 管理验证、采纳、放弃与提交状态；结算只记录一次匹配、采纳、回退和计时。
 
 执行路线具有固定优先级：
 
@@ -77,6 +77,8 @@ npm run setup:linux
 `setup:linux` 会把固定版本的 `sandlock` CLI 安装到 `~/.local`；在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、非特权 namespace、bind mount、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。共享 lower 快照后，Linux 进程世界只有在探测通过且精确不可变基线至少包含 256 个条目（本机复测后的保守边界）时才自动选择 host-visible COW；小工作区以及通用 `write`/`edit` 后备继续使用 Git。每个 content commit 只预热并共享一份驱动原生 lower 结构快照；外层观察和嵌套事务用它与各自的类型化 upper journal 重建 merged tree。事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。若工作区内出现驱动导致的 `EXDEV`、`EOPNOTSUPP`、`ENOTSUP` 或 `ENOSYS`，完整 trace 会使该分支不可采纳；这覆盖 FUSE 无法透明复现的 lower 目录 rename 等操作。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
+
+以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
 在 TUI 中打开 `/speculative-action`。菜单按投机源、调度/缓存、工具/执行分级；工具标签会说明本地后备机制。不存在隔离路线时始终回退 Actor。
 
@@ -162,7 +164,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展默认先注册 Linux 进程世界，再注册 Git 工作区 fallback；宿主也可以通过 `executionWorlds` 替换这组世界。所有 World 都按 effect capability 而不是工具名声明能力；内置 runtime world 覆盖进程调用，宿主仍可注入覆盖范围更大的 runtime sandbox。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种 `WorldBranch`，由 branch 自己拥有兼容性证据、新鲜度校验、采纳与清理。
+Pi 扩展默认先注册 Linux 进程世界，再注册 Git 工作区 fallback；宿主也可以通过 `executionWorlds` 替换这组世界。所有 World 都按 effect capability 而不是工具名声明能力；内置 runtime world 覆盖进程调用，宿主仍可注入覆盖范围更大的 runtime sandbox。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种封存 `WorldBranch` 载体；Gateway 再将其包装为唯一的 `EffectTransaction`，由事务独占新鲜度验证、采纳、放弃和提交状态，载体只保留兼容性证据与后端局部清理职责。
 
 ```ts
 createSpeculativeActionHost(sessionID, {
