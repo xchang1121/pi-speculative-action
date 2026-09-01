@@ -48,7 +48,7 @@ export type WorkspaceStructureEntry =
 	  }
 	| Exclude<WorkspaceTreeEntry, { readonly kind: "file" }>;
 
-export interface WorkspaceSnapshot<Entry> {
+interface WorkspaceSnapshot<Entry> {
 	readonly root: string;
 	readonly entries: ReadonlyMap<string, Entry>;
 	readonly files: number;

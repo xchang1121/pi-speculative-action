@@ -52,7 +52,7 @@ export interface CandidateJoinPolicy {
 	readonly durationSlack: number;
 }
 
-export const DEFAULT_CANDIDATE_JOIN_POLICY: CandidateJoinPolicy = Object.freeze({
+const DEFAULT_CANDIDATE_JOIN_POLICY: CandidateJoinPolicy = Object.freeze({
 	minNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
 	warmupWaitMs: 25,
 	durationSlack: 1.25,
@@ -67,7 +67,7 @@ export interface CandidateJoinRequest {
 	readonly actorElapsedMs?: number;
 }
 
-export type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
+type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
 
 export interface CandidateJoinDecision {
 	readonly allowed: boolean;

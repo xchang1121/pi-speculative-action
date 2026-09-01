@@ -582,7 +582,7 @@ async function fingerprintPath(target: string, scope: ResourceDependencyScope): 
 	};
 }
 
-export async function mapLimit<Input, Output>(
+async function mapLimit<Input, Output>(
 	values: ReadonlyArray<Input>,
 	limit: number,
 	run: (value: Input, index: number) => Promise<Output>,

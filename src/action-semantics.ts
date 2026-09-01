@@ -527,7 +527,7 @@ export function normalizeReadLimit(value: unknown): number {
 	return limit === undefined ? READ_DEFAULT_LIMIT : Math.max(0, Math.floor(limit));
 }
 
-export function finiteOrUndefined(value: unknown): number | undefined {
+function finiteOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 

@@ -198,7 +198,7 @@ export interface SpeculativeCacheValueMetrics {
 	readonly lastActorHitAt?: number;
 }
 
-export const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
+const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
 
 export function speculativeCacheValue(
 	metrics: SpeculativeCacheValueMetrics,

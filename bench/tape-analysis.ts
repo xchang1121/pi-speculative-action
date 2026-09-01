@@ -25,12 +25,12 @@ export interface LlmTape {
 	readonly exchanges: readonly TapeExchange[];
 }
 
-export interface TapeToolCall {
+interface TapeToolCall {
 	readonly name: string;
 	readonly arguments: unknown;
 }
 
-export interface TapeOpportunity {
+interface TapeOpportunity {
 	readonly actorSequence: number;
 	readonly actorAction: TapeToolCall;
 	readonly actorDecodeMs: number;
@@ -96,7 +96,7 @@ export interface TapeReprobeAnalysis {
 	readonly snapshotReprobeRunwayMs: number;
 }
 
-export interface TapeDrafterWidthPoint {
+interface TapeDrafterWidthPoint {
 	readonly width: number;
 	readonly actorTurns: number;
 	readonly opportunities: number;

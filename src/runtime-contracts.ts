@@ -7,8 +7,6 @@ import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PredictionSettlement } from "./settlement.ts";
 
 export type {
-	CandidateEventDescriptor,
-	CandidateExecutionProjection,
 	SpeculativeActionEvent,
 	SpeculativeCacheSnapshot,
 } from "./events.ts";

@@ -31,7 +31,7 @@ export type CandidateExecutionSettlement<Output> = Extract<
 	{ readonly status: "succeeded" | "failed" | "cancelled" }
 >;
 
-export type CandidateReservationLeaseState = "active" | "released" | "consumed";
+type CandidateReservationLeaseState = "active" | "released" | "consumed";
 
 /** One acquired reservation. Every exit can safely call `release`; adoption makes it a no-op. */
 export interface CandidateReservationLease {

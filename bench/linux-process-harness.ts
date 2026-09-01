@@ -241,7 +241,7 @@ export async function commitBenchmarkFixture(
 	await commandOutput("git", ["commit", "--quiet", "-m", "benchmark fixture"], workspace);
 }
 
-export function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
+function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
 	return new Promise((resolve, reject) => {
 		execFile(executable, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
 			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));

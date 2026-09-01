@@ -2,7 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { DependencyRole, ProvenanceTaint } from "./provenance-certificate.ts";
 
-export interface ObservedProcessPath {
+interface ObservedProcessPath {
 	readonly path: string;
 	readonly role: DependencyRole;
 }

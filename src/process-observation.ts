@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
@@ -168,7 +167,7 @@ async function captureExistingWorkspaceStructureEntry(
 }
 
 /** Effect shape used only to seal input evidence; replay bytes remain owned by the transaction. */
-export type WorkspaceTransactionEffect =
+type WorkspaceTransactionEffect =
 	| {
 			readonly kind: "write" | "delete";
 			readonly logicalPath: string;
@@ -452,11 +451,4 @@ function pathContains(root: string, target: string): boolean {
 
 function slash(value: string): string {
 	return value.replaceAll("\\", "/");
-}
-
-/** Streaming helper used by tests and trace readers without buffering a second copy. */
-export function digestBytes(chunks: readonly Uint8Array[]): Sha256Digest {
-	const hash = createHash("sha256");
-	for (const chunk of chunks) hash.update(chunk);
-	return `sha256:${hash.digest("hex")}`;
 }

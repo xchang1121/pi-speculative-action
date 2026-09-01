@@ -56,6 +56,7 @@ export {
 	type SpeculativeActionHost,
 	type SpeculativeAgentPreflightContext,
 	type SpeculativeAgentSettingsInput,
+	type SpeculativeToolExecutionInput,
 } from "./agent-integration.ts";
 export {
 	clampCandidateLimit,

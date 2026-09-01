@@ -19,7 +19,7 @@ import type {
 	ResolutionCause,
 } from "./settlement.ts";
 
-export type PlanNodeExecution =
+type PlanNodeExecution =
 	| { readonly status: "deferred" }
 	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }

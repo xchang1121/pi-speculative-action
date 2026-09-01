@@ -69,6 +69,8 @@ export {
 	type WorldResultCapture,
 } from "./execution-world.ts";
 export {
+	type AuthoritativeExecutionHooks,
+	type AuthoritativeExecutionSettlement,
 	type AuthoritativeToolExecutor,
 	ToolExecutionGateway,
 	type ToolExecutionContextFactory,
