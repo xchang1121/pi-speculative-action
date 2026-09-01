@@ -6,6 +6,7 @@ import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-co
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
+import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 
@@ -61,6 +62,7 @@ interface MeasuredRun {
 
 if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const outputPath = argument("--output");
+const workspaceDriver = workspaceDriverArgument(argument("--workspace-driver"));
 const root = await mkdtemp(path.join(os.tmpdir(), "pi-bash-reuse-bench-"));
 const workspace = path.join(root, "workspace");
 const storeRoot = path.join(root, "process-reuse");
@@ -74,7 +76,7 @@ const environment = Object.freeze({
 const localOperations = createLocalBashOperations({ shellPath });
 const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localOperations));
 const backend = new LinuxProcessReuseBackend({ storeRoot });
-const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
+const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot, driver: workspaceDriver });
 const tool = createBashTool(workspace, {
 	operations: coordinator.operations,
 	shellPath,
@@ -87,7 +89,8 @@ try {
 	const status = await backend.check(true);
 	if (status.state !== "ready") throw new Error(status.detail);
 	await world.prepare?.({ cwd: workspace });
-	const executionFingerprint = await backend.fingerprint();
+	const workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver });
+	const executionFingerprint = `${await backend.fingerprint()}:${workspaceFingerprint}`;
 	const runs: MeasuredRun[] = [];
 
 	runs.push(
@@ -122,8 +125,14 @@ try {
 	assert(cold?.output.includes(orderedChildOutput), "cold child output differs");
 	assert(hit?.output.includes(orderedChildOutput), "replayed child output differs");
 	assert(invalidated?.artifact === "beta\n", "changed input was not observed");
-	assert(hit.metricDelta.hits === 1 && hit.metricDelta.misses === 0, "second parent did not hit");
-	assert(invalidated.metricDelta.hits === 0 && invalidated.metricDelta.misses === 1, "changed input did not miss");
+	assert(
+		hit.metricDelta.hits === 1 && hit.metricDelta.misses === 0,
+		`second parent did not hit: ${JSON.stringify(hit.metricDelta)}`,
+	);
+	assert(
+		invalidated.metricDelta.hits === 0 && invalidated.metricDelta.misses === 1,
+		`changed input did not miss: ${JSON.stringify(invalidated.metricDelta)}`,
+	);
 	assert(hit.totalMs < cold.totalMs, "cache hit was not faster than cold execution");
 
 	const result = {
@@ -138,6 +147,8 @@ try {
 			strace: (await commandOutput(status.straceBinary!, ["-V"])).split(/\r?\n/)[0]?.trim(),
 		},
 		subject: "stock Pi createBashTool through linux_process_reuse WorldBranch",
+		workspaceDriver,
+		workspaceFingerprint,
 		assertions: {
 			differentParentCommands: true,
 			orderedChildOutputEqual: true,
@@ -272,6 +283,11 @@ function argument(name: string): string | undefined {
 	const value = process.argv[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${name} requires a path`);
 	return value;
+}
+
+function workspaceDriverArgument(value: string | undefined): "auto" | "git" | "overlayfs" {
+	if (value === undefined || value === "auto" || value === "git" || value === "overlayfs") return value ?? "auto";
+	throw new Error(`--workspace-driver must be auto, git, or overlayfs: ${value}`);
 }
 
 function assert(condition: unknown, message: string): asserts condition {

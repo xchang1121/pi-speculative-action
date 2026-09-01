@@ -22,6 +22,25 @@
 
 ### Added
 
+- Added a capability-selected Linux/WSL workspace driver using hash-pinned `fuse-overlayfs`, one
+  immutable Git lower tree shared across forks, private upper/work layers outside the sandbox's
+  writable process area, and exact Git fallback whenever the complete mount lifecycle is unavailable.
+- Added a typed OverlayFS effect frontier: copy-ups and creations are read directly from the upper
+  journal, 0/0 whiteouts and opaque directories expand only the affected immutable Git subtree, and
+  final bytes still pass merged-view/checkpoint comparison plus atomic Actor-world validation.
+- Added OverlayFS lifecycle health demotion and conservative resource retention: recovered unmount
+  failures send later `auto` routes to Git, while storage under an unverified live mount is never
+  deleted or recycled.
+- Kept the workspace transaction clock out of the speculative namespace: OverlayFS routes now hold
+  an anonymous `O_TMPFILE` inode in private upper-layer storage and prove its timestamp ordering
+  against the merged view; Git routes keep their named clock in the private process parent. No
+  runtime control entry is observable through the Bash workspace.
+- Quarantined pools behind an unverified live FUSE mount: they leave the allocation index, never
+  enter idle reclamation, and no longer block plugin shutdown while their backing storage is retained.
+- Added fail-closed tracing for persistent file semantics outside the typed transaction, including
+  extended attributes, explicit timestamp updates, allocation changes, and mutating file ioctls.
+- Added reusable process-cache miss diagnostics that preserve the exact dependency paths which made
+  a previously eligible pathset stale.
 - Added generic cost-aware candidate adoption to the Runtime scheduler. Exact-action and
   tool/execution-world timing classes now keep Actor execution, speculative execution, and
   validation/projection/commit distributions separate; unfinished joins receive measured deadlines

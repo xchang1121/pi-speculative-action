@@ -110,4 +110,50 @@ describe("strace provenance decoder", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test("taints persistent file semantics outside the typed transaction", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-file-semantics-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(
+				`${prefix}.500`,
+				[
+					'execve("/usr/bin/example", ["example"], 0x0) = 0',
+					'setxattr("/work/output", "user.pi", "x", 1, 0) = 0',
+					'getxattr("/work/input", "user.pi", NULL, 0) = -1 ENODATA (No data available)',
+					'utimensat(AT_FDCWD, "/work/output", NULL, 0) = 0',
+					'fallocate(3</work/output>, 0, 0, 4096) = 0',
+					'ioctl(3</work/output>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0',
+				].join("\n"),
+			);
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
+			expect(observation.taints).toContain("unsupported_syscall");
+			expect(observation.paths).toEqual(
+				expect.arrayContaining([
+					{ path: "/work/input", role: "input" },
+					{ path: "/work/output", role: "input" },
+				]),
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("does not taint a failed file-descriptor ioctl", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-failed-ioctl-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(
+				`${prefix}.501`,
+				[
+					'execve("/usr/bin/example", ["example"], 0x0) = 0',
+					'ioctl(1</dev/null<char 1:3>>, TCGETS, 0x7fff0000) = -1 ENOTTY (Inappropriate ioctl for device)',
+				].join("\n"),
+			);
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
+			expect(observation.taints).not.toContain("unsupported_syscall");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

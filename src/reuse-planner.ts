@@ -91,6 +91,7 @@ export type ProcessReusePlan<MemoryHit = never> =
 			readonly kind: "miss";
 			readonly weakKey: Sha256Digest;
 			readonly reasons: readonly ProcessReuseMissReason[];
+			readonly changedDependencies?: readonly string[];
 			readonly lookup: ProcessReuseLookupMetrics;
 	  };
 
@@ -137,6 +138,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
 		}
 		const reasons = new Set<ProcessReuseMissReason>();
+		const changedDependencies = new Set<string>();
 		const pathsets = new Map<Sha256Digest, ProcessProvenanceCertificate[]>();
 		for (const certificate of certificates) {
 			if (!certificateReplayable(certificate)) {
@@ -166,6 +168,9 @@ export class ProcessReusePlanner<MemoryHit = never> {
 			if (observation.status === "indeterminate") {
 				reasons.add("validation_indeterminate");
 				continue;
+			}
+			if (observation.status === "stale") {
+				for (const changed of observation.changed) changedDependencies.add(changed);
 			}
 			const current: DynamicDependencyCertificate = {
 				complete: true,
@@ -230,6 +235,9 @@ export class ProcessReusePlanner<MemoryHit = never> {
 			kind: "miss",
 			weakKey,
 			reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
+			...(changedDependencies.size
+				? { changedDependencies: Object.freeze([...changedDependencies].sort()) }
+				: {}),
 			lookup: lookup(),
 		};
 	}

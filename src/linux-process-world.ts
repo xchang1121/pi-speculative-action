@@ -8,12 +8,16 @@ import {
 } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { forkSandboxWorkspace, prepareSandboxWorkspace } from "./workspace-sandbox.ts";
+import {
+	forkSandboxWorkspace,
+	prepareSandboxWorkspace,
+	type WorkspaceSandboxOptions,
+	workspaceSandboxFingerprint,
+} from "./workspace-sandbox.ts";
 
-export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions {
+export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
 	readonly backend?: LinuxProcessReuseBackend;
-	readonly gitBinary?: string;
 }
 
 /** Generic process world; eligibility follows invocation/effect capabilities, never a tool name. */
@@ -21,21 +25,25 @@ export function createLinuxProcessExecutionWorld(
 	options: LinuxProcessExecutionWorldOptions,
 ): SpeculativeAgentExecutionWorld {
 	const backend = options.backend ?? new LinuxProcessReuseBackend(options);
+	const workspaceOptions = pickWorkspaceOptions(options);
 	const roots = new Set<string>();
 	return {
 		id: "linux_process_reuse",
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-		fingerprint: () => backend.fingerprint(),
+		fingerprint: async () => {
+			const [processFingerprint, workspaceFingerprint] = await Promise.all([
+				backend.fingerprint(),
+				workspaceSandboxFingerprint(workspaceOptions),
+			]);
+			return `${processFingerprint}:${workspaceFingerprint}`;
+		},
 		prepare: async ({ cwd, signal }) => {
 			const status = await backend.check();
 			if (status.state !== "ready") throw new Error(status.detail);
 			roots.add(path.resolve(cwd));
-			await prepareSandboxWorkspace(cwd, {
-				...(options.gitBinary ? { gitBinary: options.gitBinary } : {}),
-				...(signal ? { signal } : {}),
-			});
+			await prepareSandboxWorkspace(cwd, { ...workspaceOptions, ...(signal ? { signal } : {}) });
 		},
 		fork: async (context) => {
 			const invocation = processInvocation(context.action.executionContext);
@@ -48,7 +56,7 @@ export function createLinuxProcessExecutionWorld(
 				cwd: sourceRoot,
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
-				...(options.gitBinary ? { gitBinary: options.gitBinary } : {}),
+				...workspaceOptions,
 				validate: async () =>
 					validate
 						? validate()
@@ -98,6 +106,15 @@ export function createLinuxProcessExecutionWorld(
 			roots.clear();
 			await backend.dispose();
 		},
+	};
+}
+
+function pickWorkspaceOptions(options: LinuxProcessExecutionWorldOptions): WorkspaceSandboxOptions {
+	return {
+		...(options.gitBinary ? { gitBinary: options.gitBinary } : {}),
+		...(options.driver ? { driver: options.driver } : {}),
+		...(options.overlayfsBinary ? { overlayfsBinary: options.overlayfsBinary } : {}),
+		...(options.fusermountBinary ? { fusermountBinary: options.fusermountBinary } : {}),
 	};
 }
 

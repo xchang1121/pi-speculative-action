@@ -42,7 +42,11 @@ describe("ProcessReusePlanner", () => {
 				contract: contract("completed_replay"),
 				validation: { resolvePath: () => fixture.input },
 			}),
-		).toMatchObject({ kind: "miss", reasons: ["dependency_changed"] });
+		).toMatchObject({
+			kind: "miss",
+			reasons: ["dependency_changed"],
+			changedDependencies: ["/workspace/input.txt"],
+		});
 	});
 
 	it("requires a buffered transactional observation contract and can salvage file artifacts", async () => {

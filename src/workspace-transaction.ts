@@ -36,6 +36,8 @@ export interface WorkspaceTransactionCapture {
 /** Generic mutation journal installed by the concrete workspace implementation. */
 export interface WorkspaceTransactionDriver {
 	readonly begin: () => Promise<WorkspaceTransactionCapture>;
+	/** Release driver-owned journal handles before the enclosing workspace is removed. */
+	readonly dispose: () => Promise<void>;
 }
 
 /**
@@ -46,7 +48,24 @@ export function deferredWorkspaceTransactionDriver(
 	create: () => Promise<WorkspaceTransactionDriver>,
 ): WorkspaceTransactionDriver {
 	let driver: Promise<WorkspaceTransactionDriver> | undefined;
+	let disposed = false;
+	let disposal: Promise<void> | undefined;
 	return {
-		begin: async () => (await (driver ??= create())).begin(),
+		begin: async () => {
+			if (disposed) throw new Error("workspace transaction driver is disposed");
+			const resolved = await (driver ??= create());
+			if (disposed) {
+				await resolved.dispose();
+				throw new Error("workspace transaction driver is disposed");
+			}
+			return resolved.begin();
+		},
+		dispose: () => {
+			disposed = true;
+			disposal ??= (async () => {
+				if (driver) await (await driver).dispose();
+			})();
+			return disposal;
+		},
 	};
 }

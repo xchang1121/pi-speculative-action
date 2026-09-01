@@ -8,6 +8,7 @@ import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-co
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
+import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 
@@ -86,6 +87,7 @@ const mode = argument("--mode") ?? "reuse";
 if (mode !== "reuse" && mode !== "direct") throw new Error("--mode must be reuse or direct");
 const transformRounds = integerArgument("--rounds", 96, 0, 4_096);
 const outputPath = argument("--output");
+const workspaceDriver = workspaceDriverArgument(argument("--workspace-driver"));
 const root = await mkdtemp(path.join(os.tmpdir(), "pi-topology-reuse-bench-"));
 const workspace = path.join(root, "workspace");
 const storeRoot = path.join(root, "process-reuse");
@@ -101,7 +103,9 @@ const environment = Object.freeze({
 const localOperations = createLocalBashOperations({ shellPath });
 const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localOperations));
 const backend = mode === "reuse" ? new LinuxProcessReuseBackend({ storeRoot }) : undefined;
-const world = backend ? createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot }) : undefined;
+const world = backend
+	? createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot, driver: workspaceDriver })
+	: undefined;
 const tool = createBashTool(workspace, {
 	operations: coordinator.operations,
 	shellPath,
@@ -113,11 +117,13 @@ try {
 	await prepareWorkspace(workspace);
 	let status: Awaited<ReturnType<LinuxProcessReuseBackend["check"]>> | undefined;
 	let executionFingerprint: string | undefined;
+	let workspaceFingerprint: string | undefined;
 	if (backend && world) {
 		status = await backend.check(true);
 		if (status.state !== "ready") throw new Error(status.detail);
 		await world.prepare?.({ cwd: workspace });
-		executionFingerprint = await backend.fingerprint();
+		workspaceFingerprint = await workspaceSandboxFingerprint({ driver: workspaceDriver });
+		executionFingerprint = `${await backend.fingerprint()}:${workspaceFingerprint}`;
 	}
 
 	const warmup = await runTask("warmup", "pi-topology-helper input.bin generated/nested/artifact.bin");
@@ -150,6 +156,8 @@ try {
 		schemaVersion: 1,
 		measuredAt: new Date().toISOString(),
 		mode,
+		workspaceDriver,
+		...(workspaceFingerprint ? { workspaceFingerprint } : {}),
 		host: {
 			platform: process.platform,
 			arch: process.arch,
@@ -306,6 +314,11 @@ function argument(name: string): string | undefined {
 	const value = process.argv[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
 	return value;
+}
+
+function workspaceDriverArgument(value: string | undefined): "auto" | "git" | "overlayfs" {
+	if (value === undefined || value === "auto" || value === "git" || value === "overlayfs") return value ?? "auto";
+	throw new Error(`--workspace-driver must be auto, git, or overlayfs: ${value}`);
 }
 
 function integerArgument(name: string, fallback: number, minimum: number, maximum: number): number {

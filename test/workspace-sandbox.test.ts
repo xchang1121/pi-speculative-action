@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -12,6 +12,7 @@ import {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
+import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
@@ -65,7 +66,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot("write");
 		try {
 			const args = { path: "nested/created.txt", content: "isolated\n" };
-			const world = createWorkspaceSandbox();
+			const world = createWorkspaceSandbox({ driver: "git" });
 			expect(world.scope).toBe("fallback");
 			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
 			expect(effectCapabilitiesCover(world.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
@@ -122,6 +123,105 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("before\n");
 			branch.dispose();
 		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("seals copy-ups, creations, and whiteouts from the typed OverlayFS frontier", async () => {
+		if (!(await linuxOverlayfsCapability()).available) return;
+		const root = await temporaryRoot("overlay-frontier");
+		try {
+			await mkdir(path.join(root, "replaced"));
+			await Promise.all([
+				writeFile(path.join(root, "changed.txt"), "before\n", "utf8"),
+				writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8"),
+				writeFile(path.join(root, "replaced", "lower.txt"), "lower\n", "utf8"),
+			]);
+			const branch = await forkSandboxWorkspace({
+				cwd: root,
+				driver: "overlayfs",
+				action: requiredAction("write", { path: "changed.txt", content: "after\n" }, root),
+				execute: async (workspace) => {
+					const capture = await workspace.transactions.begin();
+					expect(await readdir(workspace.sandboxRoot)).not.toContain(
+						".pi-speculative-runtime.tmp",
+					);
+					await Promise.all([
+						writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after\n", "utf8"),
+						writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8"),
+						rm(path.join(workspace.sandboxRoot, "deleted.txt")),
+					]);
+					await rm(path.join(workspace.sandboxRoot, "replaced"), { recursive: true });
+					await mkdir(path.join(workspace.sandboxRoot, "replaced"));
+					await writeFile(path.join(workspace.sandboxRoot, "replaced", "created.txt"), "opaque\n", "utf8");
+					const delta = await capture.finish();
+					expect(delta.complete).toBe(true);
+					expect((await readdir(workspace.sandboxRoot)).some((entry) => entry.startsWith(".pi-speculative-"))).toBe(
+						false,
+					);
+					return settlement("overlay");
+				},
+			});
+			expect(branch.resources).toEqual([
+				"changed.txt",
+				"created.txt",
+				"deleted.txt",
+				"replaced/created.txt",
+				"replaced/lower.txt",
+			]);
+			await branch.commit();
+			expect(await readFile(path.join(root, "changed.txt"), "utf8")).toBe("after\n");
+			expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("created\n");
+			expect(await readFile(path.join(root, "replaced", "created.txt"), "utf8")).toBe("opaque\n");
+			await expect(stat(path.join(root, "deleted.txt"))).rejects.toThrow();
+			await expect(stat(path.join(root, "replaced", "lower.txt"))).rejects.toThrow();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("quarantines an unverified live mount without blocking pool shutdown", async () => {
+		if (process.platform !== "linux") return;
+		const host = await linuxOverlayfsCapability();
+		if (!host.available) return;
+		const root = await temporaryRoot("overlay-quarantine");
+		const marker = path.join(root, "probe-unmounted");
+		const wrapper = path.join(root, "fusermount-unresolved");
+		const mountsBefore = new Set(await fuseOverlayMountTargets());
+		let retainedMounts: string[] = [];
+		try {
+			await writeFile(
+				wrapper,
+				`#!/bin/sh\nif [ ! -e ${shellQuote(marker)} ]; then\n  : > ${shellQuote(marker)}\n  exec ${shellQuote(host.fusermountBinary)} "$@"\nfi\nexit 42\n`,
+				"utf8",
+			);
+			await chmod(wrapper, 0o755);
+			const options = { fusermountBinary: wrapper };
+			expect((await linuxOverlayfsCapability(options)).available).toBe(true);
+			await expect(
+				forkSandboxWorkspace({
+					cwd: root,
+					driver: "overlayfs",
+					...options,
+					action: requiredAction("write", { path: "value.txt", content: "value\n" }, root),
+					execute: async () => settlement("unsafe-unmount"),
+				}),
+			).rejects.toThrow(/cleanup|mounted|unmount/i);
+			retainedMounts = (await fuseOverlayMountTargets()).filter((target) => !mountsBefore.has(target));
+			expect(retainedMounts).toHaveLength(1);
+			await completesWithin(closeWorkspaceSandboxPools([root]), 500);
+		} finally {
+			retainedMounts = [
+				...new Set([
+					...retainedMounts,
+					...(await fuseOverlayMountTargets()).filter((target) => !mountsBefore.has(target)),
+				]),
+			];
+			for (const target of retainedMounts) {
+				await runProgram(host.fusermountBinary, ["-u", target]);
+				expect(await fuseOverlayMountTargets()).not.toContain(target);
+				await rm(path.dirname(path.dirname(target)), { recursive: true, force: true });
+			}
 			await rm(root, { recursive: true, force: true });
 		}
 	});
@@ -411,8 +511,8 @@ describe("workspace-branch ExecutionWorld", () => {
 				await rm(path.join(workspace.sandboxRoot, "deleted.txt"));
 				const delta = await capture.finish();
 
-				expect(delta.complete).toBe(true);
 				if (!delta.complete) throw new Error(`workspace transaction was incomplete: ${delta.reason}`);
+				expect(delta.complete).toBe(true);
 				const beforeEntry = delta.before.entries.get("changed.txt");
 				const afterEntry = delta.after.entries.get("changed.txt");
 				if (beforeEntry?.kind !== "file" || afterEntry?.kind !== "file") throw new Error("change clock missing");
@@ -519,6 +619,9 @@ describe("workspace-branch ExecutionWorld", () => {
 				const recovered = await workspace.transactions.begin();
 				await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "recovered\n", "utf8");
 				const recoveredDelta = await recovered.finish();
+				if (!recoveredDelta.complete) {
+					throw new Error(`recovered workspace transaction was incomplete: ${recoveredDelta.reason}`);
+				}
 				expect(recoveredDelta.complete).toBe(true);
 				expect(Buffer.from(recoveredDelta.changes[0]?.before ?? []).toString("utf8")).toBe("overlap\n");
 				expect(Buffer.from(recoveredDelta.changes[0]?.after ?? []).toString("utf8")).toBe("recovered\n");
@@ -580,4 +683,46 @@ function runGit(args: string[], cwd: string): Promise<string> {
 			else resolve(stdout);
 		});
 	});
+}
+
+function runProgram(executable: string, args: readonly string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile(executable, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+			if (error) reject(new Error(`${executable} failed: ${stderr || error.message}`, { cause: error }));
+			else resolve(stdout);
+		});
+	});
+}
+
+async function fuseOverlayMountTargets(): Promise<string[]> {
+	if (process.platform !== "linux") return [];
+	const mountInfo = await readFile("/proc/self/mountinfo", "utf8");
+	const targets: string[] = [];
+	for (const line of mountInfo.split("\n")) {
+		const separator = line.indexOf(" - ");
+		if (separator === -1) continue;
+		const left = line.slice(0, separator).split(" ");
+		const filesystem = line.slice(separator + 3).split(" ")[0];
+		if (filesystem !== "fuse.fuse-overlayfs" && filesystem !== "fuse-overlayfs") continue;
+		targets.push((left[4] ?? "").replace(/\\([0-7]{3})/g, (_match, value) => String.fromCharCode(Number.parseInt(value, 8))));
+	}
+	return targets;
+}
+
+async function completesWithin(operation: Promise<void>, timeoutMs: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			operation,
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error("workspace pool shutdown timed out")), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
 }

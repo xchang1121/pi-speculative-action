@@ -64,7 +64,7 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v6";
+const BACKEND_EPOCH = "pi-linux-process-v7";
 const POLICY_ID = "sandlock-namespaced-transparent-exec-v6";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
@@ -300,6 +300,7 @@ export class LinuxProcessReuseBackend {
 			projection,
 			sourceRoot,
 			workspaceRoot: input.workspace.sandboxRoot,
+			workspaceExcludes: input.workspace.observationExcludes,
 			token,
 			socketPath,
 			mountBinary: ready.mount,
@@ -426,6 +427,7 @@ export class LinuxProcessReuseBackend {
 		});
 		const before = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
 			maxFiles: MAX_CAPTURE_FILES,
+			exclude: session.workspace.observationExcludes,
 		});
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
@@ -437,7 +439,7 @@ export class LinuxProcessReuseBackend {
 			"-s",
 			"65535",
 			"-e",
-			"trace=%file,%process,%network,%ipc,fchdir",
+			"trace=%file,%process,%network,%ipc,fchdir,fallocate,ioctl",
 			"-o",
 			tracePrefix,
 			...sandbox,
@@ -464,6 +466,7 @@ export class LinuxProcessReuseBackend {
 			try {
 				const after = await captureWorkspaceStructure(session.workspace.sandboxRoot, {
 					maxFiles: MAX_CAPTURE_FILES,
+					exclude: session.workspace.observationExcludes,
 				});
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
 					ignoredExecutablePaths: session.interposition.executablePaths,
@@ -557,6 +560,11 @@ export class LinuxProcessReuseBackend {
 		this.counters.validationBytesRead += plan.lookup.bytesRead;
 		this.counters.validationArtifactsLoaded += plan.lookup.artifactsLoaded;
 		this.counters.validationArtifactBytesRead += plan.lookup.artifactBytesRead;
+		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
+			this.counters.lastError = `reuse_miss:${plan.reasons.join(",")}${
+				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
+			}`;
+		}
 		return plan.kind === "completed_replay" ? plan : undefined;
 	}
 
@@ -596,7 +604,7 @@ export class LinuxProcessReuseBackend {
 				"-s",
 				"65535",
 				"-e",
-				"trace=%file,%process,%network,getpid,getppid,getsid,getpgid,fchdir",
+				"trace=%file,%process,%network,getpid,getppid,getsid,getpgid,fchdir,fallocate,ioctl",
 				"-o",
 				tracePrefix,
 				ready.sandlock,
@@ -1052,7 +1060,9 @@ function interposedDirectoryFor(session: ActiveSession, target: string): Interpo
 }
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
-	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? [".git"] : undefined;
+	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot)
+		? session.workspace.observationExcludes
+		: undefined;
 }
 
 async function captureHostPath(
@@ -1222,6 +1232,7 @@ async function createProcessInterposition(input: {
 	readonly projection: ExecutionPathProjection;
 	readonly sourceRoot: string;
 	readonly workspaceRoot: string;
+	readonly workspaceExcludes: readonly string[];
 	readonly token: string;
 	readonly socketPath: string;
 	readonly mountBinary: string;
@@ -1326,7 +1337,7 @@ async function createProcessInterposition(input: {
 				directory.source,
 				slash(directory.target),
 				true,
-				path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? [".git"] : [],
+				path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
 			),
 		);
 	}

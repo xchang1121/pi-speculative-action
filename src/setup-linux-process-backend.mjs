@@ -1,12 +1,25 @@
 #!/usr/bin/env node
 
-import { access, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
+const FUSE_OVERLAYFS_RELEASE = "v1.18";
+const FUSE_OVERLAYFS_ASSETS = Object.freeze({
+	x64: {
+		name: "fuse-overlayfs-x86_64",
+		sha256: "56b0ae0aeb8abb308b068af2f137ed8d1bd239f4f27e21672ff0def861eea1e8",
+	},
+	arm64: {
+		name: "fuse-overlayfs-aarch64",
+		sha256: "82fed736197b2a881a822e5357b488796f654e8371ce8573a1592331510a0133",
+	},
+});
 
 if (process.platform !== "linux") {
 	throw new Error("The process-reuse backend must be installed from Linux or WSL 2.");
@@ -59,6 +72,44 @@ if (!ready) {
 }
 await run(sandlock, ["check"]);
 console.log(`Linux process-reuse backend ready: ${sandlock}`);
+await installFuseOverlayfs().catch((error) => {
+	console.warn(`OverlayFS optimization unavailable; the safe Git workspace driver remains active: ${error.message}`);
+});
+
+async function installFuseOverlayfs() {
+	const target = path.join(localBin, "fuse-overlayfs");
+	const asset = FUSE_OVERLAYFS_ASSETS[process.arch];
+	if (!asset) throw new Error(`no pinned fuse-overlayfs asset for ${process.arch}`);
+	try {
+		const installed = await readFile(target);
+		const digest = createHash("sha256").update(installed).digest("hex");
+		if (digest !== asset.sha256) throw new Error(`installed fuse-overlayfs checksum mismatch: ${digest}`);
+		await run(target, ["--version"]);
+		console.log(`OverlayFS workspace driver ready: ${target}`);
+		return;
+	} catch {
+		// Install a hash-pinned official static release below.
+	}
+	await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);
+	await executable(["fusermount3", "fusermount"]);
+	const url = `https://github.com/containers/fuse-overlayfs/releases/download/${FUSE_OVERLAYFS_RELEASE}/${asset.name}`;
+	console.log(`Installing fuse-overlayfs ${FUSE_OVERLAYFS_RELEASE} into ${localRoot} ...`);
+	const response = await fetch(url, { redirect: "follow" });
+	if (!response.ok) throw new Error(`download failed (${response.status} ${response.statusText})`);
+	const bytes = Buffer.from(await response.arrayBuffer());
+	const digest = createHash("sha256").update(bytes).digest("hex");
+	if (digest !== asset.sha256) throw new Error(`fuse-overlayfs checksum mismatch: ${digest}`);
+	const temporary = `${target}.${process.pid}.tmp`;
+	try {
+		await writeFile(temporary, bytes, { mode: 0o700, flag: "wx" });
+		await chmod(temporary, 0o755);
+		await rename(temporary, target);
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
+	await run(target, ["--version"]);
+	console.log(`OverlayFS workspace driver ready: ${target}`);
+}
 
 async function executable(candidates) {
 	for (const candidate of candidates) {

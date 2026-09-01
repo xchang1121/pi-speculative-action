@@ -138,6 +138,12 @@ export async function observeStrace(
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
+			if (
+				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) ||
+				(syscall === "ioctl" && unmodeledFileIoctl(line))
+			) {
+				taints.add("unsupported_syscall");
+			}
 			if (syscall === "chdir" && syscallSucceeded(line)) {
 				const value = quotedStrings(line)[0];
 				if (value) cwd = resolveObservedPath(value, cwd);
@@ -190,6 +196,10 @@ const FILE_SYSCALLS = new Set([
 	"faccessat2",
 	"fchmodat",
 	"fchownat",
+	"getxattr",
+	"lgetxattr",
+	"listxattr",
+	"llistxattr",
 	"link",
 	"linkat",
 	"lstat",
@@ -204,6 +214,8 @@ const FILE_SYSCALLS = new Set([
 	"openat2",
 	"readlink",
 	"readlinkat",
+	"removexattr",
+	"lremovexattr",
 	"rename",
 	"renameat",
 	"renameat2",
@@ -211,6 +223,8 @@ const FILE_SYSCALLS = new Set([
 	"stat",
 	"statfs",
 	"statx",
+	"setxattr",
+	"lsetxattr",
 	"symlink",
 	"symlinkat",
 	"truncate",
@@ -220,6 +234,36 @@ const FILE_SYSCALLS = new Set([
 	"utimensat",
 	"utimes",
 ]);
+
+/** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
+const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
+	"fallocate",
+	"fgetxattr",
+	"flistxattr",
+	"fremovexattr",
+	"fsetxattr",
+	"futimesat",
+	"getxattr",
+	"lgetxattr",
+	"listxattr",
+	"llistxattr",
+	"lremovexattr",
+	"lsetxattr",
+	"removexattr",
+	"setxattr",
+	"utime",
+	"utimensat",
+	"utimes",
+]);
+
+const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC_SETFLAGS|FS_IOC_SETVERSION|FS_IOC_FSSETXATTR)\b/;
+
+function unmodeledFileIoctl(line: string): boolean {
+	if (!syscallSucceeded(line)) return false;
+	if (UNMODELED_MUTATING_IOCTL.test(line)) return true;
+	const descriptorPath = /^\s*ioctl\(\d+<([^>]+)>/.exec(line)?.[1];
+	return descriptorPath?.startsWith("/") ?? false;
+}
 
 const NETWORK_SYSCALLS = new Set([
 	"accept",

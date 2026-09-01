@@ -365,9 +365,18 @@ export {
 	type SandboxWorkspaceContext,
 	type SandboxWorkspaceBranchOptions,
 	type WorkspaceSandboxOptions,
+	type WorkspaceSandboxDriver,
 	forkSandboxWorkspace,
 	withSandboxWorkspace,
+	workspaceSandboxFingerprint,
 } from "./workspace-sandbox.ts";
+export {
+	linuxOverlayfsCapability,
+	mountLinuxOverlayfs,
+	type LinuxOverlayfsCapability,
+	type LinuxOverlayfsMount,
+	type LinuxOverlayfsOptions,
+} from "./linux-overlayfs.ts";
 export type {
 	WorkspaceRegularDelta,
 	WorkspaceTransactionCapture,

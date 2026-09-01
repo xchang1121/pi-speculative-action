@@ -12,13 +12,19 @@ process substrate contain no prompts or model data and live under `results/`.
 ## Linux/WSL process reuse qualification
 
 Run the production `createBashTool`, generic process outlet, Linux execution
-world, private Git branch, adoption-time freshness validation, and commit path
+world, capability-selected workspace branch, adoption-time freshness validation, and commit path
 against real Linux processes:
 
 ```sh
 npm run setup:linux
 npm run bench:linux-process -- --output bench/results/local.json
 ```
+
+Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
+and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
+after its binary, FUSE device, copy-up, 0/0 whiteout, opaque-directory, private
+anonymous clock, cross-view timestamp ordering, namespace visibility, and unmount
+lifecycle all pass; otherwise it uses Git worktrees.
 
 The fixture uses three different parent Bash commands around an identical
 compiled child exec. It requires the second parent to hit the first process
@@ -90,11 +96,16 @@ and mount namespace:
 
 ```sh
 npm run bench:overlay-probe
+npm run bench:overlay-view
 ```
 
-This is only a capability probe. Its upperdir contains whiteouts and other
-OverlayFS-specific records; it is not an adoption implementation and must not
-be merged into a workspace as an ordinary directory tree.
+These preserve the kernel OverlayFS experiments: the first inspects upper-layer
+records and the second proves that a parent can access a mount isolated in a
+helper namespace through `/proc/<pid>/root`. They are not the production driver:
+a later PID namespace can remount `/proc` and lose that path. The production
+driver therefore uses a host-visible, unprivileged FUSE mount. Its upperdir still
+contains whiteouts and opaque markers and is decoded as a typed frontier; it is
+never merged into a workspace as an ordinary directory tree.
 
 Analyze a private `pi-llm-tape` recording without replaying or exposing its
 prompts. Actor and Drafter requests are paired only when their complete message
