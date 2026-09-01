@@ -1935,7 +1935,8 @@ describe("structural speculative runtime", () => {
 
 		const sibling = { ...parent, id: "sibling-call", input: { path: "sibling.ts" } };
 		expect(await fixture.runtime.consume(sibling)).toBeUndefined();
-		await fixture.runtime.actual({ ...sibling, durationMs: 1, output: "actor" });
+		// This case owns continuation lifetime, so keep the fallback baseline above ready-result adoption cost.
+		await fixture.runtime.actual({ ...sibling, durationMs: 1_000, output: "actor" });
 		expect(
 			fixture.events.some(
 				(event) =>
@@ -1946,7 +1947,15 @@ describe("structural speculative runtime", () => {
 		).toBe(false);
 
 		release();
-		await waitFor(() => executed.includes("child.ts"));
+		await waitFor(() =>
+			fixture.events.some(
+				(event) =>
+					event.type === "candidate" &&
+					event.state.status === "succeeded" &&
+					event.candidate.predictedAction.includes("child.ts"),
+			),
+		);
+		expect(executed).toContain("child.ts");
 		const sameBatchChild = { ...parent, id: "same-batch-child", input: { path: "child.ts" } };
 		expect(await fixture.runtime.consume(sameBatchChild)).toBe("child.ts:output");
 		await fixture.runtime.finishTurn({ ...parent, terminal: false });
