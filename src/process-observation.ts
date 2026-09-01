@@ -3,7 +3,12 @@ import type { Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import type { DynamicDependency, Sha256Digest } from "./provenance-certificate.ts";
-import { digestObject, sha256Digest } from "./provenance-certificate.ts";
+import {
+	digestObject,
+	filesystemEntryType,
+	filesystemMetadataDigest,
+	sha256Digest,
+} from "./provenance-certificate.ts";
 import type {
 	WorkspaceStructureEntry,
 	WorkspaceStructureSnapshot,
@@ -135,7 +140,7 @@ async function captureExistingWorkspaceStructureEntry(
 		return {
 			kind: "directory",
 			entriesDigest: directoryEntriesDigest(entries),
-			metadataDigest: statMetadataDigest(stat),
+			metadataDigest: filesystemMetadataDigest(stat),
 			changeDigest: statChangeDigest(stat),
 			changeTimeMs: stat.ctimeMs,
 			mode: stat.mode & 0o777,
@@ -146,7 +151,7 @@ async function captureExistingWorkspaceStructureEntry(
 	if (stat.isFile()) {
 		return {
 			kind: "file",
-			metadataDigest: statMetadataDigest(stat),
+			metadataDigest: filesystemMetadataDigest(stat),
 			changeDigest: statChangeDigest(stat),
 			changeTimeMs: stat.ctimeMs,
 			mode: stat.mode & 0o777,
@@ -402,37 +407,9 @@ function changedRootMetadata(
 export function directoryEntriesDigest(entries: readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; isSocket(): boolean; isFIFO(): boolean; isCharacterDevice(): boolean; isBlockDevice(): boolean }[]): Sha256Digest {
 	return digestObject(
 		entries
-			.map((entry) => `${direntType(entry)}\0${entry.name}`)
+			.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
 			.sort(),
 	);
-}
-
-function direntType(entry: Parameters<typeof directoryEntriesDigest>[0][number]): string {
-	return entry.isFile()
-		? "file"
-		: entry.isDirectory()
-			? "directory"
-			: entry.isSymbolicLink()
-				? "symlink"
-				: entry.isSocket()
-					? "socket"
-					: entry.isFIFO()
-						? "fifo"
-						: entry.isCharacterDevice()
-							? "char"
-							: entry.isBlockDevice()
-								? "block"
-								: "other";
-}
-
-function statMetadataDigest(stat: Stats): Sha256Digest {
-	return digestObject({
-		mode: stat.mode,
-		uid: stat.uid,
-		gid: stat.gid,
-		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
-		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
-	});
 }
 
 /** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */

@@ -1,10 +1,11 @@
 import { lstat, readFile, readdir, readlink } from "node:fs/promises";
-import type { Dirent } from "node:fs";
 import path from "node:path";
 import {
 	type DynamicDependency,
 	type DynamicDependencyCertificate,
 	digestObject,
+	filesystemEntryType,
+	filesystemMetadataDigest,
 	type ProcessProvenanceCertificate,
 	processStrongKey,
 	sha256Digest,
@@ -224,7 +225,7 @@ export async function captureFileDependency(
 			path: logicalPath,
 			role,
 			contentDigest: sha256Digest(content),
-			...(options.includeMetadata ? { metadataDigest: metadataDigest(stat) } : {}),
+			...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(stat) } : {}),
 		},
 		bytesRead: content.byteLength,
 	};
@@ -243,13 +244,13 @@ export async function captureDirectoryDependency(
 	]);
 	const normalized = entries
 		.filter((entry) => !excluded.has(entry.name))
-		.map((entry) => `${directoryEntryType(entry)}\0${entry.name}`)
+		.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
 		.sort();
 	return {
 		kind: "directory",
 		path: logicalPath,
 		entriesDigest: digestObject(normalized),
-		...(stat ? { metadataDigest: metadataDigest(stat) } : {}),
+		...(stat ? { metadataDigest: filesystemMetadataDigest(stat) } : {}),
 		...(excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
 	};
 }
@@ -289,34 +290,6 @@ export async function captureSymlinkDependency(
 function resolveEvidencePath(logicalPath: string, context: ProvenanceValidationContext): string | undefined {
 	if (context.resolvePath) return context.resolvePath(logicalPath);
 	return path.isAbsolute(logicalPath) ? path.resolve(logicalPath) : undefined;
-}
-
-function metadataDigest(stat: Awaited<ReturnType<typeof lstat>>): Sha256Digest {
-	return digestObject({
-		mode: stat.mode,
-		uid: stat.uid,
-		gid: stat.gid,
-		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
-		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
-	});
-}
-
-function directoryEntryType(entry: Dirent<string>): string {
-	return entry.isFile()
-		? "file"
-		: entry.isDirectory()
-			? "directory"
-			: entry.isSymbolicLink()
-				? "symlink"
-				: entry.isSocket()
-					? "socket"
-					: entry.isFIFO()
-						? "fifo"
-						: entry.isCharacterDevice()
-							? "char"
-							: entry.isBlockDevice()
-								? "block"
-								: "other";
 }
 
 function indeterminate(

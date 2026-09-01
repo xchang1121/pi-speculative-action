@@ -2053,6 +2053,10 @@ interface OverlayStructureFrontier {
 	readonly removals: readonly OverlayStructureRemoval[];
 }
 
+type OverlayUpperEntry =
+	| { readonly kind: "opaque" | "directory" | "whiteout"; readonly resource: string }
+	| { readonly kind: "leaf"; readonly resource: string; readonly regular: boolean };
+
 /**
  * Reconstruct the complete logical structure from one immutable lower snapshot plus the typed upper
  * journal. Only upper paths and their ancestor directories require fresh merged-view syscalls.
@@ -2099,7 +2103,6 @@ async function captureOverlayWorkspaceStructure(
 async function inspectOverlayStructureFrontier(upperRoot: string): Promise<OverlayStructureFrontier> {
 	const refresh = new Set<string>([""]);
 	const removals: OverlayStructureRemoval[] = [];
-	let entries = 0;
 	const addAncestors = (resource: string, includeSelf: boolean) => {
 		let current = includeSelf ? path.normalize(resource) : path.dirname(path.normalize(resource));
 		for (;;) {
@@ -2109,12 +2112,31 @@ async function inspectOverlayStructureFrontier(upperRoot: string): Promise<Overl
 			current = path.dirname(relative);
 		}
 	};
+	await walkOverlayUpper(upperRoot, "structure frontier", (entry) => {
+		if (entry.kind === "opaque" || entry.kind === "whiteout") {
+			removals.push({ resource: entry.resource, descendantsOnly: entry.kind === "opaque" });
+			addAncestors(entry.resource, entry.kind === "opaque");
+			return;
+		}
+		if (entry.kind === "leaf" && !entry.regular) {
+			throw new Error(`unsupported OverlayFS upper inode: ${entry.resource}`);
+		}
+		addAncestors(entry.resource, true);
+	});
+	return { refresh, removals: Object.freeze(removals) };
+}
+
+async function walkOverlayUpper(
+	upperRoot: string,
+	journal: string,
+	observe: (entry: OverlayUpperEntry) => void | Promise<void>,
+): Promise<void> {
+	let entries = 0;
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
 		for (const child of await readdir(directory, { withFileTypes: true })) {
-			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error("OverlayFS structure frontier exceeds file limit");
+			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
 			if (child.name === ".wh..wh..opq") {
-				removals.push({ resource: relativeDirectory, descendantsOnly: true });
-				addAncestors(relativeDirectory, true);
+				await observe({ kind: "opaque", resource: relativeDirectory });
 				continue;
 			}
 			if (child.name.startsWith(".wh.")) {
@@ -2125,22 +2147,17 @@ async function inspectOverlayStructureFrontier(upperRoot: string): Promise<Overl
 			const target = path.join(directory, child.name);
 			const stats = await lstat(target);
 			if (stats.isDirectory()) {
-				addAncestors(resource, true);
+				await observe({ kind: "directory", resource });
 				await visit(target, resource);
-				continue;
-			}
-			if (stats.isCharacterDevice()) {
+			} else if (stats.isCharacterDevice()) {
 				if (stats.rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
-				removals.push({ resource, descendantsOnly: false });
-				addAncestors(resource, false);
-				continue;
+				await observe({ kind: "whiteout", resource });
+			} else {
+				await observe({ kind: "leaf", resource, regular: stats.isFile() });
 			}
-			if (!stats.isFile()) throw new Error(`unsupported OverlayFS upper inode: ${resource}`);
-			addAncestors(resource, true);
 		}
 	};
 	await visit(upperRoot, "");
-	return { refresh, removals: Object.freeze(removals) };
 }
 
 function comparePathDepth(left: string, right: string): number {
@@ -2159,7 +2176,6 @@ async function collectOverlayChangeResources(
 ): Promise<readonly string[]> {
 	if (!workspace.overlay) throw new Error("OverlayFS change journal is unavailable");
 	const resources = new Set<string>();
-	let entries = 0;
 	const addBaselineSubtree = async (resource: string) => {
 		const prefix = resource || ".";
 		const tree = await git(
@@ -2181,33 +2197,10 @@ async function collectOverlayChangeResources(
 			}
 		}
 	};
-	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
-		for (const child of await readdir(directory, { withFileTypes: true })) {
-			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error("OverlayFS change journal exceeds file limit");
-			if (child.name === ".wh..wh..opq") {
-				await addBaselineSubtree(relativeDirectory);
-				continue;
-			}
-			if (child.name.startsWith(".wh.")) {
-				throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
-			}
-			const resource = slash(relativeDirectory ? path.join(relativeDirectory, child.name) : child.name);
-			if (isSnapshotExcluded(resource)) continue;
-			const target = path.join(directory, child.name);
-			const stats = await lstat(target);
-			if (stats.isDirectory()) {
-				await visit(target, resource);
-				continue;
-			}
-			if (stats.isCharacterDevice()) {
-				if (stats.rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
-				await addBaselineSubtree(resource);
-				continue;
-			}
-			resources.add(resource);
-		}
-	};
-	await visit(workspace.overlay.upperRoot, "");
+	await walkOverlayUpper(workspace.overlay.upperRoot, "change journal", async (entry) => {
+		if (entry.kind === "opaque" || entry.kind === "whiteout") await addBaselineSubtree(entry.resource);
+		else if (entry.kind === "leaf") resources.add(entry.resource);
+	});
 	return Object.freeze([...resources]);
 }
 

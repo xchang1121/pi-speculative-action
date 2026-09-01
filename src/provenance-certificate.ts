@@ -4,6 +4,27 @@ import { stableStringify } from "./stable-json.ts";
 export const PROCESS_CERTIFICATE_VERSION = 1 as const;
 export type Sha256Digest = `sha256:${string}`;
 
+export interface FilesystemTypeEvidence {
+	readonly isFile: () => boolean;
+	readonly isDirectory: () => boolean;
+	readonly isSymbolicLink: () => boolean;
+	readonly isSocket: () => boolean;
+	readonly isFIFO: () => boolean;
+	readonly isCharacterDevice: () => boolean;
+	readonly isBlockDevice: () => boolean;
+}
+
+export interface FilesystemMetadataEvidence {
+	readonly mode: number;
+	readonly uid: number;
+	readonly gid: number;
+	readonly size: number;
+	readonly nlink: number;
+	readonly isFile: () => boolean;
+	readonly isDirectory: () => boolean;
+	readonly isSymbolicLink: () => boolean;
+}
+
 export interface ArtifactReference {
 	readonly digest: Sha256Digest;
 	readonly size: number;
@@ -302,6 +323,34 @@ export function sha256Digest(value: string | Uint8Array): Sha256Digest {
 
 export function digestObject(value: unknown): Sha256Digest {
 	return sha256Digest(Buffer.from(stableStringify(value), "utf8"));
+}
+
+export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
+	return entry.isFile()
+		? "file"
+		: entry.isDirectory()
+			? "directory"
+			: entry.isSymbolicLink()
+				? "symlink"
+				: entry.isSocket()
+					? "socket"
+					: entry.isFIFO()
+						? "fifo"
+						: entry.isCharacterDevice()
+							? "char"
+							: entry.isBlockDevice()
+								? "block"
+								: "other";
+}
+
+export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
+	return digestObject({
+		mode: stat.mode,
+		uid: stat.uid,
+		gid: stat.gid,
+		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
+		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
+	});
 }
 
 export function isSha256Digest(value: unknown): value is Sha256Digest {
