@@ -81,6 +81,8 @@ describe("Linux process ExecutionWorld", () => {
 			const validation = await branch.validate?.();
 			expect(validation?.status).toBe("indeterminate");
 			expect(JSON.stringify(validation)).toContain("filesystem_semantics");
+			expect(branch.executionMetrics.reuse?.requests).toBeGreaterThan(0);
+			expect(branch.executionMetrics.reuse?.executionMs).toBeGreaterThan(0);
 			expect(backend.metrics().tainted).toBeGreaterThan(0);
 			expect((await stat(path.join(workspace, "source"))).isDirectory()).toBe(true);
 			await expect(stat(path.join(workspace, "moved"))).rejects.toThrow();

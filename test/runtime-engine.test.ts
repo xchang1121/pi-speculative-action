@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
-import type { SpeculativeExecutionRoute, WorldBranch, WorldCheckpoint } from "../src/execution-world.ts";
+import {
+	emptyWorldReuseMetrics,
+	type SpeculativeExecutionRoute,
+	type WorldBranch,
+	type WorldCheckpoint,
+	type WorldExecutionMetrics,
+} from "../src/execution-world.ts";
 import type {
 	AuthoritativeResultCapture,
 	CandidatePreflight,
@@ -223,6 +229,42 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it("correlates route and branch reuse telemetry on candidate events", async () => {
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "telemetry", { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			execute: () =>
+				world("cached", {
+					backend: RESOURCE_ROUTE.backend,
+					executionMetrics: {
+						setupMs: 3,
+						reuse: { ...emptyWorldReuseMetrics(), requests: 1, hits: 1, replayMs: 2 },
+					},
+				}),
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "telemetry" });
+		await waitFor(() => fixture.events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		const event = fixture.events.find(
+			(event) => event.type === "candidate" && event.state.status === "succeeded",
+		);
+		expect(event).toMatchObject({
+			sessionID: "session",
+			turnID: "telemetry",
+			candidate: {
+				route: RESOURCE_ROUTE,
+				world: {
+					backend: "resource_version",
+					executionMetrics: { setupMs: 3, reuse: { requests: 1, hits: 1, replayMs: 2 } },
+				},
+			},
+		});
+		await fixture.runtime.finishTurn({ ...call("telemetry"), terminal: true });
+	});
+
 	it("admits independent actions and proposals without head-of-line blocking", async () => {
 		let releaseSlow!: () => void;
 		const slow = new Promise<void>((resolve) => {
@@ -2149,7 +2191,9 @@ describe("structural speculative runtime", () => {
 function world(
 	output: string,
 	options: {
+		readonly backend?: string;
 		readonly checkpoint?: WorldCheckpoint;
+		readonly executionMetrics?: WorldExecutionMetrics;
 		readonly resources?: readonly string[];
 		readonly onCommit?: () => void;
 		readonly onDispose?: () => void;
@@ -2159,14 +2203,14 @@ function world(
 ): WorldBranch<string> {
 	return {
 		output,
-		backend: "test",
+		backend: options.backend ?? "test",
 		...(options.checkpoint ? { checkpoint: options.checkpoint } : {}),
 		resources: options.resources ?? [],
 		capturedBytes: 0,
-		executionMetrics: {},
+		executionMetrics: options.executionMetrics ?? {},
 		compatibility: {
 			status: "compatible" as const,
-			backend: "test",
+			backend: options.backend ?? "test",
 			executionFingerprint: options.executionFingerprint ?? "",
 		},
 		...(options.validate ? { validate: options.validate } : {}),

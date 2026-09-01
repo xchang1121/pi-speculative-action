@@ -113,6 +113,8 @@ export interface SandboxWorkspaceBranchOptions {
 	readonly overlayfsBinary?: string;
 	readonly fusermountBinary?: string;
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement>;
+	/** Optional backend metrics collected during execute/capture and sealed into the branch. */
+	readonly executionMetrics?: () => WorldExecutionMetrics;
 	/** Seal operation-specific evidence after the generic transaction has captured its exact delta. */
 	readonly afterCapture?: (
 		workspace: SandboxWorkspaceContext,
@@ -1063,6 +1065,7 @@ async function forkSandboxWorkspaceFor(
 				executionMetrics: {
 					setupMs,
 					captureMs: Math.max(0, performance.now() - captureStarted),
+					...options.executionMetrics?.(),
 				},
 			};
 		},

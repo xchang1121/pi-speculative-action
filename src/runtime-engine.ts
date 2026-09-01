@@ -464,6 +464,7 @@ function outputIsError(value: unknown): boolean {
 function candidateEventDescriptor<Output, StartInput, StateData>(
 	candidate: CandidateRecord<Output, StartInput, StateData>,
 ): CandidateEventDescriptor {
+	const branch = candidateBranch(candidate);
 	return {
 		source: candidate.owner.draft.source ?? "cache",
 		depth: candidate.owner.draft.depth ?? 0,
@@ -472,6 +473,8 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 		tool: candidate.key.tool,
 		actionKeyHash: candidate.key.hash,
 		execution: candidate.route.isolation,
+		route: candidate.route,
+		...(branch ? { world: { backend: branch.backend, executionMetrics: branch.executionMetrics } } : {}),
 		predictedAction: diagnosticAction(candidate.key.tool, candidate.key.input, candidate.key),
 		predictionLatencyMs: candidate.predictionLatencyMs,
 		draftTokens: candidate.draftTokens,

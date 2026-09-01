@@ -43,11 +43,55 @@ export function sameSpeculativeExecutionRoute(
 	);
 }
 
+/** Backend-neutral accounting for validated result reuse inside one execution world. */
+export interface WorldReuseMetrics {
+	readonly requests: number;
+	readonly hits: number;
+	readonly joinedHits: number;
+	readonly misses: number;
+	readonly bypasses: number;
+	readonly published: number;
+	readonly tainted: number;
+	readonly validationMs: number;
+	readonly validationCandidates: number;
+	readonly validationPathsets: number;
+	readonly validationFilesRead: number;
+	readonly validationBytesRead: number;
+	readonly validationArtifactsLoaded: number;
+	readonly validationArtifactBytesRead: number;
+	readonly replayMs: number;
+	readonly executionMs: number;
+	readonly lastError?: string;
+}
+
+export function emptyWorldReuseMetrics(): WorldReuseMetrics {
+	return {
+		requests: 0,
+		hits: 0,
+		joinedHits: 0,
+		misses: 0,
+		bypasses: 0,
+		published: 0,
+		tainted: 0,
+		validationMs: 0,
+		validationCandidates: 0,
+		validationPathsets: 0,
+		validationFilesRead: 0,
+		validationBytesRead: 0,
+		validationArtifactsLoaded: 0,
+		validationArtifactBytesRead: 0,
+		replayMs: 0,
+		executionMs: 0,
+	};
+}
+
 export interface WorldExecutionMetrics {
 	/** Time spent materializing an isolated world before the tool could start. */
 	readonly setupMs?: number;
 	/** Time spent sealing observable persistent effects after the tool completed. */
 	readonly captureMs?: number;
+	/** Validated result reuse performed by the world while executing the action. */
+	readonly reuse?: WorldReuseMetrics;
 }
 
 export interface WorldCommitMetrics {

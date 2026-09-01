@@ -52,6 +52,7 @@ export {
 } from "./effect-transaction.ts";
 export {
 	type CapturedExecutionWorldResult,
+	emptyWorldReuseMetrics,
 	type ExecutionWorld,
 	type ExecutionWorldDiagnosticReport,
 	type ExecutionWorldDiagnosticSnapshot,
@@ -69,6 +70,7 @@ export {
 	type WorldCommitMetrics,
 	type WorldCompatibilityEvidence,
 	type WorldExecutionMetrics,
+	type WorldReuseMetrics,
 	type WorldReuseStrategy,
 	type WorldResultCapture,
 } from "./execution-world.ts";

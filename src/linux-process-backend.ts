@@ -48,6 +48,7 @@ import {
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
+import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { observeStrace, type StraceObservation } from "./strace-observer.ts";
@@ -88,26 +89,15 @@ export interface LinuxProcessBackendStatus {
 	readonly unshareBinary?: string;
 }
 
-export interface LinuxProcessReuseMetrics {
-	readonly requests: number;
-	readonly hits: number;
-	readonly misses: number;
-	readonly bypasses: number;
-	readonly published: number;
-	readonly tainted: number;
-	readonly validationMs: number;
-	readonly validationCandidates: number;
-	readonly validationPathsets: number;
-	readonly validationFilesRead: number;
-	readonly validationBytesRead: number;
-	readonly validationArtifactsLoaded: number;
-	readonly validationArtifactBytesRead: number;
-	readonly executionMs: number;
-	readonly lastError?: string;
-}
+export type LinuxProcessReuseMetrics = WorldReuseMetrics;
+type CountedReuseMetric = Exclude<keyof WorldReuseMetrics, "lastError">;
+type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: number } & {
+	lastError?: string;
+};
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	readonly metrics: () => LinuxProcessReuseMetrics;
 	/** Join the outer workspace transaction delta to the process observation before validation. */
 	readonly seal: (changes: readonly SandboxWorkspaceChange[]) => Promise<readonly SandboxDirectoryChange[]>;
 	/** Revalidate every observed input immediately before Actor adoption. */
@@ -178,6 +168,7 @@ interface ActiveSession {
 	readonly server: net.Server;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
 	readonly incompleteReasons: Set<string>;
+	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
 	topLevelEvidence?: DynamicDependencyCertificate;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
@@ -209,38 +200,7 @@ export class LinuxProcessReuseBackend {
 	private ready?: Promise<ReadyBackend>;
 	private disposed = false;
 	private readonly inFlight = new Map<Sha256Digest, Promise<void>>();
-	private readonly counters: {
-		requests: number;
-		hits: number;
-		misses: number;
-		bypasses: number;
-		published: number;
-		tainted: number;
-		validationMs: number;
-		validationCandidates: number;
-		validationPathsets: number;
-		validationFilesRead: number;
-		validationBytesRead: number;
-		validationArtifactsLoaded: number;
-		validationArtifactBytesRead: number;
-		executionMs: number;
-		lastError?: string;
-	} = {
-		requests: 0,
-		hits: 0,
-		misses: 0,
-		bypasses: 0,
-		published: 0,
-		tainted: 0,
-		validationMs: 0,
-		validationCandidates: 0,
-		validationPathsets: 0,
-		validationFilesRead: 0,
-		validationBytesRead: 0,
-		validationArtifactsLoaded: 0,
-		validationArtifactBytesRead: 0,
-		executionMs: 0,
-	};
+	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
@@ -330,6 +290,7 @@ export class LinuxProcessReuseBackend {
 			server,
 			nestedEvidence: [],
 			incompleteReasons: new Set<string>(),
+			metrics: { ...emptyWorldReuseMetrics() },
 			closed: false,
 		});
 		await listen(server, socketPath);
@@ -341,6 +302,7 @@ export class LinuxProcessReuseBackend {
 		};
 		return {
 			executor: { execute: (request) => this.executeTopLevel(session, request) },
+			metrics: () => Object.freeze({ ...session.metrics }),
 			seal: (changes) => {
 				session.sealPromise ??= sealSessionEvidence(session, changes);
 				return session.sealPromise;
@@ -489,7 +451,7 @@ export class LinuxProcessReuseBackend {
 			void this.handleWireRequest(session, body)
 				.then((response) => socket.end(JSON.stringify(response)))
 				.catch(async (error) => {
-					this.counters.lastError = errorMessage(error);
+					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
 					const request = parseDispatcherRequest(body);
 					const executable = request ? await this.resolveRequestedExecutable(session, request).catch(() => undefined) : undefined;
@@ -501,26 +463,26 @@ export class LinuxProcessReuseBackend {
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
 		const request = parseDispatcherRequest(body);
 		if (!request || request.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
-		this.counters.requests++;
+		this.add(session, "requests");
 		const executable = await this.resolveRequestedExecutable(session, request);
 		if (!eligibleRequest(session, request, executable)) {
-			this.counters.bypasses++;
+			this.add(session, "bypasses");
 			session.incompleteReasons.add(`broker_bypass:${request.name}`);
 			return { version: 1, kind: "bypass", executable };
 		}
 		const prototype = await this.prototype(session, request, executable);
 		const weakKey = processWeakKey(prototype);
 		const initial = await this.plan(session, prototype);
-		if (initial) return this.replay(session, initial, weakKey);
+		if (initial) return this.replay(session, initial, weakKey, false);
 
 		const preceding = this.inFlight.get(weakKey);
 		if (preceding) {
 			await preceding;
 			const joined = await this.plan(session, prototype);
-			if (joined) return this.replay(session, joined, weakKey);
+			if (joined) return this.replay(session, joined, weakKey, true);
 		}
 
-		this.counters.misses++;
+		this.add(session, "misses");
 		let release!: () => void;
 		const pending = new Promise<void>((resolve) => {
 			release = resolve;
@@ -546,17 +508,17 @@ export class LinuxProcessReuseBackend {
 			},
 			validation: { resolvePath: (logicalPath) => session.projection.toPhysical(logicalPath) },
 		});
-		this.counters.validationMs += Math.max(0, performance.now() - started);
-		this.counters.validationCandidates += plan.lookup.candidateCertificates;
-		this.counters.validationPathsets += plan.lookup.pathsetsValidated;
-		this.counters.validationFilesRead += plan.lookup.filesRead;
-		this.counters.validationBytesRead += plan.lookup.bytesRead;
-		this.counters.validationArtifactsLoaded += plan.lookup.artifactsLoaded;
-		this.counters.validationArtifactBytesRead += plan.lookup.artifactBytesRead;
+		this.add(session, "validationMs", Math.max(0, performance.now() - started));
+		this.add(session, "validationCandidates", plan.lookup.candidateCertificates);
+		this.add(session, "validationPathsets", plan.lookup.pathsetsValidated);
+		this.add(session, "validationFilesRead", plan.lookup.filesRead);
+		this.add(session, "validationBytesRead", plan.lookup.bytesRead);
+		this.add(session, "validationArtifactsLoaded", plan.lookup.artifactsLoaded);
+		this.add(session, "validationArtifactBytesRead", plan.lookup.artifactBytesRead);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
-			this.counters.lastError = `reuse_miss:${plan.reasons.join(",")}${
+			this.setError(session, `reuse_miss:${plan.reasons.join(",")}${
 				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
-			}`;
+			}`);
 		}
 		return plan.kind === "completed_replay" ? plan : undefined;
 	}
@@ -565,13 +527,20 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
+		joined: boolean,
 	): Promise<DispatcherResponse> {
-		const { artifacts, certificate } = plan;
-		const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
-		await replayFilesystemEffects(artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
-		session.nestedEvidence.push(certificate.dependencyCertificate);
-		this.counters.hits++;
-		return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
+		const started = performance.now();
+		try {
+			const { artifacts, certificate } = plan;
+			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
+			await replayFilesystemEffects(artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+			session.nestedEvidence.push(certificate.dependencyCertificate);
+			this.add(session, "hits");
+			if (joined) this.add(session, "joinedHits");
+			return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
+		} finally {
+			this.add(session, "replayMs", Math.max(0, performance.now() - started));
+		}
 	}
 
 	private async executeAndPublish(
@@ -624,11 +593,11 @@ export class LinuxProcessReuseBackend {
 					}),
 				]);
 				if (observation.incompleteReasons.length) {
-					this.counters.lastError = `trace:${observation.incompleteReasons.join(",")}`;
+					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
 					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
 				}
 				if (!delta.complete) {
-					this.counters.lastError = `transaction:${delta.reason}`;
+					this.setError(session, `transaction:${delta.reason}`);
 					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
 				}
 				const { before, after } = delta;
@@ -640,7 +609,7 @@ export class LinuxProcessReuseBackend {
 					effects.effects,
 				);
 				if (evidence.incompleteReasons.length) {
-					this.counters.lastError = `evidence:${evidence.incompleteReasons.join(",")}`;
+					this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				}
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				for (const taint of evidence.taints) taints.add(taint);
@@ -702,20 +671,30 @@ export class LinuxProcessReuseBackend {
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				await this.planner.publishCompleted(certificate);
-				this.counters.published++;
-				if (taints.size) this.counters.tainted++;
+				this.add(session, "published");
+				if (taints.size) this.add(session, "tainted");
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
-				this.counters.lastError = `post_execution_capture:${errorMessage(error)}`;
+				this.setError(session, `post_execution_capture:${errorMessage(error)}`);
 				session.incompleteReasons.add(`nested_capture:${errorMessage(error)}`);
 			}
 			const exit = exitOutcome(outcome);
 			return { version: 1, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
-			this.counters.executionMs += Math.max(0, performance.now() - started);
+			this.add(session, "executionMs", Math.max(0, performance.now() - started));
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
+	}
+
+	private add(session: ActiveSession, metric: CountedReuseMetric, value = 1): void {
+		this.counters[metric] += value;
+		session.metrics[metric] += value;
+	}
+
+	private setError(session: ActiveSession, detail: string): void {
+		this.counters.lastError = detail;
+		session.metrics.lastError = detail;
 	}
 
 	private async resolveRequestedExecutable(session: ActiveSession, request: DispatcherRequest): Promise<string> {

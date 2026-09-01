@@ -1,4 +1,4 @@
-import type { SpeculativeExecution } from "./execution-world.ts";
+import type { SpeculativeExecution, SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
 import type {
 	ActorActionSettlement,
 	PredictionSettlement,
@@ -29,6 +29,11 @@ export interface CandidateEventDescriptor {
 	readonly tool: string;
 	readonly actionKeyHash: string;
 	readonly execution: SpeculativeExecution;
+	readonly route?: SpeculativeExecutionRoute;
+	readonly world?: {
+		readonly backend: string;
+		readonly executionMetrics: WorldExecutionMetrics;
+	};
 	readonly source: string;
 	readonly depth: number;
 	readonly predictedAction: string;
