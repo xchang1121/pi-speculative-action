@@ -51,9 +51,7 @@ import type { ProcessExecutionRequest, ProcessExecutor } from "./process-executi
 import {
 	emptyWorldReuseMetrics,
 	type ExecutionScope,
-	type ExecutionWorldStorageLimits,
-	type ExecutionWorldStorageMaintenance,
-	type ExecutionWorldStorageOperation,
+	type ExecutionWorldStorageControl,
 	type WorldReuseMetrics,
 } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
@@ -209,6 +207,7 @@ interface SpawnOutcome {
 export class LinuxProcessReuseBackend {
 	readonly store: ProvenanceCertificateStore;
 	readonly planner: ProcessReusePlanner;
+	readonly storage: ExecutionWorldStorageControl;
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
 	private disposed = false;
@@ -220,6 +219,19 @@ export class LinuxProcessReuseBackend {
 		this.options = options;
 		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
+		this.storage = {
+			configure: ({ maxEntries, maxBytes }) =>
+				this.store.configure({ maxCertificates: maxEntries, maxBytes }),
+			maintain: async (operation) => {
+				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
+				if (operation === "clear") this.certificateScopes.clear();
+				return {
+					removedEntries: result.removedCertificates,
+					removedArtifacts: result.removedArtifacts,
+					removedBytes: result.removedBytes,
+				};
+			},
+		};
 	}
 
 	async check(refresh = false): Promise<LinuxProcessBackendStatus> {
@@ -246,20 +258,6 @@ export class LinuxProcessReuseBackend {
 
 	metrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.counters });
-	}
-
-	configureStorage(limits: ExecutionWorldStorageLimits): void {
-		this.store.configure({ maxCertificates: limits.maxEntries, maxBytes: limits.maxBytes });
-	}
-
-	async maintainStorage(operation: ExecutionWorldStorageOperation): Promise<ExecutionWorldStorageMaintenance> {
-		const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
-		if (operation === "clear") this.certificateScopes.clear();
-		return {
-			removedEntries: result.removedCertificates,
-			removedArtifacts: result.removedArtifacts,
-			removedBytes: result.removedBytes,
-		};
 	}
 
 	async open(input: {

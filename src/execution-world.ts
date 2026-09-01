@@ -150,30 +150,23 @@ export interface ExecutionWorldPreparation {
 
 export type ExecutionWorldHealthState = "registered" | "ready" | "degraded" | "unavailable";
 
-export interface ExecutionWorldStorageLimits {
-	readonly maxEntries: number;
-	readonly maxBytes: number;
-}
-
-export interface ExecutionWorldStorageSnapshot extends ExecutionWorldStorageLimits {
+export interface ExecutionWorldStorageSnapshot {
 	readonly entries: number;
+	readonly maxEntries: number;
 	readonly bytes: number;
+	readonly maxBytes: number;
 	readonly orphanArtifacts?: number;
 	readonly overBudget: boolean;
 }
 
-export type ExecutionWorldStorageOperation = "gc" | "clear";
-
-export interface ExecutionWorldStorageMaintenance {
-	readonly removedEntries: number;
-	readonly removedArtifacts: number;
-	readonly removedBytes: number;
-}
-
 export interface ExecutionWorldStorageControl {
 	/** Applies the retention policy synchronously; reclamation remains an explicit maintenance action. */
-	readonly configure: (limits: ExecutionWorldStorageLimits) => void;
-	readonly maintain: (operation: ExecutionWorldStorageOperation) => Promise<ExecutionWorldStorageMaintenance>;
+	readonly configure: (limits: Pick<ExecutionWorldStorageSnapshot, "maxEntries" | "maxBytes">) => void;
+	readonly maintain: (operation: "gc" | "clear") => Promise<{
+		readonly removedEntries: number;
+		readonly removedArtifacts: number;
+		readonly removedBytes: number;
+	}>;
 }
 
 /** Backend-owned health independent from whether one concrete action has selected this world. */
