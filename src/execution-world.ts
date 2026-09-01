@@ -186,6 +186,34 @@ export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnost
 	readonly id: string;
 	readonly scope: ExecutionWorldScope;
 	readonly isolation: SpeculativeExecution;
+	readonly capabilities: EffectCapabilities;
+}
+
+/** Fast, side-effect-free view of whether the registered worlds can route one effect contract. */
+export interface ExecutionCapabilityStatus {
+	readonly state: ExecutionWorldHealthState;
+	readonly primary?: ExecutionWorldDiagnosticSnapshot;
+	readonly candidates: readonly ExecutionWorldDiagnosticSnapshot[];
+}
+
+export function executionCapabilityStatus(
+	requirements: EffectRequirements,
+	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+): ExecutionCapabilityStatus {
+	const candidates = (["runtime", "fallback"] as const).flatMap((scope) =>
+		worlds.filter(
+			(world) => world.scope === scope && effectCapabilitiesCover(world.capabilities, requirements),
+		),
+	);
+	const primary =
+		candidates.find((world) => world.state === "ready") ??
+		candidates.find((world) => world.state === "registered") ??
+		candidates[0];
+	return Object.freeze({
+		state: primary?.state ?? "unavailable",
+		...(primary ? { primary } : {}),
+		candidates: Object.freeze(candidates),
+	});
 }
 
 interface ExecutionWorldLifecycle<Context, Output> {
@@ -290,6 +318,7 @@ export class ExecutionWorldRouter<Context, Output> {
 					id: world.id,
 					scope: world.scope,
 					isolation: world.isolation,
+					capabilities: world.capabilities,
 					...(report ??
 						(route?.cwd === input.cwd ? route : undefined) ?? {
 							state: "registered",

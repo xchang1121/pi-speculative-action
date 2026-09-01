@@ -1,12 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	KEYABLE_TOOLS,
+	PI_ACTION_SEMANTICS,
+} from "../src/action-semantics.ts";
+import {
 	type EffectCapabilities,
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
-import type { ExecutionWorld, SpeculativeExecution } from "../src/execution-world.ts";
-import { ExecutionWorldRouter, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
+import type { ExecutionWorld, ExecutionWorldDiagnosticSnapshot, SpeculativeExecution } from "../src/execution-world.ts";
+import {
+	executionCapabilityStatus,
+	ExecutionWorldRouter,
+	sameSpeculativeExecutionRoute,
+} from "../src/execution-world.ts";
 
 type TestWorld = ExecutionWorld<{ readonly value: string }, string>;
 const preparation = { cwd: "/workspace" };
@@ -104,7 +112,96 @@ describe("ExecutionWorldRouter", () => {
 		expect(await branch?.commit()).toBe("actor output");
 		expect(disposeCapture).not.toHaveBeenCalled();
 	});
+
+	it.each([
+		["Windows", "Linux host required"],
+		["macOS", "Linux host required"],
+		["WSL 1", "required namespace unavailable"],
+	] as const)("routes portable tools but blocks Bash on %s", (_platform, processDetail) => {
+		const status = toolStatuses(platformWorlds("unavailable", processDetail));
+		expect(status).toEqual({
+			read: "ready",
+			grep: "ready",
+			find: "ready",
+			ls: "ready",
+			write: "registered",
+			edit: "registered",
+			bash: "unavailable",
+		});
+	});
+
+	it.each(["Linux", "WSL 2"])("routes Bash when the Linux process world is ready on %s", () => {
+		expect(toolStatuses(platformWorlds("ready", "process isolation ready"))).toEqual({
+			read: "ready",
+			grep: "ready",
+			find: "ready",
+			ls: "ready",
+			write: "registered",
+			edit: "registered",
+			bash: "ready",
+		});
+	});
+
+	it("lets an injected all-effect runtime make every tool routable on any host", () => {
+		const worlds = [
+			...platformWorlds("unavailable", "Linux host required"),
+			diagnostic("host_runtime", "runtime", "runtime_sandbox", "all", "ready", "host runtime ready"),
+		];
+		expect(new Set(Object.values(toolStatuses(worlds)))).toEqual(new Set(["ready"]));
+	});
 });
+
+function toolStatuses(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): Record<string, string> {
+	return Object.fromEntries(
+		KEYABLE_TOOLS.map((tool) => [
+			tool,
+			executionCapabilityStatus(PI_ACTION_SEMANTICS.requirements(tool)!, worlds).state,
+		]),
+	);
+}
+
+function platformWorlds(
+	processState: "ready" | "unavailable",
+	processDetail: string,
+): readonly ExecutionWorldDiagnosticSnapshot[] {
+	return [
+		diagnostic(
+			"linux_process_reuse",
+			"runtime",
+			"runtime_sandbox",
+			UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+			processState,
+			processDetail,
+		),
+		diagnostic(
+			"git_worktree",
+			"fallback",
+			"workspace_branch",
+			WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			"registered",
+			"checked on first use",
+		),
+		diagnostic(
+			"resource_version",
+			"fallback",
+			"resource_snapshot",
+			RESOURCE_OBSERVATION_EFFECTS.capabilities,
+			"ready",
+			"resource validation ready",
+		),
+	];
+}
+
+function diagnostic(
+	id: string,
+	scope: ExecutionWorldDiagnosticSnapshot["scope"],
+	isolation: ExecutionWorldDiagnosticSnapshot["isolation"],
+	capabilities: EffectCapabilities,
+	state: ExecutionWorldDiagnosticSnapshot["state"],
+	detail: string,
+): ExecutionWorldDiagnosticSnapshot {
+	return { id, scope, isolation, capabilities, state, detail };
+}
 
 function runtime(id: string): TestWorld {
 	return { ...lifecycle(id), scope: "runtime", isolation: "runtime_sandbox", capabilities: "all" };

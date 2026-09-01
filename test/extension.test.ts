@@ -26,6 +26,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { UNRESTRICTED_PROCESS_EFFECTS } from "../src/effect-model.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
@@ -358,6 +359,7 @@ describe("zero-modification Pi extension", () => {
 		const fixture = await createFixture({ settings: { enabled: true } });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([{
 			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
+			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			state: "unavailable", detail: "Linux host required",
 			storage: { entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false },
 		}]);
