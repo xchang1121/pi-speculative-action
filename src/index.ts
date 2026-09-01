@@ -368,6 +368,7 @@ export {
 	type SandboxWorkspaceBranchOptions,
 	type WorkspaceSandboxOptions,
 	type WorkspaceSandboxDriver,
+	WorkspaceSandboxService,
 	forkSandboxWorkspace,
 	withSandboxWorkspace,
 	workspaceSandboxFingerprint,

@@ -147,7 +147,15 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 	readonly sharedBaseline?: SharedOverlayBaseline;
 }
 
+interface WorkspaceSandboxState {
+	readonly repositories: Map<string, Promise<PooledGitRepository>>;
+	readonly targetLocks: Map<string, Promise<void>>;
+	cleanupTail: Promise<void>;
+	disposed: boolean;
+}
+
 interface PooledGitRepository {
+	readonly owner: WorkspaceSandboxState;
 	readonly sourceRoot: string;
 	readonly parent: string;
 	readonly repository: string;
@@ -586,7 +594,6 @@ const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";
 // Small-tree gains remain host-sensitive and carry one-time FUSE preparation cost, while the
 // 500/1,000-file A/B is material. Use a conservative power-of-two boundary and exact baseline.
 const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
-const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_AUTHOR_NAME: "Pi Speculative Action",
 	GIT_AUTHOR_EMAIL: "speculative-action@localhost",
@@ -630,14 +637,87 @@ export interface QualifiedWorkspaceSandboxDriver {
 	readonly fingerprint: string;
 }
 
+/** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
+export class WorkspaceSandboxService {
+	private readonly state: WorkspaceSandboxState = {
+		repositories: new Map(),
+		targetLocks: new Map(),
+		cleanupTail: Promise.resolve(),
+		disposed: false,
+	};
+
+	async fingerprint(options: WorkspaceSandboxOptions = {}, sourceRoot?: string): Promise<string> {
+		assertWorkspaceSandboxOpen(this.state);
+		return await workspaceSandboxFingerprintFor(this.state, options, sourceRoot);
+	}
+
+	async qualify(
+		options: WorkspaceSandboxOptions,
+		sourceRoot: string,
+	): Promise<QualifiedWorkspaceSandboxDriver> {
+		assertWorkspaceSandboxOpen(this.state);
+		return await resolveWorkspaceDriver(this.state, options, sourceRoot);
+	}
+
+	createExecutionWorld(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
+		assertWorkspaceSandboxOpen(this.state);
+		return createWorkspaceSandboxFor(this.state, options);
+	}
+
+	async prepare(cwd: string, options: PrepareSandboxWorkspaceOptions = {}): Promise<void> {
+		assertWorkspaceSandboxOpen(this.state);
+		await prepareSandboxWorkspaceFor(this.state, cwd, options);
+	}
+
+	async fork(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
+		assertWorkspaceSandboxOpen(this.state);
+		return await forkSandboxWorkspaceFor(this.state, options);
+	}
+
+	async withWorkspace<T>(
+		cwd: string,
+		run: (workspace: SandboxWorkspaceContext) => Promise<T>,
+		gitBinary = "git",
+	): Promise<T> {
+		assertWorkspaceSandboxOpen(this.state);
+		return await withSandboxWorkspaceFor(this.state, cwd, run, gitBinary);
+	}
+
+	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
+		assertWorkspaceSandboxOpen(this.state);
+		return (await commitSandboxExecution(this.state, delta)).output;
+	}
+
+	closePools(roots?: readonly string[]): Promise<void> {
+		return closeWorkspaceSandboxPoolsFor(this.state, roots);
+	}
+
+	async dispose(): Promise<void> {
+		if (this.state.disposed) return;
+		this.state.disposed = true;
+		await Promise.allSettled([...this.state.targetLocks.values()]);
+		await closeWorkspaceSandboxPoolsFor(this.state);
+	}
+}
+
+const defaultWorkspaceSandboxService = new WorkspaceSandboxService();
+
 /** Concrete storage identity is part of route compatibility, never an implicit implementation detail. */
 export async function workspaceSandboxFingerprint(
 	options: WorkspaceSandboxOptions = {},
 	sourceRoot?: string,
 ): Promise<string> {
+	return defaultWorkspaceSandboxService.fingerprint(options, sourceRoot);
+}
+
+async function workspaceSandboxFingerprintFor(
+	state: WorkspaceSandboxState,
+	options: WorkspaceSandboxOptions,
+	sourceRoot?: string,
+): Promise<string> {
 	return sourceRoot
-		? (await qualifyWorkspaceSandboxDriver(options, sourceRoot)).fingerprint
-		: (await resolveWorkspaceDriver(options)).fingerprint;
+		? (await resolveWorkspaceDriver(state, options, sourceRoot)).fingerprint
+		: (await resolveWorkspaceDriver(state, options)).fingerprint;
 }
 
 /**
@@ -649,10 +729,11 @@ export function qualifyWorkspaceSandboxDriver(
 	options: WorkspaceSandboxOptions,
 	sourceRoot: string,
 ): Promise<QualifiedWorkspaceSandboxDriver> {
-	return resolveWorkspaceDriver(options, sourceRoot);
+	return defaultWorkspaceSandboxService.qualify(options, sourceRoot);
 }
 
 async function resolveWorkspaceDriver(
+	state: WorkspaceSandboxState,
 	options: WorkspaceSandboxOptions,
 	sourceRoot?: string,
 	acquiredRepository?: PooledGitRepository,
@@ -673,7 +754,7 @@ async function resolveWorkspaceDriver(
 
 	const ownedRepository = acquiredRepository
 		? undefined
-		: await acquireSandboxRepository(path.resolve(sourceRoot), options.gitBinary ?? "git");
+		: await acquireSandboxRepository(state, path.resolve(sourceRoot), options.gitBinary ?? "git");
 	const repository = acquiredRepository ?? ownedRepository;
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
@@ -700,6 +781,13 @@ async function resolveWorkspaceDriver(
 
 /** Create a copy-on-write execution world with transactional multi-file commit. */
 export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
+	return defaultWorkspaceSandboxService.createExecutionWorld(options);
+}
+
+function createWorkspaceSandboxFor(
+	state: WorkspaceSandboxState,
+	options: WorkspaceSandboxOptions,
+): SpeculativeAgentExecutionWorld {
 	// Generic mutation routes have no workspace root at fingerprint time. Their short, targeted
 	// branches retain Git unless OverlayFS was explicitly requested; Linux process routes can make
 	// the exact baseline-qualified auto decision from their invocation context.
@@ -711,20 +799,25 @@ export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): S
 		scope: "fallback",
 		isolation: "workspace_branch",
 		capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-		fingerprint: () => workspaceSandboxFingerprint(resolvedOptions),
+		fingerprint: () => {
+			assertWorkspaceSandboxOpen(state);
+			return workspaceSandboxFingerprintFor(state, resolvedOptions);
+		},
 		prepare: async ({ cwd, signal }) => {
+			assertWorkspaceSandboxOpen(state);
 			roots.add(path.resolve(cwd));
-			await prepareSandboxWorkspace(cwd, { ...resolvedOptions, signal });
+			await prepareSandboxWorkspaceFor(state, cwd, { ...resolvedOptions, signal });
 		},
 		fork: async (context) => {
+			assertWorkspaceSandboxOpen(state);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			return executeMutation(context, resolvedOptions);
+			return executeMutation(state, context, resolvedOptions);
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
 			roots.clear();
-			await closeWorkspaceSandboxPools(ownedRoots);
+			await closeWorkspaceSandboxPoolsFor(state, ownedRoots);
 		},
 	};
 }
@@ -739,6 +832,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly validate?: () => Promise<ResourceValidation>;
 	private readonly changes: readonly SandboxWorkspaceChange[];
+	private readonly owner: WorkspaceSandboxState;
 	private stateValue: WorldBranchState = "sealed";
 	private commitMetricsValue?: WorldCommitMetrics;
 	private commitPromise?: Promise<ToolSettlement>;
@@ -747,6 +841,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 		snapshot: WorkspaceExecutionSnapshot,
 		sourceRoot: string,
 		executionFingerprint: string,
+		owner: WorkspaceSandboxState,
 		parent?: GitWorldCheckpoint,
 		validate?: () => Promise<ResourceValidation>,
 	) {
@@ -762,6 +857,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 			0,
 		);
 		this.executionMetrics = Object.freeze({ ...snapshot.executionMetrics });
+		this.owner = owner;
 		this.compatibility = Object.freeze({
 			status: "compatible" as const,
 			backend: this.backend,
@@ -781,7 +877,7 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	readonly commit = (): Promise<ToolSettlement> => {
 		if (this.commitPromise) return this.commitPromise;
 		this.stateValue = "committing";
-		this.commitPromise = commitSandboxExecution({ output: this.output, changes: this.changes }).then(
+		this.commitPromise = commitSandboxExecution(this.owner, { output: this.output, changes: this.changes }).then(
 			({ output, metrics }) => {
 				this.commitMetricsValue = metrics;
 				this.stateValue = "committed";
@@ -802,15 +898,18 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 
 /** Low-level transactional commit primitive for execution-world implementations. */
 export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
-	return (await commitSandboxExecution(delta)).output;
+	return defaultWorkspaceSandboxService.commitDelta(delta);
 }
 
 async function commitSandboxExecution(
+	state: WorkspaceSandboxState,
 	execution: SandboxExecutionDelta,
 ): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldCommitMetrics }> {
+	assertWorkspaceSandboxOpen(state);
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
 	return withTargetLocks(
+		state.targetLocks,
 		commitLockTargets(changes),
 		async () => {
 			const staged = new Map<SandboxFileChange, string>();
@@ -915,7 +1014,16 @@ export async function withSandboxWorkspace<T>(
 	run: (workspace: SandboxWorkspaceContext) => Promise<T>,
 	gitBinary = "git",
 ): Promise<T> {
-	const workspace = await createPrivateSandboxWorkspace(cwd, gitBinary, "git", {});
+	return defaultWorkspaceSandboxService.withWorkspace(cwd, run, gitBinary);
+}
+
+async function withSandboxWorkspaceFor<T>(
+	state: WorkspaceSandboxState,
+	cwd: string,
+	run: (workspace: SandboxWorkspaceContext) => Promise<T>,
+	gitBinary: string,
+): Promise<T> {
+	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, "git", {});
 	try {
 		return await run(workspace);
 	} finally {
@@ -928,13 +1036,22 @@ export async function withSandboxWorkspace<T>(
  * complete regular-file delta. Process and host-function worlds share this primitive.
  */
 export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
+	return defaultWorkspaceSandboxService.fork(options);
+}
+
+async function forkSandboxWorkspaceFor(
+	state: WorkspaceSandboxState,
+	options: SandboxWorkspaceBranchOptions,
+): Promise<WorldBranch<ToolSettlement>> {
 	const sourceRoot = path.resolve(options.cwd);
 	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
 	const resolvedDriver = await resolveWorkspaceDriver(
+		state,
 		options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options,
 	);
 	const setupStarted = performance.now();
 	const snapshot = await withPrivateSandboxWorkspace(
+		state,
 		sourceRoot,
 		options.gitBinary ?? "git",
 		resolvedDriver.driver,
@@ -957,21 +1074,36 @@ export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOption
 		},
 		parent,
 	);
-	return new GitWorldBranch(snapshot, sourceRoot, options.action.executionFingerprint, parent, options.validate);
+	return new GitWorldBranch(
+		snapshot,
+		sourceRoot,
+		options.action.executionFingerprint,
+		state,
+		parent,
+		options.validate,
+	);
 }
 
 export async function prepareSandboxWorkspace(
 	cwd: string,
 	options: PrepareSandboxWorkspaceOptions = {},
 ): Promise<void> {
+	return defaultWorkspaceSandboxService.prepare(cwd, options);
+}
+
+async function prepareSandboxWorkspaceFor(
+	state: WorkspaceSandboxState,
+	cwd: string,
+	options: PrepareSandboxWorkspaceOptions,
+): Promise<void> {
 	throwIfAborted(options.signal);
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
-	const repository = await acquireSandboxRepository(sourceRoot, options.gitBinary ?? "git");
+	const repository = await acquireSandboxRepository(state, sourceRoot, options.gitBinary ?? "git");
 	try {
 		const concreteOptions =
 			options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" as const } : options;
-		const resolved = await resolveWorkspaceDriver(concreteOptions, sourceRoot, repository);
+		const resolved = await resolveWorkspaceDriver(state, concreteOptions, sourceRoot, repository);
 		if (resolved.driver === "overlayfs") {
 			const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -988,6 +1120,7 @@ export async function prepareSandboxWorkspace(
 }
 
 async function executeMutation(
+	state: WorkspaceSandboxState,
 	context: SpeculativeToolExecutionContext,
 	options: WorkspaceSandboxOptions,
 ): Promise<WorldBranch<ToolSettlement>> {
@@ -1001,7 +1134,7 @@ async function executeMutation(
 	await assertNoSymlinkPath(sourceRoot, target);
 	const resource = slash(path.relative(sourceRoot, target));
 	const requestedPath = args.path;
-	return forkSandboxWorkspace({
+	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot,
 		action: context.action,
 		...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
@@ -1023,6 +1156,7 @@ async function executeMutation(
 }
 
 async function createPrivateSandboxWorkspace(
+	state: WorkspaceSandboxState,
 	cwd: string,
 	gitBinary: string,
 	driver: Exclude<WorkspaceSandboxDriver, "auto">,
@@ -1030,7 +1164,7 @@ async function createPrivateSandboxWorkspace(
 ): Promise<PrivateSandboxWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
-	const pool = await acquireSandboxRepository(sourceRoot, gitBinary);
+	const pool = await acquireSandboxRepository(state, sourceRoot, gitBinary);
 	let attached: PreparedGitWorkspace | undefined;
 	let sharedBaseline: SharedOverlayBaseline | undefined;
 	let overlay: LinuxOverlayfsMount | undefined;
@@ -1177,21 +1311,26 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	return driver;
 }
 
-async function acquireSandboxRepository(sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
+async function acquireSandboxRepository(
+	state: WorkspaceSandboxState,
+	sourceRoot: string,
+	gitBinary: string,
+): Promise<PooledGitRepository> {
+	assertWorkspaceSandboxOpen(state);
 	const key = `${pathKey(sourceRoot)}\0${gitBinary}`;
-	let pending = sandboxRepositories.get(key);
+	let pending = state.repositories.get(key);
 	if (!pending) {
-		pending = createSandboxRepository(sourceRoot, gitBinary);
-		sandboxRepositories.set(key, pending);
+		pending = createSandboxRepository(state, sourceRoot, gitBinary);
+		state.repositories.set(key, pending);
 		void pending.catch(() => {
-			if (sandboxRepositories.get(key) === pending) sandboxRepositories.delete(key);
+			if (state.repositories.get(key) === pending) state.repositories.delete(key);
 		});
 	}
 	const repository = await pending;
 	repository.registration ??= pending;
 	if (repository.quarantined) {
-		if (sandboxRepositories.get(key) === pending) sandboxRepositories.delete(key);
-		return acquireSandboxRepository(sourceRoot, gitBinary);
+		if (state.repositories.get(key) === pending) state.repositories.delete(key);
+		return acquireSandboxRepository(state, sourceRoot, gitBinary);
 	}
 	if (repository.idleTimer) {
 		clearTimeout(repository.idleTimer);
@@ -1201,7 +1340,11 @@ async function acquireSandboxRepository(sourceRoot: string, gitBinary: string): 
 	return repository;
 }
 
-async function createSandboxRepository(sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
+async function createSandboxRepository(
+	owner: WorkspaceSandboxState,
+	sourceRoot: string,
+	gitBinary: string,
+): Promise<PooledGitRepository> {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-pool-"));
 	const repository = path.join(parent, "snapshot.git");
 	try {
@@ -1209,6 +1352,7 @@ async function createSandboxRepository(sourceRoot: string, gitBinary: string): P
 		await git(gitBinary, ["--git-dir", repository, "config", "core.autocrlf", "false"], parent);
 		await git(gitBinary, ["--git-dir", repository, "config", "core.longpaths", "true"], parent);
 		return {
+			owner,
 			sourceRoot,
 			parent,
 			repository,
@@ -1610,7 +1754,7 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	if (repository.quarantined || repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
-		sandboxRepositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
+		repository.owner.repositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
 		const prepared = repository.prepared;
 		repository.prepared = undefined;
 		void (async () => {
@@ -1634,7 +1778,7 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 function quarantineSandboxRepository(repository: PooledGitRepository): void {
 	repository.quarantined = true;
 	const key = `${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
-	if (sandboxRepositories.get(key) === repository.registration) sandboxRepositories.delete(key);
+	if (repository.owner.repositories.get(key) === repository.registration) repository.owner.repositories.delete(key);
 	if (repository.idleTimer) {
 		clearTimeout(repository.idleTimer);
 		repository.idleTimer = undefined;
@@ -1646,14 +1790,33 @@ function quarantineSandboxRepository(repository: PooledGitRepository): void {
 }
 
 export async function closeWorkspaceSandboxPools(roots?: readonly string[]): Promise<void> {
+	return defaultWorkspaceSandboxService.closePools(roots);
+}
+
+function closeWorkspaceSandboxPoolsFor(
+	state: WorkspaceSandboxState,
+	roots?: readonly string[],
+): Promise<void> {
+	const close = state.cleanupTail.then(
+		() => closeWorkspaceSandboxPoolsNow(state, roots),
+		() => closeWorkspaceSandboxPoolsNow(state, roots),
+	);
+	state.cleanupTail = close.catch(() => undefined);
+	return close;
+}
+
+async function closeWorkspaceSandboxPoolsNow(
+	state: WorkspaceSandboxState,
+	roots?: readonly string[],
+): Promise<void> {
 	const rootKeys = roots ? new Set(roots.map(pathKey)) : undefined;
-	const pending = [...sandboxRepositories.entries()].filter(([key]) => {
+	const pending = [...state.repositories.entries()].filter(([key]) => {
 		if (!rootKeys) return true;
 		const separator = key.indexOf("\0");
 		return rootKeys.has(separator === -1 ? key : key.slice(0, separator));
 	});
 	for (const [key, item] of pending) {
-		if (sandboxRepositories.get(key) === item) sandboxRepositories.delete(key);
+		if (state.repositories.get(key) === item) state.repositories.delete(key);
 		const repository = await item.catch(() => undefined);
 		if (!repository) continue;
 		await waitForSandboxRepositoryIdle(repository);
@@ -1724,7 +1887,12 @@ function pathKey(value: string): string {
 	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+function assertWorkspaceSandboxOpen(state: WorkspaceSandboxState): void {
+	if (state.disposed) throw new Error("Workspace sandbox service is disposed");
+}
+
 async function withPrivateSandboxWorkspace<T>(
+	state: WorkspaceSandboxState,
 	cwd: string,
 	gitBinary: string,
 	driver: Exclude<WorkspaceSandboxDriver, "auto">,
@@ -1732,7 +1900,7 @@ async function withPrivateSandboxWorkspace<T>(
 	run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 	checkpoint?: GitWorldCheckpoint,
 ): Promise<T> {
-	const workspace = await createPrivateSandboxWorkspace(cwd, gitBinary, driver, overlayOptions);
+	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions);
 	try {
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);
@@ -2486,19 +2654,23 @@ function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[]
 	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))];
 }
 
-const targetLocks = new Map<string, Promise<void>>();
-
-async function withTargetLocks<T>(targets: readonly string[], run: () => Promise<T>): Promise<T> {
+async function withTargetLocks<T>(
+	targetLocks: Map<string, Promise<void>>,
+	targets: readonly string[],
+	run: () => Promise<T>,
+): Promise<T> {
 	const releases: Array<() => void> = [];
 	try {
-		for (const target of [...new Set(targets.map(pathKey))].sort()) releases.push(await acquireTargetLock(target));
+		for (const target of [...new Set(targets.map(pathKey))].sort()) {
+			releases.push(await acquireTargetLock(targetLocks, target));
+		}
 		return await run();
 	} finally {
 		for (const release of releases.reverse()) release();
 	}
 }
 
-async function acquireTargetLock(key: string): Promise<() => void> {
+async function acquireTargetLock(targetLocks: Map<string, Promise<void>>, key: string): Promise<() => void> {
 	const previous = targetLocks.get(key) ?? Promise.resolve();
 	let release: () => void = () => undefined;
 	const current = new Promise<void>((resolve) => {

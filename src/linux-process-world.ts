@@ -9,17 +9,15 @@ import {
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import {
-	closeWorkspaceSandboxPools,
-	forkSandboxWorkspace,
-	prepareSandboxWorkspace,
-	qualifyWorkspaceSandboxDriver,
+	WorkspaceSandboxService,
 	type WorkspaceSandboxOptions,
-	workspaceSandboxFingerprint,
 } from "./workspace-sandbox.ts";
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
 	readonly backend?: LinuxProcessReuseBackend;
+	/** Shared explicitly with sibling execution worlds when they belong to one host lifecycle. */
+	readonly workspaceSandbox?: WorkspaceSandboxService;
 }
 
 /** Generic process world; eligibility follows invocation/effect capabilities, never a tool name. */
@@ -27,6 +25,8 @@ export function createLinuxProcessExecutionWorld(
 	options: LinuxProcessExecutionWorldOptions,
 ): SpeculativeAgentExecutionWorld {
 	const backend = options.backend ?? new LinuxProcessReuseBackend(options);
+	const workspaceSandbox = options.workspaceSandbox ?? new WorkspaceSandboxService();
+	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
 	const workspaceOptions = pickWorkspaceOptions(options);
 	const roots = new Set<string>();
 	return {
@@ -39,8 +39,8 @@ export function createLinuxProcessExecutionWorld(
 			const [processFingerprint, workspaceFingerprint] = await Promise.all([
 				backend.fingerprint(),
 				invocation?.cwd
-					? qualifyWorkspaceSandboxDriver(workspaceOptions, invocation.cwd).then((selected) => selected.fingerprint)
-					: workspaceSandboxFingerprint(workspaceOptions),
+					? workspaceSandbox.qualify(workspaceOptions, invocation.cwd).then((selected) => selected.fingerprint)
+					: workspaceSandbox.fingerprint(workspaceOptions),
 			]);
 			return `${processFingerprint}:${workspaceFingerprint}`;
 		},
@@ -48,8 +48,8 @@ export function createLinuxProcessExecutionWorld(
 			const status = await backend.check();
 			if (status.state !== "ready") throw new Error(status.detail);
 			roots.add(path.resolve(cwd));
-			const selected = await qualifyWorkspaceSandboxDriver(workspaceOptions, cwd);
-			await prepareSandboxWorkspace(cwd, {
+			const selected = await workspaceSandbox.qualify(workspaceOptions, cwd);
+			await workspaceSandbox.prepare(cwd, {
 				...workspaceOptions,
 				driver: selected.driver,
 				...(signal ? { signal } : {}),
@@ -60,10 +60,10 @@ export function createLinuxProcessExecutionWorld(
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			const selected = await qualifyWorkspaceSandboxDriver(workspaceOptions, sourceRoot);
+			const selected = await workspaceSandbox.qualify(workspaceOptions, sourceRoot);
 			let validate: LinuxProcessSession["validate"] | undefined;
 			let seal: LinuxProcessSession["seal"] | undefined;
-			return forkSandboxWorkspace({
+			return workspaceSandbox.fork({
 				cwd: sourceRoot,
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
@@ -117,8 +117,12 @@ export function createLinuxProcessExecutionWorld(
 		dispose: async () => {
 			const ownedRoots = [...roots];
 			roots.clear();
-			await backend.dispose();
-			await closeWorkspaceSandboxPools(ownedRoots);
+			try {
+				await backend.dispose();
+			} finally {
+				if (ownsWorkspaceSandbox) await workspaceSandbox.dispose();
+				else await workspaceSandbox.closePools(ownedRoots);
+			}
 		},
 	};
 }

@@ -63,7 +63,7 @@ import {
 } from "./settings-store.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
-import { createWorkspaceSandbox } from "./workspace-sandbox.ts";
+import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
 
 const STATUS_KEY = "speculative-action";
 const CLOSE = "Close";
@@ -150,6 +150,7 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly createExecutionWorlds?: () => readonly SpeculativeAgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
+	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
 }
 
@@ -309,16 +310,21 @@ async function installController(
 		...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 	});
 	const processCoordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localProcessOperations));
+	let workspaceSandbox: WorkspaceSandboxService | undefined;
+	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.();
+	if (!configuredExecutionWorlds) {
+		workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
+		configuredExecutionWorlds = [
+			createLinuxProcessExecutionWorld({
+				coordinator: processCoordinator,
+				storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
+				workspaceSandbox,
+			}),
+			workspaceSandbox.createExecutionWorld(),
+		];
+	}
 	const executionWorlds = [
-		...new Set(
-			dependencies.createExecutionWorlds?.() ?? [
-				createLinuxProcessExecutionWorld({
-					coordinator: processCoordinator,
-					storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
-				}),
-				createWorkspaceSandbox(),
-			],
-		),
+		...new Set(configuredExecutionWorlds),
 	];
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -514,7 +520,11 @@ async function installController(
 			try {
 				await host.dispose();
 			} finally {
-				await selfSpeculation.dispose();
+				try {
+					await workspaceSandbox?.dispose();
+				} finally {
+					await selfSpeculation.dispose();
+				}
 			}
 		},
 	};

@@ -22,6 +22,7 @@ import {
 	qualifyWorkspaceSandboxDriver,
 	releaseResourceVersion,
 	ToolExecutionGateway,
+	WorkspaceSandboxService,
 } from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -45,6 +46,7 @@ describe("speculative action package boundary", () => {
 			ProcessReusePlanner,
 			ProcessExecutionCoordinator,
 			ProvenanceCertificateStore,
+			WorkspaceSandboxService,
 		]) {
 			expect(exported).toBeTypeOf("function");
 		}

@@ -21,6 +21,7 @@ import {
 	prepareSandboxWorkspace,
 	readSandboxDirectoryState,
 	withSandboxWorkspace,
+	WorkspaceSandboxService,
 	workspaceSandboxFingerprint,
 } from "../src/workspace-sandbox.ts";
 
@@ -67,6 +68,39 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
+	it("keeps pool and lock ownership inside an explicit service lifecycle", async () => {
+		const root = await temporaryRoot("service-lifecycle");
+		const first = new WorkspaceSandboxService();
+		const second = new WorkspaceSandboxService();
+		const firstWorld = first.createExecutionWorld({ driver: "git" });
+		const firstSibling = first.createExecutionWorld({ driver: "git" });
+		const secondWorld = second.createExecutionWorld({ driver: "git" });
+		try {
+			await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
+			await Promise.all([
+				firstWorld.prepare?.({ cwd: root }),
+				firstSibling.prepare?.({ cwd: root }),
+				secondWorld.prepare?.({ cwd: root }),
+			]);
+			const abandoned = await firstWorld.fork(
+				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
+			);
+
+			await Promise.all([firstWorld.dispose?.(), firstSibling.dispose?.()]);
+			await first.dispose();
+			await expect(first.prepare(root, { driver: "git" })).rejects.toThrow("service is disposed");
+			await expect(abandoned.commit()).rejects.toThrow("service is disposed");
+
+			const args = { path: "value.txt", content: "after\n" };
+			const branch = await secondWorld.fork(context(root, "write", writeTool, args));
+			await branch.commit();
+			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
+		} finally {
+			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("qualifies auto OverlayFS by the exact immutable baseline size", async () => {
 		if (!(await linuxOverlayfsCapability()).available) return;
 		const root = await temporaryRoot("overlay-auto-cost");
