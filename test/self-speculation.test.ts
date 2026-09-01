@@ -403,45 +403,32 @@ describe("self-speculation control plane", () => {
 	});
 
 	it("publishes only unique, keyable sidecar fork actions as bounded alternatives", async () => {
-		const actionBridge = new SelfSpeculationActionBridge();
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () =>
-				enabledSettings({ forkTransport: "sidecar", forkActionMinConfidence: 0, maxCandidates: 2 }),
-			requestID: () => "actor-request",
-			actionBridge,
-			fetch: vi.fn(async (input) =>
-				Response.json(
-					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
-						? {
-								details: {
-									bundle: {
-										candidates: [
-											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
-											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
-											{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
-											{
-												sources: ["self-speculation"],
-												tool_calls: [
-													{ name: "read", arguments: { path: "partial.txt" } },
-													{ name: "read", arguments: "bad" },
-												],
-											},
-											{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
-											{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
-										],
-									},
-								},
-							}
-						: {},
-				),
-			),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("text_delta", "x"));
+		const receipt = {
+			details: {
+				bundle: {
+					candidates: [
+						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
+						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
+						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
+						{
+							sources: ["self-speculation"],
+							tool_calls: [
+								{ name: "read", arguments: { path: "partial.txt" } },
+								{ name: "read", arguments: "bad" },
+							],
+						},
+						{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
+						{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
+					],
+				},
+			},
+		};
+		const { actions, coordinator } = await forkActionFixture(
+			{ forkActionMinConfidence: 0, maxCandidates: 2 },
+			receipt,
+		);
 
-		expect(await actions).toEqual([
+		expect(actions).toEqual([
 			{ tool: "read", input: { path: "a.txt" } },
 			{ tool: "write", input: { path: "b.txt" } },
 		]);
@@ -534,25 +521,12 @@ describe("self-speculation control plane", () => {
 		["positive", { token_count: 2, mean: -0.03, minimum: 0.01 }, false],
 		["infinite", { token_count: 2, mean: -0.03, minimum: Number.POSITIVE_INFINITY }, false],
 	])("applies the fork confidence gate to %s evidence", async (_label, logprobs, admitted) => {
-		const actionBridge = new SelfSpeculationActionBridge();
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar" }),
-			requestID: () => "actor-request",
-			actionBridge,
-			fetch: vi.fn(async (input) =>
-				Response.json(
-					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
-						? forkReceipt("read", { path: "not-executed.txt" }, logprobs)
-						: {},
-				),
-			),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("text_delta", "x"));
+		const { actions, coordinator } = await forkActionFixture(
+			{},
+			forkReceipt("read", { path: "not-executed.txt" }, logprobs),
+		);
 
-		expect(await actions).toEqual(admitted ? [{ tool: "read", input: { path: "not-executed.txt" } }] : []);
+		expect(actions).toEqual(admitted ? [{ tool: "read", input: { path: "not-executed.txt" } }] : []);
 		await coordinator.dispose();
 	});
 
@@ -560,20 +534,8 @@ describe("self-speculation control plane", () => {
 		["disabled", false, forkReceipt("read", { path: "a.txt" })],
 		["malformed", true, null],
 	])("releases action waiters for %s fork output", async (_label, forkActionEnabled, receipt) => {
-		const actionBridge = new SelfSpeculationActionBridge();
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar", forkActionEnabled }),
-			requestID: () => "actor-request",
-			actionBridge,
-			fetch: vi.fn(async (input) =>
-				Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}),
-			),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		const actions = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("text_delta", "x"));
-		expect(await actions).toEqual([]);
+		const { actions, coordinator } = await forkActionFixture({ forkActionEnabled }, receipt);
+		expect(actions).toEqual([]);
 		await coordinator.dispose();
 	});
 
@@ -749,6 +711,23 @@ function coordinatorFixture(
 			return Response.json(response?.(request) ?? { ok: true });
 		}),
 	});
+}
+
+async function forkActionFixture(overrides: Partial<SelfSpeculationSettings>, receipt: unknown) {
+	const actionBridge = new SelfSpeculationActionBridge();
+	const coordinator = new SelfSpeculationCoordinator({
+		settings: () => enabledSettings({ forkTransport: "sidecar", ...overrides }),
+		requestID: () => "actor-request",
+		actionBridge,
+		fetch: vi.fn(async (input) =>
+			Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}),
+		),
+	});
+	coordinator.startTurn("turn-1", model(), context(), 1);
+	const pending = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
+	coordinator.decorateActorPayload({ prompt: "P" });
+	coordinator.observeActorOutput(delta("text_delta", "x"));
+	return { actions: await pending, coordinator };
 }
 
 function forkReceipt(

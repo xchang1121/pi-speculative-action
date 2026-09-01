@@ -61,6 +61,62 @@ function plan(source: string, proposalID: string, input: Record<string, unknown>
 	};
 }
 
+function futureReadSource(
+	options: {
+		readonly latestHorizon?: number;
+		readonly expectedDurationMs?: number;
+		readonly subsequent?: "empty" | "placeholder";
+	} = {},
+): Source {
+	const { subsequent = "empty", ...action } = options;
+	return {
+		id: "source",
+		enabled: () => true,
+		propose: ({ startInput }) =>
+			startInput.turnID === "turn-1"
+				? {
+						...plan("source", "future", { path: "future.ts" }),
+						actions: [
+							{ id: "next", type: "tool_call", tool: "read", input: { path: "future.ts" }, horizon: 0, ...action },
+						],
+					}
+				: subsequent === "placeholder"
+					? plan("source", `empty:${startInput.turnID}`, {})
+					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
+	};
+}
+
+function childPlanUpdate(
+	context: { readonly proposalID: string; readonly actionID: string; readonly revision: number },
+	id: string,
+	path: string,
+) {
+	return {
+		proposalID: context.proposalID,
+		source: "source",
+		revision: context.revision,
+		upsert: [
+			{
+				id,
+				type: "tool_call" as const,
+				tool: "read",
+				input: { path },
+				dependsOn: [{ actionID: context.actionID, condition: "execution_succeeded" as const }],
+			},
+		],
+	};
+}
+
+function pathRecordingHarness(source: Source, executed: string[]) {
+	return harness({
+		source,
+		execute: (_tool, input) => {
+			executed.push(String(input.path));
+			return `${String(input.path)}:output`;
+		},
+	});
+}
+
 function harness(input: {
 	readonly source: Source;
 	readonly settings?: () => SpeculativeActionSettings;
@@ -1283,25 +1339,7 @@ describe("structural speculative runtime", () => {
 		let executions = 0;
 		const settlements: PredictionSettlement[] = [];
 		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: ({ startInput }) =>
-				startInput.turnID === "turn-1"
-					? {
-							...plan("source", "future", { path: "future.ts" }),
-							actions: [
-								{
-									id: "next",
-									type: "tool_call",
-									tool: "read",
-									input: { path: "future.ts" },
-									horizon: 0,
-									latestHorizon: 1,
-									expectedDurationMs: 10,
-								},
-							],
-						}
-					: plan("source", `empty:${startInput.turnID}`, {}),
+			...futureReadSource({ latestHorizon: 1, expectedDurationMs: 10, subsequent: "placeholder" }),
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
@@ -1392,25 +1430,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it("retains a fresh completed result after its prediction is settled", async () => {
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: ({ startInput }) =>
-				startInput.turnID === "turn-1"
-					? {
-							...plan("source", "future", { path: "future.ts" }),
-							actions: [
-								{
-									id: "next",
-									type: "tool_call",
-									tool: "read",
-									input: { path: "future.ts" },
-									horizon: 0,
-								},
-							],
-						}
-					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
-		};
+		const source = futureReadSource();
 		const fixture = harness({ source, execute: () => "future" });
 		for (let index = 1; index <= 12; index++) {
 			const turnID = `turn-${index}`;
@@ -1968,29 +1988,10 @@ describe("structural speculative runtime", () => {
 				if (String(candidate.input.path) !== "parent.ts" || trigger !== "execution_succeeded") return undefined;
 				continuationStarted = true;
 				await gate;
-				return {
-					proposalID,
-					source: "source",
-					revision,
-					upsert: [
-						{
-							id: "child",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "child.ts" },
-							dependsOn: [{ actionID, condition: "execution_succeeded" }],
-						},
-					],
-				};
+				return childPlanUpdate({ proposalID, actionID, revision }, "child", "child.ts");
 			},
 		};
-		const fixture = harness({
-			source,
-			execute: (_tool, input) => {
-				executed.push(String(input.path));
-				return `${String(input.path)}:output`;
-			},
-		});
+		const fixture = pathRecordingHarness(source, executed);
 
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent-turn" });
 		await waitFor(() => continuationStarted);
@@ -2021,29 +2022,10 @@ describe("structural speculative runtime", () => {
 			propose: () => plan("source", "conditional", { path: "parent.ts" }),
 			continue: async ({ proposalID, actionID, revision, trigger }) => {
 				if (trigger !== "execution_succeeded") return undefined;
-				return {
-					proposalID,
-					source: "source",
-					revision,
-					upsert: [
-						{
-							id: "late-child",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "late.ts" },
-							dependsOn: [{ actionID, condition: "execution_succeeded" }],
-						},
-					],
-				};
+				return childPlanUpdate({ proposalID, actionID, revision }, "late-child", "late.ts");
 			},
 		};
-		const fixture = harness({
-			source,
-			execute: (_tool, input) => {
-				executed.push(String(input.path));
-				return `${String(input.path)}:output`;
-			},
-		});
+		const fixture = pathRecordingHarness(source, executed);
 
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
 		await waitFor(() => executed.includes("late.ts"));

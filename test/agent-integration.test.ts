@@ -421,7 +421,6 @@ describe("speculative action host", () => {
 
 	it("prefers a runtime-wide sandbox over a read tool's resource-snapshot fallback", async () => {
 		const cwd = await temporaryWorkspace();
-		let hostExecutions = 0;
 		const fork = vi.fn(async (context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => {
 			const output = {
 				result: { content: [{ type: "text" as const, text: "runtime read" }], details: {} },
@@ -449,28 +448,7 @@ describe("speculative action host", () => {
 			capabilities: "all",
 			fork,
 		};
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => {
-				hostExecutions++;
-				return { content: [{ type: "text", text: "host read" }], details: {} };
-			},
-		};
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: settings,
-			draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt" }),
-			preflight: () => true,
-			executionWorlds: [runtimeWorld],
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
+		const { tool, events, host, hostExecutions } = readWorldHost(cwd, [runtimeWorld], "host read");
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
@@ -485,7 +463,7 @@ describe("speculative action host", () => {
 		expect(hit?.result.content).toEqual([{ type: "text", text: "runtime read" }]);
 		expect(fork).toHaveBeenCalledOnce();
 		expect(fork.mock.calls[0]?.[0]).toMatchObject({ toolName: "read" });
-		expect(hostExecutions).toBe(0);
+		expect(hostExecutions()).toBe(0);
 		await host.dispose();
 	});
 
@@ -518,35 +496,13 @@ describe("speculative action host", () => {
 				throw new Error("must not execute");
 			},
 		};
-		let hostExecutions = 0;
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => {
-				hostExecutions++;
-				return { content: [{ type: "text", text: "fallback" }], details: {} };
-			},
-		};
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: settings,
-			draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt" }),
-			preflight: () => true,
-			executionWorlds: [broken, unavailable],
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
+		const { tool, events, host, hostExecutions } = readWorldHost(cwd, [broken, unavailable], "fallback");
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
 		expect(brokenPrepare).not.toHaveBeenCalled();
 		expect(unavailablePrepare).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
-		expect(hostExecutions).toBe(1);
+		expect(hostExecutions()).toBe(1);
 		expect(events.find((event) => event.type === "candidate")).toMatchObject({
 			candidate: { execution: "resource_snapshot" },
 		});
@@ -671,46 +627,8 @@ describe("speculative action host", () => {
 	});
 
 	it("rebases PatternAware from an authoritative Actor action within the same turn", async () => {
-		const cwd = await temporaryWorkspace();
-		const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
-		const patternStore = new PatternAwareStore(patternSettings);
-		for (const [trainingSession, filePath] of [
-			["training-a", "alpha.txt"],
-			["training-b", "beta.txt"],
-		] as const) {
-			patternStore.observe({
-				sessionID: trainingSession,
-				turnID: `${trainingSession}:scan`,
-				tool: "grep",
-				input: { pattern: "one", path: "." },
-				outcome: "success",
-				outputPaths: [filePath],
-				durationMs: 10,
-			});
-			patternStore.observe({
-				sessionID: trainingSession,
-				turnID: `${trainingSession}:read`,
-				tool: "read",
-				input: { path: filePath },
-				outcome: "success",
-				durationMs: 10,
-			});
-		}
-		const grepTool: AgentTool<typeof grepSchema> = {
-			name: "grep",
-			label: "grep",
-			description: "grep",
-			parameters: grepSchema,
-			execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
-		};
-		const readTool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
-		};
-		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } =
+			await patternRebaseFixture();
 		const host = createSpeculativeActionHost("probe", {
 			cwd,
 			getSettings: () => ({
@@ -773,46 +691,8 @@ describe("speculative action host", () => {
 	});
 
 	it("rebases PatternAware after the Actor adopts a Drafter execution", async () => {
-		const cwd = await temporaryWorkspace();
-		const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
-		const patternStore = new PatternAwareStore(patternSettings);
-		for (const [trainingSession, filePath] of [
-			["training-a", "alpha.txt"],
-			["training-b", "beta.txt"],
-		] as const) {
-			patternStore.observe({
-				sessionID: trainingSession,
-				turnID: `${trainingSession}:scan`,
-				tool: "grep",
-				input: { pattern: "one", path: "." },
-				outcome: "success",
-				outputPaths: [filePath],
-				durationMs: 10,
-			});
-			patternStore.observe({
-				sessionID: trainingSession,
-				turnID: `${trainingSession}:read`,
-				tool: "read",
-				input: { path: filePath },
-				outcome: "success",
-				durationMs: 10,
-			});
-		}
-		const grepTool: AgentTool<typeof grepSchema> = {
-			name: "grep",
-			label: "grep",
-			description: "grep",
-			parameters: grepSchema,
-			execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
-		};
-		const readTool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
-		};
-		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } =
+			await patternRebaseFixture();
 		const events: SpeculativeActionEvent<string>[] = [];
 		const host = createSpeculativeActionHost("probe", {
 			cwd,
@@ -1035,23 +915,7 @@ describe("speculative action host", () => {
 				);
 			});
 		};
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, input) => ({ content: [{ type: "text", text: input.path }], details: {} }),
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({ ...settings(2), drafterMaxDepth: 0 }),
-			draftModel: model("draft"),
-			complete,
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
+		const { tool, host } = concurrentDrafterHost(cwd, events, complete);
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => requestSignals.length === 2);
@@ -1368,23 +1232,7 @@ describe("speculative action host", () => {
 			await validGate;
 			return drafterCall({ path: "notes.txt" });
 		};
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, input) => ({ content: [{ type: "text", text: input.path }], details: {} }),
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({ ...settings(2), drafterMaxDepth: 0 }),
-			draftModel: model("draft"),
-			complete,
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
-		});
+		const { tool, host } = concurrentDrafterHost(cwd, events, complete);
 
 		await host.startTurn(startInput(tool));
 		await waitFor(() => requestSignals.length === 2);
@@ -1488,6 +1336,106 @@ describe("speculative action host", () => {
 		expect(left).not.toBe(right);
 	});
 });
+
+function readWorldHost(
+	cwd: string,
+	executionWorlds: readonly SpeculativeAgentExecutionWorld[],
+	actorOutput: string,
+) {
+	let executions = 0;
+	const tool: AgentTool<typeof readSchema> = {
+		name: "read",
+		label: "read",
+		description: "read",
+		parameters: readSchema,
+		execute: async () => {
+			executions++;
+			return { content: [{ type: "text" as const, text: actorOutput }], details: {} };
+		},
+	};
+	const events: SpeculativeActionEvent<string>[] = [];
+	const host = createSpeculativeActionHost("session", {
+		cwd,
+		getSettings: settings,
+		draftModel: model("draft"),
+		complete: async () => drafterCall({ path: "notes.txt" }),
+		preflight: () => true,
+		executionWorlds,
+		onEvent: (event) => {
+			events.push(event);
+		},
+	});
+	return { tool, events, host, hostExecutions: () => executions };
+}
+
+function concurrentDrafterHost(
+	cwd: string,
+	events: SpeculativeActionEvent<string>[],
+	complete: CreateComplete,
+) {
+	const tool: AgentTool<typeof readSchema> = {
+		name: "read",
+		label: "read",
+		description: "read",
+		parameters: readSchema,
+		execute: async (_id, input) => ({ content: [{ type: "text", text: input.path }], details: {} }),
+	};
+	const host = createSpeculativeActionHost("session", {
+		cwd,
+		getSettings: () => ({ ...settings(2), drafterMaxDepth: 0 }),
+		draftModel: model("draft"),
+		complete,
+		preflight: () => true,
+		onEvent: (event) => {
+			events.push(event);
+		},
+	});
+	return { tool, host };
+}
+
+async function patternRebaseFixture() {
+	const cwd = await temporaryWorkspace();
+	const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
+	const patternStore = new PatternAwareStore(patternSettings);
+	for (const [trainingSession, filePath] of [
+		["training-a", "alpha.txt"],
+		["training-b", "beta.txt"],
+	] as const) {
+		patternStore.observe({
+			sessionID: trainingSession,
+			turnID: `${trainingSession}:scan`,
+			tool: "grep",
+			input: { pattern: "one", path: "." },
+			outcome: "success",
+			outputPaths: [filePath],
+			durationMs: 10,
+		});
+		patternStore.observe({
+			sessionID: trainingSession,
+			turnID: `${trainingSession}:read`,
+			tool: "read",
+			input: { path: filePath },
+			outcome: "success",
+			durationMs: 10,
+		});
+	}
+	const grepTool: AgentTool<typeof grepSchema> = {
+		name: "grep",
+		label: "grep",
+		description: "grep",
+		parameters: grepSchema,
+		execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
+	};
+	const readTool: AgentTool<typeof readSchema> = {
+		name: "read",
+		label: "read",
+		description: "read",
+		parameters: readSchema,
+		execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
+	};
+	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };
+}
 
 type CreateComplete = NonNullable<Parameters<typeof createSpeculativeActionHost>[1]["complete"]>;
 

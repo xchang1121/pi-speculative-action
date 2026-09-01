@@ -339,24 +339,11 @@ describe("zero-modification Pi extension", () => {
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture();
-		const menus = new Map<string, string[]>();
-		const visits = new Map<string, number>();
-		fixture.ui.select = async (title, options) => {
-			menus.set(title, [...options]);
-			const visit = visits.get(title) ?? 0;
-			visits.set(title, visit + 1);
-			if (title === "Speculative action" && visit === 0) {
-				return options.find((option) => option.startsWith("Tools & execution"));
-			}
-			if (title === "Speculative action" && visit === 1) {
-				return options.find((option) => option.startsWith("Target decoding"));
-			}
-			if (title === "Tools & execution" && visit === 0) return "Execution guarantees";
-			if (title === "Tools & execution") return "Back";
-			if (title === "Self-speculation") return "Back";
-			if (title === "Speculative action") return "Close";
-			return undefined;
-		};
+		const menus = driveSettingsMenus(fixture, {
+			"Speculative action": ["Tools & execution", "Target decoding", "Close"],
+			"Tools & execution": ["Execution guarantees", "Back"],
+			"Self-speculation": ["Back"],
+		});
 		await fixture.emit("session_start", {}, fixture.context);
 		const command = fixture.commands.get("speculative-action");
 		await command?.handler("", fixture.context as ExtensionCommandContext);
@@ -378,22 +365,11 @@ describe("zero-modification Pi extension", () => {
 
 	it("exposes Drafter request policy in the Drafter submenu", async () => {
 		const fixture = await createFixture();
-		const menus = new Map<string, string[]>();
-		const visits = new Map<string, number>();
-		fixture.ui.select = async (title, options) => {
-			menus.set(title, [...options]);
-			const visit = visits.get(title) ?? 0;
-			visits.set(title, visit + 1);
-			if (title === "Speculative action" && visit === 0) {
-				return options.find((option) => option.startsWith("Prediction sources"));
-			}
-			if (title === "Prediction sources" && visit === 0) {
-				return options.find((option) => option.startsWith("Drafter"));
-			}
-			if (title === "Drafter") return "Back";
-			if (title === "Prediction sources") return "Back";
-			return "Close";
-		};
+		const menus = driveSettingsMenus(fixture, {
+			"Speculative action": ["Prediction sources", "Close"],
+			"Prediction sources": ["Drafter", "Back"],
+			Drafter: ["Back"],
+		});
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
@@ -410,20 +386,14 @@ describe("zero-modification Pi extension", () => {
 
 	it("binds typed setting descriptors across root, self-speculation, and PatternAware settings", async () => {
 		const fixture = await createFixture();
-		const selections = new Map<string, string[]>([
-			["Speculative action", ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"]],
-			["Scheduling & cache", ["Resource cache memory", "Back"]],
-			["Self-speculation", ["Endpoint", "Fork action confidence", "Back"]],
-			["Prediction sources", ["PatternAware", "Back"]],
-			["PatternAware", ["Learning", "Back"]],
-			["PatternAware learning", ["Future gap coverage", "Back"]],
-		]);
-		fixture.ui.select = async (title, options) => {
-			const prefix = selections.get(title)?.shift();
-			return prefix === "Back" || prefix === "Close"
-				? prefix
-				: options.find((option) => option.startsWith(prefix ?? ""));
-		};
+		driveSettingsMenus(fixture, {
+			"Speculative action": ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"],
+			"Scheduling & cache": ["Resource cache memory", "Back"],
+			"Self-speculation": ["Endpoint", "Fork action confidence", "Back"],
+			"Prediction sources": ["PatternAware", "Back"],
+			PatternAware: ["Learning", "Back"],
+			"PatternAware learning": ["Future gap coverage", "Back"],
+		});
 		fixture.ui.input = async (title) =>
 			({
 				"Resource cache memory (MiB)": "96",
@@ -546,6 +516,20 @@ async function createFixture(options: FixtureOptions = {}) {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, eventContext);
 	};
 	return { actorTools, baseTools, commands, context, customTools, cwd, emit, handlers, host, store, tools, ui };
+}
+
+function driveSettingsMenus(
+	fixture: Awaited<ReturnType<typeof createFixture>>,
+	routes: Readonly<Record<string, readonly string[]>>,
+): Map<string, string[]> {
+	const pending = new Map(Object.entries(routes).map(([title, choices]) => [title, [...choices]]));
+	const menus = new Map<string, string[]>();
+	fixture.ui.select = async (title, options) => {
+		menus.set(title, [...options]);
+		const prefix = pending.get(title)?.shift();
+		return prefix ? options.find((option) => option === prefix || option.startsWith(prefix)) : undefined;
+	};
+	return menus;
 }
 
 function sourceInfo(path: string, source = "test"): SourceInfo {
