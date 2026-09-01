@@ -95,6 +95,7 @@ async function temporaryWorkspace(): Promise<string> {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -935,6 +936,8 @@ describe("speculative action host", () => {
 	it("gates the whole Drafter batch by realized action execution ahead and recovers with a bounded probe", async () => {
 		const cwd = await temporaryWorkspace();
 		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
+		let monotonicMs = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => monotonicMs);
 		const events: SpeculativeActionEvent<string>[] = [];
 		let completeCalls = 0;
 		let draftOptionsCalls = 0;
@@ -943,7 +946,8 @@ describe("speculative action host", () => {
 		let gateEnabled = true;
 		const complete: CreateComplete = async () => {
 			completeCalls++;
-			await new Promise((resolve) => setTimeout(resolve, 15));
+			monotonicMs += 15;
+			await Promise.resolve();
 			return drafterCall({ path: exactDraft ? "notes.txt" : "wrong.txt", offset: actionOffset });
 		};
 		const tool: AgentTool<typeof readSchema> = {
@@ -952,7 +956,10 @@ describe("speculative action host", () => {
 			description: "read",
 			parameters: readSchema,
 			execute: async (_id, input) => {
-				if (input.path === "notes.txt") await new Promise((resolve) => setTimeout(resolve, 300));
+				if (input.path === "notes.txt") {
+					monotonicMs += 400;
+					await Promise.resolve();
+				}
 				return { content: [{ type: "text", text: input.path }], details: {} };
 			},
 		};
