@@ -180,8 +180,6 @@ export interface ExecutionWorldStorageControl {
 export interface ExecutionWorldDiagnosticReport {
 	readonly state: ExecutionWorldHealthState;
 	readonly detail: string;
-	readonly fingerprint?: string;
-	readonly attributes?: Readonly<Record<string, string | number | boolean>>;
 	readonly storage?: ExecutionWorldStorageSnapshot;
 }
 
@@ -339,7 +337,6 @@ export class ExecutionWorldRouter<Context, Output> {
 							state: "ready",
 							cwd: preparation.cwd,
 							detail: "Route prepared successfully",
-							fingerprint,
 						}),
 					);
 					const route = Object.freeze({

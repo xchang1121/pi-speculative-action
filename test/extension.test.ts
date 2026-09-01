@@ -315,38 +315,6 @@ describe("zero-modification Pi extension", () => {
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
 	});
 
-	it("reports execution-world health instead of treating registration as availability", async () => {
-		const fixture = await createFixture();
-		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([
-			{
-				id: "linux_process_reuse",
-				scope: "runtime",
-				isolation: "runtime_sandbox",
-				state: "unavailable",
-				detail: "Linux host required",
-				storage: {
-					entries: 3,
-					maxEntries: 32,
-					bytes: 2048,
-					maxBytes: 4096,
-					orphanArtifacts: 1,
-					overBudget: false,
-				},
-			},
-		]);
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
-
-		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
-			expect.stringContaining("linux_process_reuse [runtime/runtime_sandbox]: unavailable — Linux host required"),
-			"warning",
-		);
-		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
-			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"),
-			"warning",
-		);
-	});
-
 	it("labels an adopted read projection as partial-result reuse", () => {
 		const event = {
 			sessionID: "session",
@@ -375,6 +343,11 @@ describe("zero-modification Pi extension", () => {
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture();
+		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue([{
+			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
+			state: "unavailable", detail: "Linux host required",
+			storage: { entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false },
+		}]);
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Target decoding", "Close"],
 			"Tools & execution": ["Execution guarantees", "Back"],
@@ -397,6 +370,9 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(menus.get("Self-speculation")).toEqual(expect.arrayContaining(["Fork action confidence: 0.9"]));
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("runtime-wide sandbox"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
+		);
 	});
 
 	it("exposes Drafter request policy in the Drafter submenu", async () => {

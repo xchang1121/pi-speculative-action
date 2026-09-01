@@ -20,39 +20,33 @@ afterEach(async () => {
 describe("persistent provenance store", () => {
 	it("deduplicates CAS artifacts and indexes immutable certificates across store instances", async () => {
 		const root = await temporaryRoot();
-		const store = new ProvenanceCertificateStore(root);
-		const first = await store.artifacts.put("output bytes");
-		const second = await store.artifacts.put(Buffer.from("output bytes"));
-		expect(second).toEqual(first);
+		const initial = new ProvenanceCertificateStore(root);
+		const first = await initial.artifacts.put("output bytes");
+		const duplicateArtifact = await initial.artifacts.put(Buffer.from("output bytes"));
+		expect(duplicateArtifact).toEqual(first);
 		const certificate = completed(first, 123);
 		const duplicate = completed(first, 456);
 		expect(duplicate.id).toBe(certificate.id);
 		const { id: _id, ...legacyBody } = certificate;
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
 		expect(parseProcessCertificate(legacy)?.id).toBe(legacy.id);
-		expect(await store.put(certificate)).toBe(true);
-		expect(await store.put(duplicate)).toBe(false);
+		expect(await initial.put(certificate)).toBe(true);
+		expect(await initial.put(duplicate)).toBe(false);
 
 		const reopened = new ProvenanceCertificateStore(root);
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
 		expect(await reopened.get(certificate.id)).toEqual(certificate);
 		expect(await reopened.findByWeakKey(certificate.weakKey)).toEqual([certificate]);
 		expect(await reopened.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
-	});
 
-	it("enforces a shared artifact budget and atomically clears only the managed store", async () => {
-		const root = await temporaryRoot();
 		const store = new ProvenanceCertificateStore(root, {
 			maxCertificates: 1,
 			maxBytes: 1024 * 1024,
 			orphanGraceMs: 0,
 		});
-		const firstArtifact = await store.artifacts.put("first");
-		const first = completed(firstArtifact, 1, "first");
-		await store.put(first);
 		const secondArtifact = await store.artifacts.put("second");
 		await store.artifacts.put("orphan");
-		const second = completed(secondArtifact, 2, "second");
+		const second = completed(secondArtifact, 789, "second");
 		await store.put(second);
 
 		const collected = await store.gc();
@@ -61,7 +55,7 @@ describe("persistent provenance store", () => {
 			removedArtifacts: 2,
 			stats: { certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false },
 		});
-		expect(await store.get(first.id)).toBeUndefined();
+		expect(await store.get(certificate.id)).toBeUndefined();
 		expect(await store.get(second.id)).toEqual(second);
 		const closure = await store.artifacts.load([secondArtifact]);
 		store.configure({ maxCertificates: 2, maxBytes: 2 * 1024 * 1024 });

@@ -214,7 +214,6 @@ interface SpeculativeActionController {
 	readonly registeredTools: () => ReadonlySet<string>;
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
-	readonly executionDiagnostics: () => readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
 	readonly executionSummary: () => string;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => void;
@@ -504,7 +503,6 @@ async function installController(
 		registeredTools: () => new Set(baseDefinitions.keys()),
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
-		executionDiagnostics: () => executionDiagnostics,
 		refreshExecutionDiagnostics,
 		executionSummary: () => executionWorldSummary(executionDiagnostics),
 		setSettings: (value) => {
@@ -518,7 +516,6 @@ async function installController(
 		attachUI: (nextUI) => {
 			ui = nextUI;
 			renderFooter();
-			void recoverSpeculation(() => refreshExecutionDiagnostics());
 		},
 		detachUI: () => {
 			ui?.setStatus(STATUS_KEY, undefined);

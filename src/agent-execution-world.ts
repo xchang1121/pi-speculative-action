@@ -59,7 +59,6 @@ export function createResourceSnapshotExecutionWorld(
 		diagnostics: () => ({
 			state: "ready",
 			detail: "Resource-version snapshots are available",
-			fingerprint: "resource-version:v1",
 		}),
 		captureAuthoritativeResult: capture,
 		fork: async (context) => {

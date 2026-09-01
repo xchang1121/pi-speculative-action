@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
 	type ArtifactReference,
@@ -25,14 +25,10 @@ export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 
 export interface ProvenanceStoreStats {
 	readonly certificates: number;
-	readonly weakKeys: number;
 	readonly artifacts: number;
 	readonly orphanArtifacts: number;
-	readonly certificateBytes: number;
-	readonly artifactBytes: number;
 	readonly totalBytes: number;
 	readonly overBudget: boolean;
-	readonly lastGCAt?: number;
 	readonly limits: ProvenanceStoreLimits;
 }
 
@@ -156,7 +152,6 @@ export class ProvenanceCertificateStore {
 	private readonly orphanGraceMs: number;
 	private maintenance: Promise<void> = Promise.resolve();
 	private gcDueAt: number;
-	private lastGCAt?: number;
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root);
@@ -182,8 +177,8 @@ export class ProvenanceCertificateStore {
 		this.gcDueAt = 0;
 	}
 
-	put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
-		const publication = this.exclusive(async () => {
+	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
+		const published = await this.exclusive(async () => {
 			const parsed = parseProcessCertificate(certificate);
 			if (!parsed || parsed.id !== certificate.id) throw new Error("invalid process provenance certificate");
 			for (const reference of referencedArtifacts(certificate)) {
@@ -196,22 +191,14 @@ export class ProvenanceCertificateStore {
 				Buffer.from(stableStringify(certificate), "utf8"),
 			);
 			if ((await this.get(certificate.id))?.id !== certificate.id) throw new Error("certificate publication failed");
-			const reference = this.weakReferencePath(certificate.weakKey, certificate.id);
-			await mkdir(path.dirname(reference), { recursive: true });
-			try {
-				await writeFile(reference, "", { flag: "wx" });
-			} catch (error) {
-				if (!alreadyExists(error)) throw error;
-			}
+			await publishImmutable(this.weakReferencePath(certificate.weakKey, certificate.id), new Uint8Array());
 			return published;
 		});
-		return publication.then((published) => {
-			if (Date.now() >= this.gcDueAt) {
-				this.gcDueAt = Date.now() + this.gcIntervalMs;
-				void this.gc().catch(() => undefined);
-			}
-			return published;
-		});
+		if (Date.now() >= this.gcDueAt) {
+			this.gcDueAt = Date.now() + this.gcIntervalMs;
+			void this.gc().catch(() => undefined);
+		}
+		return published;
 	}
 
 	async get(id: Sha256Digest): Promise<ProcessProvenanceCertificate | undefined> {
@@ -248,9 +235,7 @@ export class ProvenanceCertificateStore {
 			const reference = path.join(this.weakIndexDirectory(weakKey), name);
 			const certificate = await this.get(`sha256:${match[1]}` as Sha256Digest);
 			if (certificate?.weakKey === weakKey) certificates.push(certificate);
-			else await unlink(reference).catch((error) => {
-				if (!missing(error)) throw error;
-			});
+			else await rm(reference, { force: true });
 		}
 		certificates.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
 		return certificates;
@@ -258,7 +243,7 @@ export class ProvenanceCertificateStore {
 
 	async stats(): Promise<ProvenanceStoreStats> {
 		await this.maintenance;
-		return inventoryStats(await this.inventory(), this.limits, this.lastGCAt);
+		return inventoryStats(await this.inventory(), this.limits);
 	}
 
 	gc(): Promise<ProvenanceStoreGCResult> {
@@ -267,7 +252,7 @@ export class ProvenanceCertificateStore {
 
 	clear(): Promise<ProvenanceStoreGCResult> {
 		return this.exclusive(async () => {
-			const before = inventoryStats(await this.inventory(), this.limits, this.lastGCAt);
+			const before = inventoryStats(await this.inventory(), this.limits);
 			await mkdir(this.root, { recursive: true });
 			const tomb = path.join(this.root, `.clear-${randomUUID()}`);
 			await mkdir(tomb);
@@ -277,8 +262,7 @@ export class ProvenanceCertificateStore {
 				});
 			}
 			await rm(tomb, { recursive: true, force: true });
-			this.lastGCAt = Date.now();
-			const stats = inventoryStats(await this.inventory(), this.limits, this.lastGCAt);
+			const stats = inventoryStats(await this.inventory(), this.limits);
 			return {
 				removedCertificates: Math.max(0, before.certificates - stats.certificates),
 				removedArtifacts: Math.max(0, before.artifacts - stats.artifacts),
@@ -321,14 +305,13 @@ export class ProvenanceCertificateStore {
 			),
 			...orphans.map((artifact) => rm(artifact.path, { force: true })),
 		]);
-		this.lastGCAt = now;
 		return {
 			removedCertificates: removed.length,
 			removedArtifacts: orphans.length,
 			removedBytes:
 				removed.reduce((total, record) => total + record.bytes, 0) +
 				orphans.reduce((total, artifact) => total + artifact.bytes, 0),
-			stats: inventoryStats(await this.inventory(), this.limits, this.lastGCAt),
+			stats: inventoryStats(await this.inventory(), this.limits),
 		};
 	}
 
@@ -402,7 +385,6 @@ interface StoreInventory {
 function inventoryStats(
 	inventory: StoreInventory,
 	limits: ProvenanceStoreLimits,
-	lastGCAt?: number,
 ): ProvenanceStoreStats {
 	const replayable = inventory.certificates.flatMap((record) =>
 		record.certificate && certificateReplayable(record.certificate) ? [record.certificate] : [],
@@ -412,16 +394,12 @@ function inventoryStats(
 	const artifactBytes = [...inventory.artifacts.values()].reduce((total, record) => total + record.bytes, 0);
 	return Object.freeze({
 		certificates: inventory.certificates.length,
-		weakKeys: new Set(replayable.map((certificate) => certificate.weakKey)).size,
 		artifacts: inventory.artifacts.size,
 		orphanArtifacts: [...inventory.artifacts.keys()].filter((digest) => !referenced.has(digest)).length,
-		certificateBytes,
-		artifactBytes,
 		totalBytes: certificateBytes + artifactBytes,
 		overBudget:
 			inventory.certificates.length > limits.maxCertificates ||
 			certificateBytes + artifactBytes > limits.maxBytes,
-		...(lastGCAt === undefined ? {} : { lastGCAt }),
 		limits,
 	});
 }
@@ -448,9 +426,7 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 		if (!alreadyExists(error)) throw error;
 		published = false;
 	} finally {
-		await unlink(temporary).catch((error) => {
-			if (!missing(error)) throw error;
-		});
+		await rm(temporary, { force: true });
 	}
 	return published;
 }

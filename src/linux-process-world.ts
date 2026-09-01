@@ -73,14 +73,7 @@ export function createLinuxProcessExecutionWorld(
 				detail: selected
 					? `${status.detail}; ${selected.driver} workspace driver selected`
 					: `${status.detail}; workspace route not prepared yet`,
-				...(status.fingerprint ? { fingerprint: status.fingerprint } : {}),
 				storage,
-				attributes: {
-					workspaceDriver: selected?.driver ?? "not_prepared",
-					...(status.sandlockBinary ? { sandlock: status.sandlockBinary } : {}),
-					...(status.straceBinary ? { strace: status.straceBinary } : {}),
-					...(status.unshareBinary ? { unshare: status.unshareBinary } : {}),
-				},
 			};
 		},
 		prepare: async ({ cwd, signal }) => {
