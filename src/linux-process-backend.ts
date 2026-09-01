@@ -48,7 +48,7 @@ import {
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
-import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
+import { emptyWorldReuseMetrics, type ExecutionScope, type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import {
 	ProvenanceCertificateStore,
@@ -165,6 +165,7 @@ interface ActiveSession {
 	readonly sourceRoot: string;
 	readonly workspace: SandboxWorkspaceContext;
 	readonly invocation: ToolProcessInvocation;
+	readonly scope?: ExecutionScope;
 	readonly projection: ExecutionPathProjection;
 	readonly interposition: ProcessInterposition;
 	readonly originalPath: string;
@@ -205,6 +206,7 @@ export class LinuxProcessReuseBackend {
 	private ready?: Promise<ReadyBackend>;
 	private disposed = false;
 	private readonly inFlight = new Map<Sha256Digest, Promise<void>>();
+	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
 	constructor(options: LinuxProcessBackendOptions) {
@@ -243,6 +245,7 @@ export class LinuxProcessReuseBackend {
 		readonly sourceRoot: string;
 		readonly workspace: SandboxWorkspaceContext;
 		readonly invocation: ToolProcessInvocation;
+		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 	}): Promise<LinuxProcessSession> {
 		if (this.disposed) throw new Error("Linux process backend is disposed");
@@ -287,6 +290,7 @@ export class LinuxProcessReuseBackend {
 			sourceRoot,
 			workspace: input.workspace,
 			invocation: input.invocation,
+			scope: input.scope,
 			projection,
 			interposition,
 			originalPath,
@@ -320,6 +324,7 @@ export class LinuxProcessReuseBackend {
 	async dispose(): Promise<void> {
 		this.disposed = true;
 		await Promise.allSettled([...this.inFlight.values()]);
+		this.certificateScopes.clear();
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -542,6 +547,15 @@ export class LinuxProcessReuseBackend {
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.add(session, "hits");
 			if (joined) this.add(session, "joinedHits");
+			const producer = this.certificateScopes.get(certificate.id);
+			this.add(
+				session,
+				producer && session.scope
+					? producer.sessionID === session.scope.sessionID && producer.turnID === session.scope.turnID
+						? "sameTurnHits"
+						: "crossTurnHits"
+					: "unattributedHits",
+			);
 			return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
@@ -675,7 +689,10 @@ export class LinuxProcessReuseBackend {
 					result: { replayProfile: "buffered_noninteractive", journal, exit },
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				if (await this.planner.publishCompleted(certificate)) this.add(session, "published");
+				if (await this.planner.publishCompleted(certificate)) {
+					this.add(session, "published");
+					this.rememberScope(certificate.id, session.scope);
+				}
 				if (taints.size) this.add(session, "tainted");
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
@@ -699,6 +716,15 @@ export class LinuxProcessReuseBackend {
 	private setError(session: ActiveSession, detail: string): void {
 		this.counters.lastError = detail;
 		session.metrics.lastError = detail;
+	}
+
+	private rememberScope(id: Sha256Digest, scope: ExecutionScope | undefined): void {
+		if (!scope) return;
+		this.certificateScopes.delete(id);
+		this.certificateScopes.set(id, scope);
+		while (this.certificateScopes.size > this.store.limits.maxCertificates) {
+			this.certificateScopes.delete(this.certificateScopes.keys().next().value!);
+		}
 	}
 
 	private async resolveRequestedExecutable(session: ActiveSession, request: DispatcherRequest): Promise<string> {

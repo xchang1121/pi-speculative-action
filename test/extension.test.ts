@@ -306,6 +306,10 @@ describe("zero-modification Pi extension", () => {
 			"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
+		expect(status).toContain("Actor actions: 0/0 (n/a)");
+		expect(status).toContain("Process reuse (validated L2): 0/0 (n/a)");
+		expect(status).toContain("Task timing: n/a (no completed task)");
+		expect(status).not.toContain("0ms saved");
 		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
 		expect(status).toContain("Reuse: 0 exact actions; 0 partial results (none)");
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
@@ -320,6 +324,14 @@ describe("zero-modification Pi extension", () => {
 				isolation: "runtime_sandbox",
 				state: "unavailable",
 				detail: "Linux host required",
+				storage: {
+					entries: 3,
+					maxEntries: 32,
+					bytes: 2048,
+					maxBytes: 4096,
+					orphanArtifacts: 1,
+					overBudget: false,
+				},
 				observedAt: 1,
 			},
 		]);
@@ -330,9 +342,13 @@ describe("zero-modification Pi extension", () => {
 			expect.stringContaining("linux_process_reuse [runtime/runtime_sandbox]: unavailable — Linux host required"),
 			"warning",
 		);
+		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
+			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"),
+			"warning",
+		);
 	});
 
-	it("labels an adopted read projection as partial-result reuse", () => {
+	it("labels projection and process reuse events with their evidence", () => {
 		const event = {
 			sessionID: "session",
 			turnID: "turn",
@@ -356,6 +372,48 @@ describe("zero-modification Pi extension", () => {
 		};
 
 		expect(formatSpeculativeActionEvent(event)).toContain("partial-result reuse (read.range)");
+
+		const reuseEvent = {
+			sessionID: "session",
+			turnID: "turn-2",
+			timestamp: 2,
+			cache: emptyMetrics().cache,
+			type: "candidate" as const,
+			candidate: {
+				id: "candidate-2",
+				origin: "prediction" as const,
+				tool: "bash",
+				actionKeyHash: "hash",
+				execution: "runtime_sandbox" as const,
+				route: {
+					isolation: "runtime_sandbox" as const,
+					reuse: "shared_result" as const,
+					scope: "runtime" as const,
+					backend: "linux_process_reuse",
+					fingerprint: "linux:v1",
+				},
+				world: {
+					backend: "linux_process_reuse",
+					executionMetrics: {
+						reuse: { ...emptyMetrics().processReuse, requests: 1, hits: 1, crossTurnHits: 1, replayMs: 2 },
+					},
+				},
+				source: "Drafter",
+				depth: 0,
+				predictedAction: "bash pwd",
+				predictionLatencyMs: 1,
+				draftTokens: 1,
+				totalDraftTokens: 1,
+				expectedDurationMs: 10,
+				estimatedBytes: 1,
+				validation: { durationMs: 0, bytesRead: 0, filesRead: 0 },
+			},
+			state: { status: "succeeded" as const, startedAt: 0, completedAt: 5, executionMs: 5 },
+		};
+		const formatted = formatSpeculativeActionEvent(reuseEvent);
+		expect(formatted).toContain("session session · turn turn-2 · candidate candidate-2");
+		expect(formatted).toContain("linux_process_reuse/runtime_sandbox/shared_result");
+		expect(formatted).toContain("validated L2 1/1 (100%) hits; 0 same-turn, 1 cross-turn");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {

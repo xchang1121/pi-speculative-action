@@ -61,6 +61,7 @@ export {
 	type ExecutionWorldPreparation,
 	type ExecutionWorldRequest,
 	ExecutionWorldRouter,
+	type ExecutionScope,
 	type ExecutionWorldScope,
 	type SpeculativeExecution,
 	type SpeculativeExecutionRoute,

@@ -55,14 +55,14 @@ export function createLinuxProcessExecutionWorld(
 		diagnostics: async ({ cwd, refresh }) => {
 			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats()]);
 			const storage = {
-				storeCertificates: store.certificates,
-				storeArtifacts: store.artifacts,
-				storeBytes: store.totalBytes,
-				storeMaxCertificates: store.limits.maxCertificates,
-				storeMaxBytes: store.limits.maxBytes,
-				storeOverBudget: store.overBudget,
+				entries: store.certificates,
+				maxEntries: store.limits.maxCertificates,
+				bytes: store.totalBytes,
+				maxBytes: store.limits.maxBytes,
+				orphanArtifacts: store.orphanArtifacts,
+				overBudget: store.overBudget,
 			};
-			if (status.state !== "ready") return { state: "unavailable", detail: status.detail, attributes: storage };
+			if (status.state !== "ready") return { state: "unavailable", detail: status.detail, storage };
 			const selected = qualifiedDrivers.get(path.resolve(cwd));
 			return {
 				state: "ready",
@@ -70,8 +70,8 @@ export function createLinuxProcessExecutionWorld(
 					? `${status.detail}; ${selected.driver} workspace driver selected`
 					: `${status.detail}; workspace route not prepared yet`,
 				...(status.fingerprint ? { fingerprint: status.fingerprint } : {}),
+				storage,
 				attributes: {
-					...storage,
 					workspaceDriver: selected?.driver ?? "not_prepared",
 					...(status.sandlockBinary ? { sandlock: status.sandlockBinary } : {}),
 					...(status.straceBinary ? { strace: status.straceBinary } : {}),
@@ -123,6 +123,7 @@ export function createLinuxProcessExecutionWorld(
 						sourceRoot,
 						workspace,
 						invocation,
+						...(context.executionScope ? { scope: context.executionScope } : {}),
 						signal: context.signal,
 					});
 					validate = session.validate;

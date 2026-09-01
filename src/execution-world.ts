@@ -13,6 +13,12 @@ export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
 export type ActionReuseKind = WorldReuseStrategy;
 export type ExecutionWorldScope = "runtime" | "fallback";
 
+/** Correlation scope carried through every execution world without affecting cache identity. */
+export interface ExecutionScope {
+	readonly sessionID: string;
+	readonly turnID: string;
+}
+
 /** Tool effects are resolved independently from K(a) and prediction source. */
 export interface ExecutionWorldRequest {
 	readonly effect: ActionEffect;
@@ -48,6 +54,9 @@ export interface WorldReuseMetrics {
 	readonly requests: number;
 	readonly hits: number;
 	readonly joinedHits: number;
+	readonly sameTurnHits: number;
+	readonly crossTurnHits: number;
+	readonly unattributedHits: number;
 	readonly misses: number;
 	readonly bypasses: number;
 	readonly published: number;
@@ -69,6 +78,9 @@ export function emptyWorldReuseMetrics(): WorldReuseMetrics {
 		requests: 0,
 		hits: 0,
 		joinedHits: 0,
+		sameTurnHits: 0,
+		crossTurnHits: 0,
+		unattributedHits: 0,
 		misses: 0,
 		bypasses: 0,
 		published: 0,
@@ -176,6 +188,14 @@ export interface ExecutionWorldDiagnosticReport {
 	readonly detail: string;
 	readonly fingerprint?: string;
 	readonly attributes?: Readonly<Record<string, string | number | boolean>>;
+	readonly storage?: {
+		readonly entries: number;
+		readonly maxEntries: number;
+		readonly bytes: number;
+		readonly maxBytes: number;
+		readonly orphanArtifacts?: number;
+		readonly overBudget: boolean;
+	};
 }
 
 export interface ExecutionWorldDiagnosticsContext extends ExecutionWorldPreparation {

@@ -1,4 +1,5 @@
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
+import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
 
 export interface SpeculativeTraceSummary {
@@ -50,6 +51,7 @@ export interface SpeculativeTraceSummary {
 	/** Actor execution time that would still have remained after that overlap. */
 	readonly executionBlockedPotentialHitLatencyMs: number;
 	readonly totalDraftTokens: number;
+	readonly processReuse: WorldReuseMetrics;
 	readonly cache: SpeculativeCacheSnapshot;
 }
 
@@ -113,6 +115,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		executionBlockedPotentialHiddenLatencyMs: 0,
 		executionBlockedPotentialHitLatencyMs: 0,
 		totalDraftTokens: 0,
+		processReuse: emptyWorldReuseMetrics(),
 		cache: cloneCache(cache),
 	};
 }
@@ -160,7 +163,11 @@ export function reduceSpeculativeTrace<SessionID>(
 				if (event.candidate.origin === "prediction") {
 					next.speculativeExecutionMs += metric(event.state.executionMs);
 				}
-				if (event.state.status === "succeeded") next.candidateSucceeded++;
+				if (event.state.status === "succeeded") {
+					next.candidateSucceeded++;
+					const reuse = event.candidate.world?.executionMetrics.reuse;
+					if (reuse) next.processReuse = addReuseMetrics(next.processReuse, reuse);
+				}
 				else {
 					if (event.state.status === "failed") next.candidateFailed++;
 					else next.candidateCancelled++;
@@ -229,8 +236,18 @@ function mutableSummary(current: SpeculativeTraceSummary): MutableSummary {
 		candidateTerminalCauses: { ...current.candidateTerminalCauses },
 		actorCandidateRejections: { ...current.actorCandidateRejections },
 		partialResultReuseByProjector: { ...current.partialResultReuseByProjector },
+		processReuse: { ...current.processReuse },
 		cache: cloneCache(current.cache),
 	};
+}
+
+function addReuseMetrics(left: WorldReuseMetrics, right: WorldReuseMetrics): WorldReuseMetrics {
+	const merged = { ...left } as unknown as Record<string, number | string | undefined>;
+	for (const [key, value] of Object.entries(right)) {
+		if (key === "lastError") merged[key] = value;
+		else merged[key] = metric(Number(merged[key])) + metric(Number(value));
+	}
+	return merged as unknown as WorldReuseMetrics;
 }
 
 function cloneCache(cache: SpeculativeCacheSnapshot): SpeculativeCacheSnapshot {

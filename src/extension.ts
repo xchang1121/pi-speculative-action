@@ -38,6 +38,7 @@ import {
 	normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection,
 } from "./common.ts";
+import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "./pi-bash-projection.ts";
 import {
@@ -47,7 +48,7 @@ import {
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
-import type { ExecutionWorldDiagnosticSnapshot } from "./execution-world.ts";
+import type { ExecutionWorldDiagnosticSnapshot, WorldReuseMetrics } from "./execution-world.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
@@ -276,7 +277,6 @@ export function formatSpeculativeActionStatus(input: {
 	readonly metrics: SpeculativeActionMetrics;
 }): string {
 	const { settings, metrics } = input;
-	const hitRate = Math.round(metrics.hitRate * 100);
 	const cache = metrics.cache;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
@@ -292,17 +292,20 @@ export function formatSpeculativeActionStatus(input: {
 		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
-		`Actor actions: ${metrics.speculativeHits}/${metrics.actorActions} speculative hits (${hitRate}%); previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
+		`Actor actions: ${formatRatio(metrics.speculativeHits, metrics.actorActions)} speculative result reuse; previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
 		`Reuse: ${metrics.exactReuseHits} exact actions; ${metrics.partialResultReuseHits} partial results (${countSummary(metrics.partialResultReuseByProjector)})`,
-		`Predictions: ${metrics.predictionsMatched}/${metrics.predictionsObserved} matched (${formatPercent(metrics.predictionPrecision)}); ${metrics.predictionsAdopted}/${metrics.predictionsMatched} adopted (${formatPercent(metrics.adoptionYield)}); unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
+		`Process reuse (validated L2): ${formatProcessReuse(metrics.processReuse)}. No saved-time claim is made without a paired cold baseline.`,
+		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
-		`Task timing: ${formatDuration(metrics.endToEndMs)} actual; ${formatDuration(metrics.serializedMs)} serialized; ${formatDuration(metrics.hiddenLatencyMs)} serialized overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} tools`,
+		metrics.tasks > 0
+			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate, and L2 replay is reported separately.`
+			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
 		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
 		`Isolation-blocked potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
-		`Results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
+		`Runtime L1 results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
 
@@ -439,16 +442,9 @@ async function installController(
 	);
 	function renderFooter(): void {
 		if (!ui) return;
-		const effective = settings();
-		if (!effective.enabled) {
-			ui.setStatus(STATUS_KEY, "spec: off");
-			return;
-		}
-		const conflictText =
-			toolConflicts.size > 0 ? ` · ${toolConflicts.size} tool conflict${toolConflicts.size === 1 ? "" : "s"}` : "";
 		ui.setStatus(
 			STATUS_KEY,
-			`spec: on · unsafe routes fall back${conflictText} · ${currentMetrics.speculativeHits}/${currentMetrics.actorActions} adopted · ${currentMetrics.predictionsMatched}/${currentMetrics.predictionsObserved} predictions matched · ${formatDuration(currentMetrics.hiddenLatencyMs)} serialized overlap (${formatDuration(currentMetrics.endToEndMs)}/${formatDuration(currentMetrics.serializedMs)}) · ${currentMetrics.cache.resultEntries}/${currentMetrics.cache.cacheCapacity} results (${formatBytes(currentMetrics.cache.resultBytes)}) · ${currentMetrics.cache.inFlightJobs} jobs · ${currentMetrics.cache.branchEntries} branches`,
+			formatSpeculativeFooter(settings(), currentMetrics, executionDiagnostics, toolConflicts.size),
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
@@ -611,9 +607,13 @@ async function installController(
 		},
 		statusText: () => {
 			const effective = settings();
-			const bridge = selfSpeculation.snapshot();
-			const drafterGate = host.drafterGateSnapshot();
-			return `${formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics })}\nAction Drafter gate: ${effective.drafterGateEnabled ? "On" : "Off"}; ${drafterGate.skippedBatches} batches skipped, ${drafterGate.samples} samples${drafterGate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(drafterGate.expectedNetBenefitMs)} expected net`}\nSelf-speculation bridge: ${bridge.bufferedCandidates} buffered; ${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts; ${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}; ${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches); ${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged); ${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved; ${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `; mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}; ${bridge.failures} failures${bridge.lastError ? `; last error: ${bridge.lastError}` : ""}\n${executionWorldSummary(executionDiagnostics)}\nCustom tool conflicts: ${toolConflictSummary(toolConflicts)}`;
+			return [
+				formatSpeculativeActionStatus({ settings: effective, metrics: currentMetrics }),
+				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
+				formatSelfSpeculationBridgeStatus(selfSpeculation.snapshot()),
+				executionWorldSummary(executionDiagnostics),
+				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
+			].join("\n");
 		},
 		dispose: async () => {
 			ui?.setStatus(STATUS_KEY, undefined);
@@ -1418,13 +1418,13 @@ function showRecentEvents(ctx: ExtensionContext, controller: SpeculativeActionCo
 }
 
 export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<string>): string {
-	const parts = [`[${event.type}]`];
+	const parts = [`[${event.type}]`, `session ${compactEventText(String(event.sessionID))}`, `turn ${compactEventText(event.turnID)}`];
 	switch (event.type) {
 		case "task":
 			parts.push(
-				`${formatDuration(event.timing.endToEndMs)} actual`,
-				`${formatDuration(event.timing.serializedMs)} serialized`,
-				`${formatDuration(event.timing.hiddenLatencyMs)} serialized overlap`,
+				`${formatDuration(event.timing.endToEndMs)} wall`,
+				`${formatDuration(event.timing.serializedMs)} serialized counterfactual`,
+				`${formatDuration(event.timing.hiddenLatencyMs)} observed overlap (not causal speedup)`,
 			);
 			break;
 		case "source_request":
@@ -1443,18 +1443,32 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			else parts.push(`matched, rejected ${causeSummary(settlement.match.adoption.cause)}`);
 			break;
 		}
-		case "candidate":
-			parts.push(event.candidate.tool, event.candidate.source, event.state.status);
+		case "candidate": {
+			const route = event.candidate.route;
+			parts.push(
+				`candidate ${compactEventText(event.candidate.id)}`,
+				event.candidate.tool,
+				event.candidate.source,
+				route
+					? `${route.backend}/${route.isolation}/${route.reuse}`
+					: `${event.candidate.world?.backend ?? "unknown backend"}/${event.candidate.execution}`,
+				event.state.status,
+			);
 			if (event.state.status === "running") {
 				parts.push(
 					`${event.candidate.origin === "actor_preview" ? "previewed" : "predicted"} ${compactEventText(event.candidate.predictedAction)}`,
 				);
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
+				const reuse = event.candidate.world?.executionMetrics.reuse;
+				if (reuse) {
+					parts.push(`validated L2 ${formatProcessReuse(reuse)}`);
+				}
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
 			}
 			break;
+		}
 		case "actor_action": {
 			const sources = [...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))];
 			parts.push(
@@ -1593,6 +1607,23 @@ function selfSpeculationSummary(settings: SelfSpeculationSettings): string {
 		: "Off";
 }
 
+function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnapshot): string {
+	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(gate.expectedNetBenefitMs)} expected net`}`;
+}
+
+function formatSelfSpeculationBridgeStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
+	return [
+		`Self-speculation bridge: ${bridge.bufferedCandidates} buffered`,
+		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
+		`${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
+		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,
+		`${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged)`,
+		`${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved`,
+		`${formatDuration(bridge.forkLatencyMs)} fork latency${bridge.forkMeanLogprob === undefined ? "" : `, mean logprob ${formatNumber(bridge.forkMeanLogprob)}`}`,
+		`${bridge.failures} failures${bridge.lastError ? `, last error: ${bridge.lastError}` : ""}`,
+	].join("; ");
+}
+
 function activeModelReference(ctx: ExtensionContext): string {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "active model";
 }
@@ -1619,12 +1650,40 @@ function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
 }
 
+function formatSpeculativeFooter(
+	settings: EffectiveSpeculativeActionSettings,
+	metrics: SpeculativeActionMetrics,
+	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+	conflicts: number,
+): string {
+	if (!settings.enabled) return "spec: off";
+	const ready = worlds.filter((world) => world.state === "ready").length;
+	const reuse = metrics.processReuse;
+	return [
+		"spec: on",
+		`actions ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
+		reuse.requests > 0
+			? `L2 ${formatRatio(reuse.hits, reuse.requests)}${reuse.crossTurnHits ? `, ${reuse.crossTurnHits} cross-turn` : ""}${reuse.unattributedHits ? `, ${reuse.unattributedHits} origin unknown` : ""}`
+			: "L2 idle",
+		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
+		`L1 ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
+		worlds.length > 0 ? `worlds ${ready}/${worlds.length} ready` : "worlds probing",
+		"unsafe→Actor",
+		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
+	].join(" · ");
+}
+
 function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): string {
 	if (!worlds.length) return "Execution worlds: unavailable";
 	return [
 		"Execution worlds:",
 		...worlds.map(
-			(world) => `- ${world.id} [${world.scope}/${world.isolation}]: ${world.state} — ${world.detail}`,
+			(world) =>
+				`- ${world.id} [${world.scope}/${world.isolation}]: ${world.state} — ${world.detail}${
+					world.storage
+						? `; storage ${world.storage.entries}/${world.storage.maxEntries}, ${formatBytes(world.storage.bytes)}/${formatBytes(world.storage.maxBytes)}, ${world.storage.orphanArtifacts ?? 0} orphan artifacts${world.storage.overBudget ? "; over budget" : ""}`
+						: ""
+				}`,
 		),
 	].join("\n");
 }
@@ -1637,9 +1696,12 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 }
 
 function formatDuration(ms: number): string {
-	if (ms < 1000) return `${Math.round(ms)}ms`;
-	if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0).replace(/\.0$/, "")}s`;
-	const seconds = Math.round(ms / 1000);
+	if (!Number.isFinite(ms)) return "n/a";
+	const value = Math.max(0, ms);
+	if (value > 0 && value < 1) return "<1ms";
+	if (value < 1000) return `${Math.round(value)}ms`;
+	if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0).replace(/\.0$/, "")}s`;
+	const seconds = Math.round(value / 1000);
 	return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
@@ -1647,7 +1709,8 @@ function formatBytes(bytes: number): string {
 	if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
 	if (bytes < 1024) return `${Math.round(bytes)} B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1).replace(/\.0$/, "")} KiB`;
-	return `${(bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, "")} MiB`;
+	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, "")} MiB`;
+	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1).replace(/\.0$/, "")} GiB`;
 }
 
 function formatPercent(value: number): string {
@@ -1656,4 +1719,12 @@ function formatPercent(value: number): string {
 
 function formatNumber(value: number): string {
 	return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(3)));
+}
+
+function formatRatio(numerator: number, denominator: number): string {
+	return `${numerator}/${denominator} (${denominator > 0 ? formatPercent(numerator / denominator) : "n/a"})`;
+}
+
+function formatProcessReuse(reuse: WorldReuseMetrics): string {
+	return `${formatRatio(reuse.hits, reuse.requests)} hits; ${reuse.sameTurnHits} same-turn, ${reuse.crossTurnHits} cross-turn, ${reuse.unattributedHits} origin unknown, ${reuse.joinedHits} joined in-flight; ${formatDuration(reuse.validationMs)} validation, ${formatDuration(reuse.replayMs)} replay, ${formatDuration(reuse.executionMs)} observed cold execution`;
 }

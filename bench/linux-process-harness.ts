@@ -127,6 +127,7 @@ export async function executeReusableBash(
 		readonly command: string;
 		readonly actionNamespace: string;
 		readonly executionFingerprint: string;
+		readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
 	},
 ) {
 	const args = { command: input.command };
@@ -152,6 +153,7 @@ export async function executeReusableBash(
 		action,
 		callID: `bench-${input.label}`,
 		signal: new AbortController().signal,
+		...(input.executionScope ? { executionScope: input.executionScope } : {}),
 	});
 	const forkMs = performance.now() - forkStarted;
 	try {
@@ -273,6 +275,9 @@ export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProces
 		requests: after.requests - before.requests,
 		hits: after.hits - before.hits,
 		joinedHits: after.joinedHits - before.joinedHits,
+		sameTurnHits: after.sameTurnHits - before.sameTurnHits,
+		crossTurnHits: after.crossTurnHits - before.crossTurnHits,
+		unattributedHits: after.unattributedHits - before.unattributedHits,
 		misses: after.misses - before.misses,
 		bypasses: after.bypasses - before.bypasses,
 		published: after.published - before.published,

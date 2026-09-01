@@ -112,7 +112,7 @@ try {
 	assert(hit?.output.includes(orderedChildOutput), "replayed child output differs");
 	assert(invalidated?.artifact === "beta\n", "changed input was not observed");
 	assert(
-		hit.metricDelta.hits === 1 && hit.metricDelta.misses === 0,
+		hit.metricDelta.hits === 1 && hit.metricDelta.crossTurnHits === 1 && hit.metricDelta.misses === 0,
 		`second parent did not hit: ${JSON.stringify(hit.metricDelta)}`,
 	);
 	assert(
@@ -156,6 +156,7 @@ try {
 			command,
 			actionNamespace: "pi-bash-benchmark.v1",
 			executionFingerprint,
+			executionScope: { sessionID: "benchmark", turnID: label },
 		});
 		return {
 			label,

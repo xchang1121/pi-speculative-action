@@ -3,6 +3,7 @@ import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
 	ExecutionWorld,
+	ExecutionScope,
 	WorldBranch,
 	WorldCheckpoint,
 	WorldCompatibilityEvidence,
@@ -29,6 +30,7 @@ export interface SpeculativeToolExecutionContext {
 	readonly action: ActionKey;
 	readonly callID: string;
 	readonly signal: AbortSignal;
+	readonly executionScope?: ExecutionScope;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;
 }

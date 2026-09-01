@@ -66,7 +66,7 @@ export {
 	type SpeculativeToolSelectionInput,
 	usageTokenCount,
 } from "./common.ts";
-export type { ActionReuseKind } from "./execution-world.ts";
+export type { ActionReuseKind, ExecutionScope } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,
 	type EffectiveSpeculativeActionSettings,

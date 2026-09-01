@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { CandidateEventDescriptor, SpeculativeActionEvent, SpeculativeCacheSnapshot } from "../src/events.ts";
+import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import {
 	emptySpeculativeTraceSummary,
 	reduceSpeculativeTrace,
@@ -53,6 +54,7 @@ describe("speculative trace reduction", () => {
 			executionBlockedPotentialHiddenLatencyMs: 12,
 			executionBlockedPotentialHitLatencyMs: 0,
 			totalDraftTokens: 7,
+			processReuse: { requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3 },
 			cache: { resultEntries: 2, cacheCold: 1, cacheHot: 1 },
 		});
 	});
@@ -143,7 +145,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 		{
 			...base,
 			type: "candidate",
-			candidate: candidate("one"),
+			candidate: candidate("one", true),
 			state: { status: "succeeded", startedAt: 0, completedAt: 40, executionMs: 40 },
 		},
 		{ ...base, type: "candidate", candidate: candidate("two"), state: { status: "running", startedAt: 0 } },
@@ -207,7 +209,7 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 	];
 }
 
-function candidate(id: string): CandidateEventDescriptor {
+function candidate(id: string, withReuse = false): CandidateEventDescriptor {
 	return {
 		id,
 		origin: "prediction",
@@ -223,6 +225,16 @@ function candidate(id: string): CandidateEventDescriptor {
 		expectedDurationMs: 40,
 		estimatedBytes: 128,
 		validation: { durationMs: 0, bytesRead: 0, filesRead: 0 },
+		...(withReuse
+			? {
+					world: {
+						backend: "linux_process_reuse",
+						executionMetrics: {
+							reuse: { ...emptyWorldReuseMetrics(), requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3 },
+						},
+					},
+				}
+			: {}),
 	};
 }
 

@@ -332,7 +332,7 @@ export function createSpeculativeActionHost(
 			);
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
-		captureAuthoritativeResult: async ({ data, tool: toolName, concrete, action, callID, signal }) => {
+		captureAuthoritativeResult: async ({ startInput, data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return undefined;
 			const definition = actionSemantics.definition(toolName);
@@ -351,6 +351,7 @@ export function createSpeculativeActionHost(
 					action: operation.action ?? action,
 					callID: operation.callID ?? callID,
 					signal: operation.signal ?? signal,
+					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 				}),
 			);
 			if (!captured) return undefined;
@@ -391,7 +392,7 @@ export function createSpeculativeActionHost(
 			}
 			return result.ok ? result : { ...result, reason: "permission_or_policy_changed" };
 		},
-		executeCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
+		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
@@ -407,6 +408,7 @@ export function createSpeculativeActionHost(
 					action: operation.action ?? action,
 					callID: operation.callID ?? callID,
 					signal: operation.signal ?? signal,
+					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
 				}),
 			);
