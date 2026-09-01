@@ -27,7 +27,7 @@ import {
 	type PatternAwareStore,
 	patternAwareSettings,
 } from "./pattern-aware.ts";
-import { createPatternPlanSource, patternPlanActionID } from "./pattern-plan-source.ts";
+import { createPatternPlanSource } from "./pattern-plan-source.ts";
 import type {
 	CandidatePreflight,
 	ActorActionFeedback,
