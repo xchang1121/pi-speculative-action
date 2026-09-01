@@ -2439,11 +2439,10 @@ function transform(operation: "dirname" | "basename" | "normalize_path", value: 
 }
 
 const PATH_OPERATION_CACHE_LIMIT = 128;
-const normalizedPaths = new Map<string, string>();
-const joinedPaths = new Map<string, string>();
+const normalizedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
+const joinedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 
-function cachePathResult(cache: Map<string, string>, key: string, value: string) {
-	if (cache.size >= PATH_OPERATION_CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) {
 	cache.set(key, value);
 	return value;
 }
@@ -3134,7 +3133,7 @@ function decodePath(value: string): PatternAwarePath {
 	return parsePath(value) ?? [];
 }
 
-const parsedPaths = new Map<string, PatternAwarePath | null>();
+const parsedPaths = new BoundedRecencyMap<string, PatternAwarePath | null>(PATH_OPERATION_CACHE_LIMIT);
 
 function parsePath(value: string): PatternAwarePath | undefined {
 	const cached = parsedPaths.get(value);
