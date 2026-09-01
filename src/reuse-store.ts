@@ -150,6 +150,7 @@ export class ProvenanceCertificateStore {
 	private readonly orphanGraceMs: number;
 	private maintenance: Promise<void> = Promise.resolve();
 	private gcDueAt: number;
+	private statsValue?: ProvenanceStoreStats;
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root);
@@ -173,6 +174,7 @@ export class ProvenanceCertificateStore {
 			maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes),
 		});
 		this.gcDueAt = 0;
+		this.statsValue = undefined;
 	}
 
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
@@ -239,9 +241,10 @@ export class ProvenanceCertificateStore {
 		return certificates;
 	}
 
-	async stats(): Promise<ProvenanceStoreStats> {
+	async stats(refresh = false): Promise<ProvenanceStoreStats> {
 		await this.maintenance;
-		return inventoryStats(await this.inventory(), this.limits);
+		if (refresh || !this.statsValue) this.statsValue = inventoryStats(await this.inventory(), this.limits);
+		return this.statsValue;
 	}
 
 	gc(): Promise<ProvenanceStoreGCResult> {
@@ -336,7 +339,10 @@ export class ProvenanceCertificateStore {
 	}
 
 	private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-		const result = this.maintenance.then(operation, operation);
+		const mutate = async () => {
+			try { return await operation(); } finally { this.statsValue = undefined; }
+		};
+		const result = this.maintenance.then(mutate, mutate);
 		this.maintenance = result.then(() => undefined, () => undefined);
 		return result;
 	}

@@ -54,7 +54,7 @@ export function createLinuxProcessExecutionWorld(
 			return `${processFingerprint}:${workspaceFingerprint}`;
 		},
 		diagnostics: async ({ cwd, refresh }) => {
-			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats()]);
+			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
 			const storage = {
 				entries: store.certificates,
 				maxEntries: backend.store.limits.maxCertificates,

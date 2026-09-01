@@ -37,7 +37,10 @@ describe("persistent provenance store", () => {
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
 		expect(await reopened.get(certificate.id)).toEqual(certificate);
 		expect(await reopened.findByWeakKey(certificate.weakKey)).toEqual([certificate]);
-		expect(await reopened.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
+		const cachedStats = await reopened.stats();
+		expect(cachedStats).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
+		expect(await reopened.stats()).toBe(cachedStats);
+		expect(await reopened.stats(true)).not.toBe(cachedStats);
 
 		const store = new ProvenanceCertificateStore(root, {
 			maxCertificates: 1,
