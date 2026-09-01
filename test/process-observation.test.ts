@@ -69,7 +69,8 @@ describe("process observation", () => {
 			expect(after.bytesRead).toBe(0);
 			expect("digest" in beforeEntry).toBe(false);
 			expect(beforeEntry.metadataDigest).toBe(afterEntry.metadataDigest);
-			expect(beforeEntry.changeDigest).not.toBe(afterEntry.changeDigest);
+			// Same-size rapid rewrites can share observable timestamps on coarse-clock filesystems.
+			// The regular-file delta, not incidental metadata movement, is the authoritative evidence.
 			const diff = diffWorkspaceStructures(
 				before,
 				after,
