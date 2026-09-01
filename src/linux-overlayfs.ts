@@ -15,11 +15,16 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
 const OVERLAY_EXIT_TIMEOUT_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
+const DEFAULT_REQUEST_CACHE_CAPACITY = 32;
+const DEFAULT_RESOLVED_CACHE_CAPACITY = 8;
+const DEFAULT_DEGRADED_CAPACITY = 16;
+const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30_000;
 // asm-generic/fcntl.h: __O_TMPFILE (020000000) | O_DIRECTORY (00200000).
 const LINUX_O_TMPFILE = 0o20200000;
 
@@ -69,19 +74,135 @@ interface ResolvedOverlayfs {
 	readonly kernel: string;
 }
 
-const capabilityCache = new Map<string, Promise<LinuxOverlayfsCapability>>();
+interface LinuxOverlayfsCapabilityCacheEntry {
+	readonly pending: Promise<LinuxOverlayfsCapability>;
+	expiresAt?: number;
+}
+
+export interface LinuxOverlayfsCapabilityRegistryOptions {
+	readonly requestCapacity?: number;
+	readonly resolvedCapacity?: number;
+	readonly degradedCapacity?: number;
+	readonly negativeTtlMs?: number;
+}
+
+export interface LinuxOverlayfsCapabilityRegistryInspection {
+	readonly requestEntries: number;
+	readonly resolvedEntries: number;
+	readonly degradedEntries: number;
+	readonly disabled: boolean;
+	readonly disposed: boolean;
+}
+
+/** Lifecycle-owned, bounded capability memoization with fail-closed driver quarantine. */
+export class LinuxOverlayfsCapabilityRegistry {
+	private readonly requests: BoundedRecencyMap<string, LinuxOverlayfsCapabilityCacheEntry>;
+	private readonly resolved: BoundedRecencyMap<string, LinuxOverlayfsCapabilityCacheEntry>;
+	private readonly degraded = new Map<string, string>();
+	private readonly degradedCapacity: number;
+	private readonly negativeTtlMs: number;
+	private disabledDetail?: string;
+	private disposed = false;
+
+	constructor(options: LinuxOverlayfsCapabilityRegistryOptions = {}) {
+		this.requests = new BoundedRecencyMap(positiveCapacity(options.requestCapacity, DEFAULT_REQUEST_CACHE_CAPACITY));
+		this.resolved = new BoundedRecencyMap(positiveCapacity(options.resolvedCapacity, DEFAULT_RESOLVED_CACHE_CAPACITY));
+		this.degradedCapacity = positiveCapacity(options.degradedCapacity, DEFAULT_DEGRADED_CAPACITY);
+		this.negativeTtlMs = nonNegativeDuration(options.negativeTtlMs, DEFAULT_NEGATIVE_CACHE_TTL_MS);
+	}
+
+	capability(options: LinuxOverlayfsOptions = {}): Promise<LinuxOverlayfsCapability> {
+		if (this.disposed) return Promise.reject(new Error("Linux OverlayFS capability registry is disposed"));
+		if (this.disabledDetail) return Promise.resolve({ available: false, detail: this.disabledDetail });
+		return this.memoized(this.requests, overlayfsCapabilityKey(options), () => this.resolveCapability(options)).then(
+			(capability) => this.currentCapability(capability),
+		);
+	}
+
+	markDegraded(capability: Extract<LinuxOverlayfsCapability, { readonly available: true }>, detail: string): void {
+		if (this.disposed || this.disabledDetail) return;
+		const key = availableCapabilityKey(capability);
+		const disabled = `fuse-overlayfs driver disabled: ${detail}`;
+		if (this.degraded.has(key)) {
+			this.degraded.set(key, disabled);
+			return;
+		}
+		if (this.degraded.size >= this.degradedCapacity) {
+			this.disabledDetail = `fuse-overlayfs registry disabled after ${this.degradedCapacity + 1} driver degradations`;
+			this.requests.clear();
+			this.resolved.clear();
+			this.degraded.clear();
+			return;
+		}
+		this.degraded.set(key, disabled);
+	}
+
+	inspect(): LinuxOverlayfsCapabilityRegistryInspection {
+		return {
+			requestEntries: this.requests.size,
+			resolvedEntries: this.resolved.size,
+			degradedEntries: this.degraded.size,
+			disabled: this.disabledDetail !== undefined,
+			disposed: this.disposed,
+		};
+	}
+
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.requests.clear();
+		this.resolved.clear();
+		this.degraded.clear();
+	}
+
+	private async resolveCapability(options: LinuxOverlayfsOptions): Promise<LinuxOverlayfsCapability> {
+		if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
+		let resolved: ResolvedOverlayfs;
+		try {
+			resolved = await resolveOverlayfs(options);
+		} catch (error) {
+			return { available: false, detail: errorMessage(error) };
+		}
+		return this.memoized(this.resolved, resolvedCapabilityKey(resolved), () => probeLinuxOverlayfs(resolved));
+	}
+
+	private currentCapability(capability: LinuxOverlayfsCapability): LinuxOverlayfsCapability {
+		if (this.disabledDetail) return { available: false, detail: this.disabledDetail };
+		if (!capability.available) return capability;
+		const detail = this.degraded.get(availableCapabilityKey(capability));
+		return detail ? { available: false, detail } : capability;
+	}
+
+	private memoized(
+		cache: BoundedRecencyMap<string, LinuxOverlayfsCapabilityCacheEntry>,
+		key: string,
+		load: () => Promise<LinuxOverlayfsCapability>,
+	): Promise<LinuxOverlayfsCapability> {
+		const now = Date.now();
+		const cached = cache.get(key);
+		if (cached && (cached.expiresAt === undefined || cached.expiresAt > now)) return cached.pending;
+		if (cached) cache.delete(key);
+		const entry: LinuxOverlayfsCapabilityCacheEntry = { pending: Promise.resolve().then(load) };
+		cache.set(key, entry);
+		void entry.pending.then(
+			(capability) => {
+				if (!capability.available) entry.expiresAt = Date.now() + this.negativeTtlMs;
+			},
+			() => {
+				entry.expiresAt = Date.now() + this.negativeTtlMs;
+			},
+		);
+		return entry.pending;
+	}
+}
+
+const defaultCapabilityRegistry = new LinuxOverlayfsCapabilityRegistry();
 
 /** Probe the complete mount/read/copy-up/whiteout/unmount lifecycle; version output alone is insufficient. */
 export function linuxOverlayfsCapability(
 	options: LinuxOverlayfsOptions = {},
 ): Promise<LinuxOverlayfsCapability> {
-	const key = overlayfsCapabilityKey(options);
-	let pending = capabilityCache.get(key);
-	if (!pending) {
-		pending = probeLinuxOverlayfs(options);
-		capabilityCache.set(key, pending);
-	}
-	return pending;
+	return defaultCapabilityRegistry.capability(options);
 }
 
 /** Mount a private copy-on-write view in the caller's mount namespace. */
@@ -89,9 +210,10 @@ export async function mountLinuxOverlayfs(input: {
 	readonly lowerRoot: string;
 	readonly privateRoot: string;
 	readonly options?: LinuxOverlayfsOptions;
+	readonly capabilityRegistry?: LinuxOverlayfsCapabilityRegistry;
 }): Promise<LinuxOverlayfsMount> {
-	const capabilityKey = overlayfsCapabilityKey(input.options ?? {});
-	const capability = await linuxOverlayfsCapability(input.options);
+	const capabilityRegistry = input.capabilityRegistry ?? defaultCapabilityRegistry;
+	const capability = await capabilityRegistry.capability(input.options);
 	if (!capability.available) throw new Error(capability.detail);
 	const upperRoot = path.join(input.privateRoot, "upper");
 	const workRoot = path.join(input.privateRoot, "work");
@@ -119,22 +241,12 @@ export async function mountLinuxOverlayfs(input: {
 		workRoot,
 		root,
 		onDegraded: (detail) => {
-			capabilityCache.set(
-				capabilityKey,
-				Promise.resolve({ available: false, detail: `fuse-overlayfs driver disabled: ${detail}` }),
-			);
+			capabilityRegistry.markDegraded(capability, detail);
 		},
 	});
 }
 
-async function probeLinuxOverlayfs(options: LinuxOverlayfsOptions): Promise<LinuxOverlayfsCapability> {
-	if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
-	let resolved: ResolvedOverlayfs;
-	try {
-		resolved = await resolveOverlayfs(options);
-	} catch (error) {
-		return { available: false, detail: errorMessage(error) };
-	}
+async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOverlayfsCapability> {
 	const probeRoot = await mkdtemp(path.join(os.tmpdir(), "pi-fuse-overlayfs-probe-"));
 	const lowerRoot = path.join(probeRoot, "lower");
 	const privateRoot = path.join(probeRoot, "private");
@@ -470,6 +582,24 @@ async function resolveOverlayfs(options: LinuxOverlayfsOptions): Promise<Resolve
 
 function overlayfsCapabilityKey(options: LinuxOverlayfsOptions): string {
 	return `${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`;
+}
+
+function resolvedCapabilityKey(resolved: ResolvedOverlayfs): string {
+	return [resolved.binary, resolved.fusermountBinary, resolved.kernel, resolved.version].join("\0");
+}
+
+function availableCapabilityKey(
+	capability: Extract<LinuxOverlayfsCapability, { readonly available: true }>,
+): string {
+	return `${capability.binary}\0${capability.fusermountBinary}\0${capability.fingerprint}`;
+}
+
+function positiveCapacity(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function nonNegativeDuration(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 async function resolveExecutable(

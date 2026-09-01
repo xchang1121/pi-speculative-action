@@ -33,6 +33,10 @@ export class BoundedRecencyMap<Key, Value> {
 		return this.entriesValue.delete(key);
 	}
 
+	clear(): void {
+		this.entriesValue.clear();
+	}
+
 	values(): IterableIterator<Value> {
 		return this.entriesValue.values();
 	}

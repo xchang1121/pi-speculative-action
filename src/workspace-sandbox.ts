@@ -15,8 +15,8 @@ import type {
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import {
+	LinuxOverlayfsCapabilityRegistry,
 	LinuxOverlayfsUnsafeCleanupError,
-	linuxOverlayfsCapability,
 	mountLinuxOverlayfs,
 	openLinuxAnonymousWorkspaceFile,
 	type LinuxOverlayfsMount,
@@ -149,6 +149,7 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 interface WorkspaceSandboxState {
 	readonly repositories: Map<string, Promise<PooledGitRepository>>;
 	readonly targetLocks: Map<string, Promise<void>>;
+	readonly overlayfsCapabilities: LinuxOverlayfsCapabilityRegistry;
 	cleanupTail: Promise<void>;
 	disposed: boolean;
 }
@@ -641,6 +642,7 @@ export class WorkspaceSandboxService {
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
 		targetLocks: new Map(),
+		overlayfsCapabilities: new LinuxOverlayfsCapabilityRegistry(),
 		cleanupTail: Promise.resolve(),
 		disposed: false,
 	};
@@ -695,7 +697,11 @@ export class WorkspaceSandboxService {
 		if (this.state.disposed) return;
 		this.state.disposed = true;
 		await Promise.allSettled([...this.state.targetLocks.values()]);
-		await closeWorkspaceSandboxPoolsFor(this.state);
+		try {
+			await closeWorkspaceSandboxPoolsFor(this.state);
+		} finally {
+			this.state.overlayfsCapabilities.dispose();
+		}
 	}
 }
 
@@ -739,7 +745,7 @@ async function resolveWorkspaceDriver(
 ): Promise<QualifiedWorkspaceSandboxDriver> {
 	const requested = options.driver ?? "auto";
 	if (requested === "git") return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
-	const capability = await linuxOverlayfsCapability({
+	const capability = await state.overlayfsCapabilities.capability({
 		...(options.overlayfsBinary ? { overlayfsBinary: options.overlayfsBinary } : {}),
 		...(options.fusermountBinary ? { fusermountBinary: options.fusermountBinary } : {}),
 	});
@@ -1177,6 +1183,7 @@ async function createPrivateSandboxWorkspace(
 				lowerRoot: sharedBaseline.root,
 				privateRoot: overlayStorageRoot,
 				options: overlayOptions,
+				capabilityRegistry: state.overlayfsCapabilities,
 			});
 			overlay = mounted;
 			sandboxRoot = mounted.root;

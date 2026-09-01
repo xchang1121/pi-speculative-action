@@ -3,9 +3,73 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
+import {
+	LinuxOverlayfsCapabilityRegistry,
+	linuxOverlayfsCapability,
+	mountLinuxOverlayfs,
+} from "../src/linux-overlayfs.ts";
 
 describe("Linux OverlayFS workspace substrate", () => {
+	it("bounds request aliases and releases lifecycle-owned capability state", async () => {
+		const registry = new LinuxOverlayfsCapabilityRegistry({
+			requestCapacity: 4,
+			resolvedCapacity: 2,
+			negativeTtlMs: 60_000,
+		});
+		await Promise.all(
+			Array.from({ length: 128 }, (_value, index) =>
+				registry.capability({ overlayfsBinary: path.join(os.tmpdir(), `missing-overlay-${index}`) }),
+			),
+		);
+		expect(registry.inspect()).toMatchObject({
+			requestEntries: 4,
+			disabled: false,
+			disposed: false,
+		});
+		expect(registry.inspect().resolvedEntries).toBeLessThanOrEqual(2);
+
+		registry.dispose();
+		expect(registry.inspect()).toEqual({
+			requestEntries: 0,
+			resolvedEntries: 0,
+			degradedEntries: 0,
+			disabled: false,
+			disposed: true,
+		});
+		await expect(registry.capability()).rejects.toThrow("registry is disposed");
+	});
+
+	it("fails the registry closed instead of evicting degraded driver identities", async () => {
+		const registry = new LinuxOverlayfsCapabilityRegistry({ degradedCapacity: 1 });
+		registry.markDegraded(
+			{
+				available: true,
+				binary: "/driver/one",
+				fusermountBinary: "/unmount/one",
+				fingerprint: "one",
+				detail: "ready",
+			},
+			"first unsafe mount",
+		);
+		registry.markDegraded(
+			{
+				available: true,
+				binary: "/driver/two",
+				fusermountBinary: "/unmount/two",
+				fingerprint: "two",
+				detail: "ready",
+			},
+			"second unsafe mount",
+		);
+
+		expect(registry.inspect()).toMatchObject({ degradedEntries: 0, disabled: true });
+		await expect(registry.capability()).resolves.toMatchObject({
+			available: false,
+			detail: expect.stringMatching(/registry disabled/i),
+		});
+		registry.dispose();
+	});
+
 	it("proves copy-on-write isolation and visibility in descendant namespaces", async () => {
 		const capability = await linuxOverlayfsCapability();
 		if (!capability.available) {
