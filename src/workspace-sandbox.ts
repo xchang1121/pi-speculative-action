@@ -583,8 +583,8 @@ const WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS = 100;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";
-// After lower-structure sharing, repeated same-machine A/B crosses between 100 and 250 source files.
-// Use the next conservative power-of-two boundary and require an exact immutable baseline.
+// Small-tree gains remain host-sensitive and carry one-time FUSE preparation cost, while the
+// 500/1,000-file A/B is material. Use a conservative power-of-two boundary and exact baseline.
 const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
 const sandboxRepositories = new Map<string, Promise<PooledGitRepository>>();
 const SANDBOX_AUTHOR_ENVIRONMENT = {
