@@ -66,8 +66,9 @@ describe("speculative action package boundary", () => {
 	});
 
 	test("keeps the root entry as a compatibility aggregate of the narrow APIs", () => {
+		const rootApi = packageApi as unknown as Readonly<Record<string, unknown>>;
 		for (const api of [coreApi, processReuseApi]) {
-			for (const [name, exported] of Object.entries(api)) expect(packageApi[name]).toBe(exported);
+			for (const [name, exported] of Object.entries(api)) expect(rootApi[name]).toBe(exported);
 		}
 	});
 
