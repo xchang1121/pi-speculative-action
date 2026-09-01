@@ -70,7 +70,7 @@ describe("process provenance certificates", () => {
 				],
 				taints: [],
 			},
-			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
+			result: { replayProfile: "buffered_noninteractive", observedProcessMs: 1250.5, journal: [], exit: { kind: "code", code: 0 } },
 		});
 		const validation = await validateProcessCertificate(certificate, {
 			resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
@@ -80,6 +80,7 @@ describe("process provenance certificates", () => {
 		expect(certificate.strongKey).toBe(
 			validation.status === "valid" ? validation.strongKey : undefined,
 		);
+		expect(certificate.result.observedProcessMs).toBe(1250.5);
 
 		await writeFile(path.join(root, "input.txt"), "changed");
 		expect(

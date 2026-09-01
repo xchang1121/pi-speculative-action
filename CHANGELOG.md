@@ -22,6 +22,9 @@
 
 ### Added
 
+- Added user-facing Bash acceleration accounting from matched command evidence: successful reuse now
+  reports timed coverage, prior child-process work, complete nested reuse-request overhead, and matched-command
+  estimated savings without presenting it as whole-Agent speedup. TUI cache tiers are named by purpose.
 - Added a driver-native workspace structure contract shared by top-level provenance and nested
   transactions. OverlayFS now prewarms one immutable lower snapshot per content commit and
   reconstructs each logical tree from only typed upper paths and ancestors.

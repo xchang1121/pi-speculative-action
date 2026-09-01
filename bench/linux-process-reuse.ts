@@ -116,6 +116,11 @@ try {
 		`second parent did not hit: ${JSON.stringify(hit.metricDelta)}`,
 	);
 	assert(
+		hit.metricDelta.timedHits === 1 &&
+			hit.metricDelta.avoidedProcessMs > hit.metricDelta.timedHitOverheadMs,
+		`second parent did not report a measured reuse benefit: ${JSON.stringify(hit.metricDelta)}`,
+	);
+	assert(
 		invalidated.metricDelta.hits === 0 && invalidated.metricDelta.misses === 1,
 		`changed input did not miss: ${JSON.stringify(invalidated.metricDelta)}`,
 	);

@@ -93,7 +93,7 @@ describe("ProcessReusePlanner", () => {
 		expect(get).toHaveBeenCalledTimes(2);
 	});
 
-	it("consults an adapter over the existing L1 before persistent certificates", async () => {
+	it("consults the existing live result adapter before persistent certificates", async () => {
 		const root = await temporaryRoot();
 		const lookup = vi.fn(async () => ({ resultEntry: "runtime-owned" }));
 		const planner = new ProcessReusePlanner({

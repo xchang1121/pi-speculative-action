@@ -50,10 +50,10 @@ export function sameSpeculativeExecutionRoute(
 }
 
 const WORLD_REUSE_COUNTERS = [
-	"requests", "hits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
+	"requests", "hits", "timedHits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
 	"misses", "bypasses", "published", "tainted", "validationMs", "validationCandidates",
 	"validationPathsets", "validationFilesRead", "validationBytesRead", "validationArtifactsLoaded",
-	"validationArtifactBytesRead", "replayMs", "executionMs",
+	"validationArtifactBytesRead", "replayMs", "executionMs", "avoidedProcessMs", "timedHitOverheadMs",
 ] as const;
 
 type WorldReuseCounter = typeof WORLD_REUSE_COUNTERS[number];

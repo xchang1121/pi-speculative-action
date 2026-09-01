@@ -160,6 +160,8 @@ export type ExitOutcome =
 
 export interface ProcessResultRecord {
 	readonly replayProfile: "buffered_noninteractive";
+	/** Producer process wall time; observational only and never used to authorize replay. */
+	readonly observedProcessMs?: number;
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
 	readonly exit: ExitOutcome;
@@ -306,8 +308,10 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 function certificateContentKey(
 	certificate: Omit<ProcessProvenanceCertificate, "id">,
 ): Sha256Digest {
-	const { createdAt: _createdAt, ...content } = certificate;
-	return digestObject(content);
+	const { createdAt: _createdAt, result, ...content } = certificate;
+	// Observational timing must not split otherwise identical reusable results.
+	const { observedProcessMs: _observedProcessMs, ...semanticResult } = result;
+	return digestObject({ ...content, result: semanticResult });
 }
 
 export function referencedArtifacts(certificate: ProcessProvenanceCertificate): readonly ArtifactReference[] {
@@ -545,6 +549,12 @@ function validExcludedEntries(entries: readonly string[] | undefined): boolean {
 
 function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
+	if (
+		result.observedProcessMs !== undefined &&
+		(!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)
+	) {
+		throw new Error("invalid observed process duration");
+	}
 	const journal = [...result.journal]
 		.map((event) => ({ ...event }))
 		.sort((left, right) => left.sequence - right.sequence);
@@ -589,7 +599,12 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 			if (!validLogicalPath(effectPath)) throw new Error("invalid effect path");
 		}
 	}
-	return deepFreeze({ replayProfile: result.replayProfile, journal, exit: { ...result.exit } });
+	return deepFreeze({
+		replayProfile: result.replayProfile,
+		...(result.observedProcessMs !== undefined ? { observedProcessMs: result.observedProcessMs } : {}),
+		journal,
+		exit: { ...result.exit },
+	});
 }
 
 function effectPaths(event: OrderedEffectEvent): readonly string[] {

@@ -272,27 +272,9 @@ export function textOutput(result: { readonly content: readonly { readonly type:
 
 export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProcessReuseMetrics): LinuxProcessReuseMetrics {
 	return {
-		requests: after.requests - before.requests,
-		hits: after.hits - before.hits,
-		joinedHits: after.joinedHits - before.joinedHits,
-		sameTurnHits: after.sameTurnHits - before.sameTurnHits,
-		crossTurnHits: after.crossTurnHits - before.crossTurnHits,
-		unattributedHits: after.unattributedHits - before.unattributedHits,
-		misses: after.misses - before.misses,
-		bypasses: after.bypasses - before.bypasses,
-		published: after.published - before.published,
-		tainted: after.tainted - before.tainted,
-		validationMs: after.validationMs - before.validationMs,
-		validationCandidates: after.validationCandidates - before.validationCandidates,
-		validationPathsets: after.validationPathsets - before.validationPathsets,
-		validationFilesRead: after.validationFilesRead - before.validationFilesRead,
-		validationBytesRead: after.validationBytesRead - before.validationBytesRead,
-		validationArtifactsLoaded: after.validationArtifactsLoaded - before.validationArtifactsLoaded,
-		validationArtifactBytesRead: after.validationArtifactBytesRead - before.validationArtifactBytesRead,
-		replayMs: after.replayMs - before.replayMs,
-		executionMs: after.executionMs - before.executionMs,
+		...subtractMetrics(numericMetrics(before), numericMetrics(after)),
 		...(after.lastError !== before.lastError && after.lastError ? { lastError: after.lastError } : {}),
-	};
+	} as LinuxProcessReuseMetrics;
 }
 
 export function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetrics {

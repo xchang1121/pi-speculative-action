@@ -25,7 +25,7 @@ describe("persistent provenance store", () => {
 		const duplicateArtifact = await initial.artifacts.put(Buffer.from("output bytes"));
 		expect(duplicateArtifact).toEqual(first);
 		const certificate = completed(first, 123);
-		const duplicate = completed(first, 456);
+		const duplicate = completed(first, 456, "test", 999);
 		expect(duplicate.id).toBe(certificate.id);
 		const { id: _id, ...legacyBody } = certificate;
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
@@ -110,12 +110,18 @@ describe("persistent provenance store", () => {
 	});
 });
 
-function completed(reference: { readonly digest: `sha256:${string}`; readonly size: number }, createdAt: number, mode = "test") {
+function completed(
+	reference: { readonly digest: `sha256:${string}`; readonly size: number },
+	createdAt: number,
+	mode = "test",
+	observedProcessMs?: number,
+) {
 	return sealProcessCertificate({
 		prototype: prototype(mode),
 		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 		result: {
 			replayProfile: "buffered_noninteractive",
+			...(observedProcessMs !== undefined ? { observedProcessMs } : {}),
 			journal: [{ sequence: 0, kind: "output", fd: 1, data: reference }],
 			exit: { kind: "code", code: 0 },
 		},

@@ -26,6 +26,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
 	formatSpeculativeActionEvent,
@@ -299,7 +300,13 @@ describe("zero-modification Pi extension", () => {
 		settings.selfSpeculation = { ...settings.selfSpeculation, enabled: true, forkTransport: "sidecar" };
 		const status = formatSpeculativeActionStatus({
 			settings,
-			metrics: emptyMetrics(),
+			metrics: {
+				...emptyMetrics(),
+				processReuse: {
+					...emptyWorldReuseMetrics(), requests: 3, hits: 1, timedHits: 1, crossTurnHits: 1,
+					avoidedProcessMs: 1200, timedHitOverheadMs: 200,
+				},
+			},
 		});
 
 		expect(status).toContain("Prediction tools: read write edit bash");
@@ -308,12 +315,15 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).toContain("Actor actions: 0/0 (n/a)");
-		expect(status).toContain("Process reuse (validated L2): 0/0 (n/a)");
+		expect(status).toContain("Bash reuse this session: 1/3 (33%) commands launched by Bash reused");
+		expect(status).toContain("Bash time saved this session: ~1s estimated saved (83% less) across 1/1 reuses with timing");
+		expect(status).toContain("1.2s prior execution vs 200ms reuse overhead");
 		expect(status).toContain("Task timing: n/a (no completed task)");
-		expect(status).not.toContain("0ms saved");
 		expect(status).toContain("Execution ahead: 0ms; hit latency: 0ms; attempt lead: 0ms; Actor execution: 0ms");
 		expect(status).toContain("Reuse: 0 exact actions; 0 partial results (none)");
 		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
+		expect(status).toContain("not whole-agent speedup");
+		expect(status).not.toMatch(/\bL[12]\b/);
 	});
 
 	it("labels an adopted read projection as partial-result reuse", () => {
@@ -375,7 +385,7 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
-		expect(fixture.ui.setStatus).toHaveBeenCalledWith("speculative-action", expect.stringContaining("L2 store 3 entries (2 KiB)"));
+		expect(fixture.ui.setStatus).toHaveBeenCalledWith("speculative-action", expect.stringContaining("reuse history 3 entries (2 KiB)"));
 		expect(fixture.store.effective()).toEqual({ enabled: true });
 		expect(fixture.store.scope).toBe("project");
 	});
@@ -409,7 +419,7 @@ describe("zero-modification Pi extension", () => {
 		});
 		driveSettingsMenus(fixture, {
 			"Speculative action": ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"],
-			"Scheduling & cache": ["Resource cache memory", "Validated reuse entries", "Validated reuse memory", "Reclaim", "Clear", "Back"],
+			"Scheduling & cache": ["Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
 			"Self-speculation": ["Endpoint", "Fork action confidence", "Back"],
 			"Prediction sources": ["PatternAware", "Back"],
 			PatternAware: ["Learning", "Back"],
@@ -417,14 +427,14 @@ describe("zero-modification Pi extension", () => {
 		});
 		fixture.ui.input = async (title) =>
 			({
-				"Resource cache memory (MiB)": "96",
-				"Validated reuse entries": "2048",
-				"Validated reuse memory (MiB)": "768",
+				"Live result memory (MiB)": "96",
+				"Reusable command history entries": "2048",
+				"Reusable command history memory (MiB)": "768",
 				"Self-speculation endpoint": "file:///unsafe",
 				"Fork action minimum confidence": "0.75",
 				"Future gap coverage (0-1)": "0.8",
 			} as Readonly<Record<string, string>>)[title];
-		fixture.ui.confirm = async (title) => title === "Clear validated reuse storage?";
+		fixture.ui.confirm = async (title) => title === "Clear reusable command history?";
 
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
@@ -442,7 +452,7 @@ describe("zero-modification Pi extension", () => {
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
 		expect(maintain.mock.calls).toEqual([["gc"], ["clear"]]);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
-			"Validated reuse storage cleared: 2 entries, 3 artifacts, 4 KiB.",
+			"Reusable command history cleared: 2 entries, 3 artifacts, 4 KiB.",
 			"info",
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(

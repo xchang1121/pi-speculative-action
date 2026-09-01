@@ -124,10 +124,10 @@ type SettingInputDescriptors<T, K extends keyof T> = {
 const ROOT_SETTING_INPUTS = {
 	candidateLimit: positiveIntegerInput("Drafter requests per turn", { transform: clampCandidateLimit }),
 	maxConcurrentActions: positiveIntegerInput("Concurrent actions", { transform: clampCandidateLimit }),
-	resourceCacheMaxEntries: positiveIntegerInput("Resource cache entries"),
-	resourceCacheMaxBytes: mebibyteInput("Resource cache memory"),
-	executionStoreMaxEntries: positiveIntegerInput("Validated reuse entries"),
-	executionStoreMaxBytes: mebibyteInput("Validated reuse memory"),
+	resourceCacheMaxEntries: positiveIntegerInput("Live result entries"),
+	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
+	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
+	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
 	predictionTimeoutMs: positiveIntegerInput("Prediction timeout (ms)"),
 	drafterMaxTokens: optionalPositiveIntegerInput("Drafter output tokens (blank for provider default)"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter rollout depth"),
@@ -285,6 +285,7 @@ export function formatSpeculativeActionStatus(input: {
 }): string {
 	const { settings, metrics } = input;
 	const cache = metrics.cache;
+	const processReuse = metrics.processReuse;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
 		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
@@ -292,7 +293,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter requests: ${settings.candidateLimit}`,
 		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Concurrent actions: ${settings.maxConcurrentActions}`,
-		`Storage policy: runtime L1 ${settings.resourceCacheMaxEntries} entries/${formatBytes(settings.resourceCacheMaxBytes)}; validated L2 ${settings.executionStoreMaxEntries} entries/${formatBytes(settings.executionStoreMaxBytes)}`,
+		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
@@ -300,18 +301,21 @@ export function formatSpeculativeActionStatus(input: {
 		"Execution boundary: runtime sandbox first; resource snapshots or Git worktrees second; otherwise Actor fallback",
 		`Actor actions: ${formatRatio(metrics.speculativeHits, metrics.actorActions)} speculative result reuse; previews: ${metrics.actorPreviews}; fallbacks: ${metrics.actorFallbacks}`,
 		`Reuse: ${metrics.exactReuseHits} exact actions; ${metrics.partialResultReuseHits} partial results (${countSummary(metrics.partialResultReuseByProjector)})`,
-		`Process reuse (validated L2): ${formatProcessReuse(metrics.processReuse)}. No saved-time claim is made without a paired cold baseline.`,
+		`Bash reuse this session: ${formatCommandReuse(processReuse)}`,
+		`Bash time saved this session: ${formatReuseBenefit(processReuse)}`,
+		"Bash timing scope: estimates compare a matched child command's prior runtime with its nested reuse-request overhead; shell, sandbox, and model time are excluded, so this is not whole-agent speedup.",
+		`Bash diagnostics: ${formatDuration(processReuse.validationMs)} lookup; ${formatDuration(processReuse.replayMs)} replay; ${formatDuration(processReuse.executionMs)} observed cold execution.`,
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate, and L2 replay is reported separately.`
+			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate, and Bash command reuse is reported separately.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
 		`Execution ahead: ${formatDuration(metrics.executionAheadMs)}; hit latency: ${formatDuration(metrics.hitLatencyMs)}; attempt lead: ${formatDuration(metrics.attemptLeadMs)}; Actor execution: ${formatDuration(metrics.actorExecutionMs)}`,
 		`Isolation-blocked potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
-		`Runtime L1 results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
+		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
 
@@ -536,7 +540,7 @@ async function installController(
 				}
 			}
 			await recoverSpeculation(() => refreshExecutionDiagnostics(true));
-			return { text: `Validated reuse storage ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
+			return { text: `Reusable command history ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
 		},
 		setSettings: (value) => {
 			if (value)
@@ -882,7 +886,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			`Configuration scope: ${controller.settingsScope()}${sameSettings(applied, controller.settings()) ? "" : " (project overrides active)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
 			`Target decoding › ${selfSpeculationSummary(draft.selfSpeculation)}`,
-			`Scheduling & cache › ${draft.candidateLimit} drafts, ${draft.maxConcurrentActions} concurrent, L1 ${draft.resourceCacheMaxEntries}, L2 ${draft.executionStoreMaxEntries}`,
+			`Scheduling & cache › ${draft.candidateLimit} drafts, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} live, ${draft.executionStoreMaxEntries} reusable commands`,
 			`Tools & execution › ${enabledToolCount(draft)} tools`,
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
@@ -1106,21 +1110,21 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		const fields = new Map<string, RootInputField>([
 			[`Drafter requests: ${settings.candidateLimit}`, "candidateLimit"],
 			[`Concurrent actions: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
-			[`Resource cache entries: ${settings.resourceCacheMaxEntries}`, "resourceCacheMaxEntries"],
-			[`Resource cache memory: ${formatBytes(settings.resourceCacheMaxBytes)}`, "resourceCacheMaxBytes"],
-			[`Validated reuse entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
-			[`Validated reuse memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
+			[`Live result entries: ${settings.resourceCacheMaxEntries}`, "resourceCacheMaxEntries"],
+			[`Live result memory: ${formatBytes(settings.resourceCacheMaxBytes)}`, "resourceCacheMaxBytes"],
+			[`Reusable command history entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
+			[`Reusable command history memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
 		]);
-		const reclaim = "Reclaim validated reuse storage";
-		const clear = "Clear validated reuse storage";
+		const reclaim = "Reclaim reusable command history";
+		const clear = "Clear reusable command history";
 		const choice = await ctx.ui.select("Scheduling & cache", [...fields.keys(), reclaim, clear, BACK]);
 		if (!choice || choice === BACK) return;
-		if (choice === clear && !(await ctx.ui.confirm("Clear validated reuse storage?", "Delete all reusable execution certificates and artifacts? This cannot be undone."))) continue;
+		if (choice === clear && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) continue;
 		const operation = choice === reclaim ? "gc" : choice === clear ? "clear" : undefined;
 		if (operation) {
 			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
 			ctx.ui.notify(
-				report?.text ?? "Validated reuse storage maintenance failed.",
+				report?.text ?? "Reusable command history maintenance failed.",
 				report && !report.failed ? "info" : "warning",
 			);
 			continue;
@@ -1400,7 +1404,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				parts.push(formatDuration(event.state.executionMs));
 				const reuse = event.candidate.world?.executionMetrics.reuse;
 				if (reuse) {
-					parts.push(`validated L2 ${formatProcessReuse(reuse)}`);
+					parts.push(`Bash reuse ${formatCommandReuse(reuse)}; ${formatReuseBenefit(reuse)}`);
 				}
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
@@ -1600,6 +1604,7 @@ function formatSpeculativeFooter(
 	if (!settings.enabled) return "spec: off";
 	const ready = worlds.filter((world) => world.state === "ready").length;
 	const reuse = metrics.processReuse;
+	const benefit = formatReuseDelta(reuse);
 	const storageWorlds = worlds.filter((world) => world.storage);
 	const storedEntries = storageWorlds.reduce((total, world) => total + (world.storage?.entries ?? 0), 0);
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
@@ -1607,11 +1612,12 @@ function formatSpeculativeFooter(
 		"spec: on",
 		`actions ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		reuse.requests > 0
-			? `L2 ${formatRatio(reuse.hits, reuse.requests)}${reuse.crossTurnHits ? `, ${reuse.crossTurnHits} cross-turn` : ""}${reuse.unattributedHits ? `, ${reuse.unattributedHits} origin unknown` : ""}`
-			: "L2 idle",
+			? `Bash reuse ${formatRatio(reuse.hits, reuse.requests)}${reuse.crossTurnHits ? `, ${reuse.crossTurnHits} earlier turns` : ""}${reuse.unattributedHits ? `, ${reuse.unattributedHits} stored` : ""}`
+			: "Bash reuse idle",
+		...(benefit ? [`${benefit} child time`] : []),
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
-		`L1 ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
-		...(storageWorlds.length ? [`L2 store ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
+		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
+		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
 		worlds.length > 0 ? `worlds ${ready}/${worlds.length} ready` : "worlds probing",
 		"unsafe→Actor",
 		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
@@ -1670,6 +1676,25 @@ function formatRatio(numerator: number, denominator: number): string {
 	return `${numerator}/${denominator} (${denominator > 0 ? formatPercent(numerator / denominator) : "n/a"})`;
 }
 
-function formatProcessReuse(reuse: WorldReuseMetrics): string {
-	return `${formatRatio(reuse.hits, reuse.requests)} hits; ${reuse.sameTurnHits} same-turn, ${reuse.crossTurnHits} cross-turn, ${reuse.unattributedHits} origin unknown, ${reuse.joinedHits} joined in-flight; ${formatDuration(reuse.validationMs)} validation, ${formatDuration(reuse.replayMs)} replay, ${formatDuration(reuse.executionMs)} observed cold execution`;
+function measuredReuseDelta(reuse: WorldReuseMetrics): number | undefined {
+	if (reuse.timedHits <= 0 || reuse.avoidedProcessMs <= 0) return undefined;
+	return reuse.avoidedProcessMs - reuse.timedHitOverheadMs;
+}
+
+function formatReuseDelta(reuse: WorldReuseMetrics): string | undefined {
+	const delta = measuredReuseDelta(reuse);
+	if (delta === undefined) return undefined;
+	if (delta === 0) return "no estimated change";
+	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "saved" : "slower"} (${formatPercent(Math.abs(delta) / reuse.avoidedProcessMs)} ${delta > 0 ? "less" : "more"})`;
+}
+
+function formatCommandReuse(reuse: WorldReuseMetrics): string {
+	return `${formatRatio(reuse.hits, reuse.requests)} commands launched by Bash reused; ${reuse.sameTurnHits} same turn, ${reuse.crossTurnHits} from earlier turns, ${reuse.unattributedHits} from stored history, ${reuse.joinedHits} joined running work`;
+}
+
+function formatReuseBenefit(reuse: WorldReuseMetrics): string {
+	const benefit = formatReuseDelta(reuse);
+	return benefit
+		? `${benefit} across ${reuse.timedHits}/${reuse.hits} reuses with timing (${formatDuration(reuse.avoidedProcessMs)} prior execution vs ${formatDuration(reuse.timedHitOverheadMs)} reuse overhead)`
+		: `n/a (${reuse.hits > 0 ? "original duration unavailable" : "no reuse yet"})`;
 }

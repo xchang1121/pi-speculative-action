@@ -490,6 +490,7 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
+		const requestStarted = performance.now();
 		const request = parseDispatcherRequest(body);
 		if (!request || request.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
 		this.add(session, "requests");
@@ -502,13 +503,13 @@ export class LinuxProcessReuseBackend {
 		const prototype = await this.prototype(session, request, executable);
 		const weakKey = processWeakKey(prototype);
 		const initial = await this.plan(session, prototype);
-		if (initial) return this.replay(session, initial, weakKey, false);
+		if (initial) return this.replay(session, initial, weakKey, false, requestStarted);
 
 		const preceding = this.inFlight.get(weakKey);
 		if (preceding) {
 			await preceding;
 			const joined = await this.plan(session, prototype);
-			if (joined) return this.replay(session, joined, weakKey, true);
+			if (joined) return this.replay(session, joined, weakKey, true, requestStarted);
 		}
 
 		this.add(session, "misses");
@@ -557,8 +558,10 @@ export class LinuxProcessReuseBackend {
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
 		joined: boolean,
+		requestStarted: number,
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
+		let replayed = false;
 		try {
 			const { artifacts, certificate } = plan;
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
@@ -575,9 +578,16 @@ export class LinuxProcessReuseBackend {
 						: "crossTurnHits"
 					: "unattributedHits",
 			);
+			replayed = true;
 			return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
+			const observed = plan.certificate.result.observedProcessMs;
+			if (replayed && observed !== undefined) {
+				this.add(session, "timedHits");
+				this.add(session, "avoidedProcessMs", observed);
+				this.add(session, "timedHitOverheadMs", Math.max(0, performance.now() - requestStarted));
+			}
 		}
 	}
 
@@ -594,6 +604,7 @@ export class LinuxProcessReuseBackend {
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
 		let outcome: SpawnOutcome | undefined;
+		let observedProcessMs: number | undefined;
 		let transactionFinishing = false;
 		try {
 			const command = [
@@ -618,10 +629,12 @@ export class LinuxProcessReuseBackend {
 				executable,
 				...request.args,
 			];
+			const processStarted = performance.now();
 			outcome = await runSpawn(ready.unshare, namespaceArguments(command), {
 				cwd: request.cwd,
 				environment: executionEnvironment(request.environment, executable),
 			});
+			observedProcessMs = Math.max(0, performance.now() - processStarted);
 			try {
 				transactionFinishing = true;
 				const [delta, observation] = await Promise.all([
@@ -705,7 +718,7 @@ export class LinuxProcessReuseBackend {
 				const certificate = sealProcessCertificate({
 					prototype,
 					dependencyCertificate,
-					result: { replayProfile: "buffered_noninteractive", journal, exit },
+					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				if (await this.planner.publishCompleted(certificate)) {

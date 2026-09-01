@@ -80,7 +80,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。菜单明确区分 Runtime L1 结果与经过验证的持久 L2 复用；调度/缓存页暴露两者容量以及通用 L2 回收/清空动作，清空必须确认。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换全局/项目作用域会重新载入该层，而项目文件只保存相对规范化全局配置的差异。Footer/状态会显示 L2 命中来源和真实存储占用，但同次运行的重叠时间仍明确标为 observed overlap；没有配对冷基线时，L2 不宣称节省时间。JSON 容量单位是字节，TUI 内存输入单位是 MiB。工具标签会说明本地后备机制；不存在隔离路线时始终回退 Actor。
+在 TUI 中打开 `/speculative-action`。菜单不再暴露 L1/L2 分层术语，而是按用途显示“实时投机结果”和“可复用命令历史”，并暴露两者容量及回收/清空动作；清空必须确认。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换全局/项目作用域会重新载入该层，而项目文件只保存相对规范化全局配置的差异。Footer/状态会直接显示复用了多少个 Bash 子命令、其中多少来自更早轮次或已有历史，以及匹配命令记录了原始进程耗时时基于该命令的估算省时。该估算用既有子进程耗时减去本次完整嵌套复用请求开销，并明确排除外层 shell、沙箱、模型和整个 Agent 的时间；没有耗时记录的旧历史显示 `n/a`。同次运行的重叠时间仍明确标为 observed overlap。JSON 容量单位是字节，TUI 内存输入单位是 MiB。工具标签会说明本地后备机制；不存在隔离路线时始终回退 Actor。
 
 配置由 package 自己管理：
 

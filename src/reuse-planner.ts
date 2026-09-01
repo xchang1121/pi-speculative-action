@@ -18,7 +18,7 @@ import {
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
 export interface MemoryReuseProvider<Hit> {
-	/** Optional adapter over the Runtime-owned L1 ResultCache; the planner never owns a second L1. */
+	/** Optional adapter over the Runtime-owned ResultCache; the planner never owns a duplicate live cache. */
 	readonly lookup: (weakKey: Sha256Digest) => Hit | undefined | Promise<Hit | undefined>;
 }
 

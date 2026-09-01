@@ -141,7 +141,7 @@ class LoadedArtifactClosure implements VerifiedArtifactClosure {
 	};
 }
 
-/** Persistent L2 certificate/pathset index kept separate from the Runtime's in-memory ResultCache. */
+/** Persistent certificate/pathset index kept separate from the Runtime's live ResultCache. */
 export class ProvenanceCertificateStore {
 	readonly root: string;
 	readonly artifacts: ArtifactCAS;
