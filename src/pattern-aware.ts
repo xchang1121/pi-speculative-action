@@ -3,6 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import {
+	patternSessionBudgets,
+	type PatternPendingValidation,
+	type PatternRecurrentAction,
+	PatternSessionRegistry,
+	type PatternSessionState,
+} from "./pattern-session-state.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { stableEqual as sameValue, stableStringify } from "./stable-json.ts";
@@ -263,21 +271,6 @@ type PatternPool = {
 	patternIDs?: string[];
 };
 
-type RecurrentAction = {
-	readonly action: ActionKey;
-	readonly input: Record<string, unknown>;
-	count: number;
-	totalDurationMs: number;
-	lastSeenSequence: number;
-};
-
-type PendingValidation = {
-	readonly patternID: string;
-	readonly triggerSequence: number;
-	readonly expectedInputs: ReadonlyArray<Record<string, unknown>>;
-	remaining: number;
-};
-
 type TrieNode = {
 	readonly children: Map<string, TrieNode>;
 	readonly patterns: Set<string>;
@@ -340,11 +333,9 @@ export class PatternAwareStore {
 	private readonly patterns = new Map<string, MutablePattern>();
 	private readonly pools = new Map<string, PatternPool>();
 	private readonly controlOpportunitiesByContext = new Map<string, Map<string, number>>();
-	private readonly pending = new Map<string, PendingValidation[]>();
-	private readonly history = new Map<string, PatternAwareEvent[]>();
-	private readonly recurrentActions = new Map<string, Map<string, RecurrentAction>>();
+	private readonly sessions: PatternSessionRegistry<PatternAwareEvent>;
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
-	private readonly resolvedActionKeys = new Map<string, ActionKey | null>();
+	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
 	private sequenceModel: PpmCountTrie;
@@ -365,6 +356,8 @@ export class PatternAwareStore {
 		actionSemantics?: PatternAwareActionSemantics,
 	) {
 		this.settings = settings;
+		this.sessions = new PatternSessionRegistry(patternSessionBudgets(settings.maxPatterns));
+		this.resolvedActionKeys = new BoundedRecencyMap(settings.maxPatterns);
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
 		this.actionSemantics = actionSemantics;
@@ -472,8 +465,10 @@ export class PatternAwareStore {
 				...(batchID ? { batchID, batchIndex: index, batchSize: inputs.length } : {}),
 			}),
 		);
-		const history = this.history.get(first.sessionID) ?? [];
-		this.resolvePendingBatch(first.sessionID, events);
+		const { state: session, evicted } = this.sessions.ensure(first.sessionID);
+		if (evicted) this.finishSessionState(evicted);
+		const history = session.history;
+		this.resolvePendingBatch(session, events);
 		const prior = history;
 		for (const event of events) {
 			if (event.learnTarget !== false) {
@@ -484,12 +479,11 @@ export class PatternAwareStore {
 					this.settings.decayHalfLifeEvents,
 				);
 				this.learn(prior, event);
-				this.observeRecurrentAction(event);
+				this.observeRecurrentAction(session, event);
 			}
 		}
 		history.push(...events);
-		this.history.set(first.sessionID, history);
-		this.startPending(first.sessionID, history);
+		this.startPending(session, history);
 		this.trimSessionHistory(history);
 		this.trimPools();
 		this.trimPatterns();
@@ -502,11 +496,8 @@ export class PatternAwareStore {
 	}
 
 	finishSession(sessionID: string) {
-		const pending = this.pending.get(sessionID);
-		for (const item of pending ?? []) this.recordValidation(item.patternID, false);
-		this.pending.delete(sessionID);
-		this.history.delete(sessionID);
-		this.recurrentActions.delete(sessionID);
+		const session = this.sessions.finish(sessionID);
+		if (session) this.finishSessionState(session);
 		this.persist();
 	}
 
@@ -535,7 +526,7 @@ export class PatternAwareStore {
 		predictionSettings: PatternAwareSettings = this.settings,
 	) {
 		if (!predictionSettings.enabled) return [];
-		const history = this.history.get(sessionID) ?? [];
+		const history = this.sessions.get(sessionID)?.history ?? [];
 		return this.predictHistory(
 			history,
 			schemaHashes,
@@ -566,7 +557,7 @@ export class PatternAwareStore {
 			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
 			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
 			.map((item) => item.input);
-		const history = [...(this.history.get(sessionID) ?? [])];
+		const history = [...(this.sessions.get(sessionID)?.history ?? [])];
 		const sequence = history.at(-1)?.sequence ?? this.clock;
 		history.push(
 			...ordered.map(
@@ -873,9 +864,9 @@ export class PatternAwareStore {
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
-		const actions = sessionID ? this.recurrentActions.get(sessionID) : undefined;
-		if (!actions?.size) return [];
-		const values = [...actions.values()].filter((item) => {
+		const actions = sessionID ? this.sessions.get(sessionID)?.recurrentActions : undefined;
+		if (!actions) return [];
+		const values = [...actions].filter((item) => {
 			const current = schemaHashes[item.action.tool];
 			return current === undefined || current === item.action.schemaHash;
 		});
@@ -884,7 +875,7 @@ export class PatternAwareStore {
 			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
 			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + mass);
 		}
-		const rank = (item: RecurrentAction) =>
+		const rank = (item: PatternRecurrentAction) =>
 			recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) *
 			Math.max(item.count, item.totalDurationMs);
 		const provenTools = new Set(
@@ -984,7 +975,7 @@ export class PatternAwareStore {
 	}
 
 	recent(sessionID: string): ReadonlyArray<PatternAwareEvent> {
-		return [...(this.history.get(sessionID) ?? [])];
+		return [...(this.sessions.get(sessionID)?.history ?? [])];
 	}
 
 	async flush(): Promise<void> {
@@ -1011,11 +1002,10 @@ export class PatternAwareStore {
 		this.indexDirty = false;
 	}
 
-	private observeRecurrentAction(event: PatternAwareEvent) {
+	private observeRecurrentAction(session: PatternSessionState<PatternAwareEvent>, event: PatternAwareEvent) {
 		const action = this.resolveActionKey(event.tool, event.input, event.schemaHash);
 		if (!action) return;
-		const actions = this.recurrentActions.get(event.sessionID) ?? new Map<string, RecurrentAction>();
-		const existing = actions.get(action.key);
+		const existing = session.recurrentAction(action.key);
 		const durationMs =
 			event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
@@ -1023,7 +1013,7 @@ export class PatternAwareStore {
 			existing.totalDurationMs = Math.min(Number.MAX_VALUE / 2, existing.totalDurationMs + durationMs);
 			existing.lastSeenSequence = event.sequence;
 		} else {
-			actions.set(action.key, {
+			session.rememberRecurrentAction(action.key, {
 				action,
 				input: structuredClone(event.input),
 				count: 1,
@@ -1031,13 +1021,6 @@ export class PatternAwareStore {
 				lastSeenSequence: event.sequence,
 			});
 		}
-		this.recurrentActions.set(event.sessionID, actions);
-		if (actions.size <= this.settings.maxPatterns) return;
-		const oldest = [...actions.entries()].sort(
-			([leftKey, left], [rightKey, right]) =>
-				left.lastSeenSequence - right.lastSeenSequence || leftKey.localeCompare(rightKey),
-		)[0];
-		if (oldest) actions.delete(oldest[0]);
 	}
 
 	private learn(history: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent) {
@@ -1073,7 +1056,7 @@ export class PatternAwareStore {
 		if (!this.actionSemantics) return undefined;
 		let cacheKey: string;
 		try {
-			cacheKey = JSON.stringify([tool, schemaHash, input]);
+			cacheKey = hash(stableStringify([tool, schemaHash, input]));
 		} catch {
 			return undefined;
 		}
@@ -1086,10 +1069,6 @@ export class PatternAwareStore {
 			return undefined;
 		}
 		this.resolvedActionKeys.set(cacheKey, resolved ?? null);
-		if (this.resolvedActionKeys.size > this.settings.maxPatterns) {
-			const oldest = this.resolvedActionKeys.keys().next().value;
-			if (oldest !== undefined) this.resolvedActionKeys.delete(oldest);
-		}
 		return resolved;
 	}
 
@@ -1298,19 +1277,18 @@ export class PatternAwareStore {
 			if (retained.has(patternID)) continue;
 			if (this.patterns.delete(patternID)) this.indexDirty = true;
 			this.patternSupportSessions.delete(patternID);
-			for (const [sessionID, pending] of this.pending) {
-				const active = pending.filter((item) => item.patternID !== patternID);
-				if (active.length) this.pending.set(sessionID, active);
-				else this.pending.delete(sessionID);
-			}
+			this.sessions.removePattern(patternID);
 		}
 		pool.patternIDs = [...retained];
 	}
 
-	private resolvePendingBatch(sessionID: string, events: ReadonlyArray<PatternAwareEvent>) {
-		const pending = this.pending.get(sessionID);
+	private resolvePendingBatch(
+		session: PatternSessionState<PatternAwareEvent>,
+		events: ReadonlyArray<PatternAwareEvent>,
+	) {
+		const pending = session.pending;
 		if (!pending?.length) return;
-		const remaining: PendingValidation[] = [];
+		const remaining: PatternPendingValidation[] = [];
 		for (const item of pending) {
 			const pattern = this.patterns.get(item.patternID);
 			if (!pattern) continue;
@@ -1337,12 +1315,14 @@ export class PatternAwareStore {
 			item.remaining--;
 			remaining.push(item);
 		}
-		if (remaining.length) this.pending.set(sessionID, remaining);
-		else this.pending.delete(sessionID);
+		session.replacePending(remaining);
 	}
 
-	private startPending(sessionID: string, history: ReadonlyArray<PatternAwareEvent>) {
-		const pending = this.pending.get(sessionID) ?? [];
+	private startPending(
+		session: PatternSessionState<PatternAwareEvent>,
+		history: ReadonlyArray<PatternAwareEvent>,
+	) {
+		const pending = [...session.pending];
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
 		this.ensureIndex();
@@ -1360,7 +1340,12 @@ export class PatternAwareStore {
 				remaining: learnedGroupHorizon([pattern], this.settings, this.clock, 1),
 			});
 		}
-		if (pending.length) this.pending.set(sessionID, pending);
+		session.replacePending(pending);
+	}
+
+	private finishSessionState(session: PatternSessionState<PatternAwareEvent>) {
+		for (const item of session.pending) this.recordValidation(item.patternID, false);
+		session.replacePending([]);
 	}
 
 	private recordValidation(patternID: string, matched: boolean) {
@@ -1404,6 +1389,7 @@ export class PatternAwareStore {
 		for (const pattern of evicted) {
 			this.patterns.delete(pattern.id);
 			this.patternSupportSessions.delete(pattern.id);
+			this.sessions.removePattern(pattern.id);
 		}
 		if (evicted.length) this.indexDirty = true;
 	}
