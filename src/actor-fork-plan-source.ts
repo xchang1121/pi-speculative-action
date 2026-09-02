@@ -1,12 +1,13 @@
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
 import type { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 
-export function createSelfSpeculationPlanSource(
+/** Treat a completed Actor fork as a Drafter source without issuing another model request. */
+export function createActorForkPlanSource(
 	bridge: SelfSpeculationActionBridge | undefined,
 ): AgentPlanSource {
 	return {
 		id: "self-speculation",
-		enabled: (settings) => bridge !== undefined && settings.sourceConfig?.selfSpeculationActionEnabled === true,
+		enabled: (settings) => bridge !== undefined && settings.sourceConfig?.actorForkActionEnabled === true,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
 		propose: async ({ startInput, candidateNames, signal }) => {

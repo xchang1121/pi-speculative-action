@@ -329,7 +329,8 @@ describe("zero-modification Pi extension", () => {
 		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
 		expect(status).toContain("Bash child commands: 1/3 (33%) reused; ~1s estimated time saved (83%); 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
-		expect(status).toContain("sidecar action source On (confidence ≥0.9)");
+		expect(status).toContain("Actor-fork Drafter source: On (sidecar)");
+		expect(status).toContain("early tool execution On (confidence ≥90%)");
 		expect(status).not.toContain("prior execution");
 		expect(status).not.toMatch(/\bL[12]\b/);
 	});
@@ -366,11 +367,12 @@ describe("zero-modification Pi extension", () => {
 			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
 		}));
 		const menus = driveSettingsMenus(fixture, {
-			"Speculative action": ["Tools & execution", "Target decoding", "Enabled", "Discard changes", "Configuration scope", "Close"],
+			"Speculative action": ["Tools & execution", "Prediction sources", "Enabled", "Discard changes", "Save settings to", "Close"],
 			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
-			"Tool policy": ["[~] bash", "[ ] bash", "Back"],
-			"Self-speculation": ["Back"],
-			"Configuration scope": ["project"],
+			"Tool policy · [x] active · [~] selected · [ ] off": ["[~] bash", "[ ] bash", "Back"],
+			"Prediction sources": ["Actor fork", "Back"],
+			"Actor fork": ["Back"],
+			"Save settings to": ["This project"],
 		});
 		await fixture.emit("session_start", {}, fixture.context);
 		const command = fixture.commands.get("speculative-action");
@@ -379,18 +381,23 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Speculative action")).toEqual(
 			expect.arrayContaining([
 				expect.stringMatching(/^Prediction sources/),
-				expect.stringMatching(/^Target decoding/),
-				expect.stringMatching(/^Scheduling & cache/),
 				expect.stringMatching(/^Tools & execution/),
+				expect.stringMatching(/^Advanced settings/),
 			]),
 		);
 		expect(menus.get("Tools & execution")).toEqual(
 			expect.arrayContaining(["Tool policy › 6/6 active", "Execution routes"]),
 		);
-		expect(menus.get("Tool policy")).toEqual(expect.arrayContaining([
+		expect(menus.get("Tool policy · [x] active · [~] selected · [ ] off")).toEqual(expect.arrayContaining([
 			expect.stringMatching(/^\[ \] bash · unavailable · Linux host required/),
 		]));
-		expect(menus.get("Self-speculation")).toEqual(expect.arrayContaining(["Fork action confidence: 0.9"]));
+		expect(menus.get("Actor fork")).toEqual(expect.arrayContaining(["Actor fork prediction: Off"]));
+		expect(menus.get("Actor fork")).not.toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Use forked calls/)]),
+		);
+		expect(menus.get("Actor fork")).not.toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Minimum accepted confidence/)]),
+		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
@@ -407,49 +414,64 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.store.scope).toBe("project");
 	});
 
-	it("exposes Drafter request policy in the Drafter submenu", async () => {
+	it("keeps only direct choices in the Model Drafter menu", async () => {
 		const fixture = await createFixture();
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Prediction sources", "Close"],
-			"Prediction sources": ["Drafter", "Back"],
-			Drafter: ["Back"],
+			"Prediction sources": ["Model Drafter", "Back"],
+			"Model Drafter": ["Advanced settings", "Back"],
+			"Model Drafter advanced": ["Back"],
 		});
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
-		expect(menus.get("Drafter")).toEqual(
+		expect(menus.get("Model Drafter")).toEqual(
+			expect.arrayContaining(["Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2"]),
+		);
+		expect(menus.get("Model Drafter")).not.toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]),
+		);
+		expect(menus.get("Model Drafter advanced")).toEqual(
 			expect.arrayContaining([
-				"Action utility gate: On",
-				"Rollout depth: 1",
-				"Output tokens: provider default",
-				"Deterministic requests: 1",
-				"Temperature range: 0.7-0.7",
+				"Pause when measured cost exceeds benefit: On",
+				"Follow-up tool steps: 1",
+				"Maximum output tokens: Provider default",
+				"Temperature-0 candidates: 1",
+				"Sampling temperature: 0.7-0.7",
 			]),
 		);
 	});
 
-	it("binds typed setting descriptors across root, self-speculation, and PatternAware settings", async () => {
+	it("binds typed inputs through the advanced hierarchy", async () => {
 		const configure = vi.fn();
 		const maintain = vi.fn(async () => ({ removedEntries: 2, removedArtifacts: 3, removedBytes: 4096 }));
 		const fixture = await createFixture({
 			executionWorlds: [{ storage: { configure, maintain } } as unknown as SpeculativeAgentExecutionWorld],
 		});
-		driveSettingsMenus(fixture, {
-			"Speculative action": ["Scheduling & cache", "Target decoding", "Prediction sources", "Apply changes", "Close"],
-			"Scheduling & cache": ["Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
-			"Self-speculation": ["Endpoint", "Fork action confidence", "Back"],
-			"Prediction sources": ["PatternAware", "Back"],
-			PatternAware: ["Learning", "Back"],
-			"PatternAware learning": ["Future gap coverage", "Back"],
+		const menus = driveSettingsMenus(fixture, {
+			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
+			"Advanced settings": ["Scheduling and storage", "Actor fork and target verification", "Learned-pattern tuning", "Back"],
+			"Scheduling and storage": ["Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
+			"Actor fork advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
+			"Integration and authentication": ["Integration", "Control service URL", "Back"],
+			"Fork decoding": ["Back"],
+			"Target verification": ["Back"],
+			"Benefit control": ["Back"],
+			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back"],
+			"Learning history": ["Early-prediction coverage", "Back"],
+			"Multi-step search": ["Back"],
+			"Prediction sources": ["Actor fork", "Back"],
+			"Actor fork": ["Minimum accepted confidence", "Back"],
+			"Actor fork integration": ["Sidecar service"],
 		});
 		fixture.ui.input = async (title) =>
 			({
 				"Live result memory (MiB)": "96",
 				"Reusable command history entries": "2048",
 				"Reusable command history memory (MiB)": "768",
-				"Self-speculation endpoint": "file:///unsafe",
-				"Fork action minimum confidence": "0.75",
-				"Future gap coverage (0-1)": "0.8",
+				"Control service URL": "file:///unsafe",
+				"Minimum forked-call confidence": "0.75",
+				"Early-prediction coverage (0-1)": "0.8",
 			} as Readonly<Record<string, string>>)[title];
 		fixture.ui.confirm = async (title) => title === "Clear reusable command history?";
 
@@ -462,6 +484,7 @@ describe("zero-modification Pi extension", () => {
 			executionStoreMaxBytes: 768 * 1024 * 1024,
 			selfSpeculation: {
 				endpoint: "http://127.0.0.1:8000",
+				forkTransport: "sidecar",
 				forkActionMinConfidence: 0.75,
 			},
 			patternAware: { futureGapCoverage: 0.8 },
@@ -475,6 +498,12 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			"Endpoint must be an absolute HTTP(S) URL.",
 			"warning",
+		);
+		expect(menus.get("Actor fork")).toEqual(
+			expect.arrayContaining([
+				"Use forked calls for tool pre-execution: On",
+				"Minimum accepted confidence: 75%",
+			]),
 		);
 	});
 });

@@ -129,66 +129,66 @@ type SettingInputDescriptors<T, K extends keyof T> = {
 };
 
 const ROOT_SETTING_INPUTS = {
-	candidateLimit: positiveIntegerInput("Drafter requests per turn", { transform: clampCandidateLimit }),
-	maxConcurrentActions: positiveIntegerInput("Concurrent actions", { transform: clampCandidateLimit }),
+	candidateLimit: positiveIntegerInput("Candidate requests per Actor decision", { transform: clampCandidateLimit }),
+	maxConcurrentActions: positiveIntegerInput("Simultaneous speculative tools", { transform: clampCandidateLimit }),
 	resourceCacheMaxEntries: positiveIntegerInput("Live result entries"),
 	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	predictionTimeoutMs: positiveIntegerInput("Prediction timeout (ms)"),
-	drafterMaxTokens: optionalPositiveIntegerInput("Drafter output tokens (blank for provider default)"),
-	drafterMaxDepth: nonNegativeIntegerInput("Drafter rollout depth"),
-	drafterDeterministicCandidates: nonNegativeIntegerInput("Deterministic Drafter requests"),
+	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
+	drafterMaxTokens: optionalPositiveIntegerInput("Maximum Drafter output tokens (blank for provider default)"),
+	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
+	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
 type RootInputField = keyof typeof ROOT_SETTING_INPUTS;
 
 const SELF_SPECULATION_INPUTS = {
-	endpoint: settingInput("Self-speculation endpoint", String, (input) => {
+	endpoint: settingInput("Control service URL", String, (input) => {
 		const value = input.trim();
 		return /^https?:\/\/[^\s]+$/u.test(value)
 			? { ok: true, value }
 			: { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
 	}),
-	forkActionMinConfidence: probabilityInput("Fork action minimum confidence"),
-	forkGateMinSamples: positiveIntegerInput("Gate warm-up samples"),
-	forkGateWindowSize: positiveIntegerInput("Gate rolling window"),
-	forkGateMinNetBenefitMs: nonNegativeNumberInput("Gate minimum net benefit (ms)"),
-	forkGateProbeInterval: positiveIntegerInput("Gate probe interval"),
-	forkGateFailureThreshold: positiveIntegerInput("Gate failure threshold"),
-	maxCandidates: positiveIntegerInput("Candidate bundle size"),
-	maxDraftTokens: positiveIntegerInput("Draft tokens"),
-	draftFormat: nonEmptyTextInput("Draft format"),
-	draftBoundary: nonEmptyTextInput("Draft boundary"),
-	forkMaxTokens: positiveIntegerInput("Fork tokens"),
-	timeoutMs: positiveIntegerInput("Control timeout (ms)"),
-	forkTemperature: nonNegativeNumberInput("Fork temperature"),
-	forkDecoder: nonEmptyTextInput("Fork decoder"),
-	forkForcedPrefix: nonEmptyTextInput("Forced prefix"),
-	apiKeyEnv: optionalTextInput("Bearer-token environment variable"),
+	forkActionMinConfidence: probabilityInput("Minimum forked-call confidence"),
+	forkGateMinSamples: positiveIntegerInput("Benefit-gate warm-up samples"),
+	forkGateWindowSize: positiveIntegerInput("Benefit-gate rolling window"),
+	forkGateMinNetBenefitMs: nonNegativeNumberInput("Minimum expected time saved (ms)"),
+	forkGateProbeInterval: positiveIntegerInput("Recovery probe interval"),
+	forkGateFailureThreshold: positiveIntegerInput("Consecutive-failure limit"),
+	maxCandidates: positiveIntegerInput("Candidates sent per Actor decision"),
+	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
+	draftFormat: nonEmptyTextInput("Target tool-call format"),
+	draftBoundary: nonEmptyTextInput("Target tool-call boundary"),
+	forkMaxTokens: positiveIntegerInput("Actor fork output-token limit"),
+	timeoutMs: positiveIntegerInput("Control request timeout (ms)"),
+	forkTemperature: nonNegativeNumberInput("Actor fork temperature"),
+	forkDecoder: nonEmptyTextInput("Forked tool-call decoder"),
+	forkForcedPrefix: nonEmptyTextInput("Forced tool-call prefix"),
+	apiKeyEnv: optionalTextInput("Authentication token environment variable name (not the token)"),
 } satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
 type SelfSpeculationInputField = keyof typeof SELF_SPECULATION_INPUTS;
 
 const PATTERN_SETTING_INPUTS = {
-	maxContextLength: positiveIntegerInput("Pattern context events"),
-	maxFutureGap: nonNegativeIntegerInput("Pattern future gap"),
-	futureGapCoverage: probabilityInput("Future gap coverage (0-1)", {
-		error: "Future gap coverage must be between 0 and 1.",
+	maxContextLength: positiveIntegerInput("Previous actions used as context"),
+	maxFutureGap: nonNegativeIntegerInput("Maximum skipped Actor decisions"),
+	futureGapCoverage: probabilityInput("Early-prediction coverage (0-1)", {
+		error: "Early-prediction coverage must be between 0 and 1.",
 	}),
-	decayHalfLifeEvents: positiveIntegerInput("Pattern half-life (events)", {
+	decayHalfLifeEvents: positiveIntegerInput("History half-life (events)", {
 		error: "Pattern half-life must be a positive integer.",
 	}),
-	minOccurrences: positiveIntegerInput("Promotion occurrences"),
-	maxPatterns: positiveIntegerInput("Pattern capacity"),
-	beamWidth: positiveIntegerInput("Pattern beam width per tool"),
-	maxPredictionDepth: positiveIntegerInput("Pattern prediction depth"),
-	minBindingReplayProbability: probabilityInput("Minimum binding replay probability (0-1)", {
-		error: "Minimum binding replay probability must be between 0 and 1.",
+	minOccurrences: positiveIntegerInput("Uses required before learning a pattern"),
+	maxPatterns: positiveIntegerInput("Stored pattern limit"),
+	beamWidth: positiveIntegerInput("Alternatives retained per tool"),
+	maxPredictionDepth: positiveIntegerInput("Maximum predicted tool steps"),
+	minBindingReplayProbability: probabilityInput("Minimum argument-replay confidence (0-1)", {
+		error: "Minimum argument-replay confidence must be between 0 and 1.",
 	}),
 } satisfies Partial<SettingInputDescriptors<PatternAwareSettings, keyof PatternAwareSettings>>;
 type PatternInputField = keyof typeof PATTERN_SETTING_INPUTS;
 
 const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
-	"Drafter temperature range",
+	"Drafter sampling temperature range",
 	([lower, upper]) => `${formatNumber(lower)},${formatNumber(upper)}`,
 	(input) => {
 		const [lower, upper, ...extra] = input.split(",").map((item) => Number(item.trim()));
@@ -293,17 +293,18 @@ export function formatSpeculativeActionStatus(input: {
 	const { settings, metrics } = input;
 	const cache = metrics.cache;
 	const processReuse = metrics.processReuse;
+	const self = settings.selfSpeculation;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
-		`Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
-		`Draft model: ${settings.draftModel ?? "active model"}`,
-		`Drafter requests: ${settings.candidateLimit}`,
-		`Drafter request policy: rollout depth ${settings.drafterMaxDepth}; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} deterministic; temperature ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
-		`Concurrent actions: ${settings.maxConcurrentActions}`,
+		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
+		`Drafter model: ${settings.draftModel ?? "active model"}`,
+		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
+		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Simultaneous speculative tools: ${settings.maxConcurrentActions}`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
-		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
-		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; Actor ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
+		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
+		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, replay confidence≥${formatPercent(settings.patternAware.minBindingReplayProbability)}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`Actor-fork Drafter source: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} at ${self.draftBoundary}; ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
@@ -890,13 +891,13 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	while (true) {
 		const dirty = !sameSettings(draft, applied);
 		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools(), controller.toolCapabilities());
+		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
 		const choice = await ctx.ui.select("Speculative action", [
 			`Enabled: ${draft.enabled ? "On" : "Off"}`,
-			`Configuration scope: ${controller.settingsScope()}${sameSettings(applied, controller.settings()) ? "" : " (project overrides active)"}`,
+			`Save settings to: ${scope}${sameSettings(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
-			`Target decoding › ${selfSpeculationSummary(draft.selfSpeculation)}`,
-			`Scheduling & cache › ${draft.candidateLimit} drafts, ${draft.maxConcurrentActions} concurrent, ${draft.resourceCacheMaxEntries} live, ${draft.executionStoreMaxEntries} reusable commands`,
 			`Tools & execution › ${toolPolicy.active}/${toolPolicy.available} active`,
+			"Advanced settings › tuning, decoding, scheduling, storage",
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
 			"Status",
@@ -916,13 +917,13 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			editor.setSettings({ ...draft, enabled: !draft.enabled });
 			continue;
 		}
-		if (choice.startsWith("Configuration scope:")) {
-			const selected = await ctx.ui.select("Configuration scope", ["global", "project", BACK]);
+		if (choice.startsWith("Save settings to:")) {
+			const selected = await ctx.ui.select("Save settings to", ["All projects", "This project", BACK]);
 			if (
-				(selected === "global" || selected === "project") &&
+				(selected === "All projects" || selected === "This project") &&
 				(!dirty || (await ctx.ui.confirm("Discard changes?", "Switch configuration scope without applying?")))
 			) {
-				controller.setSettingsScope(selected);
+				controller.setSettingsScope(selected === "All projects" ? "global" : "project");
 				reload();
 			}
 			continue;
@@ -931,16 +932,12 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			await openPredictionSources(ctx, editor);
 			continue;
 		}
-		if (choice.startsWith("Target decoding")) {
-			await openSelfSpeculationSettings(ctx, editor);
-			continue;
-		}
-		if (choice.startsWith("Scheduling & cache")) {
-			await openSchedulingAndCache(ctx, editor);
-			continue;
-		}
 		if (choice.startsWith("Tools & execution")) {
 			await openToolsAndExecution(ctx, editor, controller);
+			continue;
+		}
+		if (choice.startsWith("Advanced settings")) {
+			await openAdvancedSettings(ctx, editor);
 			continue;
 		}
 		if (choice.startsWith("Apply changes")) {
@@ -970,7 +967,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			if (
 				!(await ctx.ui.confirm(
 					"Restore defaults?",
-					"Restore tunable settings while preserving enabled sources and target decoding?",
+					"Restore tuning values while keeping the main switch and prediction-source choices?",
 				))
 			)
 				continue;
@@ -979,8 +976,17 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 				...defaults,
 				enabled: draft.enabled,
 				drafterEnabled: draft.drafterEnabled,
-				patternAware: { ...defaults.patternAware, enabled: draft.patternAware.enabled },
-				selfSpeculation: { ...defaults.selfSpeculation, enabled: draft.selfSpeculation.enabled },
+				patternAware: {
+					...defaults.patternAware,
+					enabled: draft.patternAware.enabled,
+					multiStepEnabled: draft.patternAware.multiStepEnabled,
+				},
+				selfSpeculation: {
+					...defaults.selfSpeculation,
+					enabled: draft.selfSpeculation.enabled,
+					forkEnabled: draft.selfSpeculation.forkEnabled,
+					forkActionEnabled: draft.selfSpeculation.forkActionEnabled,
+				},
 			});
 		}
 	}
@@ -990,134 +996,184 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 	while (true) {
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Prediction sources", [
-			`Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}, rollout ${settings.drafterMaxDepth}`,
-			`PatternAware › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "multi-step" : "single-step"}`,
+			`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
+			`Actor fork › ${actorForkSummary(settings.selfSpeculation)}`,
+			`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`,
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Drafter")) await openDrafterSettings(ctx, controller);
-		if (choice.startsWith("PatternAware")) await openPatternAwareSettings(ctx, controller);
+		if (choice.startsWith("Model Drafter")) await openDrafterSettings(ctx, controller);
+		if (choice.startsWith("Actor fork")) await openActorForkSettings(ctx, controller);
+		if (choice.startsWith("Learned patterns")) await openPatternAwareSettings(ctx, controller);
 	}
 }
 
-async function openSelfSpeculationSettings(
+function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Advanced settings", () => {
+		const settings = controller.settings();
+		return new Map<string, MenuAction>([
+			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterAdvancedSettings(ctx, controller)],
+			[`Actor fork and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
+			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAdvancedSettings(ctx, controller)],
+			[`Scheduling and storage › ${settings.maxConcurrentActions} simultaneous tools`, () => openSchedulingAndCache(ctx, controller)],
+		]);
+	});
+}
+
+function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Model Drafter", () => {
+		const settings = controller.settings();
+		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
+		return new Map<string, MenuAction>([
+			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
+			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
+			[`Candidate requests per decision: ${settings.candidateLimit}`, () => edit("candidateLimit")],
+			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterAdvancedSettings(ctx, controller)],
+		]);
+	});
+}
+
+function openDrafterAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Model Drafter advanced", () => {
+		const settings = controller.settings();
+		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
+		return new Map<string, MenuAction>([
+			[`Pause when measured cost exceeds benefit: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
+			[`Follow-up tool steps: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
+			[`Maximum output tokens: ${settings.drafterMaxTokens ?? "Provider default"}`, () => edit("drafterMaxTokens")],
+			[`Temperature-0 candidates: ${settings.drafterDeterministicCandidates}`, () => edit("drafterDeterministicCandidates")],
+			[`Sampling temperature: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
+		]);
+	});
+}
+
+type ActorForkMenu = "basic" | "advanced" | "integration" | "fork" | "target" | "benefit";
+
+function openActorForkSettings(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
+	menu: ActorForkMenu = "basic",
 ): Promise<void> {
-	while (true) {
+	const titles: Readonly<Record<ActorForkMenu, string>> = {
+		basic: "Actor fork",
+		advanced: "Actor fork advanced",
+		integration: "Integration and authentication",
+		fork: "Fork decoding",
+		target: "Target verification",
+		benefit: "Benefit control",
+	};
+	return runActionMenuLoop(ctx, titles[menu], () => {
 		const settings = controller.settings();
 		const self = settings.selfSpeculation;
 		const edit = (field: SelfSpeculationInputField) => editSelfSpeculationSetting(ctx, controller, settings, field);
-		const actions = new Map<string, () => void | Promise<void>>([
-			[`Enabled: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled })],
-			[`Endpoint: ${self.endpoint}`, () => edit("endpoint")],
-			[`Fork transport: ${self.forkTransport}`, async () => {
-				const selected = await ctx.ui.select("Fork transport", ["provider", "sidecar", BACK]);
-				if (selected === "provider" || selected === "sidecar") updateSelfSpeculation(controller, settings, { forkTransport: selected });
-			}],
-			[`Actor fork: ${self.forkEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled })],
-			[`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled })],
-			[`Fork action confidence: ${formatNumber(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence")],
-			[`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled })],
-			[`Gate warm-up: ${self.forkGateMinSamples}`, () => edit("forkGateMinSamples")],
-			[`Gate window: ${self.forkGateWindowSize}`, () => edit("forkGateWindowSize")],
-			[`Gate minimum net: ${formatDuration(self.forkGateMinNetBenefitMs)}`, () => edit("forkGateMinNetBenefitMs")],
-			[`Gate probe interval: ${self.forkGateProbeInterval}`, () => edit("forkGateProbeInterval")],
-			[`Gate failure threshold: ${self.forkGateFailureThreshold}`, () => edit("forkGateFailureThreshold")],
-			[`Candidate bundle: ${self.maxCandidates}`, () => edit("maxCandidates")],
-			[`Draft tokens: ${self.maxDraftTokens}`, () => edit("maxDraftTokens")],
-			[`Draft format: ${self.draftFormat}`, () => edit("draftFormat")],
-			[`Draft boundary: ${self.draftBoundary}`, () => edit("draftBoundary")],
-			[`Fork tokens: ${self.forkMaxTokens}`, () => edit("forkMaxTokens")],
-			[`Fork temperature: ${formatNumber(self.forkTemperature)}`, () => edit("forkTemperature")],
-			[`Decoder: ${self.forkDecoder}`, () => edit("forkDecoder")],
-			[`Forced prefix: ${self.forkForcedPrefix}`, () => edit("forkForcedPrefix")],
-			[`Require logprobs: ${self.requireLogprobs ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs })],
-			[`Control timeout: ${formatDuration(self.timeoutMs)}`, () => edit("timeoutMs")],
-			[`Bearer-token env: ${self.apiKeyEnv ?? "none"}`, () => edit("apiKeyEnv")],
-		]);
-		const choice = await ctx.ui.select("Self-speculation", [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
+		const actions = new Map<string, MenuAction>();
+		if (menu === "basic") {
+			const active = self.enabled && self.forkEnabled;
+			actions.set(`Actor fork prediction: ${active ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: active ? self.enabled : true, forkEnabled: !active }));
+			actions.set("Advanced settings › integration, decoding, verification, benefit control", () => openActorForkSettings(ctx, controller, "advanced"));
+			if (self.forkTransport === "sidecar") {
+				actions.set(`Use forked calls for tool pre-execution: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled }));
+				if (self.forkActionEnabled) actions.set(`Minimum accepted confidence: ${formatPercent(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence"));
+			}
+		} else if (menu === "advanced") {
+			actions.set(`Integration and authentication › ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, () => openActorForkSettings(ctx, controller, "integration"));
+			actions.set(`Fork decoding › ${self.forkDecoder}, ${self.forkMaxTokens} tokens`, () => openActorForkSettings(ctx, controller, "fork"));
+			actions.set(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, () => openActorForkSettings(ctx, controller, "target"));
+			actions.set(`Benefit control › ${self.forkGateEnabled ? "Adaptive pause on" : "Always fork"}`, () => openActorForkSettings(ctx, controller, "benefit"));
+		} else if (menu === "integration") {
+			actions.set(`Integration: ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, async () => {
+				const selected = await ctx.ui.select("Actor fork integration", ["Provider-integrated", "Sidecar service", BACK]);
+				if (selected === "Provider-integrated" || selected === "Sidecar service")
+					updateSelfSpeculation(controller, settings, { forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
+			});
+			if (self.forkTransport === "sidecar") {
+				actions.set(`Control service URL: ${self.endpoint}`, () => edit("endpoint"));
+				actions.set(`Request timeout: ${formatDuration(self.timeoutMs)}`, () => edit("timeoutMs"));
+				actions.set(`Authentication token variable: ${self.apiKeyEnv ?? "None"}`, () => edit("apiKeyEnv"));
+			}
+		} else if (menu === "fork") {
+			actions.set(`Maximum output tokens: ${self.forkMaxTokens}`, () => edit("forkMaxTokens"));
+			actions.set(`Sampling temperature: ${formatNumber(self.forkTemperature)}`, () => edit("forkTemperature"));
+			actions.set(`Tool-call decoder: ${self.forkDecoder}`, () => edit("forkDecoder"));
+			actions.set(`Forced tool-call prefix: ${self.forkForcedPrefix}`, () => edit("forkForcedPrefix"));
+			actions.set(`Require token probabilities: ${self.requireLogprobs ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs }));
+		} else if (menu === "target") {
+			actions.set(`Verify predicted calls during Actor decoding: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled }));
+			actions.set(`Candidates sent per decision: ${self.maxCandidates}`, () => edit("maxCandidates"));
+			actions.set(`Draft-token limit per candidate: ${self.maxDraftTokens}`, () => edit("maxDraftTokens"));
+			actions.set(`Tool-call format: ${self.draftFormat}`, () => edit("draftFormat"));
+			actions.set(`Tool-call boundary: ${self.draftBoundary}`, () => edit("draftBoundary"));
+		} else {
+			actions.set(`Pause forks that stop saving time: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled }));
+			if (self.forkGateEnabled) {
+				actions.set(`Warm-up samples: ${self.forkGateMinSamples}`, () => edit("forkGateMinSamples"));
+				actions.set(`Rolling samples: ${self.forkGateWindowSize}`, () => edit("forkGateWindowSize"));
+				actions.set(`Minimum expected time saved: ${formatDuration(self.forkGateMinNetBenefitMs)}`, () => edit("forkGateMinNetBenefitMs"));
+				actions.set(`Recovery probe interval: ${self.forkGateProbeInterval}`, () => edit("forkGateProbeInterval"));
+				actions.set(`Consecutive-failure limit: ${self.forkGateFailureThreshold}`, () => edit("forkGateFailureThreshold"));
+			}
+		}
+		return actions;
+	});
 }
 
-async function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
+function openPatternAwareSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Learned patterns", () => {
 		const settings = controller.settings();
-		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
-		const actions = new Map<string, () => void | Promise<void>>([
-			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
-			[`Action utility gate: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
-			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
-			[`Rollout depth: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
-			[`Output tokens: ${settings.drafterMaxTokens ?? "provider default"}`, () => edit("drafterMaxTokens")],
-			[`Deterministic requests: ${settings.drafterDeterministicCandidates}`, () => edit("drafterDeterministicCandidates")],
-			[`Temperature range: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
-			[`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`, () => edit("predictionTimeoutMs")],
+		const pattern = settings.patternAware;
+		return new Map<string, MenuAction>([
+			[`Enabled: ${pattern.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, enabled: !pattern.enabled } })],
+			[`Predict follow-up tool steps: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
+			[`Advanced settings › history, confidence, search limits`, () => openPatternAdvancedSettings(ctx, controller)],
 		]);
-		const choice = await ctx.ui.select("Drafter", [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
+	});
 }
 
-async function openPatternAwareSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
-		const settings = controller.settings();
-		const actions = new Map<string, () => void | Promise<void>>([
-			[`Enabled: ${settings.patternAware.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...settings.patternAware, enabled: !settings.patternAware.enabled } })],
-			[`Learning › context ${settings.patternAware.maxContextLength}, promotion ${settings.patternAware.minOccurrences}`, () => openPatternLearning(ctx, controller)],
-			[`Multi-step prediction › ${settings.patternAware.multiStepEnabled ? "On" : "Off"}, beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}`, () => openPatternMultiStep(ctx, controller)],
+function openPatternAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Learned-pattern advanced", () => {
+		const pattern = controller.settings().patternAware;
+		const actions = new Map<string, MenuAction>([
+			[`Learning history › ${pattern.maxContextLength} previous actions`, () => openPatternAdvancedGroup(ctx, controller, "learning")],
 		]);
-		const choice = await ctx.ui.select("PatternAware", [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
+		if (pattern.multiStepEnabled)
+			actions.set(`Multi-step search › ${pattern.beamWidth} alternatives/tool, ${pattern.maxPredictionDepth} steps`, () => openPatternAdvancedGroup(ctx, controller, "multiStep"));
+		return actions;
+	});
 }
 
-async function openPatternLearning(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
+async function openPatternAdvancedGroup(
+	ctx: ExtensionContext,
+	controller: SpeculativeActionController,
+	group: "learning" | "multiStep",
+): Promise<void> {
+	return runActionMenuLoop(ctx, group === "learning" ? "Learning history" : "Multi-step search", () => {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
 		const edit = (field: PatternInputField) => editPatternSetting(ctx, controller, settings, field);
-		const actions = new Map<string, () => Promise<void>>([
-			[`Context events: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
-			[`Future gap: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
-			[`Future gap coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
-			[`Decay half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
-			[`Promotion occurrences: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
-			[`Pattern capacity: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
-		]);
-		const choice = await ctx.ui.select("PatternAware learning", [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
-}
-
-async function openPatternMultiStep(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
-		const settings = controller.settings();
-		const pattern = settings.patternAware;
-		const edit = (field: PatternInputField) => editPatternSetting(ctx, controller, settings, field);
-		const actions = new Map<string, () => void | Promise<void>>([
-			[`Enabled: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
-			[`Beam width per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
-			[`Prediction depth: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
-			[`Minimum binding replay: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
-		]);
-		const choice = await ctx.ui.select("PatternAware multi-step", [...actions.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		await actions.get(choice)?.();
-	}
+		const actions = group === "learning"
+			? new Map<string, () => Promise<void>>([
+				[`Previous actions used as context: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
+				[`Maximum skipped Actor decisions: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
+				[`Early-prediction coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
+				[`History half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
+				[`Uses before learning a pattern: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
+				[`Stored pattern limit: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
+			])
+			: new Map<string, () => Promise<void>>([
+				[`Alternatives retained per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
+				[`Maximum predicted tool steps: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
+				[`Minimum argument-replay confidence: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
+			]);
+		return actions;
+	});
 }
 
 async function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
 		const fields = new Map<string, RootInputField>([
-			[`Drafter requests: ${settings.candidateLimit}`, "candidateLimit"],
-			[`Concurrent actions: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
+			[`Simultaneous speculative tools: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
+			[`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`, "predictionTimeoutMs"],
 			[`Live result entries: ${settings.resourceCacheMaxEntries}`, "resourceCacheMaxEntries"],
 			[`Live result memory: ${formatBytes(settings.resourceCacheMaxBytes)}`, "resourceCacheMaxBytes"],
 			[`Reusable command history entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
@@ -1125,7 +1181,7 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		]);
 		const reclaim = "Reclaim reusable command history";
 		const clear = "Clear reusable command history";
-		const choice = await ctx.ui.select("Scheduling & cache", [...fields.keys(), reclaim, clear, BACK]);
+		const choice = await ctx.ui.select("Scheduling and storage", [...fields.keys(), reclaim, clear, BACK]);
 		if (!choice || choice === BACK) return;
 		if (choice === clear && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) continue;
 		const operation = choice === reclaim ? "gc" : choice === clear ? "clear" : undefined;
@@ -1139,6 +1195,21 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 		}
 		const field = fields.get(choice);
 		if (field) await editRootSetting(ctx, controller, settings, field);
+	}
+}
+
+type MenuAction = () => void | Promise<void>;
+
+async function runActionMenuLoop(
+	ctx: ExtensionContext,
+	title: string,
+	actionsForCurrentSettings: () => ReadonlyMap<string, MenuAction>,
+): Promise<void> {
+	while (true) {
+		const actions = actionsForCurrentSettings();
+		const choice = await ctx.ui.select(title, [...actions.keys(), BACK]);
+		if (!choice || choice === BACK) return;
+		await actions.get(choice)?.();
 	}
 }
 
@@ -1200,7 +1271,7 @@ async function editToolPolicy(
 					: routeLabel(route);
 			labels.set(`${marker} ${tool} · ${availability}`, tool);
 		}
-		const choice = await ctx.ui.select("Tool policy", [...labels.keys(), BACK]);
+		const choice = await ctx.ui.select("Tool policy · [x] active · [~] selected · [ ] off", [...labels.keys(), BACK]);
 		if (!choice || choice === BACK) return;
 		const tool = labels.get(choice);
 		if (!tool) continue;
@@ -1559,24 +1630,18 @@ function sameSettings(left: EffectiveSpeculativeActionSettings, right: Effective
 function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 	if (!settings.enabled) return "Inactive";
 	const sources = [
-		settings.drafterEnabled ? "Drafter" : undefined,
-		settings.patternAware.enabled ? "PatternAware" : undefined,
-		settings.selfSpeculation.enabled &&
-		settings.selfSpeculation.forkTransport === "sidecar" &&
-		settings.selfSpeculation.forkEnabled &&
-		settings.selfSpeculation.forkActionEnabled
-			? "SidecarFork"
-			: undefined,
+		settings.drafterEnabled ? "Model Drafter" : undefined,
+		settings.selfSpeculation.enabled && settings.selfSpeculation.forkEnabled ? "Actor fork" : undefined,
+		settings.patternAware.enabled ? "Learned patterns" : undefined,
 	]
 		.filter((source): source is string => source !== undefined)
 		.join(" + ");
 	return sources || "No source enabled";
 }
 
-function selfSpeculationSummary(settings: SelfSpeculationSettings): string {
-	return settings.enabled
-		? `On, ${settings.forkTransport}, ${settings.maxCandidates}×${settings.maxDraftTokens}`
-		: "Off";
+function actorForkSummary(settings: SelfSpeculationSettings): string {
+	if (!settings.enabled || !settings.forkEnabled) return "Off";
+	return `On, ${settings.forkTransport === "provider" ? "provider-integrated" : "sidecar service"}`;
 }
 
 function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnapshot): string {

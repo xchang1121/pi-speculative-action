@@ -10,7 +10,7 @@
 
 Runtime 分为四个相互独立的层次：
 
-1. **投机源**：Drafter 与 PatternAware 只产生与执行方式无关的 `PlanAction`。
+1. **投机源**：模型 Drafter、Actor fork 与历史模式预测只产生与执行方式无关的 `PlanAction`。
 2. **动作身份**：`K(a)` 规范化工具语义、已验证 schema、参数、资源与实际执行器身份；无损投影规则可以证明一个结果覆盖另一个动作。
 3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
 4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 只产生封存后的效果载体，由唯一的 `EffectTransaction` 管理验证、采纳、放弃与提交状态；结算只记录一次匹配、采纳、回退和计时。
@@ -82,7 +82,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是按用途显示“实时投机结果”“可复用命令历史”和当前执行路线。会话启动时完成的能力诊断会被直接复用，打开工具菜单不会再次运行重探测；只有显式打开“Execution routes”才刷新后端。工具策略只把当前已注册且有安全路线的工具交给投机源，`[~]` 表示偏好已保存但在当前 Pi 环境中 inactive。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换全局/项目作用域会重新载入该层，而项目文件只保存相对规范化全局配置的差异。Footer/状态首先显示所有工具调用的复用情况；仅当 Bash 实际启动了可复用子命令时，才追加一条子命令命中率、来源和估算省时，两套分母不会相加。同次运行的重叠时间明确标为 observed overlap。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线时始终由 Actor 执行。
+在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是按用途显示“实时投机结果”“可复用命令历史”和当前执行路线。会话启动时完成的能力诊断会被直接复用，打开工具菜单不会再次运行重探测；只有显式打开“Execution routes”才刷新后端。工具策略只把当前已注册且有安全路线的工具交给投机源；标题会直接解释 `[x]` 为已激活、`[~]` 为已选择但在当前环境未激活、`[ ]` 为关闭。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Footer/状态首先显示所有工具调用的复用情况；仅当 Bash 实际启动了可复用子命令时，才追加一条子命令命中率、来源和估算省时，两套分母不会相加。同次运行的重叠时间明确标为 observed overlap。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线时始终由 Actor 执行。
 
 配置由 package 自己管理：
 
@@ -143,9 +143,9 @@ npm run setup:linux
 
 `drafterMaxTokens` 是可选的硬上限。省略该项——或清空 TUI 输入框——会使用服务商默认输出上限，避免长命令和结构化工具参数被截断。
 
-### 目标解码器自投机桥接
+### Actor fork Drafter 源与目标验证
 
-`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。候选通过 schema 校验并完成参数物化后，每个 Drafter 或 PatternAware 预测都会复制到同一个 request-scoped 候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
+`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。它的 fork 是只从权威 Actor 推理流派生的 Drafter 源，独立的模型 Drafter 请求永远不会被自分叉。同一个 request-scoped 桥接还会把每个通过 schema 校验并完成参数物化的模型 Drafter 或 PatternAware 预测复制到目标验证候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
 
 桥接为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 fork 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 

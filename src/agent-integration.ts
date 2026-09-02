@@ -19,6 +19,7 @@ import type {
 	DraftOptionsContext,
 } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
+import { createActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type {
 	ExecutionWorldDiagnosticSnapshot,
 	SpeculativeExecutionRoute,
@@ -45,7 +46,6 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import type { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
-import { createSelfSpeculationPlanSource } from "./self-speculation-plan-source.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
@@ -252,7 +252,7 @@ export function createSpeculativeActionHost(
 						? settings.drafterGateEnabled
 						: DEFAULTS.drafterGateEnabled,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
-				selfSpeculationActionEnabled:
+				actorForkActionEnabled:
 					selfSpeculation.enabled &&
 					selfSpeculation.forkEnabled &&
 					selfSpeculation.forkActionEnabled &&
@@ -280,7 +280,7 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
-	const selfSpeculationSource = createSelfSpeculationPlanSource(options.selfSpeculationActionBridge);
+	const actorForkSource = createActorForkPlanSource(options.selfSpeculationActionBridge);
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		ToolSettlement,
@@ -290,7 +290,7 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources: [patternPlans.source, drafterPlans.source, selfSpeculationSource],
+		sources: [patternPlans.source, drafterPlans.source, actorForkSource],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),

@@ -108,6 +108,7 @@
 
 ### Changed
 
+- Reorganized the Pi TUI around direct source and tool choices. Sampling, learned-pattern internals, Actor-fork protocol details, benefit gates, scheduling, and storage now live under Advanced settings with mode-dependent fields hidden.
 - A five-point WSL2 stock Pi Bash sweep now retains both sides of the measured adoption crossover.
   Zero-, 40-, and 43-round in-flight candidates fall back, while 48- and 96-round candidates join;
   the conservative 96-round estimate saves 1705.23 ms. A completed zero-round hit also falls back
