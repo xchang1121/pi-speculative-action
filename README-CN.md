@@ -10,7 +10,7 @@
 
 Runtime 分为四个相互独立的层次：
 
-1. **投机源**：模型 Drafter、Actor fork 与历史模式预测只产生与执行方式无关的 `PlanAction`。
+1. **投机源**：模型 Drafter、Actor probe 与历史模式预测只产生与执行方式无关的 `PlanAction`。
 2. **动作身份**：`K(a)` 规范化工具语义、已验证 schema、参数、资源与实际执行器身份；无损投影规则可以证明一个结果覆盖另一个动作。
 3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
 4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 只产生封存后的效果载体，由唯一的 `EffectTransaction` 管理验证、采纳、放弃与提交状态；结算只记录一次匹配、采纳、回退和计时。
@@ -129,7 +129,6 @@ npm run setup:linux
     "forkTemperature": 0,
     "forkDecoder": "auto",
     "forkForcedPrefix": "<tool_call>",
-    "requireLogprobs": true,
     "timeoutMs": 2000
   }
 }
@@ -145,20 +144,20 @@ npm run setup:linux
 
 Drafter 始终接收与 Actor 相同的完整历史。每次根请求及基于工具输出的后继请求发出前，投机源都会用 Drafter 自身的 `contextWindow` 检查完整历史和输出额度；较短模型无法容纳时直接在本地跳过，不会截断、摘要，也不会为 Drafter 触发第二条压缩路径。
 
-### Actor fork Drafter 源与目标验证
+### Actor probe 与目标验证
 
-`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。它的 fork 是只从权威 Actor 推理流派生的 Drafter 源，独立的模型 Drafter 请求永远不会被自分叉。同一个 request-scoped 桥接还会把每个通过 schema 校验并完成参数物化的模型 Drafter 或 PatternAware 预测复制到目标验证候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
+`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。Actor probe 只从权威 Actor 推理流派生，独立的模型 Drafter 请求永远不会被自分叉。同一个 request-scoped 协调器还会把每个通过 schema 校验并完成参数物化的模型 Drafter 或 PatternAware 预测复制到目标验证候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
 
-桥接为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 fork 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
+协调器为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 probe 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 
 如果目标端在 clear 响应中返回 `verification`，协调器会把真实的 proposed、accepted、rejected 和 unresolved draft token 与注册回执分开统计。candidate ID 与来源会更新按模型、端点、格式、工具和来源分区的 decoder ledger，其平滑验收概率会校准后续候选排序。Runtime 的 Actor 结算则独立训练动作收益：sidecar fork 只有在匹配预测被真实采纳时才获得收益，且按来源分摊实际 `executionAheadMs`。token 拒绝不会改写动作语义概率，单纯 action-key 命中也不再给 fork gate 记收益。为保持 API 兼容，`acceptedDraftTokens` 仍表示注册确认，不能当作目标模型验收。
 
 fork 有两种传输方式：
 
-- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，每个完整 fork candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、fork timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只有 SPORK 报告的“已选 token 最低 top-1 概率”达到门槛时才接纳整批动作；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。该门控只影响动作交接，已经运行的 fork 与目标解码遥测保持不变，也不会新增推理请求。
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，每个完整 probe candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、probe timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只计算工具名 token 的最低 top-1 概率，参数 token 的不确定性不会误伤动作接纳；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。
 - `provider`：只把版本化的 `self_speculation` 控制对象放进权威 Actor 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式；Drafter 模型请求不会被修改。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
 
-使用正数动作置信度门槛与参考 sidecar 时，应把 `requireLogprobs` 设为 `true`；若引擎无法提供证据，fork 会明确失败，而不会静默执行无分数动作。
+正数工具名置信度门槛会自动请求 token 概率。`requireLogprobs` 仅作为 JSON 兼容覆盖项保留，用于关闭提前执行后仍想收集证据的场景，不再需要独立的 TUI 开关。
 
 在 `sidecar` 模式下，按模型隔离的 fork 门控会滚动学习 `Actor 精确命中的领先时间 - fork 延迟`。默认先放行 4 个样本；持续负收益时暂停请求，但每跳过 4 次仍做一次有界探测，使工作负载改变后可以恢复。连续 2 次 endpoint 失败也进入同一探测回路。上述阈值都可配置；关闭 `forkGateEnabled` 即恢复无条件 fork。同一份 `fork_gate` 策略也会作为 provider/SPORK 提示发送，但 provider 传输需要由推理服务自行执行该策略。
 

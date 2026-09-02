@@ -149,7 +149,7 @@ const SELF_SPECULATION_INPUTS = {
 			? { ok: true, value }
 			: { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
 	}),
-	forkActionMinConfidence: probabilityInput("Minimum forked-call confidence"),
+	forkActionMinConfidence: probabilityInput("Minimum tool-name confidence"),
 	forkGateMinSamples: positiveIntegerInput("Benefit-gate warm-up samples"),
 	forkGateWindowSize: positiveIntegerInput("Benefit-gate rolling window"),
 	forkGateMinNetBenefitMs: nonNegativeNumberInput("Minimum expected time saved (ms)"),
@@ -159,9 +159,9 @@ const SELF_SPECULATION_INPUTS = {
 	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
 	draftFormat: nonEmptyTextInput("Target tool-call format"),
 	draftBoundary: nonEmptyTextInput("Target tool-call boundary"),
-	forkMaxTokens: positiveIntegerInput("Actor fork output-token limit"),
+	forkMaxTokens: positiveIntegerInput("Actor probe output-token limit"),
 	timeoutMs: positiveIntegerInput("Control request timeout (ms)"),
-	forkTemperature: nonNegativeNumberInput("Actor fork temperature"),
+	forkTemperature: nonNegativeNumberInput("Actor probe temperature"),
 	forkDecoder: nonEmptyTextInput("Forked tool-call decoder"),
 	forkForcedPrefix: nonEmptyTextInput("Forced tool-call prefix"),
 	apiKeyEnv: optionalTextInput("Authentication token environment variable name (not the token)"),
@@ -304,7 +304,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, replay confidence≥${formatPercent(settings.patternAware.minBindingReplayProbability)}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Actor-fork Drafter source: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} at ${self.draftBoundary}; ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
+		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} at ${self.draftBoundary}; ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
@@ -655,7 +655,7 @@ async function installController(
 			return [
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: currentMetrics }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
-				formatSelfSpeculationBridgeStatus(selfSpeculation.snapshot()),
+				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(executionDiagnostics),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
@@ -997,13 +997,13 @@ async function openPredictionSources(ctx: ExtensionContext, controller: Speculat
 		const settings = controller.settings();
 		const choice = await ctx.ui.select("Prediction sources", [
 			`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
-			`Actor fork › ${actorForkSummary(settings.selfSpeculation)}`,
+			`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`,
 			`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`,
 			BACK,
 		]);
 		if (!choice || choice === BACK) return;
 		if (choice.startsWith("Model Drafter")) await openDrafterSettings(ctx, controller);
-		if (choice.startsWith("Actor fork")) await openActorForkSettings(ctx, controller);
+		if (choice.startsWith("Actor probe")) await openActorForkSettings(ctx, controller);
 		if (choice.startsWith("Learned patterns")) await openPatternAwareSettings(ctx, controller);
 	}
 }
@@ -1013,7 +1013,7 @@ function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActi
 		const settings = controller.settings();
 		return new Map<string, MenuAction>([
 			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterAdvancedSettings(ctx, controller)],
-			[`Actor fork and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
+			[`Actor probe and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
 			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAdvancedSettings(ctx, controller)],
 			[`Scheduling and storage › ${settings.maxConcurrentActions} simultaneous tools`, () => openSchedulingAndCache(ctx, controller)],
 		]);
@@ -1055,8 +1055,8 @@ function openActorForkSettings(
 	menu: ActorForkMenu = "basic",
 ): Promise<void> {
 	const titles: Readonly<Record<ActorForkMenu, string>> = {
-		basic: "Actor fork",
-		advanced: "Actor fork advanced",
+		basic: "Actor probe",
+		advanced: "Actor probe advanced",
 		integration: "Integration and authentication",
 		fork: "Fork decoding",
 		target: "Target verification",
@@ -1069,11 +1069,11 @@ function openActorForkSettings(
 		const actions = new Map<string, MenuAction>();
 		if (menu === "basic") {
 			const active = self.enabled && self.forkEnabled;
-			actions.set(`Actor fork prediction: ${active ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: active ? self.enabled : true, forkEnabled: !active }));
+			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: active ? self.enabled : true, forkEnabled: !active }));
 			actions.set("Advanced settings › integration, decoding, verification, benefit control", () => openActorForkSettings(ctx, controller, "advanced"));
 			if (self.forkTransport === "sidecar") {
 				actions.set(`Use forked calls for tool pre-execution: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled }));
-				if (self.forkActionEnabled) actions.set(`Minimum accepted confidence: ${formatPercent(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence"));
+				if (self.forkActionEnabled) actions.set(`Minimum tool-name confidence: ${formatPercent(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence"));
 			}
 		} else if (menu === "advanced") {
 			actions.set(`Integration and authentication › ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, () => openActorForkSettings(ctx, controller, "integration"));
@@ -1082,7 +1082,7 @@ function openActorForkSettings(
 			actions.set(`Benefit control › ${self.forkGateEnabled ? "Adaptive pause on" : "Always fork"}`, () => openActorForkSettings(ctx, controller, "benefit"));
 		} else if (menu === "integration") {
 			actions.set(`Integration: ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, async () => {
-				const selected = await ctx.ui.select("Actor fork integration", ["Provider-integrated", "Sidecar service", BACK]);
+				const selected = await ctx.ui.select("Actor probe integration", ["Provider-integrated", "Sidecar service", BACK]);
 				if (selected === "Provider-integrated" || selected === "Sidecar service")
 					updateSelfSpeculation(controller, settings, { forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
 			});
@@ -1096,7 +1096,6 @@ function openActorForkSettings(
 			actions.set(`Sampling temperature: ${formatNumber(self.forkTemperature)}`, () => edit("forkTemperature"));
 			actions.set(`Tool-call decoder: ${self.forkDecoder}`, () => edit("forkDecoder"));
 			actions.set(`Forced tool-call prefix: ${self.forkForcedPrefix}`, () => edit("forkForcedPrefix"));
-			actions.set(`Require token probabilities: ${self.requireLogprobs ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { requireLogprobs: !self.requireLogprobs }));
 		} else if (menu === "target") {
 			actions.set(`Verify predicted calls during Actor decoding: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled }));
 			actions.set(`Candidates sent per decision: ${self.maxCandidates}`, () => edit("maxCandidates"));
@@ -1631,7 +1630,7 @@ function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 	if (!settings.enabled) return "Inactive";
 	const sources = [
 		settings.drafterEnabled ? "Model Drafter" : undefined,
-		settings.selfSpeculation.enabled && settings.selfSpeculation.forkEnabled ? "Actor fork" : undefined,
+		settings.selfSpeculation.enabled && settings.selfSpeculation.forkEnabled ? "Actor probe" : undefined,
 		settings.patternAware.enabled ? "Learned patterns" : undefined,
 	]
 		.filter((source): source is string => source !== undefined)
@@ -1648,9 +1647,9 @@ function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnaps
 	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(gate.expectedNetBenefitMs)} expected net`}`;
 }
 
-function formatSelfSpeculationBridgeStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
+function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
 	return [
-		`Self-speculation bridge: ${bridge.bufferedCandidates} buffered`,
+		`Self-speculation: ${bridge.bufferedCandidates} buffered`,
 		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
 		`${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
 		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,

@@ -329,8 +329,8 @@ describe("zero-modification Pi extension", () => {
 		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
 		expect(status).toContain("Bash child commands: 1/3 (33%) reused; ~1s estimated time saved (83%); 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
-		expect(status).toContain("Actor-fork Drafter source: On (sidecar)");
-		expect(status).toContain("early tool execution On (confidence ≥90%)");
+		expect(status).toContain("Actor probe: On (sidecar)");
+		expect(status).toContain("early tool execution On (tool-name confidence ≥90%)");
 		expect(status).not.toContain("prior execution");
 		expect(status).not.toMatch(/\bL[12]\b/);
 	});
@@ -370,8 +370,8 @@ describe("zero-modification Pi extension", () => {
 			"Speculative action": ["Tools & execution", "Prediction sources", "Enabled", "Discard changes", "Save settings to", "Close"],
 			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
 			"Tool policy · [x] active · [~] selected · [ ] off": ["[~] bash", "[ ] bash", "Back"],
-			"Prediction sources": ["Actor fork", "Back"],
-			"Actor fork": ["Back"],
+			"Prediction sources": ["Actor probe", "Back"],
+			"Actor probe": ["Back"],
 			"Save settings to": ["This project"],
 		});
 		await fixture.emit("session_start", {}, fixture.context);
@@ -391,12 +391,12 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Tool policy · [x] active · [~] selected · [ ] off")).toEqual(expect.arrayContaining([
 			expect.stringMatching(/^\[ \] bash · unavailable · Linux host required/),
 		]));
-		expect(menus.get("Actor fork")).toEqual(expect.arrayContaining(["Actor fork prediction: Off"]));
-		expect(menus.get("Actor fork")).not.toEqual(
+		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
+		expect(menus.get("Actor probe")).not.toEqual(
 			expect.arrayContaining([expect.stringMatching(/^Use forked calls/)]),
 		);
-		expect(menus.get("Actor fork")).not.toEqual(
-			expect.arrayContaining([expect.stringMatching(/^Minimum accepted confidence/)]),
+		expect(menus.get("Actor probe")).not.toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
@@ -450,9 +450,9 @@ describe("zero-modification Pi extension", () => {
 		});
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
-			"Advanced settings": ["Scheduling and storage", "Actor fork and target verification", "Learned-pattern tuning", "Back"],
+			"Advanced settings": ["Scheduling and storage", "Actor probe and target verification", "Learned-pattern tuning", "Back"],
 			"Scheduling and storage": ["Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
-			"Actor fork advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
+			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
 			"Integration and authentication": ["Integration", "Control service URL", "Back"],
 			"Fork decoding": ["Back"],
 			"Target verification": ["Back"],
@@ -460,9 +460,9 @@ describe("zero-modification Pi extension", () => {
 			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back"],
 			"Learning history": ["Early-prediction coverage", "Back"],
 			"Multi-step search": ["Back"],
-			"Prediction sources": ["Actor fork", "Back"],
-			"Actor fork": ["Minimum accepted confidence", "Back"],
-			"Actor fork integration": ["Sidecar service"],
+			"Prediction sources": ["Actor probe", "Back"],
+			"Actor probe": ["Minimum tool-name confidence", "Back"],
+			"Actor probe integration": ["Sidecar service"],
 		});
 		fixture.ui.input = async (title) =>
 			({
@@ -470,7 +470,7 @@ describe("zero-modification Pi extension", () => {
 				"Reusable command history entries": "2048",
 				"Reusable command history memory (MiB)": "768",
 				"Control service URL": "file:///unsafe",
-				"Minimum forked-call confidence": "0.75",
+				"Minimum tool-name confidence": "0.75",
 				"Early-prediction coverage (0-1)": "0.8",
 			} as Readonly<Record<string, string>>)[title];
 		fixture.ui.confirm = async (title) => title === "Clear reusable command history?";
@@ -491,6 +491,9 @@ describe("zero-modification Pi extension", () => {
 		});
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
 		expect(maintain.mock.calls).toEqual([["gc"], ["clear"]]);
+		expect(menus.get("Fork decoding")).not.toEqual(
+			expect.arrayContaining([expect.stringMatching(/^Require token probabilities/)]),
+		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			"Reusable command history cleared: 2 entries, 3 artifacts, 4 KiB.",
 			"info",
@@ -499,10 +502,10 @@ describe("zero-modification Pi extension", () => {
 			"Endpoint must be an absolute HTTP(S) URL.",
 			"warning",
 		);
-		expect(menus.get("Actor fork")).toEqual(
+		expect(menus.get("Actor probe")).toEqual(
 			expect.arrayContaining([
 				"Use forked calls for tool pre-execution: On",
-				"Minimum accepted confidence: 75%",
+				"Minimum tool-name confidence: 75%",
 			]),
 		);
 	});

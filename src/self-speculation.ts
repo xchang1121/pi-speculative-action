@@ -312,7 +312,7 @@ interface ParsedSidecarActionCall {
 }
 
 /**
- * Request-scoped bridge between speculative-action predictions and a SPORK-capable engine.
+ * Request-scoped decoder-feedback coordinator for a SPORK-capable engine.
  * Network work is serialized and best-effort; it never owns Actor correctness or lifecycle.
  */
 export class SelfSpeculationCoordinator {
