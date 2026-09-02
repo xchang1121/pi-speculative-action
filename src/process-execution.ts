@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 /** One process launch as observed at the generic tool-execution outlet. */
 export interface ProcessExecutionRequest {
@@ -18,19 +19,8 @@ export interface ProcessExecutor {
 	readonly execute: (request: ProcessExecutionRequest) => Promise<ProcessExecutionResult>;
 }
 
-/** Structural subset of Pi's process-backed tool operations. */
-export interface ProcessToolOperations {
-	readonly exec: (
-		command: string,
-		cwd: string,
-		options: {
-			readonly onData: (data: Buffer) => void;
-			readonly signal?: AbortSignal;
-			readonly timeout?: number;
-			readonly env?: NodeJS.ProcessEnv;
-		},
-	) => Promise<ProcessExecutionResult>;
-}
+/** Compatibility name for Pi's public process-backed tool outlet. */
+export type ProcessToolOperations = BashOperations;
 
 /**
  * One outlet for every process-backed tool.
