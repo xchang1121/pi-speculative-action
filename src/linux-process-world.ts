@@ -8,7 +8,7 @@ import {
 	type LinuxProcessSession,
 } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
-import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import {
 	WorkspaceSandboxService,
 	type WorkspaceSandboxOptions,
@@ -139,7 +139,7 @@ export function createLinuxProcessExecutionWorld(
 							isError: false,
 						};
 					} catch (error) {
-						return errorSettlement(replaceMessagePath(error, workspace.sandboxRoot, sourceRoot));
+						return toolErrorSettlement(replaceMessagePath(error, workspace.sandboxRoot, sourceRoot));
 					} finally {
 						await session.close();
 						reuseMetrics = session.metrics();
@@ -184,16 +184,6 @@ function processInvocation(value: unknown): ToolInvocation["process"] | undefine
 		return undefined;
 	}
 	return processValue;
-}
-
-function errorSettlement(error: unknown): ToolSettlement {
-	return {
-		result: {
-			content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-			details: {},
-		},
-		isError: true,
-	};
 }
 
 function replaceMessagePath(error: unknown, from: string, to: string): unknown {

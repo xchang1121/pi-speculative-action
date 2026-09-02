@@ -19,7 +19,7 @@ import {
 } from "./resource-version.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { cause } from "./settlement.ts";
-import type { ToolSettlement } from "./tool-settlement.ts";
+import { toolErrorSettlement, type ToolSettlement } from "./tool-settlement.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
 export interface SpeculativeToolExecutionContext {
@@ -70,7 +70,7 @@ export function createResourceSnapshotExecutionWorld(
 					isError: false,
 				};
 			} catch (error) {
-				output = errorSettlement(error);
+				output = toolErrorSettlement(error);
 			}
 			return captured.seal(output);
 		},
@@ -158,14 +158,4 @@ class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 		this.stopWatcher = undefined;
 		releaseResourceVersion(this.version);
 	}
-}
-
-function errorSettlement(error: unknown): ToolSettlement {
-	return {
-		result: {
-			content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-			details: {},
-		},
-		isError: true,
-	};
 }
