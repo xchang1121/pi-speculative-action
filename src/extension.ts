@@ -1648,7 +1648,7 @@ function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot)
 	return [
 		`Self-speculation: ${bridge.bufferedCandidates} buffered`,
 		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
-		`${bridge.forkRequests}/${bridge.forkCompletions} forks completed, ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
+		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries), ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
 		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,
 		`${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged)`,
 		`${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved`,

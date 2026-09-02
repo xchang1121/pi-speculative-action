@@ -154,8 +154,8 @@ Drafter 始终接收与 Actor 相同的完整历史。每次根请求及基于�
 
 fork 有两种传输方式：
 
-- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，每个完整 probe candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、probe timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只计算工具名 token 的最低 top-1 概率，参数 token 的不确定性不会误伤动作接纳；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。
-- `provider`：只把版本化的 `self_speculation` 控制对象放进权威 Actor 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式；Drafter 模型请求不会被修改。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。低置信结果仍保留给 D3，并等待更新的 Actor 快照后再次探测；任一时刻只运行一个 probe，默认每 50 个非空流更新推进一次，最多 5 次。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，最早达到置信门槛的完整 probe candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、probe timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只计算工具名 token 的最低 top-1 概率，参数 token 的不确定性不会误伤动作接纳；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。
+- `provider`：只把版本化的 `self_speculation` 控制对象放进权威 Actor 请求，其中包括 D2 的 5 次上限、50-token 步长和工具名最低概率门。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式；Drafter 模型请求不会被修改。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
 
 正数工具名置信度门槛会自动请求 token 概率。`requireLogprobs` 仅作为 JSON 兼容覆盖项保留，用于关闭提前执行后仍想收集证据的场景，不再需要独立的 TUI 开关。
 

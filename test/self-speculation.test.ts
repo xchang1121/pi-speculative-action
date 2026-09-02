@@ -126,7 +126,17 @@ describe("self-speculation control plane", () => {
 		const secondActor = coordinator.decorateActorPayload({ model: "actor-retry" });
 
 		expect(actor.request_id).toBe("actor-request");
-		expect(actor.self_speculation).toEqual(expect.objectContaining({ fork: true }));
+		expect(actor.self_speculation).toEqual(
+			expect.objectContaining({
+				fork: true,
+				d2: {
+					confidence_metric: "minimum_tool_name_probability",
+					confidence_threshold: 0.9,
+					max_attempts: 5,
+					retry_token_step: 50,
+				},
+			}),
+		);
 		expect(actor.self_speculation).not.toHaveProperty("role");
 		expect(secondActor).toEqual({ model: "actor-retry" });
 		await coordinator.dispose();
@@ -530,6 +540,49 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
+	it("re-probes the newest Actor snapshot after low-confidence D2 output", async () => {
+		const requests: CapturedRequest[] = [];
+		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 3, retryStreamUpdates: 1 });
+		let probe = 0;
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar" }),
+			requestID: () => "actor-request",
+			actorForkPlanSource: actorForkPlans,
+			fetch: vi.fn(async (input, init) => {
+				const path = new URL(String(input)).pathname;
+				if (path !== SELF_SPECULATION_DEFAULTS.forkPath) return Response.json({});
+				requests.push({ path, body: JSON.parse(String(init?.body)) as Record<string, any> });
+				probe++;
+				return Response.json(
+					forkReceipt(
+						"read",
+						{ path: probe === 1 ? "early.txt" : "stable.txt" },
+						{
+							token_count: 2,
+							mean: -0.1,
+							tool_name: { minimum_probability: probe === 1 ? 0.5 : 0.95 },
+						},
+					),
+				);
+			}),
+		});
+		coordinator.startTurn("turn-d2", model(), context(), 1);
+		const pending = actorForkPlans.waitForBatches("turn-d2", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("thinking_delta", "first"));
+		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));
+		coordinator.observeActorOutput(delta("thinking_delta", " later"));
+
+		const batches = await pending;
+		expect(batches[0]?.calls[0]?.input).toEqual({ path: "stable.txt" });
+		expect(requests.map((request) => request.body.snapshot)).toMatchObject([
+			{ attempt: 1, generated_text: "first" },
+			{ attempt: 2, generated_text: "first later" },
+		]);
+		expect(coordinator.snapshot()).toMatchObject({ forkRequests: 2, forkCompletions: 2, forkRetries: 1 });
+		await coordinator.dispose();
+	});
+
 	it.each([
 		["disabled", false, forkReceipt("read", { path: "a.txt" })],
 		["malformed", true, null],
@@ -745,7 +798,7 @@ function coordinatorFixture(
 }
 
 async function forkActionFixture(overrides: Partial<SelfSpeculationSettings>, receipt: unknown) {
-	const actorForkPlans = createActorForkPlanSource();
+	const actorForkPlans = createActorForkPlanSource({ maxAttempts: 1 });
 	const coordinator = new SelfSpeculationCoordinator({
 		settings: () => enabledSettings({ forkTransport: "sidecar", ...overrides }),
 		requestID: () => "actor-request",

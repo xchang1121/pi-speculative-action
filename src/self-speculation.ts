@@ -7,6 +7,7 @@ import {
 } from "./fork-benefit-gate.ts";
 import {
 	createActorForkPlanSource,
+	type ActorProbeSchedule,
 	type ActorProbeSnapshot,
 	type ActorForkActionBatch,
 	type ActorForkActionEvidence,
@@ -182,6 +183,7 @@ export interface SelfSpeculationCoordinatorSnapshot {
 	readonly bufferedCandidates: number;
 	readonly candidateSubmissions: number;
 	readonly forkRequests: number;
+	readonly forkRetries: number;
 	readonly candidateReceipts: number;
 	readonly forkCompletions: number;
 	readonly forkCandidates: number;
@@ -308,6 +310,11 @@ interface ParsedSidecarActionCall {
 	readonly input: Readonly<Record<string, unknown>>;
 }
 
+interface ForkReceiptOutcome {
+	readonly committed: boolean;
+	readonly batches: readonly ActorForkActionBatch[];
+}
+
 /**
  * Request-scoped decoder-feedback coordinator for a SPORK-capable engine.
  * Network work is serialized and best-effort; it never owns Actor correctness or lifecycle.
@@ -328,6 +335,7 @@ export class SelfSpeculationCoordinator {
 	private candidateSequence = 0;
 	private submissions = 0;
 	private forks = 0;
+	private forkRetries = 0;
 	private receipts = 0;
 	private completedForks = 0;
 	private observedForkCandidates = 0;
@@ -411,7 +419,7 @@ export class SelfSpeculationCoordinator {
 		state.providerPayload = cloneSerializable(payload);
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
-		return providerPayload(payload, settings, state.requestID);
+		return providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule);
 	}
 
 	actorRequestID(): string | undefined {
@@ -514,34 +522,55 @@ export class SelfSpeculationCoordinator {
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
 		if (!state || !state.settings.forkEnabled || state.settings.forkTransport !== "sidecar") return;
-		const settings = state.settings;
 		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
-		if (!snapshot || !state.requestID) return;
-		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
-		if (!gateDecision.allowed) {
-			this.forkGateSkips++;
-			this.actorForkPlanSource.publish(state.turnID, []);
-			return;
+		if (snapshot) this.scheduleActorProbe(state, snapshot);
+	}
+
+	private scheduleActorProbe(state: TurnState, snapshot?: ActorProbeSnapshot): void {
+		if (state.ended || state.forkTask || !state.requestID) return;
+		const probe = snapshot ?? this.actorForkPlanSource.claimPendingProbe(state.turnID);
+		if (!probe) return;
+		const settings = state.settings;
+		if (probe.attempt === 1) {
+			const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
+			if (!gateDecision.allowed) {
+				this.forkGateSkips++;
+				this.actorForkPlanSource.publish(state.turnID, []);
+				return;
+			}
+		} else {
+			this.forkRetries++;
 		}
 		this.forks++;
-		state.forkStartedAt = performance.now();
+		state.forkStartedAt ??= performance.now();
 		const signal = this.actorForkPlanSource.probeSignal(state.turnID);
-		state.forkTask = this.post(
+		const task = this.post(
 			settings.forkPath,
 			{
 				version: 1,
 				request_id: state.requestID,
 				model: modelPayload(state.model),
 				context: contextPayload(state.context, state.providerPayload),
-				snapshot: actorProbeSnapshotPayload(snapshot),
+				snapshot: actorProbeSnapshotPayload(probe),
 				options: forkPayload(settings),
 			},
 			settings,
 			signal,
 		)
-			.then((receipt) => this.recordReceipt(receipt, state, true))
+			.then((receipt) => {
+				const outcome = this.recordReceipt(receipt, state, true);
+				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
+				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
+				this.actorForkPlanSource.publish(
+					state.turnID,
+					state.settings.forkActionEnabled ? outcome?.batches ?? [] : [],
+				);
+				this.reconcileForkMatches(state);
+				this.finalizeGateSample(state);
+			})
 			.catch((error: unknown) => {
 				state.forkCompletedAt = performance.now();
+				this.actorForkPlanSource.finishProbe(state.turnID);
 				this.actorForkPlanSource.publish(state.turnID, []);
 				if (signal?.aborted) {
 					this.finalizeGateSample(state);
@@ -552,9 +581,11 @@ export class SelfSpeculationCoordinator {
 				throw error;
 			})
 			.finally(() => {
-				state.forkTask = undefined;
+				if (state.forkTask === task) state.forkTask = undefined;
+				if (this.active === state && !state.ended) this.scheduleActorProbe(state);
 			});
-		this.track(state.forkTask);
+		state.forkTask = task;
+		this.track(task);
 	}
 
 	/** Observe the authoritative Actor action regardless of fork completion order. */
@@ -643,6 +674,7 @@ export class SelfSpeculationCoordinator {
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
 			candidateSubmissions: this.submissions,
 			forkRequests: this.forks,
+			forkRetries: this.forkRetries,
 			candidateReceipts: this.receipts,
 			forkCompletions: this.completedForks,
 			forkCandidates: this.observedForkCandidates,
@@ -793,10 +825,9 @@ export class SelfSpeculationCoordinator {
 		};
 	}
 
-	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
+	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): ForkReceiptOutcome | undefined {
 		if (!isRecord(receipt)) {
-			if (fork) this.actorForkPlanSource.publish(state.turnID, []);
-			return;
+			return fork ? { committed: false, batches: [] } : undefined;
 		}
 		this.receipts++;
 		this.draftTokensSubmitted += nonNegativeInteger(receipt.draft_token_count);
@@ -868,13 +899,9 @@ export class SelfSpeculationCoordinator {
 				evidence: [evidence],
 			});
 		}
-		if (!fork) return;
-		this.actorForkPlanSource.publish(
-			state.turnID,
-			state.settings.forkActionEnabled ? [...actionBatches.values()].slice(0, state.settings.maxCandidates) : [],
-		);
-		this.reconcileForkMatches(state);
-		this.finalizeGateSample(state);
+		if (!fork) return undefined;
+		const batches = [...actionBatches.values()].slice(0, state.settings.maxCandidates);
+		return { committed: batches.length > 0, batches };
 	}
 
 	private reconcileForkMatches(state: TurnState): void {
@@ -950,6 +977,7 @@ function providerPayload(
 	payload: unknown,
 	settings: SelfSpeculationSettings,
 	requestID: string,
+	probeSchedule: ActorProbeSchedule,
 ): unknown {
 	if (!isRecord(payload)) return payload;
 	const identified = {
@@ -971,6 +999,12 @@ function providerPayload(
 			fork_decoder: settings.forkDecoder,
 			fork_forced_prefix: settings.forkForcedPrefix,
 			require_logprobs: requiresForkLogprobs(settings),
+			d2: {
+				confidence_metric: "minimum_tool_name_probability",
+				confidence_threshold: settings.forkActionMinConfidence,
+				max_attempts: probeSchedule.maxAttempts,
+				retry_token_step: probeSchedule.retryStreamUpdates,
+			},
 			fork_gate: forkGatePayload(settings),
 		},
 	};
@@ -992,6 +1026,7 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 
 function actorProbeSnapshotPayload(snapshot: ActorProbeSnapshot): Readonly<Record<string, unknown>> {
 	return {
+		attempt: snapshot.attempt,
 		generated_text: snapshot.generatedText,
 		content: snapshot.content,
 		reasoning: snapshot.reasoning,
@@ -1303,7 +1338,11 @@ function probabilityOrUndefined(value: unknown): number | undefined {
 }
 
 function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
-	return settings.requireLogprobs || (settings.forkActionEnabled && settings.forkActionMinConfidence > 0);
+	return (
+		settings.requireLogprobs ||
+		((settings.forkTransport === "provider" || settings.forkActionEnabled) &&
+			settings.forkActionMinConfidence > 0)
+	);
 }
 
 function booleanOr(value: unknown, fallback: boolean): boolean {

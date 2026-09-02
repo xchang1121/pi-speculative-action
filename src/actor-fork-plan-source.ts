@@ -28,11 +28,23 @@ export interface ActorForkActionBatch {
 }
 
 export interface ActorProbeSnapshot {
+	readonly attempt: number;
 	readonly generatedText: string;
 	readonly content: string;
 	readonly reasoning: string;
 	readonly outputChunks: number;
 }
+
+export interface ActorProbeSchedule {
+	readonly maxAttempts: number;
+	/** Non-empty Actor stream updates required between sidecar retries. */
+	readonly retryStreamUpdates: number;
+}
+
+export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({
+	maxAttempts: 5,
+	retryStreamUpdates: 50,
+});
 
 interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
@@ -43,13 +55,23 @@ interface PendingFork {
 	reasoning: string;
 	outputChunks: number;
 	requestBound: boolean;
-	probeStarted: boolean;
+	attempts: number;
+	lastProbeOutputChunks: number;
+	probeInFlight: boolean;
 	settled: boolean;
 }
 
 /** One turn-scoped Actor probe source, including result delivery and cancellation. */
 export class ActorForkPlanSource {
 	private readonly pending = new Map<string, PendingFork>();
+	readonly schedule: ActorProbeSchedule;
+	constructor(schedule: Partial<ActorProbeSchedule> = {}) {
+		const normalized = { ...ACTOR_PROBE_SCHEDULE, ...schedule };
+		for (const [field, value] of Object.entries(normalized)) {
+			if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
+		}
+		this.schedule = Object.freeze(normalized);
+	}
 	readonly source: AgentPlanSource = {
 		id: "self-speculation",
 		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
@@ -90,7 +112,9 @@ export class ActorForkPlanSource {
 			reasoning: "",
 			outputChunks: 0,
 			requestBound: false,
-			probeStarted: false,
+			attempts: 0,
+			lastProbeOutputChunks: 0,
+			probeInFlight: false,
 			settled: false,
 		});
 	}
@@ -102,15 +126,42 @@ export class ActorForkPlanSource {
 
 	observeActorDelta(turnID: string, event: AssistantMessageEvent): ActorProbeSnapshot | undefined {
 		const pending = this.pending.get(turnID);
-		if (!pending || pending.probeStarted || !pending.requestBound) return undefined;
+		if (!pending || pending.settled || !pending.requestBound) return undefined;
+		if ((event.type !== "text_delta" && event.type !== "thinking_delta") || !event.delta) return undefined;
 		if (event.type === "text_delta") pending.content += event.delta;
-		else if (event.type === "thinking_delta") pending.reasoning += event.delta;
-		else return undefined;
+		else pending.reasoning += event.delta;
 		pending.generatedText += event.delta;
 		pending.outputChunks++;
-		if (!event.delta) return undefined;
-		pending.probeStarted = true;
+		return this.claimProbe(pending);
+	}
+
+	finishProbe(turnID: string): boolean {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled) return true;
+		pending.probeInFlight = false;
+		return pending.attempts >= this.schedule.maxAttempts;
+	}
+
+	claimPendingProbe(turnID: string): ActorProbeSnapshot | undefined {
+		const pending = this.pending.get(turnID);
+		return pending ? this.claimProbe(pending) : undefined;
+	}
+
+	private claimProbe(pending: PendingFork): ActorProbeSnapshot | undefined {
+		if (
+			pending.settled ||
+			pending.probeInFlight ||
+			!pending.requestBound ||
+			pending.attempts >= this.schedule.maxAttempts ||
+			pending.outputChunks <
+				pending.lastProbeOutputChunks + (pending.attempts === 0 ? 1 : this.schedule.retryStreamUpdates)
+		)
+			return undefined;
+		pending.probeInFlight = true;
+		pending.lastProbeOutputChunks = pending.outputChunks;
+		pending.attempts++;
 		return {
+			attempt: pending.attempts,
 			generatedText: pending.generatedText,
 			content: pending.content,
 			reasoning: pending.reasoning,
@@ -158,6 +209,6 @@ export class ActorForkPlanSource {
 	}
 }
 
-export function createActorForkPlanSource(): ActorForkPlanSource {
-	return new ActorForkPlanSource();
+export function createActorForkPlanSource(schedule: Partial<ActorProbeSchedule> = {}): ActorForkPlanSource {
+	return new ActorForkPlanSource(schedule);
 }

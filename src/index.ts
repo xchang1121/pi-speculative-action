@@ -148,11 +148,14 @@ export {
 	type SelfSpeculationVerificationStep,
 } from "./self-speculation.ts";
 export {
+	ACTOR_PROBE_SCHEDULE,
 	ActorForkPlanSource,
 	createActorForkPlanSource,
 	type ActorForkActionBatch,
 	type ActorForkActionCall,
 	type ActorForkActionEvidence,
+	type ActorProbeSchedule,
+	type ActorProbeSnapshot,
 } from "./actor-fork-plan-source.ts";
 export {
 	type SpeculativeActionPackageSettings,
