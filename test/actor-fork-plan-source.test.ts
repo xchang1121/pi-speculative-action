@@ -58,6 +58,16 @@ describe("actor fork plan source", () => {
 		expect(source.observeActorDelta("turn-d2", delta)).toBeUndefined();
 	});
 
+	it("releases waiters and cancels the probe when the Actor stream finishes", async () => {
+		const source = createActorForkPlanSource();
+		source.startTurn("turn-finished");
+		source.bindActorRequest("turn-finished");
+		const batches = source.waitForBatches("turn-finished", new AbortController().signal);
+		source.finishActorStream("turn-finished");
+		await expect(batches).resolves.toEqual([]);
+		expect(source.probeSignal("turn-finished")?.aborted).toBe(true);
+	});
+
 	it("preserves complete call batches and their evidence", async () => {
 		const source = createActorForkPlanSource();
 		source.startTurn("turn-batch");

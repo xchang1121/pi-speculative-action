@@ -173,6 +173,13 @@ export class ActorForkPlanSource {
 		return this.pending.get(turnID)?.controller.signal;
 	}
 
+	finishActorStream(turnID: string): void {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.settled) return;
+		pending.controller.abort();
+		this.publish(turnID, []);
+	}
+
 	publish(turnID: string, batches: readonly ActorForkActionBatch[]): void {
 		const pending = this.pending.get(turnID);
 		if (!pending || pending.settled) return;

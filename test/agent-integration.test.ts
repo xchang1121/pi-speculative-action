@@ -1214,13 +1214,17 @@ describe("speculative action host", () => {
 		forkMinimumLogprob = Math.log(0.8);
 		await triggerFork("fork-low-confidence");
 		await waitFor(() => coordinator.snapshot().forkCompletions === 3);
+		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-low-confidence")).toBe(false);
+		coordinator.observeActorOutput({ type: "done", reason: "stop", message: assistant([], "stop") });
+		await waitFor(() =>
+			events.some((event) => event.type === "source_request" && event.turnID === "fork-low-confidence"),
+		);
+		await finishTurn("fork-low-confidence");
 		const lowConfidenceRequests = events.filter(
 			(event) => event.type === "source_request" && event.turnID === "fork-low-confidence",
 		);
 		expect(lowConfidenceRequests).toHaveLength(1);
 		expect(lowConfidenceRequests[0]).toMatchObject({ request: { settlement: { status: "empty" } } });
-		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-low-confidence")).toBe(false);
-		await finishTurn("fork-low-confidence");
 
 		actionSourceEnabled = false;
 		forkMinimumLogprob = Math.log(0.95);

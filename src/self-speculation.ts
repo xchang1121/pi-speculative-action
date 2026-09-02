@@ -522,6 +522,10 @@ export class SelfSpeculationCoordinator {
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
 		if (!state || !state.settings.forkEnabled || state.settings.forkTransport !== "sidecar") return;
+		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error") {
+			this.actorForkPlanSource.finishActorStream(state.turnID);
+			return;
+		}
 		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
 		if (snapshot) this.scheduleActorProbe(state, snapshot);
 	}
