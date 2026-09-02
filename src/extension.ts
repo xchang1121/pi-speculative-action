@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -20,6 +19,7 @@ import {
 	type ExtensionUIContext,
 	getAgentDir,
 	type ModelRegistry,
+	SettingsManager,
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -407,7 +407,7 @@ async function installController(
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 	});
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
-		loadPiToolSettings(context.cwd),
+		loadPiToolSettings(context),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
 	const localProcessOperations = createLocalBashOperations({
@@ -795,44 +795,17 @@ function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, 
 	);
 }
 
-async function loadPiToolSettings(cwd: string): Promise<PiToolSettings> {
-	const [global, project] = await Promise.all([
-		readJsonRecord(path.join(getAgentDir(), "settings.json")),
-		readJsonRecord(path.join(cwd, ".pi", "settings.json")),
-	]);
-	const shellPath = stringSetting(project.shellPath) ?? stringSetting(global.shellPath);
-	const shellCommandPrefix = stringSetting(project.shellCommandPrefix) ?? stringSetting(global.shellCommandPrefix);
-	const projectImages = recordSetting(project.images);
-	const globalImages = recordSetting(global.images);
-	const autoResize = projectImages.autoResize ?? globalImages.autoResize;
+function loadPiToolSettings(context: ExtensionContext): PiToolSettings {
+	const settings = SettingsManager.create(context.cwd, getAgentDir(), {
+		projectTrusted: context.isProjectTrusted(),
+	});
+	const shellPath = settings.getShellPath();
+	const shellCommandPrefix = settings.getShellCommandPrefix();
 	return {
-		...(shellPath ? { shellPath: expandHome(shellPath) } : {}),
+		...(shellPath ? { shellPath } : {}),
 		...(shellCommandPrefix ? { shellCommandPrefix } : {}),
-		autoResizeImages: typeof autoResize === "boolean" ? autoResize : true,
+		autoResizeImages: settings.getImageAutoResize(),
 	};
-}
-
-async function readJsonRecord(file: string): Promise<Record<string, unknown>> {
-	try {
-		const value: unknown = JSON.parse(await readFile(file, "utf8"));
-		return recordSetting(value);
-	} catch {
-		return {};
-	}
-}
-
-function recordSetting(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
-}
-
-function stringSetting(value: unknown): string | undefined {
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function expandHome(value: string): string {
-	if (value !== "~" && !value.startsWith("~/") && !value.startsWith("~\\")) return value;
-	const home = process.env.USERPROFILE ?? process.env.HOME;
-	return home ? path.join(home, value.slice(2)) : value;
 }
 
 async function runCommand(
