@@ -314,7 +314,8 @@ describe("zero-modification Pi extension", () => {
 				hitLatencyMs: 40,
 				processReuse: {
 					...emptyWorldReuseMetrics(), requests: 3, hits: 1, timedHits: 1, crossTurnHits: 1,
-					avoidedProcessMs: 1200, timedHitOverheadMs: 200,
+					avoidedProcessMs: 1200, timedHitOverheadMs: 200, wholeCommandRequests: 2,
+					wholeCommandHits: 1, wholeCommandAvoidedProcessMs: 1600, wholeCommandHitOverheadMs: 100,
 				},
 			},
 		});
@@ -326,7 +327,7 @@ describe("zero-modification Pi extension", () => {
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).not.toContain("sandbox");
 		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
-		expect(status).toContain("Bash child commands: 1/3 (33%) reused; ~1s estimated time saved (83%); 1 earlier-turn");
+		expect(status).toContain("Bash reuse: whole commands 1/2 (50%) reused, ~1.5s estimated time saved; child commands 1/3 (33%) reused, ~1s estimated time saved, 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
 		expect(status).toContain("Actor probe: On (sidecar)");
 		expect(status).toContain("early tool execution On (tool-name confidence ≥90%)");

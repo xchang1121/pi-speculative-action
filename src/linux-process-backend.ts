@@ -288,6 +288,7 @@ export class LinuxProcessReuseBackend {
 				if (process.platform !== "linux" || options.enabled?.() === false || !pathContains(sourceRoot, request.cwd)) {
 					return host.execute(request);
 				}
+				const requestStarted = performance.now();
 				this.counters.wholeCommandRequests++;
 				let committed = false;
 				try {
@@ -327,6 +328,7 @@ export class LinuxProcessReuseBackend {
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 					this.counters.wholeCommandReplayMs += Math.max(0, performance.now() - replayStarted);
 					this.counters.wholeCommandAvoidedProcessMs += plan.certificate.result.observedProcessMs ?? 0;
+					this.counters.wholeCommandHitOverheadMs += Math.max(0, performance.now() - requestStarted);
 					this.counters.wholeCommandHits++;
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
@@ -482,6 +484,7 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
+		const requestStarted = performance.now();
 		if (session.closed) throw new Error("Linux process session is closed");
 		const ready = await this.resolveReady();
 		assertInvocationMatches(session.invocation, request);
@@ -494,7 +497,7 @@ export class LinuxProcessReuseBackend {
 		const prototype = await this.topLevelPrototype(session, request, ready, environment);
 		this.add(session, "wholeCommandRequests");
 		const initial = await this.plan(session, prototype);
-		if (initial) return this.replayTopLevel(session, initial, request);
+		if (initial) return this.replayTopLevel(session, initial, request, requestStarted);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -580,6 +583,7 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		request: ProcessExecutionRequest,
+		requestStarted: number,
 	): Promise<{ exitCode: number | null }> {
 		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
@@ -594,6 +598,7 @@ export class LinuxProcessReuseBackend {
 		for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 		this.add(session, "wholeCommandAvoidedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
+		this.add(session, "wholeCommandHitOverheadMs", Math.max(0, performance.now() - requestStarted));
 		this.add(session, "wholeCommandHits");
 		return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 	}

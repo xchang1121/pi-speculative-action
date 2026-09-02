@@ -308,7 +308,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
-		...(processReuse.requests > 0 ? [`Bash child commands: ${formatBashReuse(processReuse)}`] : []),
+		...(hasBashReuse(processReuse) ? [`Bash reuse: ${formatBashReuse(processReuse)}`] : []),
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
@@ -481,11 +481,13 @@ async function installController(
 		...currentSettings,
 		tools: activeTools(currentSettings, baseDefinitions.keys(), toolCapabilities()),
 	});
+	const visibleMetrics = (): SpeculativeActionMetrics =>
+		processBackend ? { ...currentMetrics, processReuse: processBackend.metrics() } : currentMetrics;
 	function renderFooter(): void {
 		if (!ui) return;
 		ui.setStatus(
 			STATUS_KEY,
-			formatSpeculativeFooter(settings(), currentMetrics, executionDiagnostics, toolConflicts.size),
+			formatSpeculativeFooter(settings(), visibleMetrics(), executionDiagnostics, toolConflicts.size),
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
@@ -537,7 +539,7 @@ async function installController(
 		editableSettings: () => normalizeSpeculativeActionSettings(settingsStore.editable()),
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope) => settingsStore.setScope(scope),
-		metrics: () => currentMetrics,
+		metrics: visibleMetrics,
 		registeredTools: () => new Set(baseDefinitions.keys()),
 		toolCapabilities,
 		toolConflicts: () => new Map(toolConflicts),
@@ -662,7 +664,7 @@ async function installController(
 		statusText: () => {
 			const effective = settings();
 			return [
-				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: currentMetrics }),
+				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(executionDiagnostics),
@@ -1467,8 +1469,8 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
 				const reuse = event.candidate.world?.executionMetrics.reuse;
-				if (reuse?.requests) {
-					parts.push(`Bash child commands ${formatBashReuse(reuse)}`);
+				if (reuse && hasBashReuse(reuse)) {
+					parts.push(`Bash ${formatBashReuse(reuse)}`);
 				}
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
@@ -1700,7 +1702,7 @@ function formatSpeculativeFooter(
 	return [
 		"spec: on",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
-		...(reuse.requests > 0 ? [`Bash child ${formatBashReuse(reuse)}`] : []),
+		...(hasBashReuse(reuse) ? [`Bash ${formatBashReuse(reuse)}`] : []),
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
@@ -1762,29 +1764,36 @@ function formatRatio(numerator: number, denominator: number): string {
 	return `${numerator}/${denominator} (${denominator > 0 ? formatPercent(numerator / denominator) : "n/a"})`;
 }
 
-function measuredReuseDelta(reuse: WorldReuseMetrics): number | undefined {
-	if (reuse.timedHits <= 0 || reuse.avoidedProcessMs <= 0) return undefined;
-	return reuse.avoidedProcessMs - reuse.timedHitOverheadMs;
+function reuseBenefit(hits: number, avoidedMs: number, overheadMs: number): string | undefined {
+	if (hits <= 0 || avoidedMs <= 0) return undefined;
+	const delta = avoidedMs - overheadMs;
+	if (delta === 0) return "no estimated time change";
+	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "time saved" : "extra time"}`;
 }
 
-function formatReuseDelta(reuse: WorldReuseMetrics): string | undefined {
-	const delta = measuredReuseDelta(reuse);
-	if (delta === undefined) return undefined;
-	if (delta === 0) return "no estimated time change";
-	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "time saved" : "extra time"} (${formatPercent(Math.abs(delta) / reuse.avoidedProcessMs)})`;
+function hasBashReuse(reuse: WorldReuseMetrics): boolean {
+	return reuse.requests + reuse.wholeCommandRequests > 0;
 }
 
 function formatBashReuse(reuse: WorldReuseMetrics): string {
-	const benefit = formatReuseDelta(reuse);
 	const origins = [
 		reuse.sameTurnHits ? `${reuse.sameTurnHits} same-turn` : "",
 		reuse.crossTurnHits ? `${reuse.crossTurnHits} earlier-turn` : "",
 		reuse.unattributedHits ? `${reuse.unattributedHits} stored` : "",
 		reuse.joinedHits ? `${reuse.joinedHits} joined` : "",
 	].filter(Boolean);
-	return [
-		`${formatRatio(reuse.hits, reuse.requests)} reused`,
-		...(benefit ? [benefit] : []),
-		...origins,
-	].join("; ");
+	const whole = reuse.wholeCommandRequests > 0
+		? [
+			`whole commands ${formatRatio(reuse.wholeCommandHits, reuse.wholeCommandRequests)} reused`,
+			reuseBenefit(reuse.wholeCommandHits, reuse.wholeCommandAvoidedProcessMs, reuse.wholeCommandHitOverheadMs),
+		].filter(Boolean).join(", ")
+		: undefined;
+	const child = reuse.requests > 0
+		? [
+			`child commands ${formatRatio(reuse.hits, reuse.requests)} reused`,
+			reuseBenefit(reuse.timedHits, reuse.avoidedProcessMs, reuse.timedHitOverheadMs),
+			...origins,
+		].filter(Boolean).join(", ")
+		: undefined;
+	return [whole, child].filter(Boolean).join("; ");
 }
