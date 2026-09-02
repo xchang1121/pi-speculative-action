@@ -62,7 +62,7 @@ import {
 	type ProvenanceStoreOptions,
 	type VerifiedArtifactClosure,
 } from "./reuse-store.ts";
-import { observeStrace, type StraceObservation } from "./strace-observer.ts";
+import { observeStrace, straceCommand, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import {
@@ -81,7 +81,6 @@ const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
-const STRACE_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,fchdir,fallocate,ioctl";
 const SANDBOX_COVERED_TAINTS: readonly ProvenanceTaint[] = ["network", "ipc", "clock", "random", "pid_observation"];
 
 export interface LinuxProcessBackendOptions {
@@ -509,19 +508,7 @@ export class LinuxProcessReuseBackend {
 		const before = await session.workspace.structure.capture();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
-		const traced = [
-			ready.strace,
-			"-ff",
-			"-qq",
-			"-yy",
-			"-s",
-			"65535",
-			"-e",
-			STRACE_FILTER,
-			"-o",
-			tracePrefix,
-			...sandbox,
-		];
+		const traced = straceCommand(ready.strace, tracePrefix, sandbox);
 		let outcome: SpawnOutcome;
 		const processStarted = performance.now();
 		try {
@@ -793,17 +780,7 @@ export class LinuxProcessReuseBackend {
 		let observedProcessMs: number | undefined;
 		let transactionFinishing = false;
 		try {
-			const command = [
-				ready.strace,
-				"-ff",
-				"-qq",
-				"-yy",
-				"-s",
-				"65535",
-				"-e",
-				STRACE_FILTER,
-				"-o",
-				tracePrefix,
+			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,
 				...sandboxPolicyArguments(
 					session.workspace.sandboxRoot,
@@ -814,7 +791,7 @@ export class LinuxProcessReuseBackend {
 				"--",
 				executable,
 				...request.args,
-			];
+			]);
 			const processStarted = performance.now();
 			outcome = await runSpawn(ready.unshare, namespaceArguments(command), {
 				cwd: request.cwd,

@@ -36,13 +36,13 @@ the storage-driver crossover; driver-induced unsupported filesystem results are
 trace-tainted and cannot be adopted. Reports include the one-time
 `routePreparationMs` separately from fork/hit latency.
 
-The fixture first transfers a completed certificate through the direct Actor
-process outlet, where no execution-world preparation occurs, and then repeats
-the command inside the full world. It next uses a different parent around the
-same compiled child and requires a child-process hit. It compares ordered output
-and a regular-file effect before changing a dynamic input and requiring a miss. This is a substrate benchmark,
-not a model-quality benchmark; avoiding an LLM request makes the command identity
-and cache decision deterministic and repeatable.
+The fixture first runs one workload directly and under the production strace shape, requiring equal
+output, exit and file effects while reporting trace cost, observed taints and strict-certificate
+eligibility. It then transfers a completed certificate through the direct Actor process outlet, where
+no execution-world preparation occurs, repeats the command inside the full world, and uses a different
+parent around the same compiled child to require a child-process hit. Finally it changes a dynamic
+input and requires a miss. This is a substrate benchmark, not a model-quality benchmark; avoiding an
+LLM request makes the command identity and cache decision deterministic and repeatable.
 
 Exercise the weak-key / dynamic-pathset / strong-key lookup with eight historical
 contents for one 32 MiB input, then return to the oldest state under a different

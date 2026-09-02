@@ -2,6 +2,17 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { DependencyRole, ProvenanceTaint } from "./provenance-certificate.ts";
 
+const SYSCALL_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,fchdir,fallocate,ioctl";
+
+/** One production trace shape shared by execution and dependency-ablation paths. */
+export function straceCommand(
+	strace: string,
+	tracePrefix: string,
+	command: readonly string[],
+): readonly string[] {
+	return [strace, "-ff", "-qq", "-yy", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
+}
+
 interface ObservedProcessPath {
 	readonly path: string;
 	readonly role: DependencyRole;

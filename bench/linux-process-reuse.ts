@@ -1,6 +1,7 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
+import { observeStrace, straceCommand } from "../src/strace-observer.ts";
 import {
 	argument,
 	assert,
@@ -78,6 +79,43 @@ try {
 		fixture,
 		{ workspaceDriver, includeWorkspaceFingerprint: true },
 	);
+	const directCommand = `exec /bin/bash ${shellQuote(path.join(workspace, "trace-workload.sh"))}`;
+	const directExecution = await executeDirectBash(fixture, { label: "direct", command: directCommand });
+	const direct = {
+		totalMs: directExecution.totalMs,
+		output: textOutput(directExecution.output),
+		artifact: await readFile(path.join(workspace, "artifact.txt"), "utf8"),
+	};
+	await rm(path.join(workspace, "artifact.txt"), { force: true });
+	const traceRoot = path.join(fixture.root, "actor-trace");
+	const tracePrefix = path.join(traceRoot, "process");
+	await mkdir(traceRoot);
+	const tracedCommand = straceCommand(status.straceBinary, tracePrefix, [
+		"/bin/bash",
+		path.join(workspace, "trace-workload.sh"),
+	]);
+	const traceExecution = await executeDirectBash(fixture, {
+		label: "trace",
+		command: `exec ${tracedCommand.map(shellQuote).join(" ")}`,
+	});
+	const traceObservation = await observeStrace(tracePrefix, "/bin/bash", workspace);
+	const trace = {
+		totalMs: traceExecution.totalMs,
+		output: textOutput(traceExecution.output),
+		artifact: await readFile(path.join(workspace, "artifact.txt"), "utf8"),
+		observation: {
+			complete: traceObservation.complete,
+			paths: traceObservation.paths.length,
+			taints: traceObservation.taints,
+			tracedProcesses: traceObservation.tracedProcesses,
+			strictCertificateEligible: traceObservation.complete && traceObservation.taints.length === 0,
+		},
+	};
+	assert(
+		trace.output === direct.output && trace.artifact === direct.artifact,
+		`strace changed Actor-visible results: ${JSON.stringify({ direct, trace })}`,
+	);
+	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	const runs: MeasuredRun[] = [];
 	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
 	runs.push(await runTask("cold", coldCommand, executionFingerprint));
@@ -147,6 +185,7 @@ try {
 		workspaceDriver,
 		workspaceFingerprint,
 		assertions: {
+			directAndTraceEquivalent: true,
 			actorReplayWithoutFork: true,
 			wholeCommandReplay: true,
 			differentParentCommands: true,
@@ -156,9 +195,13 @@ try {
 			changedInputForcedMiss: true,
 		},
 		runs,
+		direct,
+		trace,
 		actorReplay: actorReplayResult,
 		summary: {
 			routePreparationMs,
+			traceOverheadMs: trace.totalMs - direct.totalMs,
+			traceSlowdown: trace.totalMs / direct.totalMs,
 			coldToWholeCommandHitSpeedup: cold.totalMs / wholeHit.totalMs,
 			coldToActorReplaySpeedup: cold.totalMs / actorReplayResult.totalMs,
 			coldToCrossParentHitSpeedup: cold.totalMs / childHit.totalMs,
@@ -201,10 +244,20 @@ try {
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-reuse-helper.c"), HELPER_SOURCE, "utf8");
 	await writeFile(path.join(workspace, "input.txt"), "alpha\n", "utf8");
+	await writeFile(
+		path.join(workspace, "trace-workload.sh"),
+		"printf 'trace-parent\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'trace-parent-done\\n'\n",
+		"utf8",
+	);
 	await compileBenchmarkHelper(workspace, { source: "pi-reuse-helper.c", output: "pi-reuse-helper" });
 	await commitBenchmarkFixture(workspace, "Pi Bash Reuse Benchmark", [
 		"pi-reuse-helper.c",
 		"pi-reuse-helper",
 		"input.txt",
+		"trace-workload.sh",
 	]);
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
