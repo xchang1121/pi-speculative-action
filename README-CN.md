@@ -143,6 +143,8 @@ npm run setup:linux
 
 `drafterMaxTokens` 是可选的硬上限。省略该项——或清空 TUI 输入框——会使用服务商默认输出上限，避免长命令和结构化工具参数被截断。
 
+Drafter 始终接收与 Actor 相同的完整历史。每次根请求及基于工具输出的后继请求发出前，投机源都会用 Drafter 自身的 `contextWindow` 检查完整历史和输出额度；较短模型无法容纳时直接在本地跳过，不会截断、摘要，也不会为 Drafter 触发第二条压缩路径。
+
 ### Actor fork Drafter 源与目标验证
 
 `selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。它的 fork 是只从权威 Actor 推理流派生的 Drafter 源，独立的模型 Drafter 请求永远不会被自分叉。同一个 request-scoped 桥接还会把每个通过 schema 校验并完成参数物化的模型 Drafter 或 PatternAware 预测复制到目标验证候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。

@@ -1,4 +1,4 @@
-import type { AgentTool, AgentToolCall } from "@earendil-works/pi-agent-core";
+import { estimateContextTokens, type AgentTool, type AgentToolCall } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, ToolResultMessage } from "@earendil-works/pi-ai";
 import {
 	clampCandidateLimit,
@@ -134,6 +134,7 @@ export function createDrafterPlanSource(input: {
 				sessionId: prepared.options.sessionId ?? input.sessionID,
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
+			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
 			const requestStartedAt = performance.now();
 			let requestFailed = false;
 			let message: AssistantMessage;
@@ -179,6 +180,7 @@ export function createDrafterPlanSource(input: {
 				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
 			};
 			const continuationOptions = { ...previous.options, toolChoice: "auto" as const };
+			if (!drafterContextFits(previous.model, context, continuationOptions.maxTokens)) return undefined;
 			const message = await input.complete(previous.model, context, { ...continuationOptions, signal });
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
@@ -237,6 +239,17 @@ export function createDrafterPlanSource(input: {
 			gate.reset();
 		},
 	};
+}
+
+/** Preserve the Actor-visible history whole; a shorter Drafter skips instead of compacting it. */
+function drafterContextFits(model: Model<Api>, context: Context, maxTokens: number | undefined): boolean {
+	const estimate = estimateContextTokens(context.messages);
+	const staticPrompt =
+		estimate.lastUsageIndex === null
+			? Math.ceil(((context.systemPrompt?.length ?? 0) + JSON.stringify(context.tools ?? []).length) / 4)
+			: 0;
+	const output = Math.min(maxTokens ?? model.maxTokens, model.maxTokens);
+	return estimate.tokens + staticPrompt + output <= model.contextWindow;
 }
 
 function drafterModelKey(model: Model<Api>): string {

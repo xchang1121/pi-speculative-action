@@ -1349,6 +1349,34 @@ describe("speculative action host", () => {
 		expect(hasMaxTokens).toEqual([false, false]);
 	});
 
+	it("skips a shorter-context Drafter without truncating or compressing Actor history", async () => {
+		const cwd = await temporaryWorkspace();
+		const complete = vi.fn(async () => drafterCall({ path: "notes.txt" }));
+		const tool: AgentTool<typeof readSchema> = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: readSchema,
+			execute: async () => ({ content: [{ type: "text" as const, text: "unused" }], details: {} }),
+		};
+		const host = createSpeculativeActionHost("session", {
+			cwd,
+			getSettings: settings,
+			draftModel: { ...model("short"), contextWindow: 32, maxTokens: 16 },
+			complete,
+			preflight: () => true,
+		});
+
+		await host.startTurn({
+			...startInput(tool),
+			context: { systemPrompt: "x".repeat(128), messages: [], tools: [tool] },
+		});
+		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
+
+		expect(complete).not.toHaveBeenCalled();
+		await host.dispose();
+	});
+
 	it("names equal actions under different parent paths independently", () => {
 		const left = patternPlanActionID("shared", patternPlanActionID("left"));
 		const right = patternPlanActionID("shared", patternPlanActionID("right"));

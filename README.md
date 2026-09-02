@@ -143,6 +143,8 @@ Example:
 
 `drafterMaxTokens` is an optional hard cap. Omit it—or clear the TUI field—to use the provider's output limit, which avoids truncating long commands and structured tool arguments.
 
+The Drafter always receives the same complete history as the Actor. Before either a root or output-informed request, the source compares that history plus the requested output allowance with the Drafter model's own `contextWindow`. A shorter model that cannot fit it is skipped locally: the plugin never truncates, summarizes, or triggers a second compaction path for the Drafter.
+
 ### Actor-fork Drafter source and target verification
 
 `selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. Its fork is a Drafter source derived only from the authoritative Actor inference stream; the separate model Drafter is never self-forked. The same request-scoped bridge also copies every schema-valid concrete model-Drafter or PatternAware prediction into one target-verification bundle. Decoder identity remains the exact Actor-visible `predictedAction`; a wider lossless `executionAction` is carried separately for scheduling and result reuse. Identical predicted keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
