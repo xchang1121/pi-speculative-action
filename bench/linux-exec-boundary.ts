@@ -17,7 +17,7 @@ const tracer = path.join(root, "exec-events");
 try {
 	await compileBenchmarkHelper(root, {
 		source: fileURLToPath(new URL("./linux-exec-boundary-probe.c", import.meta.url)),
-		output: tracer,
+		output: path.basename(tracer),
 		arguments: ["-Werror"],
 	});
 	const modes = {
