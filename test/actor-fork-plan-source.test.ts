@@ -6,6 +6,16 @@ describe("actor fork plan source", () => {
 		const source = createActorForkPlanSource();
 		const input = { path: "a.txt" };
 		source.startTurn("turn-1");
+		const delta = { type: "thinking_delta" as const, contentIndex: 0, delta: "think", partial: undefined as never };
+		expect(source.observeActorDelta("turn-1", delta)).toBeUndefined();
+		source.bindActorRequest("turn-1");
+		expect(source.observeActorDelta("turn-1", delta)).toEqual({
+			generatedText: "think",
+			content: "",
+			reasoning: "think",
+			outputChunks: 1,
+		});
+		expect(source.observeActorDelta("turn-1", delta)).toBeUndefined();
 		const delivered = source.waitForBatches("turn-1", new AbortController().signal);
 		source.publish("turn-1", [
 			{

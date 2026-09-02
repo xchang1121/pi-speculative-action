@@ -31,7 +31,6 @@ import {
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
-import { createActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
@@ -400,14 +399,12 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
-	const actorForkPlans = createActorForkPlanSource();
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
 			const configured = settings().selfSpeculation;
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
-		actorForkPlanSource: actorForkPlans,
 	});
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
 		loadPiToolSettings(context.cwd),
@@ -500,7 +497,7 @@ async function installController(
 			...(piToolSettings.shellCommandPrefix ? [] : [PI_BASH_TAIL_LINES_PROJECTION_RULE]),
 		],
 		executionWorlds,
-		actorForkPlanSource: actorForkPlans,
+		actorForkPlanSource: selfSpeculation.actorForkPlanSource,
 		patternStateDirectory: getAgentDir(),
 		patternWorkspaceIdentity,
 		onTurnStarted: ({ turnID, actorModel, context: actorContext, decisionSequence }) =>

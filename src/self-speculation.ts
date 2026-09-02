@@ -5,10 +5,12 @@ import {
 	ForkBenefitGate,
 	type ForkBenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
-import type {
-	ActorForkActionBatch,
-	ActorForkActionEvidence,
-	ActorForkPlanSource,
+import {
+	createActorForkPlanSource,
+	type ActorProbeSnapshot,
+	type ActorForkActionBatch,
+	type ActorForkActionEvidence,
+	type ActorForkPlanSource,
 } from "./actor-fork-plan-source.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
@@ -253,11 +255,6 @@ interface TurnState {
 	readonly candidates: Map<string, CandidateRecord>;
 	requestID?: string;
 	requestBound: boolean;
-	forkRequested: boolean;
-	generatedText: string;
-	content: string;
-	reasoning: string;
-	outputChunks: number;
 	dirty: boolean;
 	flushTask?: Promise<void>;
 	forkTask?: Promise<void>;
@@ -319,7 +316,7 @@ export class SelfSpeculationCoordinator {
 	private readonly settings: () => SelfSpeculationSettings;
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
-	private readonly actorForkPlans?: ActorForkPlanSource;
+	readonly actorForkPlanSource: ActorForkPlanSource;
 	private readonly forkGate = new ForkBenefitGate();
 	private readonly decoderEvidence = new DecoderVerificationLedger();
 	private readonly actionEvidence = new ActionAdoptionLedger();
@@ -360,7 +357,7 @@ export class SelfSpeculationCoordinator {
 		this.settings = options.settings;
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
-		this.actorForkPlans = options.actorForkPlanSource;
+		this.actorForkPlanSource = options.actorForkPlanSource ?? createActorForkPlanSource();
 	}
 
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
@@ -386,11 +383,6 @@ export class SelfSpeculationCoordinator {
 			settings,
 			candidates,
 			requestBound: false,
-			forkRequested: false,
-			generatedText: "",
-			content: "",
-			reasoning: "",
-			outputChunks: 0,
 			dirty: candidates.size > 0,
 			actorActionKeys: new Set(),
 			forkCandidateKeys: new Set(),
@@ -404,7 +396,7 @@ export class SelfSpeculationCoordinator {
 			ended: false,
 			gateSampleRecorded: false,
 		};
-		this.actorForkPlans?.startTurn(turnID);
+		this.actorForkPlanSource.startTurn(turnID);
 		this.latestGateKey = modelKey(model);
 	}
 
@@ -417,6 +409,7 @@ export class SelfSpeculationCoordinator {
 		state.requestID = existing ?? this.requestID();
 		state.requestBound = true;
 		state.providerPayload = cloneSerializable(payload);
+		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
 		return providerPayload(payload, settings, state.requestID);
 	}
@@ -520,25 +513,19 @@ export class SelfSpeculationCoordinator {
 
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
-		if (!state || !state.settings.forkEnabled || state.forkRequested) return;
+		if (!state || !state.settings.forkEnabled || state.settings.forkTransport !== "sidecar") return;
 		const settings = state.settings;
-		if (event.type === "text_delta") state.content += event.delta;
-		else if (event.type === "thinking_delta") state.reasoning += event.delta;
-		else return;
-		state.generatedText += event.delta;
-		state.outputChunks++;
-		if (!event.delta || !state.requestID) return;
-		state.forkRequested = true;
-		if (settings.forkTransport !== "sidecar") return;
+		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
+		if (!snapshot || !state.requestID) return;
 		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 		if (!gateDecision.allowed) {
 			this.forkGateSkips++;
-			this.actorForkPlans?.publish(state.turnID, []);
+			this.actorForkPlanSource.publish(state.turnID, []);
 			return;
 		}
 		this.forks++;
 		state.forkStartedAt = performance.now();
-		const signal = this.actorForkPlans?.probeSignal(state.turnID);
+		const signal = this.actorForkPlanSource.probeSignal(state.turnID);
 		state.forkTask = this.post(
 			settings.forkPath,
 			{
@@ -546,13 +533,7 @@ export class SelfSpeculationCoordinator {
 				request_id: state.requestID,
 				model: modelPayload(state.model),
 				context: contextPayload(state.context, state.providerPayload),
-				snapshot: {
-					generated_text: state.generatedText,
-					content: state.content,
-					reasoning: state.reasoning,
-					chunk_count: state.outputChunks,
-					output_chunk_count: state.outputChunks,
-				},
+				snapshot: actorProbeSnapshotPayload(snapshot),
 				options: forkPayload(settings),
 			},
 			settings,
@@ -561,7 +542,7 @@ export class SelfSpeculationCoordinator {
 			.then((receipt) => this.recordReceipt(receipt, state, true))
 			.catch((error: unknown) => {
 				state.forkCompletedAt = performance.now();
-				this.actorForkPlans?.publish(state.turnID, []);
+				this.actorForkPlanSource.publish(state.turnID, []);
 				if (signal?.aborted) {
 					this.finalizeGateSample(state);
 					return;
@@ -616,7 +597,7 @@ export class SelfSpeculationCoordinator {
 	/** Clear both the active request and every future-decision candidate. */
 	reset(): void {
 		this.closeActive(false);
-		this.actorForkPlans?.reset();
+		this.actorForkPlanSource.reset();
 		this.pendingCandidates.clear();
 		this.latestStartedDecisionSequence = 0;
 		this.acceptingCandidates = false;
@@ -627,7 +608,7 @@ export class SelfSpeculationCoordinator {
 		if (state) {
 			state.ended = true;
 			this.finalizeGateSample(state);
-			this.actorForkPlans?.closeTurn(state.turnID);
+			this.actorForkPlanSource.closeTurn(state.turnID);
 		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
@@ -814,7 +795,7 @@ export class SelfSpeculationCoordinator {
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
 		if (!isRecord(receipt)) {
-			if (fork) this.actorForkPlans?.publish(state.turnID, []);
+			if (fork) this.actorForkPlanSource.publish(state.turnID, []);
 			return;
 		}
 		this.receipts++;
@@ -888,7 +869,7 @@ export class SelfSpeculationCoordinator {
 			});
 		}
 		if (!fork) return;
-		this.actorForkPlans?.publish(
+		this.actorForkPlanSource.publish(
 			state.turnID,
 			state.settings.forkActionEnabled ? [...actionBatches.values()].slice(0, state.settings.maxCandidates) : [],
 		);
@@ -1006,6 +987,16 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 		draft_format: settings.draftFormat,
 		draft_boundary: settings.draftBoundary,
 		fork_gate: forkGatePayload(settings),
+	};
+}
+
+function actorProbeSnapshotPayload(snapshot: ActorProbeSnapshot): Readonly<Record<string, unknown>> {
+	return {
+		generated_text: snapshot.generatedText,
+		content: snapshot.content,
+		reasoning: snapshot.reasoning,
+		chunk_count: snapshot.outputChunks,
+		output_chunk_count: snapshot.outputChunks,
 	};
 }
 

@@ -1,4 +1,5 @@
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
+import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
 export interface ActorForkActionCall {
 	readonly id: string;
@@ -26,10 +27,23 @@ export interface ActorForkActionBatch {
 	readonly evidence: readonly ActorForkActionEvidence[];
 }
 
+export interface ActorProbeSnapshot {
+	readonly generatedText: string;
+	readonly content: string;
+	readonly reasoning: string;
+	readonly outputChunks: number;
+}
+
 interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
 	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
 	readonly controller: AbortController;
+	generatedText: string;
+	content: string;
+	reasoning: string;
+	outputChunks: number;
+	requestBound: boolean;
+	probeStarted: boolean;
 	settled: boolean;
 }
 
@@ -67,7 +81,41 @@ export class ActorForkPlanSource {
 		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => {
 			resolve = settle;
 		});
-		this.pending.set(turnID, { promise, resolve, controller: new AbortController(), settled: false });
+		this.pending.set(turnID, {
+			promise,
+			resolve,
+			controller: new AbortController(),
+			generatedText: "",
+			content: "",
+			reasoning: "",
+			outputChunks: 0,
+			requestBound: false,
+			probeStarted: false,
+			settled: false,
+		});
+	}
+
+	bindActorRequest(turnID: string): void {
+		const pending = this.pending.get(turnID);
+		if (pending) pending.requestBound = true;
+	}
+
+	observeActorDelta(turnID: string, event: AssistantMessageEvent): ActorProbeSnapshot | undefined {
+		const pending = this.pending.get(turnID);
+		if (!pending || pending.probeStarted || !pending.requestBound) return undefined;
+		if (event.type === "text_delta") pending.content += event.delta;
+		else if (event.type === "thinking_delta") pending.reasoning += event.delta;
+		else return undefined;
+		pending.generatedText += event.delta;
+		pending.outputChunks++;
+		if (!event.delta) return undefined;
+		pending.probeStarted = true;
+		return {
+			generatedText: pending.generatedText,
+			content: pending.content,
+			reasoning: pending.reasoning,
+			outputChunks: pending.outputChunks,
+		};
 	}
 
 	probeSignal(turnID: string): AbortSignal | undefined {
