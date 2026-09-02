@@ -81,7 +81,8 @@ const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
-const SANDBOX_COVERED_TAINTS: readonly ProvenanceTaint[] = ["network", "ipc", "clock", "random", "pid_observation"];
+/** Observations confined to the execution being adopted; they still prohibit any later replay. */
+const REEXECUTION_TAINTS = new Set<ProvenanceTaint>(["network", "ipc", "clock", "random", "pid_observation"]);
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
@@ -542,7 +543,6 @@ export class LinuxProcessReuseBackend {
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
 					ignoredExecutablePaths: session.interposition.executablePaths,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
-					coveredTaints: SANDBOX_COVERED_TAINTS,
 				});
 				session.topLevelCapture = { before, after, observation };
 				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
@@ -809,7 +809,6 @@ export class LinuxProcessReuseBackend {
 					transaction.finish(),
 					observeStrace(tracePrefix, executable, request.cwd, {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
-						coveredTaints: SANDBOX_COVERED_TAINTS,
 					}),
 				]);
 				if (observation.incompleteReasons.length) {
@@ -1909,7 +1908,11 @@ async function validateSessionEvidence(session: ActiveSession): Promise<Resource
 			metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
 		};
 	}
-	const validation = await validateDynamicDependencyCertificate(evidence, { maxFileBytes: MAX_CAPTURE_BYTES });
+	const blockingTaints = evidence.taints.filter((taint) => !REEXECUTION_TAINTS.has(taint));
+	const validation = await validateDynamicDependencyCertificate(
+		{ ...evidence, taints: blockingTaints },
+		{ maxFileBytes: MAX_CAPTURE_BYTES },
+	);
 	const metrics = {
 		durationMs: validation.durationMs,
 		bytesRead: validation.bytesRead,

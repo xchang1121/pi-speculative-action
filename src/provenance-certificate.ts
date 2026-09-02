@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 3 as const;
+export const PROCESS_CERTIFICATE_VERSION = 4 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {

@@ -107,10 +107,6 @@ describe("strace provenance decoder", () => {
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
 			expect(observation.taints).toEqual(expect.arrayContaining(["network", "clock", "random", "pid_observation"]));
-			const covered = await observeStrace(prefix, "/usr/bin/example", "/work", {
-				coveredTaints: ["network", "clock", "pid_observation"],
-			});
-			expect(covered.taints).toEqual(["random"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

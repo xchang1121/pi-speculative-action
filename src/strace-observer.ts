@@ -34,8 +34,6 @@ export interface StraceObservationOptions {
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
 	 */
 	readonly guardFilesystemSemanticsWithin?: readonly string[];
-	/** Nondeterminism denied or virtualized by the execution provider, never by strace itself. */
-	readonly coveredTaints?: readonly ProvenanceTaint[];
 }
 
 interface TraceFile {
@@ -193,7 +191,6 @@ export async function observeStrace(
 		}
 	}
 	if (!complete) taints.add("trace_incomplete");
-	for (const covered of options.coveredTaints ?? []) taints.delete(covered);
 	return {
 		complete,
 		paths: Object.freeze(

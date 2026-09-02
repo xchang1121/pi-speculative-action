@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
 `;
 
 interface MeasuredRun {
-	readonly label: "cold" | "whole_command_hit" | "cross_parent_hit" | "dependency_invalidation";
+	readonly label: "cold" | "same_parent_child_hit" | "cross_parent_hit" | "dependency_invalidation";
 	readonly command: string;
 	readonly forkMs: number;
 	readonly validationMs: number;
@@ -121,15 +121,15 @@ try {
 	runs.push(await runTask("cold", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	const actorMetricsBefore = backend.metrics();
-	const actorReplay = await executeDirectBash(fixture, { label: "actor_replay", command: coldCommand });
-	const actorReplayResult = {
-		totalMs: actorReplay.totalMs,
-		output: textOutput(actorReplay.output),
+	const actorAttempt = await executeDirectBash(fixture, { label: "actor_attempt", command: coldCommand });
+	const actorAttemptResult = {
+		totalMs: actorAttempt.totalMs,
+		output: textOutput(actorAttempt.output),
 		artifact: await readFile(path.join(workspace, "artifact.txt"), "utf8"),
 		metricDelta: metricDelta(actorMetricsBefore, backend.metrics()),
 	};
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
-	runs.push(await runTask("whole_command_hit", coldCommand, executionFingerprint));
+	runs.push(await runTask("same_parent_child_hit", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	runs.push(
 		await runTask(
@@ -148,24 +148,26 @@ try {
 		),
 	);
 
-	const [cold, wholeHit, childHit, invalidated] = runs;
+	const [cold, sameParentHit, childHit, invalidated] = runs;
 	assert(cold?.artifact === "alpha\n", "cold artifact differs");
 	assert(direct.artifact === cold.artifact && direct.output === cold.output, "direct Actor execution differs");
-	assert(actorReplayResult.artifact === cold.artifact && actorReplayResult.output === cold.output, "Actor replay differs");
-	assert(wholeHit?.artifact === cold.artifact, "whole-command artifact differs");
+	assert(actorAttemptResult.artifact === cold.artifact && actorAttemptResult.output === cold.output, "Actor fallback differs");
+	assert(sameParentHit?.artifact === cold.artifact, "same-parent artifact differs");
 	assert(childHit?.artifact === cold.artifact, "child-replayed artifact differs");
 	const orderedChildOutput = "child-out:alpha\nchild-err\n";
 	assert(cold?.output.includes(orderedChildOutput), "cold child output differs");
-	assert(wholeHit?.output === cold.output, "whole-command output differs");
+	assert(sameParentHit?.output === cold.output, "same-parent output differs");
 	assert(childHit?.output.includes(orderedChildOutput), "replayed child output differs");
 	assert(invalidated?.artifact === "beta\n", "changed input was not observed");
 	assert(
-		wholeHit.metricDelta.wholeCommandHits === 1 && wholeHit.metricDelta.hits === 0,
-		`complete Bash did not hit: ${JSON.stringify(wholeHit.metricDelta)}`,
+		sameParentHit.metricDelta.wholeCommandHits === 0 &&
+			sameParentHit.metricDelta.wholeCommandMisses === 1 &&
+			sameParentHit.metricDelta.hits === 1,
+		`same-parent child did not hit safely: ${JSON.stringify(sameParentHit.metricDelta)}`,
 	);
 	assert(
-		actorReplayResult.metricDelta.wholeCommandHits === 1 && actorReplayResult.metricDelta.wholeCommandMisses === 0,
-		`Actor process outlet did not hit: ${JSON.stringify(actorReplayResult.metricDelta)}`,
+		actorAttemptResult.metricDelta.wholeCommandHits === 0 && actorAttemptResult.metricDelta.wholeCommandMisses === 1,
+		`Actor process outlet crossed execution semantics: ${JSON.stringify(actorAttemptResult.metricDelta)}`,
 	);
 	assert(
 		childHit.metricDelta.hits === 1 && childHit.metricDelta.crossTurnHits === 1 && childHit.metricDelta.misses === 0,
@@ -175,11 +177,11 @@ try {
 		invalidated.metricDelta.hits === 0 && invalidated.metricDelta.misses === 1,
 		`changed input did not miss: ${JSON.stringify(invalidated.metricDelta)}`,
 	);
-	assert(wholeHit.totalMs < cold.totalMs, "whole-command hit was not faster than cold execution");
+	assert(sameParentHit.totalMs < cold.totalMs, "same-parent child hit was not faster than cold execution");
 	assert(childHit.totalMs < cold.totalMs, "child cache hit was not faster than cold execution");
 
 	const result = {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		measuredAt: new Date().toISOString(),
 		host: await linuxBenchmarkHost(status),
 		subject: "stock Pi createBashTool through linux_process_reuse WorldBranch",
@@ -187,8 +189,8 @@ try {
 		workspaceFingerprint,
 		assertions: {
 			directAndTraceEquivalent: true,
-			actorReplayWithoutFork: true,
-			wholeCommandReplay: true,
+			actorCrossEnvironmentReplayRejected: true,
+			sameParentChildReplay: true,
 			differentParentCommands: true,
 			orderedChildOutputEqual: true,
 			regularFileEffectEqual: true,
@@ -198,17 +200,16 @@ try {
 		runs,
 		direct,
 		trace,
-		actorReplay: actorReplayResult,
+		actorAttempt: actorAttemptResult,
 		summary: {
 			routePreparationMs,
 			traceOverheadMs: trace.totalMs - direct.totalMs,
 			traceSlowdown: trace.totalMs / direct.totalMs,
-			coldToWholeCommandHitSpeedup: cold.totalMs / wholeHit.totalMs,
-			directToActorReplaySpeedup: direct.totalMs / actorReplayResult.totalMs,
+			coldToSameParentChildHitSpeedup: cold.totalMs / sameParentHit.totalMs,
+			actorFallbackOverheadMs: actorAttemptResult.totalMs - direct.totalMs,
 			coldToCrossParentHitSpeedup: cold.totalMs / childHit.totalMs,
 			coldForkToCrossParentHitForkSpeedup: cold.forkMs / childHit.forkMs,
-			actorReplayLatencySavedMs: direct.totalMs - actorReplayResult.totalMs,
-			wholeCommandLatencySavedMs: cold.totalMs - wholeHit.totalMs,
+			sameParentChildLatencySavedMs: cold.totalMs - sameParentHit.totalMs,
 			metrics: backend.metrics(),
 		},
 	};
