@@ -54,6 +54,7 @@ const WORLD_REUSE_COUNTERS = [
 	"misses", "bypasses", "published", "tainted", "validationMs", "validationCandidates",
 	"validationPathsets", "validationFilesRead", "validationBytesRead", "validationArtifactsLoaded",
 	"validationArtifactBytesRead", "replayMs", "executionMs", "avoidedProcessMs", "timedHitOverheadMs",
+	"wholeCommandRequests", "wholeCommandHits", "wholeCommandMisses", "wholeCommandPublished",
 ] as const;
 
 type WorldReuseCounter = typeof WORLD_REUSE_COUNTERS[number];

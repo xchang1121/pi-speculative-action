@@ -185,6 +185,11 @@ interface ActiveSession {
 	readonly incompleteReasons: Set<string>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
+	topLevelExecution?: {
+		readonly prototype: ExecPrototype;
+		readonly outcome: SpawnOutcome;
+		readonly observedProcessMs: number;
+	};
 	topLevelEvidence?: DynamicDependencyCertificate;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
@@ -338,7 +343,7 @@ export class LinuxProcessReuseBackend {
 			executor: { execute: (request) => this.executeTopLevel(session, request) },
 			metrics: () => Object.freeze({ ...session.metrics }),
 			seal: (changes) => {
-				session.sealPromise ??= sealSessionEvidence(session, changes);
+				session.sealPromise ??= this.seal(session, changes);
 				return session.sealPromise;
 			},
 			validate: () => validateSessionEvidence(session),
@@ -411,6 +416,11 @@ export class LinuxProcessReuseBackend {
 		if (!physicalCwd || !pathContains(session.workspace.sandboxRoot, physicalCwd)) throw new Error("process cwd is unmapped");
 		const environment = normalizeEnvironment(request.environment);
 		const command = request.command;
+		const prototype = await this.topLevelPrototype(session, request, ready, environment);
+		this.add(session, "wholeCommandRequests");
+		const initial = await this.plan(session, prototype);
+		if (initial) return this.replayTopLevel(session, initial, request);
+		this.add(session, "wholeCommandMisses");
 		const shellArguments = [...session.invocation.shellArgs];
 		if (session.invocation.commandTransport === "argv") shellArguments.push(command);
 		const sandbox = sandboxArguments({
@@ -439,6 +449,7 @@ export class LinuxProcessReuseBackend {
 			...sandbox,
 		];
 		let outcome: SpawnOutcome;
+		const processStarted = performance.now();
 		try {
 			outcome = await runSpawn(
 				ready.unshare,
@@ -457,6 +468,11 @@ export class LinuxProcessReuseBackend {
 					onOutput: (event) => request.onData(event.data),
 				},
 			);
+			session.topLevelExecution = {
+				prototype,
+				outcome,
+				observedProcessMs: Math.max(0, performance.now() - processStarted),
+			};
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
@@ -474,6 +490,122 @@ export class LinuxProcessReuseBackend {
 		}
 		if (request.signal?.aborted) throw new Error("aborted");
 		return { exitCode: outcome.signal ? null : outcome.code };
+	}
+
+	private async seal(
+		session: ActiveSession,
+		changes: readonly SandboxWorkspaceChange[],
+	): Promise<readonly SandboxDirectoryChange[]> {
+		const directories = await sealSessionEvidence(session, changes);
+		try {
+			await this.publishTopLevel(session, changes);
+		} catch (error) {
+			this.setError(session, `top_publish:${errorMessage(error)}`);
+		}
+		return directories;
+	}
+
+	private async topLevelPrototype(
+		session: ActiveSession,
+		request: ProcessExecutionRequest,
+		ready: ReadyBackend,
+		environment: Readonly<Record<string, string>>,
+	): Promise<ExecPrototype> {
+		const shell = session.invocation.shell;
+		const argv = [shell, ...session.invocation.shellArgs];
+		if (session.invocation.commandTransport === "argv") argv.push(request.command);
+		return createExecPrototype({
+			executablePath: shell,
+			executableDigest: sha256Digest(await readFile(shell)),
+			argv: argv.map((value) => session.projection.normalizeValue(value)),
+			logicalCwd: session.projection.toLogical(session.projection.toPhysical(request.cwd) ?? request.cwd),
+			environment,
+			umask: 0o22,
+			rlimitsDigest: digestObject({ nofile: "sandbox-controlled", processes: 64 }),
+			signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
+			credentialsDigest: digestObject({ userNamespace: "map-current-to-root", uid: process.getuid?.(), gid: process.getgid?.() }),
+			schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism() }),
+			stdin:
+				session.invocation.commandTransport === "stdin"
+					? { type: "bytes", digest: sha256Digest(request.command), eof: true }
+					: { type: "closed", eof: true },
+			fileDescriptorTableComplete: true,
+			inheritedFDs: [
+				{ fd: 0, type: session.invocation.commandTransport === "stdin" ? "pipe" : "device", flagsDigest: digestObject({ mode: "read" }), eof: true },
+				{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
+				{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
+			],
+			platformFingerprint: ready.platformFingerprint,
+		});
+	}
+
+	private async replayTopLevel(
+		session: ActiveSession,
+		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
+		request: ProcessExecutionRequest,
+	): Promise<{ exitCode: number | null }> {
+		const before = await session.workspace.structure.capture();
+		await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+		const after = await session.workspace.structure.capture();
+		session.nestedEvidence.push(plan.certificate.dependencyCertificate);
+		session.topLevelCapture = {
+			before,
+			after,
+			observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] },
+		};
+		for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
+		this.add(session, "wholeCommandHits");
+		return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
+	}
+
+	private async publishTopLevel(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<void> {
+		const execution = session.topLevelExecution;
+		const evidence = session.topLevelEvidence;
+		if (!execution || !evidence) return;
+		const journal: OrderedEffectEvent[] = [];
+		let sequence = 0;
+		for (const change of changes) {
+			const logicalPath = slash(path.resolve(session.sourceRoot, change.resource));
+			if (change.kind === "directory") {
+				if (change.before && change.after) throw new Error(`directory metadata replay is unsupported: ${change.resource}`);
+				if (change.after) {
+					journal.push({ sequence: sequence++, kind: "mkdir", path: logicalPath, ...change.after });
+				} else if (change.before) {
+					journal.push({ sequence: sequence++, kind: "rmdir", path: logicalPath });
+				}
+				continue;
+			}
+			if (change.after !== undefined) {
+				if (change.afterMode === undefined) throw new Error(`file replay mode is unavailable: ${change.resource}`);
+				journal.push({
+					sequence: sequence++,
+					kind: "write",
+					path: logicalPath,
+					data: await this.store.artifacts.put(change.after),
+					mode: change.afterMode,
+				});
+			} else if (change.before !== undefined) {
+				journal.push({ sequence: sequence++, kind: "delete", path: logicalPath });
+			}
+		}
+		for (const event of execution.outcome.output) {
+			journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data: await this.store.artifacts.put(event.data) });
+		}
+		const certificate = sealProcessCertificate({
+			prototype: execution.prototype,
+			producer: session.producer,
+			dependencyCertificate: evidence,
+			result: {
+				replayProfile: "buffered_noninteractive",
+				observedProcessMs: execution.observedProcessMs,
+				journal,
+				exit: exitOutcome(execution.outcome),
+			},
+		});
+		if (await this.planner.publishCompleted(certificate)) {
+			this.add(session, "wholeCommandPublished");
+			this.rememberScope(certificate.id, session.scope);
+		}
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {

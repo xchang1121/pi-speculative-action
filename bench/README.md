@@ -36,12 +36,12 @@ the storage-driver crossover; driver-induced unsupported filesystem results are
 trace-tainted and cannot be adopted. Reports include the one-time
 `routePreparationMs` separately from fork/hit latency.
 
-The fixture uses three different parent Bash commands around an identical
-compiled child exec. It requires the second parent to hit the first process
-certificate, compares ordered output and a regular-file effect, then changes a
-dynamic input and requires a miss. This is a substrate benchmark, not a model
-quality benchmark; avoiding an LLM request makes the command identity and cache
-decision deterministic and repeatable.
+The fixture first repeats one complete Bash command and requires a whole-command
+hit, then uses a different parent around the same compiled child and requires a
+child-process hit. It compares ordered output and a regular-file effect before
+changing a dynamic input and requiring a miss. This is a substrate benchmark,
+not a model-quality benchmark; avoiding an LLM request makes the command identity
+and cache decision deterministic and repeatable.
 
 Exercise the weak-key / dynamic-pathset / strong-key lookup with eight historical
 contents for one 32 MiB input, then return to the oldest state under a different

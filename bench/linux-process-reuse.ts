@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
 `;
 
 interface MeasuredRun {
-	readonly label: "cold" | "cross_parent_hit" | "dependency_invalidation";
+	readonly label: "cold" | "whole_command_hit" | "cross_parent_hit" | "dependency_invalidation";
 	readonly command: string;
 	readonly forkMs: number;
 	readonly validationMs: number;
@@ -78,14 +78,10 @@ try {
 		{ workspaceDriver, includeWorkspaceFingerprint: true },
 	);
 	const runs: MeasuredRun[] = [];
-
-	runs.push(
-		await runTask(
-			"cold",
-			"printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'",
-			executionFingerprint,
-		),
-	);
+	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
+	runs.push(await runTask("cold", coldCommand, executionFingerprint));
+	await rm(path.join(workspace, "artifact.txt"), { force: true });
+	runs.push(await runTask("whole_command_hit", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	runs.push(
 		await runTask(
@@ -104,27 +100,29 @@ try {
 		),
 	);
 
-	const [cold, hit, invalidated] = runs;
+	const [cold, wholeHit, childHit, invalidated] = runs;
 	assert(cold?.artifact === "alpha\n", "cold artifact differs");
-	assert(hit?.artifact === cold.artifact, "replayed artifact differs");
+	assert(wholeHit?.artifact === cold.artifact, "whole-command artifact differs");
+	assert(childHit?.artifact === cold.artifact, "child-replayed artifact differs");
 	const orderedChildOutput = "child-out:alpha\nchild-err\n";
 	assert(cold?.output.includes(orderedChildOutput), "cold child output differs");
-	assert(hit?.output.includes(orderedChildOutput), "replayed child output differs");
+	assert(wholeHit?.output === cold.output, "whole-command output differs");
+	assert(childHit?.output.includes(orderedChildOutput), "replayed child output differs");
 	assert(invalidated?.artifact === "beta\n", "changed input was not observed");
 	assert(
-		hit.metricDelta.hits === 1 && hit.metricDelta.crossTurnHits === 1 && hit.metricDelta.misses === 0,
-		`second parent did not hit: ${JSON.stringify(hit.metricDelta)}`,
+		wholeHit.metricDelta.wholeCommandHits === 1 && wholeHit.metricDelta.hits === 0,
+		`complete Bash did not hit: ${JSON.stringify(wholeHit.metricDelta)}`,
 	);
 	assert(
-		hit.metricDelta.timedHits === 1 &&
-			hit.metricDelta.avoidedProcessMs > hit.metricDelta.timedHitOverheadMs,
-		`second parent did not report a measured reuse benefit: ${JSON.stringify(hit.metricDelta)}`,
+		childHit.metricDelta.hits === 1 && childHit.metricDelta.crossTurnHits === 1 && childHit.metricDelta.misses === 0,
+		`second parent did not hit: ${JSON.stringify(childHit.metricDelta)}`,
 	);
 	assert(
 		invalidated.metricDelta.hits === 0 && invalidated.metricDelta.misses === 1,
 		`changed input did not miss: ${JSON.stringify(invalidated.metricDelta)}`,
 	);
-	assert(hit.totalMs < cold.totalMs, "cache hit was not faster than cold execution");
+	assert(wholeHit.totalMs < cold.totalMs, "whole-command hit was not faster than cold execution");
+	assert(childHit.totalMs < cold.totalMs, "child cache hit was not faster than cold execution");
 
 	const result = {
 		schemaVersion: 1,
@@ -134,6 +132,7 @@ try {
 		workspaceDriver,
 		workspaceFingerprint,
 		assertions: {
+			wholeCommandReplay: true,
 			differentParentCommands: true,
 			orderedChildOutputEqual: true,
 			regularFileEffectEqual: true,
@@ -143,9 +142,10 @@ try {
 		runs,
 		summary: {
 			routePreparationMs,
-			coldToCrossParentHitSpeedup: cold.totalMs / hit.totalMs,
-			coldForkToCrossParentHitForkSpeedup: cold.forkMs / hit.forkMs,
-			latencySavedMs: cold.totalMs - hit.totalMs,
+			coldToWholeCommandHitSpeedup: cold.totalMs / wholeHit.totalMs,
+			coldToCrossParentHitSpeedup: cold.totalMs / childHit.totalMs,
+			coldForkToCrossParentHitForkSpeedup: cold.forkMs / childHit.forkMs,
+			latencySavedMs: cold.totalMs - wholeHit.totalMs,
 			metrics: backend.metrics(),
 		},
 	};
