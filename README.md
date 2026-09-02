@@ -124,11 +124,11 @@ Example:
     "maxCandidates": 8,
     "maxDraftTokens": 28,
     "draftFormat": "tagged_json",
-    "draftBoundary": "<tool_call>",
+    "draftBoundary": "auto",
     "forkMaxTokens": 128,
     "forkTemperature": 0,
     "forkDecoder": "auto",
-    "forkForcedPrefix": "<tool_call>",
+    "forkForcedPrefix": "auto",
     "timeoutMs": 2000
   }
 }
@@ -163,7 +163,7 @@ For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact
 
 The default D3 cap is 28 draft tokens. In the strict DeepSeek-tokenizer tape replay, raising the former cap of 20 to 28 added 12 accepted tokens, no rejected tokens, and 10 saved target-step proxies; 32 added nothing further. This remains configurable and is bounded again by the inference engine.
 
-The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format/boundary, fork decoder/prefix, temperature, and logprob requirement. The boundary, formatter, decoder, and target tokenizer must describe the same model format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
+The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format, decoder, temperature, and expert syntax overrides. Boundary and forced-prefix overrides default to `auto`, so the inference adapter derives CoT closure, the name-aligned probe prefix, parser framing, and D3 boundary from one model format. An explicit override must describe that same format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
 
 When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
 

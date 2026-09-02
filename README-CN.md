@@ -124,11 +124,11 @@ npm run setup:linux
     "maxCandidates": 8,
     "maxDraftTokens": 28,
     "draftFormat": "tagged_json",
-    "draftBoundary": "<tool_call>",
+    "draftBoundary": "auto",
     "forkMaxTokens": 128,
     "forkTemperature": 0,
     "forkDecoder": "auto",
-    "forkForcedPrefix": "<tool_call>",
+    "forkForcedPrefix": "auto",
     "timeoutMs": 2000
   }
 }
@@ -163,7 +163,7 @@ fork 有两种传输方式：
 
 D3 默认上限为 28 个 draft token。严格 DeepSeek tokenizer tape 回放中，相比旧上限 20，28 多提交的 12 个 token 全部被接受、没有增加拒绝 token，并额外减少 10 个 target-step 代理；升到 32 不再增加收益。该值仍可配置，并会再次受推理引擎硬上限约束。
 
-JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、tool-call 格式与边界、fork decoder/prefix、温度及 logprob 要求。边界、formatter、decoder 和目标 tokenizer 必须属于同一种模型格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
+JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、tool-call 格式、decoder、温度和专家级语法覆盖。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
 
 PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor 采纳的 Drafter 结果——都会连同真实输出一起做一次不修改学习状态的同轮重基准；正式学习仍在权威 batch 边界进行。若跨轮的 `K(a)` 与 horizon 集合完全不变，则沿用提前签发的机会而不重复创建，避免共享命中被采纳后又启动同组落选候选。
 

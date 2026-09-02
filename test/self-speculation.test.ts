@@ -34,6 +34,12 @@ describe("self-speculation control plane", () => {
 			apiKeyEnv: "TOKEN_ENV",
 		});
 		expect(normalizeSelfSpeculationSettings({ forkActionMinConfidence: 0 }).forkActionMinConfidence).toBe(0);
+		expect(
+			normalizeSelfSpeculationSettings({
+				draftBoundary: "[TOOLS]",
+				forkForcedPrefix: "[TOOLS] name=",
+			}),
+		).toMatchObject({ draftBoundary: "[TOOLS]", forkForcedPrefix: "[TOOLS] name=" });
 	});
 
 	it("buffers every source, merges the same K(a), and submits one ordered Actor bundle", async () => {
@@ -61,8 +67,8 @@ describe("self-speculation control plane", () => {
 			request_id: "actor-request",
 			max_draft_tokens: SELF_SPECULATION_DEFAULTS.maxDraftTokens,
 			format: "tagged_json",
-			boundary: "<tool_call>",
 		});
+		expect(bundle?.body).not.toHaveProperty("boundary");
 		expect(bundle?.body.candidates).toEqual([
 			expect.objectContaining({
 				id: actionIdentity("key-a"),
@@ -138,6 +144,8 @@ describe("self-speculation control plane", () => {
 			}),
 		);
 		expect(actor.self_speculation).not.toHaveProperty("role");
+		expect(actor.self_speculation).not.toHaveProperty("draft_boundary");
+		expect(actor.self_speculation).not.toHaveProperty("fork_forced_prefix");
 		expect(secondActor).toEqual({ model: "actor-retry" });
 		await coordinator.dispose();
 	});
@@ -393,8 +401,10 @@ describe("self-speculation control plane", () => {
 				reasoning: "reason",
 				chunk_count: 1,
 			},
-			options: { decoder: "auto", forced_prefix: "<tool_call>" },
+			options: { decoder: "auto" },
 		});
+		expect(forks[0]?.body.options).not.toHaveProperty("forced_prefix");
+		expect(forks[0]?.body.options).not.toHaveProperty("draft_boundary");
 		expect(coordinator.snapshot()).toEqual(
 			expect.objectContaining({
 				forkRequests: 1,
