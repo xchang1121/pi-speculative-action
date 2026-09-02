@@ -173,6 +173,8 @@ interface DispatcherExecutionContext {
 	readonly outputEndpoints: readonly [string, string];
 }
 
+type OutputRoute = readonly [1 | 2, 1 | 2];
+
 interface BufferedOutput {
 	readonly fd: 1 | 2;
 	readonly data: Buffer;
@@ -518,7 +520,7 @@ export class LinuxProcessReuseBackend {
 		const command = request.command;
 		const prototype = await this.topLevelPrototype(session, request, ready, environment);
 		this.add(session, "wholeCommandRequests");
-		const initial = await this.plan(session, prototype);
+		const initial = await this.plan(session, prototype, session.producer);
 		if (initial) return this.replayTopLevel(session, initial, request, requestStarted);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
@@ -688,20 +690,21 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "requests");
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
-		if (!(await eligibleRequest(session, request, executable, ready.executionContext))) {
+		const outputRoute = await eligibleRequest(session, request, executable, ready.executionContext);
+		if (!outputRoute) {
 			this.add(session, "bypasses");
 			session.incompleteReasons.add(`broker_bypass:${request.name}`);
 			return { version: 2, kind: "bypass", executable };
 		}
-		const prototype = await this.prototype(session, request, executable);
+		const prototype = await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
-		const initial = await this.plan(session, prototype);
+		const initial = await this.plan(session, prototype, session.nestedProducer);
 		if (initial) return this.replay(session, initial, weakKey, false, requestStarted);
 
 		const preceding = this.inFlight.get(weakKey);
 		if (preceding) {
 			await preceding;
-			const joined = await this.plan(session, prototype);
+			const joined = await this.plan(session, prototype, session.nestedProducer);
 			if (joined) return this.replay(session, joined, weakKey, true, requestStarted);
 		}
 
@@ -712,17 +715,17 @@ export class LinuxProcessReuseBackend {
 		});
 		this.inFlight.set(weakKey, pending);
 		try {
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey);
+			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute);
 		} finally {
 			release();
 			if (this.inFlight.get(weakKey) === pending) this.inFlight.delete(weakKey);
 		}
 	}
 
-	private async plan(session: ActiveSession, prototype: ExecPrototype) {
+	private async plan(session: ActiveSession, prototype: ExecPrototype, producer: ProcessProducerProof) {
 		const plan = await this.planner.plan({
 			prototype,
-			acceptProducer: (producer) => compatibleProducer(session.nestedProducer, producer),
+			acceptProducer: (candidate) => compatibleProducer(producer, candidate),
 			contract: {
 				sink: "buffered",
 				orderedJournal: true,
@@ -803,6 +806,7 @@ export class LinuxProcessReuseBackend {
 		executable: string,
 		prototype: ExecPrototype,
 		weakKey: Sha256Digest,
+		outputRoute: OutputRoute,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -825,6 +829,7 @@ export class LinuxProcessReuseBackend {
 				process.execPath,
 				fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
 				"--exec",
+				outputRoute.join(""),
 				request.name,
 				executable,
 				...request.args,
@@ -979,9 +984,14 @@ export class LinuxProcessReuseBackend {
 		throw new Error(`executable not found: ${request.name}`);
 	}
 
-	private async prototype(session: ActiveSession, request: DispatcherRequest, executable: string): Promise<ExecPrototype> {
+	private async prototype(
+		session: ActiveSession,
+		request: DispatcherRequest,
+		executable: string,
+		outputRoute: OutputRoute,
+	): Promise<ExecPrototype> {
 		const [content, ready] = await Promise.all([readFile(executable), this.resolveReady()]);
-		const context = ready.executionContext;
+		const context = routedExecutionContext(ready.executionContext, outputRoute);
 		const contextDigest = sha256Digest(context.key);
 		const environment = Object.fromEntries(
 			Object.entries(executionEnvironment(request.environment, executable)).map(([name, value]) => [
@@ -1653,6 +1663,7 @@ async function probeExecutionContext(input: {
 		process.execPath,
 		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
 		"--exec",
+		"12",
 		"pi-context-probe",
 		process.execPath,
 		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
@@ -1819,14 +1830,49 @@ async function eligibleRequest(
 	request: DispatcherRequest,
 	executable: string,
 	expectedContext: DispatcherExecutionContext,
-): Promise<boolean> {
+): Promise<OutputRoute | undefined> {
 	const endpoints = await session.topLevelOutputEndpoints?.catch(() => undefined);
-	return Boolean(
-		executable && endpoints && pathContains(session.workspace.sandboxRoot, request.cwd) &&
-		request.args.length <= 4096 && request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) <= 1024 * 1024 &&
-		request.context.launchKey === expectedContext.launchKey && request.context.umask === expectedContext.umask &&
-		request.context.outputEndpoints[0] === endpoints[0] && request.context.outputEndpoints[1] === endpoints[1]
-	);
+	if (
+		!executable || !endpoints || !pathContains(session.workspace.sandboxRoot, request.cwd) ||
+		request.args.length > 4096 || request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024
+	) return undefined;
+	const routeOf = (endpoint: string): 0 | 1 | 2 => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : 0;
+	const stdout = routeOf(request.context.outputEndpoints[0]);
+	const stderr = routeOf(request.context.outputEndpoints[1]);
+	if (!stdout || !stderr) return undefined;
+	const route: OutputRoute = [stdout, stderr];
+	const context = routedExecutionContext(expectedContext, route);
+	return request.context.launchKey === context.launchKey && request.context.umask === context.umask ? route : undefined;
+}
+
+function routedExecutionContext(context: DispatcherExecutionContext, route: OutputRoute): DispatcherExecutionContext {
+	const semantic = JSON.parse(context.key) as {
+		credentials: Record<string, unknown>;
+		descriptors: Record<string, unknown>[];
+		[key: string]: unknown;
+	};
+	if (!semantic.credentials || !Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) {
+		throw new Error("invalid probed execution context");
+	}
+	const descriptors = [
+		semantic.descriptors[0]!,
+		{ ...semantic.descriptors[route[0]]!, fd: 1, alias: 1 },
+		{ ...semantic.descriptors[route[1]]!, fd: 2, alias: route[0] === route[1] ? 1 : 2 },
+	];
+	const routed = { ...semantic, descriptors };
+	return {
+		...context,
+		key: JSON.stringify(routed),
+		launchKey: JSON.stringify({
+			...routed,
+			credentials: { ...semantic.credentials, groups: "broker-preserved" },
+		}),
+		descriptorTypes: [
+			context.descriptorTypes[0],
+			context.descriptorTypes[route[0]],
+			context.descriptorTypes[route[1]],
+		],
+	};
 }
 
 function validDispatcherContext(value: unknown): value is DispatcherExecutionContext {

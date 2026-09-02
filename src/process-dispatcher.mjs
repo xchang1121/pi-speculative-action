@@ -18,8 +18,8 @@ const resetXfsz = () => {};
 process.on("SIGXFSZ", resetXfsz);
 process.off("SIGXFSZ", resetXfsz);
 
-if (!configuration && args[0] === "--exec" && args.length >= 3) {
-	await run(args[2], args.slice(3), args[1]);
+if (!configuration && args[0] === "--exec" && /^[12]{2}$/.test(args[1] ?? "") && args.length >= 4) {
+	await run(args[3], args.slice(4), args[2], [Number(args[1][0]), Number(args[1][1])]);
 } else if (!configuration && args.length === 1 && args[0] === "--probe-context") {
 	fs.writeSync(1, JSON.stringify(executionContext()));
 } else if (!validConfiguration(configuration) || !invoked) {
@@ -66,8 +66,9 @@ async function fallback(explicitExecutable) {
 	await run(executable, args, invoked);
 }
 
-async function run(executable, commandArgs, argv0) {
-	const child = spawn(executable, commandArgs, { argv0, cwd: process.cwd(), env: environment, stdio: "inherit" });
+async function run(executable, commandArgs, argv0, outputRoute) {
+	const stdio = outputRoute ? [0, outputRoute[0], outputRoute[1]] : "inherit";
+	const child = spawn(executable, commandArgs, { argv0, cwd: process.cwd(), env: environment, stdio });
 	const outcome = await new Promise((resolve, reject) => {
 		child.once("error", reject);
 		child.once("exit", (code, signal) => resolve({ code, signal }));

@@ -79,7 +79,7 @@ try {
 		fixture,
 		{ workspaceDriver, includeWorkspaceFingerprint: true },
 	);
-	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
+	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'parent-a-done\\n'";
 	const directExecution = await executeDirectBash(fixture, { label: "direct", command: coldCommand });
 	const direct = {
 		totalMs: directExecution.totalMs,
@@ -134,7 +134,7 @@ try {
 	runs.push(
 		await runTask(
 			"cross_parent_hit",
-			"printf 'parent-b\\n'; command pi-reuse-helper input.txt artifact.txt; printf 'parent-b-done\\n'",
+			"printf 'parent-b\\n'; command pi-reuse-helper input.txt artifact.txt 2>&1; printf 'parent-b-done\\n'",
 			executionFingerprint,
 		),
 	);
@@ -143,7 +143,7 @@ try {
 	runs.push(
 		await runTask(
 			"dependency_invalidation",
-			"printf 'parent-c\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-c-done\\n'",
+			"printf 'parent-c\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'parent-c-done\\n'",
 			executionFingerprint,
 		),
 	);
