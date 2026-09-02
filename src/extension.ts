@@ -1249,10 +1249,6 @@ async function editToolPolicy(
 			continue;
 		}
 		const selected = settings.tools.includes(tool);
-		if (!selected && capabilities.get(tool)?.state === "unavailable") {
-			ctx.ui.notify(`${tool} cannot be enabled here: ${routeLabel(capabilities.get(tool))}.`, "warning");
-			continue;
-		}
 		if (!selected && !registered.has(tool)) {
 			const conflict = conflicts.get(tool);
 			ctx.ui.notify(

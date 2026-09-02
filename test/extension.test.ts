@@ -389,7 +389,7 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining(["Tool policy › 6/6 active", "Execution routes"]),
 		);
 		expect(menus.get("Tool policy · [x] active · [~] selected · [ ] off")).toEqual(expect.arrayContaining([
-			expect.stringMatching(/^\[ \] bash · unavailable · Linux host required/),
+			expect.stringMatching(/^\[~\] bash · unavailable · Linux host required/),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
 		expect(menus.get("Actor probe")).not.toEqual(
@@ -399,7 +399,7 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
-		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
+		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
