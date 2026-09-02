@@ -41,6 +41,14 @@ export type SpeculativeAgentExecutionWorld = ExecutionWorld<SpeculativeToolExecu
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ): SpeculativeAgentExecutionWorld {
+	const route = {
+		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+		fingerprint: () => "resource-version:v1",
+		diagnostics: () => ({
+			state: "ready" as const,
+			detail: "Resource-version snapshots are available",
+		}),
+	};
 	const capture = async (context: SpeculativeToolExecutionContext): Promise<WorldResultCapture<ToolSettlement>> => {
 		const setupStarted = performance.now();
 		const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
@@ -54,25 +62,22 @@ export function createResourceSnapshotExecutionWorld(
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-		fingerprint: () => "resource-version:v1",
-		diagnostics: () => ({
-			state: "ready",
-			detail: "Resource-version snapshots are available",
-		}),
-		captureAuthoritativeResult: capture,
-		fork: async (context) => {
-			const captured = await capture(context);
-			let output: ToolSettlement;
-			try {
-				output = {
-					result: await context.tool.execute(context.callID, context.args as never, context.signal),
-					isError: false,
-				};
-			} catch (error) {
-				output = toolErrorSettlement(error);
-			}
-			return captured.seal(output);
+		observation: { ...route, capture },
+		speculation: {
+			...route,
+			execute: async (context) => {
+				const captured = await capture(context);
+				let output: ToolSettlement;
+				try {
+					output = {
+						result: await context.tool.execute(context.callID, context.args as never, context.signal),
+						isError: false,
+					};
+				} catch (error) {
+					output = toolErrorSettlement(error);
+				}
+				return captured.seal(output);
+			},
 		},
 	};
 }

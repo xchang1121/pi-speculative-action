@@ -806,21 +806,23 @@ function createWorkspaceSandboxFor(
 		id: "git_worktree",
 		scope: "fallback",
 		isolation: "workspace_branch",
-		capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-		fingerprint: () => {
-			assertWorkspaceSandboxOpen(state);
-			return workspaceSandboxFingerprintFor(state, resolvedOptions);
-		},
-		prepare: async ({ cwd, signal }) => {
-			assertWorkspaceSandboxOpen(state);
-			roots.add(path.resolve(cwd));
-			await prepareSandboxWorkspaceFor(state, cwd, { ...resolvedOptions, signal });
-		},
-		fork: async (context) => {
-			assertWorkspaceSandboxOpen(state);
-			const sourceRoot = path.resolve(context.cwd);
-			roots.add(sourceRoot);
-			return executeMutation(state, context, resolvedOptions);
+		speculation: {
+			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			fingerprint: () => {
+				assertWorkspaceSandboxOpen(state);
+				return workspaceSandboxFingerprintFor(state, resolvedOptions);
+			},
+			prepare: async ({ cwd, signal }) => {
+				assertWorkspaceSandboxOpen(state);
+				roots.add(path.resolve(cwd));
+				await prepareSandboxWorkspaceFor(state, cwd, { ...resolvedOptions, signal });
+			},
+			execute: async (context) => {
+				assertWorkspaceSandboxOpen(state);
+				const sourceRoot = path.resolve(context.cwd);
+				roots.add(sourceRoot);
+				return executeMutation(state, context, resolvedOptions);
+			},
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];

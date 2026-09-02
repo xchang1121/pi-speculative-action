@@ -186,6 +186,13 @@ export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnost
 	readonly id: string;
 	readonly scope: ExecutionWorldScope;
 	readonly isolation: SpeculativeExecution;
+	/** Capabilities and health of speculative execution; retained at the top level for host compatibility. */
+	readonly capabilities: EffectCapabilities;
+	/** Independently probed Actor-authorized observation, when the world provides it. */
+	readonly observation?: ExecutionWorldOperationDiagnostic;
+}
+
+export interface ExecutionWorldOperationDiagnostic extends ExecutionWorldDiagnosticReport {
 	readonly capabilities: EffectCapabilities;
 }
 
@@ -216,11 +223,10 @@ export function executionCapabilityStatus(
 	});
 }
 
-interface ExecutionWorldLifecycle<Context, Output> {
-	readonly id: string;
-	/** Atomic effects this backend can safely contain, virtualize, or validate. */
+export interface ExecutionWorldOperation {
+	/** Atomic effects this operation can safely contain, observe, virtualize, or validate. */
 	readonly capabilities: EffectCapabilities;
-	/** Stable identity of the concrete isolation backend used for route-local reuse. */
+	/** Stable identity of the concrete provider used for route-local reuse. */
 	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
 	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
 	readonly prepare?: (input: ExecutionWorldPreparation) => Promise<void>;
@@ -228,11 +234,24 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly diagnostics?: (
 		input: ExecutionWorldDiagnosticsContext,
 	) => ExecutionWorldDiagnosticReport | Promise<ExecutionWorldDiagnosticReport>;
+}
+
+export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWorldOperation {
+	readonly execute: (context: Context) => Promise<WorldBranch<Output>>;
+}
+
+export interface ExecutionWorldObservation<Context, Output> extends ExecutionWorldOperation {
+	/** Capture freshness before a host-authoritative execution without executing the tool again. */
+	readonly capture: (context: Context) => Promise<WorldResultCapture<Output>>;
+}
+
+interface ExecutionWorldLifecycle<Context, Output> {
+	readonly id: string;
 	/** Optional persistent storage capability, independent from tool or action syntax. */
 	readonly storage?: ExecutionWorldStorageControl;
-	readonly fork: (context: Context) => Promise<WorldBranch<Output>>;
-	/** Capture freshness before a host-authoritative execution without executing the tool again. */
-	readonly captureAuthoritativeResult?: (context: Context) => Promise<WorldResultCapture<Output>>;
+	/** Pre-Actor execution and Actor-authorized observation deliberately have independent authority. */
+	readonly speculation: ExecutionWorldSpeculation<Context, Output>;
+	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
@@ -272,12 +291,12 @@ export class ExecutionWorldRouter<Context, Output> {
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		return this.select(request, preparation, (_world, route) => route);
+		return this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route);
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
 		const world = this.world(route);
-		return world.fork(context);
+		return world.speculation.execute(context);
 	}
 
 	/** Select a capture-capable world and snapshot its baseline before host execution. */
@@ -287,14 +306,14 @@ export class ExecutionWorldRouter<Context, Output> {
 		context: Context,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		return this.select(
+			"observation",
 			request,
 			preparation,
+			(world) => world.observation,
 			async (world, route) => {
-				if (!world.captureAuthoritativeResult) return undefined;
-				const capture = await world.captureAuthoritativeResult(context);
+				const capture = await world.observation!.capture(context);
 				return Object.freeze({ route, capture });
 			},
-			(world) => world.captureAuthoritativeResult !== undefined,
 		);
 	}
 
@@ -306,24 +325,16 @@ export class ExecutionWorldRouter<Context, Output> {
 	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return Promise.all(
 			this.worlds.map(async (world) => {
-				let report: ExecutionWorldDiagnosticReport | undefined;
-				try {
-					report = await world.diagnostics?.(input);
-				} catch (error) {
-					report = { state: "unavailable", detail: errorDetail(error) };
-				}
-				const route = this.routeObservations.get(world.id);
-				if (route?.cwd === input.cwd && route.state === "unavailable") report = route;
+				const speculation = await this.diagnose(world.id, "speculation", world.speculation, input);
+				const observation = world.observation
+					? await this.diagnose(world.id, "observation", world.observation, input)
+					: undefined;
 				return Object.freeze({
 					id: world.id,
 					scope: world.scope,
 					isolation: world.isolation,
-					capabilities: world.capabilities,
-					...(report ??
-						(route?.cwd === input.cwd ? route : undefined) ?? {
-							state: "registered",
-							detail: "Registered; availability is checked during route preparation",
-						}),
+					...speculation,
+					...(observation ? { observation } : {}),
 				});
 			}),
 		);
@@ -338,22 +349,25 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	private async select<Selected>(
+		kind: "speculation" | "observation",
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
+		operationFor: (world: ExecutionWorld<Context, Output>) => ExecutionWorldOperation | undefined,
 		select: (
 			world: ExecutionWorld<Context, Output>,
 			route: SpeculativeExecutionRoute,
 		) => Selected | undefined | Promise<Selected | undefined>,
-		eligible: (world: ExecutionWorld<Context, Output>) => boolean = () => true,
 	): Promise<Selected | undefined> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worlds) {
-				if (world.scope !== scope || !eligible(world)) continue;
+				if (world.scope !== scope) continue;
+				const operation = operationFor(world);
+				if (!operation) continue;
 				try {
-					if (!effectCapabilitiesCover(world.capabilities, request.requirements)) continue;
-					const fingerprint = (await world.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
-					await world.prepare?.(preparation);
-					this.observeRoute(world.id, preparation.cwd, "ready", "Route prepared successfully");
+					if (!effectCapabilitiesCover(operation.capabilities, request.requirements)) continue;
+					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
+					await operation.prepare?.(preparation);
+					this.observeRoute(world.id, kind, preparation.cwd, "ready", "Route prepared successfully");
 					const route = Object.freeze({
 						isolation: world.isolation,
 						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
@@ -366,7 +380,7 @@ export class ExecutionWorldRouter<Context, Output> {
 					if (selected !== undefined) return selected;
 				} catch (error) {
 					if (preparation.signal?.aborted) throw error;
-					this.observeRoute(world.id, preparation.cwd, "unavailable", errorDetail(error));
+					this.observeRoute(world.id, kind, preparation.cwd, "unavailable", errorDetail(error));
 					// Unavailable worlds are skipped in explicit capability order.
 				}
 			}
@@ -374,8 +388,38 @@ export class ExecutionWorldRouter<Context, Output> {
 		return undefined;
 	}
 
-	private observeRoute(id: string, cwd: string, state: ExecutionWorldHealthState, detail: string): void {
-		this.routeObservations.set(id, { state, cwd, detail });
+	private async diagnose(
+		id: string,
+		kind: "speculation" | "observation",
+		operation: ExecutionWorldOperation,
+		input: ExecutionWorldDiagnosticsContext,
+	): Promise<ExecutionWorldOperationDiagnostic> {
+		let report: ExecutionWorldDiagnosticReport | undefined;
+		try {
+			report = await operation.diagnostics?.(input);
+		} catch (error) {
+			report = { state: "unavailable", detail: errorDetail(error) };
+		}
+		const route = this.routeObservations.get(`${id}:${kind}`);
+		if (route?.cwd === input.cwd && route.state === "unavailable") report = route;
+		return Object.freeze({
+			capabilities: operation.capabilities,
+			...(report ??
+				(route?.cwd === input.cwd ? route : undefined) ?? {
+					state: "registered",
+					detail: "Registered; availability is checked during route preparation",
+				}),
+		});
+	}
+
+	private observeRoute(
+		id: string,
+		kind: "speculation" | "observation",
+		cwd: string,
+		state: ExecutionWorldHealthState,
+		detail: string,
+	): void {
+		this.routeObservations.set(`${id}:${kind}`, { state, cwd, detail });
 	}
 }
 

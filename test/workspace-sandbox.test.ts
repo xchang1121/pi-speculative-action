@@ -79,11 +79,11 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
 			await Promise.all([
-				firstWorld.prepare?.({ cwd: root }),
-				firstSibling.prepare?.({ cwd: root }),
-				secondWorld.prepare?.({ cwd: root }),
+				firstWorld.speculation.prepare?.({ cwd: root }),
+				firstSibling.speculation.prepare?.({ cwd: root }),
+				secondWorld.speculation.prepare?.({ cwd: root }),
 			]);
-			const abandoned = await firstWorld.fork(
+			const abandoned = await firstWorld.speculation.execute(
 				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
 			);
 
@@ -93,7 +93,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(abandoned.commit()).rejects.toThrow("service is disposed");
 
 			const args = { path: "value.txt", content: "after\n" };
-			const branch = await secondWorld.fork(context(root, "write", writeTool, args));
+			const branch = await secondWorld.speculation.execute(context(root, "write", writeTool, args));
 			await branch.commit();
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		} finally {
@@ -133,15 +133,15 @@ describe("workspace-branch ExecutionWorld", () => {
 			const world = createWorkspaceSandbox({ driver: "git" });
 			expect(world.scope).toBe("fallback");
 			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
-			expect(effectCapabilitiesCover(world.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
-			expect(effectCapabilitiesCover(world.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
+			expect(effectCapabilitiesCover(world.speculation.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
+			expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
 			expect(
-				await world.fingerprint?.({
+				await world.speculation.fingerprint?.({
 					effect: "workspace_mutation",
 					requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 				}),
 			).toBe("git-worktree:v1");
-			const branch = await world.fork(context(root, "write", writeTool, args));
+			const branch = await world.speculation.execute(context(root, "write", writeTool, args));
 
 			expect(branch.commitMetrics).toBeUndefined();
 			expect(branch.resources).toEqual(["nested/created.txt"]);
@@ -296,7 +296,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			await writeFile(target, "base\n", "utf8");
 			const args = { path: "value.txt", edits: [{ oldText: "base", newText: "speculative" }] };
-			const branch = await createWorkspaceSandbox().fork(context(root, "edit", editTool, args));
+			const branch = await createWorkspaceSandbox().speculation.execute(context(root, "edit", editTool, args));
 			await writeFile(target, "actor\n", "utf8");
 
 			const failed = branch.commit();
@@ -316,9 +316,9 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(target, "base\n", "utf8");
 			const world = createWorkspaceSandbox();
 			const parentArgs = { path: "lineage.txt", content: "parent\n" };
-			const parent = await world.fork(context(root, "write", writeTool, parentArgs));
+			const parent = await world.speculation.execute(context(root, "write", writeTool, parentArgs));
 			const childArgs = { path: "lineage.txt", edits: [{ oldText: "parent", newText: "child" }] };
-			const child = await world.fork({
+			const child = await world.speculation.execute({
 				...context(root, "edit", editTool, childArgs),
 				parentCheckpoint: parent.checkpoint,
 			});
@@ -516,11 +516,11 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			const escapingInput = { path: "../outside.txt", content: "no" };
 			await expect(
-				createWorkspaceSandbox().fork(context(root, "write", countingTool, escapingInput)),
+				createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, escapingInput)),
 			).rejects.toThrow("escapes workspace");
 			await symlink(outside, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
 			const linked = { path: "linked/out.txt", content: "no" };
-			await expect(createWorkspaceSandbox().fork(context(root, "write", countingTool, linked))).rejects.toThrow(
+			await expect(createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, linked))).rejects.toThrow(
 				"contains symlink",
 			);
 			expect(executions).toBe(0);
@@ -544,7 +544,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			const beforeStatus = await runGit(["status", "--short"], root);
 			const beforeBranch = await runGit(["branch", "--show-current"], root);
 			const args = { path: "created.txt", content: "speculative\n" };
-			await createWorkspaceSandbox().fork(context(root, "write", writeTool, args));
+			await createWorkspaceSandbox().speculation.execute(context(root, "write", writeTool, args));
 
 			expect(await runGit(["status", "--short"], root)).toBe(beforeStatus);
 			expect(await runGit(["branch", "--show-current"], root)).toBe(beforeBranch);

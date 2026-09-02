@@ -16,12 +16,17 @@ describe("ToolExecutionGateway", () => {
 			id: "workspace",
 			scope: "fallback",
 			isolation: "workspace_branch",
-			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-			fork: async ({ value }) => branch("workspace", value),
-			captureAuthoritativeResult: async ({ value }) => ({
-				seal: async (output) => branch("workspace", `${value}:${output}`),
-				dispose: () => {},
-			}),
+			speculation: {
+				capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+				execute: async ({ value }) => branch("workspace", value),
+			},
+			observation: {
+				capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+				capture: async ({ value }) => ({
+					seal: async (output) => branch("workspace", `${value}:${output}`),
+					dispose: () => {},
+				}),
+			},
 			dispose,
 		};
 		const gateway = new ToolExecutionGateway([world]);

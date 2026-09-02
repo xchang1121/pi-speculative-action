@@ -45,11 +45,15 @@ describe("ExecutionWorldRouter", () => {
 	});
 
 	it("falls through unavailable worlds and exclusively owns backend lifecycle", async () => {
+		const unavailableBase = runtime("unavailable");
 		const unavailable = {
-			...runtime("unavailable"),
-			prepare: vi.fn(async () => {
-				throw new Error("unavailable");
-			}),
+			...unavailableBase,
+			speculation: {
+				...unavailableBase.speculation,
+				prepare: vi.fn(async () => {
+					throw new Error("unavailable");
+				}),
+			},
 		};
 		const resource = fallback("resource", "resource_snapshot", "all");
 		const router = new ExecutionWorldRouter([unavailable, resource, resource]);
@@ -59,7 +63,7 @@ describe("ExecutionWorldRouter", () => {
 		);
 
 		expect(route).toMatchObject({ backend: "resource", scope: "fallback" });
-		expect(unavailable.prepare).toHaveBeenCalledOnce();
+		expect(unavailable.speculation.prepare).toHaveBeenCalledOnce();
 		expect(route && (await router.fork(route, { value: "captured" })).output).toBe("captured");
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route })).toBe(true);
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "changed" })).toBe(false);
@@ -89,14 +93,23 @@ describe("ExecutionWorldRouter", () => {
 	it("captures an authoritative result with the first explicitly capable world", async () => {
 		const disposeCapture = vi.fn();
 		const resourceBase = fallback("resource", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
+		const capture = vi.fn(async () => ({
+			seal: (output: string) => resourceBase.speculation.execute({ value: output }),
+			dispose: disposeCapture,
+		}));
 		const resource: TestWorld = {
 			...resourceBase,
-			captureAuthoritativeResult: vi.fn(async () => ({
-				seal: (output: string) => resourceBase.fork({ value: output }),
-				dispose: disposeCapture,
-			})),
+			observation: {
+				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+				capture,
+			},
 		};
-		const runtimeWithoutCapture = { ...runtime("runtime"), prepare: vi.fn(async () => {}) };
+		const runtimeBase = runtime("runtime");
+		const prepare = vi.fn(async () => {});
+		const runtimeWithoutCapture = {
+			...runtimeBase,
+			speculation: { ...runtimeBase.speculation, prepare },
+		};
 		const router = new ExecutionWorldRouter([runtimeWithoutCapture, resource]);
 
 		const captured = await router.captureAuthoritativeResult(
@@ -106,11 +119,40 @@ describe("ExecutionWorldRouter", () => {
 		);
 
 		expect(captured?.route).toMatchObject({ backend: "resource", reuse: "shared_result" });
-		expect(runtimeWithoutCapture.prepare).not.toHaveBeenCalled();
-		expect(resource.captureAuthoritativeResult).toHaveBeenCalledOnce();
+		expect(prepare).not.toHaveBeenCalled();
+		expect(capture).toHaveBeenCalledOnce();
 		const branch = await captured?.capture.seal("actor output");
 		expect(await branch?.commit()).toBe("actor output");
 		expect(disposeCapture).not.toHaveBeenCalled();
+	});
+
+	it("routes Actor observation independently from speculative containment", async () => {
+		const world = fallback("split", "workspace_branch", RESOURCE_OBSERVATION_EFFECTS.capabilities);
+		const capture = vi.fn(async () => ({
+			seal: (output: string) => world.speculation.execute({ value: output }),
+			dispose: () => {},
+		}));
+		const split: TestWorld = {
+			...world,
+			observation: { capabilities: "all", capture },
+		};
+		const router = new ExecutionWorldRouter([split]);
+
+		expect(
+			await router.resolve({ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, preparation),
+		).toBeUndefined();
+		expect(
+			await router.captureAuthoritativeResult(
+				{ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
+				preparation,
+				{ value: "actor" },
+			),
+		).toMatchObject({ route: { backend: "split", reuse: "exclusive_branch" } });
+		expect(capture).toHaveBeenCalledOnce();
+		expect((await router.diagnostics(preparation))[0]).toMatchObject({
+			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+			observation: { capabilities: "all" },
+		});
 	});
 
 	it.each([
@@ -204,7 +246,7 @@ function diagnostic(
 }
 
 function runtime(id: string): TestWorld {
-	return { ...lifecycle(id), scope: "runtime", isolation: "runtime_sandbox", capabilities: "all" };
+	return world(id, "runtime", "runtime_sandbox", "all");
 }
 
 function fallback(
@@ -212,24 +254,34 @@ function fallback(
 	isolation: Exclude<SpeculativeExecution, "runtime_sandbox">,
 	capabilities: EffectCapabilities,
 ): TestWorld {
-	return { ...lifecycle(id), scope: "fallback", isolation, capabilities };
+	return world(id, "fallback", isolation, capabilities);
 }
 
-function lifecycle(id: string) {
+function world(
+	id: string,
+	scope: TestWorld["scope"],
+	isolation: TestWorld["isolation"],
+	capabilities: EffectCapabilities,
+): TestWorld {
 	const dispose = vi.fn(async () => {});
 	return {
 		id,
-		fingerprint: () => `${id}:v1`,
-		fork: async ({ value }: { readonly value: string }) => ({
-			output: value,
-			backend: id,
-			resources: [],
-			capturedBytes: 0,
-			executionMetrics: {},
-			compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
-			commit: async () => value,
-			dispose: () => {},
-		}),
+		scope,
+		isolation,
+		speculation: {
+			capabilities,
+			fingerprint: () => `${id}:v1`,
+			execute: async ({ value }: { readonly value: string }) => ({
+				output: value,
+				backend: id,
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
+				commit: async () => value,
+				dispose: () => {},
+			}),
+		},
 		dispose,
-	};
+	} as TestWorld;
 }

@@ -449,7 +449,7 @@ describe("speculative action host", () => {
 
 	it("prefers a runtime-wide sandbox over a read tool's resource-snapshot fallback", async () => {
 		const cwd = await temporaryWorkspace();
-		const fork = vi.fn(async (_context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => {
+		const fork = vi.fn(async (_context: Parameters<SpeculativeAgentExecutionWorld["speculation"]["execute"]>[0]) => {
 			return {
 				result: { content: [{ type: "text" as const, text: "runtime read" }], details: {} },
 				isError: false,
@@ -485,23 +485,27 @@ describe("speculative action host", () => {
 			id: "broken",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
-			capabilities: "all",
-			fingerprint: () => {
-				throw new Error("backend unavailable");
-			},
-			prepare: brokenPrepare,
-			fork: async () => {
-				throw new Error("must not execute");
+			speculation: {
+				capabilities: "all",
+				fingerprint: () => {
+					throw new Error("backend unavailable");
+				},
+				prepare: brokenPrepare,
+				execute: async () => {
+					throw new Error("must not execute");
+				},
 			},
 		};
 		const unavailable: SpeculativeAgentExecutionWorld = {
 			id: "unavailable",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
-			capabilities: "all",
-			prepare: unavailablePrepare,
-			fork: async () => {
-				throw new Error("must not execute");
+			speculation: {
+				capabilities: "all",
+				prepare: unavailablePrepare,
+				execute: async () => {
+					throw new Error("must not execute");
+				},
 			},
 		};
 		const { tool, events, host, hostExecutions } = readWorldHost(cwd, [broken, unavailable], "fallback");
@@ -551,12 +555,14 @@ describe("speculative action host", () => {
 			id: "unavailable",
 			scope: "runtime",
 			isolation: "runtime_sandbox",
-			capabilities: "all",
-			fingerprint: () => {
-				throw new Error("unavailable");
-			},
-			fork: async () => {
-				throw new Error("unused");
+			speculation: {
+				capabilities: "all",
+				fingerprint: () => {
+					throw new Error("unavailable");
+				},
+				execute: async () => {
+					throw new Error("unused");
+				},
 			},
 			dispose: async () => {
 				disposed++;
@@ -1424,31 +1430,33 @@ function readWorldHost(
 }
 
 function mockRuntimeWorld(
-	execute: (context: Parameters<SpeculativeAgentExecutionWorld["fork"]>[0]) => ToolSettlement | Promise<ToolSettlement>,
+	execute: (context: Parameters<SpeculativeAgentExecutionWorld["speculation"]["execute"]>[0]) => ToolSettlement | Promise<ToolSettlement>,
 	dispose?: SpeculativeAgentExecutionWorld["dispose"],
 ): SpeculativeAgentExecutionWorld {
 	return {
 		id: "runtime",
 		scope: "runtime",
 		isolation: "runtime_sandbox",
-		capabilities: "all",
-		fingerprint: () => "runtime:v1",
-		fork: async (context) => {
-			const output = await execute(context);
-			return {
-				output,
-				backend: "runtime",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: {
-					status: "compatible",
+		speculation: {
+			capabilities: "all",
+			fingerprint: () => "runtime:v1",
+			execute: async (context) => {
+				const output = await execute(context);
+				return {
+					output,
 					backend: "runtime",
-					executionFingerprint: context.action.executionFingerprint,
-				},
-				commit: async () => output,
-				dispose: () => {},
-			};
+					resources: [],
+					capturedBytes: 0,
+					executionMetrics: {},
+					compatibility: {
+						status: "compatible",
+						backend: "runtime",
+						executionFingerprint: context.action.executionFingerprint,
+					},
+					commit: async () => output,
+					dispose: () => {},
+				};
+			},
 		},
 		...(dispose ? { dispose } : {}),
 	};

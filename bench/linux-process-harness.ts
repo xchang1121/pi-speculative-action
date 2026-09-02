@@ -108,7 +108,7 @@ export async function prepareLinuxProcessReuse(
 	const workspaceFingerprint = options.includeWorkspaceFingerprint
 		? await workspaceSandboxFingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)
 		: undefined;
-	await fixture.world.prepare?.({ cwd: fixture.workspace });
+	await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 	const backendFingerprint = await fixture.backend.fingerprint();
 	return {
 		status: readyStatus,
@@ -145,7 +145,7 @@ export async function executeReusableBash(
 	const metricsBefore = fixture.backend.metrics();
 	const started = performance.now();
 	const forkStarted = performance.now();
-	const branch = await fixture.world.fork({
+	const branch = await fixture.world.speculation.execute({
 		cwd: fixture.workspace,
 		tool: fixture.tool,
 		toolName: "bash",

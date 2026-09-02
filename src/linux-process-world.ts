@@ -41,50 +41,51 @@ export function createLinuxProcessExecutionWorld(
 		id: "linux_process_reuse",
 		scope: "runtime",
 		isolation: "runtime_sandbox",
-		capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 		storage: backend.storage,
-		fingerprint: async (request) => {
-			const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
-			const [processFingerprint, workspaceFingerprint] = await Promise.all([
-				backend.fingerprint(),
-				invocation?.cwd
-					? qualify(invocation.cwd).then((selected) => selected.fingerprint)
-					: workspaceSandbox.fingerprint(workspaceOptions),
-			]);
-			return `${processFingerprint}:${workspaceFingerprint}`;
-		},
-		diagnostics: async ({ cwd, refresh }) => {
-			const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
-			const storage = {
-				entries: store.certificates,
-				maxEntries: backend.store.limits.maxCertificates,
-				bytes: store.totalBytes,
-				maxBytes: backend.store.limits.maxBytes,
-				orphanArtifacts: store.orphanArtifacts,
-				overBudget: store.overBudget,
-			};
-			if (status.state !== "ready") return { state: "unavailable", detail: status.detail, storage };
-			const selected = qualifiedDrivers.get(path.resolve(cwd));
-			return {
-				state: "ready",
-				detail: selected
-					? `${status.detail}; ${selected.driver} workspace driver selected`
-					: `${status.detail}; workspace route not prepared yet`,
-				storage,
-			};
-		},
-		prepare: async ({ cwd, signal }) => {
-			const status = await backend.check();
-			if (status.state !== "ready") throw new Error(status.detail);
-			roots.add(path.resolve(cwd));
-			const selected = await qualify(cwd);
-			await workspaceSandbox.prepare(cwd, {
-				...workspaceOptions,
-				driver: selected.driver,
-				...(signal ? { signal } : {}),
-			});
-		},
-		fork: async (context) => {
+		speculation: {
+			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+			fingerprint: async (request) => {
+				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
+				const [processFingerprint, workspaceFingerprint] = await Promise.all([
+					backend.fingerprint(),
+					invocation?.cwd
+						? qualify(invocation.cwd).then((selected) => selected.fingerprint)
+						: workspaceSandbox.fingerprint(workspaceOptions),
+				]);
+				return `${processFingerprint}:${workspaceFingerprint}`;
+			},
+			diagnostics: async ({ cwd, refresh }) => {
+				const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
+				const storage = {
+					entries: store.certificates,
+					maxEntries: backend.store.limits.maxCertificates,
+					bytes: store.totalBytes,
+					maxBytes: backend.store.limits.maxBytes,
+					orphanArtifacts: store.orphanArtifacts,
+					overBudget: store.overBudget,
+				};
+				if (status.state !== "ready") return { state: "unavailable" as const, detail: status.detail, storage };
+				const selected = qualifiedDrivers.get(path.resolve(cwd));
+				return {
+					state: "ready" as const,
+					detail: selected
+						? `${status.detail}; ${selected.driver} workspace driver selected`
+						: `${status.detail}; workspace route not prepared yet`,
+					storage,
+				};
+			},
+			prepare: async ({ cwd, signal }) => {
+				const status = await backend.check();
+				if (status.state !== "ready") throw new Error(status.detail);
+				roots.add(path.resolve(cwd));
+				const selected = await qualify(cwd);
+				await workspaceSandbox.prepare(cwd, {
+					...workspaceOptions,
+					driver: selected.driver,
+					...(signal ? { signal } : {}),
+				});
+			},
+			execute: async (context) => {
 			const invocation = processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
@@ -146,6 +147,7 @@ export function createLinuxProcessExecutionWorld(
 					}
 				},
 			});
+			},
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];

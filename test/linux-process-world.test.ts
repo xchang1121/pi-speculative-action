@@ -19,7 +19,7 @@ describe("Linux process ExecutionWorld", () => {
 		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot: path.join(root, "store") });
 		try {
 			const expected = await backend.check(true);
-			const actual = await world.diagnostics?.({ cwd: root, refresh: true });
+			const actual = await world.speculation.diagnostics?.({ cwd: root, refresh: true });
 			expect(actual?.state).toBe(expected.state === "ready" ? "ready" : "unavailable");
 			expect(actual?.detail).toContain(expected.detail);
 		} finally {
@@ -51,11 +51,11 @@ describe("Linux process ExecutionWorld", () => {
 			exposeSessionEnvironment: false,
 			spawnHook: (context) => ({ ...context, env: { ...environment } }),
 		});
-		let branch: Awaited<ReturnType<typeof world.fork>> | undefined;
+		let branch: Awaited<ReturnType<typeof world.speculation.execute>> | undefined;
 		try {
 			const status = await backend.check(true);
 			if (status.state !== "ready") throw new Error(status.detail);
-			await world.prepare?.({ cwd: workspace });
+			await world.speculation.prepare?.({ cwd: workspace });
 			const args = { command: "mv source moved" };
 			const invocation = resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath });
 			if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
@@ -68,7 +68,7 @@ describe("Linux process ExecutionWorld", () => {
 				context: invocation,
 			});
 			if (!action) throw new Error("Pi Bash action could not be keyed");
-			branch = await world.fork({
+			branch = await world.speculation.execute({
 				cwd: workspace,
 				tool,
 				toolName: "bash",
