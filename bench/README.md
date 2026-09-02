@@ -15,6 +15,15 @@ kept outside this repository. The checked-in runner and suites remain the
 reproducible measurement surface. Machine-qualification results for the Linux
 process substrate contain no prompts or model data and live under `results/`.
 
+Measure the cost and semantic boundary of pass-through process tracing separately from provenance
+capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,
+and strace's seccomp-BPF acceleration; it also proves that a held x86-64 exec can be replaced before a
+five-second child begins, while recording the observable `TracerPid` difference:
+
+```sh
+npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
+```
+
 ## Linux/WSL process reuse qualification
 
 Run the production `createBashTool`, generic process outlet, Linux execution

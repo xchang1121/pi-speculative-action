@@ -54,6 +54,7 @@
 		"bench:linux-artifacts": "tsx ./bench/linux-process-artifact-closure.ts",
 		"bench:linux-topology": "tsx ./bench/linux-process-topology-reuse.ts",
 		"bench:linux-admission": "tsx ./bench/linux-process-admission.ts",
+		"bench:exec-boundary": "tsx ./bench/linux-exec-boundary.ts",
 		"bench:overlay-probe": "sh ./bench/overlayfs-capability-probe.sh",
 		"bench:overlay-view": "tsx ./bench/overlayfs-namespace-view.ts",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
