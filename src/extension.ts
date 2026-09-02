@@ -1361,7 +1361,6 @@ async function editDraftModel(
 ): Promise<void> {
 	const models = ctx.modelRegistry
 		.getAvailable()
-		.filter((model) => ctx.modelRegistry.hasConfiguredAuth(model))
 		.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
 	const providers = new Map<string, typeof models>();
 	for (const model of models) providers.set(model.provider, [...(providers.get(model.provider) ?? []), model]);
@@ -1508,8 +1507,7 @@ export function resolveSpeculativeDraftModel(
 	modelRegistry: ModelRegistry,
 ): Model<Api> {
 	if (!reference) return actorModel;
-	const model = findExactModelReferenceMatch(reference, modelRegistry.getAll());
-	return model && modelRegistry.hasConfiguredAuth(model) ? model : actorModel;
+	return findExactModelReferenceMatch(reference, modelRegistry.getAvailable()) ?? actorModel;
 }
 
 function findExactModelReferenceMatch(reference: string, models: readonly Model<Api>[]): Model<Api> | undefined {

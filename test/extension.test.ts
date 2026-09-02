@@ -65,8 +65,7 @@ describe("zero-modification Pi extension", () => {
 		const actor = testModel("actor");
 		const draft = testModel("draft");
 		const registry = {
-			getAll: () => [actor, draft],
-			hasConfiguredAuth: () => true,
+			getAvailable: () => [actor, draft],
 		} as unknown as Parameters<typeof resolveSpeculativeDraftModel>[2];
 
 		expect(resolveSpeculativeDraftModel(undefined, actor, registry)).toBe(actor);
@@ -568,9 +567,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		model: testModel(),
 		modelRegistry: {
 			complete: vi.fn(),
-			getAll: () => [testModel()],
 			getAvailable: () => [testModel()],
-			hasConfiguredAuth: () => true,
 		},
 		sessionManager: { getSessionId: () => "session", getSessionFile: () => undefined },
 		isProjectTrusted: () => true,
