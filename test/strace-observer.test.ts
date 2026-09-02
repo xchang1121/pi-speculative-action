@@ -102,10 +102,15 @@ describe("strace provenance decoder", () => {
 					'socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 4',
 					'clock_gettime(CLOCK_REALTIME, {tv_sec=1, tv_nsec=2}) = 0',
 					'getrandom("abc", 3, 0) = 3',
+					'getpid() = 2',
 				].join("\n"),
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.taints).toEqual(expect.arrayContaining(["network", "clock", "random"]));
+			expect(observation.taints).toEqual(expect.arrayContaining(["network", "clock", "random", "pid_observation"]));
+			const covered = await observeStrace(prefix, "/usr/bin/example", "/work", {
+				coveredTaints: ["network", "clock", "pid_observation"],
+			});
+			expect(covered.taints).toEqual(["random"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

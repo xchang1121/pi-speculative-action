@@ -82,6 +82,7 @@ const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 const STRACE_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,fchdir,fallocate,ioctl";
+const SANDBOX_COVERED_TAINTS: readonly ProvenanceTaint[] = ["network", "ipc", "clock", "random", "pid_observation"];
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
@@ -325,7 +326,8 @@ export class LinuxProcessReuseBackend {
 					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
-					this.counters.replayMs += Math.max(0, performance.now() - replayStarted);
+					this.counters.wholeCommandReplayMs += Math.max(0, performance.now() - replayStarted);
+					this.counters.wholeCommandAvoidedProcessMs += plan.certificate.result.observedProcessMs ?? 0;
 					this.counters.wholeCommandHits++;
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
@@ -495,15 +497,13 @@ export class LinuxProcessReuseBackend {
 		const initial = await this.plan(session, prototype);
 		if (initial) return this.replayTopLevel(session, initial, request);
 		this.add(session, "wholeCommandMisses");
-		const shellArguments = [...session.invocation.shellArgs];
-		if (session.invocation.commandTransport === "argv") shellArguments.push(command);
 		const sandbox = sandboxArguments({
 			ready,
 			workspaceRoot: session.workspace.sandboxRoot,
 			privateRoot: session.workspace.processRoot,
 			cwd: physicalCwd,
 			deniedPaths: session.deniedPaths,
-			command: [session.invocation.shell, ...shellArguments],
+			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
 		const before = await session.workspace.structure.capture();
@@ -552,6 +552,7 @@ export class LinuxProcessReuseBackend {
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
 					ignoredExecutablePaths: session.interposition.executablePaths,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+					coveredTaints: SANDBOX_COVERED_TAINTS,
 				});
 				session.topLevelCapture = { before, after, observation };
 				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
@@ -593,6 +594,7 @@ export class LinuxProcessReuseBackend {
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		request: ProcessExecutionRequest,
 	): Promise<{ exitCode: number | null }> {
+		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
 		await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 		const after = await session.workspace.structure.capture();
@@ -603,6 +605,8 @@ export class LinuxProcessReuseBackend {
 			observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] },
 		};
 		for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
+		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
+		this.add(session, "wholeCommandAvoidedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
 		return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 	}
@@ -823,6 +827,7 @@ export class LinuxProcessReuseBackend {
 					transaction.finish(),
 					observeStrace(tracePrefix, executable, request.cwd, {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+						coveredTaints: SANDBOX_COVERED_TAINTS,
 					}),
 				]);
 				if (observation.incompleteReasons.length) {
@@ -1786,6 +1791,10 @@ function executionEnvironment(environment: Readonly<Record<string, string>>, exe
 
 function normalizeEnvironment(environment: Readonly<Record<string, string | undefined>>): Record<string, string> {
 	return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
+	return invocation.commandTransport === "argv" ? [...invocation.shellArgs, command] : [...invocation.shellArgs];
 }
 
 async function actorTopLevelPrototype(
