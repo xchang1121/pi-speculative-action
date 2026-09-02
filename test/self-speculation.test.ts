@@ -45,12 +45,14 @@ describe("self-speculation control plane", () => {
 		coordinator.addCandidate(candidate("drafter", "key-b", "hash-b", "read", { path: "b.txt" }, 0.8));
 
 		expect(requests).toHaveLength(0);
-		expect(coordinator.decorateActorPayload({ model: "actor" })).toEqual(
+		const actorPayload = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, unknown>;
+		expect(actorPayload).toEqual(
 			expect.objectContaining({
 				request_id: "actor-request",
-				self_speculation: expect.objectContaining({ role: "actor", fork: false }),
+				self_speculation: expect.objectContaining({ fork: false }),
 			}),
 		);
+		expect(actorPayload.self_speculation).not.toHaveProperty("role");
 		await coordinator.dispose();
 
 		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
@@ -115,19 +117,17 @@ describe("self-speculation control plane", () => {
 		]);
 	});
 
-	it("isolates Drafter request controls from the stable Actor request identity", async () => {
+	it("binds the provider self-fork contract once to the stable Actor request", async () => {
 		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, {}, ["actor-request", "drafter-request"]);
+		const coordinator = coordinatorFixture(requests, {}, ["actor-request"]);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 
 		const actor = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, unknown>;
-		const drafter = coordinator.decorateDrafterPayload({ model: "drafter" }) as Record<string, unknown>;
 		const secondActor = coordinator.decorateActorPayload({ model: "actor-retry" });
 
 		expect(actor.request_id).toBe("actor-request");
-		expect(actor.self_speculation).toEqual(expect.objectContaining({ role: "actor", fork: true }));
-		expect(drafter.request_id).toBe("drafter-request");
-		expect(drafter.self_speculation).toEqual(expect.objectContaining({ role: "drafter", fork: true }));
+		expect(actor.self_speculation).toEqual(expect.objectContaining({ fork: true }));
+		expect(actor.self_speculation).not.toHaveProperty("role");
 		expect(secondActor).toEqual({ model: "actor-retry" });
 		await coordinator.dispose();
 	});
@@ -363,7 +363,6 @@ describe("self-speculation control plane", () => {
 			prompt: "PROMPT",
 			request_id: "actor-request",
 		});
-		expect(coordinator.decorateDrafterPayload({ model: "drafter" })).toEqual({ model: "drafter" });
 		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 		coordinator.observeActorOutput(delta("text_delta", "later"));
 		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));

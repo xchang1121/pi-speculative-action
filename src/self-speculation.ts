@@ -53,8 +53,6 @@ export interface SelfSpeculationSettingsInput {
 	readonly forkForcedPrefix?: string;
 	/** Require a capable engine to expose token logprobs to its SPORK fork. */
 	readonly requireLogprobs?: boolean;
-	/** Apply the same provider-side self-fork control to Drafter requests. */
-	readonly drafterEnabled?: boolean;
 	readonly forkGateEnabled?: boolean;
 	readonly forkGateMinSamples?: number;
 	readonly forkGateWindowSize?: number;
@@ -85,7 +83,6 @@ export interface SelfSpeculationSettings {
 	readonly forkDecoder: string;
 	readonly forkForcedPrefix: string;
 	readonly requireLogprobs: boolean;
-	readonly drafterEnabled: boolean;
 	readonly forkGateEnabled: boolean;
 	readonly forkGateMinSamples: number;
 	readonly forkGateWindowSize: number;
@@ -115,7 +112,6 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	forkDecoder: "auto",
 	forkForcedPrefix: "<tool_call>",
 	requireLogprobs: false,
-	drafterEnabled: true,
 	forkGateEnabled: DEFAULT_BENEFIT_GATE_POLICY.enabled,
 	forkGateMinSamples: DEFAULT_BENEFIT_GATE_POLICY.minSamples,
 	forkGateWindowSize: DEFAULT_BENEFIT_GATE_POLICY.windowSize,
@@ -161,7 +157,6 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 		forkDecoder: nonEmptyString(input.forkDecoder) ?? SELF_SPECULATION_DEFAULTS.forkDecoder,
 		forkForcedPrefix: nonEmptyString(input.forkForcedPrefix) ?? SELF_SPECULATION_DEFAULTS.forkForcedPrefix,
 		requireLogprobs: booleanOr(input.requireLogprobs, SELF_SPECULATION_DEFAULTS.requireLogprobs),
-		drafterEnabled: booleanOr(input.drafterEnabled, SELF_SPECULATION_DEFAULTS.drafterEnabled),
 		forkGateEnabled: booleanOr(input.forkGateEnabled, SELF_SPECULATION_DEFAULTS.forkGateEnabled),
 		forkGateMinSamples,
 		forkGateWindowSize,
@@ -315,8 +310,6 @@ interface ParsedSidecarActionCall {
 	readonly input: Readonly<Record<string, unknown>>;
 }
 
-type ProviderRole = "actor" | "drafter";
-
 /**
  * Request-scoped bridge between speculative-action predictions and a SPORK-capable engine.
  * Network work is serialized and best-effort; it never owns Actor correctness or lifecycle.
@@ -413,7 +406,7 @@ export class SelfSpeculationCoordinator {
 		this.latestGateKey = modelKey(model);
 	}
 
-	/** Bind exactly one non-Drafter provider request to the current speculative turn. */
+	/** Bind exactly one authoritative Actor provider request to the current speculative turn. */
 	decorateActorPayload(payload: unknown): unknown {
 		const state = this.active;
 		if (!state || state.requestBound) return payload;
@@ -423,19 +416,7 @@ export class SelfSpeculationCoordinator {
 		state.requestBound = true;
 		state.providerPayload = cloneSerializable(payload);
 		this.scheduleFlush(state);
-		return providerPayload(payload, settings, state.requestID, "actor");
-	}
-
-	decorateDrafterPayload(payload: unknown): unknown {
-		const settings = this.settings();
-		if (
-			!settings.enabled ||
-			!settings.forkEnabled ||
-			!settings.drafterEnabled ||
-			settings.forkTransport !== "provider"
-		)
-			return payload;
-		return providerPayload(payload, settings, this.requestID(), "drafter");
+		return providerPayload(payload, settings, state.requestID);
 	}
 
 	actorRequestID(): string | undefined {
@@ -977,7 +958,6 @@ function providerPayload(
 	payload: unknown,
 	settings: SelfSpeculationSettings,
 	requestID: string,
-	role: ProviderRole,
 ): unknown {
 	if (!isRecord(payload)) return payload;
 	const identified = {
@@ -989,8 +969,7 @@ function providerPayload(
 		...identified,
 		self_speculation: {
 			version: 1,
-			role,
-			fork: role === "actor" ? settings.forkEnabled : settings.forkEnabled && settings.drafterEnabled,
+			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
 			max_draft_tokens: settings.maxDraftTokens,
 			draft_format: settings.draftFormat,

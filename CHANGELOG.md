@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Removed provider-side self-fork controls from Drafter-model requests. Self-speculation now decorates and forks only the authoritative Actor stream.
 - Split materialized prediction identity into exact `predictedAction` and lossless covering `executionAction`; target-decoder candidates no longer inherit execution-projection identity.
 - Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
 - Added required `ActionKey.schemaHash`; canonical keys now include execution class and validated input schema, preventing reuse after an in-session tool contract change.

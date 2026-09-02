@@ -234,7 +234,6 @@ interface SpeculativeActionController {
 	readonly previewActorTool: (tool: string, signal?: AbortSignal) => void;
 	readonly previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => void;
 	readonly decorateActorPayload: (payload: unknown) => unknown;
-	readonly decorateDrafterPayload: (payload: unknown) => unknown;
 	readonly observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) => void;
 	readonly selfSpeculationSnapshot: () => SelfSpeculationCoordinatorSnapshot;
 	readonly finishTurn: (terminal?: boolean) => Promise<void>;
@@ -304,7 +303,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction timeout: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`PatternAware: ${settings.patternAware.enabled ? "On" : "Off"}; multi-step: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (beam/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, promotion ${settings.patternAware.minOccurrences}, binding≥${settings.patternAware.minBindingReplayProbability}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; Drafter provider self-fork ${settings.selfSpeculation.forkTransport === "provider" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.drafterEnabled ? "On" : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
+		`Self-speculation: ${settings.selfSpeculation.enabled ? "On" : "Off"}; Actor ${settings.selfSpeculation.forkTransport} fork ${settings.selfSpeculation.forkEnabled ? "On" : "Off"}; sidecar action source ${settings.selfSpeculation.enabled && settings.selfSpeculation.forkTransport === "sidecar" && settings.selfSpeculation.forkEnabled && settings.selfSpeculation.forkActionEnabled ? `On (confidence ≥${formatNumber(settings.selfSpeculation.forkActionMinConfidence)})` : "Off"}; fork gate ${settings.selfSpeculation.forkGateEnabled ? `On (${settings.selfSpeculation.forkGateWindowSize} samples, ≥${formatDuration(settings.selfSpeculation.forkGateMinNetBenefitMs)} net)` : "Off"}; ${settings.selfSpeculation.maxCandidates} candidates × ${settings.selfSpeculation.maxDraftTokens} draft tokens; ${settings.selfSpeculation.draftFormat} at ${settings.selfSpeculation.draftBoundary}; ${settings.selfSpeculation.endpoint}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
@@ -329,17 +328,15 @@ export function createSpeculativeActionExtension(
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
 		const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
-		const providerRole = new AsyncLocalStorage<"drafter">();
+		const providerRequest = new AsyncLocalStorage<"drafter">();
 
 		pi.on("before_provider_request", (event) =>
-			providerRole.getStore() === "drafter"
-				? controller?.decorateDrafterPayload(event.payload)
-				: controller?.decorateActorPayload(event.payload),
+			providerRequest.getStore() === "drafter" ? event.payload : controller?.decorateActorPayload(event.payload),
 		);
 
 		pi.on("session_start", async (_event, ctx) => {
 			await controller?.dispose();
-			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRole);
+			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRequest);
 			controller.attachUI(ctx.ui);
 		});
 		pi.on("context", async (event, ctx) => {
@@ -387,7 +384,7 @@ async function installController(
 	pi: ExtensionAPI,
 	dependencies: SpeculativeActionExtensionDependencies,
 	wrapperSources: Map<string, string>,
-	providerRole: AsyncLocalStorage<"drafter">,
+	providerRequest: AsyncLocalStorage<"drafter">,
 ): Promise<SpeculativeActionController> {
 	let currentMetrics = emptyMetrics();
 	let ui: ExtensionUIContext | undefined;
@@ -478,7 +475,7 @@ async function installController(
 		cwd: context.cwd,
 		getSettings: runtimeSettings,
 		complete: (model, llmContext, options) =>
-			providerRole.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
+			providerRequest.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
 		draftModel: (actorModel) =>
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
 		getDraftOptions: async ({ draftModel, actorOptions, signal }) =>
@@ -616,7 +613,6 @@ async function installController(
 			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
 		},
 		decorateActorPayload: (payload) => selfSpeculation.decorateActorPayload(payload),
-		decorateDrafterPayload: (payload) => selfSpeculation.decorateDrafterPayload(payload),
 		observeActorOutput: (event) => selfSpeculation.observeActorOutput(event),
 		selfSpeculationSnapshot: () => selfSpeculation.snapshot(),
 		finishTurn: async (terminal = false) => {
@@ -1022,7 +1018,6 @@ async function openSelfSpeculationSettings(
 			[`Actor fork: ${self.forkEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkEnabled: !self.forkEnabled })],
 			[`Fork action source: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled })],
 			[`Fork action confidence: ${formatNumber(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence")],
-			[`Drafter fork: ${self.drafterEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { drafterEnabled: !self.drafterEnabled })],
 			[`Fork gate: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled })],
 			[`Gate warm-up: ${self.forkGateMinSamples}`, () => edit("forkGateMinSamples")],
 			[`Gate window: ${self.forkGateWindowSize}`, () => edit("forkGateWindowSize")],

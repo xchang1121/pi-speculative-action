@@ -153,8 +153,8 @@ npm run setup:linux
 
 fork 有两种传输方式：
 
-- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，每个完整 fork candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、fork timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只有 SPORK 报告的“已选 token 最低 top-1 概率”达到门槛时才接纳整批动作；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。该门控只影响动作交接，已经运行的 fork 与目标解码遥测保持不变，也不会新增推理请求。该模式看不到 Drafter 的私有流，因此 Drafter 动作仍进入统一候选包，但不会进行 Drafter 自 fork。
-- `provider`：把版本化的 `self_speculation` 控制对象直接放进 Actor 请求；`drafterEnabled` 打开时也放进每个 Drafter 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，每个完整 fork candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、fork timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只有 SPORK 报告的“已选 token 最低 top-1 概率”达到门槛时才接纳整批动作；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。该门控只影响动作交接，已经运行的 fork 与目标解码遥测保持不变，也不会新增推理请求。
+- `provider`：只把版本化的 `self_speculation` 控制对象放进权威 Actor 请求。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式；Drafter 模型请求不会被修改。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
 
 使用正数动作置信度门槛与参考 sidecar 时，应把 `requireLogprobs` 设为 `true`；若引擎无法提供证据，fork 会明确失败，而不会静默执行无分数动作。
 
