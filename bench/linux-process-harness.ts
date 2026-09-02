@@ -51,6 +51,7 @@ export async function createLinuxProcessBenchmark(
 	const environment = Object.freeze({
 		PATH: `${workspace}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
 		HOME: os.homedir(),
+		SHELL: shellPath,
 		LANG: "C.UTF-8",
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
