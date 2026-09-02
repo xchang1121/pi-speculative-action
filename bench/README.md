@@ -1,5 +1,11 @@
 # Speculative-action ablation benchmark
 
+The process dependency combinations and mandatory Direct/Trace/Publish/Whole-hit/Child-hit/
+Child-join/Fork-miss/Fork-hit comparison are specified in
+`../docs/bash-reuse-capability-lattice.md`. Existing Linux
+qualifications below cover a subset of that matrix; a report must not claim the full dependency
+ablation until every applicable row has been measured on the same machine and initial snapshot.
+
 This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
