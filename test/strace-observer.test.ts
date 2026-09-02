@@ -112,6 +112,22 @@ describe("strace provenance decoder", () => {
 		}
 	});
 
+	test("allows captured resource-limit reads but rejects mutations", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-limits-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(`${prefix}.425`, [
+				'execve("/usr/bin/example", ["example"], 0x0) = 0',
+				'prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0',
+			].join("\n"));
+			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).not.toContain("unsupported_syscall");
+			await fs.appendFile(`${prefix}.425`, '\nsetrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0\n');
+			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toContain("unsupported_syscall");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("treats Unix-domain communication as external input unless a provider removes it from the trace", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-unix-socket-"));
 		const prefix = path.join(root, "process");

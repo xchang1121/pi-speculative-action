@@ -156,7 +156,7 @@ export async function observeStrace(
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
 			if (
-				RESOURCE_LIMIT_SYSCALLS.has(syscall) ||
+				resourceLimitMutation(line, syscall) ||
 				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
@@ -331,7 +331,11 @@ const IPC_SYSCALLS = new Set([
 
 const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
 const RANDOM_SYSCALLS = new Set(["getrandom"]);
-const RESOURCE_LIMIT_SYSCALLS = new Set(["getrlimit", "setrlimit", "prlimit64"]);
+
+function resourceLimitMutation(line: string, syscall: string): boolean {
+	if (!syscallSucceeded(line)) return false;
+	return syscall === "setrlimit" || (syscall === "prlimit64" && !/^\s*prlimit64\([^,]+,[^,]+,\s*NULL\s*,/.test(line));
+}
 
 function ignoredProcessSegments(
 	selected: ReadonlyMap<number, number>,
