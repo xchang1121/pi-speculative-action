@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 4 as const;
+export const PROCESS_CERTIFICATE_VERSION = 5 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -57,10 +57,7 @@ export interface ExecPrototype {
 	readonly environment: readonly SemanticEnvironmentEntry[];
 	readonly environmentComplete: true;
 	readonly umask: number;
-	readonly rlimitsDigest: Sha256Digest;
-	readonly signalDispositionsDigest: Sha256Digest;
-	readonly credentialsDigest: Sha256Digest;
-	readonly schedulingDigest: Sha256Digest;
+	readonly processContextDigest: Sha256Digest;
 	readonly stdin: {
 		readonly type: "closed" | "bytes";
 		readonly digest?: Sha256Digest;
@@ -413,10 +410,7 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 	for (const digest of [
 		prototype.executableDigest,
 		prototype.argvDigest,
-		prototype.rlimitsDigest,
-		prototype.signalDispositionsDigest,
-		prototype.credentialsDigest,
-		prototype.schedulingDigest,
+		prototype.processContextDigest,
 	]) {
 		if (!isSha256Digest(digest)) throw new Error("process prototype contains an invalid digest");
 	}
@@ -460,10 +454,7 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 		environment,
 		environmentComplete: true,
 		umask: prototype.umask,
-		rlimitsDigest: prototype.rlimitsDigest,
-		signalDispositionsDigest: prototype.signalDispositionsDigest,
-		credentialsDigest: prototype.credentialsDigest,
-		schedulingDigest: prototype.schedulingDigest,
+		processContextDigest: prototype.processContextDigest,
 		stdin: { ...prototype.stdin },
 		fileDescriptorTableComplete: true,
 		inheritedFDs,

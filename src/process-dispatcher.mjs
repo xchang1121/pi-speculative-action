@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
@@ -11,28 +12,31 @@ const token = configuration?.token;
 const invokedPath = process.argv[1] ?? "";
 const invoked = path.basename(invokedPath);
 const args = process.argv.slice(2);
-const stdinTarget = readDescriptorTarget(0);
-const buffered = !process.stdin.isTTY && !process.stdout.isTTY && !process.stderr.isTTY;
-const stdinClosed = stdinTarget === "/dev/null";
-
 const environment = { ...process.env };
+// Node ignores SIGXFSZ at startup; an exec outlet must preserve the shell's default disposition.
+const resetXfsz = () => {};
+process.on("SIGXFSZ", resetXfsz);
+process.off("SIGXFSZ", resetXfsz);
 
-if (!validConfiguration(configuration) || !invoked || !buffered || !stdinClosed) {
+if (!configuration && args[0] === "--exec" && args.length >= 3) {
+	await run(args[2], args.slice(3), args[1]);
+} else if (!configuration && args.length === 1 && args[0] === "--probe-context") {
+	fs.writeSync(1, JSON.stringify(executionContext()));
+} else if (!validConfiguration(configuration) || !invoked) {
 	await fallback();
 } else {
 	try {
 		const response = await exchange({
-			version: 1,
+			version: 2,
 			token,
 			name: invoked,
 			invokedPath,
 			args,
 			cwd: process.cwd(),
 			environment,
-			umask: process.umask(),
-			stdin: "closed",
+			context: executionContext(),
 		});
-		if (!response || response.version !== 1 || response.kind === "bypass") {
+		if (!response || response.version !== 2 || response.kind === "bypass") {
 			await fallback(response?.executable);
 		} else {
 			for (const event of response.output ?? []) {
@@ -45,13 +49,9 @@ if (!validConfiguration(configuration) || !invoked || !buffered || !stdinClosed)
 				process.exitCode = Number.isSafeInteger(response.exit?.code) ? response.exit.code : 125;
 			}
 		}
-	} catch (error) {
-		if (error?.outcomeUncertain) {
-			process.stderr.write(`${invoked}: broker outcome unavailable; refusing unsafe re-execution\n`);
-			process.exitCode = 125;
-		} else {
-			await fallback();
-		}
+	} catch {
+		process.stderr.write(`${invoked}: broker unavailable; refusing unobserved execution\n`);
+		process.exitCode = 125;
 	}
 }
 
@@ -63,7 +63,11 @@ async function fallback(explicitExecutable) {
 		process.exitCode = 127;
 		return;
 	}
-	const child = spawn(executable, args, { cwd: process.cwd(), env: environment, stdio: "inherit" });
+	await run(executable, args, invoked);
+}
+
+async function run(executable, commandArgs, argv0) {
+	const child = spawn(executable, commandArgs, { argv0, cwd: process.cwd(), env: environment, stdio: "inherit" });
 	const outcome = await new Promise((resolve, reject) => {
 		child.once("error", reject);
 		child.once("exit", (code, signal) => resolve({ code, signal }));
@@ -85,7 +89,7 @@ function escapeExecutable(executable) {
 function validConfiguration(value) {
 	return Boolean(
 		value &&
-			value.version === 1 &&
+			value.version === 2 &&
 			typeof value.socketPath === "string" &&
 			typeof value.token === "string" &&
 			Array.isArray(value.directories) &&
@@ -96,23 +100,69 @@ function validConfiguration(value) {
 	);
 }
 
+function executionContext() {
+	const status = Object.fromEntries(
+		fs.readFileSync("/proc/self/status", "utf8")
+			.split("\n")
+			.map((line) => line.split(/:\s*/, 2))
+			.filter(([name]) => ["Cpus_allowed_list", "Mems_allowed_list", "SigBlk", "SigIgn"].includes(name)),
+	);
+	const aliases = new Map();
+	const descriptors = [0, 1, 2].map((fd) => descriptor(fd, aliases));
+	const umask = process.umask();
+	return {
+		key: JSON.stringify({
+			rlimits: fs.readFileSync("/proc/self/limits", "utf8").split("\n").slice(1)
+				.map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
+			credentials: {
+				uid: process.getuid(), euid: process.geteuid(), gid: process.getgid(), egid: process.getegid(),
+				groups: process.getgroups().sort((left, right) => left - right),
+			},
+			signals: { blocked: status.SigBlk, ignored: status.SigIgn },
+			scheduling: {
+				nice: os.getPriority(), cpus: status.Cpus_allowed_list, memoryNodes: status.Mems_allowed_list,
+			},
+			descriptors: descriptors.map(({ endpoint, ...value }) => ({
+				...value, flags: value.flags & ~0o2000000, ...(value.type === "device" ? { endpoint } : {}),
+			})),
+		}),
+		umask,
+		descriptorTypes: descriptors.map(({ type }) => type),
+		outputEndpoints: [descriptors[1]?.endpoint ?? "", descriptors[2]?.endpoint ?? ""],
+	};
+}
+
+function descriptor(fd, aliases) {
+	const stat = fs.fstatSync(fd, { bigint: true });
+	const endpoint = readDescriptorTarget(fd);
+	const identity = `${stat.dev}:${stat.ino}`;
+	if (!aliases.has(identity)) aliases.set(identity, aliases.size);
+	const flags = /^flags:\s*([0-7]+)/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))?.[1];
+	if (!flags) throw new Error(`descriptor ${fd} flags unavailable`);
+	return {
+		fd,
+		type: stat.isFile() ? "regular" : stat.isFIFO() ? "pipe" : stat.isSocket() ? "socket" :
+			stat.isCharacterDevice() ? (endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other",
+		flags: Number.parseInt(flags, 8),
+		alias: aliases.get(identity),
+		...(endpoint ? { endpoint } : {}),
+	};
+}
+
 function exchange(request) {
 	return new Promise((resolve, reject) => {
 		const socket = net.createConnection(socketPath);
 		let body = "";
 		let settled = false;
-		let outcomeUncertain = false;
 		const finish = (error, value) => {
 			if (settled) return;
 			settled = true;
 			socket.destroy();
-			if (error && outcomeUncertain && typeof error === "object") error.outcomeUncertain = true;
 			error ? reject(error) : resolve(value);
 		};
 		socket.setTimeout(24 * 60 * 60 * 1000, () => finish(new Error("broker timeout")));
 		socket.once("error", (error) => finish(error));
 		socket.once("connect", () => {
-			outcomeUncertain = true;
 			socket.end(`${JSON.stringify(request)}\n`);
 		});
 		socket.on("data", (chunk) => {

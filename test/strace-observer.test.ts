@@ -136,6 +136,7 @@ describe("strace provenance decoder", () => {
 					'execve("/usr/bin/example", ["example"], 0x0) = 0',
 					'setxattr("/work/output", "user.pi", "x", 1, 0) = 0',
 					'getxattr("/work/input", "user.pi", NULL, 0) = -1 ENODATA (No data available)',
+					'prlimit64(0, RLIMIT_CORE, NULL, {rlim_cur=0, rlim_max=RLIM64_INFINITY}) = 0',
 					'utimensat(AT_FDCWD, "/work/output", NULL, 0) = 0',
 					'fallocate(3</work/output>, 0, 0, 4096) = 0',
 					'ioctl(3</work/output>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0',

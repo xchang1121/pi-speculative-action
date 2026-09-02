@@ -2,7 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { DependencyRole, ProvenanceTaint } from "./provenance-certificate.ts";
 
-const SYSCALL_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,fchdir,fallocate,ioctl";
+const SYSCALL_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl";
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -156,6 +156,7 @@ export async function observeStrace(
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
 			if (
+				RESOURCE_LIMIT_SYSCALLS.has(syscall) ||
 				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
@@ -330,6 +331,7 @@ const IPC_SYSCALLS = new Set([
 
 const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
 const RANDOM_SYSCALLS = new Set(["getrandom"]);
+const RESOURCE_LIMIT_SYSCALLS = new Set(["getrlimit", "setrlimit", "prlimit64"]);
 
 function ignoredProcessSegments(
 	selected: ReadonlyMap<number, number>,

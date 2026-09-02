@@ -10,6 +10,7 @@ import {
 	mkdtemp,
 	readFile,
 	readdir,
+	readlink,
 	realpath,
 	rm,
 	symlink,
@@ -18,6 +19,7 @@ import {
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	createExecPrototype,
 	digestObject,
@@ -75,8 +77,8 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v10";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v9";
+const BACKEND_EPOCH = "pi-linux-process-v11";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v10";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
@@ -131,6 +133,7 @@ interface ReadyBackend {
 	readonly fingerprint: string;
 	readonly platformFingerprint: Sha256Digest;
 	readonly observerFingerprint: Sha256Digest;
+	readonly executionContext: DispatcherExecutionContext;
 }
 
 interface InterposedDirectory {
@@ -150,15 +153,21 @@ interface ProcessInterposition {
 }
 
 interface DispatcherRequest {
-	readonly version: 1;
+	readonly version: 2;
 	readonly token: string;
 	readonly name: string;
 	readonly invokedPath: string;
 	readonly args: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
+	readonly context: DispatcherExecutionContext;
+}
+
+interface DispatcherExecutionContext {
+	readonly key: string;
 	readonly umask: number;
-	readonly stdin: "closed";
+	readonly descriptorTypes: readonly ["device" | "other", "pipe" | "socket", "pipe" | "socket"];
+	readonly outputEndpoints: readonly [string, string];
 }
 
 interface BufferedOutput {
@@ -167,7 +176,7 @@ interface BufferedOutput {
 }
 
 interface DispatcherResponse {
-	readonly version: 1;
+	readonly version: 2;
 	readonly kind: "hit" | "executed" | "bypass";
 	readonly executable?: string;
 	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
@@ -198,6 +207,7 @@ interface ActiveSession {
 		readonly observedProcessMs: number;
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
+	topLevelOutputEndpoints?: Promise<readonly [string, string]>;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -460,14 +470,17 @@ export class LinuxProcessReuseBackend {
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
 		await execText(unshare, namespaceArguments(["true"]));
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-mount-probe-"));
+		let executionContext: DispatcherExecutionContext | undefined;
 		try {
 			const source = path.join(mountProbe, "source");
 			const target = path.join(mountProbe, "target");
 			await Promise.all([mkdir(source), mkdir(target)]);
 			await execText(unshare, namespaceArguments([mount, "--bind", source, target]));
+			executionContext = await probeExecutionContext({ sandlock, strace, unshare, workspace: source, privateRoot: target });
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
+		if (!executionContext) throw new Error("process execution context probe failed");
 		const observerFingerprint = digestObject({ epoch: BACKEND_EPOCH });
 		const fingerprint = digestObject({
 			epoch: BACKEND_EPOCH,
@@ -476,10 +489,14 @@ export class LinuxProcessReuseBackend {
 			strace: straceVersion.split(/\r?\n/)[0]?.trim(),
 			mount: mountVersion.split(/\r?\n/)[0]?.trim(),
 			platformFingerprint,
+			executionContext: sha256Digest(executionContext.key),
 			arch: process.arch,
 			deniedPaths: sensitivePaths(this.options.storeRoot, this.options.deniedPaths),
 		});
-		return { sandlock, strace, unshare, mount, fingerprint, platformFingerprint, observerFingerprint };
+		return {
+			sandlock, strace, unshare, mount, fingerprint, platformFingerprint, observerFingerprint,
+			executionContext,
+		};
 	}
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
@@ -525,6 +542,12 @@ export class LinuxProcessReuseBackend {
 				{
 					cwd: physicalCwd,
 					environment,
+					onSpawn: (pid) => {
+						session.topLevelOutputEndpoints = Promise.all([
+							readlink(`/proc/${pid}/fd/1`),
+							readlink(`/proc/${pid}/fd/2`),
+						]).then(([stdout, stderr]) => [stdout, stderr] as const);
+					},
 					...(session.invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
 					...(request.signal ? { signal: request.signal } : {}),
 					...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
@@ -647,7 +670,7 @@ export class LinuxProcessReuseBackend {
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
 					const request = parseDispatcherRequest(body);
 					const executable = request ? await this.resolveRequestedExecutable(session, request).catch(() => undefined) : undefined;
-					socket.end(JSON.stringify({ version: 1, kind: "bypass", ...(executable ? { executable } : {}) }));
+					socket.end(JSON.stringify({ version: 2, kind: "bypass", ...(executable ? { executable } : {}) }));
 				});
 		});
 	}
@@ -657,11 +680,12 @@ export class LinuxProcessReuseBackend {
 		const request = parseDispatcherRequest(body);
 		if (!request || request.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
 		this.add(session, "requests");
+		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
-		if (!eligibleRequest(session, request, executable)) {
+		if (!(await eligibleRequest(session, request, executable, ready.executionContext))) {
 			this.add(session, "bypasses");
 			session.incompleteReasons.add(`broker_bypass:${request.name}`);
-			return { version: 1, kind: "bypass", executable };
+			return { version: 2, kind: "bypass", executable };
 		}
 		const prototype = await this.prototype(session, request, executable);
 		const weakKey = processWeakKey(prototype);
@@ -755,7 +779,7 @@ export class LinuxProcessReuseBackend {
 					: "unattributedHits",
 			);
 			replayed = true;
-			return { version: 1, kind: "hit", weakKey, output, exit: certificate.result.exit };
+			return { version: 2, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
 			const observed = plan.certificate.result.observedProcessMs;
@@ -792,6 +816,10 @@ export class LinuxProcessReuseBackend {
 					session.deniedPaths,
 				),
 				"--",
+				process.execPath,
+				fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+				"--exec",
+				request.name,
 				executable,
 				...request.args,
 			]);
@@ -887,7 +915,7 @@ export class LinuxProcessReuseBackend {
 				session.incompleteReasons.add(`nested_capture:${errorMessage(error)}`);
 			}
 			const exit = exitOutcome(outcome);
-			return { version: 1, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
+			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
 			this.add(session, "executionMs", Math.max(0, performance.now() - started));
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
@@ -947,6 +975,8 @@ export class LinuxProcessReuseBackend {
 
 	private async prototype(session: ActiveSession, request: DispatcherRequest, executable: string): Promise<ExecPrototype> {
 		const [content, ready] = await Promise.all([readFile(executable), this.resolveReady()]);
+		const context = ready.executionContext;
+		const contextDigest = sha256Digest(context.key);
 		const environment = Object.fromEntries(
 			Object.entries(executionEnvironment(request.environment, executable)).map(([name, value]) => [
 				name,
@@ -960,18 +990,13 @@ export class LinuxProcessReuseBackend {
 			argv,
 			logicalCwd: session.projection.toLogical(request.cwd),
 			environment,
-			umask: request.umask,
-			rlimitsDigest: digestObject({ nofile: "broker-controlled", processes: 64 }),
-			signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-			credentialsDigest: digestObject({ userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() }),
-			schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism() }),
+			umask: context.umask,
+			processContextDigest: contextDigest,
 			stdin: { type: "closed", eof: true },
 			fileDescriptorTableComplete: true,
-			inheritedFDs: [
-				{ fd: 0, type: "device", flagsDigest: digestObject({ mode: "read", endpoint: "/dev/null" }), eof: true },
-				{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
-				{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
-			],
+			inheritedFDs: context.descriptorTypes.map((type, fd) => ({
+				fd, type, flagsDigest: sha256Digest(`${context.key}\0${fd}`), ...(fd === 0 ? { eof: true } : {}),
+			})),
 			platformFingerprint: ready.platformFingerprint,
 		});
 	}
@@ -1475,7 +1500,7 @@ async function createProcessInterposition(input: {
 		directories.push({ source, target, shadow: path.join(shadowRoot, index), view: path.join(viewRoot, index) });
 	}
 	const configuration = {
-		version: 1,
+		version: 2,
 		socketPath: input.socketPath,
 		token: input.token,
 		directories: directories.map(({ target, shadow }) => ({ target, shadow })),
@@ -1609,6 +1634,36 @@ function sandboxPolicyArguments(
 	];
 }
 
+async function probeExecutionContext(input: {
+	readonly sandlock: string;
+	readonly strace: string;
+	readonly unshare: string;
+	readonly workspace: string;
+	readonly privateRoot: string;
+}): Promise<DispatcherExecutionContext> {
+	const outcome = await runSpawn(
+		input.unshare,
+		namespaceArguments(straceCommand(input.strace, path.join(input.privateRoot, "context"), [
+			input.sandlock,
+			...sandboxPolicyArguments(input.workspace, input.privateRoot, input.workspace, []),
+			"--",
+			process.execPath,
+			fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+			"--exec",
+			"pi-context-probe",
+			process.execPath,
+			fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+			"--probe-context",
+		])),
+		{ cwd: input.workspace, environment: normalizeEnvironment(process.env) },
+	);
+	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
+	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
+	const parsed: unknown = JSON.parse(stdout);
+	if (!validDispatcherContext(parsed)) throw new Error("process execution context probe returned invalid data");
+	return parsed;
+}
+
 function speculativeProducerProof(
 	ready: ReadyBackend,
 	deniedPaths: readonly string[],
@@ -1663,6 +1718,7 @@ async function runSpawn(
 		readonly signal?: AbortSignal;
 		readonly timeoutSeconds?: number;
 		readonly onOutput?: (event: BufferedOutput) => void;
+		readonly onSpawn?: (pid: number) => void;
 	},
 ): Promise<SpawnOutcome> {
 	throwIfAborted(options.signal);
@@ -1673,6 +1729,7 @@ async function runSpawn(
 		stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"],
 	});
 	const output: BufferedOutput[] = [];
+	if (child.pid) options.onSpawn?.(child.pid);
 	const append = (fd: 1 | 2, value: Buffer) => {
 		const event = { fd, data: Buffer.from(value) } as const;
 		const previous = output.at(-1);
@@ -1722,7 +1779,7 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
 		if (
-			request.version !== 1 ||
+			request.version !== 2 ||
 			typeof request.token !== "string" ||
 			typeof request.name !== "string" ||
 			typeof request.invokedPath !== "string" ||
@@ -1732,8 +1789,7 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 			typeof request.cwd !== "string" ||
 			!request.environment ||
 			typeof request.environment !== "object" ||
-			!Number.isSafeInteger(request.umask) ||
-			request.stdin !== "closed"
+			!validDispatcherContext(request.context)
 		) {
 			return undefined;
 		}
@@ -1750,12 +1806,32 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 	}
 }
 
-function eligibleRequest(session: ActiveSession, request: DispatcherRequest, executable: string): boolean {
+async function eligibleRequest(
+	session: ActiveSession,
+	request: DispatcherRequest,
+	executable: string,
+	expectedContext: DispatcherExecutionContext,
+): Promise<boolean> {
+	const endpoints = await session.topLevelOutputEndpoints?.catch(() => undefined);
+	return Boolean(
+		executable && endpoints && pathContains(session.workspace.sandboxRoot, request.cwd) &&
+		request.args.length <= 4096 && request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) <= 1024 * 1024 &&
+		request.context.key === expectedContext.key && request.context.umask === expectedContext.umask &&
+		request.context.outputEndpoints[0] === endpoints[0] && request.context.outputEndpoints[1] === endpoints[1]
+	);
+}
+
+function validDispatcherContext(value: unknown): value is DispatcherExecutionContext {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const context = value as Partial<DispatcherExecutionContext>;
 	return (
-		pathContains(session.workspace.sandboxRoot, request.cwd) &&
-		request.args.length <= 4096 &&
-		request.args.reduce((total, value) => total + Buffer.byteLength(value), 0) <= 1024 * 1024 &&
-		Boolean(executable)
+		typeof context.key === "string" && context.key.length > 0 && context.key.length <= 64 * 1024 &&
+		Number.isSafeInteger(context.umask) && context.umask! >= 0 && context.umask! <= 0o777 &&
+		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
+		context.descriptorTypes[0] === "device" && ["pipe", "socket"].includes(context.descriptorTypes[1] ?? "") &&
+		["pipe", "socket"].includes(context.descriptorTypes[2] ?? "") &&
+		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
+		context.outputEndpoints.every((endpoint) => typeof endpoint === "string" && endpoint.length <= 4096)
 	);
 }
 
@@ -1799,12 +1875,14 @@ async function topLevelProcessPrototype(
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
 		umask: process.umask(),
-		rlimitsDigest: digestObject({ inherited: sha256Digest(await readFile("/proc/self/limits")) }),
-		signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-		credentialsDigest: digestObject({
-			uid: process.getuid?.(), euid: process.geteuid?.(), gid: process.getgid?.(), egid: process.getegid?.(), groups: process.getgroups?.(),
+		processContextDigest: digestObject({
+			limits: sha256Digest(await readFile("/proc/self/limits")),
+			credentials: {
+				uid: process.getuid?.(), euid: process.geteuid?.(), gid: process.getgid?.(), egid: process.getegid?.(), groups: process.getgroups?.(),
+			},
+			scheduler: { cpuCount: os.availableParallelism(), timeout: request.timeout ?? null },
+			signals: "node-default-v1",
 		}),
-		schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism(), timeout: request.timeout ?? null }),
 		stdin:
 			invocation.commandTransport === "stdin"
 				? { type: "bytes", digest: sha256Digest(request.command), eof: true }
