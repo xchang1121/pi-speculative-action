@@ -722,18 +722,9 @@ function createBaseToolDefinitions(
 
 function speculativeToolDefinition(base: BaseToolDefinition, controller: SpeculativeActionController): ToolDefinition {
 	return {
-		name: base.name,
-		label: base.label,
-		description: base.description,
-		parameters: base.parameters,
-		...(base.promptSnippet ? { promptSnippet: base.promptSnippet } : {}),
-		...(base.promptGuidelines ? { promptGuidelines: base.promptGuidelines } : {}),
-		...(base.prepareArguments ? { prepareArguments: base.prepareArguments } : {}),
-		...(base.constrainedSampling ? { constrainedSampling: base.constrainedSampling } : {}),
-		...(base.executionMode ? { executionMode: base.executionMode } : {}),
-		...(base.renderShell ? { renderShell: base.renderShell } : {}),
-		...(base.renderCall ? { renderCall: base.renderCall as ToolDefinition["renderCall"] } : {}),
-		...(base.renderResult ? { renderResult: base.renderResult as ToolDefinition["renderResult"] } : {}),
+		...base,
+		renderCall: base.renderCall as ToolDefinition["renderCall"],
+		renderResult: base.renderResult as ToolDefinition["renderResult"],
 		async execute(callID, input, signal, onUpdate, context) {
 			return controller.execute(base.name, callID, input, signal, onUpdate, context);
 		},
@@ -754,12 +745,7 @@ function toolConflictSummary(conflicts: ReadonlyMap<string, string>): string {
 
 function toAgentTool(base: BaseToolDefinition, context: () => ExtensionContext): AgentTool {
 	return {
-		name: base.name,
-		label: base.label,
-		description: base.description,
-		parameters: base.parameters,
-		...(base.prepareArguments ? { prepareArguments: base.prepareArguments } : {}),
-		...(base.executionMode ? { executionMode: base.executionMode } : {}),
+		...base,
 		execute: async (callID, input, signal, onUpdate) =>
 			withPiProjectionCoverage(
 				base.name,
