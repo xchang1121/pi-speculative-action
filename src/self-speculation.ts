@@ -16,12 +16,7 @@ import {
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
-import {
-	ActionAdoptionLedger,
-	DecoderVerificationLedger,
-	type ActionEvidenceContext,
-	type DecoderEvidenceContext,
-} from "./self-speculation-evidence.ts";
+import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { stableStringify } from "./stable-json.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
@@ -325,8 +320,8 @@ export class SelfSpeculationCoordinator {
 	private readonly requestID: () => string;
 	readonly actorForkPlanSource: ActorForkPlanSource;
 	private readonly forkGate = new ForkBenefitGate();
-	private readonly decoderEvidence = new DecoderVerificationLedger();
-	private readonly actionEvidence = new ActionAdoptionLedger();
+	private readonly decoderEvidence = new EvidenceLedger(4, 2);
+	private readonly actionEvidence = new EvidenceLedger(2, 1);
 	private readonly background = new Set<Promise<void>>();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
@@ -621,7 +616,8 @@ export class SelfSpeculationCoordinator {
 		const adopted = settlement.match.matched && settlement.match.adoption.status === "adopted";
 		this.actionEvidence.observe(
 			actionEvidenceContext(state, feedback.tool, settlement.prediction.source),
-			adopted,
+			1,
+			adopted ? 1 : 0,
 		);
 	}
 
@@ -710,10 +706,10 @@ export class SelfSpeculationCoordinator {
 			forkActionAdoptions: this.forkActionAdoptions,
 			forkExecutionAheadMs: this.totalForkExecutionAheadMs,
 			decoderEvidenceContexts: decoderEvidence.contexts,
-			decoderVerificationSteps: decoderEvidence.verificationSteps,
+			decoderVerificationSteps: decoderEvidence.observations,
 			actionEvidenceContexts: actionEvidence.contexts,
-			actionEvidenceObservations: actionEvidence.observations,
-			actionEvidenceAdoptions: actionEvidence.adoptions,
+			actionEvidenceObservations: actionEvidence.trials,
+			actionEvidenceAdoptions: actionEvidence.successes,
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
@@ -1186,7 +1182,7 @@ function modelKey(model: Model<Api>): string {
 	return JSON.stringify([model.provider, model.api, model.id]);
 }
 
-function decoderEvidenceContext(state: TurnState, tool: string, source: string): DecoderEvidenceContext {
+function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
 	return {
 		model: state.gateKey,
 		endpoint: state.settings.endpoint,
@@ -1197,7 +1193,7 @@ function decoderEvidenceContext(state: TurnState, tool: string, source: string):
 	};
 }
 
-function actionEvidenceContext(state: TurnState, tool: string, source: string): ActionEvidenceContext {
+function actionEvidenceContext(state: TurnState, tool: string, source: string) {
 	return { model: state.gateKey, tool, source };
 }
 
