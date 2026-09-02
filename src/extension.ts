@@ -48,6 +48,7 @@ import {
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
 import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
+import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
 	executionCapabilityStatus,
@@ -413,14 +414,32 @@ async function installController(
 	const localProcessOperations = createLocalBashOperations({
 		...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 	});
-	const processCoordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localProcessOperations));
-	let workspaceSandbox: WorkspaceSandboxService | undefined;
 	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.();
+	const processBackend = configuredExecutionWorlds
+		? undefined
+		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
+	const directProcessExecutor = adaptProcessToolOperations(localProcessOperations);
+	const processCoordinator = new ProcessExecutionCoordinator(
+		processBackend?.completedReplayExecutor(directProcessExecutor, {
+			sourceRoot: context.cwd,
+			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
+			invocation: (request) =>
+				resolvePiToolInvocation("bash", { command: request.command, ...(request.timeout !== undefined ? { timeout: request.timeout } : {}) }, {
+					cwd: request.cwd,
+					environment: Object.fromEntries(
+						Object.entries(request.environment).filter((entry): entry is [string, string] => entry[1] !== undefined),
+					),
+					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
+				})?.process,
+		}) ?? directProcessExecutor,
+	);
+	let workspaceSandbox: WorkspaceSandboxService | undefined;
 	if (!configuredExecutionWorlds) {
 		workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
 		configuredExecutionWorlds = [
 			createLinuxProcessExecutionWorld({
 				coordinator: processCoordinator,
+				backend: processBackend,
 				storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
 				workspaceSandbox,
 			}),

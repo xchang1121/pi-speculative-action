@@ -49,7 +49,7 @@ import {
 	type WorkspaceStructureSnapshot,
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
-import type { ProcessExecutionRequest, ProcessExecutor } from "./process-execution.ts";
+import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
 import {
 	emptyWorldReuseMetrics,
 	type ExecutionScope,
@@ -92,6 +92,12 @@ export interface LinuxProcessBackendOptions {
 	readonly deniedPaths?: readonly string[];
 }
 
+export interface CompletedProcessReplayOptions {
+	readonly sourceRoot: string;
+	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
+	readonly enabled?: () => boolean;
+}
+
 export interface LinuxProcessBackendStatus {
 	readonly state: "ready" | "unavailable";
 	readonly detail: string;
@@ -123,7 +129,7 @@ interface ReadyBackend {
 	readonly unshare: string;
 	readonly mount: string;
 	readonly fingerprint: string;
-	readonly platformFingerprint: string;
+	readonly platformFingerprint: Sha256Digest;
 	readonly observerFingerprint: Sha256Digest;
 }
 
@@ -220,6 +226,7 @@ export class LinuxProcessReuseBackend {
 	readonly storage: ExecutionWorldStorageControl;
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
+	private platformFingerprint?: Promise<Sha256Digest>;
 	private disposed = false;
 	private readonly inFlight = new Map<Sha256Digest, Promise<void>>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
@@ -268,6 +275,63 @@ export class LinuxProcessReuseBackend {
 
 	metrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.counters });
+	}
+
+	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
+	completedReplayExecutor(host: ProcessExecutor, options: CompletedProcessReplayOptions): ProcessExecutor {
+		const sourceRoot = path.resolve(options.sourceRoot);
+		return {
+			execute: async (request) => {
+				if (process.platform !== "linux" || options.enabled?.() === false || !pathContains(sourceRoot, request.cwd)) {
+					return host.execute(request);
+				}
+				this.counters.wholeCommandRequests++;
+				let committed = false;
+				try {
+					throwIfAborted(request.signal);
+					const invocation = options.invocation(request);
+					if (!invocation) return this.actorReplayMiss(host, request);
+					assertInvocationMatches(invocation, request);
+					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
+					const prototype = await actorTopLevelPrototype(
+						invocation,
+						request,
+						projection,
+						await this.resolvePlatformFingerprint(),
+					);
+					const plan = await this.planner.plan({
+						prototype,
+						acceptProducer: actorCertificateProducer,
+						contract: {
+							sink: "buffered",
+							orderedJournal: true,
+							transactionalEffects: true,
+							mode: "completed_replay",
+						},
+						validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath) },
+					});
+					this.recordLookup(plan.lookup);
+					if (plan.kind !== "completed_replay") {
+						if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
+							this.counters.lastError = `actor_reuse_miss:${plan.reasons.join(",")}`;
+						}
+						return this.actorReplayMiss(host, request);
+					}
+					throwIfAborted(request.signal);
+					const replayStarted = performance.now();
+					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+					committed = true;
+					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
+					this.counters.replayMs += Math.max(0, performance.now() - replayStarted);
+					this.counters.wholeCommandHits++;
+					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
+				} catch (error) {
+					this.counters.lastError = `actor_replay:${errorMessage(error)}`;
+					if (committed || error instanceof AggregateError) throw error;
+					return this.actorReplayMiss(host, request);
+				}
+			},
+		};
 	}
 
 	async open(input: {
@@ -364,6 +428,13 @@ export class LinuxProcessReuseBackend {
 		return this.ready;
 	}
 
+	private resolvePlatformFingerprint(): Promise<Sha256Digest> {
+		this.platformFingerprint ??= execText("uname", ["-srm"]).then((kernel) =>
+			digestObject({ kernel: kernel.trim(), arch: process.arch }),
+		);
+		return this.platformFingerprint;
+	}
+
 	private async probe(): Promise<ReadyBackend> {
 		if (process.platform !== "linux") throw new Error("Linux host required");
 		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
@@ -374,12 +445,12 @@ export class LinuxProcessReuseBackend {
 			resolveBinary(this.options.unshareBinary, "unshare"),
 			resolveBinary(undefined, "mount"),
 		]);
-		const [sandlockCheck, sandlockVersion, straceVersion, mountVersion, kernel] = await Promise.all([
+		const [sandlockCheck, sandlockVersion, straceVersion, mountVersion, platformFingerprint] = await Promise.all([
 			execText(sandlock, ["check"]),
 			execText(sandlock, ["--version"]),
 			execText(strace, ["-V"]),
 			execText(mount, ["--version"]),
-			execText("uname", ["-srm"]),
+			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
 		await execText(unshare, namespaceArguments(["true"]));
@@ -392,7 +463,6 @@ export class LinuxProcessReuseBackend {
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
-		const platformFingerprint = digestObject({ kernel: kernel.trim(), arch: process.arch });
 		const observerFingerprint = digestObject({ epoch: BACKEND_EPOCH });
 		const fingerprint = digestObject({
 			epoch: BACKEND_EPOCH,
@@ -400,7 +470,7 @@ export class LinuxProcessReuseBackend {
 			sandlock: sandlockVersion.trim(),
 			strace: straceVersion.split(/\r?\n/)[0]?.trim(),
 			mount: mountVersion.split(/\r?\n/)[0]?.trim(),
-			kernel: kernel.trim(),
+			platformFingerprint,
 			arch: process.arch,
 			deniedPaths: sensitivePaths(this.options.storeRoot, this.options.deniedPaths),
 		});
@@ -512,31 +582,11 @@ export class LinuxProcessReuseBackend {
 		ready: ReadyBackend,
 		environment: Readonly<Record<string, string>>,
 	): Promise<ExecPrototype> {
-		const shell = session.invocation.shell;
-		const argv = [shell, ...session.invocation.shellArgs];
-		if (session.invocation.commandTransport === "argv") argv.push(request.command);
-		return createExecPrototype({
-			executablePath: shell,
-			executableDigest: sha256Digest(await readFile(shell)),
-			argv: argv.map((value) => session.projection.normalizeValue(value)),
-			logicalCwd: session.projection.toLogical(session.projection.toPhysical(request.cwd) ?? request.cwd),
-			environment,
+		return topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint, {
 			umask: 0o22,
-			rlimitsDigest: digestObject({ nofile: "sandbox-controlled", processes: 64 }),
-			signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-			credentialsDigest: digestObject({ userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() }),
-			schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism() }),
-			stdin:
-				session.invocation.commandTransport === "stdin"
-					? { type: "bytes", digest: sha256Digest(request.command), eof: true }
-					: { type: "closed", eof: true },
-			fileDescriptorTableComplete: true,
-			inheritedFDs: [
-				{ fd: 0, type: session.invocation.commandTransport === "stdin" ? "pipe" : "device", flagsDigest: digestObject({ mode: "read" }), eof: true },
-				{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
-				{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
-			],
-			platformFingerprint: ready.platformFingerprint,
+			rlimits: { nofile: "sandbox-controlled", processes: 64 },
+			credentials: { userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() },
+			scheduling: { scheduler: "inherited", cpuCount: os.availableParallelism() },
 		});
 	}
 
@@ -648,7 +698,6 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async plan(session: ActiveSession, prototype: ExecPrototype) {
-		const started = performance.now();
 		const plan = await this.planner.plan({
 			prototype,
 			acceptProducer: (producer) => compatibleProducer(session.producer, producer),
@@ -660,19 +709,32 @@ export class LinuxProcessReuseBackend {
 			},
 			validation: { resolvePath: (logicalPath) => session.projection.toPhysical(logicalPath) },
 		});
-		this.add(session, "validationMs", Math.max(0, performance.now() - started));
-		this.add(session, "validationCandidates", plan.lookup.candidateCertificates);
-		this.add(session, "validationPathsets", plan.lookup.pathsetsValidated);
-		this.add(session, "validationFilesRead", plan.lookup.filesRead);
-		this.add(session, "validationBytesRead", plan.lookup.bytesRead);
-		this.add(session, "validationArtifactsLoaded", plan.lookup.artifactsLoaded);
-		this.add(session, "validationArtifactBytesRead", plan.lookup.artifactBytesRead);
+		this.recordLookup(plan.lookup, session);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
 			this.setError(session, `reuse_miss:${plan.reasons.join(",")}${
 				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
 			}`);
 		}
 		return plan.kind === "completed_replay" ? plan : undefined;
+	}
+
+	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
+		const record = (metric: CountedReuseMetric, value: number) => {
+			if (session) this.add(session, metric, value);
+			else this.counters[metric] += value;
+		};
+		record("validationMs", lookup.durationMs);
+		record("validationCandidates", lookup.candidateCertificates);
+		record("validationPathsets", lookup.pathsetsValidated);
+		record("validationFilesRead", lookup.filesRead);
+		record("validationBytesRead", lookup.bytesRead);
+		record("validationArtifactsLoaded", lookup.artifactsLoaded);
+		record("validationArtifactBytesRead", lookup.artifactBytesRead);
+	}
+
+	private actorReplayMiss(host: ProcessExecutor, request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
+		this.counters.wholeCommandMisses++;
+		return host.execute(request);
 	}
 
 	private async replay(
@@ -1726,6 +1788,77 @@ function executionEnvironment(environment: Readonly<Record<string, string>>, exe
 
 function normalizeEnvironment(environment: Readonly<Record<string, string | undefined>>): Record<string, string> {
 	return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+interface TopLevelProcessContext {
+	readonly umask: number;
+	readonly rlimits: unknown;
+	readonly credentials: unknown;
+	readonly scheduling: unknown;
+}
+
+async function actorTopLevelPrototype(
+	invocation: ToolProcessInvocation,
+	request: ProcessExecutionRequest,
+	projection: ExecutionPathProjection,
+	platformFingerprint: Sha256Digest,
+): Promise<ExecPrototype> {
+	return topLevelProcessPrototype(invocation, request, normalizeEnvironment(request.environment), projection, platformFingerprint, {
+		umask: process.umask(),
+		rlimits: { inherited: sha256Digest(await readFile("/proc/self/limits")) },
+		credentials: {
+			userNamespace: "host",
+			uid: process.getuid?.(),
+			euid: process.geteuid?.(),
+			gid: process.getgid?.(),
+			egid: process.getegid?.(),
+			groups: process.getgroups?.(),
+		},
+		scheduling: { scheduler: "inherited", cpuCount: os.availableParallelism() },
+	});
+}
+
+async function topLevelProcessPrototype(
+	invocation: ToolProcessInvocation,
+	request: ProcessExecutionRequest,
+	environment: Readonly<Record<string, string>>,
+	projection: ExecutionPathProjection,
+	platformFingerprint: Sha256Digest,
+	context: TopLevelProcessContext,
+): Promise<ExecPrototype> {
+	const argv = [invocation.shell, ...invocation.shellArgs];
+	if (invocation.commandTransport === "argv") argv.push(request.command);
+	return createExecPrototype({
+		executablePath: invocation.shell,
+		executableDigest: sha256Digest(await readFile(invocation.shell)),
+		argv: argv.map((value) => projection.normalizeValue(value)),
+		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
+		environment,
+		umask: context.umask,
+		rlimitsDigest: digestObject(context.rlimits),
+		signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
+		credentialsDigest: digestObject(context.credentials),
+		schedulingDigest: digestObject({ context: context.scheduling, timeout: request.timeout ?? null }),
+		stdin:
+			invocation.commandTransport === "stdin"
+				? { type: "bytes", digest: sha256Digest(request.command), eof: true }
+				: { type: "closed", eof: true },
+		fileDescriptorTableComplete: true,
+		inheritedFDs: [
+			{ fd: 0, type: invocation.commandTransport === "stdin" ? "pipe" : "device", flagsDigest: digestObject({ mode: "read" }), eof: true },
+			{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
+			{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
+		],
+		platformFingerprint,
+	});
+}
+
+function actorCertificateProducer(producer: ProcessProducerProof): boolean {
+	return (
+		producer.execution.authority === "actor" &&
+		producer.observer.provider === "strace" &&
+		producer.observer.fingerprint === digestObject({ epoch: BACKEND_EPOCH })
+	);
 }
 
 async function resolveBinary(explicit: string | undefined, name: string, fallbacks: readonly string[] = []): Promise<string> {
