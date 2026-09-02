@@ -79,7 +79,7 @@ try {
 		fixture,
 		{ workspaceDriver, includeWorkspaceFingerprint: true },
 	);
-	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'parent-a-done\\n'";
+	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
 	const directExecution = await executeDirectBash(fixture, { label: "direct", command: coldCommand });
 	const direct = {
 		totalMs: directExecution.totalMs,
