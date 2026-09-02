@@ -2,11 +2,13 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import {
 	createExecPrototype,
 	dependencyPathsetKey,
 	type DynamicDependency,
 	processWeakKey,
+	type ProvenanceTaint,
 	sealProcessCertificate,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
@@ -128,6 +130,20 @@ describe("process provenance certificates", () => {
 			dependencyCertificate: { complete: true, dependencies: [], taints: ["clock"] },
 		});
 		expect(await validateProcessCertificate(tainted)).toMatchObject({ status: "indeterminate", reason: "tainted:clock" });
+	});
+
+	it("transfers native one-shot inputs but rejects external effects", async () => {
+		const validate = (taint: ProvenanceTaint) =>
+			validateTransferredProcessEvidence({ complete: true, dependencies: [], taints: [taint] });
+		for (const taint of ["clock", "random", "pid_observation"] satisfies ProvenanceTaint[]) {
+			expect(await validate(taint)).toMatchObject({ status: "valid" });
+		}
+		for (const taint of ["network", "ipc"] satisfies ProvenanceTaint[]) {
+			expect(await validate(taint)).toMatchObject({
+				status: "indeterminate",
+				cause: { detail: `tainted:${taint}` },
+			});
+		}
 	});
 
 	it("keys complete environment and process context without persisting raw values", () => {

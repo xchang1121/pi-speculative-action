@@ -76,13 +76,11 @@ import {
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-v10";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v8";
-const FIXED_TIME = "2000-01-01T00:00:00Z";
-const FIXED_RANDOM_SEED = "1201147211";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v9";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
-/** Observations confined to the execution being adopted; they still prohibit any later replay. */
-const REEXECUTION_TAINTS = new Set<ProvenanceTaint>(["network", "ipc", "clock", "random", "pid_observation"]);
+/** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
+const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>(["clock", "random", "pid_observation"]);
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
@@ -418,7 +416,7 @@ export class LinuxProcessReuseBackend {
 				session.sealPromise ??= this.seal(session, changes);
 				return session.sealPromise;
 			},
-			validate: () => validateSessionEvidence(session),
+			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 			close,
 		};
 	}
@@ -1600,10 +1598,8 @@ function sandboxPolicyArguments(
 		"--fs-write",
 		privateRoot,
 		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
-		"--random-seed",
-		FIXED_RANDOM_SEED,
 		"--time-start",
-		FIXED_TIME,
+		new Date().toISOString(),
 		"--no-huge-pages",
 		"--no-coredump",
 		"--max-processes",
@@ -1899,8 +1895,10 @@ function assertInvocationMatches(invocation: ToolProcessInvocation, request: Pro
 	}
 }
 
-async function validateSessionEvidence(session: ActiveSession): Promise<ResourceValidation> {
-	const evidence = session.topLevelEvidence;
+export async function validateTransferredProcessEvidence(
+	evidence: DynamicDependencyCertificate | undefined,
+	incompleteReasons: Iterable<string> = [],
+): Promise<ResourceValidation> {
 	if (!evidence) {
 		return {
 			status: "indeterminate",
@@ -1908,7 +1906,7 @@ async function validateSessionEvidence(session: ActiveSession): Promise<Resource
 			metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
 		};
 	}
-	const blockingTaints = evidence.taints.filter((taint) => !REEXECUTION_TAINTS.has(taint));
+	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
 	const validation = await validateDynamicDependencyCertificate(
 		{ ...evidence, taints: blockingTaints },
 		{ maxFileBytes: MAX_CAPTURE_BYTES },
@@ -1932,7 +1930,7 @@ async function validateSessionEvidence(session: ActiveSession): Promise<Resource
 		cause: {
 			stage: "freshness",
 			code: "process_provenance_indeterminate",
-			detail: [validation.reason, ...session.incompleteReasons].join(","),
+			detail: [validation.reason, ...incompleteReasons].join(","),
 		},
 		metrics,
 	};
