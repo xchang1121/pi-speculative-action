@@ -242,7 +242,13 @@ describe("process provenance certificates", () => {
 					replayProfile: "buffered_noninteractive",
 					journal: [
 						{ sequence: 0, kind: "output", fd: 1, data: { digest, size: 11 } },
-						{ sequence: 1, kind: "write", path: "/workspace/out", data: { digest, size: 12 }, mode: 0o644 },
+						{
+							sequence: 1,
+							kind: "workspace",
+							path: "/workspace/out",
+							before: { kind: "absent" },
+							after: { kind: "file", data: { digest, size: 12 }, mode: 0o644 },
+						},
 					],
 					exit: { kind: "code", code: 0 },
 				},
@@ -259,13 +265,28 @@ describe("process provenance certificates", () => {
 			result: {
 				replayProfile: "buffered_noninteractive",
 				journal: [
-					{ sequence: 0, kind: "mkdir", path: "/workspace/generated", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
-					{ sequence: 1, kind: "rmdir", path: "/workspace/obsolete" },
+					{
+						sequence: 0,
+						kind: "workspace",
+						path: "/workspace/generated",
+						before: { kind: "absent" },
+						after: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
+					},
+					{
+						sequence: 1,
+						kind: "workspace",
+						path: "/workspace/obsolete",
+						before: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
+						after: { kind: "absent" },
+					},
 				],
 				exit: { kind: "code", code: 0 },
 			},
 		});
-		expect(certificate.result.journal[0]).toMatchObject({ kind: "mkdir", entriesDigest, mode: 0o750 });
+		expect(certificate.result.journal[0]).toMatchObject({
+			kind: "workspace",
+			after: { kind: "directory", entriesDigest, mode: 0o750 },
+		});
 
 		expect(() =>
 			sealProcessCertificate({
@@ -277,18 +298,16 @@ describe("process provenance certificates", () => {
 					journal: [
 						{
 							sequence: 0,
-							kind: "mkdir",
+							kind: "workspace",
 							path: "/workspace/generated",
-							entriesDigest: "not-a-digest",
-							mode: 0o750,
-							uid: -1,
-							gid: 1000,
+							before: { kind: "absent" },
+							after: { kind: "directory", entriesDigest: "not-a-digest", mode: 0o750, uid: -1, gid: 1000 },
 						},
 					] as never,
 					exit: { kind: "code", code: 0 },
 				},
 			}),
-		).toThrow("invalid mkdir effect state");
+		).toThrow("invalid directory effect state");
 	});
 });
 

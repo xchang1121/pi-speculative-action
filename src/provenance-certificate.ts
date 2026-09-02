@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 2 as const;
+export const PROCESS_CERTIFICATE_VERSION = 3 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -145,29 +145,27 @@ export interface DynamicDependencyCertificate {
 	readonly taints: readonly ProvenanceTaint[];
 }
 
-export type OrderedEffectEvent =
-	| { readonly sequence: number; readonly kind: "output"; readonly fd: 1 | 2; readonly data: ArtifactReference }
+/** Exact state on one side of a replayable workspace transition. */
+export type WorkspaceEffectState =
+	| { readonly kind: "absent" }
+	| { readonly kind: "file"; readonly data: ArtifactReference; readonly mode: number }
 	| {
-			readonly sequence: number;
-			readonly kind: "write";
-			readonly path: string;
-			readonly data: ArtifactReference;
-			readonly mode: number;
-	  }
-	| { readonly sequence: number; readonly kind: "delete"; readonly path: string }
-	| {
-			readonly sequence: number;
-			readonly kind: "mkdir";
-			readonly path: string;
+			readonly kind: "directory";
 			readonly entriesDigest: Sha256Digest;
 			readonly mode: number;
 			readonly uid: number;
 			readonly gid: number;
-	  }
-	| { readonly sequence: number; readonly kind: "rmdir"; readonly path: string }
-	| { readonly sequence: number; readonly kind: "rename"; readonly from: string; readonly to: string }
-	| { readonly sequence: number; readonly kind: "symlink"; readonly path: string; readonly target: string }
-	| { readonly sequence: number; readonly kind: "hardlink"; readonly from: string; readonly to: string };
+	  };
+
+export type OrderedEffectEvent =
+	| { readonly sequence: number; readonly kind: "output"; readonly fd: 1 | 2; readonly data: ArtifactReference }
+	| {
+			readonly sequence: number;
+			readonly kind: "workspace";
+			readonly path: string;
+			readonly before: WorkspaceEffectState;
+			readonly after: WorkspaceEffectState;
+	  };
 
 export type ExitOutcome =
 	| { readonly kind: "code"; readonly code: number }
@@ -338,7 +336,10 @@ function certificateContentKey(
 export function referencedArtifacts(certificate: ProcessProvenanceCertificate): readonly ArtifactReference[] {
 	const unique = new Map<Sha256Digest, ArtifactReference>();
 	for (const event of certificate.result.journal) {
-		if (event.kind === "output" || event.kind === "write") unique.set(event.data.digest, event.data);
+		if (event.kind === "output") unique.set(event.data.digest, event.data);
+		else for (const state of [event.before, event.after]) {
+			if (state.kind === "file") unique.set(state.data.digest, state.data);
+		}
 	}
 	return [...unique.values()];
 }
@@ -611,40 +612,15 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 		const event = journal[index]!;
 		if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) throw new Error("invalid effect sequence");
 		if (index > 0 && event.sequence === journal[index - 1]!.sequence) throw new Error("duplicate effect sequence");
-		if ((event.kind === "output" || event.kind === "write") && !isSha256Digest(event.data.digest)) {
-			throw new Error("invalid effect artifact");
-		}
-		if (
-			(event.kind === "output" || event.kind === "write") &&
-			(!Number.isSafeInteger(event.data.size) || event.data.size < 0)
-		) {
-			throw new Error("invalid effect artifact size");
-		}
-		if (event.kind === "output" || event.kind === "write") {
-			const previousSize = artifactSizes.get(event.data.digest);
-			if (previousSize !== undefined && previousSize !== event.data.size) {
-				throw new Error("conflicting effect artifact sizes");
+		if (event.kind === "output") validateArtifact(event.data, artifactSizes);
+		else {
+			if (!validLogicalPath(event.path)) throw new Error("invalid effect path");
+			const before = normalizeWorkspaceEffectState(event.before, artifactSizes);
+			const after = normalizeWorkspaceEffectState(event.after, artifactSizes);
+			if (before.kind === after.kind && stableStringify(before) === stableStringify(after)) {
+				throw new Error("workspace effect does not change state");
 			}
-			artifactSizes.set(event.data.digest, event.data.size);
-		}
-		if (event.kind === "write" && (!Number.isSafeInteger(event.mode) || event.mode < 0 || event.mode > 0o777)) {
-			throw new Error("invalid write effect mode");
-		}
-		if (
-			event.kind === "mkdir" &&
-			(!isSha256Digest(event.entriesDigest) ||
-				!Number.isSafeInteger(event.mode) ||
-				event.mode < 0 ||
-				event.mode > 0o777 ||
-				!Number.isSafeInteger(event.uid) ||
-				event.uid < 0 ||
-				!Number.isSafeInteger(event.gid) ||
-				event.gid < 0)
-		) {
-			throw new Error("invalid mkdir effect state");
-		}
-		for (const effectPath of effectPaths(event)) {
-			if (!validLogicalPath(effectPath)) throw new Error("invalid effect path");
+			journal[index] = { ...event, before, after };
 		}
 	}
 	return deepFreeze({
@@ -655,16 +631,39 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 	});
 }
 
-function effectPaths(event: OrderedEffectEvent): readonly string[] {
-	switch (event.kind) {
-		case "output":
-			return [];
-		case "rename":
-		case "hardlink":
-			return [event.from, event.to];
-		default:
-			return [event.path];
+function normalizeWorkspaceEffectState(
+	state: WorkspaceEffectState,
+	artifactSizes: Map<Sha256Digest, number>,
+): WorkspaceEffectState {
+	if (state.kind === "absent") return { kind: "absent" };
+	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) {
+		throw new Error("invalid workspace effect mode");
 	}
+	if (state.kind === "file") {
+		validateArtifact(state.data, artifactSizes);
+		return { ...state, data: { ...state.data } };
+	}
+	if (
+		!isSha256Digest(state.entriesDigest) ||
+		!Number.isSafeInteger(state.uid) ||
+		state.uid < 0 ||
+		!Number.isSafeInteger(state.gid) ||
+		state.gid < 0
+	) {
+		throw new Error("invalid directory effect state");
+	}
+	return { ...state };
+}
+
+function validateArtifact(reference: ArtifactReference, sizes: Map<Sha256Digest, number>): void {
+	if (!reference || !isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
+		throw new Error("invalid effect artifact");
+	}
+	const previousSize = sizes.get(reference.digest);
+	if (previousSize !== undefined && previousSize !== reference.size) {
+		throw new Error("conflicting effect artifact sizes");
+	}
+	sizes.set(reference.digest, reference.size);
 }
 
 function validLogicalPath(value: string): boolean {

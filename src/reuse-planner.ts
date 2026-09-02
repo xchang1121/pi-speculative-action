@@ -86,7 +86,7 @@ export type ProcessReusePlan<MemoryHit = never> =
 			readonly source: "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
-			readonly effects: readonly Exclude<OrderedEffectEvent, { kind: "output" }>[];
+			readonly effects: readonly Extract<OrderedEffectEvent, { kind: "workspace" }>[];
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
 			readonly artifacts: VerifiedArtifactClosure;
 			readonly lookup: ProcessReuseLookupMetrics;
@@ -220,8 +220,8 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				}
 				const accepted = new Set(request.contract.seed?.acceptedPaths ?? []);
 				const effects = certificate.result.journal.filter(
-					(event): event is Extract<OrderedEffectEvent, { kind: "write" }> =>
-						event.kind === "write" && accepted.has(event.path),
+					(event): event is Extract<OrderedEffectEvent, { kind: "workspace" }> =>
+						event.kind === "workspace" && event.after.kind === "file" && accepted.has(event.path),
 				);
 				if (!effects.length) {
 					reasons.add("no_seedable_effects");

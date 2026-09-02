@@ -32,6 +32,7 @@ import {
 	sealProcessCertificate,
 	sha256Digest,
 	type Sha256Digest,
+	type WorkspaceEffectState,
 } from "./provenance-certificate.ts";
 import {
 	captureAbsenceDependency,
@@ -566,27 +567,7 @@ export class LinuxProcessReuseBackend {
 		let sequence = 0;
 		for (const change of changes) {
 			const logicalPath = slash(path.resolve(session.sourceRoot, change.resource));
-			if (change.kind === "directory") {
-				if (change.before && change.after) throw new Error(`directory metadata replay is unsupported: ${change.resource}`);
-				if (change.after) {
-					journal.push({ sequence: sequence++, kind: "mkdir", path: logicalPath, ...change.after });
-				} else if (change.before) {
-					journal.push({ sequence: sequence++, kind: "rmdir", path: logicalPath });
-				}
-				continue;
-			}
-			if (change.after !== undefined) {
-				if (change.afterMode === undefined) throw new Error(`file replay mode is unavailable: ${change.resource}`);
-				journal.push({
-					sequence: sequence++,
-					kind: "write",
-					path: logicalPath,
-					data: await this.store.artifacts.put(change.after),
-					mode: change.afterMode,
-				});
-			} else if (change.before !== undefined) {
-				journal.push({ sequence: sequence++, kind: "delete", path: logicalPath });
-			}
+			journal.push(await workspaceTransition(this.store, sequence++, logicalPath, change));
 		}
 		for (const event of execution.outcome.output) {
 			journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data: await this.store.artifacts.put(event.data) });
@@ -815,30 +796,18 @@ export class LinuxProcessReuseBackend {
 				for (const effect of effects.effects) {
 					switch (effect.kind) {
 						case "delete":
-							journal.push({ sequence: sequence++, kind: "delete", path: effect.logicalPath });
-							break;
-						case "rmdir":
-							journal.push({ sequence: sequence++, kind: "rmdir", path: effect.logicalPath });
-							break;
-						case "mkdir":
-							journal.push({
-								sequence: sequence++,
-								kind: "mkdir",
-								path: effect.logicalPath,
-								entriesDigest: effect.after.entriesDigest,
-								mode: effect.after.mode,
-								uid: effect.after.uid,
-								gid: effect.after.gid,
-							});
-							break;
 						case "write": {
 							const change = changes.get(path.normalize(effect.relativePath));
-							if (!change?.after) throw new Error(`transaction output is unavailable: ${effect.relativePath}`);
-							if (change.afterMode === undefined) throw new Error(`transaction output mode is unavailable: ${effect.relativePath}`);
-							const data = await this.store.artifacts.put(change.after);
-							journal.push({ sequence: sequence++, kind: "write", path: effect.logicalPath, data, mode: change.afterMode });
+							if (!change) throw new Error(`transaction change is unavailable: ${effect.relativePath}`);
+							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, change));
 							break;
 						}
+						case "rmdir":
+							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, { kind: "directory", before: effect.before }));
+							break;
+						case "mkdir":
+							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, { kind: "directory", after: effect.after }));
+							break;
 					}
 				}
 				for (const event of outcome.output) {
@@ -1332,51 +1301,30 @@ async function replayFilesystemEffects(
 	const changes: SandboxWorkspaceChange[] = [];
 	for (const event of journal) {
 		if (event.kind === "output") continue;
-		if (event.kind !== "write" && event.kind !== "delete" && event.kind !== "mkdir" && event.kind !== "rmdir") {
-			throw new Error(`unsupported replay effect ${event.kind}`);
-		}
 		const target = projection.toPhysical(event.path);
 		if (!target || !pathContains(workspaceRoot, target) || target === path.resolve(workspaceRoot)) {
 			throw new Error(`replay effect escapes workspace: ${event.path}`);
 		}
 		const resource = slash(path.relative(workspaceRoot, target));
-		if (event.kind === "mkdir") {
-			if ((await readSandboxDirectoryState(target)) !== undefined) {
-				throw new Error(`replay directory already exists: ${event.path}`);
-			}
+		if (event.before.kind === "directory" || event.after.kind === "directory") {
+			if (event.before.kind !== "absent" && event.before.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
+			if (event.after.kind !== "absent" && event.after.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
 			changes.push({
 				kind: "directory",
 				root: workspaceRoot,
 				target,
 				resource,
-				after: {
-					entriesDigest: event.entriesDigest,
-					mode: event.mode,
-					uid: event.uid,
-					gid: event.gid,
-				},
+				...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
+				...(event.after.kind === "directory" ? { after: directoryState(event.after) } : {}),
 			});
 			continue;
 		}
-		if (event.kind === "rmdir") {
-			const before = await readSandboxDirectoryState(target);
-			if (!before) throw new Error(`replay directory is missing: ${event.path}`);
-			changes.push({ kind: "directory", root: workspaceRoot, target, resource, before });
-			continue;
-		}
-		const before = await readRegularState(target);
-		if (event.kind === "delete") {
-			changes.push({ root: workspaceRoot, target, resource, ...before });
-			continue;
-		}
-		const after = artifacts.read(event.data);
 		changes.push({
 			root: workspaceRoot,
 			target,
 			resource,
-			...before,
-			after,
-			afterMode: event.mode,
+			...(event.before.kind === "file" ? { before: artifacts.read(event.before.data), beforeMode: event.before.mode } : {}),
+			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode } : {}),
 		});
 	}
 	if (!changes.length) return;
@@ -1384,6 +1332,40 @@ async function replayFilesystemEffects(
 		output: { result: { content: [], details: {} }, isError: false },
 		changes,
 	});
+}
+
+async function workspaceTransition(
+	store: ProvenanceCertificateStore,
+	sequence: number,
+	logicalPath: string,
+	change:
+		| Pick<SandboxFileChange, "kind" | "before" | "after" | "beforeMode" | "afterMode">
+		| Pick<SandboxDirectoryChange, "kind" | "before" | "after">,
+): Promise<Extract<OrderedEffectEvent, { kind: "workspace" }>> {
+	let before: WorkspaceEffectState;
+	let after: WorkspaceEffectState;
+	if (change.kind === "directory") {
+		before = change.before ? { kind: "directory", ...change.before } : { kind: "absent" };
+		after = change.after ? { kind: "directory", ...change.after } : { kind: "absent" };
+	} else {
+		before = await regularEffectState(store, change.before, change.beforeMode);
+		after = await regularEffectState(store, change.after, change.afterMode);
+	}
+	return { sequence, kind: "workspace", path: logicalPath, before, after };
+}
+
+async function regularEffectState(
+	store: ProvenanceCertificateStore,
+	content: Uint8Array | undefined,
+	mode: number | undefined,
+): Promise<WorkspaceEffectState> {
+	if (content === undefined) return { kind: "absent" };
+	if (mode === undefined) throw new Error("transaction file mode is unavailable");
+	return { kind: "file", data: await store.artifacts.put(content), mode };
+}
+
+function directoryState(state: Extract<WorkspaceEffectState, { kind: "directory" }>): SandboxDirectoryChange["before"] {
+	return { entriesDigest: state.entriesDigest, mode: state.mode, uid: state.uid, gid: state.gid };
 }
 
 function loadOutputEvents(
@@ -1789,17 +1771,6 @@ function listen(server: net.Server, socketPath: string): Promise<void> {
 
 function closeServer(server: net.Server): Promise<void> {
 	return new Promise((resolve) => server.close(() => resolve()));
-}
-
-async function readRegularState(target: string): Promise<{ readonly before?: Uint8Array; readonly beforeMode?: number }> {
-	try {
-		const stat = await lstat(target);
-		if (!stat.isFile()) throw new Error(`replay target is not a regular file: ${target}`);
-		return { before: await readFile(target), beforeMode: stat.mode & 0o777 };
-	} catch (error) {
-		if (missing(error)) return {};
-		throw error;
-	}
 }
 
 function exitOutcome(outcome: SpawnOutcome): ExitOutcome {

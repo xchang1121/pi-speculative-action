@@ -27,6 +27,7 @@ export {
 	type SemanticEnvironmentEntry,
 	sha256Digest,
 	type Sha256Digest,
+	type WorkspaceEffectState,
 } from "./provenance-certificate.ts";
 export {
 	captureAbsenceDependency,

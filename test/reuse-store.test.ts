@@ -34,7 +34,7 @@ describe("persistent provenance store", () => {
 		const { id: _id, ...legacyBody } = certificate;
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
 		expect(parseProcessCertificate(legacy)?.id).toBe(legacy.id);
-		expect(parseProcessCertificate({ ...certificate, version: 1 })).toBeUndefined();
+		expect(parseProcessCertificate({ ...certificate, version: 2 })).toBeUndefined();
 		expect(await initial.put(certificate)).toBe(true);
 		expect(await initial.put(duplicate)).toBe(false);
 
@@ -83,7 +83,13 @@ describe("persistent provenance store", () => {
 			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 			result: {
 				replayProfile: "buffered_noninteractive",
-				journal: [{ sequence: 0, kind: "write", path: "/workspace/out", data: missing, mode: 0o644 }],
+				journal: [{
+					sequence: 0,
+					kind: "workspace",
+					path: "/workspace/out",
+					before: { kind: "absent" },
+					after: { kind: "file", data: missing, mode: 0o644 },
+				}],
 				exit: { kind: "code", code: 0 },
 			},
 		});

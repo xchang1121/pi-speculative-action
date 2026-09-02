@@ -73,7 +73,7 @@ describe("ProcessReusePlanner", () => {
 			contract: contract("artifact_seed"),
 			validation,
 		});
-		expect(salvage).toMatchObject({ kind: "artifact_seed", effects: [{ kind: "write" }] });
+		expect(salvage).toMatchObject({ kind: "artifact_seed", effects: [{ kind: "workspace" }] });
 	});
 
 	it("lets the execution authority reject an otherwise matching producer proof", async () => {
@@ -102,7 +102,9 @@ describe("ProcessReusePlanner", () => {
 		});
 		if (plan.kind !== "completed_replay") throw new Error("expected completed replay");
 		const references = plan.certificate.result.journal.flatMap((event) =>
-			event.kind === "output" || event.kind === "write" ? [event.data] : [],
+			event.kind === "output"
+				? [event.data]
+				: [event.before, event.after].flatMap((state) => (state.kind === "file" ? [state.data] : [])),
 		);
 		expect(get).toHaveBeenCalledTimes(2);
 		for (const reference of references) {
@@ -190,7 +192,13 @@ async function fixtureWithCertificate(withFileEffect = false) {
 			journal: [
 				{ sequence: 0, kind: "output", fd: 1, data: output },
 				...(withFileEffect
-					? [{ sequence: 1, kind: "write" as const, path: "/workspace/out.bin", data: artifact, mode: 0o644 }]
+					? [{
+							sequence: 1,
+							kind: "workspace" as const,
+							path: "/workspace/out.bin",
+							before: { kind: "absent" as const },
+							after: { kind: "file" as const, data: artifact, mode: 0o644 },
+						}]
 					: []),
 			],
 			exit: { kind: "code", code: 0 },
