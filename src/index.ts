@@ -64,8 +64,8 @@ export {
 	type LegacySpeculativeToolGroups,
 	normalizeSpeculativeToolSelection,
 	type SpeculativeToolSelectionInput,
-	usageTokenCount,
 } from "./common.ts";
+export { calculateContextTokens as usageTokenCount } from "@earendil-works/pi-agent-core";
 export type { ActionReuseKind, ExecutionScope } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,

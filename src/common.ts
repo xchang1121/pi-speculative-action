@@ -106,24 +106,6 @@ export function drafterRequestTemperature(
 	);
 }
 
-export function usageTokenCount(
-	usage:
-		| {
-				readonly input?: number;
-				readonly output?: number;
-				readonly cacheRead?: number;
-				readonly cacheWrite?: number;
-				readonly totalTokens?: number;
-		  }
-		| undefined,
-): number {
-	if (!usage) return 0;
-	if (typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens)) return usage.totalTokens;
-	return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
-		.filter((value): value is number => typeof value === "number" && Number.isFinite(value))
-		.reduce((sum, value) => sum + value, 0);
-}
-
 function optionalPositiveInteger(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }

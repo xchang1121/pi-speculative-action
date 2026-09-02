@@ -1,4 +1,9 @@
-import { estimateContextTokens, type AgentTool, type AgentToolCall } from "@earendil-works/pi-agent-core";
+import {
+	calculateContextTokens,
+	estimateContextTokens,
+	type AgentTool,
+	type AgentToolCall,
+} from "@earendil-works/pi-agent-core";
 import {
 	clampThinkingLevel,
 	type Api,
@@ -13,7 +18,6 @@ import {
 	DEFAULTS,
 	drafterRequestTemperature,
 	normalizeDrafterRequestSettings,
-	usageTokenCount,
 } from "./common.ts";
 import {
 	DrafterUtilityGate,
@@ -174,7 +178,7 @@ export function createDrafterPlanSource(input: {
 				source: "drafter",
 				revision: 0,
 				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)],
-				draftTokens: usageTokenCount(message.usage),
+				draftTokens: calculateContextTokens(message.usage),
 			};
 		},
 		continue: async ({ proposalID, actionID, revision, feedback, output, signal }) => {
@@ -206,7 +210,7 @@ export function createDrafterPlanSource(input: {
 						{ actionID, condition: "execution_succeeded" },
 					]),
 				],
-				draftTokens: usageTokenCount(message.usage),
+				draftTokens: calculateContextTokens(message.usage),
 			};
 		},
 	};
