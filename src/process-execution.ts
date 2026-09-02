@@ -11,9 +11,7 @@ export interface ProcessExecutionRequest {
 	readonly onData: (data: Buffer) => void;
 }
 
-export interface ProcessExecutionResult {
-	readonly exitCode: number | null;
-}
+export type ProcessExecutionResult = Awaited<ReturnType<BashOperations["exec"]>>;
 
 export interface ProcessExecutor {
 	readonly execute: (request: ProcessExecutionRequest) => Promise<ProcessExecutionResult>;
