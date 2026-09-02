@@ -79,8 +79,8 @@ try {
 		fixture,
 		{ workspaceDriver, includeWorkspaceFingerprint: true },
 	);
-	const directCommand = `exec /bin/bash ${shellQuote(path.join(workspace, "trace-workload.sh"))}`;
-	const directExecution = await executeDirectBash(fixture, { label: "direct", command: directCommand });
+	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'parent-a-done\\n'";
+	const directExecution = await executeDirectBash(fixture, { label: "direct", command: coldCommand });
 	const direct = {
 		totalMs: directExecution.totalMs,
 		output: textOutput(directExecution.output),
@@ -92,7 +92,8 @@ try {
 	await mkdir(traceRoot);
 	const tracedCommand = straceCommand(status.straceBinary, tracePrefix, [
 		"/bin/bash",
-		path.join(workspace, "trace-workload.sh"),
+		"-c",
+		coldCommand,
 	]);
 	const traceExecution = await executeDirectBash(fixture, {
 		label: "trace",
@@ -117,7 +118,6 @@ try {
 	);
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	const runs: MeasuredRun[] = [];
-	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
 	runs.push(await runTask("cold", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	const actorMetricsBefore = backend.metrics();
@@ -150,6 +150,7 @@ try {
 
 	const [cold, wholeHit, childHit, invalidated] = runs;
 	assert(cold?.artifact === "alpha\n", "cold artifact differs");
+	assert(direct.artifact === cold.artifact && direct.output === cold.output, "direct Actor execution differs");
 	assert(actorReplayResult.artifact === cold.artifact && actorReplayResult.output === cold.output, "Actor replay differs");
 	assert(wholeHit?.artifact === cold.artifact, "whole-command artifact differs");
 	assert(childHit?.artifact === cold.artifact, "child-replayed artifact differs");
@@ -178,7 +179,7 @@ try {
 	assert(childHit.totalMs < cold.totalMs, "child cache hit was not faster than cold execution");
 
 	const result = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		measuredAt: new Date().toISOString(),
 		host: await linuxBenchmarkHost(status),
 		subject: "stock Pi createBashTool through linux_process_reuse WorldBranch",
@@ -203,10 +204,11 @@ try {
 			traceOverheadMs: trace.totalMs - direct.totalMs,
 			traceSlowdown: trace.totalMs / direct.totalMs,
 			coldToWholeCommandHitSpeedup: cold.totalMs / wholeHit.totalMs,
-			coldToActorReplaySpeedup: cold.totalMs / actorReplayResult.totalMs,
+			directToActorReplaySpeedup: direct.totalMs / actorReplayResult.totalMs,
 			coldToCrossParentHitSpeedup: cold.totalMs / childHit.totalMs,
 			coldForkToCrossParentHitForkSpeedup: cold.forkMs / childHit.forkMs,
-			latencySavedMs: cold.totalMs - wholeHit.totalMs,
+			actorReplayLatencySavedMs: direct.totalMs - actorReplayResult.totalMs,
+			wholeCommandLatencySavedMs: cold.totalMs - wholeHit.totalMs,
 			metrics: backend.metrics(),
 		},
 	};
@@ -244,17 +246,11 @@ try {
 async function prepareWorkspace(workspace: string): Promise<void> {
 	await writeFile(path.join(workspace, "pi-reuse-helper.c"), HELPER_SOURCE, "utf8");
 	await writeFile(path.join(workspace, "input.txt"), "alpha\n", "utf8");
-	await writeFile(
-		path.join(workspace, "trace-workload.sh"),
-		"printf 'trace-parent\\n'; pi-reuse-helper input.txt artifact.txt 2>&1; printf 'trace-parent-done\\n'\n",
-		"utf8",
-	);
 	await compileBenchmarkHelper(workspace, { source: "pi-reuse-helper.c", output: "pi-reuse-helper" });
 	await commitBenchmarkFixture(workspace, "Pi Bash Reuse Benchmark", [
 		"pi-reuse-helper.c",
 		"pi-reuse-helper",
 		"input.txt",
-		"trace-workload.sh",
 	]);
 }
 
