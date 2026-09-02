@@ -75,8 +75,8 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v8";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v6";
+const BACKEND_EPOCH = "pi-linux-process-v9";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v7";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -382,7 +382,7 @@ export class LinuxProcessReuseBackend {
 			execText("uname", ["-srm"]),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
-		await execText(unshare, ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "--net", "--ipc", "--uts", "--", "true"]);
+		await execText(unshare, namespaceArguments(["true"]));
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-mount-probe-"));
 		try {
 			const source = path.join(mountProbe, "source");
@@ -524,7 +524,7 @@ export class LinuxProcessReuseBackend {
 			umask: 0o22,
 			rlimitsDigest: digestObject({ nofile: "sandbox-controlled", processes: 64 }),
 			signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-			credentialsDigest: digestObject({ userNamespace: "map-current-to-root", uid: process.getuid?.(), gid: process.getgid?.() }),
+			credentialsDigest: digestObject({ userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() }),
 			schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism() }),
 			stdin:
 				session.invocation.commandTransport === "stdin"
@@ -919,7 +919,7 @@ export class LinuxProcessReuseBackend {
 			umask: request.umask,
 			rlimitsDigest: digestObject({ nofile: "broker-controlled", processes: 64 }),
 			signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-			credentialsDigest: digestObject({ userNamespace: "map-current-to-root", uid: process.getuid?.(), gid: process.getgid?.() }),
+			credentialsDigest: digestObject({ userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() }),
 			schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism() }),
 			stdin: { type: "closed", eof: true },
 			fileDescriptorTableComplete: true,
@@ -1597,7 +1597,8 @@ function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessPr
 function namespaceArguments(command: readonly string[]): readonly string[] {
 	return [
 		"--user",
-		"--map-root-user",
+		"--map-current-user",
+		"--keep-caps",
 		"--mount",
 		"--pid",
 		"--fork",
