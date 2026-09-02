@@ -111,6 +111,20 @@ describe("strace provenance decoder", () => {
 		}
 	});
 
+	test("treats Unix-domain communication as external input unless a provider removes it from the trace", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-unix-socket-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(`${prefix}.450`, [
+				'execve("/usr/bin/example", ["example"], 0x0) = 0',
+				'socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1]>',
+			].join("\n"));
+			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toContain("network");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("taints persistent file semantics outside the typed transaction", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-file-semantics-"));
 		const prefix = path.join(root, "process");

@@ -81,6 +81,7 @@ const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
+const STRACE_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,fchdir,fallocate,ioctl";
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
@@ -516,7 +517,7 @@ export class LinuxProcessReuseBackend {
 			"-s",
 			"65535",
 			"-e",
-			"trace=%file,%process,%network,%ipc,fchdir,fallocate,ioctl",
+			STRACE_FILTER,
 			"-o",
 			tracePrefix,
 			...sandbox,
@@ -796,7 +797,7 @@ export class LinuxProcessReuseBackend {
 				"-s",
 				"65535",
 				"-e",
-				"trace=%file,%process,%network,getpid,getppid,getsid,getpgid,fchdir,fallocate,ioctl",
+				STRACE_FILTER,
 				"-o",
 				tracePrefix,
 				ready.sandlock,

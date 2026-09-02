@@ -140,7 +140,7 @@ export async function observeStrace(
 			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") {
 				taints.add("pid_observation");
 			}
-			if (NETWORK_SYSCALLS.has(syscall) && !unixSocketOperation(line)) taints.add("network");
+			if (NETWORK_SYSCALLS.has(syscall)) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
@@ -317,7 +317,7 @@ const IPC_SYSCALLS = new Set([
 	"shmget",
 ]);
 
-const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time"]);
+const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
 const RANDOM_SYSCALLS = new Set(["getrandom"]);
 
 function ignoredProcessSegments(
@@ -366,10 +366,6 @@ function spawnedPID(line: string): number | undefined {
 	if (!match) return undefined;
 	const pid = Number.parseInt(match[1]!, 10);
 	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
-}
-
-function unixSocketOperation(line: string): boolean {
-	return /\bAF_(?:UNIX|LOCAL)\b|\bUNIX(?:-STREAM|-DGRAM)?\b/.test(line);
 }
 
 function syscallName(line: string): string | undefined {
