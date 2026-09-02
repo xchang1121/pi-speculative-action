@@ -75,8 +75,8 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v9";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v7";
+const BACKEND_EPOCH = "pi-linux-process-v10";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v8";
 const FIXED_TIME = "2000-01-01T00:00:00Z";
 const FIXED_RANDOM_SEED = "1201147211";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -280,6 +280,8 @@ export class LinuxProcessReuseBackend {
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
 	completedReplayExecutor(host: ProcessExecutor, options: CompletedProcessReplayOptions): ProcessExecutor {
 		const sourceRoot = path.resolve(options.sourceRoot);
+		const acceptProducer = (producer: ProcessProducerProof) =>
+			actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
 				if (process.platform !== "linux" || options.enabled?.() === false || !pathContains(sourceRoot, request.cwd)) {
@@ -301,7 +303,7 @@ export class LinuxProcessReuseBackend {
 					);
 					const plan = await this.planner.plan({
 						prototype,
-						acceptProducer: actorCertificateProducer,
+						acceptProducer,
 						contract: {
 							sink: "buffered",
 							orderedJournal: true,
@@ -582,12 +584,7 @@ export class LinuxProcessReuseBackend {
 		ready: ReadyBackend,
 		environment: Readonly<Record<string, string>>,
 	): Promise<ExecPrototype> {
-		return topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint, {
-			umask: 0o22,
-			rlimits: { nofile: "sandbox-controlled", processes: 64 },
-			credentials: { userNamespace: "preserve-current-user", uid: process.getuid?.(), gid: process.getgid?.() },
-			scheduling: { scheduler: "inherited", cpuCount: os.availableParallelism() },
-		});
+		return topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint);
 	}
 
 	private async replayTopLevel(
@@ -1790,32 +1787,13 @@ function normalizeEnvironment(environment: Readonly<Record<string, string | unde
 	return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
-interface TopLevelProcessContext {
-	readonly umask: number;
-	readonly rlimits: unknown;
-	readonly credentials: unknown;
-	readonly scheduling: unknown;
-}
-
 async function actorTopLevelPrototype(
 	invocation: ToolProcessInvocation,
 	request: ProcessExecutionRequest,
 	projection: ExecutionPathProjection,
 	platformFingerprint: Sha256Digest,
 ): Promise<ExecPrototype> {
-	return topLevelProcessPrototype(invocation, request, normalizeEnvironment(request.environment), projection, platformFingerprint, {
-		umask: process.umask(),
-		rlimits: { inherited: sha256Digest(await readFile("/proc/self/limits")) },
-		credentials: {
-			userNamespace: "host",
-			uid: process.getuid?.(),
-			euid: process.geteuid?.(),
-			gid: process.getgid?.(),
-			egid: process.getegid?.(),
-			groups: process.getgroups?.(),
-		},
-		scheduling: { scheduler: "inherited", cpuCount: os.availableParallelism() },
-	});
+	return topLevelProcessPrototype(invocation, request, normalizeEnvironment(request.environment), projection, platformFingerprint);
 }
 
 async function topLevelProcessPrototype(
@@ -1824,7 +1802,6 @@ async function topLevelProcessPrototype(
 	environment: Readonly<Record<string, string>>,
 	projection: ExecutionPathProjection,
 	platformFingerprint: Sha256Digest,
-	context: TopLevelProcessContext,
 ): Promise<ExecPrototype> {
 	const argv = [invocation.shell, ...invocation.shellArgs];
 	if (invocation.commandTransport === "argv") argv.push(request.command);
@@ -1834,11 +1811,13 @@ async function topLevelProcessPrototype(
 		argv: argv.map((value) => projection.normalizeValue(value)),
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
-		umask: context.umask,
-		rlimitsDigest: digestObject(context.rlimits),
+		umask: process.umask(),
+		rlimitsDigest: digestObject({ inherited: sha256Digest(await readFile("/proc/self/limits")) }),
 		signalDispositionsDigest: digestObject({ spawn: "node-default-v1" }),
-		credentialsDigest: digestObject(context.credentials),
-		schedulingDigest: digestObject({ context: context.scheduling, timeout: request.timeout ?? null }),
+		credentialsDigest: digestObject({
+			uid: process.getuid?.(), euid: process.geteuid?.(), gid: process.getgid?.(), egid: process.getegid?.(), groups: process.getgroups?.(),
+		}),
+		schedulingDigest: digestObject({ scheduler: "inherited", cpuCount: os.availableParallelism(), timeout: request.timeout ?? null }),
 		stdin:
 			invocation.commandTransport === "stdin"
 				? { type: "bytes", digest: sha256Digest(request.command), eof: true }
@@ -1853,11 +1832,13 @@ async function topLevelProcessPrototype(
 	});
 }
 
-function actorCertificateProducer(producer: ProcessProducerProof): boolean {
-	return (
-		producer.execution.authority === "actor" &&
-		producer.observer.provider === "strace" &&
-		producer.observer.fingerprint === digestObject({ epoch: BACKEND_EPOCH })
+function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]): boolean {
+	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== digestObject({ epoch: BACKEND_EPOCH })) {
+		return false;
+	}
+	return producer.execution.authority === "actor" || (
+		producer.execution.confinement.provider === "sandlock+namespaces" &&
+		producer.execution.confinement.fingerprint === digestObject({ policy: POLICY_ID, deniedPaths })
 	);
 }
 

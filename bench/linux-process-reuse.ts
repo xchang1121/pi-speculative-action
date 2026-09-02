@@ -7,6 +7,7 @@ import {
 	commitBenchmarkFixture,
 	compileBenchmarkHelper,
 	createLinuxProcessBenchmark,
+	executeDirectBash,
 	executeReusableBash,
 	linuxBenchmarkHost,
 	metricDelta,
@@ -81,6 +82,15 @@ try {
 	const coldCommand = "printf 'parent-a\\n'; pi-reuse-helper input.txt artifact.txt; printf 'parent-a-done\\n'";
 	runs.push(await runTask("cold", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
+	const actorMetricsBefore = backend.metrics();
+	const actorReplay = await executeDirectBash(fixture, { label: "actor_replay", command: coldCommand });
+	const actorReplayResult = {
+		totalMs: actorReplay.totalMs,
+		output: textOutput(actorReplay.output),
+		artifact: await readFile(path.join(workspace, "artifact.txt"), "utf8"),
+		metricDelta: metricDelta(actorMetricsBefore, backend.metrics()),
+	};
+	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	runs.push(await runTask("whole_command_hit", coldCommand, executionFingerprint));
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	runs.push(
@@ -102,6 +112,7 @@ try {
 
 	const [cold, wholeHit, childHit, invalidated] = runs;
 	assert(cold?.artifact === "alpha\n", "cold artifact differs");
+	assert(actorReplayResult.artifact === cold.artifact && actorReplayResult.output === cold.output, "Actor replay differs");
 	assert(wholeHit?.artifact === cold.artifact, "whole-command artifact differs");
 	assert(childHit?.artifact === cold.artifact, "child-replayed artifact differs");
 	const orderedChildOutput = "child-out:alpha\nchild-err\n";
@@ -112,6 +123,10 @@ try {
 	assert(
 		wholeHit.metricDelta.wholeCommandHits === 1 && wholeHit.metricDelta.hits === 0,
 		`complete Bash did not hit: ${JSON.stringify(wholeHit.metricDelta)}`,
+	);
+	assert(
+		actorReplayResult.metricDelta.wholeCommandHits === 1 && actorReplayResult.metricDelta.wholeCommandMisses === 0,
+		`Actor process outlet did not hit: ${JSON.stringify(actorReplayResult.metricDelta)}`,
 	);
 	assert(
 		childHit.metricDelta.hits === 1 && childHit.metricDelta.crossTurnHits === 1 && childHit.metricDelta.misses === 0,
@@ -132,6 +147,7 @@ try {
 		workspaceDriver,
 		workspaceFingerprint,
 		assertions: {
+			actorReplayWithoutFork: true,
 			wholeCommandReplay: true,
 			differentParentCommands: true,
 			orderedChildOutputEqual: true,
@@ -140,9 +156,11 @@ try {
 			changedInputForcedMiss: true,
 		},
 		runs,
+		actorReplay: actorReplayResult,
 		summary: {
 			routePreparationMs,
 			coldToWholeCommandHitSpeedup: cold.totalMs / wholeHit.totalMs,
+			coldToActorReplaySpeedup: cold.totalMs / actorReplayResult.totalMs,
 			coldToCrossParentHitSpeedup: cold.totalMs / childHit.totalMs,
 			coldForkToCrossParentHitForkSpeedup: cold.forkMs / childHit.forkMs,
 			latencySavedMs: cold.totalMs - wholeHit.totalMs,

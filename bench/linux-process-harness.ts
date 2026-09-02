@@ -54,8 +54,20 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
-	const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(localOperations));
 	const backend = new LinuxProcessReuseBackend({ storeRoot });
+	const coordinator = new ProcessExecutionCoordinator(
+		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
+			sourceRoot: workspace,
+			invocation: (request) =>
+				resolvePiToolInvocation("bash", { command: request.command }, {
+					cwd: request.cwd,
+					environment: Object.fromEntries(
+						Object.entries(request.environment).filter((entry): entry is [string, string] => entry[1] !== undefined),
+					),
+					shellPath,
+				})?.process,
+		}),
+	);
 	const world = createLinuxProcessExecutionWorld({
 		coordinator,
 		backend,
