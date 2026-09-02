@@ -852,7 +852,11 @@ describe("speculative action host", () => {
 				drafterTemperatureMin: 0.4,
 				drafterTemperatureMax: 1.6,
 			}),
-			draftModel: model("draft"),
+			draftModel: {
+				...model("draft"),
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: null, low: "low" },
+			},
 			getDraftOptions,
 			complete,
 			preflight: () => true,
@@ -890,7 +894,7 @@ describe("speculative action host", () => {
 			expect(request.options).toMatchObject({
 				maxTokens: 96,
 				toolChoice: "required",
-				reasoning: undefined,
+				reasoning: "low",
 				deferred: false,
 				cacheRetention: "short",
 			});

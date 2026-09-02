@@ -142,7 +142,7 @@ Example:
 
 `drafterMaxTokens` is an optional hard cap. Omit it—or clear the TUI field—to use the provider's output limit, which avoids truncating long commands and structured tool arguments.
 
-The Drafter always receives the same complete history as the Actor. Before either a root or output-informed request, the source compares that history plus the requested output allowance with the Drafter model's own `contextWindow`. A shorter model that cannot fit it is skipped locally: the plugin never truncates, summarizes, or triggers a second compaction path for the Drafter.
+The Drafter always receives the same complete history as the Actor and uses the lowest thinking level its Pi model metadata permits (`off` when supported). Before either a root or output-informed request, the source compares that history plus the requested output allowance with the Drafter model's own `contextWindow`. A shorter model that cannot fit it is skipped locally: the plugin never truncates, summarizes, or triggers a second compaction path for the Drafter.
 
 ### Actor probe and target verification
 

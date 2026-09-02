@@ -1,5 +1,13 @@
 import { estimateContextTokens, type AgentTool, type AgentToolCall } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel,
+	type Api,
+	type AssistantMessage,
+	type Context,
+	type Model,
+	type SimpleStreamOptions,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import {
 	clampCandidateLimit,
 	DEFAULTS,
@@ -123,13 +131,14 @@ export function createDrafterPlanSource(input: {
 			const prepared = await batch;
 			if (!prepared.utility.allowed) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
+			const reasoning = clampThinkingLevel(prepared.model, "off");
 			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
 			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
 				...requestOptions,
 				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
 				...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
 				toolChoice: "required",
-				reasoning: undefined,
+				reasoning: reasoning === "off" ? undefined : reasoning,
 				deferred: false,
 				sessionId: prepared.options.sessionId ?? input.sessionID,
 				cacheRetention: prepared.options.cacheRetention ?? "short",
