@@ -3,7 +3,7 @@ import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works
 import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "../src/runtime.ts";
-import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
+import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -435,11 +435,11 @@ describe("self-speculation control plane", () => {
 	});
 
 	it("publishes a complete sidecar call batch with candidate evidence intact", async () => {
-		const actionBridge = new SelfSpeculationActionBridge();
+		const actorForkPlans = createActorForkPlanSource();
 		const coordinator = new SelfSpeculationCoordinator({
 			settings: () => enabledSettings({ forkTransport: "sidecar", forkActionMinConfidence: 0 }),
 			requestID: () => "actor-request",
-			actionBridge,
+			actorForkPlanSource: actorForkPlans,
 			fetch: vi.fn(async (input) =>
 				Response.json(
 					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
@@ -466,11 +466,12 @@ describe("self-speculation control plane", () => {
 												],
 												fork: {
 													total_ms: 25,
-													logprobs: {
-														token_count: 2,
-														mean: Math.log(0.96),
-														minimum: Math.log(0.96),
-													},
+												logprobs: {
+													token_count: 2,
+													mean: Math.log(0.96),
+													minimum: Math.log(0.96),
+													tool_name: { token_count: 1, matched_calls: 1, minimum_probability: 0.96 },
+												},
 												},
 											},
 										],
@@ -482,7 +483,7 @@ describe("self-speculation control plane", () => {
 			),
 		});
 		coordinator.startTurn("turn-1", model(), context(), 1);
-		const batches = actionBridge.waitForBatches("turn-1", new AbortController().signal);
+		const batches = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
 		coordinator.decorateActorPayload({ prompt: "P" });
 		coordinator.observeActorOutput(delta("text_delta", "x"));
 
@@ -513,12 +514,12 @@ describe("self-speculation control plane", () => {
 	});
 
 	it.each([
-		["exact-boundary", { token_count: 2, mean: Math.log(0.9), minimum: Math.log(0.9) }, true],
-		["next-lower", { token_count: 2, mean: Math.log(0.9), minimum: Math.log(0.8999999999999999) }, false],
+		["exact-boundary", { token_count: 2, mean: Math.log(0.9), tool_name: { minimum_probability: 0.9 } }, true],
+		["next-lower", { token_count: 2, mean: Math.log(0.9), tool_name: { minimum_probability: 0.8999999999999999 } }, false],
 		["missing", { token_count: 2, mean: -0.03 }, false],
-		["malformed", { token_count: 2, mean: -0.03, minimum: "bad" }, false],
-		["positive", { token_count: 2, mean: -0.03, minimum: 0.01 }, false],
-		["infinite", { token_count: 2, mean: -0.03, minimum: Number.POSITIVE_INFINITY }, false],
+		["malformed", { token_count: 2, mean: -0.03, tool_name: { minimum_probability: "bad" } }, false],
+		["above-one", { token_count: 2, mean: -0.03, tool_name: { minimum_probability: 1.01 } }, false],
+		["infinite", { token_count: 2, mean: -0.03, tool_name: { minimum_probability: Number.POSITIVE_INFINITY } }, false],
 	])("applies the fork confidence gate to %s evidence", async (_label, logprobs, admitted) => {
 		const { actions, coordinator } = await forkActionFixture(
 			{},
@@ -639,6 +640,37 @@ describe("self-speculation control plane", () => {
 		expect(paths.at(-1)).toBe(SELF_SPECULATION_DEFAULTS.clearPath);
 	});
 
+	it("cancels an in-flight sidecar probe when Runtime stops waiting for its source", async () => {
+		const actorForkPlans = createActorForkPlanSource();
+		const coordinator = new SelfSpeculationCoordinator({
+			settings: () => enabledSettings({ forkTransport: "sidecar" }),
+			requestID: () => "actor-request",
+			actorForkPlanSource: actorForkPlans,
+			fetch: vi.fn(async (input, init) => {
+				if (new URL(String(input)).pathname !== SELF_SPECULATION_DEFAULTS.forkPath)
+					return Response.json({});
+				return await new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener(
+						"abort",
+						() => reject(new DOMException("aborted", "AbortError")),
+						{ once: true },
+					);
+				});
+			}),
+		});
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const runtime = new AbortController();
+		const pending = actorForkPlans.waitForBatches("turn-1", runtime.signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "x"));
+		await vi.waitFor(() => expect(coordinator.snapshot().forkRequests).toBe(1));
+
+		runtime.abort();
+		expect(await pending).toEqual([]);
+		await coordinator.dispose();
+		expect(coordinator.snapshot()).toMatchObject({ failures: 0, forkCompletions: 0 });
+	});
+
 	it("routes future K(a) only to its expected Actor decision", async () => {
 		const requests: CapturedRequest[] = [];
 		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-1", "actor-2"]);
@@ -713,26 +745,29 @@ function coordinatorFixture(
 }
 
 async function forkActionFixture(overrides: Partial<SelfSpeculationSettings>, receipt: unknown) {
-	const actionBridge = new SelfSpeculationActionBridge();
+	const actorForkPlans = createActorForkPlanSource();
 	const coordinator = new SelfSpeculationCoordinator({
 		settings: () => enabledSettings({ forkTransport: "sidecar", ...overrides }),
 		requestID: () => "actor-request",
-		actionBridge,
+		actorForkPlanSource: actorForkPlans,
 		fetch: vi.fn(async (input) =>
 			Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}),
 		),
 	});
 	coordinator.startTurn("turn-1", model(), context(), 1);
-	const pending = actionBridge.waitForCandidates("turn-1", new AbortController().signal);
+	const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
 	coordinator.decorateActorPayload({ prompt: "P" });
 	coordinator.observeActorOutput(delta("text_delta", "x"));
-	return { actions: await pending, coordinator };
+	return {
+		actions: (await pending).flatMap((batch) => batch.calls.map(({ tool, input }) => ({ tool, input }))),
+		coordinator,
+	};
 }
 
 function forkReceipt(
 	tool: string,
 	input: Record<string, unknown>,
-	logprobs: unknown = { token_count: 2, mean: -0.03, minimum: Math.log(0.95) },
+	logprobs: unknown = { token_count: 2, mean: -0.03, tool_name: { minimum_probability: 0.95 } },
 ): Record<string, unknown> {
 	return {
 		registered: true,

@@ -5,12 +5,12 @@ import {
 	ForkBenefitGate,
 	type ForkBenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
-import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type {
-	SelfSpeculationActionBatch,
-	SelfSpeculationActionBridge,
-	SelfSpeculationActionEvidence,
-} from "./self-speculation-action-bridge.ts";
+	ActorForkActionBatch,
+	ActorForkActionEvidence,
+	ActorForkPlanSource,
+} from "./actor-fork-plan-source.ts";
+import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import {
@@ -241,7 +241,7 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly settings: () => SelfSpeculationSettings;
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
-	readonly actionBridge?: SelfSpeculationActionBridge;
+	readonly actorForkPlanSource?: ActorForkPlanSource;
 }
 
 interface TurnState {
@@ -254,6 +254,7 @@ interface TurnState {
 	requestID?: string;
 	requestBound: boolean;
 	forkRequested: boolean;
+	generatedText: string;
 	content: string;
 	reasoning: string;
 	outputChunks: number;
@@ -318,7 +319,7 @@ export class SelfSpeculationCoordinator {
 	private readonly settings: () => SelfSpeculationSettings;
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
-	private readonly actionBridge?: SelfSpeculationActionBridge;
+	private readonly actorForkPlans?: ActorForkPlanSource;
 	private readonly forkGate = new ForkBenefitGate();
 	private readonly decoderEvidence = new DecoderVerificationLedger();
 	private readonly actionEvidence = new ActionAdoptionLedger();
@@ -359,7 +360,7 @@ export class SelfSpeculationCoordinator {
 		this.settings = options.settings;
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
-		this.actionBridge = options.actionBridge;
+		this.actorForkPlans = options.actorForkPlanSource;
 	}
 
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
@@ -386,6 +387,7 @@ export class SelfSpeculationCoordinator {
 			candidates,
 			requestBound: false,
 			forkRequested: false,
+			generatedText: "",
 			content: "",
 			reasoning: "",
 			outputChunks: 0,
@@ -402,7 +404,7 @@ export class SelfSpeculationCoordinator {
 			ended: false,
 			gateSampleRecorded: false,
 		};
-		this.actionBridge?.startTurn(turnID);
+		this.actorForkPlans?.startTurn(turnID);
 		this.latestGateKey = modelKey(model);
 	}
 
@@ -523,6 +525,7 @@ export class SelfSpeculationCoordinator {
 		if (event.type === "text_delta") state.content += event.delta;
 		else if (event.type === "thinking_delta") state.reasoning += event.delta;
 		else return;
+		state.generatedText += event.delta;
 		state.outputChunks++;
 		if (!event.delta || !state.requestID) return;
 		state.forkRequested = true;
@@ -530,11 +533,12 @@ export class SelfSpeculationCoordinator {
 		const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 		if (!gateDecision.allowed) {
 			this.forkGateSkips++;
-			this.actionBridge?.publishBatches(state.turnID, []);
+			this.actorForkPlans?.publish(state.turnID, []);
 			return;
 		}
 		this.forks++;
 		state.forkStartedAt = performance.now();
+		const signal = this.actorForkPlans?.probeSignal(state.turnID);
 		state.forkTask = this.post(
 			settings.forkPath,
 			{
@@ -543,7 +547,7 @@ export class SelfSpeculationCoordinator {
 				model: modelPayload(state.model),
 				context: contextPayload(state.context, state.providerPayload),
 				snapshot: {
-					generated_text: state.reasoning + state.content,
+					generated_text: state.generatedText,
 					content: state.content,
 					reasoning: state.reasoning,
 					chunk_count: state.outputChunks,
@@ -552,12 +556,17 @@ export class SelfSpeculationCoordinator {
 				options: forkPayload(settings),
 			},
 			settings,
+			signal,
 		)
 			.then((receipt) => this.recordReceipt(receipt, state, true))
 			.catch((error: unknown) => {
-				state.forkFailed = true;
 				state.forkCompletedAt = performance.now();
-				this.actionBridge?.publishBatches(state.turnID, []);
+				this.actorForkPlans?.publish(state.turnID, []);
+				if (signal?.aborted) {
+					this.finalizeGateSample(state);
+					return;
+				}
+				state.forkFailed = true;
 				this.finalizeGateSample(state);
 				throw error;
 			})
@@ -607,7 +616,7 @@ export class SelfSpeculationCoordinator {
 	/** Clear both the active request and every future-decision candidate. */
 	reset(): void {
 		this.closeActive(false);
-		this.actionBridge?.reset();
+		this.actorForkPlans?.reset();
 		this.pendingCandidates.clear();
 		this.latestStartedDecisionSequence = 0;
 		this.acceptingCandidates = false;
@@ -618,7 +627,7 @@ export class SelfSpeculationCoordinator {
 		if (state) {
 			state.ended = true;
 			this.finalizeGateSample(state);
-			this.actionBridge?.closeTurn(state.turnID);
+			this.actorForkPlans?.closeTurn(state.turnID);
 		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
@@ -805,7 +814,7 @@ export class SelfSpeculationCoordinator {
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): void {
 		if (!isRecord(receipt)) {
-			if (fork) this.actionBridge?.publishBatches(state.turnID, []);
+			if (fork) this.actorForkPlans?.publish(state.turnID, []);
 			return;
 		}
 		this.receipts++;
@@ -817,7 +826,7 @@ export class SelfSpeculationCoordinator {
 		}
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
-		const actionBatches = new Map<string, SelfSpeculationActionBatch>();
+		const actionBatches = new Map<string, ActorForkActionBatch>();
 		for (const rawCandidate of array(bundle?.candidates)) {
 			const candidate = record(rawCandidate);
 			if (!candidate) continue;
@@ -842,9 +851,7 @@ export class SelfSpeculationCoordinator {
 			const logprobs = record(forkObservation?.logprobs);
 			const logprobTokens = nonNegativeInteger(logprobs?.token_count);
 			const meanLogprob = finiteNumber(logprobs?.mean);
-			const minimumLogprob = finiteNumber(logprobs?.minimum);
-			const confidence =
-				minimumLogprob !== undefined && minimumLogprob <= 0 ? Math.exp(minimumLogprob) : undefined;
+			const confidence = probabilityOrUndefined(record(logprobs?.tool_name)?.minimum_probability);
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
 				this.totalForkLogprobTokens += logprobTokens;
@@ -858,7 +865,7 @@ export class SelfSpeculationCoordinator {
 				continue;
 			const fingerprint = sidecarActionBatchFingerprint(calls);
 			const score = record(candidate.score);
-			const evidence: SelfSpeculationActionEvidence = {
+			const evidence: ActorForkActionEvidence = {
 				candidateIDs,
 				sources,
 				provenance: structuredClone(array(candidate.provenance)),
@@ -881,7 +888,7 @@ export class SelfSpeculationCoordinator {
 			});
 		}
 		if (!fork) return;
-		this.actionBridge?.publishBatches(
+		this.actorForkPlans?.publish(
 			state.turnID,
 			state.settings.forkActionEnabled ? [...actionBatches.values()].slice(0, state.settings.maxCandidates) : [],
 		);
@@ -921,9 +928,11 @@ export class SelfSpeculationCoordinator {
 		path: string,
 		payload: Readonly<Record<string, unknown>>,
 		settings: SelfSpeculationSettings = this.settings(),
+		externalSignal?: AbortSignal,
 	): Promise<unknown> {
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), settings.timeoutMs);
+		const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
 		try {
 			const apiKey = settings.apiKeyEnv ? process.env[settings.apiKeyEnv] : undefined;
 			const response = await this.fetch(`${settings.endpoint}${path}`, {
@@ -933,13 +942,15 @@ export class SelfSpeculationCoordinator {
 					...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
 				},
 				body: JSON.stringify(payload),
-				signal: controller.signal,
+				signal,
 			});
 			if (!response.ok) throw new Error(`self-speculation control plane returned HTTP ${response.status}`);
 			return response.status === 204 ? undefined : await response.json().catch(() => undefined);
 		} catch (error) {
-			this.failureCount++;
-			this.lastFailure = error instanceof Error ? error.message : String(error);
+			if (!externalSignal?.aborted) {
+				this.failureCount++;
+				this.lastFailure = error instanceof Error ? error.message : String(error);
+			}
 			throw error;
 		} finally {
 			clearTimeout(timeout);
@@ -978,7 +989,7 @@ function providerPayload(
 			fork_temperature: settings.forkTemperature,
 			fork_decoder: settings.forkDecoder,
 			fork_forced_prefix: settings.forkForcedPrefix,
-			require_logprobs: settings.requireLogprobs,
+			require_logprobs: requiresForkLogprobs(settings),
 			fork_gate: forkGatePayload(settings),
 		},
 	};
@@ -990,7 +1001,7 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 		temperature: settings.forkTemperature,
 		decoder: settings.forkDecoder,
 		forced_prefix: settings.forkForcedPrefix,
-		require_logprobs: settings.requireLogprobs,
+		require_logprobs: requiresForkLogprobs(settings),
 		max_draft_tokens: settings.maxDraftTokens,
 		draft_format: settings.draftFormat,
 		draft_boundary: settings.draftBoundary,
@@ -1294,6 +1305,14 @@ function nonNegativeNumber(value: unknown, fallback: number): number {
 
 function probability(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
+}
+
+function probabilityOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
+}
+
+function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
+	return settings.requireLogprobs || (settings.forkActionEnabled && settings.forkActionMinConfidence > 0);
 }
 
 function booleanOr(value: unknown, fallback: boolean): boolean {

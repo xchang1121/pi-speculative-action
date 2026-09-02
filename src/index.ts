@@ -148,12 +148,12 @@ export {
 	type SelfSpeculationVerificationStep,
 } from "./self-speculation.ts";
 export {
-	SelfSpeculationActionBridge,
-	type SelfSpeculationActionBatch,
-	type SelfSpeculationActionCandidate,
-	type SelfSpeculationActionCall,
-	type SelfSpeculationActionEvidence,
-} from "./self-speculation-action-bridge.ts";
+	ActorForkPlanSource,
+	createActorForkPlanSource,
+	type ActorForkActionBatch,
+	type ActorForkActionCall,
+	type ActorForkActionEvidence,
+} from "./actor-fork-plan-source.ts";
 export {
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,

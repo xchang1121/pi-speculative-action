@@ -12,7 +12,7 @@ import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
-import { SelfSpeculationActionBridge } from "../src/self-speculation-action-bridge.ts";
+import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import {
 	normalizeSelfSpeculationSettings,
@@ -1059,7 +1059,7 @@ describe("speculative action host", () => {
 		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
 		const events: SpeculativeActionEvent<string>[] = [];
 		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
-		const actionBridge = new SelfSpeculationActionBridge();
+		const actorForkPlans = createActorForkPlanSource();
 		let forkPath = "notes.txt";
 		let forkMinimumLogprob = Math.log(0.95);
 		let actionSourceEnabled = true;
@@ -1074,7 +1074,7 @@ describe("speculative action host", () => {
 		const coordinator = new SelfSpeculationCoordinator({
 			settings: selfSettings,
 			requestID: () => "actor-request",
-			actionBridge,
+			actorForkPlanSource: actorForkPlans,
 			fetch: vi.fn(async (input) =>
 				Response.json(
 					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
@@ -1090,11 +1090,12 @@ describe("speculative action host", () => {
 													{ name: "read", arguments: { path: `${forkPath}.sibling` }, index: 1 },
 												],
 												fork: {
-													logprobs: {
-														token_count: 1,
-														mean: forkMinimumLogprob,
-														minimum: forkMinimumLogprob,
-													},
+												logprobs: {
+													token_count: 1,
+													mean: forkMinimumLogprob,
+													minimum: forkMinimumLogprob,
+													tool_name: { minimum_probability: Math.exp(forkMinimumLogprob) },
+												},
 												},
 											},
 										],
@@ -1123,7 +1124,7 @@ describe("speculative action host", () => {
 				maxConcurrentActions: 2,
 				selfSpeculation: selfSettings(),
 			}),
-			selfSpeculationActionBridge: actionBridge,
+			actorForkPlanSource: actorForkPlans,
 			complete: async () => assistant([], "stop"),
 			preflight: () => true,
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>

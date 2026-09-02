@@ -31,6 +31,7 @@ import {
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
+import { createActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
@@ -59,7 +60,6 @@ import {
 import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
-import { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import {
 	nonEmptyTextInput,
 	nonNegativeIntegerInput,
@@ -400,14 +400,14 @@ async function installController(
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	const settings = () => currentSettings;
-	const selfSpeculationActions = new SelfSpeculationActionBridge();
+	const actorForkPlans = createActorForkPlanSource();
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
 			const configured = settings().selfSpeculation;
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
-		actionBridge: selfSpeculationActions,
+		actorForkPlanSource: actorForkPlans,
 	});
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
 		loadPiToolSettings(context.cwd),
@@ -500,7 +500,7 @@ async function installController(
 			...(piToolSettings.shellCommandPrefix ? [] : [PI_BASH_TAIL_LINES_PROJECTION_RULE]),
 		],
 		executionWorlds,
-		selfSpeculationActionBridge: selfSpeculationActions,
+		actorForkPlanSource: actorForkPlans,
 		patternStateDirectory: getAgentDir(),
 		patternWorkspaceIdentity,
 		onTurnStarted: ({ turnID, actorModel, context: actorContext, decisionSequence }) =>

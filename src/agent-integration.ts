@@ -19,7 +19,7 @@ import type {
 	DraftOptionsContext,
 } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
-import { createActorForkPlanSource } from "./actor-fork-plan-source.ts";
+import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type {
 	ExecutionWorldDiagnosticSnapshot,
 	SpeculativeExecutionRoute,
@@ -44,7 +44,6 @@ import type {
 	SpeculativeActionSettings,
 } from "./runtime.ts";
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
-import type { SelfSpeculationActionBridge } from "./self-speculation-action-bridge.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
@@ -113,8 +112,8 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
-	/** Completed sidecar fork actions enter the same runtime through this bounded handoff. */
-	readonly selfSpeculationActionBridge?: SelfSpeculationActionBridge;
+	/** Actor probe source shared with the decoder-feedback coordinator. */
+	readonly actorForkPlanSource?: ActorForkPlanSource;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
 	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	/** Optional persistence root for workspace-hashed PatternAware state. */
@@ -253,6 +252,7 @@ export function createSpeculativeActionHost(
 						: DEFAULTS.drafterGateEnabled,
 				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
 				actorForkActionEnabled:
+					options.actorForkPlanSource !== undefined &&
 					selfSpeculation.enabled &&
 					selfSpeculation.forkEnabled &&
 					selfSpeculation.forkActionEnabled &&
@@ -280,7 +280,6 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
-	const actorForkSource = createActorForkPlanSource(options.selfSpeculationActionBridge);
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		ToolSettlement,
@@ -290,7 +289,11 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources: [patternPlans.source, drafterPlans.source, actorForkSource],
+		sources: [
+			patternPlans.source,
+			drafterPlans.source,
+			...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : []),
+		],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
