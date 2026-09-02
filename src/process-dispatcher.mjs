@@ -110,21 +110,26 @@ function executionContext() {
 	const aliases = new Map();
 	const descriptors = [0, 1, 2].map((fd) => descriptor(fd, aliases));
 	const umask = process.umask();
+	const semantic = {
+		rlimits: fs.readFileSync("/proc/self/limits", "utf8").split("\n").slice(1)
+			.map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
+		credentials: {
+			uid: process.getuid(), euid: process.geteuid(), gid: process.getgid(), egid: process.getegid(),
+			groups: process.getgroups().sort((left, right) => left - right),
+		},
+		signals: { blocked: status.SigBlk, ignored: status.SigIgn },
+		scheduling: {
+			nice: os.getPriority(), cpus: status.Cpus_allowed_list, memoryNodes: status.Mems_allowed_list,
+		},
+		descriptors: descriptors.map(({ endpoint, ...value }) => ({
+			...value, flags: value.flags & ~0o2000000, ...(value.type === "device" ? { endpoint } : {}),
+		})),
+	};
 	return {
-		key: JSON.stringify({
-			rlimits: fs.readFileSync("/proc/self/limits", "utf8").split("\n").slice(1)
-				.map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
-			credentials: {
-				uid: process.getuid(), euid: process.geteuid(), gid: process.getgid(), egid: process.getegid(),
-				groups: process.getgroups().sort((left, right) => left - right),
-			},
-			signals: { blocked: status.SigBlk, ignored: status.SigIgn },
-			scheduling: {
-				nice: os.getPriority(), cpus: status.Cpus_allowed_list, memoryNodes: status.Mems_allowed_list,
-			},
-			descriptors: descriptors.map(({ endpoint, ...value }) => ({
-				...value, flags: value.flags & ~0o2000000, ...(value.type === "device" ? { endpoint } : {}),
-			})),
+		key: JSON.stringify(semantic),
+		launchKey: JSON.stringify({
+			...semantic,
+			credentials: { ...semantic.credentials, groups: "broker-preserved" },
 		}),
 		umask,
 		descriptorTypes: descriptors.map(({ type }) => type),

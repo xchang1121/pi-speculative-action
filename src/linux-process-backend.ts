@@ -77,8 +77,9 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v11";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v10";
+const BACKEND_EPOCH = "pi-linux-process-v12";
+const POLICY_ID = "sandlock-namespaced-transparent-exec-v11";
+const LEAF_POLICY_ID = "sandlock-host-context-leaf-v1";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
@@ -165,6 +166,8 @@ interface DispatcherRequest {
 
 interface DispatcherExecutionContext {
 	readonly key: string;
+	/** Parent launch contract, excluding groups that the host-side leaf broker deliberately preserves. */
+	readonly launchKey: string;
 	readonly umask: number;
 	readonly descriptorTypes: readonly ["device" | "other", "pipe" | "socket", "pipe" | "socket"];
 	readonly outputEndpoints: readonly [string, string];
@@ -195,6 +198,7 @@ interface ActiveSession {
 	readonly originalPath: string;
 	readonly deniedPaths: readonly string[];
 	readonly producer: ProcessProducerProof;
+	readonly nestedProducer: ProcessProducerProof;
 	readonly socketPath: string;
 	readonly server: net.Server;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
@@ -392,6 +396,7 @@ export class LinuxProcessReuseBackend {
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
 		);
 		const producer = speculativeProducerProof(ready, deniedPaths);
+		const nestedProducer = speculativeProducerProof(ready, deniedPaths, "sandlock", LEAF_POLICY_ID);
 		const session = {} as ActiveSession;
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		Object.assign(session, {
@@ -405,6 +410,7 @@ export class LinuxProcessReuseBackend {
 			originalPath,
 			deniedPaths,
 			producer,
+			nestedProducer,
 			socketPath,
 			server,
 			nestedEvidence: [],
@@ -476,7 +482,7 @@ export class LinuxProcessReuseBackend {
 			const target = path.join(mountProbe, "target");
 			await Promise.all([mkdir(source), mkdir(target)]);
 			await execText(unshare, namespaceArguments([mount, "--bind", source, target]));
-			executionContext = await probeExecutionContext({ sandlock, strace, unshare, workspace: source, privateRoot: target });
+			executionContext = await probeExecutionContext({ sandlock, strace, workspace: source, privateRoot: target });
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
@@ -716,7 +722,7 @@ export class LinuxProcessReuseBackend {
 	private async plan(session: ActiveSession, prototype: ExecPrototype) {
 		const plan = await this.planner.plan({
 			prototype,
-			acceptProducer: (producer) => compatibleProducer(session.producer, producer),
+			acceptProducer: (producer) => compatibleProducer(session.nestedProducer, producer),
 			contract: {
 				sink: "buffered",
 				orderedJournal: true,
@@ -824,7 +830,7 @@ export class LinuxProcessReuseBackend {
 				...request.args,
 			]);
 			const processStarted = performance.now();
-			outcome = await runSpawn(ready.unshare, namespaceArguments(command), {
+			outcome = await runSpawn(ready.strace, command.slice(1), {
 				cwd: request.cwd,
 				environment: executionEnvironment(request.environment, executable),
 			});
@@ -899,7 +905,7 @@ export class LinuxProcessReuseBackend {
 				const exit = exitOutcome(outcome);
 				const certificate = sealProcessCertificate({
 					prototype,
-					producer: session.producer,
+					producer: session.nestedProducer,
 					dependencyCertificate,
 					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
@@ -1637,24 +1643,24 @@ function sandboxPolicyArguments(
 async function probeExecutionContext(input: {
 	readonly sandlock: string;
 	readonly strace: string;
-	readonly unshare: string;
 	readonly workspace: string;
 	readonly privateRoot: string;
 }): Promise<DispatcherExecutionContext> {
+	const command = straceCommand(input.strace, path.join(input.privateRoot, "context"), [
+		input.sandlock,
+		...sandboxPolicyArguments(input.workspace, input.privateRoot, input.workspace, []),
+		"--",
+		process.execPath,
+		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+		"--exec",
+		"pi-context-probe",
+		process.execPath,
+		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+		"--probe-context",
+	]);
 	const outcome = await runSpawn(
-		input.unshare,
-		namespaceArguments(straceCommand(input.strace, path.join(input.privateRoot, "context"), [
-			input.sandlock,
-			...sandboxPolicyArguments(input.workspace, input.privateRoot, input.workspace, []),
-			"--",
-			process.execPath,
-			fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
-			"--exec",
-			"pi-context-probe",
-			process.execPath,
-			fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
-			"--probe-context",
-		])),
+		input.strace,
+		command.slice(1),
 		{ cwd: input.workspace, environment: normalizeEnvironment(process.env) },
 	);
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
@@ -1667,14 +1673,16 @@ async function probeExecutionContext(input: {
 function speculativeProducerProof(
 	ready: ReadyBackend,
 	deniedPaths: readonly string[],
+	provider = "sandlock+namespaces",
+	policy = POLICY_ID,
 ): ProcessProducerProof {
 	return Object.freeze({
 		observer: { provider: "strace", fingerprint: ready.observerFingerprint },
 		execution: {
 			authority: "speculative",
 			confinement: {
-				provider: "sandlock+namespaces",
-				fingerprint: digestObject({ policy: POLICY_ID, deniedPaths }),
+				provider,
+				fingerprint: digestObject({ policy, deniedPaths }),
 			},
 		},
 	} satisfies ProcessProducerProof);
@@ -1816,7 +1824,7 @@ async function eligibleRequest(
 	return Boolean(
 		executable && endpoints && pathContains(session.workspace.sandboxRoot, request.cwd) &&
 		request.args.length <= 4096 && request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) <= 1024 * 1024 &&
-		request.context.key === expectedContext.key && request.context.umask === expectedContext.umask &&
+		request.context.launchKey === expectedContext.launchKey && request.context.umask === expectedContext.umask &&
 		request.context.outputEndpoints[0] === endpoints[0] && request.context.outputEndpoints[1] === endpoints[1]
 	);
 }
@@ -1826,6 +1834,7 @@ function validDispatcherContext(value: unknown): value is DispatcherExecutionCon
 	const context = value as Partial<DispatcherExecutionContext>;
 	return (
 		typeof context.key === "string" && context.key.length > 0 && context.key.length <= 64 * 1024 &&
+		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
 		Number.isSafeInteger(context.umask) && context.umask! >= 0 && context.umask! <= 0o777 &&
 		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
 		context.descriptorTypes[0] === "device" && ["pipe", "socket"].includes(context.descriptorTypes[1] ?? "") &&
@@ -1901,9 +1910,13 @@ function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readon
 	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== digestObject({ epoch: BACKEND_EPOCH })) {
 		return false;
 	}
-	return producer.execution.authority === "actor" || (
-		producer.execution.confinement.provider === "sandlock+namespaces" &&
-		producer.execution.confinement.fingerprint === digestObject({ policy: POLICY_ID, deniedPaths })
+	if (producer.execution.authority === "actor") return true;
+	const confinement = producer.execution.confinement;
+	return (
+		(confinement.provider === "sandlock+namespaces" &&
+			confinement.fingerprint === digestObject({ policy: POLICY_ID, deniedPaths })) ||
+		(confinement.provider === "sandlock" &&
+			confinement.fingerprint === digestObject({ policy: LEAF_POLICY_ID, deniedPaths }))
 	);
 }
 
