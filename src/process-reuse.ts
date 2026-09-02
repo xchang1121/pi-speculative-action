@@ -15,6 +15,7 @@ export {
 	type OrderedEffectEvent,
 	parseProcessCertificate,
 	type ProcessPrototypeInput,
+	type ProcessProducerProof,
 	type ProcessProvenanceCertificate,
 	type ProcessResultRecord,
 	PROCESS_CERTIFICATE_VERSION,

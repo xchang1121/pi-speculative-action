@@ -12,6 +12,13 @@ import { ProcessReusePlanner } from "../src/reuse-planner.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 
 const roots: string[] = [];
+const PRODUCER = {
+	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
+	execution: {
+		authority: "speculative" as const,
+		confinement: { provider: "test", fingerprint: sha256Digest("confinement-v1") },
+	},
+};
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -69,6 +76,18 @@ describe("ProcessReusePlanner", () => {
 		expect(salvage).toMatchObject({ kind: "artifact_seed", effects: [{ kind: "write" }] });
 	});
 
+	it("lets the execution authority reject an otherwise matching producer proof", async () => {
+		const fixture = await fixtureWithCertificate();
+		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
+			prototype: fixture.prototype,
+			contract: contract("completed_replay"),
+			validation: { resolvePath: () => fixture.input },
+			acceptProducer: () => false,
+		});
+
+		expect(plan).toMatchObject({ kind: "miss", reasons: ["producer_guarantee_incompatible"] });
+	});
+
 	it("loads each result artifact once into a verified closure before replay", async () => {
 		const fixture = await fixtureWithCertificate(true);
 		const get = vi.spyOn(fixture.store.artifacts, "get");
@@ -119,6 +138,7 @@ describe("ProcessReusePlanner", () => {
 			const output = await store.artifacts.put(`result:${value}`);
 			const certificate = sealProcessCertificate({
 				prototype,
+				producer: PRODUCER,
 				dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints: [] },
 				result: {
 					replayProfile: "buffered_noninteractive",
@@ -163,6 +183,7 @@ async function fixtureWithCertificate(withFileEffect = false) {
 	const prototype = processPrototype();
 	const certificate = sealProcessCertificate({
 		prototype,
+		producer: PRODUCER,
 		dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints: [] },
 		result: {
 			replayProfile: "buffered_noninteractive",
@@ -196,8 +217,6 @@ function processPrototype() {
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [],
 		platformFingerprint: "linux-x64",
-		monitorEpoch: "monitor-v1",
-		policyID: "closed-v1",
 	});
 }
 

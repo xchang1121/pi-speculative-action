@@ -12,6 +12,10 @@ import {
 import { ArtifactCAS, ProvenanceCertificateStore } from "../src/reuse-store.ts";
 
 const roots: string[] = [];
+const PRODUCER = {
+	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
+	execution: { authority: "actor" as const },
+};
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -30,6 +34,7 @@ describe("persistent provenance store", () => {
 		const { id: _id, ...legacyBody } = certificate;
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
 		expect(parseProcessCertificate(legacy)?.id).toBe(legacy.id);
+		expect(parseProcessCertificate({ ...certificate, version: 1 })).toBeUndefined();
 		expect(await initial.put(certificate)).toBe(true);
 		expect(await initial.put(duplicate)).toBe(false);
 
@@ -74,6 +79,7 @@ describe("persistent provenance store", () => {
 		const missing = { digest: sha256Digest("missing"), size: 7 };
 		const certificate = sealProcessCertificate({
 			prototype: prototype(),
+			producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 			result: {
 				replayProfile: "buffered_noninteractive",
@@ -118,6 +124,7 @@ function completed(
 ) {
 	return sealProcessCertificate({
 		prototype: prototype(mode),
+		producer: PRODUCER,
 		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 		result: {
 			replayProfile: "buffered_noninteractive",
@@ -146,8 +153,6 @@ function prototype(mode = "test") {
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [],
 		platformFingerprint: "linux",
-		monitorEpoch: "v1",
-		policyID: "closed",
 	});
 }
 

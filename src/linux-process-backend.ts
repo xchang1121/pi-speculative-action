@@ -26,6 +26,7 @@ import {
 	type ExecPrototype,
 	type ExitOutcome,
 	type OrderedEffectEvent,
+	type ProcessProducerProof,
 	processWeakKey,
 	type ProvenanceTaint,
 	sealProcessCertificate,
@@ -121,6 +122,8 @@ interface ReadyBackend {
 	readonly unshare: string;
 	readonly mount: string;
 	readonly fingerprint: string;
+	readonly platformFingerprint: string;
+	readonly observerFingerprint: Sha256Digest;
 }
 
 interface InterposedDirectory {
@@ -175,6 +178,7 @@ interface ActiveSession {
 	readonly interposition: ProcessInterposition;
 	readonly originalPath: string;
 	readonly deniedPaths: readonly string[];
+	readonly producer: ProcessProducerProof;
 	readonly socketPath: string;
 	readonly server: net.Server;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
@@ -302,6 +306,7 @@ export class LinuxProcessReuseBackend {
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
 		);
+		const producer = speculativeProducerProof(ready, deniedPaths);
 		const session = {} as ActiveSession;
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		Object.assign(session, {
@@ -314,6 +319,7 @@ export class LinuxProcessReuseBackend {
 			interposition,
 			originalPath,
 			deniedPaths,
+			producer,
 			socketPath,
 			server,
 			nestedEvidence: [],
@@ -380,6 +386,8 @@ export class LinuxProcessReuseBackend {
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
+		const platformFingerprint = digestObject({ kernel: kernel.trim(), arch: process.arch });
+		const observerFingerprint = digestObject({ epoch: BACKEND_EPOCH });
 		const fingerprint = digestObject({
 			epoch: BACKEND_EPOCH,
 			policy: POLICY_ID,
@@ -390,7 +398,7 @@ export class LinuxProcessReuseBackend {
 			arch: process.arch,
 			deniedPaths: sensitivePaths(this.options.storeRoot, this.options.deniedPaths),
 		});
-		return { sandlock, strace, unshare, mount, fingerprint };
+		return { sandlock, strace, unshare, mount, fingerprint, platformFingerprint, observerFingerprint };
 	}
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
@@ -530,6 +538,7 @@ export class LinuxProcessReuseBackend {
 		const started = performance.now();
 		const plan = await this.planner.plan({
 			prototype,
+			acceptProducer: (producer) => compatibleProducer(session.producer, producer),
 			contract: {
 				sink: "buffered",
 				orderedJournal: true,
@@ -717,6 +726,7 @@ export class LinuxProcessReuseBackend {
 				const exit = exitOutcome(outcome);
 				const certificate = sealProcessCertificate({
 					prototype,
+					producer: session.producer,
 					dependencyCertificate,
 					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
@@ -817,9 +827,7 @@ export class LinuxProcessReuseBackend {
 				{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
 				{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
 			],
-			platformFingerprint: ready.fingerprint,
-			monitorEpoch: BACKEND_EPOCH,
-			policyID: digestObject({ policy: POLICY_ID, deniedPaths: session.deniedPaths }),
+			platformFingerprint: ready.platformFingerprint,
 		});
 	}
 }
@@ -1443,6 +1451,33 @@ function sandboxPolicyArguments(
 		"--cwd",
 		cwd,
 	];
+}
+
+function speculativeProducerProof(
+	ready: ReadyBackend,
+	deniedPaths: readonly string[],
+): ProcessProducerProof {
+	return Object.freeze({
+		observer: { provider: "strace", fingerprint: ready.observerFingerprint },
+		execution: {
+			authority: "speculative",
+			confinement: {
+				provider: "sandlock+namespaces",
+				fingerprint: digestObject({ policy: POLICY_ID, deniedPaths }),
+			},
+		},
+	} satisfies ProcessProducerProof);
+}
+
+function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessProducerProof): boolean {
+	return (
+		expected.observer.provider === candidate.observer.provider &&
+		expected.observer.fingerprint === candidate.observer.fingerprint &&
+		expected.execution.authority === "speculative" &&
+		candidate.execution.authority === "speculative" &&
+		expected.execution.confinement.provider === candidate.execution.confinement.provider &&
+		expected.execution.confinement.fingerprint === candidate.execution.confinement.fingerprint
+	);
 }
 
 function namespaceArguments(command: readonly string[]): readonly string[] {

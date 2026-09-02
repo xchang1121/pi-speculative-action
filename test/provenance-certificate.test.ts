@@ -19,6 +19,13 @@ import {
 } from "../src/provenance-validation.ts";
 
 const roots: string[] = [];
+const PRODUCER = {
+	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
+	execution: {
+		authority: "speculative" as const,
+		confinement: { provider: "test", fingerprint: sha256Digest("confinement-v1") },
+	},
+};
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -58,6 +65,7 @@ describe("process provenance certificates", () => {
 		if (!absent) throw new Error("expected negative lookup evidence");
 		const certificate = sealProcessCertificate({
 			prototype: prototype(),
+			producer: PRODUCER,
 			dependencyCertificate: {
 				complete: true,
 				dependencies: [
@@ -98,6 +106,7 @@ describe("process provenance certificates", () => {
 		if (!absent) throw new Error("expected absence");
 		const base = {
 			prototype: prototype(),
+			producer: PRODUCER,
 			result: { replayProfile: "buffered_noninteractive" as const, journal: [], exit: { kind: "code" as const, code: 0 } },
 		};
 		const certificate = sealProcessCertificate({
@@ -132,6 +141,33 @@ describe("process provenance certificates", () => {
 		expect(Object.isFrozen(first.environment)).toBe(true);
 	});
 
+	it("keeps producer authority out of semantic keys but inside certificate identity", () => {
+		const semantic = prototype();
+		const result = { replayProfile: "buffered_noninteractive" as const, journal: [], exit: { kind: "code" as const, code: 0 } };
+		const dependencyCertificate = { complete: true, dependencies: [], taints: [] };
+		const speculative = sealProcessCertificate({
+			prototype: semantic,
+			producer: PRODUCER,
+			dependencyCertificate,
+			result,
+		});
+		const actor = sealProcessCertificate({
+			prototype: semantic,
+			producer: {
+				observer: { provider: "test", fingerprint: sha256Digest("observer-v2") },
+				execution: { authority: "actor" },
+			},
+			dependencyCertificate,
+			result,
+		});
+
+		expect(actor.weakKey).toBe(speculative.weakKey);
+		expect(actor.strongKey).toBe(speculative.strongKey);
+		expect(actor.id).not.toBe(speculative.id);
+		expect(actor.prototype).not.toHaveProperty("policyID");
+		expect(actor.prototype).not.toHaveProperty("monitorEpoch");
+	});
+
 	it("projects backend-private directory entries consistently during validation", async () => {
 		const root = await workspace();
 		await writeFile(path.join(root, "tracked.txt"), "base");
@@ -142,6 +178,7 @@ describe("process provenance certificates", () => {
 		if (!absent) throw new Error("expected absence");
 		const certificate = sealProcessCertificate({
 			prototype: prototype(),
+			producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies: [directory, absent], taints: [] },
 			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
 		});
@@ -199,6 +236,7 @@ describe("process provenance certificates", () => {
 		expect(() =>
 			sealProcessCertificate({
 				prototype: prototype(),
+				producer: PRODUCER,
 				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 				result: {
 					replayProfile: "buffered_noninteractive",
@@ -216,6 +254,7 @@ describe("process provenance certificates", () => {
 		const entriesDigest = sha256Digest("empty directory");
 		const certificate = sealProcessCertificate({
 			prototype: prototype(),
+			producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 			result: {
 				replayProfile: "buffered_noninteractive",
@@ -231,6 +270,7 @@ describe("process provenance certificates", () => {
 		expect(() =>
 			sealProcessCertificate({
 				prototype: prototype(),
+				producer: PRODUCER,
 				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 				result: {
 					replayProfile: "buffered_noninteractive",
@@ -269,8 +309,6 @@ function prototype(environment: Readonly<Record<string, string | undefined>> = {
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [],
 		platformFingerprint: "linux-x64:kernel",
-		monitorEpoch: "monitor-v1",
-		policyID: "closed-v1",
 	});
 }
 

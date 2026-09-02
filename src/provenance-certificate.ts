@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 1 as const;
+export const PROCESS_CERTIFICATE_VERSION = 2 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -69,8 +69,23 @@ export interface ExecPrototype {
 	readonly fileDescriptorTableComplete: true;
 	readonly inheritedFDs: readonly InheritedFileDescriptor[];
 	readonly platformFingerprint: string;
-	readonly monitorEpoch: string;
-	readonly policyID: string;
+}
+
+/** How the producer established evidence; deliberately excluded from semantic process identity. */
+export interface ProcessProducerProof {
+	readonly observer: {
+		readonly provider: string;
+		readonly fingerprint: Sha256Digest;
+	};
+	readonly execution:
+		| { readonly authority: "actor" }
+		| {
+				readonly authority: "speculative";
+				readonly confinement: {
+					readonly provider: string;
+					readonly fingerprint: Sha256Digest;
+				};
+		  };
 }
 
 export type DependencyRole = "input" | "executable" | "shared_object" | "metadata";
@@ -174,6 +189,7 @@ export interface ProcessProvenanceCertificate {
 	readonly weakKey: Sha256Digest;
 	readonly strongKey: Sha256Digest;
 	readonly prototype: ExecPrototype;
+	readonly producer: ProcessProducerProof;
 	readonly dependencyCertificate: DynamicDependencyCertificate;
 	readonly result: ProcessResultRecord;
 	readonly createdAt: number;
@@ -249,11 +265,13 @@ export function processStrongKey(
 
 export function sealProcessCertificate(input: {
 	readonly prototype: ExecPrototype;
+	readonly producer: ProcessProducerProof;
 	readonly dependencyCertificate: DynamicDependencyCertificate;
 	readonly result: ProcessResultRecord;
 	readonly createdAt?: number;
 }): ProcessProvenanceCertificate {
 	const prototype = normalizePrototype(input.prototype);
+	const producer = normalizeProducerProof(input.producer);
 	const dependencyCertificate = normalizeDependencyCertificate(input.dependencyCertificate);
 	const result = normalizeResult(input.result);
 	const weakKey = processWeakKey(prototype);
@@ -264,6 +282,7 @@ export function sealProcessCertificate(input: {
 		weakKey,
 		strongKey,
 		prototype,
+		producer,
 		dependencyCertificate,
 		result,
 		createdAt,
@@ -278,6 +297,7 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 		candidate.version !== PROCESS_CERTIFICATE_VERSION ||
 		!isSha256Digest(candidate.id) ||
 		!candidate.prototype ||
+		!candidate.producer ||
 		!candidate.dependencyCertificate ||
 		!candidate.result
 	) {
@@ -286,6 +306,7 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 	try {
 		const sealed = sealProcessCertificate({
 			prototype: candidate.prototype,
+			producer: candidate.producer,
 			dependencyCertificate: candidate.dependencyCertificate,
 			result: candidate.result,
 			createdAt: candidate.createdAt,
@@ -381,9 +402,7 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 	if (
 		!validLogicalPath(prototype.executablePath) ||
 		!validLogicalPath(prototype.logicalCwd) ||
-		!prototype.platformFingerprint ||
-		!prototype.monitorEpoch ||
-		!prototype.policyID
+		!prototype.platformFingerprint
 	) {
 		throw new Error("process prototype identity is incomplete");
 	}
@@ -448,9 +467,38 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 		fileDescriptorTableComplete: true,
 		inheritedFDs,
 		platformFingerprint: prototype.platformFingerprint,
-		monitorEpoch: prototype.monitorEpoch,
-		policyID: prototype.policyID,
 	});
+}
+
+function normalizeProducerProof(proof: ProcessProducerProof): ProcessProducerProof {
+	if (
+		!proof ||
+		!validProvider(proof.observer?.provider) ||
+		!isSha256Digest(proof.observer?.fingerprint) ||
+		(proof.execution?.authority !== "actor" && proof.execution?.authority !== "speculative")
+	) {
+		throw new Error("process producer proof is incomplete");
+	}
+	if (proof.execution.authority === "actor") {
+		return deepFreeze({ observer: { ...proof.observer }, execution: { authority: "actor" } });
+	}
+	if (
+		!validProvider(proof.execution.confinement?.provider) ||
+		!isSha256Digest(proof.execution.confinement?.fingerprint)
+	) {
+		throw new Error("speculative process producer requires confinement proof");
+	}
+	return deepFreeze({
+		observer: { ...proof.observer },
+		execution: {
+			authority: "speculative",
+			confinement: { ...proof.execution.confinement },
+		},
+	});
+}
+
+function validProvider(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && !value.includes("\0");
 }
 
 function normalizeDependencyCertificate(certificate: DynamicDependencyCertificate): DynamicDependencyCertificate {

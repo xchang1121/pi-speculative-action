@@ -4,6 +4,7 @@ import {
 	type DynamicDependencyCertificate,
 	type ExecPrototype,
 	type OrderedEffectEvent,
+	type ProcessProducerProof,
 	processStrongKey,
 	processWeakKey,
 	type ProcessProvenanceCertificate,
@@ -38,11 +39,14 @@ export interface ProcessReuseRequest {
 	readonly prototype: ExecPrototype;
 	readonly contract: ReplayObservationContract;
 	readonly validation?: ProvenanceValidationContext;
+	/** Optional host policy for accepting proof produced under a different execution authority. */
+	readonly acceptProducer?: (proof: ProcessProducerProof) => boolean;
 }
 
 export type ProcessReuseMissReason =
 	| "no_candidate_pathset"
 	| "certificate_tainted"
+	| "producer_guarantee_incompatible"
 	| "dependency_changed"
 	| "validation_indeterminate"
 	| "artifact_missing"
@@ -141,6 +145,10 @@ export class ProcessReusePlanner<MemoryHit = never> {
 		const changedDependencies = new Set<string>();
 		const pathsets = new Map<Sha256Digest, ProcessProvenanceCertificate[]>();
 		for (const certificate of certificates) {
+			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) {
+				reasons.add("producer_guarantee_incompatible");
+				continue;
+			}
 			if (!certificateReplayable(certificate)) {
 				reasons.add("certificate_tainted");
 				continue;
