@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBashToolDefinition,
@@ -476,13 +476,6 @@ async function installController(
 			providerRequest.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
 		draftModel: (actorModel) =>
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
-		getDraftOptions: async ({ draftModel, actorOptions, signal }) =>
-			resolveDraftOptions({
-				draftModel,
-				actorOptions,
-				signal,
-				modelRegistry: latestContext.modelRegistry,
-			}),
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
 		resolveInvocation: (tool, input) =>
@@ -1527,21 +1520,6 @@ function findExactModelReferenceMatch(reference: string, models: readonly Model<
 	if (canonical.length > 1 || normalized.includes("/")) return undefined;
 	const byID = models.filter((model) => model.id.toLowerCase() === normalized);
 	return byID.length === 1 ? byID[0] : undefined;
-}
-
-async function resolveDraftOptions(input: {
-	readonly draftModel: Model<Api>;
-	readonly actorOptions: SimpleStreamOptions | undefined;
-	readonly signal: AbortSignal;
-	readonly modelRegistry: ModelRegistry;
-}): Promise<SimpleStreamOptions> {
-	const base: SimpleStreamOptions = {
-		...input.actorOptions,
-		signal: input.signal,
-	};
-	const auth = await input.modelRegistry.getApiKeyAndHeaders(input.draftModel);
-	if (!auth.ok) throw new Error(auth.error);
-	return { ...base, apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
 }
 
 function emptyMetrics(): SpeculativeActionMetrics {

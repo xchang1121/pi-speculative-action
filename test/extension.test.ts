@@ -571,7 +571,6 @@ async function createFixture(options: FixtureOptions = {}) {
 			getAll: () => [testModel()],
 			getAvailable: () => [testModel()],
 			hasConfiguredAuth: () => true,
-			getApiKeyAndHeaders: async () => ({ ok: true }),
 		},
 		sessionManager: { getSessionId: () => "session", getSessionFile: () => undefined },
 		isProjectTrusted: () => true,
