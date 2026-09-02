@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { asRecord, contains, slash } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
@@ -150,7 +151,7 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 
 interface WorkspaceSandboxState {
 	readonly repositories: Map<string, Promise<PooledGitRepository>>;
-	readonly targetLocks: Map<string, Promise<void>>;
+	readonly pendingCommits: Set<Promise<unknown>>;
 	readonly overlayfsCapabilities: LinuxOverlayfsCapabilityRegistry;
 	cleanupTail: Promise<void>;
 	disposed: boolean;
@@ -643,7 +644,7 @@ export interface QualifiedWorkspaceSandboxDriver {
 export class WorkspaceSandboxService {
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
-		targetLocks: new Map(),
+		pendingCommits: new Set(),
 		overlayfsCapabilities: new LinuxOverlayfsCapabilityRegistry(),
 		cleanupTail: Promise.resolve(),
 		disposed: false,
@@ -698,7 +699,7 @@ export class WorkspaceSandboxService {
 	async dispose(): Promise<void> {
 		if (this.state.disposed) return;
 		this.state.disposed = true;
-		await Promise.allSettled([...this.state.targetLocks.values()]);
+		await Promise.allSettled([...this.state.pendingCommits]);
 		try {
 			await closeWorkspaceSandboxPoolsFor(this.state);
 		} finally {
@@ -904,8 +905,7 @@ async function commitSandboxExecution(
 	assertWorkspaceSandboxOpen(state);
 	const started = performance.now();
 	const changes = deduplicateChanges(execution.changes);
-	return withTargetLocks(
-		state.targetLocks,
+	const commit = withCommitLocks(
 		commitLockTargets(changes),
 		async () => {
 			const staged = new Map<SandboxFileChange, string>();
@@ -1003,6 +1003,9 @@ async function commitSandboxExecution(
 			};
 		},
 	);
+	const tracked = commit.finally(() => state.pendingCommits.delete(tracked));
+	state.pendingCommits.add(tracked);
+	return tracked;
 }
 
 export async function withSandboxWorkspace<T>(
@@ -2642,38 +2645,18 @@ function orderSandboxChanges(changes: readonly SandboxWorkspaceChange[]): Sandbo
 
 /** Root locks make namespace changes conflict with every file commit below the same workspace. */
 function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[] {
-	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))];
+	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))].sort(
+		(left, right) => pathKey(left).localeCompare(pathKey(right)),
+	);
 }
 
-async function withTargetLocks<T>(
-	targetLocks: Map<string, Promise<void>>,
+function withCommitLocks<T>(
 	targets: readonly string[],
 	run: () => Promise<T>,
+	index = 0,
 ): Promise<T> {
-	const releases: Array<() => void> = [];
-	try {
-		for (const target of [...new Set(targets.map(pathKey))].sort()) {
-			releases.push(await acquireTargetLock(targetLocks, target));
-		}
-		return await run();
-	} finally {
-		for (const release of releases.reverse()) release();
-	}
-}
-
-async function acquireTargetLock(targetLocks: Map<string, Promise<void>>, key: string): Promise<() => void> {
-	const previous = targetLocks.get(key) ?? Promise.resolve();
-	let release: () => void = () => undefined;
-	const current = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const tail = previous.then(() => current);
-	targetLocks.set(key, tail);
-	await previous;
-	return () => {
-		release();
-		if (targetLocks.get(key) === tail) targetLocks.delete(key);
-	};
+	const target = targets[index];
+	return target ? withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
 }
 
 function isMissing(error: unknown): boolean {

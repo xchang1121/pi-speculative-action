@@ -3,6 +3,7 @@ import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writ
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/action-semantics.ts";
@@ -478,7 +479,21 @@ describe("workspace-branch ExecutionWorld", () => {
 				],
 			}));
 
-			const results = await Promise.allSettled(deltas.map(commitSandboxDelta));
+			let enterBlock!: () => void;
+			let releaseBlock!: () => void;
+			const entered = new Promise<void>((resolve) => (enterBlock = resolve));
+			const blocker = withFileMutationQueue(target, () => {
+				enterBlock();
+				return new Promise<void>((resolve) => (releaseBlock = resolve));
+			});
+			await entered;
+			const pending = Promise.allSettled(deltas.map(commitSandboxDelta));
+			expect(
+				await Promise.race([pending.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))]),
+			).toBe(false);
+			releaseBlock();
+			const results = await pending;
+			await blocker;
 			expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
 			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
 			expect(["first\n", "second\n"]).toContain(await readFile(target, "utf8"));
