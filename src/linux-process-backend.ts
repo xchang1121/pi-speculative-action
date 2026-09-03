@@ -73,6 +73,7 @@ import {
 	type ProvenanceStoreOptions,
 	type VerifiedArtifactClosure,
 } from "./reuse-store.ts";
+import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
@@ -270,6 +271,7 @@ interface SpawnOutcome {
 interface ProcessTransfer {
 	readonly completion: Promise<void>;
 	readonly finish: () => void;
+	readonly startedAt: number;
 	readonly scope: ExecutionScope | undefined;
 	candidate?: ProcessProvenanceCertificate;
 	state: "running" | "completed" | "claimed";
@@ -290,6 +292,7 @@ export class LinuxProcessReuseBackend {
 	private disposed = false;
 	private readonly transfers = new Map<Sha256Digest, ProcessTransfer[]>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
+	private readonly processScheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
 	constructor(options: LinuxProcessBackendOptions) {
@@ -747,7 +750,6 @@ export class LinuxProcessReuseBackend {
 		const acquired = await this.acquireProcessResult(
 			weakKey,
 			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
-			true,
 			undefined,
 			session.scope,
 		);
@@ -764,14 +766,16 @@ export class LinuxProcessReuseBackend {
 	private async acquireProcessResult(
 		weakKey: Sha256Digest,
 		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
-		produce: boolean,
 		signal?: AbortSignal,
 		scope?: ExecutionScope,
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean }> {
+		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean; readonly waitedMs: number }> {
 		let joined = false;
+		let waitedMs = 0;
+		const miss = () => actor ? { joined, waitedMs } : { work: this.claimProcessWork(weakKey, scope), joined, waitedMs };
 		while (true) {
 			const completed = await lookup();
-			if (completed) return { plan: completed, joined };
+			if (completed) return { plan: completed, joined, waitedMs };
 			const transfers = this.transfers.get(weakKey) ?? [];
 			for (const transfer of [...transfers].reverse()) {
 				if (transfer.state !== "completed" || !transfer.candidate || !sameScope(transfer.scope, scope)) continue;
@@ -779,13 +783,32 @@ export class LinuxProcessReuseBackend {
 				if (plan && transfer.state === "completed") {
 					transfer.state = "claimed";
 					this.removeTransfer(weakKey, transfer);
-					return { plan, joined };
+					return { plan, joined, waitedMs };
 				}
 			}
 			const running = transfers.find((transfer) => transfer.state === "running" && sameScope(transfer.scope, scope));
-			if (!running) return produce ? { work: this.claimProcessWork(weakKey, scope), joined } : { joined };
+			if (!running) return miss();
+			if (!actor) {
+				joined = true;
+				await running.completion;
+				continue;
+			}
+			const decision = this.processScheduler.assessCandidateJoin({
+				identity: actor.timing,
+				state: "running",
+				expectedSpeculativeDurationMs: 1,
+				elapsedMs: Math.max(0, performance.now() - running.startedAt),
+				actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
+			});
+			if (!decision.allowed) return miss();
+			const waitStarted = performance.now();
+			const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
+			waitedMs += Math.max(0, performance.now() - waitStarted);
+			if (finished.status !== "completed") {
+				throwIfAborted(signal);
+				return miss();
+			}
 			joined = true;
-			await waitForCompletion(running.completion, signal);
 		}
 	}
 
@@ -796,6 +819,7 @@ export class LinuxProcessReuseBackend {
 		});
 		const work: ProcessTransfer = {
 			completion,
+			startedAt: performance.now(),
 			scope,
 			state: "running",
 			finish: () => {
@@ -913,19 +937,24 @@ export class LinuxProcessReuseBackend {
 				})),
 				platformFingerprint: await this.resolvePlatformFingerprint(),
 			});
+			const weakKey = processWeakKey(prototype);
+			const timing = processTimingIdentity(prototype, weakKey);
 			const accepted = (producer: ProcessProducerProof) =>
 				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(
-				processWeakKey(prototype),
+				weakKey,
 				(live) => this.plan(prototype, projection, accepted, undefined, live),
-				false,
 				process.signal,
 				scope,
+				{ timing, arrivedAt: requestStarted },
 			);
 			const plan = acquired.plan;
 			if (!plan || plan.certificate.result.exit.kind !== "code") {
 				this.counters.misses++;
-				return { kind: "continue" };
+				return {
+					kind: "continue",
+					observeCompletion: (durationMs) => this.processScheduler.observeActorService(timing, durationMs),
+				};
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
 			return {
@@ -938,6 +967,10 @@ export class LinuxProcessReuseBackend {
 						throwIfAborted(process.signal);
 						await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 						this.recordHit(plan.certificate, acquired.joined, undefined, scope);
+						this.processScheduler.observeAdoption(
+							timing,
+							Math.max(0, performance.now() - requestStarted - acquired.waitedMs),
+						);
 						const observed = plan.certificate.result.observedProcessMs;
 						if (observed !== undefined) {
 							this.counters.timedHits++;
@@ -1122,7 +1155,9 @@ export class LinuxProcessReuseBackend {
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
-			this.add(session, "executionMs", Math.max(0, performance.now() - started));
+			const durationMs = Math.max(0, performance.now() - started);
+			this.add(session, "executionMs", durationMs);
+			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
@@ -1235,6 +1270,18 @@ export class LinuxProcessReuseBackend {
 
 function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
 	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);
+}
+
+function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
+	return {
+		tool: "process",
+		executionFingerprint: digestObject({
+			executable: prototype.executableDigest,
+			context: prototype.processContextDigest,
+			platform: prototype.platformFingerprint,
+		}),
+		actionKeyHash: weakKey,
+	};
 }
 
 async function sealSessionEvidence(
@@ -2434,19 +2481,6 @@ function slash(value: string): string {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw signal.reason ?? new Error("aborted");
-}
-
-async function waitForCompletion(completion: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
-	throwIfAborted(signal);
-	if (!signal) return completion;
-	await new Promise<void>((resolve, reject) => {
-		const aborted = () => reject(signal.reason ?? new Error("aborted"));
-		signal.addEventListener("abort", aborted, { once: true });
-		void completion.then(() => {
-			signal.removeEventListener("abort", aborted);
-			resolve();
-		});
-	});
 }
 
 function missing(error: unknown): boolean {

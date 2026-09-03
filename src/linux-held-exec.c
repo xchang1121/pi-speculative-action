@@ -30,6 +30,12 @@ struct output_event {
 	unsigned char *data;
 };
 
+struct completion_observer {
+	pid_t pid;
+	int fd;
+	struct completion_observer *next;
+};
+
 static int replace_with_exit(pid_t pid, unsigned code) {
 #if defined(__x86_64__)
 	struct user_regs_struct registers;
@@ -202,16 +208,16 @@ static int open_tracee_output(pid_t pid, unsigned fd) {
 	return open(path, O_WRONLY | O_CLOEXEC);
 }
 
-/* Return 1 only after the tracee has irreversibly become a replay stub. */
+/* A nonnegative return keeps the connection until the continued tracee exits. */
 static int actor_decision(pid_t pid, const char *socket_path, const char *token, const char *execution_id) {
-	int connection = -1, outputs[3] = {-1, -1, -1}, armed = 0;
+	int connection = -1, outputs[3] = {-1, -1, -1}, observer = -1;
 	struct output_event *events = NULL;
 	unsigned count = 0, code = 125;
 	size_t total = 0;
 	char line[MAX_LINE];
-	if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return 0;
+	if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
 	connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	if (connection < 0) return 0;
+	if (connection < 0) return -1;
 	struct sockaddr_un address = {.sun_family = AF_UNIX};
 	strcpy(address.sun_path, socket_path);
 	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) goto done;
@@ -221,6 +227,7 @@ static int actor_decision(pid_t pid, const char *socket_path, const char *token,
 	if (request_length < 0 || request_length >= (int)sizeof(line) ||
 		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) goto done;
 	if (!strcmp(line, "C")) goto done;
+	if (!strcmp(line, "O")) { observer = connection; connection = -1; goto done; }
 	if (sscanf(line, "P %u %u %zu", &code, &count, &total) != 3 || code > 255 ||
 		count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) goto done;
 	events = calloc(count ? count : 1, sizeof(*events));
@@ -238,7 +245,6 @@ static int actor_decision(pid_t pid, const char *socket_path, const char *token,
 		received += length;
 	}
 	if (received != total || replace_with_exit(pid, 125) < 0) goto done;
-	armed = 1;
 	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		if (transfer(outputs[events[index].fd], events[index].data, events[index].length, 1) < 0) goto done;
@@ -248,7 +254,32 @@ done:
 	if (connection >= 0) close(connection);
 	for (unsigned fd = 1; fd <= 2; fd++) if (outputs[fd] >= 0) close(outputs[fd]);
 	free_events(events, count);
-	return armed;
+	return observer;
+}
+
+static void observe_completion(struct completion_observer **observers, pid_t pid, int fd) {
+	struct completion_observer *observer = malloc(sizeof(*observer));
+	if (!observer) { close(fd); return; }
+	*observer = (struct completion_observer){.pid = pid, .fd = fd, .next = *observers};
+	*observers = observer;
+}
+
+static void complete_observers(struct completion_observer **observers, pid_t pid) {
+	struct completion_observer **cursor = observers;
+	while (*cursor) {
+		struct completion_observer *observer = *cursor;
+		if (observer->pid != pid) { cursor = &observer->next; continue; }
+		*cursor = observer->next;
+		size_t sent = 0;
+		while (sent < 2) {
+			ssize_t moved = send(observer->fd, "D\n" + sent, 2 - sent, MSG_NOSIGNAL);
+			if (moved < 0 && errno == EINTR) continue;
+			if (moved <= 0) break;
+			sent += (size_t)moved;
+		}
+		close(observer->fd);
+		free(observer);
+	}
 }
 
 static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
@@ -275,6 +306,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	close(gate[1]);
 	int status = 0;
 	unsigned exec_events = 0;
+	struct completion_observer *observers = NULL;
 	for (;;) {
 		pid_t pid = waitpid(-1, &status, __WALL);
 		if (pid < 0) {
@@ -283,6 +315,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			return 74;
 		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
+			complete_observers(&observers, pid);
 			if (pid != root) continue;
 			if (WIFEXITED(status)) return WEXITSTATUS(status);
 			signal(WTERMSIG(status), SIG_DFL);
@@ -298,7 +331,10 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) return 76;
-			if (socket_path) (void)actor_decision(pid, socket_path, token, execution_id);
+			if (socket_path) {
+				int observer = actor_decision(pid, socket_path, token, execution_id);
+				if (observer >= 0) observe_completion(&observers, pid, observer);
+			}
 		}
 		if (event != 0) delivered = 0;
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) return 75;
@@ -309,7 +345,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("2");
+		puts("3");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {

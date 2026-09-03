@@ -286,11 +286,11 @@ int main(int argc, char **argv) {
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
-		const beforeMiss = replayBackend.metrics();
+		const beforeMiss = fixture.backend.metrics();
 		const missStarted = performance.now();
-		const miss = await actor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
+		const miss = await joiningActor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
 		const missMs = performance.now() - missStarted;
-		const missMetrics = metricDelta(beforeMiss, replayBackend.metrics());
+		const missMetrics = metricDelta(beforeMiss, fixture.backend.metrics());
 		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
 		let joiningBranch: Awaited<typeof joiningTask> | undefined;
 		let joiningOutput: Awaited<ReturnType<typeof actor.execute>> | undefined;
 		let joiningMs = 0;
-		const leadMs = 300;
+		const leadMs = 400;
 		try {
 			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses);
 			await delay(leadMs);

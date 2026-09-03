@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ProcessExecutor } from "./process-execution.ts";
 
-const HELPER_PROTOCOL_VERSION = 2;
+const HELPER_PROTOCOL_VERSION = 3;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -39,7 +39,7 @@ export interface HeldExecSnapshot {
 }
 
 export type HeldExecDecision =
-	| { readonly kind: "continue" }
+	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number) => void }
 	| {
 			readonly kind: "replay";
 			readonly exitCode: number;
@@ -57,6 +57,7 @@ interface ActiveExecution {
 	readonly sourceRoot: string;
 	readonly signal?: AbortSignal;
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
+	readonly observations: Set<Promise<void>>;
 }
 
 interface WireRequest {
@@ -104,12 +105,21 @@ export class LinuxHeldExecBoundary {
 		return boundary;
 	}
 
-	executor(host: ProcessExecutor, options: ActiveExecution & { readonly realShell: string; readonly enabled: () => boolean }): ProcessExecutor {
+	executor(
+		host: ProcessExecutor,
+		options: Omit<ActiveExecution, "observations"> & { readonly realShell: string; readonly enabled: () => boolean },
+	): ProcessExecutor {
 		return {
 			execute: async (request) => {
 				const execution = randomBytes(24).toString("hex");
 				const enabled = options.enabled() && !request.signal?.aborted;
-				if (enabled) this.active.set(execution, { sourceRoot: options.sourceRoot, decide: options.decide, ...(request.signal ? { signal: request.signal } : {}) });
+				const active = {
+					sourceRoot: options.sourceRoot,
+					decide: options.decide,
+					observations: new Set<Promise<void>>(),
+					...(request.signal ? { signal: request.signal } : {}),
+				};
+				if (enabled) this.active.set(execution, active);
 				try {
 					return await host.execute({
 						...request,
@@ -124,6 +134,7 @@ export class LinuxHeldExecBoundary {
 						},
 					});
 				} finally {
+					await Promise.allSettled(active.observations);
 					this.active.delete(execution);
 				}
 			},
@@ -154,7 +165,17 @@ export class LinuxHeldExecBoundary {
 				sourceRoot: active.sourceRoot,
 				...(active.signal ? { signal: active.signal } : {}),
 			});
-			if (decision.kind === "continue") return void socket.end("C\n");
+			if (decision.kind === "continue") {
+				if (!decision.observeCompletion) return void socket.end("C\n");
+				const observation = observeCompletion(socket, decision.observeCompletion);
+				active.observations.add(observation);
+				try {
+					await observation;
+				} finally {
+					active.observations.delete(observation);
+				}
+				return;
+			}
 			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0);
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) return void socket.end("C\n");
@@ -172,6 +193,20 @@ export class LinuxHeldExecBoundary {
 			if (!socket.destroyed) socket.end(prepared ? "F\n" : "C\n");
 		}
 	}
+}
+
+async function observeCompletion(socket: net.Socket, observe: (durationMs: number) => void): Promise<void> {
+	const startedAt = performance.now();
+	await write(socket, Buffer.from("O\n"));
+	const event = await readLine(socket);
+	if (event === "D") {
+		try {
+			observe(Math.max(0, performance.now() - startedAt));
+		} catch {
+			// Timing feedback cannot affect the already-authorized process.
+		}
+	}
+	socket.end();
 }
 
 /** Resolve the native helper shared by transparent dispatch and x86-64 Actor handoff. */
