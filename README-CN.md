@@ -169,6 +169,29 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 旧的 `resourceCached` / `sandbox` / `predictionOnly` 三组对象仅作为迁移输入继续识别，读取后统一规范化为一个 `tools` 数组。
 
+## ThinkThread Profile（Linux）
+
+可选入口 `./thinkthread-extension` 通过 ThinkThread 执行现有七个 stock tools，不修改 Pi 本体或默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
+
+```sh
+./scripts/install-thinkthread-profile.sh
+cd /path/to/project
+tt pi-speculative-action
+```
+
+安装脚本支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 使用预构建包，以及重复的 `--model provider/model` 授权。它固定 Agent POSIX SDK 0.1.0，校验 protocol 2 和契约指纹，安装 schema-4 Profile，并把独立运行时放在 `~/.local/share/pi-speculative-action`。环境需要预先提供 Profile 可访问的 Pi、Node、`fd` 和 `rg`。Profile 配置保存在安装目录的 `config` 下，项目 `.pi/speculative-action.json` 仍可覆盖。
+
+适配器提供两条独立能力：
+
+- `speculation.execute`：同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
+- `observation.capture`：在 Actor 的 `read`、`grep`、`find`、`ls` 执行前创建新快照，封装这一次 Actor 输出，供后续验证复用，不重复执行工具，也不依赖投机 runner。两条路径都由 `EffectTransaction` 统一管理采纳状态。
+
+本 Profile 支持整个工具调用的投机复用，暂不支持默认 Linux 后端的持久进程证书回放、跨 Bash 父命令复用子进程或 held-exec 接管。它替换默认后端，不在 ThinkThread 内再嵌套 Git/namespace/ptrace 实现。状态会显示独立的 ThinkThread 路线；适配器没有暴露证书仓，因此可复用命令历史的存储操作不可用。普通源码加载仍使用原默认后端，不加载可选 SDK。
+
+`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。工作区验证不等于完整的动态进程依赖证书；应选择符合这些边界的任务，外部副作用无法回滚。不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
+
+开发这个可选适配器时，先运行 `npm install --ignore-scripts --no-save --package-lock=false /path/to/sdk.tgz` 安装匹配的 SDK，再运行检查与测试。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
+
 ## 接入 Runtime 沙箱
 
 Pi 扩展默认先注册 Linux 进程世界，再注册 Git 工作区 fallback；宿主也可以通过 `executionWorlds` 替换这组世界。所有 World 都按 effect capability 而不是工具名声明能力；内置 runtime world 覆盖进程调用，宿主仍可注入覆盖范围更大的 runtime sandbox。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种封存 `WorldBranch` 载体；Gateway 再将其包装为唯一的 `EffectTransaction`，由事务独占新鲜度验证、采纳、放弃和提交状态，载体只保留兼容性证据与后端局部清理职责。
