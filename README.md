@@ -28,9 +28,9 @@ On Linux and WSL 2, the default extension includes a lightweight process world. 
 
 Tool policy is not hard-coded by platform or tool name. Startup diagnostics intersect each execution world's effect guarantees with each tool's requirements: Windows, macOS, WSL 1, and incompletely qualified Linux hosts configure `read`, `grep`, `find`, `ls`, `write`, and `edit` by default; a ready Linux/WSL 2 process world adds `bash`; and a host-injected all-effect world enables every tool. A selected tool with no safe route keeps its preference but remains inactive and is not sent to prediction sources.
 
-Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, mount-namespace views leave the command's `PATH` and environment unchanged while routing PATH-resolved execs to one broker. The broker identifies an exec by executable bytes, argv, logical cwd, complete environment, descriptors, credentials, limits, platform, and policy—not by its parent Bash text or tool name. This lets different Bash parents reuse one completed child process.
+Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, mount-namespace views leave the command's `PATH` and environment unchanged while routing PATH-resolved execs to one broker. On x86-64 Linux, a native Actor boundary also stops real child `execve` events before their first instruction. Both routes use the same executable/argv/cwd/environment/process-context key, dependency certificates, result journal, and planner—not a Bash-text cache. A validated child can therefore be reused under a different parent Bash string, while a miss continues the Actor child exactly once.
 
-Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, or unsupported observations fail closed.
+Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, unsupported, or observably different confinement state fails closed.
 
 Lookup follows a weak-exec-key / dynamic-pathset / strong-input-key hierarchy. Historical certificates that observed the same pathset share one current-world capture; observation semantics such as dependency role, metadata policy, negative-parent enumeration, and private-entry exclusions remain part of the pathset identity. See the research and platform notes and the WSL2 multi-history qualification.
 
@@ -42,7 +42,7 @@ Nested process misses use the same generic workspace-transaction outlet as the o
 
 - Prediction sources never choose an execution backend.
 - `K(a)` never changes because a different isolation backend is available.
-- In-flight and cached work is reused only within an identical execution route.
+- In-flight and cached work is reused only when its producer proof is accepted by the consumer; observations of confinement state remain reusable inside the same confinement domain but cannot cross into the Actor domain.
 - Cross-parent process results are reusable across turns only after exact prototype matching and full dynamic-dependency validation; the parent shell command is deliberately absent from that nested key.
 - The Linux world preserves the visible `PATH`, mounts the private workspace over its logical source path only inside the namespace, denies common credential stores and the certificate store, and permits persistent writes only in the private branch.
 - Broker uncertainty is at-most-once: after a request may have executed, a lost reply returns an error instead of re-running the command.
@@ -68,7 +68,16 @@ Pi can install the repository directly:
 pi install https://github.com/xchang1121/pi
 ```
 
-To enable process reuse, run Pi and the project inside Linux or WSL 2. Install Rust stable, Git, `strace`, and `util-linux`, then build the pinned Sandlock revision:
+Linux and WSL 2 expose independent capabilities rather than one all-or-nothing backend:
+
+| Capability | Minimum host support |
+| --- | --- |
+| Replay an existing complete command certificate | Node.js and the local certificate store; no Landlock or `strace` on the hit path |
+| Reuse a completed or running child under a different Actor Bash | x86-64 Linux, the small native helper, `ptrace`, and `pidfd_getfd` for Pi's pipe descriptors |
+| Produce new speculative Bash certificates | Git, `strace`, `util-linux`, the pinned Sandlock build, and a successfully qualified Landlock/seccomp/namespace policy |
+| Accelerate large workspace transactions | Optional, hash-verified `fuse-overlayfs`; Git remains the safe fallback |
+
+For all tiers, install the available system dependencies and run the best-effort qualifier:
 
 ```sh
 sudo apt-get install git strace util-linux build-essential
@@ -76,7 +85,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
-`setup:linux` installs the pinned `sandlock` CLI and, on x86-64/aarch64 hosts with `/dev/fuse`, an official hash-verified `fuse-overlayfs` static release under `~/.local`; it does not alter Pi or install a daemon. The runtime probes Landlock ABI 6+, unprivileged namespaces, bind mounts, Sandlock, strace, and the complete OverlayFS copy-up/whiteout/anonymous-transaction-clock/unmount lifecycle again on every host. The Linux process world selects the host-visible COW route only when that probe passes and the exact immutable baseline contains at least 256 entries, the conservative measured same-machine boundary after lower-snapshot sharing; small workspaces and generic `write`/`edit` fallbacks retain Git. One driver-native lower structure snapshot is prewarmed and shared per content commit; outer and nested observers reconstruct each merged tree from that snapshot plus its typed upper journal. Its transaction clock is an unnamed `O_TMPFILE` in private upper-layer storage whose ordering against merged-view timestamps is proven by the probe, so Bash cannot observe a runtime control path. Driver-induced `EXDEV`, `EOPNOTSUPP`, `ENOTSUP`, or `ENOSYS` results inside the workspace taint the complete trace and prevent adoption; this covers operations such as lower-directory rename that FUSE cannot transparently reproduce. Any missing binary, unsupported marker, anonymous inode or clock projection, mount failure, or recovered lifecycle fault demotes later routes to the existing Git-worktree driver. An unresolved live mount and its pool are quarantined and retained rather than reclaimed, without blocking plugin shutdown. WSL must be version 2, and the checkout should live in its native Linux filesystem.
+`setup:linux` qualifies and reports each row separately. It builds the packaged held-exec helper when a C compiler is available, installs the pinned `sandlock` CLI when the full producer dependencies exist, and optionally installs an official hash-verified `fuse-overlayfs` release under `~/.local`; it installs no daemon and does not alter Pi. Missing Landlock, Rust, `strace`, namespaces, FUSE, or the native helper disables only the dependent operation. Runtime probes repeat before use and fail closed. WSL must be version 2, and performance-sensitive workspaces should live in its native Linux filesystem. Detailed policy, transaction, and storage qualification is documented in the capability lattice.
 
 The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.
 

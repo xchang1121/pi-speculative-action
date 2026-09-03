@@ -30,55 +30,36 @@ const localRoot = path.join(os.homedir(), ".local");
 const localBin = path.join(localRoot, "bin");
 const sandlock = path.join(localBin, "sandlock");
 await mkdir(localBin, { recursive: true });
-await installHeldExec().catch((error) => {
-	console.warn(`Held-exec Actor reuse unavailable; completed whole-command replay remains active: ${error.message}`);
-});
-const missing = [];
-for (const command of ["strace", "unshare", "git"]) {
-	try {
-		await executable([command]);
-	} catch {
-		missing.push(command);
-	}
-}
-if (missing.length) {
-	throw new Error(
-		`Missing Linux dependencies: ${missing.join(", ")}. On Ubuntu/WSL run: sudo apt-get install strace util-linux git`,
-	);
-}
+const held = await optional("Actor child handoff", installHeldExec);
+const missing = await missingExecutables(["strace", "unshare", "mount", "git"]);
+let producer = false;
+if (missing.length)
+	console.warn(`Speculative Bash producer unavailable (missing ${missing.join(", ")}); cached Actor replay remains usable.`);
+else producer = await optional("Speculative Bash producer", installSandlock);
+const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
+console.log(
+	`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
+);
 
-let ready = false;
-try {
-	await run(sandlock, ["check"]);
-	ready = true;
-} catch {
-	// Install the pinned source revision below.
-}
-if (!ready) {
-	let cargo;
+async function installSandlock() {
 	try {
-		cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]);
+		await run(sandlock, ["check"]);
+		console.log(`Speculative Bash producer ready: ${sandlock}`);
+		return;
 	} catch {
-		throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
+		// Install the pinned source revision below.
 	}
+	const cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]).catch(() => {
+		throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
+	});
 	console.log(`Building Sandlock ${SANDLOCK_REVISION.slice(0, 12)} into ${localRoot} ...`);
 	await run(cargo, [
-		"install",
-		"--locked",
-		"--git",
-		SANDLOCK_REPOSITORY,
-		"--rev",
-		SANDLOCK_REVISION,
-		"--root",
-		localRoot,
-		"sandlock-cli",
+		"install", "--locked", "--git", SANDLOCK_REPOSITORY, "--rev", SANDLOCK_REVISION,
+		"--root", localRoot, "sandlock-cli",
 	]);
+	await run(sandlock, ["check"]);
+	console.log(`Speculative Bash producer ready: ${sandlock}`);
 }
-await run(sandlock, ["check"]);
-console.log(`Linux process-reuse backend ready: ${sandlock}`);
-await installFuseOverlayfs().catch((error) => {
-	console.warn(`OverlayFS optimization unavailable; the safe Git workspace driver remains active: ${error.message}`);
-});
 
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
@@ -165,6 +146,22 @@ async function executable(candidates) {
 		}
 	}
 	throw new Error(`Executable not found: ${candidates.join(" or ")}`);
+}
+
+async function missingExecutables(candidates) {
+	const results = await Promise.all(candidates.map((candidate) =>
+		executable([candidate]).then(() => undefined, () => candidate)));
+	return results.filter(Boolean);
+}
+
+async function optional(label, operation) {
+	try {
+		await operation();
+		return true;
+	} catch (error) {
+		console.warn(`${label} unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return false;
+	}
 }
 
 function run(command, args, expected = 0) {
