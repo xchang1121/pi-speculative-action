@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import {
 	argument,
@@ -17,6 +18,7 @@ import {
 	metricDelta,
 	prepareLinuxProcessReuse,
 	textOutput,
+	type LinuxProcessBenchmark,
 	writeBenchmarkReport,
 } from "./linux-process-harness.ts";
 
@@ -115,6 +117,12 @@ function assertSame(expected: Outcome, actual: Outcome): void {
 
 async function conversionAblation() {
 	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
+	const replayBackend = new LinuxProcessReuseBackend({
+		storeRoot: fixture.storeRoot,
+		sandlockBinary: "/pi-dependency-disabled/sandlock",
+		straceBinary: "/pi-dependency-disabled/strace",
+		unshareBinary: "/pi-dependency-disabled/unshare",
+	});
 	try {
 		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
 		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
@@ -163,24 +171,12 @@ int main(int argc, char **argv) {
 		} finally {
 			await branch.dispose();
 		}
-		const route = await fixture.backend.heldExecActorReplay({
-			sourceRoot: fixture.workspace,
-			realShell: fixture.shellPath,
-			enabled: () => true,
-		});
-		const operations = createLocalBashOperations({ shellPath: route.shellPath });
-		const coordinator = new ProcessExecutionCoordinator(route.executor(adaptProcessToolOperations(operations)));
-		const actor = createBashTool(fixture.workspace, {
-			operations: coordinator.operations,
-			shellPath: fixture.shellPath,
-			exposeSessionEnvironment: false,
-			spawnHook: (context) => ({ ...context, env: { ...fixture.environment } }),
-		});
-		const beforeHit = fixture.backend.metrics();
+		const actor = await heldActor(fixture, replayBackend);
+		const beforeHit = replayBackend.metrics();
 		const hitStarted = performance.now();
 		const hit = await actor.execute("held-hit", { command: actorCommand }, new AbortController().signal);
 		const hitMs = performance.now() - hitStarted;
-		const hitMetrics = metricDelta(beforeHit, fixture.backend.metrics());
+		const hitMetrics = metricDelta(beforeHit, replayBackend.metrics());
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
@@ -199,12 +195,13 @@ int main(int argc, char **argv) {
 		}
 		const securityProduced = metricDelta(securityBefore, fixture.backend.metrics());
 		assert(securityProduced.tainted === 1 && securityProduced.published === 1, "confinement evidence was not retained");
+		const securityActorBefore = replayBackend.metrics();
 		const securityActor = await actor.execute(
 			"held-security-actor",
 			{ command: ": actor-security; worker unused probe" },
 			new AbortController().signal,
 		);
-		const securityMetrics = metricDelta(securityBefore, fixture.backend.metrics());
+		const securityMetrics = metricDelta(securityActorBefore, replayBackend.metrics());
 		assert(textOutput(securityActor).includes("nnp:0"), "Actor did not retain its native security context");
 		assert(
 			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
@@ -215,15 +212,16 @@ int main(int argc, char **argv) {
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
-		const beforeMiss = fixture.backend.metrics();
+		const beforeMiss = replayBackend.metrics();
 		const missStarted = performance.now();
 		const miss = await actor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
 		const missMs = performance.now() - missStarted;
-		const missMetrics = metricDelta(beforeMiss, fixture.backend.metrics());
+		const missMetrics = metricDelta(beforeMiss, replayBackend.metrics());
 		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const joinBefore = fixture.backend.metrics();
+		const joiningActor = await heldActor(fixture, fixture.backend);
 		const joiningTask = forkReusableBash(fixture, {
 			label: "held-joining-producer",
 			command: ": speculative-join; worker joined.txt",
@@ -238,7 +236,7 @@ int main(int argc, char **argv) {
 			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses);
 			await delay(leadMs);
 			const joiningStarted = performance.now();
-			joiningOutput = await actor.execute(
+			joiningOutput = await joiningActor.execute(
 				"held-joining",
 				{ command: "printf 'actor-join\\n'; worker joined.txt" },
 				new AbortController().signal,
@@ -256,7 +254,12 @@ int main(int argc, char **argv) {
 		assert(joinMetrics.hits === 1 && joinMetrics.joinedHits === 1, `Actor did not join in-flight work: ${JSON.stringify(joinMetrics)}`);
 		return {
 			directMs: direct.totalMs,
-			completed: { actorMs: hitMs, hits: hitMetrics.hits, avoidedProcessMs: hitMetrics.avoidedProcessMs },
+			completed: {
+				actorMs: hitMs,
+				hits: hitMetrics.hits,
+				avoidedProcessMs: hitMetrics.avoidedProcessMs,
+				producerDependenciesDisabledAtReplay: ["sandlock", "strace", "unshare"],
+			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
 			confinementMismatch: {
@@ -267,8 +270,25 @@ int main(int argc, char **argv) {
 			},
 		};
 	} finally {
+		await replayBackend.dispose();
 		await fixture.dispose();
 	}
+}
+
+async function heldActor(fixture: LinuxProcessBenchmark, backend: LinuxProcessReuseBackend) {
+	const route = await backend.heldExecActorReplay({
+		sourceRoot: fixture.workspace,
+		realShell: fixture.shellPath,
+		enabled: () => true,
+	});
+	const operations = createLocalBashOperations({ shellPath: route.shellPath });
+	const coordinator = new ProcessExecutionCoordinator(route.executor(adaptProcessToolOperations(operations)));
+	return createBashTool(fixture.workspace, {
+		operations: coordinator.operations,
+		shellPath: fixture.shellPath,
+		exposeSessionEnvironment: false,
+		spawnHook: (context) => ({ ...context, env: { ...fixture.environment } }),
+	});
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
