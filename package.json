@@ -40,6 +40,8 @@
 	"files": [
 		"dist",
 		"src",
+		".thinkthread",
+		"scripts/install-thinkthread-profile.sh",
 		"README.md",
 		"README-CN.md",
 		"CHANGELOG.md",

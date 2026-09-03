@@ -125,7 +125,7 @@ describe("speculative action package boundary", () => {
 			"./process-reuse",
 			"./thinkthread-extension",
 		]);
-		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
+		expect(manifest.files).toEqual(["dist", "src", ".thinkthread", "scripts/install-thinkthread-profile.sh", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
 		expect(manifest.scripts?.build).toBe(
 			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs && shx cp src/process-namespace-launcher.mjs dist/process-namespace-launcher.mjs",
 		);

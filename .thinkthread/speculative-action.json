@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "drafterEnabled": true,
+  "candidateLimit": 2,
+  "maxConcurrentActions": 8,
+  "tools": [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "write",
+    "edit",
+    "bash"
+  ]
+}
