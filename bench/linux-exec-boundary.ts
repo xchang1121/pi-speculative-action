@@ -252,6 +252,32 @@ int main(int argc, char **argv) {
 		assert(textOutput(joiningOutput!).includes("actor-join\nworker:v2"), "joined child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
 		assert(joinMetrics.hits === 1 && joinMetrics.joinedHits === 1, `Actor did not join in-flight work: ${JSON.stringify(joinMetrics)}`);
+
+		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'sleep 0.2; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
+		const descriptorProducerBefore = fixture.backend.metrics();
+		const descriptorTask = forkReusableBash(fixture, {
+			label: "held-descriptor-producer",
+			command: descriptorCommand,
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		let descriptorBranch: Awaited<typeof descriptorTask> | undefined;
+		let descriptorActor: Awaited<ReturnType<typeof fixture.tool.execute>> | undefined;
+		try {
+			await waitUntil(() => fixture.backend.metrics().wholeCommandMisses > descriptorProducerBefore.wholeCommandMisses);
+			[descriptorBranch, descriptorActor] = await Promise.all([
+				descriptorTask,
+				fixture.tool.execute("held-descriptor-actor", { command: descriptorCommand }, new AbortController().signal),
+			]);
+			assert(!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok", "native descriptor bypass changed output");
+		} finally {
+			descriptorBranch ??= await descriptorTask.catch(() => undefined);
+			await descriptorBranch?.dispose();
+		}
+		const descriptorMetrics = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
+		assert(textOutput(descriptorActor!) === "descriptor-ok", "descriptor whole-command transfer changed output");
+		assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "descriptor whole-command replay changed its effect");
+		assert(descriptorMetrics.wholeCommandHits === 1, `descriptor-preserving command was not transferred: ${JSON.stringify(descriptorMetrics)}`);
 		return {
 			directMs: direct.totalMs,
 			completed: {
@@ -261,6 +287,7 @@ int main(int argc, char **argv) {
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace", "unshare"],
 			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
+			inheritedDescriptor: { wholeCommandHits: descriptorMetrics.wholeCommandHits },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
 			confinementMismatch: {
 				producer: "nnp:1",

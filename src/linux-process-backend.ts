@@ -56,6 +56,7 @@ import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor }
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
+	resolveLinuxExecHelper,
 	type HeldExecDecision,
 	type HeldExecProcess,
 } from "./linux-held-exec.ts";
@@ -84,7 +85,7 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v12";
+const BACKEND_EPOCH = "pi-linux-process-v13";
 const POLICY_ID = "sandlock-namespaced-transparent-exec-v11";
 const LEAF_POLICY_ID = "sandlock-host-context-leaf-v1";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -98,6 +99,7 @@ export interface LinuxProcessBackendOptions {
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly unshareBinary?: string;
+	readonly heldExecBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -153,6 +155,7 @@ interface ReadyBackend {
 	readonly platformFingerprint: Sha256Digest;
 	readonly observerFingerprint: Sha256Digest;
 	readonly executionContext: DispatcherExecutionContext;
+	readonly dispatcher?: string;
 }
 
 interface InterposedDirectory {
@@ -160,14 +163,14 @@ interface InterposedDirectory {
 	readonly target: string;
 	readonly shadow: string;
 	readonly view: string;
+	readonly launcher: string;
 }
 
 interface ProcessInterposition {
-	readonly launcher: string;
 	readonly namespaceLauncher: string;
 	readonly planPath: string;
 	readonly directories: readonly InterposedDirectory[];
-	readonly executablePaths: readonly string[];
+	readonly executables: readonly (readonly [intercepted: string, original: string])[];
 	readonly dependencies: readonly DynamicDependency[];
 }
 
@@ -327,6 +330,7 @@ export class LinuxProcessReuseBackend {
 	async heldExecActorReplay(options: HeldExecActorReplayOptions): Promise<HeldExecActorReplayRoute> {
 		const boundary = await (this.heldExecOpening ??= LinuxHeldExecBoundary.open({
 			storeRoot: this.options.storeRoot,
+			...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
 			decide: (process) => this.decideHeldExec(process),
 		}));
 		this.heldExecBoundary = boundary;
@@ -421,9 +425,11 @@ export class LinuxProcessReuseBackend {
 			token,
 			socketPath,
 			mountBinary: ready.mount,
+			...(ready.dispatcher ? { dispatcherBinary: ready.dispatcher } : {}),
 			excludedExecutables: [
 				input.invocation.shell,
 				process.execPath,
+				...(ready.dispatcher ? [ready.dispatcher] : []),
 				ready.sandlock,
 				ready.strace,
 				ready.unshare,
@@ -504,11 +510,12 @@ export class LinuxProcessReuseBackend {
 		if (process.platform !== "linux") throw new Error("Linux host required");
 		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
-		const [sandlock, strace, unshare, mount] = await Promise.all([
+		const [sandlock, strace, unshare, mount, dispatcher] = await Promise.all([
 			resolveBinary(this.options.sandlockBinary, "sandlock", [path.join(os.homedir(), ".local", "bin", "sandlock")]),
 			resolveBinary(this.options.straceBinary, "strace"),
 			resolveBinary(this.options.unshareBinary, "unshare"),
 			resolveBinary(undefined, "mount"),
+			resolveLinuxExecHelper(this.options.heldExecBinary).catch(() => undefined),
 		]);
 		const [sandlockCheck, sandlockVersion, straceVersion, mountVersion, platformFingerprint] = await Promise.all([
 			execText(sandlock, ["check"]),
@@ -546,6 +553,7 @@ export class LinuxProcessReuseBackend {
 		return {
 			sandlock, strace, unshare, mount, fingerprint, platformFingerprint, observerFingerprint,
 			executionContext,
+			...(dispatcher ? { dispatcher } : {}),
 		};
 	}
 
@@ -620,7 +628,7 @@ export class LinuxProcessReuseBackend {
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
-					ignoredExecutablePaths: session.interposition.executablePaths,
+					interposedExecutables: session.interposition.executables,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
@@ -1488,7 +1496,9 @@ const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 function interposedDirectoryFor(session: ActiveSession, target: string): InterposedDirectory | undefined {
 	return session.interposition.directories.find(
-		(directory) => path.resolve(path.dirname(target)) === path.resolve(directory.target),
+		(directory) => [directory.target, directory.shadow].some(
+			(parent) => path.resolve(path.dirname(target)) === path.resolve(parent),
+		),
 	);
 }
 
@@ -1682,22 +1692,23 @@ async function createProcessInterposition(input: {
 	readonly token: string;
 	readonly socketPath: string;
 	readonly mountBinary: string;
+	readonly dispatcherBinary?: string;
 	readonly excludedExecutables: readonly string[];
 }): Promise<ProcessInterposition> {
-	if (process.execPath.includes("\n") || process.execPath.includes("\r") || process.execPath.includes(" ")) {
-		throw new Error("Node executable path cannot be represented by dispatcher shebang");
-	}
 	const root = path.join(input.privateRoot, "process-interposition");
 	const viewRoot = path.join(root, "views");
 	const shadowRoot = path.join(root, "originals");
-	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true })]);
-	const launcher = path.join(root, "process-dispatcher.mjs");
+	const launcherRoot = path.join(root, "launchers");
+	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true }), mkdir(launcherRoot, { recursive: true })]);
 	const dispatcher = new URL("./process-dispatcher.mjs", import.meta.url).href;
 	const namespaceLauncher = path.join(root, "process-namespace-launcher.mjs");
 	const namespaceModule = new URL("./process-namespace-launcher.mjs", import.meta.url).href;
 	const directories: InterposedDirectory[] = [];
 	const seenSources = new Set<string>();
-	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
+	const shebang = input.dispatcherBinary && !/\s/.test(input.dispatcherBinary) && !/[\r\n]/.test(process.execPath)
+		? `#!${input.dispatcherBinary} --dispatch=${process.execPath}`
+		: undefined;
+	for (const rawDirectory of shebang && Buffer.byteLength(shebang) < 128 ? input.pathValue.split(path.delimiter) : []) {
 		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
 		const logicalDirectory = path.resolve(rawDirectory);
 		const projected = input.projection.toPhysical(logicalDirectory) ?? logicalDirectory;
@@ -1715,7 +1726,15 @@ async function createProcessInterposition(input: {
 			target = await realpath(logicalDirectory).catch(() => logicalDirectory);
 		}
 		const index = directories.length.toString().padStart(3, "0");
-		directories.push({ source, target, shadow: path.join(shadowRoot, index), view: path.join(viewRoot, index) });
+		const shadow = path.join(shadowRoot, index);
+		if (/[\r\n]/.test(shadow)) continue;
+		directories.push({
+			source,
+			target,
+			shadow,
+			view: path.join(viewRoot, index),
+			launcher: path.join(launcherRoot, `${index}.mjs`),
+		});
 	}
 	const configuration = {
 		version: 2,
@@ -1723,12 +1742,6 @@ async function createProcessInterposition(input: {
 		token: input.token,
 		directories: directories.map(({ target, shadow }) => ({ target, shadow })),
 	};
-	await writeFile(
-		launcher,
-		`#!${process.execPath}\nglobalThis.__PI_SPEC_PROCESS_DISPATCHER__=${JSON.stringify(configuration)};\nawait import(${JSON.stringify(dispatcher)});\n`,
-		{ mode: 0o755 },
-	);
-	await chmod(launcher, 0o755);
 	await writeFile(namespaceLauncher, `#!${process.execPath}\nawait import(${JSON.stringify(namespaceModule)});\n`, { mode: 0o755 });
 	await chmod(namespaceLauncher, 0o755);
 
@@ -1740,9 +1753,16 @@ async function createProcessInterposition(input: {
 			// A missing exclusion cannot be executed.
 		}
 	}
-	const executablePaths: string[] = [];
+	const executables: Array<readonly [string, string]> = [];
 	const dependencies: DynamicDependency[] = [];
 	for (const directory of directories) {
+		await writeFile(
+			directory.launcher,
+			`${shebang}\n//PI_SPEC_NATIVE ${directory.shadow}\n` +
+				`globalThis.__PI_SPEC_PROCESS_DISPATCHER__=${JSON.stringify(configuration)};\nawait import(${JSON.stringify(dispatcher)});\n`,
+			{ mode: 0o755 },
+		);
+		await chmod(directory.launcher, 0o755);
 		await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
 		let entries: string[];
 		try {
@@ -1767,9 +1787,9 @@ async function createProcessInterposition(input: {
 					}
 				}
 				if (executable) {
-					if (linkStat.isSymbolicLink()) await symlink(launcher, viewEntry);
-					else await link(launcher, viewEntry);
-					executablePaths.push(path.join(directory.target, name));
+					if (linkStat.isSymbolicLink()) await symlink(directory.launcher, viewEntry);
+					else await link(directory.launcher, viewEntry);
+					executables.push([path.join(directory.target, name), path.join(directory.shadow, name)]);
 				} else {
 					await symlink(path.join(directory.shadow, name), viewEntry);
 				}
@@ -1799,11 +1819,10 @@ async function createProcessInterposition(input: {
 		{ mode: 0o600 },
 	);
 	return {
-		launcher,
 		namespaceLauncher,
 		planPath,
 		directories: Object.freeze(directories),
-		executablePaths: Object.freeze(executablePaths),
+		executables: Object.freeze(executables),
 		dependencies: Object.freeze(dependencies),
 	};
 }

@@ -80,11 +80,42 @@ describe("strace provenance decoder", () => {
 				),
 			]);
 			const observation = await observeStrace(prefix, "/bin/bash", "/work", {
-				ignoredExecutablePaths: ["/usr/bin/sleep"],
+				interposedExecutables: [["/usr/bin/sleep", "/private/original/sleep"]],
 			});
 			expect(observation.complete).toBe(true);
 			expect(observation.taints).not.toContain("network");
 			expect(observation.paths).not.toContainEqual({ path: "/usr/bin/sleep", role: "executable" });
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("resumes provenance after a native descriptor-preserving bypass", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-native-bypass-"));
+		const prefix = path.join(root, "process");
+		try {
+			await Promise.all([
+				fs.writeFile(`${prefix}.310`, [
+					'execve("/bin/bash", ["bash"], 0x0) = 0',
+					"clone(child_stack=NULL, flags=SIGCHLD) = 311",
+				].join("\n")),
+				fs.writeFile(`${prefix}.311`, [
+					'execve("/usr/bin/tool", ["tool"], 0x0) = 0',
+					"getpid() = 311",
+					'openat(AT_FDCWD, "/private/launcher", O_RDONLY) = 4',
+					'execve("/private/original/tool", ["tool"], 0x0) = 0',
+					'openat(AT_FDCWD, "/work/input", O_RDONLY) = 4',
+				].join("\n")),
+			]);
+			const observation = await observeStrace(prefix, "/bin/bash", "/work", {
+				interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]],
+			});
+			expect(observation.complete).toBe(true);
+			expect(observation.taints).not.toContain("pid_observation");
+			expect(observation.paths).toEqual(expect.arrayContaining([
+				{ path: "/private/original/tool", role: "executable" },
+				{ path: "/work/input", role: "input" },
+			]));
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

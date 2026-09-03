@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -84,6 +85,67 @@ static char *take_env(const char *name) {
 	return copy;
 }
 
+static int has_extra_descriptors(void) {
+	DIR *directory = opendir("/proc/self/fd");
+	if (!directory) return -1;
+	int scan_fd = dirfd(directory), found = 0, saved = 0;
+	struct dirent *entry;
+	for (;;) {
+		errno = 0;
+		entry = readdir(directory);
+		if (!entry) { saved = errno; break; }
+		char *end;
+		long fd = strtol(entry->d_name, &end, 10);
+		if (!*entry->d_name || *end || fd <= 2 || fd == scan_fd) continue;
+		errno = 0;
+		if (fcntl((int)fd, F_GETFD) >= 0) { found = 1; break; }
+		if (errno != EBADF) { saved = errno; break; }
+	}
+	closedir(directory);
+	if (saved) { errno = saved; return -1; }
+	return found;
+}
+
+static int native_bypass(const char *script, int argc, char **argv) {
+	FILE *file = fopen(script, "r");
+	char *line = NULL;
+	size_t capacity = 0;
+	int result = 125;
+	if (!file || getline(&line, &capacity, file) < 0 || getline(&line, &capacity, file) < 0) goto done;
+	const char marker[] = "//PI_SPEC_NATIVE ";
+	if (strncmp(line, marker, sizeof(marker) - 1)) goto done;
+	char *shadow = line + sizeof(marker) - 1;
+	shadow[strcspn(shadow, "\r\n")] = 0;
+	const char *name = strrchr(script, '/'); name = name ? name + 1 : script;
+	char target[PATH_MAX];
+	if (!*shadow || !*name || strchr(name, '/') ||
+		snprintf(target, sizeof(target), "%s/%s", shadow, name) >= (int)sizeof(target)) goto done;
+	fclose(file); file = NULL;
+	char **command = calloc((size_t)argc, sizeof(*command));
+	if (!command) goto done;
+	command[0] = (char *)name;
+	for (int index = 3; index < argc; index++) command[index - 2] = argv[index];
+	execv(target, command);
+	result = errno == ENOENT ? 127 : 126;
+done:
+	if (file) fclose(file);
+	free(line);
+	return result;
+}
+
+static int dispatch(const char *node, int argc, char **argv) {
+	if (argc < 3 || !*node) return 64;
+	int extra = has_extra_descriptors();
+	if (extra < 0) return 70;
+	if (extra) return native_bypass(argv[2], argc, argv);
+	char **command = calloc((size_t)argc, sizeof(*command));
+	if (!command) return 70;
+	command[0] = (char *)node;
+	for (int index = 2; index < argc; index++) command[index - 1] = argv[index];
+	execv(node, command);
+	return errno == ENOENT ? 127 : 126;
+}
+
 static int open_tracee_output(pid_t pid, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 	int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
@@ -156,7 +218,7 @@ done:
 }
 
 static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
-	int skip, unsigned skip_code, int broker) {
+	int skip, unsigned skip_code) {
 	int gate[2];
 	if (pipe2(gate, O_CLOEXEC) < 0) return 70;
 	pid_t root = fork();
@@ -202,13 +264,6 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) return 76;
-			if (broker) {
-				unsigned char request = 'E', response[2];
-				if (transfer(3, &request, 1, 1) < 0 || transfer(4, response, sizeof(response), 0) < 0) return 77;
-				if (response[0] == 'S') {
-					if (replace_with_exit(pid, response[1]) < 0) return 76;
-				} else if (response[0] != 'C') return 78;
-			}
 			if (socket_path) (void)actor_decision(pid, socket_path, token, execution_id);
 		}
 		if (event != 0) delivered = 0;
@@ -218,9 +273,10 @@ static int trace(char **command, const char *socket_path, const char *token, con
 
 int main(int argc, char **argv) {
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("1");
+		puts("2");
 		return 0;
 	}
+	if (argc >= 3 && !strncmp(argv[1], "--dispatch=", 11)) return dispatch(argv[1] + 11, argc, argv);
 	if (getenv("PI_SPEC_HELD_EXEC_SHELL")) {
 		char *real_shell = take_env("PI_SPEC_HELD_EXEC_SHELL");
 		char *socket_path = take_env("PI_SPEC_HELD_EXEC_SOCKET");
@@ -235,20 +291,14 @@ int main(int argc, char **argv) {
 			execvp(real_shell, command);
 			return errno == ENOENT ? 127 : 126;
 		}
-		return trace(command, socket_path, token, execution_id, 0, 0, 0);
+		return trace(command, socket_path, token, execution_id, 0, 0);
 	}
 	if (argc < 2) return 64;
-	int command = 1, skip = 0, broker = 0;
+	int command = 1, skip = 0;
 	unsigned skip_code = 0;
 	if (argc >= 4 && !strcmp(argv[1], "--skip-code")) {
 		skip = 1; skip_code = (unsigned)strtoul(argv[2], 0, 10); command = 3;
 		if (skip_code > 255) return 64;
-	} else if (argc >= 3 && !strcmp(argv[1], "--broker")) {
-		broker = 1; command = 2;
-		for (int fd = 3; fd <= 4; fd++) {
-			int flags = fcntl(fd, F_GETFD);
-			if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return 65;
-		}
 	}
-	return trace(argv + command, NULL, NULL, NULL, skip, skip_code, broker);
+	return trace(argv + command, NULL, NULL, NULL, skip, skip_code);
 }

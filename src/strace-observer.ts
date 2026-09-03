@@ -34,8 +34,8 @@ export interface StraceObservation {
 }
 
 export interface StraceObservationOptions {
-	/** Exec paths replaced by the process outlet. Their implementation subtree is not workload provenance. */
-	readonly ignoredExecutablePaths?: readonly string[];
+	/** Intercepted path to native target; a direct second exec proves descriptor-preserving bypass. */
+	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
 	/**
 	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
@@ -121,18 +121,21 @@ export async function observeStrace(
 
 	const paths = new Map<string, DependencyRole>();
 	const taints = new Set<ProvenanceTaint>();
-	const ignoredExecutables = new Set(
-		(options.ignoredExecutablePaths ?? []).map((value) => path.posix.resolve(value)),
+	const interposedExecutables = new Map(
+		(options.interposedExecutables ?? []).map(([intercepted, original]) => [
+			path.posix.resolve(intercepted), path.posix.resolve(original),
+		]),
 	);
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const ignoredAfter = ignoredProcessSegments(selected, byPID, ignoredExecutables);
+	const ignoredSegments = ignoredProcessSegments(selected, byPID, interposedExecutables);
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
 		if (!file) continue;
 		let cwd = path.posix.resolve(initialCwd);
 		const unfinished = new Map<string, number>();
-		const end = ignoredAfter.get(pid) ?? file.lines.length;
-		for (const line of file.lines.slice(start, end)) {
+		for (let index = start; index < file.lines.length; index++) {
+			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
+			const line = file.lines[index]!;
 			if (!line) continue;
 			if (line.includes("<unfinished ...>")) {
 				const name = syscallName(line);
@@ -211,8 +214,11 @@ export async function observeStrace(
 			})),
 		),
 		taints: Object.freeze([...taints].sort()),
-		tracedProcesses: [...selected].filter(([pid, start]) => (ignoredAfter.get(pid) ?? Number.POSITIVE_INFINITY) > start)
-			.length,
+		tracedProcesses: [...selected].filter(([pid, start]) =>
+			byPID.get(pid)?.lines.slice(start).some((_, offset) =>
+				!ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to),
+			),
+		).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
 	};
 }
@@ -350,11 +356,12 @@ function resourceLimitMutation(line: string, syscall: string): boolean {
 function ignoredProcessSegments(
 	selected: ReadonlyMap<number, number>,
 	byPID: ReadonlyMap<number, TraceFile>,
-	ignoredExecutables: ReadonlySet<string>,
-): Map<number, number> {
-	const ignoredAfter = new Map<number, number>();
-	if (!ignoredExecutables.size) return ignoredAfter;
-	const queue: number[] = [];
+	interposedExecutables: ReadonlyMap<string, string>,
+): Map<number, Array<readonly [number, number]>> {
+	const ignored = new Map<number, Array<readonly [number, number]>>();
+	if (!interposedExecutables.size) return ignored;
+	const queue: Array<readonly [number, number]> = [];
+	const fullyIgnored = new Set<number>();
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
 		if (!file) continue;
@@ -362,25 +369,34 @@ function ignoredProcessSegments(
 			const line = file.lines[index]!;
 			if (!successfulExec(line)) continue;
 			const executable = quotedStrings(line)[0];
-			if (!executable || !ignoredExecutables.has(path.posix.resolve(executable))) continue;
-			ignoredAfter.set(pid, index);
-			queue.push(pid);
+			const original = executable && interposedExecutables.get(path.posix.resolve(executable));
+			if (!original) continue;
+			const resumed = file.lines.findIndex((candidate, candidateIndex) => candidateIndex > index && successfulExec(candidate));
+			const resumedExecutable = resumed < 0 ? undefined : quotedStrings(file.lines[resumed]!)[0];
+			if (resumedExecutable && path.posix.resolve(resumedExecutable) === original) {
+				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumed]);
+				index = resumed - 1;
+				continue;
+			}
+			(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, file.lines.length]);
+			fullyIgnored.add(pid);
+			queue.push([pid, index]);
 			break;
 		}
 	}
 	while (queue.length) {
-		const pid = queue.shift()!;
+		const [pid, start] = queue.shift()!;
 		const file = byPID.get(pid);
 		if (!file) continue;
-		const start = ignoredAfter.get(pid) ?? 0;
 		for (const line of file.lines.slice(start)) {
 			const child = spawnedPID(line);
-			if (!child || ignoredAfter.has(child)) continue;
-			ignoredAfter.set(child, 0);
-			queue.push(child);
+			if (!child || fullyIgnored.has(child)) continue;
+			ignored.set(child, [[0, byPID.get(child)?.lines.length ?? Number.POSITIVE_INFINITY]]);
+			fullyIgnored.add(child);
+			queue.push([child, 0]);
 		}
 	}
-	return ignoredAfter;
+	return ignored;
 }
 
 function successfulExec(line: string): boolean {

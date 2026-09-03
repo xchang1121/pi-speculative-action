@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import type { ProcessExecutor } from "./process-execution.ts";
 
-const PROTOCOL_VERSION = 1;
+const HELPER_PROTOCOL_VERSION = 2;
+const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
@@ -90,11 +91,7 @@ export class LinuxHeldExecBoundary {
 
 	static async open(options: LinuxHeldExecOptions): Promise<LinuxHeldExecBoundary> {
 		if (process.platform !== "linux" || process.arch !== "x64") throw new Error("x86-64 Linux required");
-		const binary = await realpath(options.binary ?? path.join(os.homedir(), ".local", "bin", "pi-speculative-held-exec"));
-		await access(binary, fsConstants.X_OK);
-		if ((await execute(binary, ["--protocol-version"])).stdout.trim() !== String(PROTOCOL_VERSION)) {
-			throw new Error("held-exec protocol mismatch; rerun npm run setup:linux");
-		}
+		const binary = await resolveLinuxExecHelper(options.binary);
 		const probe = await execute(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"]);
 		if (probe.code !== 42 || probe.signal) throw new Error("held-exec functional probe failed");
 		await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
@@ -177,6 +174,17 @@ export class LinuxHeldExecBoundary {
 			if (!socket.destroyed) socket.end(prepared ? "F\n" : "C\n");
 		}
 	}
+}
+
+/** Resolve the native helper shared by transparent dispatch and x86-64 Actor handoff. */
+export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
+	if (process.platform !== "linux") throw new Error("Linux required");
+	const resolved = await realpath(binary ?? path.join(os.homedir(), ".local", "bin", "pi-speculative-held-exec"));
+	await access(resolved, fsConstants.X_OK);
+	if ((await execute(resolved, ["--protocol-version"])).stdout.trim() !== String(HELPER_PROTOCOL_VERSION)) {
+		throw new Error("held-exec protocol mismatch; rerun npm run setup:linux");
+	}
+	return resolved;
 }
 
 /** Inspect an image while PTRACE_EVENT_EXEC guarantees it has not run a user instruction. */
@@ -287,7 +295,7 @@ function numbers(value: string): number[] {
 function parseRequest(line: string): WireRequest | undefined {
 	try {
 		const value = JSON.parse(line) as Partial<WireRequest>;
-		return value.version === PROTOCOL_VERSION && /^[0-9a-f]{64}$/.test(value.token ?? "") &&
+		return value.version === WIRE_PROTOCOL_VERSION && /^[0-9a-f]{64}$/.test(value.token ?? "") &&
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
 			Number.isSafeInteger(value.tracer) && value.tracer! > 0 ? value as WireRequest : undefined;
 	} catch {
