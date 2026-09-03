@@ -4,7 +4,7 @@ import {
 	type EffectCapabilities,
 	type EffectRequirements,
 } from "./effect-model.ts";
-import type { ResourceValidation } from "./settlement.ts";
+import type { ResolutionCause, ResourceValidation } from "./settlement.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
@@ -82,6 +82,17 @@ export interface WorldCommitMetrics {
 	readonly bytesValidated: number;
 	readonly resourcesValidated: number;
 	readonly resourcesCommitted: number;
+}
+
+/** Backend-classified rejection without a backend dependency in the transaction or runtime. */
+export class WorldCommitRejectedError extends Error {
+	readonly resolutionCause: ResolutionCause;
+
+	constructor(resolutionCause: ResolutionCause, message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "WorldCommitRejectedError";
+		this.resolutionCause = resolutionCause;
+	}
 }
 
 /** Backend-issued evidence; policy decides whether it matches the Actor world. */

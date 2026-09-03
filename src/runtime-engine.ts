@@ -22,7 +22,12 @@ import {
 import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
-import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type WorldBranch } from "./execution-world.ts";
+import {
+	type SpeculativeExecutionRoute,
+	sameSpeculativeExecutionRoute,
+	type WorldBranch,
+	WorldCommitRejectedError,
+} from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
@@ -2203,7 +2208,9 @@ export function makeStructuralSpeculativeActionRuntime<
 					const committed = await branch.commit();
 					if (choice.match.kind === "exact") output = committed;
 				} catch (error) {
-					const failure = cause("commit", "world_commit_failed", errorDetail(error));
+					const failure = error instanceof WorldCommitRejectedError
+						? error.resolutionCause
+						: cause("commit", "world_commit_failed", errorDetail(error));
 					attempt.rejectCandidate(candidate.id, choice.match, failure);
 					discardCandidate(state.session, candidate, failure);
 					continue;

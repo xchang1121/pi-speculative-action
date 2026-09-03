@@ -77,6 +77,7 @@ export {
 	type WorldBranch,
 	type WorldCheckpoint,
 	type WorldCommitMetrics,
+	WorldCommitRejectedError,
 	type WorldCompatibilityEvidence,
 	type WorldExecutionMetrics,
 	type WorldReuseMetrics,
