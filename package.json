@@ -65,7 +65,13 @@
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": "*",
+		"@thinkthread/agent-posix": "0.1.0"
+	},
+	"peerDependenciesMeta": {
+		"@thinkthread/agent-posix": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@earendil-works/pi-agent-core": "0.84.1",
