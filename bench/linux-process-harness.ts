@@ -64,7 +64,6 @@ export async function createLinuxProcessBenchmark(
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace,
-			scope: () => BENCHMARK_SCOPE,
 			invocation: (request) =>
 				resolvePiToolInvocation("bash", { command: request.command }, {
 					cwd: request.cwd,

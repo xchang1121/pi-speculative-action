@@ -110,7 +110,6 @@ export interface CompletedProcessReplayOptions {
 	readonly sourceRoot: string;
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 	readonly enabled?: () => boolean;
-	readonly scope?: () => ExecutionScope | undefined;
 }
 
 export interface HeldExecActorReplayOptions {
@@ -247,7 +246,6 @@ interface ActiveSession {
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: Promise<readonly [string, string]>;
-	topLevelWork?: ProcessTransfer;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -384,14 +382,7 @@ export class LinuxProcessReuseBackend {
 						projection,
 						await this.resolvePlatformFingerprint(),
 					);
-					const acquired = await this.acquireProcessResult(
-						processWeakKey(prototype),
-						(live) => this.plan(prototype, projection, acceptProducer, undefined, live),
-						false,
-						request.signal,
-						options.scope?.(),
-					);
-					const plan = acquired.plan;
+					const plan = await this.plan(prototype, projection, acceptProducer);
 					if (!plan) return this.actorReplayMiss(host, request);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
@@ -482,8 +473,6 @@ export class LinuxProcessReuseBackend {
 			session.closed = true;
 			await closeServer(server);
 			await rm(socketPath, { force: true }).catch(() => undefined);
-			session.topLevelWork?.finish();
-			session.topLevelWork = undefined;
 		};
 		return {
 			executor: { execute: (request) => this.executeTopLevel(session, request) },
@@ -578,19 +567,17 @@ export class LinuxProcessReuseBackend {
 		const environment = normalizeEnvironment(request.environment);
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
-		const prototype = await this.topLevelPrototype(session, request, ready, environment);
-		this.add(session, "wholeCommandRequests");
-		const weakKey = processWeakKey(prototype);
-		const acquired = await this.acquireProcessResult(
-			weakKey,
-			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.producer, candidate), session, live),
-			true,
-			request.signal,
-			session.scope,
+		const prototype = await topLevelProcessPrototype(
+			session.invocation, request, environment, session.projection, ready.platformFingerprint,
 		);
-		if (acquired.plan) return this.replayTopLevel(session, acquired.plan, request, requestStarted);
-		if (!acquired.work) throw new Error("process work reservation failed");
-		session.topLevelWork = acquired.work;
+		this.add(session, "wholeCommandRequests");
+		const plan = await this.plan(
+			prototype,
+			session.projection,
+			(candidate) => compatibleProducer(session.producer, candidate),
+			session,
+		);
+		if (plan) return this.replayTopLevel(session, plan, request, requestStarted);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -644,10 +631,6 @@ export class LinuxProcessReuseBackend {
 				session.incompleteReasons.add(`top_capture:${errorMessage(error)}`);
 				session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 			}
-		} catch (error) {
-			session.topLevelWork?.finish();
-			session.topLevelWork = undefined;
-			throw error;
 		} finally {
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
@@ -659,27 +642,13 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		changes: readonly SandboxWorkspaceChange[],
 	): Promise<readonly SandboxDirectoryChange[]> {
+		const directories = await sealSessionEvidence(session, changes);
 		try {
-			const directories = await sealSessionEvidence(session, changes);
-			try {
-				await this.publishTopLevel(session, changes);
-			} catch (error) {
-				this.setError(session, `top_publish:${errorMessage(error)}`);
-			}
-			return directories;
-		} finally {
-			session.topLevelWork?.finish();
-			session.topLevelWork = undefined;
+			await this.publishTopLevel(session, changes);
+		} catch (error) {
+			this.setError(session, `top_publish:${errorMessage(error)}`);
 		}
-	}
-
-	private async topLevelPrototype(
-		session: ActiveSession,
-		request: ProcessExecutionRequest,
-		ready: ReadyBackend,
-		environment: Readonly<Record<string, string>>,
-	): Promise<ExecPrototype> {
-		return topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint);
+		return directories;
 	}
 
 	private async replayTopLevel(
@@ -730,10 +699,10 @@ export class LinuxProcessReuseBackend {
 				exit: exitOutcome(execution.outcome),
 			},
 		});
-		this.rememberScope(certificate.id, session.scope);
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
+			this.rememberScope(certificate.id, session.scope);
 			this.add(session, "wholeCommandPublished");
-		} else if (session.topLevelWork) session.topLevelWork.candidate = certificate;
+		}
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {

@@ -446,7 +446,6 @@ async function installController(
 		processBackend?.completedReplayExecutor(directProcessExecutor, {
 			sourceRoot: context.cwd,
 			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
-			scope: executionScope,
 			invocation: (request) =>
 				resolvePiToolInvocation("bash", { command: request.command, ...(request.timeout !== undefined ? { timeout: request.timeout } : {}) }, {
 					cwd: request.cwd,
