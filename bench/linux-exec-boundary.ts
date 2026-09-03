@@ -198,8 +198,7 @@ int main(int argc, char **argv) {
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
-		let actorTurn = "benchmark";
-		const joiningActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: actorTurn }));
+		const joiningActor = await heldActor(fixture, fixture.backend);
 
 		const cwdProducerBefore = fixture.backend.metrics();
 		const cwdBranch = await forkReusableBash(fixture, {
@@ -353,23 +352,32 @@ int main(int argc, char **argv) {
 			await completedBranch.dispose();
 		}
 		const lateChild = "worker late.txt volatile";
-		const lateBranch = await forkReusableBash(fixture, {
+		const lateBefore = fixture.backend.metrics();
+		const lateTask = forkReusableBash(fixture, {
 			label: "held-late-producer",
 			command: `: speculative-late; ${lateChild}`,
 			actionNamespace: "pi-held-exec-production.v1",
 			executionFingerprint,
 		});
-		actorTurn = "later";
-		const lateBefore = fixture.backend.metrics();
+		let lateBranch: Awaited<typeof lateTask> | undefined;
 		try {
+			await waitUntil(() => fixture.backend.metrics().misses > lateBefore.misses);
+			const laterActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: "later" }));
+			const rejectCrossTurn = async (callID: string) => {
+				const before = fixture.backend.metrics();
+				const output = await laterActor.execute(callID, { command: lateChild }, new AbortController().signal);
+				const metrics = metricDelta(before, fixture.backend.metrics());
+				assert(textOutput(output).includes("worker:v2") && metrics.hits === 0 && metrics.joinedHits === 0 && metrics.misses >= 1,
+					`${callID} crossed its turn boundary: ${JSON.stringify(metrics)}`);
+			};
+			await rejectCrossTurn("held-late-running");
+			lateBranch = await lateTask;
 			assert(!lateBranch.output.isError, `late producer failed: ${textOutput(lateBranch.output.result)}`);
-			const lateActor = await joiningActor.execute("held-late", { command: lateChild }, new AbortController().signal);
-			const lateMetrics = metricDelta(lateBefore, fixture.backend.metrics());
-			assert(textOutput(lateActor).includes("worker:v2") && lateMetrics.hits === 0 && lateMetrics.misses >= 1,
-				`completed work crossed its turn boundary: ${JSON.stringify(lateMetrics)}`);
+			await rm(path.join(fixture.workspace, "late.txt"));
+			await rejectCrossTurn("held-late-completed");
 		} finally {
-			actorTurn = "benchmark";
-			await lateBranch.dispose();
+			lateBranch ??= await lateTask.catch(() => undefined);
+			await lateBranch?.dispose();
 		}
 
 		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'date +%s >/dev/null; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
@@ -414,7 +422,7 @@ int main(int argc, char **argv) {
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
 			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
-			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnRejected: true },
+			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnCompletedRejected: true, crossTurnRunningRejected: true },
 			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },
 			inheritedDescriptor: { completedHandoffHits: 0, exactMetadataFallback: true },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },

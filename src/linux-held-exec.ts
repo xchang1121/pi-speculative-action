@@ -51,12 +51,12 @@ export type HeldExecDecision =
 export interface LinuxHeldExecOptions {
 	readonly storeRoot: string;
 	readonly binary?: string;
-	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
 }
 
 interface ActiveExecution {
 	readonly sourceRoot: string;
 	readonly signal?: AbortSignal;
+	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
 }
 
 interface WireRequest {
@@ -75,13 +75,11 @@ export class LinuxHeldExecBoundary {
 	private readonly server: net.Server;
 	private readonly sockets = new Set<net.Socket>();
 	private readonly socketPath: string;
-	private readonly decide: LinuxHeldExecOptions["decide"];
 	private closed = false;
 
-	private constructor(binary: string, socketPath: string, decide: LinuxHeldExecOptions["decide"]) {
+	private constructor(binary: string, socketPath: string) {
 		this.shellPath = binary;
 		this.socketPath = socketPath;
-		this.decide = decide;
 		this.server = net.createServer({ allowHalfOpen: true }, (socket) => {
 			this.sockets.add(socket);
 			socket.once("close", () => this.sockets.delete(socket));
@@ -100,18 +98,18 @@ export class LinuxHeldExecBoundary {
 		const socketPath = Buffer.byteLength(candidate) < 104
 			? candidate
 			: path.join(os.tmpdir(), `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
-		const boundary = new LinuxHeldExecBoundary(binary, socketPath, options.decide);
+		const boundary = new LinuxHeldExecBoundary(binary, socketPath);
 		await listen(boundary.server, socketPath);
 		await chmod(socketPath, 0o600);
 		return boundary;
 	}
 
-	executor(host: ProcessExecutor, options: { readonly realShell: string; readonly sourceRoot: string; readonly enabled: () => boolean }): ProcessExecutor {
+	executor(host: ProcessExecutor, options: ActiveExecution & { readonly realShell: string; readonly enabled: () => boolean }): ProcessExecutor {
 		return {
 			execute: async (request) => {
 				const execution = randomBytes(24).toString("hex");
 				const enabled = options.enabled() && !request.signal?.aborted;
-				if (enabled) this.active.set(execution, { sourceRoot: options.sourceRoot, ...(request.signal ? { signal: request.signal } : {}) });
+				if (enabled) this.active.set(execution, { sourceRoot: options.sourceRoot, decide: options.decide, ...(request.signal ? { signal: request.signal } : {}) });
 				try {
 					return await host.execute({
 						...request,
@@ -150,7 +148,7 @@ export class LinuxHeldExecBoundary {
 				return void socket.end("C\n");
 			}
 			throwIfAborted(active.signal);
-			const decision = await this.decide({
+			const decision = await active.decide({
 				pid: request.pid,
 				tracerPid: request.tracer,
 				sourceRoot: active.sourceRoot,

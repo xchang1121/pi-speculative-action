@@ -247,7 +247,7 @@ interface ActiveSession {
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: Promise<readonly [string, string]>;
-	topLevelWork?: InFlightProcess;
+	topLevelWork?: ProcessTransfer;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -269,11 +269,12 @@ interface SpawnOutcome {
 	readonly output: readonly BufferedOutput[];
 }
 
-interface InFlightProcess {
+interface ProcessTransfer {
 	readonly completion: Promise<void>;
 	readonly finish: () => void;
+	readonly scope: ExecutionScope | undefined;
 	candidate?: ProcessProvenanceCertificate;
-	claimed: boolean;
+	state: "running" | "completed" | "claimed";
 }
 
 type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay" }>;
@@ -289,8 +290,7 @@ export class LinuxProcessReuseBackend {
 	private heldExecBoundary?: LinuxHeldExecBoundary;
 	private heldExecOpening?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
-	private readonly inFlight = new Map<Sha256Digest, InFlightProcess>();
-	private readonly completedHandoffs = new Map<Sha256Digest, ProcessProvenanceCertificate>();
+	private readonly transfers = new Map<Sha256Digest, ProcessTransfer[]>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
@@ -301,10 +301,10 @@ export class LinuxProcessReuseBackend {
 		this.storage = {
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
-				this.trimCompletedHandoffs();
+				this.trimTransfers();
 			},
 			maintain: async (operation) => {
-				this.completedHandoffs.clear();
+				this.trimTransfers(true);
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
 				if (operation === "clear") this.certificateScopes.clear();
 				return {
@@ -346,7 +346,6 @@ export class LinuxProcessReuseBackend {
 		const boundary = await (this.heldExecOpening ??= LinuxHeldExecBoundary.open({
 			storeRoot: this.options.storeRoot,
 			...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
-			decide: (process) => this.decideHeldExec(process, options.scope?.()),
 		}));
 		this.heldExecBoundary = boundary;
 		return {
@@ -355,6 +354,7 @@ export class LinuxProcessReuseBackend {
 				realShell: options.realShell,
 				sourceRoot: path.resolve(options.sourceRoot),
 				enabled: options.enabled,
+				decide: (process) => this.decideHeldExec(process, options.scope?.()),
 			}),
 		};
 	}
@@ -499,11 +499,11 @@ export class LinuxProcessReuseBackend {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
-		const running = [...this.inFlight.values()];
+		const running = [...this.transfers.values()].flat().filter((transfer) => transfer.state === "running");
 		for (const work of running) work.finish();
 		await Promise.allSettled(running.map((work) => work.completion));
 		await this.heldExecBoundary?.close();
-		this.completedHandoffs.clear();
+		this.transfers.clear();
 		this.certificateScopes.clear();
 	}
 
@@ -586,6 +586,7 @@ export class LinuxProcessReuseBackend {
 			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.producer, candidate), session, live),
 			true,
 			request.signal,
+			session.scope,
 		);
 		if (acquired.plan) return this.replayTopLevel(session, acquired.plan, request, requestStarted);
 		if (!acquired.work) throw new Error("process work reservation failed");
@@ -729,11 +730,10 @@ export class LinuxProcessReuseBackend {
 				exit: exitOutcome(execution.outcome),
 			},
 		});
-		if (session.topLevelWork) session.topLevelWork.candidate = certificate;
 		this.rememberScope(certificate.id, session.scope);
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 			this.add(session, "wholeCommandPublished");
-		}
+		} else if (session.topLevelWork) session.topLevelWork.candidate = certificate;
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {
@@ -779,6 +779,8 @@ export class LinuxProcessReuseBackend {
 			weakKey,
 			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
 			true,
+			undefined,
+			session.scope,
 		);
 		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined, requestStarted);
 		if (!acquired.work) throw new Error("process work reservation failed");
@@ -796,71 +798,65 @@ export class LinuxProcessReuseBackend {
 		produce: boolean,
 		signal?: AbortSignal,
 		scope?: ExecutionScope,
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: InFlightProcess; readonly joined: boolean }> {
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean }> {
 		let joined = false;
 		while (true) {
 			const completed = await lookup();
-			if (completed) {
-				this.completedHandoffs.delete(weakKey);
-				return { plan: completed, joined };
-			}
-			if (!produce) {
-				const handoff = this.completedHandoffs.get(weakKey);
-				if (handoff) {
-					this.completedHandoffs.delete(weakKey);
-					const producerScope = this.certificateScopes.get(handoff.id);
-					if (scope && producerScope?.sessionID === scope.sessionID && producerScope.turnID === scope.turnID) {
-						const transferred = await lookup(handoff);
-						if (transferred) return { plan: transferred, joined };
-					}
+			if (completed) return { plan: completed, joined };
+			const transfers = this.transfers.get(weakKey) ?? [];
+			for (const transfer of [...transfers].reverse()) {
+				if (transfer.state !== "completed" || !transfer.candidate || !sameScope(transfer.scope, scope)) continue;
+				const plan = await lookup(transfer.candidate);
+				if (plan && transfer.state === "completed") {
+					transfer.state = "claimed";
+					this.removeTransfer(weakKey, transfer);
+					return { plan, joined };
 				}
 			}
-			const running = this.inFlight.get(weakKey);
-			if (!running) return produce ? { work: this.claimProcessWork(weakKey), joined } : { joined };
+			const running = transfers.find((transfer) => transfer.state === "running" && sameScope(transfer.scope, scope));
+			if (!running) return produce ? { work: this.claimProcessWork(weakKey, scope), joined } : { joined };
 			joined = true;
 			await waitForCompletion(running.completion, signal);
-			const persisted = await lookup();
-			if (persisted) return { plan: persisted, joined };
-			const candidate = running.candidate;
-			if (!candidate) continue;
-			const transferred = await lookup(candidate);
-			if (transferred && !running.claimed) {
-				running.claimed = true;
-				this.completedHandoffs.delete(weakKey);
-				return { plan: transferred, joined };
-			}
 		}
 	}
 
-	private claimProcessWork(weakKey: Sha256Digest): InFlightProcess {
-		if (this.inFlight.has(weakKey)) throw new Error("process work is already in flight");
+	private claimProcessWork(weakKey: Sha256Digest, scope?: ExecutionScope): ProcessTransfer {
 		let settle!: () => void;
-		let finished = false;
 		const completion = new Promise<void>((resolve) => {
 			settle = resolve;
 		});
-		const work: InFlightProcess = {
+		const work: ProcessTransfer = {
 			completion,
-			claimed: false,
+			scope,
+			state: "running",
 			finish: () => {
-				if (finished) return;
-				finished = true;
-				if (this.inFlight.get(weakKey) === work) this.inFlight.delete(weakKey);
-				if (work.candidate && this.certificateScopes.has(work.candidate.id) && !work.claimed) {
-					this.completedHandoffs.delete(weakKey);
-					this.completedHandoffs.set(weakKey, work.candidate);
-					this.trimCompletedHandoffs();
-				}
+				if (work.state !== "running") return;
+				work.state = "completed";
+				if (!work.candidate || !work.scope) this.removeTransfer(weakKey, work);
+				else this.trimTransfers();
 				settle();
 			},
 		};
-		this.inFlight.set(weakKey, work);
+		const transfers = this.transfers.get(weakKey) ?? [];
+		transfers.push(work);
+		this.transfers.set(weakKey, transfers);
 		return work;
 	}
 
-	private trimCompletedHandoffs(): void {
-		while (this.completedHandoffs.size > this.store.limits.maxCertificates) {
-			this.completedHandoffs.delete(this.completedHandoffs.keys().next().value!);
+	private removeTransfer(weakKey: Sha256Digest, transfer: ProcessTransfer): void {
+		const retained = this.transfers.get(weakKey)?.filter((candidate) => candidate !== transfer) ?? [];
+		if (retained.length) this.transfers.set(weakKey, retained);
+		else this.transfers.delete(weakKey);
+	}
+
+	private trimTransfers(clear = false): void {
+		let excess = clear ? Number.POSITIVE_INFINITY :
+			[...this.transfers.values()].flat().filter((transfer) => transfer.state === "completed").length - this.store.limits.maxCertificates;
+		if (excess <= 0) return;
+		for (const [weakKey, transfers] of this.transfers) {
+			const retained = transfers.filter((transfer) => transfer.state === "running" || excess-- <= 0);
+			if (retained.length) this.transfers.set(weakKey, retained);
+			else this.transfers.delete(weakKey);
 		}
 	}
 
@@ -1029,7 +1025,7 @@ export class LinuxProcessReuseBackend {
 		prototype: ExecPrototype,
 		weakKey: Sha256Digest,
 		outputRoute: OutputRoute,
-		work: InFlightProcess,
+		work: ProcessTransfer,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -1141,11 +1137,10 @@ export class LinuxProcessReuseBackend {
 					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				work.candidate = certificate;
 				this.rememberScope(certificate.id, session.scope);
 				if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 					this.add(session, "published");
-				}
+				} else work.candidate = certificate;
 				if (taints.size) {
 					this.add(session, "tainted");
 					this.setError(session, `tainted:${[...taints].join(",")}`);
@@ -1181,7 +1176,7 @@ export class LinuxProcessReuseBackend {
 		const producer = this.certificateScopes.get(certificate.id);
 		add(
 			producer && scope
-				? producer.sessionID === scope.sessionID && producer.turnID === scope.turnID
+				? sameScope(producer, scope)
 					? "sameTurnHits"
 					: "crossTurnHits"
 				: "unattributedHits",
@@ -1267,6 +1262,10 @@ export class LinuxProcessReuseBackend {
 			platformFingerprint: ready.platformFingerprint,
 		});
 	}
+}
+
+function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
+	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);
 }
 
 async function sealSessionEvidence(
