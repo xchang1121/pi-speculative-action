@@ -37,6 +37,9 @@ static int write_all(int fd, const char *data, size_t length) {
 
 int main(int argc, char **argv) {
   if (argc != 3) return 64;
+  int cwd = open(".", O_RDONLY | O_DIRECTORY);
+  if (cwd < 0 || chdir("/") != 0 || fchdir(cwd) != 0) return 69;
+  close(cwd);
   struct timespec delay = {1, 0};
   while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
   int input = open(argv[1], O_RDONLY);
@@ -189,6 +192,7 @@ try {
 		workspaceFingerprint,
 		assertions: {
 			directAndTraceEquivalent: true,
+			directoryFdCwdTransition: true,
 			actorCrossEnvironmentReplayRejected: true,
 			sameParentChildReplay: true,
 			differentParentCommands: true,
