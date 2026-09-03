@@ -22,7 +22,7 @@ const root = await mkdtemp(path.join(os.tmpdir(), "pi-exec-boundary-"));
 const tracer = path.join(root, "exec-events");
 try {
 	await compileBenchmarkHelper(root, {
-		source: fileURLToPath(new URL("./linux-exec-boundary-probe.c", import.meta.url)),
+		source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)),
 		output: path.basename(tracer),
 		arguments: ["-Werror"],
 	});

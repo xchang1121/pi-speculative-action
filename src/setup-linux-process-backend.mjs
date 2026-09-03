@@ -6,6 +6,7 @@ import { access, chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/p
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
@@ -28,6 +29,10 @@ if (process.platform !== "linux") {
 const localRoot = path.join(os.homedir(), ".local");
 const localBin = path.join(localRoot, "bin");
 const sandlock = path.join(localBin, "sandlock");
+await mkdir(localBin, { recursive: true });
+await installHeldExec().catch((error) => {
+	console.warn(`Held-exec Actor reuse unavailable; completed whole-command replay remains active: ${error.message}`);
+});
 const missing = [];
 for (const command of ["strace", "unshare", "git"]) {
 	try {
@@ -42,7 +47,6 @@ if (missing.length) {
 	);
 }
 
-await mkdir(localBin, { recursive: true });
 let ready = false;
 try {
 	await run(sandlock, ["check"]);
@@ -75,6 +79,34 @@ console.log(`Linux process-reuse backend ready: ${sandlock}`);
 await installFuseOverlayfs().catch((error) => {
 	console.warn(`OverlayFS optimization unavailable; the safe Git workspace driver remains active: ${error.message}`);
 });
+
+async function installHeldExec() {
+	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
+	const content = await readFile(source);
+	const digest = createHash("sha256").update(content).digest("hex");
+	const target = path.join(localBin, "pi-speculative-held-exec");
+	const stamp = `${target}.sha256`;
+	try {
+		if ((await readFile(stamp, "utf8")).trim() !== digest) throw new Error("source changed");
+		await run(target, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
+		console.log(`Held-exec Actor boundary ready: ${target}`);
+		return;
+	} catch {
+		// Build and functionally qualify the exact packaged source below.
+	}
+	const compiler = await executable(["cc", "gcc", "clang"]);
+	const temporary = `${target}.${process.pid}.tmp`;
+	try {
+		await run(compiler, ["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
+		await chmod(temporary, 0o755);
+		await run(temporary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
+		await rename(temporary, target);
+		await writeFile(stamp, `${digest}\n`, { mode: 0o600 });
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
+	console.log(`Held-exec Actor boundary ready: ${target}`);
+}
 
 async function installFuseOverlayfs() {
 	const target = path.join(localBin, "fuse-overlayfs");
@@ -135,12 +167,12 @@ async function executable(candidates) {
 	throw new Error(`Executable not found: ${candidates.join(" or ")}`);
 }
 
-function run(command, args) {
+function run(command, args, expected = 0) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, { stdio: "inherit" });
 		child.once("error", reject);
 		child.once("exit", (code, signal) => {
-			if (code === 0) resolve();
+			if (code === expected && signal === null) resolve();
 			else reject(new Error(`${command} failed (${signal ?? code ?? "unknown"})`));
 		});
 	});
