@@ -26,6 +26,10 @@
 			"types": "./dist/process-reuse.d.ts",
 			"import": "./dist/process-reuse.js"
 		},
+		"./thinkthread-extension": {
+			"types": "./dist/thinkthread/index.d.ts",
+			"import": "./dist/thinkthread/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"pi": {

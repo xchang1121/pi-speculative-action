@@ -84,6 +84,21 @@ describe("speculative action package boundary", () => {
 		expect(processReuseApi).not.toHaveProperty("makeSpeculativeActionRuntime");
 	});
 
+	test("loads ThinkThread only through its opt-in entry", async () => {
+		for (const entry of ["index.ts", "core.ts", "process-reuse.ts", "extension.ts"]) {
+			const closure = await readModuleClosure(path.join(packageRoot, "src", entry));
+			expect(closure).not.toMatch(/@thinkthread\/agent-posix|["']\.\/thinkthread\//);
+		}
+		expect(coreApi.WorldCommitRejectedError).toBe(packageApi.WorldCommitRejectedError);
+		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
+		expect(manifest.peerDependencies["@thinkthread/agent-posix"]).toBe("0.1.0");
+		expect(manifest.peerDependenciesMeta["@thinkthread/agent-posix"]).toEqual({ optional: true });
+		expect(manifest.exports["./thinkthread-extension"]).toEqual({
+			types: "./dist/thinkthread/index.d.ts",
+			import: "./dist/thinkthread/index.js",
+		});
+	});
+
 	test("keeps runtime contracts below the implementation facade", async () => {
 		const contracts = await fs.readFile(path.join(packageRoot, "src", "runtime-contracts.ts"), "utf8");
 		const engine = await fs.readFile(path.join(packageRoot, "src", "runtime-engine.ts"), "utf8");
@@ -108,6 +123,7 @@ describe("speculative action package boundary", () => {
 			"./package.json",
 			"./pattern-aware",
 			"./process-reuse",
+			"./thinkthread-extension",
 		]);
 		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
 		expect(manifest.scripts?.build).toBe(
