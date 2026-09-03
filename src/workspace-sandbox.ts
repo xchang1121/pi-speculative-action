@@ -15,6 +15,7 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
+import { filesystemPathKey } from "./filesystem-evidence.ts";
 import {
 	LinuxOverlayfsCapabilityRegistry,
 	LinuxOverlayfsUnsafeCleanupError,
@@ -629,7 +630,7 @@ function resolveWorkspaceCheckpoint(
 	if (checkpoint === undefined) return undefined;
 	if (!(checkpoint instanceof GitWorldCheckpoint))
 		throw new Error("Execution world checkpoint belongs to another backend.");
-	if (pathKey(checkpoint.sourceRoot) !== pathKey(sourceRoot)) {
+	if (filesystemPathKey(checkpoint.sourceRoot) !== filesystemPathKey(sourceRoot)) {
 		throw new Error("Execution world checkpoint belongs to another workspace.");
 	}
 	return checkpoint;
@@ -1320,7 +1321,7 @@ async function acquireSandboxRepository(
 	gitBinary: string,
 ): Promise<PooledGitRepository> {
 	assertWorkspaceSandboxOpen(state);
-	const key = `${pathKey(sourceRoot)}\0${gitBinary}`;
+	const key = `${filesystemPathKey(sourceRoot)}\0${gitBinary}`;
 	let pending = state.repositories.get(key);
 	if (!pending) {
 		pending = createSandboxRepository(state, sourceRoot, gitBinary);
@@ -1757,7 +1758,7 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	if (repository.quarantined || repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
-		repository.owner.repositories.delete(`${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
+		repository.owner.repositories.delete(`${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
 		const prepared = repository.prepared;
 		repository.prepared = undefined;
 		void (async () => {
@@ -1780,7 +1781,7 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
  */
 function quarantineSandboxRepository(repository: PooledGitRepository): void {
 	repository.quarantined = true;
-	const key = `${pathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
+	const key = `${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
 	if (repository.owner.repositories.get(key) === repository.registration) repository.owner.repositories.delete(key);
 	if (repository.idleTimer) {
 		clearTimeout(repository.idleTimer);
@@ -1812,7 +1813,7 @@ async function closeWorkspaceSandboxPoolsNow(
 	state: WorkspaceSandboxState,
 	roots?: readonly string[],
 ): Promise<void> {
-	const rootKeys = roots ? new Set(roots.map(pathKey)) : undefined;
+	const rootKeys = roots ? new Set(roots.map(filesystemPathKey)) : undefined;
 	const pending = [...state.repositories.entries()].filter(([key]) => {
 		if (!rootKeys) return true;
 		const separator = key.indexOf("\0");
@@ -1883,11 +1884,6 @@ function isSnapshotExcluded(relative: string): boolean {
 		segments.some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment)) ||
 		segments.some((segment) => segment.startsWith(SANDBOX_STAGING_FILE_PREFIX) && segment.endsWith(".tmp"))
 	);
-}
-
-function pathKey(value: string): string {
-	const normalized = path.resolve(value).replaceAll("\\", "/");
-	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function assertWorkspaceSandboxOpen(state: WorkspaceSandboxState): void {
@@ -2448,14 +2444,14 @@ function sameOptionalState(left: RegularFileState | undefined, right: RegularFil
 function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
 	const result = new Map<string, SandboxWorkspaceChange>();
 	for (const change of changes) {
-		const key = pathKey(change.target);
+		const key = filesystemPathKey(change.target);
 		const previous = result.get(key);
 		if (!previous) {
 			result.set(key, change);
 			continue;
 		}
 		if (
-			pathKey(previous.root) !== pathKey(change.root) ||
+			filesystemPathKey(previous.root) !== filesystemPathKey(change.root) ||
 			(previous.kind === "directory") !== (change.kind === "directory")
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
@@ -2479,7 +2475,9 @@ function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): Sandbox
 		}
 		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode });
 	}
-	return [...result.values()].sort((left, right) => pathKey(left.target).localeCompare(pathKey(right.target)));
+	return [...result.values()].sort((left, right) =>
+		filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target)),
+	);
 }
 
 async function restoreChanges(
@@ -2641,14 +2639,14 @@ function orderSandboxChanges(changes: readonly SandboxWorkspaceChange[]): Sandbo
 		if (phase(left) <= 1) {
 			if (depthDifference !== 0) return -depthDifference;
 		} else if (depthDifference !== 0) return depthDifference;
-		return pathKey(left.target).localeCompare(pathKey(right.target));
+		return filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target));
 	});
 }
 
 /** Root locks make namespace changes conflict with every file commit below the same workspace. */
 function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[] {
 	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))].sort(
-		(left, right) => pathKey(left).localeCompare(pathKey(right)),
+		(left, right) => filesystemPathKey(left).localeCompare(filesystemPathKey(right)),
 	);
 }
 

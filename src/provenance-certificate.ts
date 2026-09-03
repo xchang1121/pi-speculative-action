@@ -15,11 +15,11 @@ export interface FilesystemTypeEvidence {
 }
 
 export interface FilesystemMetadataEvidence {
-	readonly mode: number;
-	readonly uid: number;
-	readonly gid: number;
-	readonly size: number;
-	readonly nlink: number;
+	readonly mode: number | bigint;
+	readonly uid: number | bigint;
+	readonly gid: number | bigint;
+	readonly size: number | bigint;
+	readonly nlink: number | bigint;
 	readonly isFile: () => boolean;
 	readonly isDirectory: () => boolean;
 	readonly isSymbolicLink: () => boolean;
@@ -402,10 +402,10 @@ export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
 
 export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
 	return digestObject({
-		mode: stat.mode,
-		uid: stat.uid,
-		gid: stat.gid,
-		...(stat.isFile() ? { size: stat.size, links: stat.nlink } : {}),
+		mode: Number(stat.mode),
+		uid: Number(stat.uid),
+		gid: Number(stat.gid),
+		...(stat.isFile() ? { size: Number(stat.size), links: Number(stat.nlink) } : {}),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }

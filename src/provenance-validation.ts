@@ -1,5 +1,6 @@
-import { lstat, readFile, readdir, readlink, stat } from "node:fs/promises";
+import { lstat, readdir, readlink, stat } from "node:fs/promises";
 import path from "node:path";
+import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import {
 	type DynamicDependency,
 	type DynamicDependencyCertificate,
@@ -244,20 +245,17 @@ export async function captureFileDependency(
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
 	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number }> {
-	const stat = await lstat(physicalPath);
-	if (!stat.isFile()) throw new Error("not_regular_file");
 	const maxBytes = finiteLimit(options.maxFileBytes ?? Number.POSITIVE_INFINITY);
-	if (stat.size > maxBytes) throw new Error(`file_too_large:${stat.size}`);
-	const content = await readFile(physicalPath);
+	const content = await captureStableFile(physicalPath, maxBytes);
 	return {
 		dependency: {
 			kind: "file",
 			path: logicalPath,
 			role,
-			contentDigest: sha256Digest(content),
-			...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(stat) } : {}),
+			contentDigest: `sha256:${content.hash}`,
+			...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(content.stat) } : {}),
 		},
-		bytesRead: content.byteLength,
+		bytesRead: content.bytesRead,
 	};
 }
 
@@ -268,10 +266,11 @@ export async function captureDirectoryDependency(
 	excludedEntries: readonly string[] = [],
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
 	const excluded = new Set(excludedEntries);
-	const [entries, stat] = await Promise.all([
-		readdir(physicalPath, { withFileTypes: true }),
-		includeMetadata ? lstat(physicalPath) : undefined,
-	]);
+	const before = await lstat(physicalPath, { bigint: true });
+	if (!before.isDirectory()) throw new Error("not_directory");
+	const entries = await readdir(physicalPath, { withFileTypes: true });
+	const after = await lstat(physicalPath, { bigint: true });
+	if (!sameFilesystemIdentity(before, after)) throw new Error("directory_changed_during_capture");
 	const normalized = entries
 		.filter((entry) => !excluded.has(entry.name))
 		.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
@@ -280,7 +279,7 @@ export async function captureDirectoryDependency(
 		kind: "directory",
 		path: logicalPath,
 		entriesDigest: digestObject(normalized),
-		...(stat ? { metadataDigest: filesystemMetadataDigest(stat) } : {}),
+		...(includeMetadata ? { metadataDigest: filesystemMetadataDigest(after) } : {}),
 		...(excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
 	};
 }
@@ -313,8 +312,19 @@ export async function captureSymlinkDependency(
 	physicalPath: string,
 	logicalPath: string,
 ): Promise<Extract<DynamicDependency, { kind: "symlink" }>> {
+	const before = await lstat(physicalPath, { bigint: true });
+	if (!before.isSymbolicLink()) throw new Error("not_symlink");
 	const target = await readlink(physicalPath);
-	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(Buffer.from(target, "utf8")) };
+	const after = await lstat(physicalPath, { bigint: true });
+	if (!after.isSymbolicLink() || !sameFilesystemIdentity(before, after)) {
+		throw new Error("symlink_changed_during_capture");
+	}
+	return {
+		kind: "symlink",
+		path: logicalPath,
+		target,
+		targetDigest: sha256Digest(Buffer.from(target, "utf8")),
+	};
 }
 
 function resolveEvidencePath(logicalPath: string, context: ProvenanceValidationContext): string | undefined {

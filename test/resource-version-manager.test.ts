@@ -1,8 +1,11 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { filesystemPathKey } from "../src/filesystem-evidence.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -14,6 +17,7 @@ import {
 } from "../src/resource-version.ts";
 
 const roots: string[] = [];
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
 	closeResourceVersionManagers();
@@ -21,7 +25,7 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
-	test("validates an unchanged watched subtree without scanning files or reading bytes", async () => {
+	test("requires exact evidence even when a watcher reports no change", async () => {
 		const root = await workspace();
 		await fs.mkdir(path.join(root, "src"), { recursive: true });
 		await Promise.all(
@@ -32,9 +36,10 @@ describe("speculative action resource versions", () => {
 		const token = await captureResourceVersion(action("grep", ["src"]), root);
 		const result = await validateResourceVersion(token);
 
-		expect(token.captureBytes).toBe(0);
-		expect(token.captureFiles).toBe(0);
-		expect(result).toMatchObject({ expired: false, mode: "watcher", bytesRead: 0, filesRead: 0 });
+		expect(token.captureBytes).toBeGreaterThan(0);
+		expect(token.captureFiles).toBe(32);
+		expect(result).toMatchObject({ expired: false, mode: "exact", filesRead: 32 });
+		expect(result.bytesRead).toBeGreaterThan(0);
 	});
 
 	test("expires file content dependencies after a write", async () => {
@@ -80,10 +85,56 @@ describe("speculative action resource versions", () => {
 
 		expect(await validateResourceVersion(token)).toMatchObject({
 			expired: false,
-			mode: "watcher",
-			bytesRead: 0,
-			filesRead: 0,
+			mode: "exact",
+			bytesRead: 8,
+			filesRead: 1,
 		});
+	});
+
+	test.runIf(process.platform !== "win32")("fingerprints a symlink target rather than only its link text", async () => {
+		const root = await workspace();
+		const target = path.join(root, "target.txt");
+		const link = path.join(root, "input.txt");
+		await fs.writeFile(target, "before");
+		await fs.symlink("target.txt", link);
+		const manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture(resourceDependencies(action("read", ["input.txt"]), root));
+
+		await fs.writeFile(target, "after!");
+		const result = await manager.validate(token);
+		manager.close();
+
+		expect(result).toMatchObject({ expired: true, mode: "exact" });
+		expect(result.bytesRead).toBe(6);
+	});
+
+	test.runIf(process.platform !== "win32")("rejects resource symlinks that escape the workspace", async () => {
+		const root = await workspace();
+		const outside = await workspace();
+		await fs.writeFile(path.join(outside, "secret.txt"), "secret");
+		await fs.symlink(path.join(outside, "secret.txt"), path.join(root, "input.txt"));
+		const manager = new ResourceVersionManager(root, { watch: false });
+
+		await expect(manager.capture(resourceDependencies(action("read", ["input.txt"]), root))).rejects.toThrow(
+			"resource_symlink_escapes_workspace",
+		);
+		manager.close();
+	});
+
+	test.runIf(process.platform === "linux")("rejects special files without opening them", async () => {
+		const root = await workspace();
+		const fifo = path.join(root, "input.pipe");
+		await execFileAsync("mkfifo", [fifo]);
+		const manager = new ResourceVersionManager(root, { watch: false });
+
+		await expect(manager.capture(resourceDependencies(action("read", ["input.pipe"]), root))).rejects.toThrow(
+			"unsupported_resource_type:fifo",
+		);
+		manager.close();
+	});
+
+	test("preserves path case in cache and watcher identities", () => {
+		expect(filesystemPathKey(path.join("root", "Case"))).not.toBe(filesystemPathKey(path.join("root", "case")));
 	});
 
 	test("keeps find results for content-only writes and expires them for entry changes", async () => {
