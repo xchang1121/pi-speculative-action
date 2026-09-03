@@ -119,8 +119,16 @@ async function conversionAblation() {
 		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
 		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
+	if (argc > 2) {
+		char result[] = "nnp:?\n";
+		int value = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+		if (value < 0 || value > 9) return 68;
+		result[4] = (char)('0' + value);
+		return write(1, result, sizeof(result) - 1) == sizeof(result) - 1 ? 0 : 69;
+	}
   char value[32] = {0};
   const char *output_path = argc > 1 ? argv[1] : "result.txt";
   int input = open("input.txt", O_RDONLY);
@@ -177,6 +185,32 @@ int main(int argc, char **argv) {
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
 
+		const securityBefore = fixture.backend.metrics();
+		const securityBranch = await forkReusableBash(fixture, {
+			label: "held-security-producer",
+			command: ": speculative-security; worker unused probe",
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		try {
+			assert(textOutput(securityBranch.output.result).includes("nnp:1"), "producer confinement probe was not active");
+		} finally {
+			await securityBranch.dispose();
+		}
+		const securityProduced = metricDelta(securityBefore, fixture.backend.metrics());
+		assert(securityProduced.tainted === 1 && securityProduced.published === 1, "confinement evidence was not retained");
+		const securityActor = await actor.execute(
+			"held-security-actor",
+			{ command: ": actor-security; worker unused probe" },
+			new AbortController().signal,
+		);
+		const securityMetrics = metricDelta(securityBefore, fixture.backend.metrics());
+		assert(textOutput(securityActor).includes("nnp:0"), "Actor did not retain its native security context");
+		assert(
+			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
+			`confinement-sensitive result was reused: ${JSON.stringify(securityMetrics)}`,
+		);
+
 		await Promise.all([
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
@@ -225,6 +259,12 @@ int main(int argc, char **argv) {
 			completed: { actorMs: hitMs, hits: hitMetrics.hits, avoidedProcessMs: hitMetrics.avoidedProcessMs },
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
+			confinementMismatch: {
+				producer: "nnp:1",
+				actor: "nnp:0",
+				hits: securityMetrics.hits,
+				rejection: securityMetrics.lastError,
+			},
 		};
 	} finally {
 		await fixture.dispose();

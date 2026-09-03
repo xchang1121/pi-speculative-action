@@ -716,7 +716,7 @@ export class LinuxProcessReuseBackend {
 			},
 		});
 		if (session.topLevelWork) session.topLevelWork.candidate = certificate;
-		if (await this.planner.publishCompleted(certificate)) {
+		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 			this.add(session, "wholeCommandPublished");
 			this.rememberScope(certificate.id, session.scope);
 		}
@@ -836,7 +836,10 @@ export class LinuxProcessReuseBackend {
 				transactionalEffects: true,
 				mode: "completed_replay",
 			},
-			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath) },
+			validation: {
+				resolvePath: (logicalPath) => projection.toPhysical(logicalPath),
+				...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}),
+			},
 			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		});
 		this.recordLookup(plan.lookup, session);
@@ -1091,7 +1094,7 @@ export class LinuxProcessReuseBackend {
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				work.candidate = certificate;
-				if (await this.planner.publishCompleted(certificate)) {
+				if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 					this.add(session, "published");
 					this.rememberScope(certificate.id, session.scope);
 				}
@@ -1415,6 +1418,11 @@ async function captureDependencies(
 	for (const item of observed) {
 		const observedPath = path.resolve(item.path);
 		if (STABLE_SANDBOX_DEVICES.has(observedPath) || interposedDirectoryFor(session, observedPath)) continue;
+		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {
+			taints.add("escaped_sandbox");
+			incompleteReasons.add(`denied:${observedPath}`);
+			continue;
+		}
 		const physical = pathContains(session.sourceRoot, observedPath)
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
@@ -1476,6 +1484,7 @@ async function captureDependencies(
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
+const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 function interposedDirectoryFor(session: ActiveSession, target: string): InterposedDirectory | undefined {
 	return session.interposition.directories.find(
@@ -1831,6 +1840,7 @@ function sandboxPolicyArguments(
 		workspaceRoot,
 		"--fs-write",
 		privateRoot,
+		...[...STABLE_SANDBOX_DEVICES].flatMap((target) => ["--fs-write", target]),
 		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
 		"--time-start",
 		new Date().toISOString(),
@@ -2059,7 +2069,7 @@ function routedExecutionContext(context: DispatcherExecutionContext, route: Outp
 		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
 		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
 	};
-	const routed = { ...semantic, signals, descriptors };
+	const routed = { ...semantic, executionDomain: "ptrace-v1", signals, descriptors };
 	return {
 		...context,
 		key: JSON.stringify(routed),

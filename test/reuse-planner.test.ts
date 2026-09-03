@@ -88,6 +88,21 @@ describe("ProcessReusePlanner", () => {
 		expect(plan).toMatchObject({ kind: "miss", reasons: ["producer_guarantee_incompatible"] });
 	});
 
+	it("reuses confinement observations only when the consumer proves the same domain", async () => {
+		const fixture = await fixtureWithCertificate(false, ["confinement_observation"]);
+		const planner = new ProcessReusePlanner({ store: fixture.store });
+		const request = {
+			prototype: fixture.prototype,
+			contract: contract("completed_replay"),
+			validation: { resolvePath: () => fixture.input },
+		};
+		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["certificate_tainted"] });
+		expect(await planner.plan({
+			...request,
+			validation: { ...request.validation, acceptedTaints: ["confinement_observation" as const] },
+		})).toMatchObject({ kind: "completed_replay" });
+	});
+
 	it("loads each result artifact once into a verified closure before replay", async () => {
 		const fixture = await fixtureWithCertificate(true);
 		const get = vi.spyOn(fixture.store.artifacts, "get");
@@ -189,7 +204,10 @@ describe("ProcessReusePlanner", () => {
 	});
 });
 
-async function fixtureWithCertificate(withFileEffect = false) {
+async function fixtureWithCertificate(
+	withFileEffect = false,
+	taints: readonly ("confinement_observation")[] = [],
+) {
 	const root = await temporaryRoot();
 	const input = path.join(root, "input.txt");
 	await writeFile(input, "input");
@@ -201,7 +219,7 @@ async function fixtureWithCertificate(withFileEffect = false) {
 	const certificate = sealProcessCertificate({
 		prototype,
 		producer: PRODUCER,
-		dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints: [] },
+		dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints },
 		result: {
 			replayProfile: "buffered_noninteractive",
 			journal: [

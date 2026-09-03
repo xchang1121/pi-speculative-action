@@ -103,10 +103,15 @@ describe("strace provenance decoder", () => {
 					'clock_gettime(CLOCK_REALTIME, {tv_sec=1, tv_nsec=2}) = 0',
 					'getrandom("abc", 3, 0) = 3',
 					'getpid() = 2',
+					'prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1',
+					'openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)',
+					'clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)',
 				].join("\n"),
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.taints).toEqual(expect.arrayContaining(["network", "clock", "random", "pid_observation"]));
+			expect(observation.taints).toEqual(expect.arrayContaining([
+				"network", "clock", "random", "pid_observation", "confinement_observation",
+			]));
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -118,9 +123,10 @@ describe("strace provenance decoder", () => {
 		try {
 			await fs.writeFile(`${prefix}.425`, [
 				'execve("/usr/bin/example", ["example"], 0x0) = 0',
+				'prctl(PR_SET_NAME, "worker") = 0',
 				'prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0',
 			].join("\n"));
-			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).not.toContain("unsupported_syscall");
+			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toEqual([]);
 			await fs.appendFile(`${prefix}.425`, '\nsetrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0\n');
 			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toContain("unsupported_syscall");
 		} finally {

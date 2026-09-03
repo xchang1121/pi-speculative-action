@@ -19,7 +19,7 @@ export interface ProvenanceValidationContext {
 	/** Current inherited readable-FD content identities. Missing entries fail closed. */
 	readonly fileDescriptors?: ReadonlyMap<number, { readonly contentDigest: Sha256Digest; readonly eof: boolean }>;
 	readonly maxFileBytes?: number;
-	/** One-shot inputs that the caller proves are transferred rather than replayed. */
+	/** Taints whose semantics the consumer proves equivalent in its execution domain. */
 	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
 

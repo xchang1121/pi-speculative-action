@@ -123,6 +123,10 @@ export class ProcessReusePlanner {
 			});
 		const weakKey = processWeakKey(request.prototype);
 		const live = request.live?.certificate.weakKey === weakKey ? request.live : undefined;
+		const acceptedTaints = [...new Set([
+			...(request.validation?.acceptedTaints ?? []),
+			...(live?.acceptedTaints ?? []),
+		])];
 		const certificates = live ? [live.certificate] : await this.store.findByWeakKey(weakKey);
 		candidateCertificates = certificates.length;
 		if (!certificates.length) {
@@ -136,7 +140,7 @@ export class ProcessReusePlanner {
 				reasons.add("producer_guarantee_incompatible");
 				continue;
 			}
-			if (!certificateReplayable(certificate, live?.acceptedTaints)) {
+			if (!certificateReplayable(certificate, acceptedTaints)) {
 				reasons.add("certificate_tainted");
 				continue;
 			}
@@ -156,7 +160,7 @@ export class ProcessReusePlanner {
 			pathsetsValidated++;
 			const observation = await validateDynamicDependencyCertificate(
 				representative.dependencyCertificate,
-				{ ...request.validation, ...(live ? { acceptedTaints: live.acceptedTaints } : {}) },
+				{ ...request.validation, acceptedTaints },
 			);
 			filesRead += observation.filesRead;
 			bytesRead += observation.bytesRead;
@@ -238,8 +242,11 @@ export class ProcessReusePlanner {
 	}
 
 	/** Publish unmatched replayable executions so useful work survives branch discard. */
-	async publishCompleted(certificate: ProcessProvenanceCertificate): Promise<boolean> {
-		if (!certificateReplayable(certificate)) return false;
+	async publishCompleted(
+		certificate: ProcessProvenanceCertificate,
+		acceptedTaints: readonly ProvenanceTaint[] = [],
+	): Promise<boolean> {
+		if (!certificateReplayable(certificate, acceptedTaints)) return false;
 		return this.store.put(certificate);
 	}
 }

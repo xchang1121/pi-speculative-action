@@ -2,7 +2,14 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { DependencyRole, ProvenanceTaint } from "./provenance-certificate.ts";
 
-const SYSCALL_FILTER = "trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl";
+const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
+	"seccomp", "capget", "capset", "mount", "umount2", "pivot_root", "swapon", "swapoff", "reboot",
+	"sethostname", "setdomainname", "kexec_load", "init_module", "finit_module", "delete_module", "unshare", "setns",
+	"perf_event_open", "bpf", "userfaultfd", "keyctl", "add_key", "request_key", "ptrace", "process_vm_readv",
+	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
+	"io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
+]);
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -155,6 +162,9 @@ export async function observeStrace(
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
+			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
+				taints.add("confinement_observation");
+			}
 			if (
 				resourceLimitMutation(line, syscall) ||
 				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) ||
@@ -392,6 +402,18 @@ function syscallName(line: string): string | undefined {
 function syscallSucceeded(line: string): boolean {
 	const result = /=\s*([^\s]+)/.exec(line)?.[1];
 	return result !== undefined && result !== "-1" && result !== "?";
+}
+
+function confinementDenied(line: string): boolean {
+	return /\)\s+= -1 (?:EACCES|EPERM)\b/.test(line);
+}
+
+function prctlConfinementSensitive(line: string, syscall: string): boolean {
+	return syscall === "prctl" && !/^prctl\(PR_SET_(?:NAME|VMA)\b/.test(line);
+}
+
+function processLimitDenied(line: string, syscall: string): boolean {
+	return ["clone", "clone3", "fork", "vfork"].includes(syscall) && /\)\s+= -1 EAGAIN\b/.test(line);
 }
 
 function syscallPaths(line: string, syscall: string, cwd: string): readonly string[] {

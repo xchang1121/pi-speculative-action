@@ -112,6 +112,7 @@ function executionContext() {
 	const descriptors = [0, 1, 2].map((fd) => descriptor(fd, aliases));
 	const umask = process.umask();
 	const semantic = {
+		executionDomain: "ptrace-v1",
 		rlimits: fs.readFileSync("/proc/self/limits", "utf8").split("\n").slice(1)
 			.map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: {

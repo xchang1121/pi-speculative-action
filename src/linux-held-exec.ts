@@ -233,6 +233,7 @@ export async function inspectHeldExecProcess(pid: number): Promise<HeldExecSnaps
 	if (!groups.includes(gid[1]!)) groups.push(gid[1]!);
 	groups.sort((left, right) => left - right);
 	const semantic = {
+		executionDomain: "ptrace-v1",
 		rlimits: limits.split("\n").slice(1).map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
 		signals: { blocked: statusField(status, "SigBlk"), ignored: statusField(status, "SigIgn") },

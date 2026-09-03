@@ -131,6 +131,7 @@ export type ProvenanceTaint =
 	| "pid_observation"
 	| "interactive_io"
 	| "untracked_fd"
+	| "confinement_observation"
 	| "unsupported_syscall"
 	| "escaped_sandbox"
 	| "mutable_input"
