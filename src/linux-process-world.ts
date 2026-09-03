@@ -4,7 +4,6 @@ import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import {
 	LinuxProcessReuseBackend,
 	type LinuxProcessBackendOptions,
-	type LinuxProcessReuseMetrics,
 	type LinuxProcessSession,
 } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
@@ -93,14 +92,16 @@ export function createLinuxProcessExecutionWorld(
 			const selected = await qualify(sourceRoot);
 			let validate: LinuxProcessSession["validate"] | undefined;
 			let seal: LinuxProcessSession["seal"] | undefined;
-			let reuseMetrics: LinuxProcessReuseMetrics | undefined;
-			return workspaceSandbox.fork({
+			let close: LinuxProcessSession["close"] | undefined;
+			let metrics: LinuxProcessSession["metrics"] | undefined;
+			try {
+				return await workspaceSandbox.fork({
 				cwd: sourceRoot,
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 				...workspaceOptions,
 				driver: selected.driver,
-				executionMetrics: () => (reuseMetrics ? { reuse: reuseMetrics } : {}),
+				executionMetrics: () => (metrics ? { reuse: metrics() } : {}),
 				validate: async () =>
 					validate
 						? validate()
@@ -123,6 +124,8 @@ export function createLinuxProcessExecutionWorld(
 					});
 					validate = session.validate;
 					seal = session.seal;
+					close = session.close;
+					metrics = session.metrics;
 					let launches = 0;
 					try {
 						const result = await options.coordinator.runWith(
@@ -141,12 +144,12 @@ export function createLinuxProcessExecutionWorld(
 						};
 					} catch (error) {
 						return toolErrorSettlement(replaceMessagePath(error, workspace.sandboxRoot, sourceRoot));
-					} finally {
-						await session.close();
-						reuseMetrics = session.metrics();
 					}
 				},
-			});
+				});
+			} finally {
+				await close?.();
+			}
 			},
 		},
 		dispose: async () => {

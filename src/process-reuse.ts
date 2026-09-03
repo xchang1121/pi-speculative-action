@@ -41,7 +41,6 @@ export {
 	validateProcessCertificate,
 } from "./provenance-validation.ts";
 export {
-	type MemoryReuseProvider,
 	type ProcessReuseLookupMetrics,
 	type ProcessReuseMissReason,
 	type ProcessReusePlan,

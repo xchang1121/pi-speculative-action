@@ -8,6 +8,7 @@ import {
 	processStrongKey,
 	processWeakKey,
 	type ProcessProvenanceCertificate,
+	type ProvenanceTaint,
 	referencedArtifacts,
 	type Sha256Digest,
 } from "./provenance-certificate.ts";
@@ -17,11 +18,6 @@ import {
 	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
-
-export interface MemoryReuseProvider<Hit> {
-	/** Optional adapter over the Runtime-owned ResultCache; the planner never owns a duplicate live cache. */
-	readonly lookup: (weakKey: Sha256Digest) => Hit | undefined | Promise<Hit | undefined>;
-}
 
 export interface ReplayObservationContract {
 	readonly sink: "buffered" | "pipe" | "tty" | "interactive";
@@ -41,6 +37,11 @@ export interface ProcessReuseRequest {
 	readonly validation?: ProvenanceValidationContext;
 	/** Optional host policy for accepting proof produced under a different execution authority. */
 	readonly acceptProducer?: (proof: ProcessProducerProof) => boolean;
+	/** One already-reserved running result; accepted taints are never written into persistent history. */
+	readonly live?: {
+		readonly certificate: ProcessProvenanceCertificate;
+		readonly acceptedTaints: readonly ProvenanceTaint[];
+	};
 }
 
 export type ProcessReuseMissReason =
@@ -64,17 +65,10 @@ export interface ProcessReuseLookupMetrics {
 	readonly durationMs: number;
 }
 
-export type ProcessReusePlan<MemoryHit = never> =
-	| {
-			readonly kind: "memory_hit";
-			readonly source: "l1";
-			readonly weakKey: Sha256Digest;
-			readonly hit: MemoryHit;
-			readonly lookup: ProcessReuseLookupMetrics;
-	  }
+export type ProcessReusePlan =
 	| {
 			readonly kind: "completed_replay";
-			readonly source: "l2";
+			readonly source: "live" | "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
@@ -83,7 +77,7 @@ export type ProcessReusePlan<MemoryHit = never> =
 	  }
 	| {
 			readonly kind: "artifact_seed";
-			readonly source: "l2";
+			readonly source: "live" | "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
 			readonly effects: readonly Extract<OrderedEffectEvent, { kind: "workspace" }>[];
@@ -100,19 +94,14 @@ export type ProcessReusePlan<MemoryHit = never> =
 	  };
 
 /** BuildXL-style weak pathset lookup followed by eager current-world strong validation. */
-export class ProcessReusePlanner<MemoryHit = never> {
+export class ProcessReusePlanner {
 	private readonly store: ProvenanceCertificateStore;
-	private readonly memory?: MemoryReuseProvider<MemoryHit>;
 
-	constructor(options: {
-		readonly store: ProvenanceCertificateStore;
-		readonly memory?: MemoryReuseProvider<MemoryHit>;
-	}) {
+	constructor(options: { readonly store: ProvenanceCertificateStore }) {
 		this.store = options.store;
-		this.memory = options.memory;
 	}
 
-	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan<MemoryHit>> {
+	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
 		const startedAt = performance.now();
 		let candidateCertificates = 0;
 		let eligibleCertificates = 0;
@@ -133,10 +122,8 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				durationMs: Math.max(0, performance.now() - startedAt),
 			});
 		const weakKey = processWeakKey(request.prototype);
-		const memoryHit = await this.memory?.lookup(weakKey);
-		if (memoryHit !== undefined) return { kind: "memory_hit", source: "l1", weakKey, hit: memoryHit, lookup: lookup() };
-
-		const certificates = await this.store.findByWeakKey(weakKey);
+		const live = request.live?.certificate.weakKey === weakKey ? request.live : undefined;
+		const certificates = live ? [live.certificate] : await this.store.findByWeakKey(weakKey);
 		candidateCertificates = certificates.length;
 		if (!certificates.length) {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
@@ -149,7 +136,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				reasons.add("producer_guarantee_incompatible");
 				continue;
 			}
-			if (!certificateReplayable(certificate)) {
+			if (!certificateReplayable(certificate, live?.acceptedTaints)) {
 				reasons.add("certificate_tainted");
 				continue;
 			}
@@ -169,7 +156,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 			pathsetsValidated++;
 			const observation = await validateDynamicDependencyCertificate(
 				representative.dependencyCertificate,
-				request.validation,
+				{ ...request.validation, ...(live ? { acceptedTaints: live.acceptedTaints } : {}) },
 			);
 			filesRead += observation.filesRead;
 			bytesRead += observation.bytesRead;
@@ -210,7 +197,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				if (request.contract.mode === "completed_replay") {
 					return {
 						kind: "completed_replay",
-						source: "l2",
+						source: live ? "live" : "l2",
 						weakKey,
 						certificate,
 						validation,
@@ -229,7 +216,7 @@ export class ProcessReusePlanner<MemoryHit = never> {
 				}
 				return {
 					kind: "artifact_seed",
-					source: "l2",
+					source: live ? "live" : "l2",
 					weakKey,
 					certificate,
 					effects,

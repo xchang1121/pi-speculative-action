@@ -341,13 +341,17 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 	return [...unique.values()];
 }
 
-export function certificateReplayable(certificate: ProcessProvenanceCertificate): boolean {
+export function certificateReplayable(
+	certificate: ProcessProvenanceCertificate,
+	acceptedTaints: readonly ProvenanceTaint[] = [],
+): boolean {
 	const stdinReplayable =
 		certificate.prototype.stdin.type === "closed" ||
 		(certificate.prototype.stdin.eof && isSha256Digest(certificate.prototype.stdin.digest));
+	const accepted = new Set(acceptedTaints);
 	return (
 		certificate.dependencyCertificate.complete &&
-		certificate.dependencyCertificate.taints.length === 0 &&
+		certificate.dependencyCertificate.taints.every((taint) => accepted.has(taint)) &&
 		certificate.prototype.environmentComplete &&
 		certificate.prototype.fileDescriptorTableComplete &&
 		stdinReplayable

@@ -114,18 +114,33 @@ describe("ProcessReusePlanner", () => {
 		expect(get).toHaveBeenCalledTimes(2);
 	});
 
-	it("consults the existing live result adapter before persistent certificates", async () => {
-		const root = await temporaryRoot();
-		const lookup = vi.fn(async () => ({ resultEntry: "runtime-owned" }));
-		const planner = new ProcessReusePlanner({
-			store: new ProvenanceCertificateStore(root),
-			memory: { lookup },
+	it("validates a transferable running result without weakening persistent history", async () => {
+		const fixture = await fixtureWithCertificate();
+		const find = vi.spyOn(fixture.store, "findByWeakKey");
+		const live = sealProcessCertificate({
+			prototype: fixture.certificate.prototype,
+			producer: fixture.certificate.producer,
+			dependencyCertificate: { ...fixture.certificate.dependencyCertificate, taints: ["clock"] },
+			result: fixture.certificate.result,
 		});
-		const prototype = processPrototype();
-		const plan = await planner.plan({ prototype, contract: contract("completed_replay") });
+		const planner = new ProcessReusePlanner({ store: fixture.store });
+		const request = {
+			prototype: fixture.prototype,
+			contract: contract("completed_replay"),
+			validation: { resolvePath: () => fixture.input },
+		};
 
-		expect(plan).toMatchObject({ kind: "memory_hit", source: "l1", hit: { resultEntry: "runtime-owned" } });
-		expect(lookup).toHaveBeenCalledOnce();
+		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: [] } })).toMatchObject({
+			kind: "miss", reasons: ["certificate_tainted"],
+		});
+		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
+			kind: "completed_replay", source: "live", certificate: { id: live.id },
+		});
+		expect(find).not.toHaveBeenCalled();
+		await writeFile(fixture.input, "changed");
+		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
+			kind: "miss", reasons: ["dependency_changed"],
+		});
 	});
 
 	it("captures one dynamic pathset once when matching several historical input states", async () => {

@@ -8,6 +8,7 @@ import {
 	filesystemMetadataDigest,
 	type ProcessProvenanceCertificate,
 	processStrongKey,
+	type ProvenanceTaint,
 	sha256Digest,
 	type Sha256Digest,
 } from "./provenance-certificate.ts";
@@ -18,6 +19,8 @@ export interface ProvenanceValidationContext {
 	/** Current inherited readable-FD content identities. Missing entries fail closed. */
 	readonly fileDescriptors?: ReadonlyMap<number, { readonly contentDigest: Sha256Digest; readonly eof: boolean }>;
 	readonly maxFileBytes?: number;
+	/** One-shot inputs that the caller proves are transferred rather than replayed. */
+	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
 
 export type ProvenanceValidation =
@@ -92,9 +95,11 @@ export async function validateDynamicDependencyCertificate(
 	if (!certificate.complete) {
 		return indeterminate("trace_incomplete", startedAt, filesRead, bytesRead);
 	}
-	if (certificate.taints.length) {
+	const acceptedTaints = new Set(context.acceptedTaints ?? []);
+	const blockingTaints = certificate.taints.filter((taint) => !acceptedTaints.has(taint));
+	if (blockingTaints.length) {
 		return indeterminate(
-			`tainted:${certificate.taints.join(",")}`,
+			`tainted:${blockingTaints.join(",")}`,
 			startedAt,
 			filesRead,
 			bytesRead,

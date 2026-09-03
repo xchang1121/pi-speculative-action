@@ -29,6 +29,7 @@ import {
 	type ExitOutcome,
 	type OrderedEffectEvent,
 	type ProcessProducerProof,
+	type ProcessProvenanceCertificate,
 	processWeakKey,
 	type ProvenanceTaint,
 	sealProcessCertificate,
@@ -214,6 +215,7 @@ interface ActiveSession {
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: Promise<readonly [string, string]>;
+	topLevelWork?: InFlightProcess;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -235,6 +237,15 @@ interface SpawnOutcome {
 	readonly output: readonly BufferedOutput[];
 }
 
+interface InFlightProcess {
+	readonly completion: Promise<void>;
+	readonly finish: () => void;
+	candidate?: ProcessProvenanceCertificate;
+	claimed: boolean;
+}
+
+type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay" }>;
+
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
 	readonly store: ProvenanceCertificateStore;
@@ -244,7 +255,7 @@ export class LinuxProcessReuseBackend {
 	private ready?: Promise<ReadyBackend>;
 	private platformFingerprint?: Promise<Sha256Digest>;
 	private disposed = false;
-	private readonly inFlight = new Map<Sha256Digest, Promise<void>>();
+	private readonly inFlight = new Map<Sha256Digest, InFlightProcess>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
@@ -318,24 +329,14 @@ export class LinuxProcessReuseBackend {
 						projection,
 						await this.resolvePlatformFingerprint(),
 					);
-					const plan = await this.planner.plan({
-						prototype,
-						acceptProducer,
-						contract: {
-							sink: "buffered",
-							orderedJournal: true,
-							transactionalEffects: true,
-							mode: "completed_replay",
-						},
-						validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath) },
-					});
-					this.recordLookup(plan.lookup);
-					if (plan.kind !== "completed_replay") {
-						if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
-							this.counters.lastError = `actor_reuse_miss:${plan.reasons.join(",")}`;
-						}
-						return this.actorReplayMiss(host, request);
-					}
+					const acquired = await this.acquireProcessResult(
+						processWeakKey(prototype),
+						(live) => this.plan(prototype, projection, acceptProducer, undefined, live),
+						false,
+						request.signal,
+					);
+					const plan = acquired.plan;
+					if (!plan) return this.actorReplayMiss(host, request);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
@@ -426,6 +427,8 @@ export class LinuxProcessReuseBackend {
 			session.closed = true;
 			await closeServer(server);
 			await rm(socketPath, { force: true }).catch(() => undefined);
+			session.topLevelWork?.finish();
+			session.topLevelWork = undefined;
 		};
 		return {
 			executor: { execute: (request) => this.executeTopLevel(session, request) },
@@ -441,7 +444,9 @@ export class LinuxProcessReuseBackend {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
-		await Promise.allSettled([...this.inFlight.values()]);
+		const running = [...this.inFlight.values()];
+		for (const work of running) work.finish();
+		await Promise.allSettled(running.map((work) => work.completion));
 		this.certificateScopes.clear();
 	}
 
@@ -520,8 +525,16 @@ export class LinuxProcessReuseBackend {
 		const command = request.command;
 		const prototype = await this.topLevelPrototype(session, request, ready, environment);
 		this.add(session, "wholeCommandRequests");
-		const initial = await this.plan(session, prototype, session.producer);
-		if (initial) return this.replayTopLevel(session, initial, request, requestStarted);
+		const weakKey = processWeakKey(prototype);
+		const acquired = await this.acquireProcessResult(
+			weakKey,
+			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.producer, candidate), session, live),
+			true,
+			request.signal,
+		);
+		if (acquired.plan) return this.replayTopLevel(session, acquired.plan, request, requestStarted);
+		if (!acquired.work) throw new Error("process work reservation failed");
+		session.topLevelWork = acquired.work;
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -579,6 +592,10 @@ export class LinuxProcessReuseBackend {
 				session.incompleteReasons.add(`top_capture:${errorMessage(error)}`);
 				session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 			}
+		} catch (error) {
+			session.topLevelWork?.finish();
+			session.topLevelWork = undefined;
+			throw error;
 		} finally {
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
@@ -590,13 +607,18 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		changes: readonly SandboxWorkspaceChange[],
 	): Promise<readonly SandboxDirectoryChange[]> {
-		const directories = await sealSessionEvidence(session, changes);
 		try {
-			await this.publishTopLevel(session, changes);
-		} catch (error) {
-			this.setError(session, `top_publish:${errorMessage(error)}`);
+			const directories = await sealSessionEvidence(session, changes);
+			try {
+				await this.publishTopLevel(session, changes);
+			} catch (error) {
+				this.setError(session, `top_publish:${errorMessage(error)}`);
+			}
+			return directories;
+		} finally {
+			session.topLevelWork?.finish();
+			session.topLevelWork = undefined;
 		}
-		return directories;
 	}
 
 	private async topLevelPrototype(
@@ -656,6 +678,7 @@ export class LinuxProcessReuseBackend {
 				exit: exitOutcome(execution.outcome),
 			},
 		});
+		if (session.topLevelWork) session.topLevelWork.candidate = certificate;
 		if (await this.planner.publishCompleted(certificate)) {
 			this.add(session, "wholeCommandPublished");
 			this.rememberScope(certificate.id, session.scope);
@@ -698,47 +721,94 @@ export class LinuxProcessReuseBackend {
 		}
 		const prototype = await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
-		const initial = await this.plan(session, prototype, session.nestedProducer);
-		if (initial) return this.replay(session, initial, weakKey, false, requestStarted);
-
-		const preceding = this.inFlight.get(weakKey);
-		if (preceding) {
-			await preceding;
-			const joined = await this.plan(session, prototype, session.nestedProducer);
-			if (joined) return this.replay(session, joined, weakKey, true, requestStarted);
-		}
-
+		const acquired = await this.acquireProcessResult(
+			weakKey,
+			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
+			true,
+		);
+		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined, requestStarted);
+		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
-		let release!: () => void;
-		const pending = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		this.inFlight.set(weakKey, pending);
 		try {
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute);
+			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work);
 		} finally {
-			release();
-			if (this.inFlight.get(weakKey) === pending) this.inFlight.delete(weakKey);
+			acquired.work.finish();
 		}
 	}
 
-	private async plan(session: ActiveSession, prototype: ExecPrototype, producer: ProcessProducerProof) {
+	private async acquireProcessResult(
+		weakKey: Sha256Digest,
+		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
+		produce: boolean,
+		signal?: AbortSignal,
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: InFlightProcess; readonly joined: boolean }> {
+		let joined = false;
+		while (true) {
+			const completed = await lookup();
+			if (completed) return { plan: completed, joined };
+			const running = this.inFlight.get(weakKey);
+			if (!running) return produce ? { work: this.claimProcessWork(weakKey), joined } : { joined };
+			joined = true;
+			await waitForCompletion(running.completion, signal);
+			const persisted = await lookup();
+			if (persisted) return { plan: persisted, joined };
+			const candidate = running.candidate;
+			if (!candidate) continue;
+			const transferred = await lookup(candidate);
+			if (transferred && !running.claimed) {
+				running.claimed = true;
+				return { plan: transferred, joined };
+			}
+		}
+	}
+
+	private claimProcessWork(weakKey: Sha256Digest): InFlightProcess {
+		if (this.inFlight.has(weakKey)) throw new Error("process work is already in flight");
+		let settle!: () => void;
+		let finished = false;
+		const completion = new Promise<void>((resolve) => {
+			settle = resolve;
+		});
+		const work: InFlightProcess = {
+			completion,
+			claimed: false,
+			finish: () => {
+				if (finished) return;
+				finished = true;
+				if (this.inFlight.get(weakKey) === work) this.inFlight.delete(weakKey);
+				settle();
+			},
+		};
+		this.inFlight.set(weakKey, work);
+		return work;
+	}
+
+	private async plan(
+		prototype: ExecPrototype,
+		projection: ExecutionPathProjection,
+		acceptProducer: (producer: ProcessProducerProof) => boolean,
+		session?: ActiveSession,
+		live?: ProcessProvenanceCertificate,
+	): Promise<CompletedProcessPlan | undefined> {
 		const plan = await this.planner.plan({
 			prototype,
-			acceptProducer: (candidate) => compatibleProducer(producer, candidate),
+			acceptProducer,
 			contract: {
 				sink: "buffered",
 				orderedJournal: true,
 				transactionalEffects: true,
 				mode: "completed_replay",
 			},
-			validation: { resolvePath: (logicalPath) => session.projection.toPhysical(logicalPath) },
+			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath) },
+			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		});
 		this.recordLookup(plan.lookup, session);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
-			this.setError(session, `reuse_miss:${plan.reasons.join(",")}${
+			const detail = `reuse_miss:${plan.reasons.join(",")}${
 				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
-			}`);
+			}`;
+			if (session) this.setError(session, detail);
+			else this.counters.lastError = `actor_${detail}`;
 		}
 		return plan.kind === "completed_replay" ? plan : undefined;
 	}
@@ -807,6 +877,7 @@ export class LinuxProcessReuseBackend {
 		prototype: ExecPrototype,
 		weakKey: Sha256Digest,
 		outputRoute: OutputRoute,
+		work: InFlightProcess,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -915,6 +986,7 @@ export class LinuxProcessReuseBackend {
 					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
+				work.candidate = certificate;
 				if (await this.planner.publishCompleted(certificate)) {
 					this.add(session, "published");
 					this.rememberScope(certificate.id, session.scope);
@@ -2159,6 +2231,19 @@ function slash(value: string): string {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw signal.reason ?? new Error("aborted");
+}
+
+async function waitForCompletion(completion: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+	throwIfAborted(signal);
+	if (!signal) return completion;
+	await new Promise<void>((resolve, reject) => {
+		const aborted = () => reject(signal.reason ?? new Error("aborted"));
+		signal.addEventListener("abort", aborted, { once: true });
+		void completion.then(() => {
+			signal.removeEventListener("abort", aborted);
+			resolve();
+		});
+	});
 }
 
 function missing(error: unknown): boolean {

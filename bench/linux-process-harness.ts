@@ -135,39 +135,12 @@ export async function prepareLinuxProcessReuse(
 
 export async function executeReusableBash(
 	fixture: LinuxProcessBenchmark,
-	input: {
-		readonly label: string;
-		readonly command: string;
-		readonly actionNamespace: string;
-		readonly executionFingerprint: string;
-		readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
-	},
+	input: ReusableBashInput,
 ) {
-	const args = { command: input.command };
-	const invocation = resolvePiToolInvocation("bash", args, {
-		cwd: fixture.workspace,
-		environment: fixture.environment,
-		shellPath: fixture.shellPath,
-	});
-	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, {
-		fingerprint: input.executionFingerprint,
-		context: invocation,
-	});
-	if (!action) throw new Error("Pi Bash action could not be keyed");
 	const metricsBefore = fixture.backend.metrics();
 	const started = performance.now();
 	const forkStarted = performance.now();
-	const branch = await fixture.world.speculation.execute({
-		cwd: fixture.workspace,
-		tool: fixture.tool,
-		toolName: "bash",
-		args,
-		action,
-		callID: `bench-${input.label}`,
-		signal: new AbortController().signal,
-		...(input.executionScope ? { executionScope: input.executionScope } : {}),
-	});
+	const branch = await forkReusableBash(fixture, input);
 	const forkMs = performance.now() - forkStarted;
 	try {
 		if (branch.output.isError) throw new Error(textOutput(branch.output.result));
@@ -191,6 +164,39 @@ export async function executeReusableBash(
 	} finally {
 		branch.dispose();
 	}
+}
+
+export interface ReusableBashInput {
+	readonly label: string;
+	readonly command: string;
+	readonly actionNamespace: string;
+	readonly executionFingerprint: string;
+	readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
+}
+
+export async function forkReusableBash(fixture: LinuxProcessBenchmark, input: ReusableBashInput) {
+	const args = { command: input.command };
+	const invocation = resolvePiToolInvocation("bash", args, {
+		cwd: fixture.workspace,
+		environment: fixture.environment,
+		shellPath: fixture.shellPath,
+	});
+	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
+	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, {
+		fingerprint: input.executionFingerprint,
+		context: invocation,
+	});
+	if (!action) throw new Error("Pi Bash action could not be keyed");
+	return fixture.world.speculation.execute({
+		cwd: fixture.workspace,
+		tool: fixture.tool,
+		toolName: "bash",
+		args,
+		action,
+		callID: `bench-${input.label}`,
+		signal: new AbortController().signal,
+		...(input.executionScope ? { executionScope: input.executionScope } : {}),
+	});
 }
 
 export async function executeDirectBash(
