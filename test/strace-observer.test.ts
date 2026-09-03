@@ -16,6 +16,7 @@ describe("strace provenance decoder", () => {
 						'execve("/usr/bin/example", ["example"], 0x0) = 0',
 						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
 						'fstat(3</work/input.txt>, {st_dev=makedev(0x8, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=4, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
+						'chdir("/work/sub") = 0',
 						"clone(child_stack=NULL, flags=SIGCHLD) = 101",
 						"+++ exited with 0 +++",
 					].join("\n"),
@@ -38,7 +39,7 @@ describe("strace provenance decoder", () => {
 					{ path: "/usr/bin/child", role: "executable" },
 					{ path: "/work/input.txt", role: "input" },
 					{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
-					{ path: "/work/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
+					{ path: "/work/sub/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
 				]),
 			);
 		} finally {

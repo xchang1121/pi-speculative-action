@@ -158,7 +158,12 @@ export async function observeStrace(
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
 		if (!file) continue;
-		let cwd = path.posix.resolve(initialCwd);
+		let cwd = initialCwds.get(pid);
+		if (!cwd) {
+			complete = false;
+			incompleteReasons.add(`cwd_unknown:${pid}`);
+			cwd = path.posix.resolve(initialCwd);
+		}
 		const unfinished = new Map<string, number>();
 		for (let index = start; index < file.lines.length; index++) {
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
