@@ -1,0 +1,58 @@
+# Reusable ThinkThread Profile for Pi speculative action on Linux.
+# Install with scripts/install-thinkthread-profile.sh, then run:
+#   tt pi-speculative-action
+
+schemaVersion = 4
+
+[agent]
+name = "pi"
+executable = "pi"
+executableSearchPaths = [
+    "${HOME}/.local/share/pi-node/current/bin",
+    "${HOME}/.local/node_modules/.bin",
+    "${HOME}/.local/bin",
+    "${HOME}/.npm-global/bin",
+    "${HOME}/.bun/bin",
+]
+executableReadAncestor = "pi-node"
+args = [
+    "--extension", "${HOME}/.local/share/pi-speculative-action/runtime/node_modules/@earendil-works/pi-speculative-action/dist/thinkthread/profile-extension.js",
+]
+configDirEnv = "PI_CODING_AGENT_DIR"
+configDirDefault = "${HOME}/.pi/agent"
+configDirAccess = "read_write"
+
+[agent.extension]
+schemaVersion = 1
+name = "pi"
+
+[agent.extension.loader]
+kind = "process"
+command = ["thinkthread-extension-pi"]
+protocolVersion = 5
+
+[environment]
+fs = "."
+rootFsMode = "direct"
+childFsMode = "copy_on_write"
+read = [
+    "${HOME}/.local/share/pi-speculative-action",
+    "/sys/devices/system/cpu",
+]
+write = [
+    "${HOME}/.local/share/pi-speculative-action/config",
+]
+
+[environment.root]
+PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/config"
+
+[environment.child]
+PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/config"
+
+# Pi and self-contained stock-tool children inherit this policy. External-process
+# grep/find and Bash stay on the Actor path because their dependencies are not sealed.
+[environment.network]
+mode = "all"
+
+[delegation.capabilities]
+allow = ["thinkthread.fs.self"]

@@ -178,6 +178,29 @@ When PatternAware multi-step mode is enabled, each authoritative Actor action—
 
 The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.
 
+## ThinkThread profile (Linux)
+
+The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute four self-contained stock tools and to observe Actor results from two external-process search tools, without changing Pi or the default Linux backend. Install and launch it from Linux (Orb on macOS):
+
+```sh
+./scripts/install-thinkthread-profile.sh
+cd /path/to/project
+tt pi-speculative-action
+```
+
+The installer accepts `--agent-posix-package /path/to/sdk.tgz` and `--speculative-action-package /path/to/spec.tgz` for prebuilt packages, and repeatable `--model provider/model` delegation. It pins Agent POSIX SDK 0.1.0, verifies protocol 2 and the contract fingerprint, and installs a schema-4 profile plus a private runtime under `~/.local/share/pi-speculative-action`. Pi, Node, `fd`, and `rg` must already be available to the profile. Profile settings live under that installation's `config` directory; project `.pi/speculative-action.json` overrides still apply.
+
+The adapter supplies two independent operations:
+
+- `speculation.execute`: `read`, `ls`, `write`, and `edit` use a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
+- `observation.capture`: a fresh snapshot immediately before an Actor `read`, `grep`, `find`, or `ls`; the same Actor output is sealed for later validated reuse, without executing the tool again. This route does not require the speculative runner. `EffectTransaction` owns adoption state for both operations.
+
+The external-process `grep` and `find` tools remain on the Actor path, but their completed Actor results can be replayed while the captured tree is unchanged. This profile does not provide the default Linux provider's persistent process-certificate replay, cross-parent child reuse, or held-exec handoff. It replaces that provider instead of nesting its Git/namespace/ptrace implementation inside ThinkThread. Status reports the per-tool ThinkThread routes separately; reusable-command storage controls are unavailable because the adapter exposes no certificate store. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
+
+`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. The world therefore does not pre-execute `grep`, `find`, or `bash`, whose process dependencies are outside its workspace proof. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
+
+For development of this optional adapter, install the matching SDK tarball with `npm install --ignore-scripts --save-dev --package-lock=false /path/to/sdk.tgz`, then run `npm pkg delete 'devDependencies.@thinkthread/agent-posix'` before checks or packaging. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
+
 ## Runtime sandbox integration
 
 The Pi extension registers the Linux process world followed by the Git workspace fallback by default. Hosts may replace that list through `executionWorlds`. Every world advertises effect capabilities rather than tool names; the built-in runtime world covers process invocation, while a host may inject a broader runtime sandbox. The router confirms backend availability before returning a route, so an unavailable runtime sandbox naturally falls through to a compatible local fallback. Every successful backend—including process provenance, resource snapshots, and Git worktrees—returns the same sealed `WorldBranch` artifact. The gateway wraps it in one `EffectTransaction`, which exclusively owns freshness validation, adoption, abort, and commit state while the artifact retains compatibility evidence and backend-local cleanup.

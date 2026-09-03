@@ -1,5 +1,5 @@
 import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
-import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
+import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 
 export type EffectTransactionState =
 	| "begun"
@@ -20,11 +20,18 @@ export type EffectCommitDisposition = "recoverable" | "poisoned";
 /** A commit failure whose disposition decides whether authoritative execution may still begin. */
 export class EffectCommitFailure extends Error {
 	readonly disposition: EffectCommitDisposition;
+	readonly resolutionCause?: ResolutionCause;
 
-	constructor(disposition: EffectCommitDisposition, message: string, cause: unknown) {
+	constructor(
+		disposition: EffectCommitDisposition,
+		message: string,
+		cause: unknown,
+		resolutionCause?: ResolutionCause,
+	) {
 		super(message, { cause });
 		this.name = "EffectCommitFailure";
 		this.disposition = disposition;
+		this.resolutionCause = resolutionCause;
 	}
 }
 
@@ -32,11 +39,16 @@ export function effectCommitFailure(
 	error: unknown,
 	disposition: EffectCommitDisposition,
 	message = error instanceof Error ? error.message : String(error),
+	resolutionCause?: ResolutionCause,
 ): EffectCommitFailure {
-	return error instanceof EffectCommitFailure ? error : new EffectCommitFailure(disposition, message, error);
+	return error instanceof EffectCommitFailure
+		? error
+		: new EffectCommitFailure(disposition, message, error, resolutionCause);
 }
 
-export function isPoisonedEffectCommit(error: unknown): error is EffectCommitFailure {
+export function isPoisonedEffectCommit(
+	error: unknown,
+): error is EffectCommitFailure & { readonly disposition: "poisoned" } {
 	return error instanceof EffectCommitFailure && error.disposition === "poisoned";
 }
 

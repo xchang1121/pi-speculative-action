@@ -2177,7 +2177,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				} catch (error) {
 					const commitFailure = effectCommitFailure(error, "poisoned");
 					if (isPoisonedEffectCommit(commitFailure)) throw commitFailure;
-					const failure = cause("commit", "world_commit_failed", errorDetail(commitFailure));
+					const failure = commitFailure.resolutionCause ??
+						cause("commit", "world_commit_failed", errorDetail(commitFailure));
 					attempt.rejectCandidate(candidate.id, choice.match, failure);
 					discardCandidate(state.session, candidate, failure);
 					continue;

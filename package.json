@@ -26,6 +26,10 @@
 			"types": "./dist/process-reuse.d.ts",
 			"import": "./dist/process-reuse.js"
 		},
+		"./thinkthread-extension": {
+			"types": "./dist/thinkthread/index.d.ts",
+			"import": "./dist/thinkthread/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"pi": {
@@ -36,6 +40,8 @@
 	"files": [
 		"dist",
 		"src",
+		".thinkthread",
+		"scripts/install-thinkthread-profile.sh",
 		"README.md",
 		"README-CN.md",
 		"CHANGELOG.md",
@@ -64,7 +70,13 @@
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": "*",
+		"@thinkthread/agent-posix": "0.1.0"
+	},
+	"peerDependenciesMeta": {
+		"@thinkthread/agent-posix": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@earendil-works/pi-agent-core": "0.84.1",

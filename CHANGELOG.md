@@ -25,6 +25,9 @@
 
 ### Added
 
+- Added an optional ThinkThread profile that pre-executes self-contained `read`, `ls`, `write`,
+  and `edit` calls and captures Actor-authorized `grep`/`find` results for later validation.
+  External-process search and Bash remain on the Actor path when their dependencies are unsealed.
 - Added capability-derived tool policy: startup diagnostics now keep unroutable preferences inactive,
   prediction sources receive only safe current tools, and the TUI reuses this result without per-tool probes.
 - Added user-facing reuse accounting led by all tool calls. Bash child-command hit rate and matched-command

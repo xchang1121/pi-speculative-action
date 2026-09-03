@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	buildPiActionKey,
 	KEYABLE_TOOLS,
 	PI_ACTION_SEMANTICS,
 } from "../src/action-semantics.ts";
@@ -181,6 +182,35 @@ describe("ExecutionWorldRouter", () => {
 		]);
 		expect(executionCapabilityStatus(request.requirements, diagnostics).state).toBe("unavailable");
 		expect(executionCapabilityStatus(request.requirements, diagnostics, "observation").state).toBe("ready");
+	});
+
+	it("applies provider tool scopes independently to speculation and observation", async () => {
+		const base = fallback("scoped", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
+		const scoped: TestWorld = {
+			...base,
+			speculation: { ...base.speculation, tools: ["read"] },
+			observation: {
+				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+				tools: ["grep"],
+				capture: async () => ({ seal: async (output) => worldBranch("scoped", output), dispose: () => {} }),
+			},
+		};
+		const router = new ExecutionWorldRouter([scoped]);
+		const request = (tool: "read" | "grep") => ({
+			effect: "observation" as const,
+			requirements: RESOURCE_OBSERVATION_EFFECTS,
+			action: buildPiActionKey(tool, { path: ".", ...(tool === "grep" ? { pattern: "x" } : {}) }, "/workspace")!,
+		});
+
+		expect(await router.resolve(request("read"), preparation)).toBeDefined();
+		expect(await router.resolve(request("grep"), preparation)).toBeUndefined();
+		expect(await router.captureAuthoritativeResult(request("read"), preparation, { value: "actor" })).toBeUndefined();
+		expect(await router.captureAuthoritativeResult(request("grep"), preparation, { value: "actor" })).toBeDefined();
+		const diagnostics = await router.diagnostics(preparation);
+		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "speculation", "grep").state)
+			.toBe("unavailable");
+		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "observation", "grep").state)
+			.toBe("ready");
 	});
 
 	it.each([

@@ -194,12 +194,16 @@ export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnost
 	readonly isolation: SpeculativeExecution;
 	/** Capabilities and health of speculative execution; retained at the top level for host compatibility. */
 	readonly capabilities: EffectCapabilities;
+	/** Omitted means every tool whose effect contract is covered. */
+	readonly tools?: readonly string[];
 	/** Independently probed Actor-authorized observation, when the world provides it. */
 	readonly observation?: ExecutionWorldOperationDiagnostic;
 }
 
 export interface ExecutionWorldOperationDiagnostic extends ExecutionWorldDiagnosticReport {
 	readonly capabilities: EffectCapabilities;
+	/** Omitted means every tool whose effect contract is covered. */
+	readonly tools?: readonly string[];
 }
 
 /** Fast, side-effect-free view of whether the registered worlds can route one effect contract. */
@@ -213,12 +217,13 @@ export function executionCapabilityStatus(
 	requirements: EffectRequirements,
 	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
 	operation: "speculation" | "observation" = "speculation",
+	tool?: string,
 ): ExecutionCapabilityStatus {
 	const candidates = (["runtime", "fallback"] as const).flatMap((scope) =>
 		worlds.flatMap((world) => {
 			if (world.scope !== scope) return [];
 			const diagnostic = operation === "speculation" ? world : world.observation;
-			return diagnostic && effectCapabilitiesCover(diagnostic.capabilities, requirements)
+			return diagnostic && supportsTool(diagnostic, tool) && effectCapabilitiesCover(diagnostic.capabilities, requirements)
 				? [{ ...world, ...diagnostic }]
 				: [];
 		}),
@@ -237,6 +242,8 @@ export function executionCapabilityStatus(
 export interface ExecutionWorldOperation {
 	/** Atomic effects this operation can safely contain, observe, virtualize, or validate. */
 	readonly capabilities: EffectCapabilities;
+	/** Optional provider-native tool scope; effect capabilities remain the safety boundary. */
+	readonly tools?: readonly string[];
 	/** Stable identity of the concrete provider used for route-local reuse. */
 	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
 	/** Idempotent and concurrency-safe; reject while unavailable so resolution can try the next world. */
@@ -383,6 +390,7 @@ export class ExecutionWorldRouter<Context, Output> {
 				const operation = operationFor(world);
 				if (!operation) continue;
 				try {
+					if (!supportsTool(operation, request.action?.tool)) continue;
 					if (!effectCapabilitiesCover(operation.capabilities, request.requirements)) continue;
 					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await operation.prepare?.(preparation);
@@ -423,6 +431,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		if (route?.cwd === input.cwd && route.state === "unavailable") report = route;
 		return Object.freeze({
 			capabilities: operation.capabilities,
+			...(operation.tools ? { tools: Object.freeze([...operation.tools]) } : {}),
 			...(report ??
 				(route?.cwd === input.cwd ? route : undefined) ?? {
 					state: "registered",
@@ -440,6 +449,10 @@ export class ExecutionWorldRouter<Context, Output> {
 	): void {
 		this.routeObservations.set(`${id}:${kind}`, { state, cwd, detail });
 	}
+}
+
+function supportsTool(operation: { readonly tools?: readonly string[] }, tool: string | undefined): boolean {
+	return tool === undefined || operation.tools === undefined || operation.tools.includes(tool);
 }
 
 function errorDetail(error: unknown): string {

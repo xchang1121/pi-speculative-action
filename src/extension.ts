@@ -262,11 +262,18 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createExecutionWorlds?: () => readonly AgentExecutionWorld[];
+	readonly createExecutionWorlds?: (
+		context: SpeculativeActionExecutionWorldContext,
+	) => readonly AgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
+}
+
+export interface SpeculativeActionExecutionWorldContext {
+	readonly cwd: string;
+	readonly autoResizeImages: boolean;
 }
 
 export function normalizeSpeculativeActionSettings(
@@ -429,7 +436,10 @@ async function installController(
 		loadPiToolSettings(context),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
-	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.();
+	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.({
+		cwd: context.cwd,
+		autoResizeImages: piToolSettings.autoResizeImages,
+	});
 	const processBackend = configuredExecutionWorlds
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
@@ -1678,9 +1688,9 @@ function resolveToolCapabilities(
 		KEYABLE_TOOLS.map((tool): [string, ToolCapabilityRow] => {
 			const requirements = PI_ACTION_SEMANTICS.requirements(tool);
 			const pending = { state: "registered" as const, candidates: [] };
-			const fork = requirements && known ? executionCapabilityStatus(requirements, worlds) : pending;
+			const fork = requirements && known ? executionCapabilityStatus(requirements, worlds, "speculation", tool) : pending;
 			const observe = requirements && known
-				? executionCapabilityStatus(requirements, worlds, "observation")
+				? executionCapabilityStatus(requirements, worlds, "observation", tool)
 				: pending;
 			const unavailable = conflicts.get(tool) ?? (!registeredTools.has(tool) ? "not registered" : undefined);
 			if (unavailable) {
