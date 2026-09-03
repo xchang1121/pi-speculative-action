@@ -392,6 +392,8 @@ async function installController(
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
 	let currentTurnID: string | undefined;
+	const sessionID = context.sessionManager.getSessionId();
+	const executionScope = () => currentTurnID ? { sessionID, turnID: currentTurnID } : undefined;
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
 	let turnTools: readonly AgentTool[] = [];
@@ -423,6 +425,7 @@ async function installController(
 				sourceRoot: context.cwd,
 				realShell: shell.shell,
 				enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
+				scope: executionScope,
 			}).then((route) => {
 				actorBashReuse = "ready — previous matching Bash calls and completed/running child commands";
 				return route;
@@ -443,6 +446,7 @@ async function installController(
 		processBackend?.completedReplayExecutor(directProcessExecutor, {
 			sourceRoot: context.cwd,
 			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
+			scope: executionScope,
 			invocation: (request) =>
 				resolvePiToolInvocation("bash", { command: request.command, ...(request.timeout !== undefined ? { timeout: request.timeout } : {}) }, {
 					cwd: request.cwd,
@@ -510,7 +514,7 @@ async function installController(
 			formatSpeculativeFooter(settings(), visibleMetrics(), executionDiagnostics, toolConflicts.size),
 		);
 	}
-	const host = (dependencies.createHost ?? createSpeculativeActionHost)(context.sessionManager.getSessionId(), {
+	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
 		getSettings: runtimeSettings,
 		complete: (model, llmContext, options) =>

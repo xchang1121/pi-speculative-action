@@ -19,6 +19,7 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { workspaceSandboxFingerprint, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 
 export type NumericMetrics = Readonly<Record<string, number>>;
+const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
 	readonly state: "ready";
 	readonly sandlockBinary: string;
@@ -59,6 +60,7 @@ export async function createLinuxProcessBenchmark(
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace,
+			scope: () => BENCHMARK_SCOPE,
 			invocation: (request) =>
 				resolvePiToolInvocation("bash", { command: request.command }, {
 					cwd: request.cwd,
@@ -195,7 +197,7 @@ export async function forkReusableBash(fixture: LinuxProcessBenchmark, input: Re
 		action,
 		callID: `bench-${input.label}`,
 		signal: new AbortController().signal,
-		...(input.executionScope ? { executionScope: input.executionScope } : {}),
+		executionScope: input.executionScope ?? BENCHMARK_SCOPE,
 	});
 }
 

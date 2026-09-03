@@ -108,12 +108,14 @@ export interface CompletedProcessReplayOptions {
 	readonly sourceRoot: string;
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 	readonly enabled?: () => boolean;
+	readonly scope?: () => ExecutionScope | undefined;
 }
 
 export interface HeldExecActorReplayOptions {
 	readonly sourceRoot: string;
 	readonly realShell: string;
 	readonly enabled: () => boolean;
+	readonly scope?: () => ExecutionScope | undefined;
 }
 
 export interface HeldExecActorReplayRoute {
@@ -278,6 +280,7 @@ export class LinuxProcessReuseBackend {
 	private heldExecOpening?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
 	private readonly inFlight = new Map<Sha256Digest, InFlightProcess>();
+	private readonly completedHandoffs = new Map<Sha256Digest, ProcessProvenanceCertificate>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
@@ -286,9 +289,12 @@ export class LinuxProcessReuseBackend {
 		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.storage = {
-			configure: ({ maxEntries, maxBytes }) =>
-				this.store.configure({ maxCertificates: maxEntries, maxBytes }),
+			configure: ({ maxEntries, maxBytes }) => {
+				this.store.configure({ maxCertificates: maxEntries, maxBytes });
+				this.trimCompletedHandoffs();
+			},
 			maintain: async (operation) => {
+				this.completedHandoffs.clear();
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
 				if (operation === "clear") this.certificateScopes.clear();
 				return {
@@ -331,7 +337,7 @@ export class LinuxProcessReuseBackend {
 		const boundary = await (this.heldExecOpening ??= LinuxHeldExecBoundary.open({
 			storeRoot: this.options.storeRoot,
 			...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
-			decide: (process) => this.decideHeldExec(process),
+			decide: (process) => this.decideHeldExec(process, options.scope?.()),
 		}));
 		this.heldExecBoundary = boundary;
 		return {
@@ -374,6 +380,7 @@ export class LinuxProcessReuseBackend {
 						(live) => this.plan(prototype, projection, acceptProducer, undefined, live),
 						false,
 						request.signal,
+						options.scope?.(),
 					);
 					const plan = acquired.plan;
 					if (!plan) return this.actorReplayMiss(host, request);
@@ -490,6 +497,7 @@ export class LinuxProcessReuseBackend {
 		for (const work of running) work.finish();
 		await Promise.allSettled(running.map((work) => work.completion));
 		await this.heldExecBoundary?.close();
+		this.completedHandoffs.clear();
 		this.certificateScopes.clear();
 	}
 
@@ -724,9 +732,9 @@ export class LinuxProcessReuseBackend {
 			},
 		});
 		if (session.topLevelWork) session.topLevelWork.candidate = certificate;
+		this.rememberScope(certificate.id, session.scope);
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 			this.add(session, "wholeCommandPublished");
-			this.rememberScope(certificate.id, session.scope);
 		}
 	}
 
@@ -786,11 +794,26 @@ export class LinuxProcessReuseBackend {
 		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
 		produce: boolean,
 		signal?: AbortSignal,
+		scope?: ExecutionScope,
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: InFlightProcess; readonly joined: boolean }> {
 		let joined = false;
 		while (true) {
 			const completed = await lookup();
-			if (completed) return { plan: completed, joined };
+			if (completed) {
+				this.completedHandoffs.delete(weakKey);
+				return { plan: completed, joined };
+			}
+			if (!produce) {
+				const handoff = this.completedHandoffs.get(weakKey);
+				if (handoff) {
+					this.completedHandoffs.delete(weakKey);
+					const producerScope = this.certificateScopes.get(handoff.id);
+					if (scope && producerScope?.sessionID === scope.sessionID && producerScope.turnID === scope.turnID) {
+						const transferred = await lookup(handoff);
+						if (transferred) return { plan: transferred, joined };
+					}
+				}
+			}
 			const running = this.inFlight.get(weakKey);
 			if (!running) return produce ? { work: this.claimProcessWork(weakKey), joined } : { joined };
 			joined = true;
@@ -802,6 +825,7 @@ export class LinuxProcessReuseBackend {
 			const transferred = await lookup(candidate);
 			if (transferred && !running.claimed) {
 				running.claimed = true;
+				this.completedHandoffs.delete(weakKey);
 				return { plan: transferred, joined };
 			}
 		}
@@ -821,11 +845,22 @@ export class LinuxProcessReuseBackend {
 				if (finished) return;
 				finished = true;
 				if (this.inFlight.get(weakKey) === work) this.inFlight.delete(weakKey);
+				if (work.candidate && this.certificateScopes.has(work.candidate.id) && !work.claimed) {
+					this.completedHandoffs.delete(weakKey);
+					this.completedHandoffs.set(weakKey, work.candidate);
+					this.trimCompletedHandoffs();
+				}
 				settle();
 			},
 		};
 		this.inFlight.set(weakKey, work);
 		return work;
+	}
+
+	private trimCompletedHandoffs(): void {
+		while (this.completedHandoffs.size > this.store.limits.maxCertificates) {
+			this.completedHandoffs.delete(this.completedHandoffs.keys().next().value!);
+		}
 	}
 
 	private async plan(
@@ -880,7 +915,7 @@ export class LinuxProcessReuseBackend {
 		return host.execute(request);
 	}
 
-	private async decideHeldExec(process: HeldExecProcess): Promise<HeldExecDecision> {
+	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const requestStarted = performance.now();
 		this.counters.requests++;
 		try {
@@ -919,6 +954,7 @@ export class LinuxProcessReuseBackend {
 				(live) => this.plan(prototype, projection, accepted, undefined, live),
 				false,
 				process.signal,
+				scope,
 			);
 			const plan = acquired.plan;
 			if (!plan || plan.certificate.result.exit.kind !== "code") {
@@ -935,7 +971,7 @@ export class LinuxProcessReuseBackend {
 					try {
 						throwIfAborted(process.signal);
 						await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
-						this.recordHit(plan.certificate, acquired.joined);
+						this.recordHit(plan.certificate, acquired.joined, undefined, scope);
 						const observed = plan.certificate.result.observedProcessMs;
 						if (observed !== undefined) {
 							this.counters.timedHits++;
@@ -1102,9 +1138,9 @@ export class LinuxProcessReuseBackend {
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				work.candidate = certificate;
+				this.rememberScope(certificate.id, session.scope);
 				if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 					this.add(session, "published");
-					this.rememberScope(certificate.id, session.scope);
 				}
 				if (taints.size) {
 					this.add(session, "tainted");
@@ -1129,14 +1165,19 @@ export class LinuxProcessReuseBackend {
 		session.metrics[metric] += value;
 	}
 
-	private recordHit(certificate: ProcessProvenanceCertificate, joined: boolean, session?: ActiveSession): void {
+	private recordHit(
+		certificate: ProcessProvenanceCertificate,
+		joined: boolean,
+		session?: ActiveSession,
+		scope: ExecutionScope | undefined = session?.scope,
+	): void {
 		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.counters[metric]++;
 		add("hits");
 		if (joined) add("joinedHits");
 		const producer = this.certificateScopes.get(certificate.id);
 		add(
-			producer && session?.scope
-				? producer.sessionID === session.scope.sessionID && producer.turnID === session.scope.turnID
+			producer && scope
+				? producer.sessionID === scope.sessionID && producer.turnID === scope.turnID
 					? "sameTurnHits"
 					: "crossTurnHits"
 				: "unattributedHits",

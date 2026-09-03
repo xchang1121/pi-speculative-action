@@ -127,15 +127,23 @@ async function conversionAblation() {
 		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
 		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
 #include <fcntl.h>
+#include <sys/random.h>
 #include <sys/prctl.h>
+#include <time.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
 	if (argc > 2) {
-		char result[] = "nnp:?\n";
-		int value = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-		if (value < 0 || value > 9) return 68;
-		result[4] = (char)('0' + value);
-		return write(1, result, sizeof(result) - 1) == sizeof(result) - 1 ? 0 : 69;
+		if (*argv[2] == 'v') {
+			struct timespec now;
+			unsigned char random;
+			if (clock_gettime(CLOCK_REALTIME, &now) < 0 || getrandom(&random, 1, 0) != 1 || getpid() <= 0) return 64;
+		} else {
+			char result[] = "nnp:?\n";
+			int value = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+			if (value < 0 || value > 9) return 68;
+			result[4] = (char)('0' + value);
+			return write(1, result, sizeof(result) - 1) == sizeof(result) - 1 ? 0 : 69;
+		}
 	}
   char value[32] = {0};
   const char *output_path = argc > 1 ? argv[1] : "result.txt";
@@ -221,7 +229,8 @@ int main(int argc, char **argv) {
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const joinBefore = fixture.backend.metrics();
-		const joiningActor = await heldActor(fixture, fixture.backend);
+		let actorTurn = "benchmark";
+		const joiningActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: actorTurn }));
 		const joiningTask = forkReusableBash(fixture, {
 			label: "held-joining-producer",
 			command: ": speculative-join; worker joined.txt",
@@ -253,31 +262,73 @@ int main(int argc, char **argv) {
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
 		assert(joinMetrics.hits === 1 && joinMetrics.joinedHits === 1, `Actor did not join in-flight work: ${JSON.stringify(joinMetrics)}`);
 
-		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'sleep 0.2; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
+		const completedChild = "worker completed.txt volatile";
+		const completedBefore = fixture.backend.metrics();
+		const completedBranch = await forkReusableBash(fixture, {
+			label: "held-completed-producer",
+			command: `: speculative-completed; ${completedChild}`,
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		try {
+			assert(!completedBranch.output.isError, `completed producer failed: ${textOutput(completedBranch.output.result)}`);
+			const completedProduced = metricDelta(completedBefore, fixture.backend.metrics());
+			assert(completedProduced.tainted === 1 && completedProduced.published === 0, "completed child did not remain ephemeral");
+			const completedActor = await joiningActor.execute(
+				"held-completed",
+				{ command: `printf 'actor-completed\n'; ${completedChild}` },
+				new AbortController().signal,
+			);
+			const completedMetrics = metricDelta(completedBefore, fixture.backend.metrics());
+			assert(textOutput(completedActor).includes("actor-completed\nworker:v2"), "completed child transfer changed Actor output");
+			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:v2\n", "completed child transfer changed its effect");
+			assert(completedMetrics.hits === 1 && completedMetrics.joinedHits === 0 && completedMetrics.sameTurnHits === 1,
+				`Actor did not claim completed same-turn work: ${JSON.stringify(completedMetrics)}`);
+		} finally {
+			await completedBranch.dispose();
+		}
+		const lateChild = "worker late.txt volatile";
+		const lateBranch = await forkReusableBash(fixture, {
+			label: "held-late-producer",
+			command: `: speculative-late; ${lateChild}`,
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		actorTurn = "later";
+		const lateBefore = fixture.backend.metrics();
+		try {
+			assert(!lateBranch.output.isError, `late producer failed: ${textOutput(lateBranch.output.result)}`);
+			const lateActor = await joiningActor.execute("held-late", { command: lateChild }, new AbortController().signal);
+			const lateMetrics = metricDelta(lateBefore, fixture.backend.metrics());
+			assert(textOutput(lateActor).includes("worker:v2") && lateMetrics.hits === 0 && lateMetrics.misses >= 1,
+				`completed work crossed its turn boundary: ${JSON.stringify(lateMetrics)}`);
+		} finally {
+			actorTurn = "benchmark";
+			await lateBranch.dispose();
+		}
+
+		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'date +%s >/dev/null; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
 		const descriptorProducerBefore = fixture.backend.metrics();
-		const descriptorTask = forkReusableBash(fixture, {
+		const descriptorBranch = await forkReusableBash(fixture, {
 			label: "held-descriptor-producer",
 			command: descriptorCommand,
 			actionNamespace: "pi-held-exec-production.v1",
 			executionFingerprint,
 		});
-		let descriptorBranch: Awaited<typeof descriptorTask> | undefined;
-		let descriptorActor: Awaited<ReturnType<typeof fixture.tool.execute>> | undefined;
 		try {
-			await waitUntil(() => fixture.backend.metrics().wholeCommandMisses > descriptorProducerBefore.wholeCommandMisses);
-			[descriptorBranch, descriptorActor] = await Promise.all([
-				descriptorTask,
-				fixture.tool.execute("held-descriptor-actor", { command: descriptorCommand }, new AbortController().signal),
-			]);
 			assert(!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok", "native descriptor bypass changed output");
+			assert((await descriptorBranch.validate?.())?.status === "valid", "completed descriptor branch was not transferable");
+			const produced = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
+			assert(produced.wholeCommandPublished === 0, "descriptor command unexpectedly entered persistent history");
+			const descriptorBefore = fixture.backend.metrics();
+			const descriptorActor = await fixture.tool.execute("held-descriptor-actor", { command: descriptorCommand }, new AbortController().signal);
+			const descriptorMetrics = metricDelta(descriptorBefore, fixture.backend.metrics());
+			assert(textOutput(descriptorActor) === "descriptor-ok", "completed descriptor transfer changed output");
+			assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "completed descriptor transfer changed its effect");
+			assert(descriptorMetrics.wholeCommandHits === 1, `completed descriptor command was not transferred: ${JSON.stringify(descriptorMetrics)}`);
 		} finally {
-			descriptorBranch ??= await descriptorTask.catch(() => undefined);
-			await descriptorBranch?.dispose();
+			await descriptorBranch.dispose();
 		}
-		const descriptorMetrics = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
-		assert(textOutput(descriptorActor!) === "descriptor-ok", "descriptor whole-command transfer changed output");
-		assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "descriptor whole-command replay changed its effect");
-		assert(descriptorMetrics.wholeCommandHits === 1, `descriptor-preserving command was not transferred: ${JSON.stringify(descriptorMetrics)}`);
 		return {
 			directMs: direct.totalMs,
 			completed: {
@@ -287,7 +338,8 @@ int main(int argc, char **argv) {
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace", "unshare"],
 			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
-			inheritedDescriptor: { wholeCommandHits: descriptorMetrics.wholeCommandHits },
+			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnRejected: true },
+			inheritedDescriptor: { completedHandoffHits: 1 },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
 			confinementMismatch: {
 				producer: "nnp:1",
@@ -302,11 +354,16 @@ int main(int argc, char **argv) {
 	}
 }
 
-async function heldActor(fixture: LinuxProcessBenchmark, backend: LinuxProcessReuseBackend) {
+async function heldActor(
+	fixture: LinuxProcessBenchmark,
+	backend: LinuxProcessReuseBackend,
+	scope = () => ({ sessionID: "benchmark", turnID: "benchmark" }),
+) {
 	const route = await backend.heldExecActorReplay({
 		sourceRoot: fixture.workspace,
 		realShell: fixture.shellPath,
 		enabled: () => true,
+		scope,
 	});
 	const operations = createLocalBashOperations({ shellPath: route.shellPath });
 	const coordinator = new ProcessExecutionCoordinator(route.executor(adaptProcessToolOperations(operations)));
