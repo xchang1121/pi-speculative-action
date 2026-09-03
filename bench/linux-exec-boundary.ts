@@ -1,17 +1,26 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { argument, compileBenchmarkHelper, linuxBenchmarkHost, writeBenchmarkReport } from "./linux-process-harness.ts";
+import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import {
+	argument,
+	assert,
+	commitBenchmarkFixture,
+	compileBenchmarkHelper,
+	createLinuxProcessBenchmark,
+	executeDirectBash,
+	forkReusableBash,
+	linuxBenchmarkHost,
+	metricDelta,
+	prepareLinuxProcessReuse,
+	textOutput,
+	writeBenchmarkReport,
+} from "./linux-process-harness.ts";
 
 interface Outcome { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly stdout: Buffer; readonly stderr: Buffer; readonly durationMs: number }
-interface HeldOutcome extends Outcome { readonly execEvents: number; readonly replayedExecs: number }
-type HeldDecision =
-	| { readonly kind: "continue" }
-	| { readonly kind: "replay"; readonly code: number; readonly stdout: Buffer; readonly stderr: Buffer; readonly commit: () => Promise<void> };
 type Command = readonly [string, ...string[]];
 
 if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
@@ -56,7 +65,11 @@ try {
 	const ptraceTracer = await run([tracer, "/bin/bash", "-c", "grep '^TracerPid:' /proc/self/status"]);
 	if (!nativeTracer.stdout.toString().endsWith("\t0\n") || ptraceTracer.stdout.toString().endsWith("\t0\n"))
 		throw new Error("ptrace observability probe failed");
-	const childConversion = process.arch === "x64" ? await conversionAblation(root, tracer) : undefined;
+	const jobControl = await run([tracer, "/bin/bash", "-c", "(sleep 0.05; kill -CONT $$) & kill -STOP $$; printf resumed"]);
+	if (jobControl.code !== 0 || jobControl.stdout.toString() !== "resumed") throw new Error("ptrace changed job-control stops");
+	const detached = await run([tracer, "/bin/bash", "-c", "sleep 1 >/dev/null 2>&1 &"]);
+	if (detached.code !== 0 || detached.durationMs > 500) throw new Error("ptrace waited for a detached shell child");
+	const childConversion = process.arch === "x64" ? await conversionAblation() : undefined;
 	await writeBenchmarkReport({
 		schemaVersion: 1,
 		measuredAt: new Date().toISOString(),
@@ -65,7 +78,12 @@ try {
 		measurements,
 		heldExecSubstitution: substitution ? { exitCode: substitution.code, durationMs: substitution.durationMs } : { unsupportedArchitecture: process.arch },
 		childConversion: childConversion ?? { unsupportedArchitecture: process.arch },
-		semanticDifference: { direct: nativeTracer.stdout.toString().trim(), ptrace: ptraceTracer.stdout.toString().trim() },
+		semanticDifference: {
+			direct: nativeTracer.stdout.toString().trim(),
+			ptrace: ptraceTracer.stdout.toString().trim(),
+			jobControlPreserved: true,
+			detachedChildReturnMs: detached.durationMs,
+		},
 	}, output);
 } finally {
 	await rm(root, { recursive: true, force: true });
@@ -95,144 +113,134 @@ function assertSame(expected: Outcome, actual: Outcome): void {
 		throw new Error("pass-through tracer changed the command result");
 }
 
-async function conversionAblation(root: string, tracer: string) {
-	const worker = "#!/bin/bash\nset -e\nvalue=$(cat input.txt)\n/bin/sleep 0.3\nprintf 'artifact:%s\\n' \"$value\" > result.txt\nprintf 'worker:%s\\n' \"$value\"\n";
-	const workspace = async (name: string, value = "v1") => {
-		const cwd = path.join(root, name);
-		await mkdir(cwd);
-		await Promise.all([
-			writeFile(path.join(cwd, "input.txt"), `${value}\n`),
-			writeFile(path.join(cwd, "worker.sh"), worker, { mode: 0o755 }),
-		]);
-		return cwd;
-	};
-	const certificate = async (cwd: string) => {
-		const outcome = await run(["./worker.sh"], cwd);
-		if (outcome.code !== 0 || outcome.signal) throw new Error("speculative child failed");
-		return {
-			input: digest(await readFile(path.join(cwd, "input.txt"))),
-			worker: digest(await readFile(path.join(cwd, "worker.sh"))),
-			result: await readFile(path.join(cwd, "result.txt")),
-			outcome,
-		};
-	};
-	const valid = async (cwd: string, cached: Awaited<ReturnType<typeof certificate>>) =>
-		digest(await readFile(path.join(cwd, "input.txt"))) === cached.input &&
-		digest(await readFile(path.join(cwd, "worker.sh"))) === cached.worker;
-	const replay = (cwd: string, cached: Awaited<ReturnType<typeof certificate>>): HeldDecision => ({
-		kind: "replay",
-		code: cached.outcome.code ?? 125,
-		stdout: cached.outcome.stdout,
-		stderr: cached.outcome.stderr,
-		commit: () => atomicWrite(path.join(cwd, "result.txt"), cached.result),
-	});
-	const actorCommand: Command = ["/bin/bash", "-c", ": actor-parent; ./worker.sh; cat result.txt"];
-	const expectedCwd = await workspace("expected");
-	const expected = await run(actorCommand, expectedCwd);
-	const expectedResult = await readFile(path.join(expectedCwd, "result.txt"));
-
-	const completedCertificate = await certificate(await workspace("completed-speculation"));
-	const completedCwd = await workspace("completed-actor");
-	const completed = await runHeld(tracer, actorCommand, completedCwd, async (event) =>
-		event === 1 && await valid(completedCwd, completedCertificate)
-			? replay(completedCwd, completedCertificate)
-			: { kind: "continue" },
-	);
-	await assertConversion(expected, expectedResult, completed, completedCwd, 1);
-
-	const joiningSpeculation = certificate(await workspace("joining-speculation"));
-	await new Promise((resolve) => setTimeout(resolve, 100));
-	const joiningCwd = await workspace("joining-actor");
-	let waitedMs = 0;
-	const joining = await runHeld(tracer, actorCommand, joiningCwd, async (event) => {
-		if (event !== 1) return { kind: "continue" };
-		const started = performance.now();
-		const cached = await joiningSpeculation;
-		waitedMs = performance.now() - started;
-		return await valid(joiningCwd, cached) ? replay(joiningCwd, cached) : { kind: "continue" };
-	});
-	await assertConversion(expected, expectedResult, joining, joiningCwd, 1);
-
-	const staleExpectedCwd = await workspace("stale-expected", "v2");
-	const staleExpected = await run(actorCommand, staleExpectedCwd);
-	const staleResult = await readFile(path.join(staleExpectedCwd, "result.txt"));
-	const staleCwd = await workspace("stale-actor", "v2");
-	const stale = await runHeld(tracer, actorCommand, staleCwd, async (event) =>
-		event === 1 && await valid(staleCwd, completedCertificate)
-			? replay(staleCwd, completedCertificate)
-			: { kind: "continue" },
-	);
-	await assertConversion(staleExpected, staleResult, stale, staleCwd, 0);
-	return {
-		directMs: expected.durationMs,
-		completed: { durationMs: completed.durationMs, execEvents: completed.execEvents, replayedExecs: completed.replayedExecs },
-		joining: { actorDurationMs: joining.durationMs, waitedMs, speculationLeadMs: 100, execEvents: joining.execEvents, replayedExecs: joining.replayedExecs },
-		changedInputMiss: { durationMs: stale.durationMs, execEvents: stale.execEvents, replayedExecs: stale.replayedExecs },
-	};
-}
-
-async function assertConversion(expected: Outcome, expectedResult: Buffer, actual: HeldOutcome, cwd: string, hits: number) {
-	assertSame(expected, actual);
-	if (!expectedResult.equals(await readFile(path.join(cwd, "result.txt"))) || actual.replayedExecs !== hits)
-		throw new Error("held child conversion changed the final workspace or reuse decision");
-}
-
-async function atomicWrite(target: string, content: Buffer): Promise<void> {
-	const temporary = `${target}.replay-${process.pid}`;
+async function conversionAblation() {
+	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
 	try {
-		await writeFile(temporary, content);
-		await rename(temporary, target);
+		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
+		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char value[32] = {0};
+  const char *output_path = argc > 1 ? argv[1] : "result.txt";
+  int input = open("input.txt", O_RDONLY);
+  ssize_t length;
+  if (input < 0 || (length = read(input, value, sizeof(value))) <= 0) return 65;
+  close(input);
+  volatile unsigned long long digest = 1;
+  for (unsigned long long index = 0; index < 240000000; index++) digest = digest * 1664525 + 1013904223;
+  int output = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (output < 0 || write(output, "artifact:", 9) != 9 || write(output, value, (size_t)length) != length) return 66;
+  close(output);
+  return write(1, "worker:", 7) == 7 && write(1, value, (size_t)length) == length ? 0 : 67;
+}
+`);
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+		await commitBenchmarkFixture(fixture.workspace, "Pi Held Exec Benchmark");
+		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		const actorCommand = "printf 'actor-parent\\n'; worker result.txt";
+		const direct = await executeDirectBash(fixture, { label: "held-direct", command: actorCommand });
+		const expectedOutput = textOutput(direct.output);
+		const expectedResult = await readFile(path.join(fixture.workspace, "result.txt"));
+		await rm(path.join(fixture.workspace, "result.txt"));
+		const branch = await forkReusableBash(fixture, {
+			label: "held-producer",
+			command: ": speculative-parent; worker result.txt",
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		try {
+			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)}`);
+			assert(fixture.backend.metrics().published > 0, `speculative child did not publish a reusable certificate: ${JSON.stringify(fixture.backend.metrics())}`);
+		} finally {
+			await branch.dispose();
+		}
+		const route = await fixture.backend.heldExecActorReplay({
+			sourceRoot: fixture.workspace,
+			realShell: fixture.shellPath,
+			enabled: () => true,
+		});
+		const operations = createLocalBashOperations({ shellPath: route.shellPath });
+		const coordinator = new ProcessExecutionCoordinator(route.executor(adaptProcessToolOperations(operations)));
+		const actor = createBashTool(fixture.workspace, {
+			operations: coordinator.operations,
+			shellPath: fixture.shellPath,
+			exposeSessionEnvironment: false,
+			spawnHook: (context) => ({ ...context, env: { ...fixture.environment } }),
+		});
+		const beforeHit = fixture.backend.metrics();
+		const hitStarted = performance.now();
+		const hit = await actor.execute("held-hit", { command: actorCommand }, new AbortController().signal);
+		const hitMs = performance.now() - hitStarted;
+		const hitMetrics = metricDelta(beforeHit, fixture.backend.metrics());
+		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
+		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
+		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
+
+		await Promise.all([
+			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
+			rm(path.join(fixture.workspace, "result.txt")),
+		]);
+		const beforeMiss = fixture.backend.metrics();
+		const missStarted = performance.now();
+		const miss = await actor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
+		const missMs = performance.now() - missStarted;
+		const missMetrics = metricDelta(beforeMiss, fixture.backend.metrics());
+		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
+		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
+
+		const joinBefore = fixture.backend.metrics();
+		const joiningTask = forkReusableBash(fixture, {
+			label: "held-joining-producer",
+			command: ": speculative-join; worker joined.txt",
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		let joiningBranch: Awaited<typeof joiningTask> | undefined;
+		let joiningOutput: Awaited<ReturnType<typeof actor.execute>> | undefined;
+		let joiningMs = 0;
+		const leadMs = 300;
+		try {
+			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses);
+			await delay(leadMs);
+			const joiningStarted = performance.now();
+			joiningOutput = await actor.execute(
+				"held-joining",
+				{ command: "printf 'actor-join\\n'; worker joined.txt" },
+				new AbortController().signal,
+			);
+			joiningMs = performance.now() - joiningStarted;
+			joiningBranch = await joiningTask;
+			assert(!joiningBranch.output.isError, `joining producer failed: ${textOutput(joiningBranch.output.result)}`);
+		} finally {
+			joiningBranch ??= await joiningTask.catch(() => undefined);
+			await joiningBranch?.dispose();
+		}
+		const joinMetrics = metricDelta(joinBefore, fixture.backend.metrics());
+		assert(textOutput(joiningOutput!).includes("actor-join\nworker:v2"), "joined child changed Actor output");
+		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
+		assert(joinMetrics.hits === 1 && joinMetrics.joinedHits === 1, `Actor did not join in-flight work: ${JSON.stringify(joinMetrics)}`);
+		return {
+			directMs: direct.totalMs,
+			completed: { actorMs: hitMs, hits: hitMetrics.hits, avoidedProcessMs: hitMetrics.avoidedProcessMs },
+			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
+			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
+		};
 	} finally {
-		await rm(temporary, { force: true });
+		await fixture.dispose();
 	}
 }
 
-function digest(content: Buffer): string {
-	return createHash("sha256").update(content).digest("hex");
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = performance.now() + timeoutMs;
+	while (!predicate()) {
+		if (performance.now() >= deadline) throw new Error("timed out waiting for speculative child execution");
+		await delay(5);
+	}
 }
 
-function runHeld(
-	tracer: string,
-	command: Command,
-	cwd: string,
-	decide: (event: number) => HeldDecision | Promise<HeldDecision>,
-): Promise<HeldOutcome> {
-	return new Promise((resolve, reject) => {
-		const started = performance.now();
-		const child = spawn(tracer, ["--broker", ...command], { cwd, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
-		const childStdout = child.stdout!;
-		const childStderr = child.stderr!;
-		const eventStream = child.stdio[3] as Readable;
-		const decisionStream = child.stdio[4] as Writable;
-		const stdout: Buffer[] = [], stderr: Buffer[] = [];
-		let execEvents = 0, replayedExecs = 0, failure: unknown;
-		let decisions = Promise.resolve();
-		childStdout.on("data", (value: Buffer) => stdout.push(Buffer.from(value)));
-		childStderr.on("data", (value: Buffer) => stderr.push(Buffer.from(value)));
-		eventStream.on("data", (value: Buffer) => {
-			for (const marker of value) {
-				if (marker !== 0x45) { failure ??= new Error("invalid held-exec event"); continue; }
-				const event = ++execEvents;
-				decisions = decisions.then(async () => {
-					let decision: HeldDecision = { kind: "continue" };
-					try { decision = await decide(event); } catch (error) { failure ??= error; }
-					if (decision.kind === "replay") {
-						await decision.commit();
-						stdout.push(decision.stdout); stderr.push(decision.stderr); replayedExecs++;
-					}
-					await new Promise<void>((settle, fail) => decisionStream.write(
-						Buffer.from([decision.kind === "replay" ? 0x53 : 0x43, decision.kind === "replay" ? decision.code : 0]),
-						(error?: Error | null) => error ? fail(error) : settle(),
-					));
-				}).catch((error) => { failure ??= error; decisionStream.destroy(); });
-			}
-		});
-		child.once("error", reject);
-		child.once("close", (code, signal) => void decisions.then(() => {
-			if (failure) reject(failure);
-			else resolve({ code, signal, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), durationMs: performance.now() - started, execEvents, replayedExecs });
-		}, reject));
-	});
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function run([executable, ...args]: Command, cwd?: string): Promise<Outcome> {

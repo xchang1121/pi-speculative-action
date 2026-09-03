@@ -131,6 +131,7 @@ function executionContext() {
 		launchKey: JSON.stringify({
 			...semantic,
 			credentials: { ...semantic.credentials, groups: "broker-preserved" },
+			signals: "broker-normalized",
 		}),
 		umask,
 		descriptorTypes: descriptors.map(({ type }) => type),

@@ -54,6 +54,12 @@ import {
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
 import {
+	inspectHeldExecProcess,
+	LinuxHeldExecBoundary,
+	type HeldExecDecision,
+	type HeldExecProcess,
+} from "./linux-held-exec.ts";
+import {
 	emptyWorldReuseMetrics,
 	type ExecutionScope,
 	type ExecutionWorldStorageControl,
@@ -100,6 +106,17 @@ export interface CompletedProcessReplayOptions {
 	readonly sourceRoot: string;
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 	readonly enabled?: () => boolean;
+}
+
+export interface HeldExecActorReplayOptions {
+	readonly sourceRoot: string;
+	readonly realShell: string;
+	readonly enabled: () => boolean;
+}
+
+export interface HeldExecActorReplayRoute {
+	readonly shellPath: string;
+	readonly executor: (host: ProcessExecutor) => ProcessExecutor;
 }
 
 export interface LinuxProcessBackendStatus {
@@ -167,7 +184,7 @@ interface DispatcherRequest {
 
 interface DispatcherExecutionContext {
 	readonly key: string;
-	/** Parent launch contract, excluding groups that the host-side leaf broker deliberately preserves. */
+	/** Parent contract, excluding state that the host-side leaf broker deliberately supplies. */
 	readonly launchKey: string;
 	readonly umask: number;
 	readonly descriptorTypes: readonly ["device" | "other", "pipe" | "socket", "pipe" | "socket"];
@@ -254,6 +271,8 @@ export class LinuxProcessReuseBackend {
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
 	private platformFingerprint?: Promise<Sha256Digest>;
+	private heldExecBoundary?: LinuxHeldExecBoundary;
+	private heldExecOpening?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
 	private readonly inFlight = new Map<Sha256Digest, InFlightProcess>();
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
@@ -302,6 +321,23 @@ export class LinuxProcessReuseBackend {
 
 	metrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.counters });
+	}
+
+	/** Hold real Actor child execs; a miss continues exactly once and requires no Fork dependencies. */
+	async heldExecActorReplay(options: HeldExecActorReplayOptions): Promise<HeldExecActorReplayRoute> {
+		const boundary = await (this.heldExecOpening ??= LinuxHeldExecBoundary.open({
+			storeRoot: this.options.storeRoot,
+			decide: (process) => this.decideHeldExec(process),
+		}));
+		this.heldExecBoundary = boundary;
+		return {
+			shellPath: boundary.shellPath,
+			executor: (host) => boundary.executor(host, {
+				realShell: options.realShell,
+				sourceRoot: path.resolve(options.sourceRoot),
+				enabled: options.enabled,
+			}),
+		};
 	}
 
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
@@ -447,6 +483,7 @@ export class LinuxProcessReuseBackend {
 		const running = [...this.inFlight.values()];
 		for (const work of running) work.finish();
 		await Promise.allSettled(running.map((work) => work.completion));
+		await this.heldExecBoundary?.close();
 		this.certificateScopes.clear();
 	}
 
@@ -832,6 +869,83 @@ export class LinuxProcessReuseBackend {
 		return host.execute(request);
 	}
 
+	private async decideHeldExec(process: HeldExecProcess): Promise<HeldExecDecision> {
+		const requestStarted = performance.now();
+		this.counters.requests++;
+		try {
+			throwIfAborted(process.signal);
+			const sourceRoot = path.resolve(process.sourceRoot);
+			const snapshot = await inspectHeldExecProcess(process.pid);
+			if (!pathContains(sourceRoot, snapshot.cwd)) {
+				this.counters.bypasses++;
+				return { kind: "continue" };
+			}
+			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
+			const prototype = createExecPrototype({
+				executablePath: projection.toLogical(snapshot.executable),
+				executableDigest: sha256Digest(await readFile(`/proc/${process.pid}/exe`)),
+				argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
+				logicalCwd: projection.toLogical(snapshot.cwd),
+				environment: Object.fromEntries(
+					Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)]),
+				),
+				umask: snapshot.context.umask,
+				processContextDigest: sha256Digest(snapshot.context.key),
+				stdin: { type: "closed", eof: true },
+				fileDescriptorTableComplete: true,
+				inheritedFDs: snapshot.context.descriptorTypes.map((type, fd) => ({
+					fd,
+					type,
+					flagsDigest: sha256Digest(`${snapshot.context.key}\0${fd}`),
+					...(fd === 0 ? { eof: true } : {}),
+				})),
+				platformFingerprint: await this.resolvePlatformFingerprint(),
+			});
+			const accepted = (producer: ProcessProducerProof) =>
+				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
+			const acquired = await this.acquireProcessResult(
+				processWeakKey(prototype),
+				(live) => this.plan(prototype, projection, accepted, undefined, live),
+				false,
+				process.signal,
+			);
+			const plan = acquired.plan;
+			if (!plan || plan.certificate.result.exit.kind !== "code") {
+				this.counters.misses++;
+				return { kind: "continue" };
+			}
+			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
+			return {
+				kind: "replay",
+				exitCode: plan.certificate.result.exit.code,
+				output,
+				commit: async () => {
+					const started = performance.now();
+					try {
+						throwIfAborted(process.signal);
+						await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+						this.recordHit(plan.certificate, acquired.joined);
+						const observed = plan.certificate.result.observedProcessMs;
+						if (observed !== undefined) {
+							this.counters.timedHits++;
+							this.counters.avoidedProcessMs += observed;
+							this.counters.timedHitOverheadMs += Math.max(0, performance.now() - requestStarted);
+						}
+					} catch (error) {
+						this.counters.lastError = `actor_child_commit:${errorMessage(error)}`;
+						throw error;
+					} finally {
+						this.counters.replayMs += Math.max(0, performance.now() - started);
+					}
+				},
+			};
+		} catch (error) {
+			this.counters.bypasses++;
+			this.counters.lastError = `actor_child:${errorMessage(error)}`;
+			return { kind: "continue" };
+		}
+	}
+
 	private async replay(
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
@@ -846,17 +960,7 @@ export class LinuxProcessReuseBackend {
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
 			await replayFilesystemEffects(artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 			session.nestedEvidence.push(certificate.dependencyCertificate);
-			this.add(session, "hits");
-			if (joined) this.add(session, "joinedHits");
-			const producer = this.certificateScopes.get(certificate.id);
-			this.add(
-				session,
-				producer && session.scope
-					? producer.sessionID === session.scope.sessionID && producer.turnID === session.scope.turnID
-						? "sameTurnHits"
-						: "crossTurnHits"
-					: "unattributedHits",
-			);
+			this.recordHit(certificate, joined, session);
 			replayed = true;
 			return { version: 2, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
@@ -991,7 +1095,10 @@ export class LinuxProcessReuseBackend {
 					this.add(session, "published");
 					this.rememberScope(certificate.id, session.scope);
 				}
-				if (taints.size) this.add(session, "tainted");
+				if (taints.size) {
+					this.add(session, "tainted");
+					this.setError(session, `tainted:${[...taints].join(",")}`);
+				}
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
 				this.setError(session, `post_execution_capture:${errorMessage(error)}`);
@@ -1009,6 +1116,20 @@ export class LinuxProcessReuseBackend {
 	private add(session: ActiveSession, metric: CountedReuseMetric, value = 1): void {
 		this.counters[metric] += value;
 		session.metrics[metric] += value;
+	}
+
+	private recordHit(certificate: ProcessProvenanceCertificate, joined: boolean, session?: ActiveSession): void {
+		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.counters[metric]++;
+		add("hits");
+		if (joined) add("joinedHits");
+		const producer = this.certificateScopes.get(certificate.id);
+		add(
+			producer && session?.scope
+				? producer.sessionID === session.scope.sessionID && producer.turnID === session.scope.turnID
+					? "sameTurnHits"
+					: "crossTurnHits"
+				: "unattributedHits",
+		);
 	}
 
 	private setError(session: ActiveSession, detail: string): void {
@@ -1920,10 +2041,12 @@ async function eligibleRequest(
 function routedExecutionContext(context: DispatcherExecutionContext, route: OutputRoute): DispatcherExecutionContext {
 	const semantic = JSON.parse(context.key) as {
 		credentials: Record<string, unknown>;
+		signals: { blocked: string; ignored: string };
 		descriptors: Record<string, unknown>[];
 		[key: string]: unknown;
 	};
-	if (!semantic.credentials || !Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) {
+	if (!semantic.credentials || !validSignalState(semantic.signals) ||
+		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) {
 		throw new Error("invalid probed execution context");
 	}
 	const descriptors = [
@@ -1931,13 +2054,19 @@ function routedExecutionContext(context: DispatcherExecutionContext, route: Outp
 		{ ...semantic.descriptors[route[0]]!, fd: 1, alias: 1 },
 		{ ...semantic.descriptors[route[1]]!, fd: 2, alias: route[0] === route[1] ? 1 : 2 },
 	];
-	const routed = { ...semantic, descriptors };
+	// libuv resets the signal mask and dispositions for every spawned target.
+	const signals = {
+		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
+		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
+	};
+	const routed = { ...semantic, signals, descriptors };
 	return {
 		...context,
 		key: JSON.stringify(routed),
 		launchKey: JSON.stringify({
 			...routed,
 			credentials: { ...semantic.credentials, groups: "broker-preserved" },
+			signals: "broker-normalized",
 		}),
 		descriptorTypes: [
 			context.descriptorTypes[0],
@@ -1945,6 +2074,13 @@ function routedExecutionContext(context: DispatcherExecutionContext, route: Outp
 			context.descriptorTypes[route[1]],
 		],
 	};
+}
+
+function validSignalState(value: unknown): value is { blocked: string; ignored: string } {
+	if (!value || typeof value !== "object") return false;
+	const signals = value as { blocked?: unknown; ignored?: unknown };
+	return typeof signals.blocked === "string" && /^[0-9a-f]+$/i.test(signals.blocked) &&
+		typeof signals.ignored === "string" && /^[0-9a-f]+$/i.test(signals.ignored);
 }
 
 function validDispatcherContext(value: unknown): value is DispatcherExecutionContext {

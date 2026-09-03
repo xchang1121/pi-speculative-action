@@ -18,6 +18,7 @@ import {
 	type ExtensionFactory,
 	type ExtensionUIContext,
 	getAgentDir,
+	getShellConfig,
 	type ModelRegistry,
 	SettingsManager,
 	type SourceInfo,
@@ -411,14 +412,23 @@ async function installController(
 		loadPiToolSettings(context),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
-	const localProcessOperations = createLocalBashOperations({
-		...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
-	});
 	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.();
 	const processBackend = configuredExecutionWorlds
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
-	const directProcessExecutor = adaptProcessToolOperations(localProcessOperations);
+	const shell = getShellConfig(piToolSettings.shellPath);
+	const heldExec = processBackend && shell.commandTransport !== "stdin"
+		? await recoverSpeculation(() => processBackend.heldExecActorReplay({
+			sourceRoot: context.cwd,
+			realShell: shell.shell,
+			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
+		}))
+		: undefined;
+	const localProcessOperations = createLocalBashOperations({
+		shellPath: heldExec?.shellPath ?? shell.shell,
+	});
+	const rawProcessExecutor = adaptProcessToolOperations(localProcessOperations);
+	const directProcessExecutor = heldExec?.executor(rawProcessExecutor) ?? rawProcessExecutor;
 	const processCoordinator = new ProcessExecutionCoordinator(
 		processBackend?.completedReplayExecutor(directProcessExecutor, {
 			sourceRoot: context.cwd,
