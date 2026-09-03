@@ -22,7 +22,7 @@ try {
 	await writeFile(`${fixture.workspace}/fixture.txt`, "fixture\n");
 	await commitBenchmarkFixture(fixture.workspace, "Pi In-Flight Process Benchmark");
 	const { status, executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-	const command = "printf 'pid:%s\\n' \"$$\"; sleep 2; printf 'complete\\n'";
+	const command = "printf 'pid:%s\\n' \"$$\"; /usr/bin/sleep 4; printf 'complete\\n'";
 	const direct = await executeDirectBash(fixture, { label: "direct", command });
 	const beforeProducer = fixture.backend.metrics();
 	const producerStarted = performance.now();
@@ -31,10 +31,9 @@ try {
 		command,
 		actionNamespace: "pi-process-inflight.v1",
 		executionFingerprint,
-		executionScope: { sessionID: "benchmark", turnID: "speculative" },
 	}).then((branch) => ({ branch, durationMs: performance.now() - producerStarted }));
 	await waitUntil(() => fixture.backend.metrics().wholeCommandMisses > beforeProducer.wholeCommandMisses);
-	const speculationLeadMs = 1_500;
+	const speculationLeadMs = 3_000;
 	await delay(speculationLeadMs);
 	const beforeActor = fixture.backend.metrics();
 	const [production, ...actors] = await Promise.all([
@@ -54,7 +53,8 @@ try {
 		assert(adopted.length === 1 && fallback.length === 1, "running result was not claimed exactly once");
 		assert(actorMetrics.wholeCommandHits === 1 && actorMetrics.wholeCommandMisses === 1, "Actor join/fallback accounting differs");
 		assert(fixture.backend.metrics().wholeCommandPublished === 0, "one-shot PID result leaked into persistent history");
-		assert(adopted[0]!.totalMs < direct.totalMs, "running-result transfer did not shorten Actor latency");
+		assert(adopted[0]!.totalMs < direct.totalMs,
+			`running-result transfer did not shorten Actor latency: ${JSON.stringify({ directMs: direct.totalMs, adoptedMs: adopted[0]!.totalMs })}`);
 		await writeBenchmarkReport({
 			schemaVersion: 1,
 			measuredAt: new Date().toISOString(),

@@ -70,13 +70,13 @@ describe("strace provenance decoder", () => {
 			await Promise.all([
 				fs.writeFile(
 					`${prefix}.300`,
-					'execve("/bin/bash", ["bash"], 0x0) = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 301\n',
+					'execve("/bin/bash", ["bash"], 0x0) = 0\nchdir("/usr/bin") = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 301\n',
 				),
 				fs.writeFile(
 					`${prefix}.301`,
 					[
 						'newfstatat(AT_FDCWD, "/usr/bin/sleep", {st_mode=S_IFREG|0755}, 0) = 0',
-						'execve("/usr/bin/sleep", ["sleep", "1"], 0x0) = 0',
+						'execve("./sleep", ["sleep", "1"], 0x0) = 0',
 						'socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3',
 					].join("\n"),
 				),

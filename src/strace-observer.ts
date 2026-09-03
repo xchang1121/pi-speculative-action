@@ -103,6 +103,7 @@ export async function observeStrace(
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
 	const selected = new Map<number, number>([[root.file.pid, root.start]]);
+	const initialCwds = new Map<number, string | undefined>([[root.file.pid, path.posix.resolve(initialCwd)]]);
 	const queue = [root.file.pid];
 	let complete = true;
 	const incompleteReasons = new Set<string>();
@@ -114,7 +115,9 @@ export async function observeStrace(
 			incompleteReasons.add(`trace_file_missing:${pid}`);
 			continue;
 		}
+		let cwd = initialCwds.get(pid);
 		for (const line of file.lines.slice(selected.get(pid) ?? 0)) {
+			cwd = tracedCwd(line, cwd);
 			const child = spawnedPID(line);
 			if (!child || selected.has(child)) continue;
 			const childFile = byPID.get(child);
@@ -124,6 +127,7 @@ export async function observeStrace(
 				continue;
 			}
 			selected.set(child, 0);
+			initialCwds.set(child, cwd);
 			queue.push(child);
 		}
 	}
@@ -137,7 +141,7 @@ export async function observeStrace(
 		]),
 	);
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const ignoredSegments = ignoredProcessSegments(selected, byPID, interposedExecutables);
+	const ignoredSegments = ignoredProcessSegments(selected, byPID, interposedExecutables, initialCwds);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, digest: Sha256Digest) => {
 		const identity = `metadata:${followSymlinks}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
@@ -407,6 +411,7 @@ function ignoredProcessSegments(
 	selected: ReadonlyMap<number, number>,
 	byPID: ReadonlyMap<number, TraceFile>,
 	interposedExecutables: ReadonlyMap<string, string>,
+	initialCwds: ReadonlyMap<number, string | undefined>,
 ): Map<number, Array<readonly [number, number]>> {
 	const ignored = new Map<number, Array<readonly [number, number]>>();
 	if (!interposedExecutables.size) return ignored;
@@ -415,15 +420,24 @@ function ignoredProcessSegments(
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
 		if (!file) continue;
+		let cwd = initialCwds.get(pid);
 		for (let index = start; index < file.lines.length; index++) {
 			const line = file.lines[index]!;
+			cwd = tracedCwd(line, cwd);
 			if (!successfulExec(line)) continue;
 			const executable = quotedStrings(line)[0];
-			const original = executable && interposedExecutables.get(path.posix.resolve(executable));
+			const original = executable && interposedExecutables.get(tracedPath(executable, cwd) ?? "");
 			if (!original) continue;
-			const resumed = file.lines.findIndex((candidate, candidateIndex) => candidateIndex > index && successfulExec(candidate));
-			const resumedExecutable = resumed < 0 ? undefined : quotedStrings(file.lines[resumed]!)[0];
-			if (resumedExecutable && path.posix.resolve(resumedExecutable) === original) {
+			let resumed = -1, resumedExecutable: string | undefined, resumedCwd = cwd;
+			for (let candidateIndex = index + 1; candidateIndex < file.lines.length; candidateIndex++) {
+				const candidate = file.lines[candidateIndex]!;
+				resumedCwd = tracedCwd(candidate, resumedCwd);
+				if (!successfulExec(candidate)) continue;
+				resumed = candidateIndex;
+				resumedExecutable = quotedStrings(candidate)[0];
+				break;
+			}
+			if (resumedExecutable && tracedPath(resumedExecutable, resumedCwd) === original) {
 				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumed]);
 				index = resumed - 1;
 				continue;
@@ -447,6 +461,19 @@ function ignoredProcessSegments(
 		}
 	}
 	return ignored;
+}
+
+function tracedCwd(line: string, cwd: string | undefined): string | undefined {
+	if (!syscallSucceeded(line)) return cwd;
+	const syscall = syscallName(line);
+	if (syscall === "fchdir") return undefined;
+	if (syscall !== "chdir") return cwd;
+	const target = quotedStrings(line)[0];
+	return target ? tracedPath(target, cwd) : undefined;
+}
+
+function tracedPath(target: string, cwd: string | undefined): string | undefined {
+	return path.posix.isAbsolute(target) ? path.posix.resolve(target) : cwd ? path.posix.resolve(cwd, target) : undefined;
 }
 
 function successfulExec(line: string): boolean {
