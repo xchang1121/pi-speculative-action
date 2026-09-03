@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Removed the unused `ActionReuseKind`, `actionKeyProjects`, and `artifact_seed` planner surfaces;
+  process reuse now has one completed-replay path and otherwise executes the Actor action.
 - Removed provider-side self-fork controls from Drafter-model requests. Self-speculation now decorates and forks only the authoritative Actor stream.
 - Split materialized prediction identity into exact `predictedAction` and lossless covering `executionAction`; target-decoder candidates no longer inherit execution-projection identity.
 - Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
@@ -108,6 +110,10 @@
 
 ### Changed
 
+- Resource snapshots are now observation-only authority; speculative execution requires a provider
+  with an actual isolation guarantee. Bash whole-command and child reuse share the process coordinator.
+- Bash telemetry now separates eliminated process work from calibrated Actor critical-path savings;
+  uncalibrated hits report unavailable timing instead of manufacturing a speedup.
 - Reorganized the Pi TUI around direct source and tool choices. Sampling, learned-pattern internals, Actor-fork protocol details, benefit gates, scheduling, and storage now live under Advanced settings with mode-dependent fields hidden.
 - A five-point WSL2 stock Pi Bash sweep now retains both sides of the measured adoption crossover.
   Zero-, 40-, and 43-round in-flight candidates fall back, while 48- and 96-round candidates join;
@@ -156,6 +162,12 @@
 
 ### Fixed
 
+- File evidence now captures stable descriptor identities, follows and seals symlink chains, rejects
+  special files, and treats watchers only as early invalidation hints.
+- Strace evidence now reconstructs unfinished/resumed syscalls, selects the root from process
+  topology, and waits for stdio closure before sealing a certificate.
+- Indeterminate or partially rolled-back commits now poison the effect transaction and prevent a
+  second Actor execution; only proven-clean failures may fall back.
 - Authoritative observation fallbacks no longer invalidate overlapping reusable results; only actions whose semantics may mutate workspace resources advance cache invalidation.
 - Target-decoder candidate bundles are now routed by the Plan Runtime's absolute expected Actor decision sequence, so output-informed and multi-step predictions cannot be submitted to an already-finished request; same-decision retries retain the bundle and stale decisions are dropped.
 - Self-speculation cleanup now waits for in-flight candidate and sidecar-fork submissions, fences the package-level disabled state, and keeps Drafter request identities isolated from the Actor request.
