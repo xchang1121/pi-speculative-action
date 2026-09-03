@@ -419,12 +419,12 @@ async function installController(
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
+	const bashReuseEnabled = () => currentSettings.enabled && currentSettings.tools.includes("bash");
 	let actorBashReuse: string | undefined;
 	const heldExec = processBackend && shell.commandTransport !== "stdin"
 		? await processBackend.heldExecActorReplay({
 				sourceRoot: context.cwd,
 				realShell: shell.shell,
-				enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
 				scope: executionScope,
 			}).then((route) => {
 				actorBashReuse = "ready — previous matching Bash calls and completed/running child commands";
@@ -437,15 +437,13 @@ async function installController(
 	if (processBackend && !actorBashReuse) actorBashReuse = process.platform === "linux"
 		? "partial — previous matching Bash calls only; this shell cannot hold child commands"
 		: "unavailable — Linux or WSL 2 required";
-	const localProcessOperations = createLocalBashOperations({
-		shellPath: heldExec?.shellPath ?? shell.shell,
-	});
-	const rawProcessExecutor = adaptProcessToolOperations(localProcessOperations);
-	const directProcessExecutor = heldExec?.executor(rawProcessExecutor) ?? rawProcessExecutor;
-	const processCoordinator = new ProcessExecutionCoordinator(
-		processBackend?.completedReplayExecutor(directProcessExecutor, {
+	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
+	const heldProcessExecutor = heldExec?.executor(
+		adaptProcessToolOperations(createLocalBashOperations({ shellPath: heldExec.shellPath })),
+		rawProcessExecutor,
+	) ?? rawProcessExecutor;
+	const actorProcessExecutor = processBackend?.completedReplayExecutor(heldProcessExecutor, {
 			sourceRoot: context.cwd,
-			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
 			invocation: (request) =>
 				resolvePiToolInvocation("bash", { command: request.command, ...(request.timeout !== undefined ? { timeout: request.timeout } : {}) }, {
 					cwd: request.cwd,
@@ -454,7 +452,10 @@ async function installController(
 					),
 					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 				})?.process,
-		}) ?? directProcessExecutor,
+		}) ?? heldProcessExecutor;
+	const processCoordinator = new ProcessExecutionCoordinator(
+		rawProcessExecutor,
+		processBackend ? { enabled: bashReuseEnabled, executor: actorProcessExecutor } : undefined,
 	);
 	let workspaceSandbox: WorkspaceSandboxService | undefined;
 	if (!configuredExecutionWorlds) {

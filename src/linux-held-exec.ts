@@ -18,6 +18,7 @@ const PRIVATE_ENV = {
 	token: "PI_SPEC_HELD_EXEC_TOKEN",
 	execution: "PI_SPEC_HELD_EXEC_ID",
 } as const;
+const PRIVATE_ENV_NAMES: readonly string[] = Object.values(PRIVATE_ENV);
 
 export interface HeldExecProcess {
 	readonly pid: number;
@@ -107,30 +108,33 @@ export class LinuxHeldExecBoundary {
 
 	executor(
 		host: ProcessExecutor,
-		options: Omit<ActiveExecution, "observations"> & { readonly realShell: string; readonly enabled: () => boolean },
+		options: Omit<ActiveExecution, "observations"> & { readonly realShell: string },
+		fallback: ProcessExecutor = host,
 	): ProcessExecutor {
 		return {
 			execute: async (request) => {
+				// The transport never owns caller-provided environment entries. A collision
+				// therefore disables handoff for this launch and preserves stock Bash semantics.
+				if (request.signal?.aborted || PRIVATE_ENV_NAMES.some((name) => Object.hasOwn(request.environment, name))) {
+					return fallback.execute(request);
+				}
 				const execution = randomBytes(24).toString("hex");
-				const enabled = options.enabled() && !request.signal?.aborted;
 				const active = {
 					sourceRoot: options.sourceRoot,
 					decide: options.decide,
 					observations: new Set<Promise<void>>(),
 					...(request.signal ? { signal: request.signal } : {}),
 				};
-				if (enabled) this.active.set(execution, active);
+				this.active.set(execution, active);
 				try {
 					return await host.execute({
 						...request,
 						environment: {
 							...request.environment,
 							[PRIVATE_ENV.shell]: options.realShell,
-							...(enabled ? {
-								[PRIVATE_ENV.socket]: this.socketPath,
-								[PRIVATE_ENV.token]: this.token,
-								[PRIVATE_ENV.execution]: execution,
-							} : {}),
+							[PRIVATE_ENV.socket]: this.socketPath,
+							[PRIVATE_ENV.token]: this.token,
+							[PRIVATE_ENV.execution]: execution,
 						},
 					});
 				} finally {

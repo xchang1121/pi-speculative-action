@@ -465,7 +465,6 @@ async function heldActor(
 	const route = await backend.heldExecActorReplay({
 		sourceRoot: fixture.workspace,
 		realShell: fixture.shellPath,
-		enabled: () => true,
 		scope,
 	});
 	const operations = createLocalBashOperations({ shellPath: route.shellPath });

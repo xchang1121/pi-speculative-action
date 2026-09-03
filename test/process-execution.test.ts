@@ -33,4 +33,29 @@ describe("ProcessExecutionCoordinator", () => {
 
 		expect(calls).toEqual(["host:outside-before", "isolated:inside", "host:outside-after"]);
 	});
+
+	test("keeps the raw Actor outlet when reuse is disabled", async () => {
+		const calls: string[] = [];
+		let enabled = false;
+		const executor = (label: string) => ({
+			execute: async () => {
+				calls.push(label);
+				return { exitCode: 0 };
+			},
+		});
+		const coordinator = new ProcessExecutionCoordinator(executor("raw"), {
+			enabled: () => enabled,
+			executor: executor("reuse"),
+		});
+		const invoke = () => coordinator.operations.exec("true", "/work", { onData: () => undefined });
+
+		await invoke();
+		enabled = true;
+		await invoke();
+		await coordinator.runWith(executor("world"), invoke);
+		enabled = false;
+		await invoke();
+
+		expect(calls).toEqual(["raw", "reuse", "world", "raw"]);
+	});
 });

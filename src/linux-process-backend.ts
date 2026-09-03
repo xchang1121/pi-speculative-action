@@ -111,19 +111,17 @@ export interface LinuxProcessBackendOptions {
 export interface CompletedProcessReplayOptions {
 	readonly sourceRoot: string;
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
-	readonly enabled?: () => boolean;
 }
 
 export interface HeldExecActorReplayOptions {
 	readonly sourceRoot: string;
 	readonly realShell: string;
-	readonly enabled: () => boolean;
 	readonly scope?: () => ExecutionScope | undefined;
 }
 
 export interface HeldExecActorReplayRoute {
 	readonly shellPath: string;
-	readonly executor: (host: ProcessExecutor) => ProcessExecutor;
+	readonly executor: (host: ProcessExecutor, fallback?: ProcessExecutor) => ProcessExecutor;
 }
 
 export interface LinuxProcessBackendStatus {
@@ -352,12 +350,11 @@ export class LinuxProcessReuseBackend {
 		this.heldExecBoundary = boundary;
 		return {
 			shellPath: boundary.shellPath,
-			executor: (host) => boundary.executor(host, {
+			executor: (host, fallback) => boundary.executor(host, {
 				realShell: options.realShell,
 				sourceRoot: path.resolve(options.sourceRoot),
-				enabled: options.enabled,
 				decide: (process) => this.decideHeldExec(process, options.scope?.()),
-			}),
+			}, fallback),
 		};
 	}
 
@@ -368,7 +365,7 @@ export class LinuxProcessReuseBackend {
 			actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
-				if (process.platform !== "linux" || options.enabled?.() === false || !pathContains(sourceRoot, request.cwd)) {
+				if (process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) {
 					return host.execute(request);
 				}
 				const requestStarted = performance.now();
@@ -1077,7 +1074,7 @@ export class LinuxProcessReuseBackend {
 			const processStarted = performance.now();
 			outcome = await runSpawn(ready.strace, command.slice(1), {
 				cwd: request.cwd,
-				environment: executionEnvironment(request.environment),
+				environment: request.environment,
 			});
 			observedProcessMs = Math.max(0, performance.now() - processStarted);
 			try {
@@ -1260,7 +1257,7 @@ export class LinuxProcessReuseBackend {
 		const context = routedExecutionContext(ready.executionContext, outputRoute);
 		const contextDigest = sha256Digest(context.key);
 		const environment = Object.fromEntries(
-			Object.entries(executionEnvironment(request.environment)).map(([name, value]) => [
+			Object.entries(request.environment).map(([name, value]) => [
 				name,
 				session.projection.normalizeValue(value),
 			]),
@@ -2230,12 +2227,6 @@ function validDispatcherContext(value: unknown): value is DispatcherExecutionCon
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
 		context.outputEndpoints.every((endpoint) => typeof endpoint === "string" && endpoint.length <= 4096)
 	);
-}
-
-function executionEnvironment(environment: Readonly<Record<string, string>>): Record<string, string> {
-	const result = { ...environment };
-	for (const name of Object.keys(result)) if (name.startsWith("PI_SPEC_")) delete result[name];
-	return result;
 }
 
 function normalizeEnvironment(environment: Readonly<Record<string, string | undefined>>): Record<string, string> {

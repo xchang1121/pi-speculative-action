@@ -17,6 +17,11 @@ export interface ProcessExecutor {
 	readonly execute: (request: ProcessExecutionRequest) => Promise<ProcessExecutionResult>;
 }
 
+export interface ProcessExecutionRoute {
+	readonly enabled: () => boolean;
+	readonly executor: ProcessExecutor;
+}
+
 /** Compatibility name for Pi's public process-backed tool outlet. */
 export type ProcessToolOperations = BashOperations;
 
@@ -29,13 +34,15 @@ export type ProcessToolOperations = BashOperations;
 export class ProcessExecutionCoordinator {
 	private readonly scope = new AsyncLocalStorage<ProcessExecutor>();
 	private readonly host: ProcessExecutor;
+	private readonly actorRoute?: ProcessExecutionRoute;
 	readonly operations: ProcessToolOperations;
 
-	constructor(host: ProcessExecutor) {
+	constructor(host: ProcessExecutor, actorRoute?: ProcessExecutionRoute) {
 		this.host = host;
+		this.actorRoute = actorRoute;
 		this.operations = Object.freeze({
 			exec: (command: string, cwd: string, options: Parameters<ProcessToolOperations["exec"]>[2]) =>
-				(this.scope.getStore() ?? this.host).execute({
+				(this.scope.getStore() ?? (this.actorRoute?.enabled() ? this.actorRoute.executor : this.host)).execute({
 					command,
 					cwd,
 					environment: options.env ?? process.env,

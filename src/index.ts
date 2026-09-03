@@ -131,6 +131,7 @@ export {
 export {
 	adaptProcessToolOperations,
 	ProcessExecutionCoordinator,
+	type ProcessExecutionRoute,
 	type ProcessExecutionRequest,
 	type ProcessExecutionResult,
 	type ProcessExecutor,
