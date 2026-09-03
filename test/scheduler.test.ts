@@ -240,9 +240,17 @@ describe("SpeculationScheduler", () => {
 			}),
 		).toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: 19 });
 
-		scheduler.observeSpeculativeService(first, 900);
+		const cold = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
+		cold.observeSpeculativeService(first, 900);
 		expect(
-			scheduler.evaluate([
+			cold.assessCandidateJoin({
+				identity: second,
+				state: "running",
+				expectedSpeculativeDurationMs: 1,
+			}),
+		).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
+		expect(
+			cold.evaluate([
 				forecast({
 					tool: "bash",
 					executionFingerprint: second.executionFingerprint,

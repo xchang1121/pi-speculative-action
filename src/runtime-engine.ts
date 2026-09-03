@@ -45,6 +45,7 @@ import {
 	type PredictionForecast,
 	type ServiceTimingIdentity,
 	SpeculationScheduler,
+	waitForCandidate,
 } from "./scheduler.ts";
 import type {
 	ActorActionIdentity,
@@ -302,36 +303,6 @@ async function projectOutput<Output, StartInput, StateData>(
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
-}
-
-type CandidateWaitResult<T> =
-	| { readonly status: "completed"; readonly value: T }
-	| { readonly status: "aborted" }
-	| { readonly status: "deadline" };
-
-async function waitForCandidate<T>(
-	promise: Promise<T>,
-	signal?: AbortSignal,
-	waitBudgetMs?: number,
-): Promise<CandidateWaitResult<T>> {
-	if (signal?.aborted) return { status: "aborted" };
-	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
-	if (!signal && !bounded) return { status: "completed", value: await promise };
-	return new Promise((resolve) => {
-		let settled = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const finish = (result: CandidateWaitResult<T>) => {
-			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			signal?.removeEventListener("abort", aborted);
-			resolve(result);
-		};
-		const aborted = () => finish({ status: "aborted" });
-		signal?.addEventListener("abort", aborted, { once: true });
-		if (bounded) timer = setTimeout(() => finish({ status: "deadline" }), Math.max(0, waitBudgetMs!));
-		void promise.then((value) => finish({ status: "completed", value }));
-	});
 }
 
 function registerActorAction<SessionID, Output, StartInput, StateData>(

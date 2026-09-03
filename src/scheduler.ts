@@ -46,6 +46,8 @@ export interface ServiceTimingIdentity {
 export interface CandidateJoinPolicy {
 	/** Required estimated Actor critical-path saving before waiting for unfinished work. */
 	readonly minNetBenefitMs: number;
+	/** Initial Actor wait cap; omission preserves eager adoption while a route learns. */
+	readonly uncalibratedWaitMs?: number;
 	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
 	readonly warmupWaitMs: number;
 	/** Slack applied to a high-quantile remaining-time estimate. */
@@ -81,6 +83,37 @@ export interface CandidateJoinDecision {
 	readonly expectedAdoptionMs: number;
 	readonly expectedActorMs?: number;
 	readonly expectedNetBenefitMs?: number;
+}
+
+export type CandidateWaitResult<T> =
+	| { readonly status: "completed"; readonly value: T }
+	| { readonly status: "aborted" }
+	| { readonly status: "deadline" };
+
+/** One cancellation/deadline boundary shared by every in-flight adoption path. */
+export async function waitForCandidate<T>(
+	promise: Promise<T>,
+	signal?: AbortSignal,
+	waitBudgetMs?: number,
+): Promise<CandidateWaitResult<T>> {
+	if (signal?.aborted) return { status: "aborted" };
+	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
+	if (!signal && !bounded) return { status: "completed", value: await promise };
+	return new Promise((resolve) => {
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (result: CandidateWaitResult<T>) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", aborted);
+			resolve(result);
+		};
+		const aborted = () => finish({ status: "aborted" });
+		signal?.addEventListener("abort", aborted, { once: true });
+		if (bounded) timer = setTimeout(() => finish({ status: "deadline" }), Math.max(0, waitBudgetMs));
+		void promise.then((value) => finish({ status: "completed", value }));
+	});
 }
 
 export type SchedulerAdmission =
@@ -285,11 +318,11 @@ export class SpeculationScheduler<Job extends object> {
 		}
 
 		if (expectedActorMs === undefined) {
+			const waitBudgetMs = policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY;
 			return {
-				allowed: true,
+				allowed: waitBudgetMs > 0,
 				reason: "warmup_probe",
-				// No counterfactual evidence exists yet, so preserve the established join behavior.
-				waitBudgetMs: Number.POSITIVE_INFINITY,
+				waitBudgetMs,
 				...base,
 			};
 		}
@@ -498,6 +531,7 @@ function windowEstimate(
 function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | undefined): CandidateJoinPolicy {
 	return Object.freeze({
 		minNetBenefitMs: finite(policy?.minNetBenefitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.minNetBenefitMs),
+		...(policy?.uncalibratedWaitMs === undefined ? {} : { uncalibratedWaitMs: finite(policy.uncalibratedWaitMs) }),
 		warmupWaitMs: finite(policy?.warmupWaitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.warmupWaitMs),
 		durationSlack: Math.max(1, finite(policy?.durationSlack ?? DEFAULT_CANDIDATE_JOIN_POLICY.durationSlack)),
 	});
