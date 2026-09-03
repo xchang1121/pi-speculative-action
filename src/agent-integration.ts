@@ -3,7 +3,7 @@ import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from 
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
-import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import {
 	clampCandidateLimit,
 	DEFAULTS,
@@ -115,7 +115,7 @@ export interface CreateSpeculativeActionHostOptions {
 	/** Actor probe source shared with the decoder-feedback coordinator. */
 	readonly actorForkPlanSource?: ActorForkPlanSource;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
-	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
+	readonly executionWorlds?: readonly AgentExecutionWorld[];
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
 	/** Stable logical workspace identity when physical checkout paths are ephemeral. */

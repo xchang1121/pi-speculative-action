@@ -44,6 +44,7 @@ export {
 } from "./action-semantics.ts";
 export {
 	createResourceSnapshotExecutionWorld,
+	type AgentExecutionWorld,
 	type SpeculativeAgentExecutionWorld,
 	type SpeculativeToolExecutionContext,
 } from "./agent-execution-world.ts";

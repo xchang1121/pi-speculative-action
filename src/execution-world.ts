@@ -252,7 +252,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	/** Optional persistent storage capability, independent from tool or action syntax. */
 	readonly storage?: ExecutionWorldStorageControl;
 	/** Pre-Actor execution and Actor-authorized observation deliberately have independent authority. */
-	readonly speculation: ExecutionWorldSpeculation<Context, Output>;
+	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
@@ -283,6 +283,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		this.worlds = [...new Set(worlds)];
 		for (const world of this.worlds) {
 			if (!world.id.trim()) throw new Error("execution world id must not be empty");
+			if (!world.speculation && !world.observation) throw new Error(`execution world ${world.id} provides no operation`);
 			if (this.worldsByID.has(world.id)) throw new Error(`duplicate execution world ${world.id}`);
 			this.worldsByID.set(world.id, world);
 		}
@@ -298,6 +299,7 @@ export class ExecutionWorldRouter<Context, Output> {
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
 		const world = this.world(route);
+		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
 		return world.speculation.execute(context);
 	}
 
@@ -327,7 +329,13 @@ export class ExecutionWorldRouter<Context, Output> {
 	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return Promise.all(
 			this.worlds.map(async (world) => {
-				const speculation = await this.diagnose(world.id, "speculation", world.speculation, input);
+				const speculation = world.speculation
+					? await this.diagnose(world.id, "speculation", world.speculation, input)
+					: {
+							capabilities: Object.freeze([]),
+							state: "unavailable" as const,
+							detail: "Speculative execution is not provided",
+						};
 				const observation = world.observation
 					? await this.diagnose(world.id, "observation", world.observation, input)
 					: undefined;

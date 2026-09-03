@@ -386,7 +386,7 @@ describe("zero-modification Pi extension", () => {
 			]),
 		);
 		expect(menus.get("Tools & execution")).toEqual(
-			expect.arrayContaining(["Tool policy › 6/6 active", "Execution routes"]),
+			expect.arrayContaining(["Tool policy › 7/7 active", "Execution routes"]),
 		);
 		expect(menus.get("Tool policy · [x] active · [~] selected · [ ] off")).toEqual(expect.arrayContaining([
 			expect.stringMatching(/^\[~\] bash · unavailable · Linux host required/),
@@ -406,7 +406,7 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(2);
 		expect(JSON.stringify([...menus.values()])).not.toContain("sandbox");
-		expect(await fixture.hostSettings()).toMatchObject({ tools: ["read", "grep", "find", "ls", "write", "edit"] });
+		expect(await fixture.hostSettings()).toMatchObject({ tools: ["read", "grep", "find", "ls", "bash", "write", "edit"] });
 		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
 		expect(footer).toContain("tools reused 0/0 (n/a)");
 		expect(footer).toContain("reuse history 3 entries (2 KiB)");

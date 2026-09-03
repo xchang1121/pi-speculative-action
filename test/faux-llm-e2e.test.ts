@@ -16,7 +16,9 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -959,6 +961,7 @@ async function runAgent(input: RunAgentInput) {
 		draftModel: drafter.getModel(),
 		complete: (model, context, options) => drafter.streamSimple(model, context, options).result(),
 		preflight: () => true,
+		executionWorlds: [fauxRuntimeWorld()],
 		...(input.patternStore ? { patternStore: input.patternStore } : {}),
 		onEvent: (event) => {
 			events.push(event);
@@ -1100,6 +1103,37 @@ async function runAgent(input: RunAgentInput) {
 	} finally {
 		await host.dispose();
 	}
+}
+
+function fauxRuntimeWorld(): SpeculativeAgentExecutionWorld {
+	return {
+		id: "faux_runtime",
+		scope: "runtime",
+		isolation: "runtime_sandbox",
+		speculation: {
+			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+			execute: async (context) => {
+				const output = {
+					result: await context.tool.execute(context.callID, context.args as never, context.signal),
+					isError: false,
+				};
+				return {
+					output,
+					backend: "faux_runtime",
+					resources: [],
+					capturedBytes: 0,
+					executionMetrics: {},
+					compatibility: {
+						status: "compatible",
+						backend: "faux_runtime",
+						executionFingerprint: context.action.executionFingerprint,
+					},
+					commit: async () => output,
+					dispose: () => {},
+				};
+			},
+		},
+	};
 }
 
 function standardMessages(messages: readonly AgentMessage[]): Message[] {

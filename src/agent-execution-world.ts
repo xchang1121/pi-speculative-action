@@ -19,7 +19,7 @@ import {
 } from "./resource-version.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { cause } from "./settlement.ts";
-import { toolErrorSettlement, type ToolSettlement } from "./tool-settlement.ts";
+import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
 export interface SpeculativeToolExecutionContext {
@@ -35,12 +35,15 @@ export interface SpeculativeToolExecutionContext {
 	readonly parentCheckpoint?: WorldCheckpoint;
 }
 
-export type SpeculativeAgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement>;
+export type AgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement>;
+export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & {
+	readonly speculation: NonNullable<AgentExecutionWorld["speculation"]>;
+};
 
-/** Read-only local substitute: execute now, then prove the observed resources are still current. */
+/** Observe Actor-authorized reads and retain their result while the exact resources remain current. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-): SpeculativeAgentExecutionWorld {
+): AgentExecutionWorld {
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version:v1",
@@ -63,22 +66,6 @@ export function createResourceSnapshotExecutionWorld(
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, capture },
-		speculation: {
-			...route,
-			execute: async (context) => {
-				const captured = await capture(context);
-				let output: ToolSettlement;
-				try {
-					output = {
-						result: await context.tool.execute(context.callID, context.args as never, context.signal),
-						isError: false,
-					};
-				} catch (error) {
-					output = toolErrorSettlement(error);
-				}
-				return captured.seal(output);
-			},
-		},
 	};
 }
 

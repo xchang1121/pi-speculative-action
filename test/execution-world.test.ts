@@ -16,7 +16,8 @@ import {
 	sameSpeculativeExecutionRoute,
 } from "../src/execution-world.ts";
 
-type TestWorld = ExecutionWorld<{ readonly value: string }, string>;
+type BaseTestWorld = ExecutionWorld<{ readonly value: string }, string>;
+type TestWorld = BaseTestWorld & { readonly speculation: NonNullable<BaseTestWorld["speculation"]> };
 const preparation = { cwd: "/workspace" };
 
 describe("ExecutionWorldRouter", () => {
@@ -155,6 +156,30 @@ describe("ExecutionWorldRouter", () => {
 		});
 	});
 
+	it("keeps an observation-only world off the speculative route", async () => {
+		const capture = vi.fn(async () => ({
+			seal: async (output: string) => worldBranch("observe", output),
+			dispose: () => {},
+		}));
+		const observationOnly: BaseTestWorld = {
+			id: "observe",
+			scope: "fallback",
+			isolation: "resource_snapshot",
+			observation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, capture },
+		};
+		const router = new ExecutionWorldRouter([observationOnly]);
+		const request = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
+
+		expect(await router.resolve(request, preparation)).toBeUndefined();
+		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" })).toBeDefined();
+		expect(await router.diagnostics(preparation)).toEqual([
+			expect.objectContaining({
+				state: "unavailable",
+				observation: expect.objectContaining({ state: "ready" }),
+			}),
+		]);
+	});
+
 	it.each([
 		["Windows", "Linux host required"],
 		["macOS", "Linux host required"],
@@ -271,17 +296,21 @@ function world(
 		speculation: {
 			capabilities,
 			fingerprint: () => `${id}:v1`,
-			execute: async ({ value }: { readonly value: string }) => ({
-				output: value,
-				backend: id,
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
-				commit: async () => value,
-				dispose: () => {},
-			}),
+			execute: async ({ value }: { readonly value: string }) => worldBranch(id, value),
 		},
 		dispose,
 	} as TestWorld;
+}
+
+function worldBranch(id: string, output: string) {
+	return {
+		output,
+		backend: id,
+		resources: [],
+		capturedBytes: 0,
+		executionMetrics: {},
+		compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
+		commit: async () => output,
+		dispose: () => {},
+	};
 }

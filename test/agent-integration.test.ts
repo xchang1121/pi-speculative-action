@@ -475,7 +475,7 @@ describe("speculative action host", () => {
 		await host.dispose();
 	});
 
-	it("falls through unavailable runtime worlds to the resource fallback", async () => {
+	it("does not execute speculatively when only the observation fallback remains", async () => {
 		const cwd = await temporaryWorkspace();
 		const brokenPrepare = vi.fn();
 		const unavailablePrepare = vi.fn(async () => {
@@ -511,17 +511,15 @@ describe("speculative action host", () => {
 		const { tool, events, host, hostExecutions } = readWorldHost(cwd, [broken, unavailable], "fallback");
 
 		await host.startTurn(startInput(tool));
-		await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
+		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
 		const hit = await host.consume({
 			turnID: "turn-1", id: "actor-read", tool: "read", args: { path: "notes.txt" }, tools: [tool],
 		});
 		expect(brokenPrepare).not.toHaveBeenCalled();
 		expect(unavailablePrepare).toHaveBeenCalledWith(expect.objectContaining({ cwd }));
-		expect(hostExecutions()).toBe(1);
-		expect(hit?.result.content).toEqual([{ type: "text", text: "fallback" }]);
-		expect(events.find((event) => event.type === "candidate")).toMatchObject({
-			candidate: { execution: "resource_snapshot" },
-		});
+		expect(hostExecutions()).toBe(0);
+		expect(hit).toBeUndefined();
+		expect(events.some((event) => event.type === "candidate")).toBe(false);
 		await host.dispose();
 	});
 
@@ -728,6 +726,7 @@ describe("speculative action host", () => {
 					"toolUse",
 				),
 			preflight: () => true,
+			executionWorlds: [toolRuntimeWorld()],
 			onCandidateMaterialized: (candidate) => {
 				materialized.push(candidate);
 			},
@@ -866,6 +865,7 @@ describe("speculative action host", () => {
 			getDraftOptions,
 			complete,
 			preflight: () => true,
+			executionWorlds: [toolRuntimeWorld()],
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -994,6 +994,7 @@ describe("speculative action host", () => {
 			},
 			complete,
 			preflight: () => true,
+			executionWorlds: [toolRuntimeWorld()],
 			onEvent: (event) => {
 				events.push(event);
 			},
@@ -1137,6 +1138,7 @@ describe("speculative action host", () => {
 			actorForkPlanSource: actorForkPlans,
 			complete: async () => assistant([], "stop"),
 			preflight: () => true,
+			executionWorlds: [toolRuntimeWorld()],
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
 			onCandidateMaterialized: (candidate) => {
@@ -1312,6 +1314,7 @@ describe("speculative action host", () => {
 			draftModel: model("draft"),
 			complete,
 			preflight: () => true,
+			executionWorlds: [toolRuntimeWorld()],
 		});
 
 		await host.startTurn(startInput(tool));
@@ -1480,11 +1483,19 @@ function concurrentDrafterHost(
 		draftModel: model("draft"),
 		complete,
 		preflight: () => true,
+		executionWorlds: [toolRuntimeWorld()],
 		onEvent: (event) => {
 			events.push(event);
 		},
 	});
 	return { tool, host };
+}
+
+function toolRuntimeWorld(): SpeculativeAgentExecutionWorld {
+	return mockRuntimeWorld(async (context) => ({
+		result: await context.tool.execute(context.callID, context.args as never, context.signal),
+		isError: false,
+	}));
 }
 
 async function patternRebaseFixture() {

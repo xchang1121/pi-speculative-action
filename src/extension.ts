@@ -32,7 +32,7 @@ import {
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
-import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
+import type { AgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
@@ -251,7 +251,7 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createExecutionWorlds?: () => readonly SpeculativeAgentExecutionWorld[];
+	readonly createExecutionWorlds?: () => readonly AgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
@@ -502,7 +502,7 @@ async function installController(
 	const toolCapabilities = () => resolveToolCapabilities(executionDiagnostics, executionDiagnosticsKnown);
 	const runtimeSettings = () => ({
 		...currentSettings,
-		tools: activeTools(currentSettings, baseDefinitions.keys(), toolCapabilities()),
+		tools: activeTools(currentSettings, baseDefinitions.keys()),
 	});
 	const visibleMetrics = (): SpeculativeActionMetrics =>
 		processBackend ? { ...currentMetrics, processReuse: processBackend.metrics() } : currentMetrics;
@@ -883,7 +883,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	};
 	while (true) {
 		const dirty = !sameSettings(draft, applied);
-		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools(), controller.toolCapabilities());
+		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools());
 		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
 		const choice = await ctx.ui.select("Speculative action", [
 			`Enabled: ${draft.enabled ? "On" : "Off"}`,
@@ -1212,7 +1212,7 @@ async function openToolsAndExecution(
 ): Promise<void> {
 	while (true) {
 		const settings = editor.settings();
-		const policy = toolPolicyCounts(settings, controller.registeredTools(), controller.toolCapabilities());
+		const policy = toolPolicyCounts(settings, controller.registeredTools());
 		const choice = await ctx.ui.select("Tools & execution", [
 			`Tool policy › ${policy.active}/${policy.available} active`,
 			"Execution routes",
@@ -1658,22 +1658,18 @@ function resolveToolCapabilities(
 function activeTools(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: Iterable<string>,
-	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
 ): readonly string[] {
 	const available = new Set(registered);
-	return [...new Set(settings.tools)].filter(
-		(tool) => available.has(tool) && capabilities.get(tool)?.state !== "unavailable",
-	);
+	return [...new Set(settings.tools)].filter((tool) => available.has(tool));
 }
 
 function toolPolicyCounts(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: ReadonlySet<string>,
-	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
 ): { readonly active: number; readonly available: number } {
 	return {
-		active: activeTools(settings, registered, capabilities).length,
-		available: [...registered].filter((tool) => capabilities.get(tool)?.state !== "unavailable").length,
+		active: activeTools(settings, registered).length,
+		available: registered.size,
 	};
 }
 
