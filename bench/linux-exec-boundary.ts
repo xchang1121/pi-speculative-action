@@ -197,7 +197,10 @@ int main(int argc, char **argv) {
 		const hitMetrics = metricDelta(beforeHit, replayBackend.metrics());
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
-		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
+		assert(
+			hitMetrics.hits === 1 && hitMetrics.timedHits === 0 && hitMetrics.avoidedProcessMs === 0,
+			`uncalibrated held child reported invented savings: ${JSON.stringify(hitMetrics)}`,
+		);
 		const joiningActor = await heldActor(fixture, fixture.backend);
 
 		const cwdProducerBefore = fixture.backend.metrics();
@@ -324,7 +327,10 @@ int main(int argc, char **argv) {
 		const joinMetrics = metricDelta(joinBefore, fixture.backend.metrics());
 		assert(textOutput(joiningOutput!).includes("actor-join\nworker:v2"), "joined child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
-		assert(joinMetrics.hits === 1 && joinMetrics.joinedHits === 1, `Actor did not join in-flight work: ${JSON.stringify(joinMetrics)}`);
+		assert(
+			joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 && joinMetrics.timedHits === 1 && joinMetrics.avoidedProcessMs > 0,
+			`Actor did not join measured in-flight work: ${JSON.stringify(joinMetrics)}`,
+		);
 
 		const completedChild = "worker completed.txt volatile";
 		const completedBefore = fixture.backend.metrics();
@@ -421,7 +427,14 @@ int main(int argc, char **argv) {
 				avoidedProcessMs: hitMetrics.avoidedProcessMs,
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
 			},
-			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
+			joining: {
+				actorMs: joiningMs,
+				leadMs,
+				hits: joinMetrics.hits,
+				joinedHits: joinMetrics.joinedHits,
+				estimatedActorMs: joinMetrics.avoidedProcessMs,
+				estimatedSavedMs: joinMetrics.avoidedProcessMs - joinMetrics.timedHitOverheadMs,
+			},
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnCompletedRejected: true, crossTurnRunningRejected: true },
 			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },
 			inheritedDescriptor: { completedHandoffHits: 0, exactMetadataFallback: true },

@@ -769,21 +769,36 @@ export class LinuxProcessReuseBackend {
 		signal?: AbortSignal,
 		scope?: ExecutionScope,
 		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean; readonly waitedMs: number }> {
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let joined = false;
 		let waitedMs = 0;
+		let actorMs: number | undefined;
 		const miss = () => actor ? { joined, waitedMs } : { work: this.claimProcessWork(weakKey, scope), joined, waitedMs };
+		const hit = (plan: CompletedProcessPlan) => ({
+			plan, joined, waitedMs, ...(actorMs === undefined ? {} : { actorMs }),
+		});
+		const admitCompleted = () => {
+			if (!actor || joined) return true;
+			const decision = this.processScheduler.assessCandidateJoin({
+				identity: actor.timing,
+				state: "succeeded",
+				expectedSpeculativeDurationMs: 1,
+			});
+			actorMs = decision.expectedActorMs;
+			return decision.allowed;
+		};
 		while (true) {
 			const completed = await lookup();
-			if (completed) return { plan: completed, joined, waitedMs };
+			if (completed) return admitCompleted() ? hit(completed) : miss();
 			const transfers = this.transfers.get(weakKey) ?? [];
 			for (const transfer of [...transfers].reverse()) {
 				if (transfer.state !== "completed" || !transfer.candidate || !sameScope(transfer.scope, scope)) continue;
 				const plan = await lookup(transfer.candidate);
 				if (plan && transfer.state === "completed") {
+					if (!admitCompleted()) return miss();
 					transfer.state = "claimed";
 					this.removeTransfer(weakKey, transfer);
-					return { plan, joined, waitedMs };
+					return hit(plan);
 				}
 			}
 			const running = transfers.find((transfer) => transfer.state === "running" && sameScope(transfer.scope, scope));
@@ -800,6 +815,7 @@ export class LinuxProcessReuseBackend {
 				elapsedMs: Math.max(0, performance.now() - running.startedAt),
 				actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
 			});
+			actorMs = decision.expectedActorMs;
 			if (!decision.allowed) return miss();
 			const waitStarted = performance.now();
 			const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
@@ -971,10 +987,9 @@ export class LinuxProcessReuseBackend {
 							timing,
 							Math.max(0, performance.now() - requestStarted - acquired.waitedMs),
 						);
-						const observed = plan.certificate.result.observedProcessMs;
-						if (observed !== undefined) {
+						if (acquired.actorMs !== undefined) {
 							this.counters.timedHits++;
-							this.counters.avoidedProcessMs += observed;
+							this.counters.avoidedProcessMs += acquired.actorMs;
 							this.counters.timedHitOverheadMs += Math.max(0, performance.now() - requestStarted);
 						}
 					} catch (error) {
