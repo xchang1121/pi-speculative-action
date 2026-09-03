@@ -51,6 +51,7 @@ export interface SpeculativeTraceSummary {
 	/** Actor execution time that would still have remained after that overlap. */
 	readonly executionBlockedPotentialHitLatencyMs: number;
 	readonly totalDraftTokens: number;
+	/** Process reuse performed inside speculative execution worlds, never on the Actor path. */
 	readonly processReuse: WorldReuseMetrics;
 	readonly cache: SpeculativeCacheSnapshot;
 }

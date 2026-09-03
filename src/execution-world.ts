@@ -50,16 +50,21 @@ export function sameSpeculativeExecutionRoute(
 }
 
 const WORLD_REUSE_COUNTERS = [
-	"requests", "hits", "timedHits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
+	"requests", "hits", "actorTimedHits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
 	"misses", "bypasses", "published", "tainted", "validationMs", "validationCandidates",
 	"validationPathsets", "validationFilesRead", "validationBytesRead", "validationArtifactsLoaded",
-	"validationArtifactBytesRead", "replayMs", "executionMs", "avoidedProcessMs", "timedHitOverheadMs",
+	"validationArtifactBytesRead", "replayMs", "executionMs", "reusedProcessMs", "actorBaselineMs",
+	"actorTimedHitLatencyMs",
 	"wholeCommandRequests", "wholeCommandHits", "wholeCommandMisses", "wholeCommandPublished",
-	"wholeCommandReplayMs", "wholeCommandAvoidedProcessMs", "wholeCommandHitOverheadMs",
+	"wholeCommandReplayMs", "wholeCommandReusedProcessMs", "wholeCommandActorTimedHits",
+	"wholeCommandActorBaselineMs", "wholeCommandActorTimedHitLatencyMs",
 ] as const;
 
 type WorldReuseCounter = typeof WORLD_REUSE_COUNTERS[number];
-/** Backend-neutral accounting for validated result reuse inside one execution world. */
+/**
+ * Backend-neutral process-reuse accounting. Reused-process time is producer-observed work;
+ * Actor baseline/latency fields exist only for hits calibrated by prior authoritative runs.
+ */
 export type WorldReuseMetrics = Readonly<Record<WorldReuseCounter, number>> & { readonly lastError?: string };
 const EMPTY_WORLD_REUSE_METRICS = Object.fromEntries(WORLD_REUSE_COUNTERS.map((key) => [key, 0])) as unknown as WorldReuseMetrics;
 
@@ -209,11 +214,16 @@ export interface ExecutionCapabilityStatus {
 export function executionCapabilityStatus(
 	requirements: EffectRequirements,
 	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+	operation: "speculation" | "observation" = "speculation",
 ): ExecutionCapabilityStatus {
 	const candidates = (["runtime", "fallback"] as const).flatMap((scope) =>
-		worlds.filter(
-			(world) => world.scope === scope && effectCapabilitiesCover(world.capabilities, requirements),
-		),
+		worlds.flatMap((world) => {
+			if (world.scope !== scope) return [];
+			const diagnostic = operation === "speculation" ? world : world.observation;
+			return diagnostic && effectCapabilitiesCover(diagnostic.capabilities, requirements)
+				? [{ ...world, ...diagnostic }]
+				: [];
+		}),
 	);
 	const primary =
 		candidates.find((world) => world.state === "ready") ??

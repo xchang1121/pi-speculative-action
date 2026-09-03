@@ -312,10 +312,10 @@ describe("zero-modification Pi extension", () => {
 				partialResultReuseHits: 1,
 				executionAheadMs: 300,
 				hitLatencyMs: 40,
-				processReuse: {
-					...emptyWorldReuseMetrics(), requests: 3, hits: 1, timedHits: 1, crossTurnHits: 1,
-					avoidedProcessMs: 1200, timedHitOverheadMs: 200, wholeCommandRequests: 2,
-					wholeCommandHits: 1, wholeCommandAvoidedProcessMs: 1600, wholeCommandHitOverheadMs: 100,
+				actorProcessReuse: {
+					...emptyWorldReuseMetrics(), requests: 3, hits: 1, actorTimedHits: 1, crossTurnHits: 1,
+					reusedProcessMs: 1200, actorBaselineMs: 1200, actorTimedHitLatencyMs: 200,
+					wholeCommandRequests: 2, wholeCommandHits: 1, wholeCommandReusedProcessMs: 1600,
 				},
 			},
 		});
@@ -327,12 +327,25 @@ describe("zero-modification Pi extension", () => {
 		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
 		expect(status).not.toContain("sandbox");
 		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
-		expect(status).toContain("Bash reuse: whole commands 1/2 (50%) reused, ~1.5s estimated time saved; child commands 1/3 (33%) reused, ~1s estimated time saved, 1 earlier-turn");
+		expect(status).toContain("Bash Actor reuse: whole 1/2 (50%); child 1/3 (33%); 2.8s recorded process work reused; Actor path ~1s shorter (1/2 calibrated estimate); 1 earlier-turn");
 		expect(status).toContain("Task timing: n/a (no completed task)");
 		expect(status).toContain("Actor probe: On (sidecar)");
 		expect(status).toContain("early tool execution On (tool-name confidence ≥90%)");
 		expect(status).not.toContain("prior execution");
 		expect(status).not.toMatch(/\bL[12]\b/);
+
+		const firstHit = formatSpeculativeActionStatus({
+			settings,
+			metrics: {
+				...emptyMetrics(),
+				actorProcessReuse: {
+					...emptyWorldReuseMetrics(), wholeCommandRequests: 1, wholeCommandHits: 1,
+					wholeCommandReusedProcessMs: 800,
+				},
+			},
+		});
+		expect(firstHit).toContain("800ms recorded process work reused; Actor timing unavailable");
+		expect(firstHit).not.toContain("time saved");
 	});
 
 	it("labels an adopted read projection as partial-result reuse", () => {
@@ -369,7 +382,7 @@ describe("zero-modification Pi extension", () => {
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Prediction sources", "Enabled", "Discard changes", "Save settings to", "Close"],
 			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
-			"Tool policy · [x] active · [~] selected · [ ] off": ["[~] bash", "[ ] bash", "Back"],
+			"Tool policy · [x] prediction on · [ ] prediction off": ["[x] bash", "[ ] bash", "Back"],
 			"Prediction sources": ["Actor probe", "Back"],
 			"Actor probe": ["Back"],
 			"Save settings to": ["This project"],
@@ -386,10 +399,12 @@ describe("zero-modification Pi extension", () => {
 			]),
 		);
 		expect(menus.get("Tools & execution")).toEqual(
-			expect.arrayContaining(["Tool policy › 7/7 active", "Execution routes"]),
+			expect.arrayContaining(["Tool policy › 7/7 enabled for prediction", "Execution routes"]),
 		);
-		expect(menus.get("Tool policy · [x] active · [~] selected · [ ] off")).toEqual(expect.arrayContaining([
-			expect.stringMatching(/^\[~\] bash · unavailable · Linux host required/),
+		expect(menus.get("Tool policy · [x] prediction on · [ ] prediction off")).toEqual(expect.arrayContaining([
+			expect.stringMatching(new RegExp(
+				`^\\[x\\] bash · Predict On · Replay ${process.platform === "linux" ? "Ready" : "Unavailable"} · Observe Unavailable · Fork Unavailable`,
+			)),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
 		expect(menus.get("Actor probe")).not.toEqual(
@@ -398,8 +413,9 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Actor probe")).not.toEqual(
 			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
 		);
-		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
-		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Main-agent Bash reuse:"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Replay, Observe, and Fork are independent"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Actor Bash history:"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
@@ -726,8 +742,11 @@ function portableDiagnostics(
 		},
 		{
 			id: "resource_version", scope: "fallback", isolation: "resource_snapshot",
-			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-			state: "ready", detail: "Resource validation ready",
+			capabilities: [], state: "unavailable", detail: "Speculative execution is not provided",
+			observation: {
+				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+				state: "ready", detail: "Resource validation ready",
+			},
 		},
 	];
 }
@@ -810,7 +829,7 @@ function effectiveSettings() {
 }
 
 function emptyMetrics(): SpeculativeActionMetrics {
-	return emptySpeculativeTraceSummary({
+	return { ...emptySpeculativeTraceSummary({
 		cacheCapacity: 8,
 		cacheByteCapacity: 1024,
 		cacheCold: 0,
@@ -824,5 +843,5 @@ function emptyMetrics(): SpeculativeActionMetrics {
 		sharedCandidates: 0,
 		cacheTools: [],
 		cacheExecutions: [],
-	});
+	}), actorProcessReuse: emptyWorldReuseMetrics() };
 }

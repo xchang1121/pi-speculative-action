@@ -172,12 +172,15 @@ describe("ExecutionWorldRouter", () => {
 
 		expect(await router.resolve(request, preparation)).toBeUndefined();
 		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" })).toBeDefined();
-		expect(await router.diagnostics(preparation)).toEqual([
+		const diagnostics = await router.diagnostics(preparation);
+		expect(diagnostics).toEqual([
 			expect.objectContaining({
 				state: "unavailable",
 				observation: expect.objectContaining({ state: "ready" }),
 			}),
 		]);
+		expect(executionCapabilityStatus(request.requirements, diagnostics).state).toBe("unavailable");
+		expect(executionCapabilityStatus(request.requirements, diagnostics, "observation").state).toBe("ready");
 	});
 
 	it.each([

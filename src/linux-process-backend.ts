@@ -293,6 +293,7 @@ export class LinuxProcessReuseBackend {
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly processScheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
+	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
@@ -337,8 +338,14 @@ export class LinuxProcessReuseBackend {
 		return (await this.resolveReady()).fingerprint;
 	}
 
+	/** Aggregate backend counters retained for qualification and low-level diagnostics. */
 	metrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.counters });
+	}
+
+	/** Actor-path counters, excluding child reuse performed inside speculative worlds. */
+	actorMetrics(): LinuxProcessReuseMetrics {
+		return Object.freeze({ ...this.actorCounters });
 	}
 
 	/** Hold real Actor child execs; a miss continues exactly once and requires no Fork dependencies. */
@@ -369,8 +376,9 @@ export class LinuxProcessReuseBackend {
 					return host.execute(request);
 				}
 				const requestStarted = performance.now();
-				this.counters.wholeCommandRequests++;
+				this.addActor("wholeCommandRequests");
 				let committed = false;
+				let timing: ServiceTimingIdentity | undefined;
 				try {
 					throwIfAborted(request.signal);
 					const invocation = options.invocation(request);
@@ -383,22 +391,34 @@ export class LinuxProcessReuseBackend {
 						projection,
 						await this.resolvePlatformFingerprint(),
 					);
+					timing = processTimingIdentity(prototype, processWeakKey(prototype));
 					const plan = await this.plan(prototype, projection, acceptProducer);
-					if (!plan) return this.actorReplayMiss(host, request);
+					if (!plan) return this.actorReplayMiss(host, request, timing);
+					const expectedActorMs = this.processScheduler.assessCandidateJoin({
+						identity: timing,
+						state: "succeeded",
+						expectedSpeculativeDurationMs: 1,
+					}).expectedActorMs;
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
-					this.counters.wholeCommandReplayMs += Math.max(0, performance.now() - replayStarted);
-					this.counters.wholeCommandAvoidedProcessMs += plan.certificate.result.observedProcessMs ?? 0;
-					this.counters.wholeCommandHitOverheadMs += Math.max(0, performance.now() - requestStarted);
-					this.counters.wholeCommandHits++;
+					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
+					this.addActor("wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
+					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
+					this.addActor("wholeCommandHits");
+					this.processScheduler.observeAdoption(timing, hitLatencyMs);
+					if (expectedActorMs !== undefined) {
+						this.addActor("wholeCommandActorTimedHits");
+						this.addActor("wholeCommandActorBaselineMs", expectedActorMs);
+						this.addActor("wholeCommandActorTimedHitLatencyMs", hitLatencyMs);
+					}
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
-					this.counters.lastError = `actor_replay:${errorMessage(error)}`;
+					this.setActorError(`actor_replay:${errorMessage(error)}`);
 					if (committed || isPoisonedEffectCommit(error)) throw error;
-					return this.actorReplayMiss(host, request);
+					return this.actorReplayMiss(host, request, timing);
 				}
 			},
 		};
@@ -670,8 +690,7 @@ export class LinuxProcessReuseBackend {
 		};
 		for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
-		this.add(session, "wholeCommandAvoidedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
-		this.add(session, "wholeCommandHitOverheadMs", Math.max(0, performance.now() - requestStarted));
+		this.add(session, "wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
 		return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 	}
@@ -729,7 +748,6 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
-		const requestStarted = performance.now();
 		const received = parseDispatcherRequest(body);
 		if (!received || received.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
 		const request = materializeDispatcherRequest(session, received);
@@ -751,7 +769,7 @@ export class LinuxProcessReuseBackend {
 			undefined,
 			session.scope,
 		);
-		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined, requestStarted);
+		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined);
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
@@ -895,7 +913,7 @@ export class LinuxProcessReuseBackend {
 				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
 			}`;
 			if (session) this.setError(session, detail);
-			else this.counters.lastError = `actor_${detail}`;
+			else this.setActorError(`actor_${detail}`);
 		}
 		return plan.kind === "completed_replay" ? plan : undefined;
 	}
@@ -903,7 +921,7 @@ export class LinuxProcessReuseBackend {
 	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
 		const record = (metric: CountedReuseMetric, value: number) => {
 			if (session) this.add(session, metric, value);
-			else this.counters[metric] += value;
+			else this.addActor(metric, value);
 		};
 		record("validationMs", lookup.durationMs);
 		record("validationCandidates", lookup.candidateCertificates);
@@ -914,20 +932,31 @@ export class LinuxProcessReuseBackend {
 		record("validationArtifactBytesRead", lookup.artifactBytesRead);
 	}
 
-	private actorReplayMiss(host: ProcessExecutor, request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
-		this.counters.wholeCommandMisses++;
-		return host.execute(request);
+	private async actorReplayMiss(
+		host: ProcessExecutor,
+		request: ProcessExecutionRequest,
+		timing?: ServiceTimingIdentity,
+	): Promise<ProcessExecutionResult> {
+		this.addActor("wholeCommandMisses");
+		const started = performance.now();
+		try {
+			return await host.execute(request);
+		} finally {
+			if (timing && !request.signal?.aborted) {
+				this.processScheduler.observeActorService(timing, Math.max(0, performance.now() - started));
+			}
+		}
 	}
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const requestStarted = performance.now();
-		this.counters.requests++;
+		this.addActor("requests");
 		try {
 			throwIfAborted(process.signal);
 			const sourceRoot = path.resolve(process.sourceRoot);
 			const snapshot = await inspectHeldExecProcess(process.pid);
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
-				this.counters.bypasses++;
+				this.addActor("bypasses");
 				return { kind: "continue" };
 			}
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
@@ -964,7 +993,7 @@ export class LinuxProcessReuseBackend {
 			);
 			const plan = acquired.plan;
 			if (!plan || plan.certificate.result.exit.kind !== "code") {
-				this.counters.misses++;
+				this.addActor("misses");
 				return {
 					kind: "continue",
 					observeCompletion: (durationMs) => this.processScheduler.observeActorService(timing, durationMs),
@@ -985,22 +1014,23 @@ export class LinuxProcessReuseBackend {
 							timing,
 							Math.max(0, performance.now() - requestStarted - acquired.waitedMs),
 						);
+						this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 						if (acquired.actorMs !== undefined) {
-							this.counters.timedHits++;
-							this.counters.avoidedProcessMs += acquired.actorMs;
-							this.counters.timedHitOverheadMs += Math.max(0, performance.now() - requestStarted);
+							this.addActor("actorTimedHits");
+							this.addActor("actorBaselineMs", acquired.actorMs);
+							this.addActor("actorTimedHitLatencyMs", Math.max(0, performance.now() - requestStarted));
 						}
 					} catch (error) {
-						this.counters.lastError = `actor_child_commit:${errorMessage(error)}`;
+						this.setActorError(`actor_child_commit:${errorMessage(error)}`);
 						throw error;
 					} finally {
-						this.counters.replayMs += Math.max(0, performance.now() - started);
+						this.addActor("replayMs", Math.max(0, performance.now() - started));
 					}
 				},
 			};
 		} catch (error) {
-			this.counters.bypasses++;
-			this.counters.lastError = `actor_child:${errorMessage(error)}`;
+			this.addActor("bypasses");
+			this.setActorError(`actor_child:${errorMessage(error)}`);
 			return { kind: "continue" };
 		}
 	}
@@ -1010,7 +1040,6 @@ export class LinuxProcessReuseBackend {
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
 		joined: boolean,
-		requestStarted: number,
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
 		let replayed = false;
@@ -1025,11 +1054,7 @@ export class LinuxProcessReuseBackend {
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
 			const observed = plan.certificate.result.observedProcessMs;
-			if (replayed && observed !== undefined) {
-				this.add(session, "timedHits");
-				this.add(session, "avoidedProcessMs", observed);
-				this.add(session, "timedHitOverheadMs", Math.max(0, performance.now() - requestStarted));
-			}
+			if (replayed && observed !== undefined) this.add(session, "reusedProcessMs", observed);
 		}
 	}
 
@@ -1181,13 +1206,18 @@ export class LinuxProcessReuseBackend {
 		session.metrics[metric] += value;
 	}
 
+	private addActor(metric: CountedReuseMetric, value = 1): void {
+		this.counters[metric] += value;
+		this.actorCounters[metric] += value;
+	}
+
 	private recordHit(
 		certificate: ProcessProvenanceCertificate,
 		joined: boolean,
 		session?: ActiveSession,
 		scope: ExecutionScope | undefined = session?.scope,
 	): void {
-		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.counters[metric]++;
+		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.addActor(metric);
 		add("hits");
 		if (joined) add("joinedHits");
 		const producer = this.certificateScopes.get(certificate.id);
@@ -1203,6 +1233,11 @@ export class LinuxProcessReuseBackend {
 	private setError(session: ActiveSession, detail: string): void {
 		this.counters.lastError = detail;
 		session.metrics.lastError = detail;
+	}
+
+	private setActorError(detail: string): void {
+		this.counters.lastError = detail;
+		this.actorCounters.lastError = detail;
 	}
 
 	private rememberScope(id: Sha256Digest, scope: ExecutionScope | undefined): void {

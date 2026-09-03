@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import {
 	argument,
@@ -190,16 +190,17 @@ int main(int argc, char **argv) {
 			await branch.dispose();
 		}
 		const actor = await heldActor(fixture, replayBackend);
-		const beforeHit = replayBackend.metrics();
+		const beforeHit = replayBackend.actorMetrics();
 		const hitStarted = performance.now();
 		const hit = await actor.execute("held-hit", { command: actorCommand }, new AbortController().signal);
 		const hitMs = performance.now() - hitStarted;
-		const hitMetrics = metricDelta(beforeHit, replayBackend.metrics());
+		const hitMetrics = metricDelta(beforeHit, replayBackend.actorMetrics());
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(
-			hitMetrics.hits === 1 && hitMetrics.timedHits === 0 && hitMetrics.avoidedProcessMs === 0,
-			`uncalibrated held child reported invented savings: ${JSON.stringify(hitMetrics)}`,
+			hitMetrics.hits === 1 && hitMetrics.actorTimedHits === 0 && hitMetrics.actorBaselineMs === 0 &&
+				hitMetrics.reusedProcessMs > 0,
+			`uncalibrated held child did not separate reused work from Actor timing: ${JSON.stringify(hitMetrics)}`,
 		);
 		const joiningActor = await heldActor(fixture, fixture.backend);
 
@@ -214,13 +215,13 @@ int main(int argc, char **argv) {
 		try {
 			const cwdProduced = metricDelta(cwdProducerBefore, fixture.backend.metrics());
 			assert(textOutput(cwdBranch.output.result) === `${fixture.workspace}\n`, "speculative child observed a private cwd");
-			const cwdBefore = fixture.backend.metrics();
+			const cwdBefore = fixture.backend.actorMetrics();
 			const cwdActor = await joiningActor.execute(
 				"held-cwd-actor",
 				{ command: "printf 'actor-cwd\\n'; /bin/pwd" },
 				new AbortController().signal,
 			);
-			const cwdMetrics = metricDelta(cwdBefore, fixture.backend.metrics());
+			const cwdMetrics = metricDelta(cwdBefore, fixture.backend.actorMetrics());
 			cwdHits = cwdMetrics.hits;
 			assert(textOutput(cwdActor) === `actor-cwd\n${fixture.workspace}\n`, "transferred child observed a non-Actor cwd");
 			assert(
@@ -245,13 +246,13 @@ int main(int argc, char **argv) {
 		}
 		const securityProduced = metricDelta(securityBefore, fixture.backend.metrics());
 		assert(securityProduced.tainted === 1 && securityProduced.published === 1, "confinement evidence was not retained");
-		const securityActorBefore = replayBackend.metrics();
+		const securityActorBefore = replayBackend.actorMetrics();
 		const securityActor = await actor.execute(
 			"held-security-actor",
 			{ command: ": actor-security; worker unused probe" },
 			new AbortController().signal,
 		);
-		const securityMetrics = metricDelta(securityActorBefore, replayBackend.metrics());
+		const securityMetrics = metricDelta(securityActorBefore, replayBackend.actorMetrics());
 		assert(textOutput(securityActor).includes("nnp:0"), "Actor did not retain its native security context");
 		assert(
 			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
@@ -264,7 +265,7 @@ int main(int argc, char **argv) {
 			actionNamespace: "pi-held-exec-production.v1",
 			executionFingerprint,
 		});
-		const inodeBefore = replayBackend.metrics();
+		const inodeBefore = replayBackend.actorMetrics();
 		const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
 			.toString(16).padStart(16, "0");
 		let inodeHits = -1;
@@ -274,7 +275,7 @@ int main(int argc, char **argv) {
 				{ command: ": actor-inode; worker unused inode" },
 				new AbortController().signal,
 			);
-			const inodeMetrics = metricDelta(inodeBefore, replayBackend.metrics());
+			const inodeMetrics = metricDelta(inodeBefore, replayBackend.actorMetrics());
 			inodeHits = inodeMetrics.hits;
 			assert(
 				textOutput(inodeActor).trim() === expectedInode,
@@ -289,11 +290,11 @@ int main(int argc, char **argv) {
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
-		const beforeMiss = fixture.backend.metrics();
+		const beforeMiss = fixture.backend.actorMetrics();
 		const missStarted = performance.now();
 		const miss = await joiningActor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
 		const missMs = performance.now() - missStarted;
-		const missMetrics = metricDelta(beforeMiss, fixture.backend.metrics());
+		const missMetrics = metricDelta(beforeMiss, fixture.backend.actorMetrics());
 		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
@@ -306,11 +307,13 @@ int main(int argc, char **argv) {
 		});
 		let joiningBranch: Awaited<typeof joiningTask> | undefined;
 		let joiningOutput: Awaited<ReturnType<typeof actor.execute>> | undefined;
+		let joinMetrics: LinuxProcessReuseMetrics | undefined;
 		let joiningMs = 0;
 		const leadMs = 400;
 		try {
 			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses);
 			await delay(leadMs);
+			const actorBefore = fixture.backend.actorMetrics();
 			const joiningStarted = performance.now();
 			joiningOutput = await joiningActor.execute(
 				"held-joining",
@@ -318,17 +321,19 @@ int main(int argc, char **argv) {
 				new AbortController().signal,
 			);
 			joiningMs = performance.now() - joiningStarted;
+			joinMetrics = metricDelta(actorBefore, fixture.backend.actorMetrics());
 			joiningBranch = await joiningTask;
 			assert(!joiningBranch.output.isError, `joining producer failed: ${textOutput(joiningBranch.output.result)}`);
 		} finally {
 			joiningBranch ??= await joiningTask.catch(() => undefined);
 			await joiningBranch?.dispose();
 		}
-		const joinMetrics = metricDelta(joinBefore, fixture.backend.metrics());
+		if (!joinMetrics) throw new Error("joining Actor metrics were not captured");
 		assert(textOutput(joiningOutput!).includes("actor-join\nworker:v2"), "joined child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
 		assert(
-			joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 && joinMetrics.timedHits === 1 && joinMetrics.avoidedProcessMs > 0,
+			joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 && joinMetrics.actorTimedHits === 1 &&
+				joinMetrics.actorBaselineMs > 0 && joinMetrics.reusedProcessMs > 0,
 			`Actor did not join measured in-flight work: ${JSON.stringify(joinMetrics)}`,
 		);
 
@@ -344,12 +349,13 @@ int main(int argc, char **argv) {
 			assert(!completedBranch.output.isError, `completed producer failed: ${textOutput(completedBranch.output.result)}`);
 			const completedProduced = metricDelta(completedBefore, fixture.backend.metrics());
 			assert(completedProduced.tainted === 1 && completedProduced.published === 0, "completed child did not remain ephemeral");
+			const actorBefore = fixture.backend.actorMetrics();
 			const completedActor = await joiningActor.execute(
 				"held-completed",
 				{ command: `printf 'actor-completed\n'; ${completedChild}` },
 				new AbortController().signal,
 			);
-			const completedMetrics = metricDelta(completedBefore, fixture.backend.metrics());
+			const completedMetrics = metricDelta(actorBefore, fixture.backend.actorMetrics());
 			assert(textOutput(completedActor).includes("actor-completed\nworker:v2"), "completed child transfer changed Actor output");
 			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:v2\n", "completed child transfer changed its effect");
 			assert(completedMetrics.hits === 1 && completedMetrics.joinedHits === 0 && completedMetrics.sameTurnHits === 1,
@@ -370,9 +376,9 @@ int main(int argc, char **argv) {
 			await waitUntil(() => fixture.backend.metrics().misses > lateBefore.misses);
 			const laterActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: "later" }));
 			const rejectCrossTurn = async (callID: string) => {
-				const before = fixture.backend.metrics();
+				const before = fixture.backend.actorMetrics();
 				const output = await laterActor.execute(callID, { command: lateChild }, new AbortController().signal);
-				const metrics = metricDelta(before, fixture.backend.metrics());
+				const metrics = metricDelta(before, fixture.backend.actorMetrics());
 				assert(textOutput(output).includes("worker:v2") && metrics.hits === 0 && metrics.joinedHits === 0 && metrics.misses >= 1,
 					`${callID} crossed its turn boundary: ${JSON.stringify(metrics)}`);
 			};
@@ -407,9 +413,9 @@ int main(int argc, char **argv) {
 			);
 			const produced = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
 			assert(produced.wholeCommandPublished === 0, "descriptor command unexpectedly entered persistent history");
-			const descriptorBefore = fixture.backend.metrics();
+			const descriptorBefore = fixture.backend.actorMetrics();
 			const descriptorActor = await fixture.tool.execute("held-descriptor-actor", { command: descriptorCommand }, new AbortController().signal);
-			const descriptorMetrics = metricDelta(descriptorBefore, fixture.backend.metrics());
+			const descriptorMetrics = metricDelta(descriptorBefore, fixture.backend.actorMetrics());
 			assert(textOutput(descriptorActor) === "descriptor-ok", "completed descriptor transfer changed output");
 			assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "completed descriptor transfer changed its effect");
 			assert(
@@ -424,7 +430,8 @@ int main(int argc, char **argv) {
 			completed: {
 				actorMs: hitMs,
 				hits: hitMetrics.hits,
-				avoidedProcessMs: hitMetrics.avoidedProcessMs,
+				reusedProcessMs: hitMetrics.reusedProcessMs,
+				actorTimingAvailable: hitMetrics.actorTimedHits > 0,
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
 			},
 			joining: {
@@ -432,8 +439,8 @@ int main(int argc, char **argv) {
 				leadMs,
 				hits: joinMetrics.hits,
 				joinedHits: joinMetrics.joinedHits,
-				estimatedActorMs: joinMetrics.avoidedProcessMs,
-				estimatedSavedMs: joinMetrics.avoidedProcessMs - joinMetrics.timedHitOverheadMs,
+				estimatedActorMs: joinMetrics.actorBaselineMs,
+				estimatedSavedMs: joinMetrics.actorBaselineMs - joinMetrics.actorTimedHitLatencyMs,
 			},
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnCompletedRejected: true, crossTurnRunningRejected: true },
 			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },

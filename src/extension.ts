@@ -52,9 +52,10 @@ import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
+	emptyWorldReuseMetrics,
 	executionCapabilityStatus,
-	type ExecutionCapabilityStatus,
 	type ExecutionWorldDiagnosticSnapshot,
+	type ExecutionWorldHealthState,
 	type SpeculativeExecution,
 	type WorldReuseMetrics,
 } from "./execution-world.ts";
@@ -202,7 +203,17 @@ const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
 	},
 );
 
-export type SpeculativeActionMetrics = SpeculativeTraceSummary;
+export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
+	/** Reuse on the authoritative Actor path, excluding reuse internal to speculative branches. */
+	readonly actorProcessReuse: WorldReuseMetrics;
+};
+
+type CapabilityState = "on" | "off" | ExecutionWorldHealthState;
+type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "fork", CapabilityState>>;
+interface ActorProcessReplayCapability {
+	readonly state: ExecutionWorldHealthState;
+	readonly detail: string;
+}
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -222,7 +233,7 @@ interface SpeculativeActionController {
 	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
 	readonly metrics: () => SpeculativeActionMetrics;
 	readonly registeredTools: () => ReadonlySet<string>;
-	readonly toolCapabilities: () => ReadonlyMap<string, ExecutionCapabilityStatus>;
+	readonly toolCapabilities: () => ReadonlyMap<string, ToolCapabilityRow>;
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
@@ -293,7 +304,6 @@ export function formatSpeculativeActionStatus(input: {
 }): string {
 	const { settings, metrics } = input;
 	const cache = metrics.cache;
-	const processReuse = metrics.processReuse;
 	const self = settings.selfSpeculation;
 	return [
 		`Enabled: ${settings.enabled ? "On" : "Off"}`,
@@ -309,7 +319,12 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
-		...(hasBashReuse(processReuse) ? [`Bash reuse: ${formatBashReuse(processReuse)}`] : []),
+		...(hasProcessReuse(metrics.actorProcessReuse)
+			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
+			: []),
+		...(hasProcessReuse(metrics.processReuse)
+			? [`Bash work reused inside speculative branches: ${formatProcessWorkReuse(metrics.processReuse)}`]
+			: []),
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
@@ -388,7 +403,7 @@ async function installController(
 	wrapperSources: Map<string, string>,
 	providerRequest: AsyncLocalStorage<"drafter">,
 ): Promise<SpeculativeActionController> {
-	let currentMetrics = emptyMetrics();
+	let currentMetrics: SpeculativeTraceSummary = emptyMetrics();
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
 	let currentTurnID: string | undefined;
@@ -420,23 +435,31 @@ async function installController(
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const bashReuseEnabled = () => currentSettings.enabled && currentSettings.tools.includes("bash");
-	let actorBashReuse: string | undefined;
+	let actorProcessReplay: ActorProcessReplayCapability | undefined;
 	const heldExec = processBackend && shell.commandTransport !== "stdin"
 		? await processBackend.heldExecActorReplay({
 				sourceRoot: context.cwd,
 				realShell: shell.shell,
 				scope: executionScope,
 			}).then((route) => {
-				actorBashReuse = "ready — previous matching Bash calls and completed/running child commands";
+				actorProcessReplay = {
+					state: "ready",
+					detail: "matching whole Bash calls plus completed or running child processes",
+				};
 				return route;
 			}, (error) => {
-				actorBashReuse = `partial — previous matching Bash calls only; child handoff unavailable (${error instanceof Error ? error.message : String(error)})`;
+				actorProcessReplay = process.platform === "linux"
+					? {
+							state: "ready",
+							detail: `matching whole Bash calls; child handoff unavailable (${error instanceof Error ? error.message : String(error)})`,
+						}
+					: { state: "unavailable", detail: "Linux or WSL 2 required" };
 				return undefined;
 			})
 		: undefined;
-	if (processBackend && !actorBashReuse) actorBashReuse = process.platform === "linux"
-		? "partial — previous matching Bash calls only; this shell cannot hold child commands"
-		: "unavailable — Linux or WSL 2 required";
+	if (processBackend && !actorProcessReplay) actorProcessReplay = process.platform === "linux"
+		? { state: "ready", detail: "matching whole Bash calls; this shell cannot hold child processes" }
+		: { state: "unavailable", detail: "Linux or WSL 2 required" };
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
 	const heldProcessExecutor = heldExec?.executor(
 		adaptProcessToolOperations(createLocalBashOperations({ shellPath: heldExec.shellPath })),
@@ -500,13 +523,22 @@ async function installController(
 	const agentTools = new Map(
 		[...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]),
 	);
-	const toolCapabilities = () => resolveToolCapabilities(executionDiagnostics, executionDiagnosticsKnown);
+	const toolCapabilities = () => resolveToolCapabilities(
+		currentSettings,
+		baseDefinitions.keys(),
+		toolConflicts,
+		executionDiagnostics,
+		executionDiagnosticsKnown,
+		actorProcessReplay,
+	);
 	const runtimeSettings = () => ({
 		...currentSettings,
-		tools: activeTools(currentSettings, baseDefinitions.keys()),
+		tools: predictionTools(currentSettings, baseDefinitions.keys()),
 	});
-	const visibleMetrics = (): SpeculativeActionMetrics =>
-		processBackend ? { ...currentMetrics, processReuse: processBackend.metrics() } : currentMetrics;
+	const visibleMetrics = (): SpeculativeActionMetrics => ({
+		...currentMetrics,
+		actorProcessReuse: processBackend?.actorMetrics() ?? emptyWorldReuseMetrics(),
+	});
 	function renderFooter(): void {
 		if (!ui) return;
 		ui.setStatus(
@@ -569,7 +601,7 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
-		executionSummary: () => executionWorldSummary(executionDiagnostics, actorBashReuse),
+		executionSummary: () => executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay),
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -691,7 +723,7 @@ async function installController(
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
-				executionWorldSummary(executionDiagnostics, actorBashReuse),
+				executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
@@ -890,7 +922,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			`Enabled: ${draft.enabled ? "On" : "Off"}`,
 			`Save settings to: ${scope}${sameSettings(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
-			`Tools & execution › ${toolPolicy.active}/${toolPolicy.available} active`,
+			`Tools & execution › ${toolPolicy.enabled}/${toolPolicy.available} enabled for prediction`,
 			"Advanced settings › tuning, decoding, scheduling, storage",
 			`Apply changes${dirty ? " (pending)" : ""}`,
 			...(dirty ? ["Discard changes"] : []),
@@ -1215,7 +1247,7 @@ async function openToolsAndExecution(
 		const settings = editor.settings();
 		const policy = toolPolicyCounts(settings, controller.registeredTools());
 		const choice = await ctx.ui.select("Tools & execution", [
-			`Tool policy › ${policy.active}/${policy.available} active`,
+			`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`,
 			"Execution routes",
 			BACK,
 		]);
@@ -1226,12 +1258,11 @@ async function openToolsAndExecution(
 				editor,
 				controller.registeredTools(),
 				controller.toolConflicts(),
-				controller.toolCapabilities(),
 			);
 		if (choice === "Execution routes") {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(
-				`Each tool uses the first ready execution route whose guarantees cover its effects. The main-agent Bash reuse line is independent of early execution; tools without a safe route remain with the Actor.\n${controller.executionSummary()}`,
+				`Predict controls which tools sources may propose. Replay, Observe, and Fork are independent runtime capabilities; unavailable work stays with the Actor.\n${controller.executionSummary()}`,
 				"info",
 			);
 		}
@@ -1243,10 +1274,10 @@ async function editToolPolicy(
 	controller: SpeculativeActionController,
 	registered: ReadonlySet<string>,
 	conflicts: ReadonlyMap<string, string>,
-	capabilities: ReadonlyMap<string, ExecutionCapabilityStatus>,
 ): Promise<void> {
 	while (true) {
 		const settings = controller.settings();
+		const capabilities = controller.toolCapabilities();
 		const tools = [...new Set([...KEYABLE_TOOLS, ...settings.tools, ...registered])].sort(
 			(left, right) => toolCategory(left) - toolCategory(right) || left.localeCompare(right),
 		);
@@ -1254,17 +1285,10 @@ async function editToolPolicy(
 		for (const tool of tools) {
 			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
 			const selected = supported && settings.tools.includes(tool);
-			const route = capabilities.get(tool);
-			const active = selected && registered.has(tool) && route?.state !== "unavailable" && !conflicts.has(tool);
-			const marker = active ? "[x]" : selected ? "[~]" : "[ ]";
-			const availability = conflicts.has(tool)
-				? "custom override"
-				: !registered.has(tool)
-					? "not registered"
-					: routeLabel(route);
-			labels.set(`${marker} ${tool} · ${availability}`, tool);
+			const capability = capabilities.get(tool);
+			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(capability)}`, tool);
 		}
-		const choice = await ctx.ui.select("Tool policy · [x] active · [~] selected · [ ] off", [...labels.keys(), BACK]);
+		const choice = await ctx.ui.select("Tool policy · [x] prediction on · [ ] prediction off", [...labels.keys(), BACK]);
 		if (!choice || choice === BACK) return;
 		const tool = labels.get(choice);
 		if (!tool) continue;
@@ -1489,8 +1513,8 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
 				const reuse = event.candidate.world?.executionMetrics.reuse;
-				if (reuse && hasBashReuse(reuse)) {
-					parts.push(`Bash ${formatBashReuse(reuse)}`);
+				if (reuse && hasProcessReuse(reuse)) {
+					parts.push(`Bash branch work ${formatProcessWorkReuse(reuse)}`);
 				}
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
@@ -1561,7 +1585,7 @@ function findExactModelReferenceMatch(reference: string, models: readonly Model<
 	return byID.length === 1 ? byID[0] : undefined;
 }
 
-function emptyMetrics(): SpeculativeActionMetrics {
+function emptyMetrics(): SpeculativeTraceSummary {
 	return emptySpeculativeTraceSummary({
 		cacheCapacity: DEFAULTS.resourceCacheMaxEntries,
 		cacheByteCapacity: DEFAULTS.resourceCacheMaxBytes,
@@ -1642,21 +1666,42 @@ function activeModelReference(ctx: ExtensionContext): string {
 }
 
 function resolveToolCapabilities(
+	settings: EffectiveSpeculativeActionSettings,
+	registered: Iterable<string>,
+	conflicts: ReadonlyMap<string, string>,
 	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
 	known = true,
-): ReadonlyMap<string, ExecutionCapabilityStatus> {
-	return new Map(
-		KEYABLE_TOOLS.map((tool) => {
+	actorProcessReplay?: ActorProcessReplayCapability,
+): ReadonlyMap<string, ToolCapabilityRow> {
+	const registeredTools = new Set(registered);
+	return new Map<string, ToolCapabilityRow>(
+		KEYABLE_TOOLS.map((tool): [string, ToolCapabilityRow] => {
 			const requirements = PI_ACTION_SEMANTICS.requirements(tool);
-			const status = requirements && known
-				? executionCapabilityStatus(requirements, worlds)
-				: { state: "registered" as const, candidates: [] };
-			return [tool, status];
+			const pending = { state: "registered" as const, candidates: [] };
+			const fork = requirements && known ? executionCapabilityStatus(requirements, worlds) : pending;
+			const observe = requirements && known
+				? executionCapabilityStatus(requirements, worlds, "observation")
+				: pending;
+			const unavailable = conflicts.get(tool) ?? (!registeredTools.has(tool) ? "not registered" : undefined);
+			if (unavailable) {
+				return [tool, { predict: "unavailable", replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
+			}
+			const replay = bestCapabilityState([
+				fork.state,
+				observe.state,
+				...(tool === "bash" && actorProcessReplay ? [actorProcessReplay.state] : []),
+			]);
+			return [tool, {
+				predict: settings.tools.includes(tool) ? "on" : "off",
+				replay,
+				observe: observe.state,
+				fork: fork.state,
+			}];
 		}),
 	);
 }
 
-function activeTools(
+function predictionTools(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: Iterable<string>,
 ): readonly string[] {
@@ -1667,11 +1712,15 @@ function activeTools(
 function toolPolicyCounts(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: ReadonlySet<string>,
-): { readonly active: number; readonly available: number } {
+): { readonly enabled: number; readonly available: number } {
 	return {
-		active: activeTools(settings, registered).length,
+		enabled: predictionTools(settings, registered).length,
 		available: registered.size,
 	};
+}
+
+function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): ExecutionWorldHealthState {
+	return states.includes("ready") ? "ready" : states.includes("registered") ? "registered" : "unavailable";
 }
 
 function executionRouteKind(isolation: SpeculativeExecution): string {
@@ -1682,14 +1731,21 @@ function executionRouteKind(isolation: SpeculativeExecution): string {
 	}
 }
 
-function routeLabel(status: ExecutionCapabilityStatus | undefined): string {
-	if (!status) return "unsupported";
-	if (status.primary && status.state === "ready") return `ready · ${executionRouteKind(status.primary.isolation)}`;
-	if (status.primary && status.state === "registered")
-		return `available · ${executionRouteKind(status.primary.isolation)} (checked on first use)`;
-	if (status.state === "registered") return "availability pending";
-	const reasons = [...new Set(status.candidates.map((candidate) => candidate.detail))];
-	return `unavailable · ${reasons.join("; ") || "no safe execution route"}`;
+function capabilityRowLabel(row: ToolCapabilityRow | undefined): string {
+	if (!row) return "unsupported";
+	return (["predict", "replay", "observe", "fork"] as const)
+		.map((name) => `${name[0]!.toUpperCase()}${name.slice(1)} ${capabilityLabel(row[name])}`)
+		.join(" · ");
+}
+
+function capabilityLabel(state: CapabilityState): string {
+	switch (state) {
+		case "on": return "On";
+		case "off": return "Off";
+		case "ready": return "Ready";
+		case "registered": return "Check";
+		case "unavailable": return "Unavailable";
+	}
 }
 
 function toolCategory(tool: string): number {
@@ -1710,38 +1766,61 @@ function formatSpeculativeFooter(
 	conflicts: number,
 ): string {
 	if (!settings.enabled) return "spec: off";
-	const ready = worlds.filter((world) => world.state === "ready").length;
-	const reuse = metrics.processReuse;
+	const ready = worlds.filter((world) => world.state === "ready" || world.observation?.state === "ready").length;
+	const reuse = metrics.actorProcessReuse;
 	const storageWorlds = worlds.filter((world) => world.storage);
 	const storedEntries = storageWorlds.reduce((total, world) => total + (world.storage?.entries ?? 0), 0);
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
-		...(hasBashReuse(reuse) ? [`Bash ${formatBashReuse(reuse)}`] : []),
+		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
-		worlds.length > 0 ? `routes ${ready}/${worlds.length} ready` : "routes probing",
+		worlds.length > 0 ? `providers ${ready}/${worlds.length} ready` : "providers probing",
 		"unsafe→Actor",
 		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
 	].join(" · ");
 }
 
-function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[], actorBashReuse?: string): string {
-	if (!worlds.length && !actorBashReuse) return "Execution routes: unavailable";
+function executionWorldSummary(
+	tools: ReadonlyMap<string, ToolCapabilityRow>,
+	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+	actorProcessReplay?: ActorProcessReplayCapability,
+): string {
+	if (!worlds.length && !actorProcessReplay) return "Execution capabilities: unavailable";
 	return [
-		"Execution routes:",
-		...(actorBashReuse ? [`- Main-agent Bash reuse: ${actorBashReuse}`] : []),
+		"Execution capabilities:",
+		capabilityTable(tools),
+		"Providers:",
+		...(actorProcessReplay
+			? [`- Actor Bash history: ${capabilityLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]
+			: []),
 		...worlds.map(
 			(world) =>
-				`- ${executionRouteKind(world.isolation)} (${world.id}): ${world.state} — ${world.detail}${
+				`- ${executionRouteKind(world.isolation)} (${world.id}): Fork ${capabilityLabel(world.state)} — ${world.detail}; Observe ${
+					world.observation ? `${capabilityLabel(world.observation.state)} — ${world.observation.detail}` : "Unavailable"
+				}${
 					world.storage
 						? `; storage ${world.storage.entries}/${world.storage.maxEntries}, ${formatBytes(world.storage.bytes)}/${formatBytes(world.storage.maxBytes)}, ${world.storage.orphanArtifacts ?? 0} orphan artifacts${world.storage.overBudget ? "; over budget" : ""}`
 						: ""
 				}`,
 		),
 	].join("\n");
+}
+
+function capabilityTable(tools: ReadonlyMap<string, ToolCapabilityRow>): string {
+	const rows = [...tools].map(([tool, capability]) => [
+		tool,
+		capabilityLabel(capability.predict),
+		capabilityLabel(capability.replay),
+		capabilityLabel(capability.observe),
+		capabilityLabel(capability.fork),
+	]);
+	const table = [["Tool", "Predict", "Replay", "Observe", "Fork"], ...rows];
+	const widths = table[0]!.map((_, column) => Math.max(...table.map((row) => row[column]!.length)));
+	return table.map((row) => row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd()).join("\n");
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {
@@ -1781,36 +1860,50 @@ function formatRatio(numerator: number, denominator: number): string {
 	return `${numerator}/${denominator} (${denominator > 0 ? formatPercent(numerator / denominator) : "n/a"})`;
 }
 
-function reuseBenefit(hits: number, avoidedMs: number, overheadMs: number): string | undefined {
-	if (hits <= 0 || avoidedMs <= 0) return undefined;
-	const delta = avoidedMs - overheadMs;
-	if (delta === 0) return "no estimated time change";
-	return `~${formatDuration(Math.abs(delta))} estimated ${delta > 0 ? "time saved" : "extra time"}`;
-}
-
-function hasBashReuse(reuse: WorldReuseMetrics): boolean {
+function hasProcessReuse(reuse: WorldReuseMetrics): boolean {
 	return reuse.requests + reuse.wholeCommandRequests > 0;
 }
 
-function formatBashReuse(reuse: WorldReuseMetrics): string {
+function formatProcessWorkReuse(reuse: WorldReuseMetrics): string {
+	const hits = reuse.hits + reuse.wholeCommandHits;
+	const requests = reuse.requests + reuse.wholeCommandRequests;
+	const workMs = reuse.reusedProcessMs + reuse.wholeCommandReusedProcessMs;
+	return [
+		reuse.wholeCommandRequests ? `whole ${formatRatio(reuse.wholeCommandHits, reuse.wholeCommandRequests)}` : "",
+		reuse.requests ? `child ${formatRatio(reuse.hits, reuse.requests)}` : "",
+		hits > 0 ? (workMs > 0 ? `${formatDuration(workMs)} recorded process work reused` : "work timing unavailable") : "",
+	].filter(Boolean).join("; ");
+}
+
+function formatActorProcessReuse(reuse: WorldReuseMetrics): string {
 	const origins = [
 		reuse.sameTurnHits ? `${reuse.sameTurnHits} same-turn` : "",
 		reuse.crossTurnHits ? `${reuse.crossTurnHits} earlier-turn` : "",
 		reuse.unattributedHits ? `${reuse.unattributedHits} stored` : "",
 		reuse.joinedHits ? `${reuse.joinedHits} joined` : "",
 	].filter(Boolean);
-	const whole = reuse.wholeCommandRequests > 0
-		? [
-			`whole commands ${formatRatio(reuse.wholeCommandHits, reuse.wholeCommandRequests)} reused`,
-			reuseBenefit(reuse.wholeCommandHits, reuse.wholeCommandAvoidedProcessMs, reuse.wholeCommandHitOverheadMs),
-		].filter(Boolean).join(", ")
-		: undefined;
-	const child = reuse.requests > 0
-		? [
-			`child commands ${formatRatio(reuse.hits, reuse.requests)} reused`,
-			reuseBenefit(reuse.timedHits, reuse.avoidedProcessMs, reuse.timedHitOverheadMs),
-			...origins,
-		].filter(Boolean).join(", ")
-		: undefined;
-	return [whole, child].filter(Boolean).join("; ");
+	return [formatProcessWorkReuse(reuse), actorTiming(reuse), ...origins].filter(Boolean).join("; ");
+}
+
+function formatActorProcessFooter(reuse: WorldReuseMetrics): string {
+	const hits = reuse.hits + reuse.wholeCommandHits;
+	const requests = reuse.requests + reuse.wholeCommandRequests;
+	const workMs = reuse.reusedProcessMs + reuse.wholeCommandReusedProcessMs;
+	return [
+		`${formatRatio(hits, requests)} reused`,
+		workMs > 0 ? `${formatDuration(workMs)} work` : "",
+		actorTiming(reuse),
+	].filter(Boolean).join(" · ");
+}
+
+function actorTiming(reuse: WorldReuseMetrics): string {
+	const hits = reuse.hits + reuse.wholeCommandHits;
+	const timed = reuse.actorTimedHits + reuse.wholeCommandActorTimedHits;
+	if (hits <= 0) return "";
+	if (timed <= 0) return "Actor timing unavailable";
+	const baseline = reuse.actorBaselineMs + reuse.wholeCommandActorBaselineMs;
+	const latency = reuse.actorTimedHitLatencyMs + reuse.wholeCommandActorTimedHitLatencyMs;
+	const delta = baseline - latency;
+	const change = delta === 0 ? "unchanged" : `~${formatDuration(Math.abs(delta))} ${delta > 0 ? "shorter" : "longer"}`;
+	return `Actor path ${change} (${timed}/${hits} calibrated estimate)`;
 }
