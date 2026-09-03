@@ -251,11 +251,18 @@ interface SpeculativeActionController {
 }
 
 export interface SpeculativeActionExtensionDependencies {
-	readonly createExecutionWorlds?: () => readonly SpeculativeAgentExecutionWorld[];
+	readonly createExecutionWorlds?: (
+		context: SpeculativeActionExecutionWorldContext,
+	) => readonly SpeculativeAgentExecutionWorld[];
 	readonly createHost?: typeof createSpeculativeActionHost;
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
+}
+
+export interface SpeculativeActionExecutionWorldContext {
+	readonly cwd: string;
+	readonly autoResizeImages: boolean;
 }
 
 export function normalizeSpeculativeActionSettings(
@@ -412,7 +419,10 @@ async function installController(
 		loadPiToolSettings(context),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
-	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.();
+	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.({
+		cwd: context.cwd,
+		autoResizeImages: piToolSettings.autoResizeImages,
+	});
 	const processBackend = configuredExecutionWorlds
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });

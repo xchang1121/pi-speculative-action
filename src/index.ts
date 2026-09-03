@@ -74,6 +74,7 @@ export {
 	formatSpeculativeActionStatus,
 	normalizeSpeculativeActionSettings,
 	resolveSpeculativeDraftModel,
+	type SpeculativeActionExecutionWorldContext,
 	type SpeculativeActionExtensionDependencies,
 	type SpeculativeActionMetrics,
 	type SpeculativeSettingsStore,

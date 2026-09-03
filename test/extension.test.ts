@@ -61,6 +61,14 @@ afterEach(async () => {
 });
 
 describe("zero-modification Pi extension", () => {
+	it("passes resolved workspace and image settings to execution-world factories", async () => {
+		const fixture = await createFixture();
+		await mkdir(path.join(fixture.cwd, ".pi"));
+		await writeFile(path.join(fixture.cwd, ".pi", "settings.json"), JSON.stringify({ images: { autoResize: false } }));
+		await fixture.emit("session_start", {}, fixture.context);
+		expect(fixture.createExecutionWorlds).toHaveBeenCalledWith({ cwd: fixture.cwd, autoResizeImages: false });
+	});
+
 	it("uses the actor model by default and accepts either the same or a different configured model", () => {
 		const actor = testModel("actor");
 		const draft = testModel("draft");
@@ -598,20 +606,21 @@ async function createFixture(options: FixtureOptions = {}) {
 				sourceInfo: toolSources.get(tool.name) ?? sourceInfo("unknown"),
 			})),
 	} as unknown as ExtensionAPI;
+	const createExecutionWorlds = vi.fn(() => options.executionWorlds ?? []);
 	const factory = createSpeculativeActionExtension({
 		createHost: (_sessionID, hostOptions) => {
 			getHostSettings = hostOptions.getSettings;
 			return host;
 		},
 		createSettingsStore: () => store,
-		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds: () => options.executionWorlds ?? [] }),
+		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds }),
 	});
 	await factory(pi);
 	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, eventContext);
 	};
 	return {
-		actorTools, baseTools, commands, context, customTools, cwd, emit, handlers, host,
+		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host,
 		hostSettings: async () => getHostSettings?.(), store, tools, ui,
 	};
 }
