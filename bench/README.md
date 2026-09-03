@@ -36,9 +36,10 @@ npm run bench:linux-process -- --output bench/results/local.json
 npm run bench:linux-inflight -- --output bench/results/local-inflight.json
 ```
 
-The in-flight qualification starts two Actor consumers while one PID-observing speculative Bash is
-running. Exactly one must validate and claim that result; the other must execute normally, and the
-one-shot certificate must never enter persistent history.
+The in-flight qualification lets one Actor arrive while a PID-observing speculative Bash is running,
+then repeats the same Actor action. The Runtime must validate and claim the branch exactly once; the
+second call must execute normally, and the one-shot result must never enter persistent history or a
+second top-level transfer registry.
 
 Pass `--workspace-driver git` or `--workspace-driver overlayfs` to the process
 and topology qualifications for a same-machine A/B. `auto` uses OverlayFS only
