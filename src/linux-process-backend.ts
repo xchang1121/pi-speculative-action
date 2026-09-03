@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
 	createExecPrototype,
 	digestObject,
+	dynamicDependencyIdentity,
 	type DynamicDependency,
 	type DynamicDependencyCertificate,
 	type ExecPrototype,
@@ -72,7 +73,7 @@ import {
 	type ProvenanceStoreOptions,
 	type VerifiedArtifactClosure,
 } from "./reuse-store.ts";
-import { observeStrace, straceCommand, type StraceObservation } from "./strace-observer.ts";
+import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import {
@@ -85,7 +86,7 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v13";
+const BACKEND_EPOCH = "pi-linux-process-v14";
 const POLICY_ID = "sandlock-namespaced-transparent-exec-v11";
 const LEAF_POLICY_ID = "sandlock-host-context-leaf-v1";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -1434,7 +1435,7 @@ function transactionDependencySource(
 async function captureDependencies(
 	session: ActiveSession,
 	before: WorkspaceDependencySource,
-	observed: readonly { readonly path: string; readonly role: "input" | "executable" | "shared_object" | "metadata" }[],
+	observed: readonly ObservedProcessPath[],
 	effects: readonly { readonly logicalPath: string; readonly relativePath: string; readonly before?: unknown }[],
 ): Promise<{
 	readonly complete: boolean;
@@ -1452,7 +1453,7 @@ async function captureDependencies(
 			incompleteReasons.add(reason);
 			return;
 		}
-		const identity = dependency.kind === "fd" ? `fd:${dependency.fd}` : `${dependency.kind}:${dependency.path}`;
+		const identity = dynamicDependencyIdentity(dependency);
 		const existing = dependencies.get(identity);
 		if (
 			existing?.kind === "file" &&
@@ -1466,7 +1467,7 @@ async function captureDependencies(
 
 	for (const item of observed) {
 		const observedPath = path.resolve(item.path);
-		if (STABLE_SANDBOX_DEVICES.has(observedPath) || interposedDirectoryFor(session, observedPath)) continue;
+		if (interposedDirectoryFor(session, observedPath)) continue;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {
 			taints.add("escaped_sandbox");
 			incompleteReasons.add(`denied:${observedPath}`);
@@ -1475,6 +1476,16 @@ async function captureDependencies(
 		const physical = pathContains(session.sourceRoot, observedPath)
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
+		if (item.role === "metadata") {
+			add({
+				kind: "metadata",
+				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical),
+				followSymlinks: item.followSymlinks,
+				digest: item.digest,
+			});
+			continue;
+		}
+		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
 		if (session.projection.isWorkspacePhysical(physical)) {
 			const logical = session.projection.toLogical(physical);
 			const [entry, parentEntry] = await Promise.all([before.entry(physical), before.parentEntry(physical)]);
@@ -1551,7 +1562,7 @@ function workspaceMetadataExclusions(session: ActiveSession, target: string): re
 
 async function captureHostPath(
 	physicalPath: string,
-	role: "input" | "executable" | "shared_object" | "metadata",
+	role: Exclude<ObservedProcessPath["role"], "metadata">,
 ): Promise<readonly DynamicDependency[]> {
 	const dependencies: DynamicDependency[] = [];
 	const normalized = path.resolve(physicalPath);
@@ -2364,7 +2375,7 @@ function mergeDependencyEvidence(
 		complete &&= certificate.complete;
 		for (const taint of certificate.taints) taints.add(taint);
 		for (const dependency of certificate.dependencies) {
-			const identity = dependency.kind === "fd" ? `fd:${dependency.fd}` : `${dependency.kind}:${dependency.path}`;
+			const identity = dynamicDependencyIdentity(dependency);
 			const existing = dependencies.get(identity);
 			if (
 				existing?.kind === "file" &&

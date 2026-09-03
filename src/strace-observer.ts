@@ -1,6 +1,11 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import type { DependencyRole, ProvenanceTaint } from "./provenance-certificate.ts";
+import {
+	type DependencyRole,
+	filesystemObservationDigest,
+	type ProvenanceTaint,
+	type Sha256Digest,
+} from "./provenance-certificate.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"seccomp", "capget", "capset", "mount", "umount2", "pivot_root", "swapon", "swapoff", "reboot",
@@ -9,7 +14,7 @@ const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
 	"io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
 ]);
-const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,fstat,fstatfs,getdents,getdents64,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -17,13 +22,17 @@ export function straceCommand(
 	tracePrefix: string,
 	command: readonly string[],
 ): readonly string[] {
-	return [strace, "-ff", "-qq", "-yy", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
+	return [strace, "-ff", "-qq", "-yy", "-v", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
 }
 
-interface ObservedProcessPath {
-	readonly path: string;
-	readonly role: DependencyRole;
-}
+export type ObservedProcessPath =
+	| { readonly path: string; readonly role: DependencyRole }
+	| {
+			readonly path: string;
+			readonly role: "metadata";
+			readonly followSymlinks: boolean;
+			readonly digest: Sha256Digest;
+	  };
 
 export interface StraceObservation {
 	readonly complete: boolean;
@@ -120,6 +129,7 @@ export async function observeStrace(
 	}
 
 	const paths = new Map<string, DependencyRole>();
+	const metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
 	const taints = new Set<ProvenanceTaint>();
 	const interposedExecutables = new Map(
 		(options.interposedExecutables ?? []).map(([intercepted, original]) => [
@@ -128,6 +138,19 @@ export async function observeStrace(
 	);
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
 	const ignoredSegments = ignoredProcessSegments(selected, byPID, interposedExecutables);
+	const observeMetadata = (observedPath: string, followSymlinks: boolean, digest: Sha256Digest) => {
+		const identity = `metadata:${followSymlinks}:${observedPath}`;
+		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
+			taints.add("mutable_input");
+			incompleteReasons.add(`metadata_changed:${observedPath}`);
+		}
+		metadata.set(identity, {
+			path: observedPath,
+			role: "metadata",
+			followSymlinks,
+			digest,
+		});
+	};
 	for (const [pid, start] of selected) {
 		const file = byPID.get(pid);
 		if (!file) continue;
@@ -175,6 +198,10 @@ export async function observeStrace(
 			) {
 				taints.add("unsupported_syscall");
 			}
+			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && syscallSucceeded(line)) {
+				taints.add("unsupported_syscall");
+				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
+			}
 			if (semanticRoots.length && workspaceDriverSemanticGap(line, syscall, cwd, semanticRoots)) {
 				complete = false;
 				taints.add("unsupported_syscall");
@@ -192,11 +219,28 @@ export async function observeStrace(
 				complete = false;
 				incompleteReasons.add(`fchdir:${pid}`);
 			}
+			if (MODELED_METADATA_SYSCALLS.has(syscall)) {
+				if (syscallSucceeded(line)) {
+					const metadataPaths = metadataSyscallPaths(line, syscall, cwd);
+					const digest = statObservationDigest(line);
+					if (!metadataPaths.length || !digest) {
+						taints.add("unsupported_syscall");
+						incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
+					}
+					if (digest) {
+						for (const observed of metadataPaths) observeMetadata(observed.path, observed.followSymlinks, digest);
+					}
+				} else {
+					for (const observed of syscallPaths(line, syscall, cwd)) {
+						if (paths.get(observed) !== "executable") paths.set(observed, "input");
+					}
+				}
+				continue;
+			}
 			if (!FILE_SYSCALLS.has(syscall)) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			for (const observed of syscallPaths(line, syscall, cwd)) {
-				const existing = paths.get(observed);
-				if (existing !== "executable") paths.set(observed, role);
+				if (paths.get(observed) !== "executable") paths.set(observed, role);
 			}
 		}
 		if (unfinished.size) {
@@ -208,10 +252,15 @@ export async function observeStrace(
 	return {
 		complete,
 		paths: Object.freeze(
-			[...paths].sort(([left], [right]) => left.localeCompare(right)).map(([observedPath, role]) => ({
-				path: observedPath,
-				role: sharedObjectRole(observedPath, role),
-			})),
+			[
+				...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role) })),
+				...metadata.values(),
+			]
+				.sort((left, right) =>
+					`${left.role}:${left.role === "metadata" ? left.followSymlinks : ""}:${left.path}`.localeCompare(
+						`${right.role}:${right.role === "metadata" ? right.followSymlinks : ""}:${right.path}`,
+					),
+				),
 		),
 		taints: Object.freeze([...taints].sort()),
 		tracedProcesses: [...selected].filter(([pid, start]) =>
@@ -241,13 +290,11 @@ const FILE_SYSCALLS = new Set([
 	"llistxattr",
 	"link",
 	"linkat",
-	"lstat",
 	"mkdir",
 	"mkdirat",
 	"mknod",
 	"mknodat",
 	"mount",
-	"newfstatat",
 	"open",
 	"openat",
 	"openat2",
@@ -259,9 +306,6 @@ const FILE_SYSCALLS = new Set([
 	"renameat",
 	"renameat2",
 	"rmdir",
-	"stat",
-	"statfs",
-	"statx",
 	"setxattr",
 	"lsetxattr",
 	"symlink",
@@ -273,6 +317,9 @@ const FILE_SYSCALLS = new Set([
 	"utimensat",
 	"utimes",
 ]);
+
+const MODELED_METADATA_SYSCALLS = new Set(["stat", "lstat", "fstat", "newfstatat"]);
+const UNMODELED_METADATA_SYSCALLS = new Set(["statx", "statfs", "fstatfs", "getdents", "getdents64"]);
 
 /** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
 const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
@@ -448,6 +495,109 @@ function syscallPaths(line: string, syscall: string, cwd: string): readonly stri
 	return values
 		.filter((value) => value.length > 0)
 		.map((value) => resolveObservedPath(value, base));
+}
+
+function metadataSyscallPaths(
+	line: string,
+	syscall: string,
+	cwd: string,
+): readonly { readonly path: string; readonly followSymlinks: boolean }[] {
+	const followSymlinks = syscall !== "lstat" && !/\bAT_SYMLINK_NOFOLLOW\b/.test(line);
+	const paths = syscall === "fstat" ? [] : syscallPaths(line, syscall, cwd);
+	if (paths.length) return paths.map((observedPath) => ({ path: observedPath, followSymlinks }));
+	if (syscall !== "fstat" && syscall !== "newfstatat") return [];
+	const descriptor = /^\s*(?:fstat|newfstatat)\(\d+<(.+?)>,/.exec(line)?.[1];
+	const descriptorPath = descriptor?.replace(/<[^<>]*>$/, "");
+	if (!descriptorPath?.startsWith("/") || descriptorPath.endsWith(" (deleted)")) return [];
+	return [{ path: path.posix.normalize(descriptorPath), followSymlinks }];
+}
+
+const STAT_MODE_BITS: Readonly<Record<string, bigint>> = {
+	S_IFSOCK: 0o140000n,
+	S_IFLNK: 0o120000n,
+	S_IFREG: 0o100000n,
+	S_IFBLK: 0o060000n,
+	S_IFDIR: 0o040000n,
+	S_IFCHR: 0o020000n,
+	S_IFIFO: 0o010000n,
+	S_ISUID: 0o004000n,
+	S_ISGID: 0o002000n,
+	S_ISVTX: 0o001000n,
+};
+
+/** Normalize the successful kernel stat structure printed by strace -v. */
+function statObservationDigest(line: string): Sha256Digest | undefined {
+	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);
+	const device = (name: string): bigint | undefined => {
+		const match = new RegExp(`\\b${name}=makedev\\(([^,]+),\\s*([^\\)]+)\\)`).exec(line);
+		if (!match) return field(name) ?? (name === "st_rdev" ? 0n : undefined);
+		const major = parseInteger(match[1]);
+		const minor = parseInteger(match[2]);
+		return major === undefined || minor === undefined ? undefined : linuxDevice(major, minor);
+	};
+	const modeText = /\bst_mode=([^,}]+)/.exec(line)?.[1]?.trim();
+	const mode = modeText?.split("|").reduce<bigint | undefined>((combined, token) => {
+		const bits = STAT_MODE_BITS[token] ?? parseInteger(token);
+		return bits === undefined || combined === undefined ? undefined : combined | bits;
+	}, 0n);
+	const evidence = {
+		dev: device("st_dev"),
+		ino: field("st_ino"),
+		mode,
+		nlink: field("st_nlink"),
+		uid: field("st_uid"),
+		gid: field("st_gid"),
+		rdev: device("st_rdev"),
+		size: field("st_size"),
+		blksize: field("st_blksize"),
+		blocks: field("st_blocks"),
+		atime: field("st_atime"),
+		atimeNsec: field("st_atime_nsec"),
+		mtime: field("st_mtime"),
+		mtimeNsec: field("st_mtime_nsec"),
+		ctime: field("st_ctime"),
+		ctimeNsec: field("st_ctime_nsec"),
+	};
+	if (Object.values(evidence).some((value) => value === undefined)) return undefined;
+	return filesystemObservationDigest({
+		dev: evidence.dev!,
+		ino: evidence.ino!,
+		mode: evidence.mode!,
+		nlink: evidence.nlink!,
+		uid: evidence.uid!,
+		gid: evidence.gid!,
+		rdev: evidence.rdev!,
+		size: evidence.size!,
+		blksize: evidence.blksize!,
+		blocks: evidence.blocks!,
+		atimeNs: evidence.atime! * 1_000_000_000n + evidence.atimeNsec!,
+		mtimeNs: evidence.mtime! * 1_000_000_000n + evidence.mtimeNsec!,
+		ctimeNs: evidence.ctime! * 1_000_000_000n + evidence.ctimeNsec!,
+	});
+}
+
+function parseInteger(value: string | undefined): bigint | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim();
+	try {
+		if (/^-?0x[0-9a-f]+$/i.test(normalized)) return BigInt(normalized);
+		if (/^-?0[0-7]+$/.test(normalized)) {
+			const negative = normalized.startsWith("-");
+			const magnitude = BigInt(`0o${normalized.replace(/^-?0/, "") || "0"}`);
+			return negative ? -magnitude : magnitude;
+		}
+		return /^-?[0-9]+$/.test(normalized) ? BigInt(normalized) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Linux's userspace-compatible new_encode_dev layout. */
+function linuxDevice(major: bigint, minor: bigint): bigint {
+	return ((major & 0xfffn) << 8n) |
+		(minor & 0xffn) |
+		((minor & ~0xffn) << 12n) |
+		((major & ~0xfffn) << 32n);
 }
 
 function resolveObservedPath(value: string, cwd: string): string {

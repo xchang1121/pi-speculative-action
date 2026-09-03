@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 5 as const;
+export const PROCESS_CERTIFICATE_VERSION = 6 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -24,6 +24,11 @@ export interface FilesystemMetadataEvidence {
 	readonly isDirectory: () => boolean;
 	readonly isSymbolicLink: () => boolean;
 }
+
+const FILESYSTEM_OBSERVATION_FIELDS = [
+	"dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs",
+] as const;
+export type FilesystemObservationEvidence = { readonly [Field in typeof FILESYSTEM_OBSERVATION_FIELDS[number]]: bigint };
 
 export interface ArtifactReference {
 	readonly digest: Sha256Digest;
@@ -85,7 +90,7 @@ export interface ProcessProducerProof {
 		  };
 }
 
-export type DependencyRole = "input" | "executable" | "shared_object" | "metadata";
+export type DependencyRole = "input" | "executable" | "shared_object";
 
 export type DynamicDependency =
 	| {
@@ -115,6 +120,13 @@ export type DynamicDependency =
 			readonly path: string;
 			readonly target: string;
 			readonly targetDigest: Sha256Digest;
+	  }
+	| {
+			/** Exact successful stat(2) result; content equality alone cannot prove this observation. */
+			readonly kind: "metadata";
+			readonly path: string;
+			readonly followSymlinks: boolean;
+			readonly digest: Sha256Digest;
 	  }
 	| {
 			readonly kind: "fd";
@@ -245,6 +257,8 @@ export function dependencyPathsetKey(certificate: DynamicDependencyCertificate):
 					};
 				case "symlink":
 					return { kind: dependency.kind, path: dependency.path };
+				case "metadata":
+					return { kind: dependency.kind, path: dependency.path, followSymlinks: dependency.followSymlinks };
 				case "fd":
 					return { kind: dependency.kind, fd: dependency.fd };
 			}
@@ -395,6 +409,10 @@ export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha2
 	});
 }
 
+export function filesystemObservationDigest(stat: FilesystemObservationEvidence): Sha256Digest {
+	return digestObject(Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map((field) => [field, String(stat[field])])));
+}
+
 export function isSha256Digest(value: unknown): value is Sha256Digest {
 	return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
 }
@@ -520,21 +538,22 @@ function normalizeDependencies(dependencies: readonly DynamicDependency[]): Dyna
 		}
 		return { ...dependency };
 	});
-	normalized.sort((left, right) => dependencyIdentity(left).localeCompare(dependencyIdentity(right)));
+	normalized.sort((left, right) => dynamicDependencyIdentity(left).localeCompare(dynamicDependencyIdentity(right)));
 	const seen = new Map<string, string>();
 	for (const dependency of normalized) {
-		const identity = dependencyIdentity(dependency);
+		const identity = dynamicDependencyIdentity(dependency);
 		const encoded = stableStringify(dependency);
 		const existing = seen.get(identity);
 		if (existing !== undefined && existing !== encoded) throw new Error(`conflicting dependency evidence for ${identity}`);
 		seen.set(identity, encoded);
 	}
-	return normalized.filter((dependency, index) => index === 0 || dependencyIdentity(dependency) !== dependencyIdentity(normalized[index - 1]!));
+	return normalized.filter((dependency, index) => index === 0 || dynamicDependencyIdentity(dependency) !== dynamicDependencyIdentity(normalized[index - 1]!));
 }
 
-function dependencyIdentity(dependency: DynamicDependency): string {
-	return dependency.kind === "fd"
-		? `fd:${dependency.fd}`
+export function dynamicDependencyIdentity(dependency: DynamicDependency): string {
+	if (dependency.kind === "fd") return `fd:${dependency.fd}`;
+	return dependency.kind === "metadata"
+		? `${dependency.kind}:${dependency.followSymlinks ? "follow" : "nofollow"}:${dependency.path}`
 		: `${dependency.kind}:${dependency.path}`;
 }
 
@@ -550,7 +569,7 @@ function validateDependency(dependency: DynamicDependency): void {
 	switch (dependency.kind) {
 		case "file":
 			if (
-				!["input", "executable", "shared_object", "metadata"].includes(dependency.role) ||
+				!["input", "executable", "shared_object"].includes(dependency.role) ||
 				!isSha256Digest(dependency.contentDigest) ||
 				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest))
 			) {
@@ -579,6 +598,13 @@ function validateDependency(dependency: DynamicDependency): void {
 				throw new Error("invalid symlink dependency");
 			}
 			break;
+		case "metadata":
+			if (typeof dependency.followSymlinks !== "boolean" || !isSha256Digest(dependency.digest)) {
+				throw new Error("invalid metadata dependency");
+			}
+			break;
+		default:
+			throw new Error("invalid dynamic dependency kind");
 	}
 }
 

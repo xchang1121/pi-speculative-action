@@ -16,6 +16,7 @@ import {
 	captureAbsenceDependency,
 	captureDirectoryDependency,
 	captureFileDependency,
+	captureMetadataDependency,
 	captureSymlinkDependency,
 	validateProcessCertificate,
 } from "../src/provenance-validation.ts";
@@ -38,6 +39,7 @@ describe("process provenance certificates", () => {
 		const root = await workspace();
 		await mkdir(path.join(root, "lib"));
 		await writeFile(path.join(root, "input.txt"), "one");
+		await writeFile(path.join(root, "metadata.txt"), "metadata");
 		await writeFile(path.join(root, "tool"), "executable");
 		await writeFile(path.join(root, "lib", "runtime.so"), "library");
 		let link: Awaited<ReturnType<typeof captureSymlinkDependency>> | undefined;
@@ -60,6 +62,7 @@ describe("process provenance certificates", () => {
 			"shared_object",
 		);
 		const directory = await captureDirectoryDependency(path.join(root, "lib"), "/workspace/lib");
+		const metadata = await captureMetadataDependency(path.join(root, "metadata.txt"), "/workspace/metadata.txt", true);
 		const absent = await captureAbsenceDependency(
 			path.join(root, "missing.txt"),
 			"/workspace/missing.txt",
@@ -72,6 +75,7 @@ describe("process provenance certificates", () => {
 				complete: true,
 				dependencies: [
 					input.dependency,
+					metadata,
 					executable.dependency,
 					library.dependency,
 					directory,
@@ -85,7 +89,6 @@ describe("process provenance certificates", () => {
 		const validation = await validateProcessCertificate(certificate, {
 			resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
 		});
-
 		expect(validation).toMatchObject({ status: "valid", filesRead: 3 });
 		expect(certificate.strongKey).toBe(
 			validation.status === "valid" ? validation.strongKey : undefined,
@@ -218,6 +221,8 @@ describe("process provenance certificates", () => {
 			includeMetadata: true,
 		});
 		const executable = await captureFileDependency(target, "/workspace/input.txt", "executable");
+		const followedMetadata = await captureMetadataDependency(target, "/workspace/input.txt", true);
+		const linkMetadata = { ...followedMetadata, followSymlinks: false } as const;
 		await mkdir(path.join(root, "directory"));
 		await mkdir(path.join(root, "directory", ".private"));
 		const fullDirectory = await captureDirectoryDependency(path.join(root, "directory"), "/workspace/directory");
@@ -243,6 +248,7 @@ describe("process provenance certificates", () => {
 
 		expect(key(contentOnly.dependency)).not.toBe(key(withMetadata.dependency));
 		expect(key(contentOnly.dependency)).not.toBe(key(executable.dependency));
+		expect(key(followedMetadata)).not.toBe(key(linkMetadata));
 		expect(key(fullDirectory)).not.toBe(key(projectedDirectory));
 		expect(key(absentWithParent)).not.toBe(key(absentWithoutParent));
 	});

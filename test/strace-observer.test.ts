@@ -15,6 +15,7 @@ describe("strace provenance decoder", () => {
 					[
 						'execve("/usr/bin/example", ["example"], 0x0) = 0',
 						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
+						'fstat(3</work/input.txt>, {st_dev=makedev(0x8, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=4, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
 						"clone(child_stack=NULL, flags=SIGCHLD) = 101",
 						"+++ exited with 0 +++",
 					].join("\n"),
@@ -23,7 +24,7 @@ describe("strace provenance decoder", () => {
 					`${prefix}.101`,
 					[
 						'execve("/usr/bin/child", ["child"], 0x0) = 0',
-						'newfstatat(AT_FDCWD, "relative.dat", {st_mode=S_IFREG|0644}, 0) = 0',
+						'newfstatat(AT_FDCWD, "relative.dat", {st_dev=makedev(0x8, 1), st_ino=43, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=5, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}, 0) = 0',
 						"+++ exited with 0 +++",
 					].join("\n"),
 				),
@@ -36,7 +37,8 @@ describe("strace provenance decoder", () => {
 					{ path: "/usr/bin/example", role: "executable" },
 					{ path: "/usr/bin/child", role: "executable" },
 					{ path: "/work/input.txt", role: "input" },
-					{ path: "/work/relative.dat", role: "input" },
+					{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
+					{ path: "/work/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
 				]),
 			);
 		} finally {
@@ -134,6 +136,7 @@ describe("strace provenance decoder", () => {
 					'clock_gettime(CLOCK_REALTIME, {tv_sec=1, tv_nsec=2}) = 0',
 					'getrandom("abc", 3, 0) = 3',
 					'getpid() = 2',
+					'fstat(1<pipe:[7]>, {st_dev=makedev(0, 0xf), st_ino=7, st_mode=S_IFIFO|0600, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=0, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
 					'prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1',
 					'openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)',
 					'clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)',
@@ -141,8 +144,9 @@ describe("strace provenance decoder", () => {
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
 			expect(observation.taints).toEqual(expect.arrayContaining([
-				"network", "clock", "random", "pid_observation", "confinement_observation",
+				"network", "clock", "random", "pid_observation", "confinement_observation", "unsupported_syscall",
 			]));
+			expect(observation.incompleteReasons).toContain("unparsed_metadata:fstat:400");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

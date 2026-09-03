@@ -1,4 +1,4 @@
-import { lstat, readFile, readdir, readlink } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, stat } from "node:fs/promises";
 import path from "node:path";
 import {
 	type DynamicDependency,
@@ -6,6 +6,7 @@ import {
 	digestObject,
 	filesystemEntryType,
 	filesystemMetadataDigest,
+	filesystemObservationDigest,
 	type ProcessProvenanceCertificate,
 	processStrongKey,
 	type ProvenanceTaint,
@@ -179,6 +180,16 @@ export async function validateDynamicDependencyCertificate(
 					}
 					break;
 				}
+				case "metadata": {
+					const dependency = await captureMetadataDependency(
+						physicalPath,
+						expected.path,
+						expected.followSymlinks,
+					);
+					current.push(dependency);
+					if (dependency.digest !== expected.digest) changed.push(expected.path);
+					break;
+				}
 			}
 		} catch (error) {
 			if (missing(error)) {
@@ -210,6 +221,20 @@ export async function validateDynamicDependencyCertificate(
 		filesRead,
 		bytesRead,
 		durationMs: elapsed(startedAt),
+	};
+}
+
+export async function captureMetadataDependency(
+	physicalPath: string,
+	logicalPath: string,
+	followSymlinks: boolean,
+): Promise<Extract<DynamicDependency, { kind: "metadata" }>> {
+	const observed = await (followSymlinks ? stat : lstat)(physicalPath, { bigint: true });
+	return {
+		kind: "metadata",
+		path: logicalPath,
+		followSymlinks,
+		digest: filesystemObservationDigest(observed),
 	};
 }
 

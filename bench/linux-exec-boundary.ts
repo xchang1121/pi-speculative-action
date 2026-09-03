@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +130,7 @@ async function conversionAblation() {
 #include <sys/random.h>
 #include <sys/prctl.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
 	if (argc > 2) {
@@ -137,6 +138,16 @@ int main(int argc, char **argv) {
 			struct timespec now;
 			unsigned char random;
 			if (clock_gettime(CLOCK_REALTIME, &now) < 0 || getrandom(&random, 1, 0) != 1 || getpid() <= 0) return 64;
+		} else if (*argv[2] == 'i') {
+			struct stat state;
+			char result[] = "0000000000000000\n";
+			if (stat("input.txt", &state) < 0) return 70;
+			for (int index = 15; index >= 0; index--) {
+				unsigned digit = (unsigned)(state.st_ino & 15);
+				result[index] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
+				state.st_ino >>= 4;
+			}
+			return write(1, result, sizeof(result) - 1) == sizeof(result) - 1 ? 0 : 71;
 		} else {
 			char result[] = "nnp:?\n";
 			int value = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
@@ -215,6 +226,30 @@ int main(int argc, char **argv) {
 			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
 			`confinement-sensitive result was reused: ${JSON.stringify(securityMetrics)}`,
 		);
+
+		const inodeBranch = await forkReusableBash(fixture, {
+			label: "held-inode-producer",
+			command: ": speculative-inode; worker unused inode",
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		const inodeBefore = replayBackend.metrics();
+		const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
+			.toString(16).padStart(16, "0");
+		let inodeHits = -1;
+		try {
+			const inodeActor = await actor.execute(
+				"held-inode-actor",
+				{ command: ": actor-inode; worker unused inode" },
+				new AbortController().signal,
+			);
+			const inodeMetrics = metricDelta(inodeBefore, replayBackend.metrics());
+			inodeHits = inodeMetrics.hits;
+			assert(textOutput(inodeActor).trim() === expectedInode, "Actor observed speculative inode metadata");
+			assert(inodeMetrics.hits === 0 && inodeMetrics.misses >= 1, "non-equivalent inode metadata was reused");
+		} finally {
+			await inodeBranch.dispose();
+		}
 
 		await Promise.all([
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
@@ -317,7 +352,12 @@ int main(int argc, char **argv) {
 		});
 		try {
 			assert(!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok", "native descriptor bypass changed output");
-			assert((await descriptorBranch.validate?.())?.status === "valid", "completed descriptor branch was not transferable");
+			const descriptorValidation = await descriptorBranch.validate?.();
+			assert(
+				descriptorValidation?.status === "indeterminate" &&
+				JSON.stringify(descriptorValidation).includes("unparsed_metadata:fstat"),
+				`descriptor metadata was not rejected exactly: ${JSON.stringify(descriptorValidation)}`,
+			);
 			const produced = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
 			assert(produced.wholeCommandPublished === 0, "descriptor command unexpectedly entered persistent history");
 			const descriptorBefore = fixture.backend.metrics();
@@ -325,7 +365,10 @@ int main(int argc, char **argv) {
 			const descriptorMetrics = metricDelta(descriptorBefore, fixture.backend.metrics());
 			assert(textOutput(descriptorActor) === "descriptor-ok", "completed descriptor transfer changed output");
 			assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "completed descriptor transfer changed its effect");
-			assert(descriptorMetrics.wholeCommandHits === 1, `completed descriptor command was not transferred: ${JSON.stringify(descriptorMetrics)}`);
+			assert(
+				descriptorMetrics.wholeCommandHits === 0 && descriptorMetrics.wholeCommandMisses >= 1,
+				`descriptor metadata did not force Actor execution: ${JSON.stringify(descriptorMetrics)}`,
+			);
 		} finally {
 			await descriptorBranch.dispose();
 		}
@@ -339,13 +382,18 @@ int main(int argc, char **argv) {
 			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnRejected: true },
-			inheritedDescriptor: { completedHandoffHits: 1 },
+			inheritedDescriptor: { completedHandoffHits: 0, exactMetadataFallback: true },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
 			confinementMismatch: {
 				producer: "nnp:1",
 				actor: "nnp:0",
 				hits: securityMetrics.hits,
 				rejection: securityMetrics.lastError,
+			},
+			metadataMismatch: {
+				speculativeDiffers: textOutput(inodeBranch.output.result).trim() !== expectedInode,
+				actorMatchedSource: true,
+				hits: inodeHits,
 			},
 		};
 	} finally {
