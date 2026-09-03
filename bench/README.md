@@ -121,14 +121,12 @@ and mount namespace:
 
 ```sh
 npm run bench:overlay-probe
-npm run bench:overlay-view
 ```
 
-These preserve the kernel OverlayFS experiments: the first inspects upper-layer
-records and the second proves that a parent can access a mount isolated in a
-helper namespace through `/proc/<pid>/root`. They are not the production driver:
-a later PID namespace can remount `/proc` and lose that path. The production
-driver therefore uses a host-visible, unprivileged FUSE mount. Its upperdir still
+This inspects upper-layer records for the retained production driver. The rejected
+private-mount experiment depended on `/proc/<pid>/root`; a later PID namespace can
+remount `/proc` and lose that path, so its standalone probe has been removed. The
+production driver uses a host-visible, unprivileged FUSE mount. Its upperdir still
 contains whiteouts and opaque markers and is decoded as a typed frontier; it is
 never merged into a workspace as an ordinary directory tree.
 

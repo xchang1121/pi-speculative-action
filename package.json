@@ -57,7 +57,6 @@
 		"bench:linux-inflight": "tsx ./bench/linux-process-inflight.ts",
 		"bench:exec-boundary": "tsx ./bench/linux-exec-boundary.ts",
 		"bench:overlay-probe": "sh ./bench/overlayfs-capability-probe.sh",
-		"bench:overlay-view": "tsx ./bench/overlayfs-namespace-view.ts",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"test": "vitest --run",
 		"prepack": "npm run build"
