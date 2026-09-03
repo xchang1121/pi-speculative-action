@@ -9,8 +9,6 @@ import type { ResourceValidation } from "./settlement.ts";
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
 export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
-/** @deprecated Use WorldReuseStrategy; this names world isolation policy, not an action-key reuse relation. */
-export type ActionReuseKind = WorldReuseStrategy;
 export type ExecutionWorldScope = "runtime" | "fallback";
 
 /** Correlation scope carried through every execution world without affecting cache identity. */

@@ -5,7 +5,8 @@ import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, r
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { asRecord, contains, slash } from "./action-semantics.ts";
+import { asRecord } from "./action-semantics.ts";
+import { contains, slash } from "./path-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,

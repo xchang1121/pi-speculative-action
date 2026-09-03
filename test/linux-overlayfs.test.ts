@@ -70,12 +70,9 @@ describe("Linux OverlayFS workspace substrate", () => {
 		registry.dispose();
 	});
 
-	it("proves copy-on-write isolation and visibility in descendant namespaces", async () => {
+	it("proves copy-on-write isolation and visibility in descendant namespaces", async ({ skip }) => {
 		const capability = await linuxOverlayfsCapability();
-		if (!capability.available) {
-			expect(capability.detail.length).toBeGreaterThan(0);
-			return;
-		}
+		if (!capability.available) return skip(capability.detail);
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-test-"));
 		const lowerRoot = path.join(root, "lower");
 		const privateRoot = path.join(root, "private");
@@ -104,10 +101,10 @@ describe("Linux OverlayFS workspace substrate", () => {
 		}
 	});
 
-	it("demotes the driver after a recovered unmount failure", async () => {
-		if (process.platform !== "linux") return;
+	it("demotes the driver after a recovered unmount failure", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
 		const host = await linuxOverlayfsCapability();
-		if (!host.available) return;
+		if (!host.available) return skip(host.detail);
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-health-test-"));
 		const lowerRoot = path.join(root, "lower");
 		const privateRoot = path.join(root, "private");

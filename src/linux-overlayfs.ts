@@ -2,13 +2,11 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
-	access,
 	lstat,
 	mkdir,
 	mkdtemp,
 	open,
 	readFile,
-	realpath,
 	rm,
 	writeFile,
 	type FileHandle,
@@ -16,6 +14,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import { resolveHostExecutable } from "./executable-path.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
@@ -567,12 +566,12 @@ function decodeMountInfoPath(value: string): string {
 }
 
 async function resolveOverlayfs(options: LinuxOverlayfsOptions): Promise<ResolvedOverlayfs> {
-	const binary = await resolveExecutable(
+	const binary = await resolveHostExecutable(
 		options.overlayfsBinary,
 		"fuse-overlayfs",
 		[path.join(os.homedir(), ".local", "bin", "fuse-overlayfs")],
 	);
-	const fusermountBinary = await resolveExecutable(options.fusermountBinary, "fusermount3", [], ["fusermount"]);
+	const fusermountBinary = await resolveHostExecutable(options.fusermountBinary, "fusermount3", [], ["fusermount"]);
 	const [version, kernel] = await Promise.all([
 		execText(binary, ["--version"]),
 		readFile("/proc/sys/kernel/osrelease", "utf8"),
@@ -600,35 +599,6 @@ function positiveCapacity(value: number | undefined, fallback: number): number {
 
 function nonNegativeDuration(value: number | undefined, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-async function resolveExecutable(
-	explicit: string | undefined,
-	name: string,
-	fallbacks: readonly string[],
-	alternateNames: readonly string[] = [],
-): Promise<string> {
-	for (const candidate of [explicit, ...fallbacks].filter((value): value is string => Boolean(value))) {
-		try {
-			await access(candidate, fsConstants.X_OK);
-			return await realpath(candidate);
-		} catch {
-			// Continue with PATH lookup.
-		}
-	}
-	for (const executable of [name, ...alternateNames]) {
-		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
-			if (!directory) continue;
-			const candidate = path.join(directory, executable);
-			try {
-				await access(candidate, fsConstants.X_OK);
-				return await realpath(candidate);
-			} catch {
-				// Continue.
-			}
-		}
-	}
-	throw new Error(`Executable not found: ${[name, ...alternateNames].join(" or ")}`);
 }
 
 function execText(executable: string, args: readonly string[]): Promise<string> {

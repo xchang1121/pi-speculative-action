@@ -55,9 +55,11 @@ import {
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
+import { resolveHostExecutable } from "./executable-path.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
+	listenUnixSocket,
 	resolveLinuxExecHelper,
 	type HeldExecDecision,
 	type HeldExecProcess,
@@ -87,6 +89,7 @@ import {
 	type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
+import { contains as pathContains, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-v15";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
@@ -488,7 +491,7 @@ export class LinuxProcessReuseBackend {
 			metrics: { ...emptyWorldReuseMetrics() },
 			closed: false,
 		});
-		await listen(server, socketPath);
+		await listenUnixSocket(server, socketPath);
 		const close = async () => {
 			if (session.closed) return;
 			session.closed = true;
@@ -535,10 +538,10 @@ export class LinuxProcessReuseBackend {
 		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
 		const [sandlock, strace, dispatcher] = await Promise.all([
-			resolveBinary(this.options.sandlockBinary, "pi-speculative-sandlock", [
+			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [
 				path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock"),
 			]),
-			resolveBinary(this.options.straceBinary, "strace"),
+			resolveHostExecutable(this.options.straceBinary, "strace"),
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
 		const [sandlockCheck, sandlockVersion, straceVersion, platformFingerprint] = await Promise.all([
@@ -577,7 +580,6 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
-		const requestStarted = performance.now();
 		if (session.closed) throw new Error("Linux process session is closed");
 		const ready = await this.resolveReady();
 		assertInvocationMatches(session.invocation, request);
@@ -598,7 +600,7 @@ export class LinuxProcessReuseBackend {
 			(candidate) => compatibleProducer(session.producer, candidate),
 			session,
 		);
-		if (plan) return this.replayTopLevel(session, plan, request, requestStarted);
+		if (plan) return this.replayTopLevel(session, plan, request);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -676,7 +678,6 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		request: ProcessExecutionRequest,
-		requestStarted: number,
 	): Promise<{ exitCode: number | null }> {
 		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
@@ -899,7 +900,6 @@ export class LinuxProcessReuseBackend {
 				sink: "buffered",
 				orderedJournal: true,
 				transactionalEffects: true,
-				mode: "completed_replay",
 			},
 			validation: {
 				resolvePath: (logicalPath) => projection.toPhysical(logicalPath),
@@ -2333,44 +2333,11 @@ function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readon
 	);
 }
 
-async function resolveBinary(explicit: string | undefined, name: string, fallbacks: readonly string[] = []): Promise<string> {
-	for (const candidate of [explicit, ...fallbacks].filter((value): value is string => Boolean(value))) {
-		try {
-			await access(candidate, fsConstants.X_OK);
-			return await realpath(candidate);
-		} catch {
-			// Try PATH.
-		}
-	}
-	const pathValue = process.env.PATH ?? "";
-	for (const directory of pathValue.split(path.delimiter)) {
-		if (!directory) continue;
-		const candidate = path.join(directory, name);
-		try {
-			await access(candidate, fsConstants.X_OK);
-			return await realpath(candidate);
-		} catch {
-			// Continue.
-		}
-	}
-	throw new Error(`${name} executable not found`);
-}
-
 function execText(executable: string, args: readonly string[]): Promise<string> {
 	return new Promise((resolve, reject) => {
 		execFile(executable, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
 			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));
 			else resolve(`${stdout}${stderr}`);
-		});
-	});
-}
-
-function listen(server: net.Server, socketPath: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(socketPath, () => {
-			server.off("error", reject);
-			resolve();
 		});
 	});
 }
@@ -2513,15 +2480,6 @@ function sensitivePaths(storeRoot: string, additional: readonly string[] | undef
 			.map((value) => path.resolve(value))
 			.filter((value, index, values) => values.indexOf(value) === index),
 	);
-}
-
-function pathContains(root: string, target: string): boolean {
-	const relative = path.relative(path.resolve(root), path.resolve(target));
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function slash(value: string): string {
-	return value.replaceAll("\\", "/");
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

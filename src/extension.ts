@@ -1866,7 +1866,6 @@ function hasProcessReuse(reuse: WorldReuseMetrics): boolean {
 
 function formatProcessWorkReuse(reuse: WorldReuseMetrics): string {
 	const hits = reuse.hits + reuse.wholeCommandHits;
-	const requests = reuse.requests + reuse.wholeCommandRequests;
 	const workMs = reuse.reusedProcessMs + reuse.wholeCommandReusedProcessMs;
 	return [
 		reuse.wholeCommandRequests ? `whole ${formatRatio(reuse.wholeCommandHits, reuse.wholeCommandRequests)}` : "",

@@ -101,7 +101,7 @@ export class LinuxHeldExecBoundary {
 			? candidate
 			: path.join(os.tmpdir(), `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const boundary = new LinuxHeldExecBoundary(binary, socketPath);
-		await listen(boundary.server, socketPath);
+		await listenUnixSocket(boundary.server, socketPath);
 		await chmod(socketPath, 0o600);
 		return boundary;
 	}
@@ -392,7 +392,7 @@ async function write(socket: net.Socket, data: Buffer): Promise<void> {
 	});
 }
 
-function listen(server: net.Server, socketPath: string): Promise<void> {
+export function listenUnixSocket(server: net.Server, socketPath: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(socketPath, () => {

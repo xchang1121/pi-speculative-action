@@ -3,7 +3,6 @@ import {
 	dependencyPathsetKey,
 	type DynamicDependencyCertificate,
 	type ExecPrototype,
-	type OrderedEffectEvent,
 	type ProcessProducerProof,
 	processStrongKey,
 	processWeakKey,
@@ -23,12 +22,6 @@ export interface ReplayObservationContract {
 	readonly sink: "buffered" | "pipe" | "tty" | "interactive";
 	readonly orderedJournal: boolean;
 	readonly transactionalEffects: boolean;
-	readonly mode: "completed_replay" | "artifact_seed";
-	/** Explicit consumer contract required before file artifacts may be seeded into a later execution. */
-	readonly seed?: {
-		readonly acceptedPaths: readonly string[];
-		readonly preconditionsValidated: true;
-	};
 }
 
 export interface ProcessReuseRequest {
@@ -51,8 +44,7 @@ export type ProcessReuseMissReason =
 	| "dependency_changed"
 	| "validation_indeterminate"
 	| "artifact_missing"
-	| "observation_contract_incompatible"
-	| "no_seedable_effects";
+	| "observation_contract_incompatible";
 
 export interface ProcessReuseLookupMetrics {
 	readonly candidateCertificates: number;
@@ -71,16 +63,6 @@ export type ProcessReusePlan =
 			readonly source: "live" | "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
-			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
-			readonly artifacts: VerifiedArtifactClosure;
-			readonly lookup: ProcessReuseLookupMetrics;
-	  }
-	| {
-			readonly kind: "artifact_seed";
-			readonly source: "live" | "l2";
-			readonly weakKey: Sha256Digest;
-			readonly certificate: ProcessProvenanceCertificate;
-			readonly effects: readonly Extract<OrderedEffectEvent, { kind: "workspace" }>[];
 			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
 			readonly artifacts: VerifiedArtifactClosure;
 			readonly lookup: ProcessReuseLookupMetrics;
@@ -198,32 +180,11 @@ export class ProcessReusePlanner {
 				}
 				artifactsLoaded += artifacts.artifacts;
 				artifactBytesRead += artifacts.bytes;
-				if (request.contract.mode === "completed_replay") {
-					return {
-						kind: "completed_replay",
-						source: live ? "live" : "l2",
-						weakKey,
-						certificate,
-						validation,
-						artifacts,
-						lookup: lookup(),
-					};
-				}
-				const accepted = new Set(request.contract.seed?.acceptedPaths ?? []);
-				const effects = certificate.result.journal.filter(
-					(event): event is Extract<OrderedEffectEvent, { kind: "workspace" }> =>
-						event.kind === "workspace" && event.after.kind === "file" && accepted.has(event.path),
-				);
-				if (!effects.length) {
-					reasons.add("no_seedable_effects");
-					continue;
-				}
 				return {
-					kind: "artifact_seed",
+					kind: "completed_replay",
 					source: live ? "live" : "l2",
 					weakKey,
 					certificate,
-					effects,
 					validation,
 					artifacts,
 					lookup: lookup(),
@@ -257,11 +218,5 @@ function contractCompatible(
 ): boolean {
 	if (!contract.orderedJournal || !contract.transactionalEffects) return false;
 	if (contract.sink !== "buffered") return false;
-	if (
-		contract.mode === "artifact_seed" &&
-		(!contract.seed?.preconditionsValidated || contract.seed.acceptedPaths.length === 0)
-	) {
-		return false;
-	}
 	return certificate.result.replayProfile === "buffered_noninteractive";
 }

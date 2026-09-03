@@ -1,6 +1,7 @@
 import type { Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
+import { contains, slash } from "./path-utils.ts";
 import type { DynamicDependency, Sha256Digest } from "./provenance-certificate.ts";
 import {
 	digestObject,
@@ -41,15 +42,15 @@ export class ExecutionPathProjection {
 
 	toLogical(physicalPath: string): string {
 		const physical = path.resolve(physicalPath);
-		if (!pathContains(this.workspaceRoot, physical)) return slash(physical);
+		if (!contains(this.workspaceRoot, physical)) return slash(physical);
 		return slash(path.join(this.sourceRoot, path.relative(this.workspaceRoot, physical)));
 	}
 
 	toPhysical(logicalPath: string): string | undefined {
 		const logical = path.resolve(logicalPath);
-		if (!pathContains(this.sourceRoot, logical)) return logical;
+		if (!contains(this.sourceRoot, logical)) return logical;
 		const physical = path.resolve(this.workspaceRoot, path.relative(this.sourceRoot, logical));
-		return pathContains(this.workspaceRoot, physical) ? physical : undefined;
+		return contains(this.workspaceRoot, physical) ? physical : undefined;
 	}
 
 	normalizeValue(value: string): string {
@@ -59,7 +60,7 @@ export class ExecutionPathProjection {
 	}
 
 	isWorkspacePhysical(physicalPath: string): boolean {
-		return pathContains(this.workspaceRoot, path.resolve(physicalPath));
+		return contains(this.workspaceRoot, path.resolve(physicalPath));
 	}
 }
 
@@ -442,13 +443,4 @@ function replacePath(value: string, from: string, to: string): string {
 	let replaced = value;
 	for (const variant of variants) replaced = replaced.split(variant).join(to);
 	return replaced;
-}
-
-function pathContains(root: string, target: string): boolean {
-	const relative = path.relative(root, target);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function slash(value: string): string {
-	return value.replaceAll("\\", "/");
 }

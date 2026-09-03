@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { slash } from "./path-utils.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 
@@ -14,7 +15,7 @@ export type StableFileCapture = {
 
 /** A conservative path identity: never fold case that the backing volume may distinguish. */
 export function filesystemPathKey(value: string): string {
-	return path.resolve(value).replaceAll("\\", "/");
+	return slash(path.resolve(value));
 }
 
 export function containsFilesystemPath(parent: string, child: string): boolean {

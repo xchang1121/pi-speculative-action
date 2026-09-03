@@ -28,8 +28,10 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("rejects adoption when the COW driver forces a handled cross-device rename", async () => {
-		if (process.platform !== "linux" || !(await linuxOverlayfsCapability()).available) return;
+	test("rejects adoption when the COW driver forces a handled cross-device rename", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const overlay = await linuxOverlayfsCapability();
+		if (!overlay.available) return skip(overlay.detail);
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-driver-semantics-"));
 		const workspace = path.join(root, "workspace");
 		const storeRoot = path.join(root, "store");

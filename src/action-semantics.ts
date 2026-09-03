@@ -1,4 +1,5 @@
 import path from "node:path";
+import { contains, slash } from "./path-utils.ts";
 import {
 	type EffectRequirements,
 	normalizeEffectRequirements,
@@ -348,14 +349,6 @@ export function actionKeyMatches(
 	return actionKeyMatch(speculative, actor, projectors) !== undefined;
 }
 
-export function actionKeyProjects(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[],
-): boolean {
-	return actionKeyMatch(speculative, actor, projectors)?.kind === "projected";
-}
-
 /** K(a_s) covers K(a) without relying on completed-output coverage. */
 export function actionKeyCovers(
 	speculative: ActionKey,
@@ -534,15 +527,6 @@ function finiteOrUndefined(value: unknown): number | undefined {
 export function asRecord(value: unknown): Record<string, unknown> | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	return value as Record<string, unknown>;
-}
-
-export function slash(value: string): string {
-	return value.replaceAll("\\", "/");
-}
-
-export function contains(root: string, target: string): boolean {
-	const relative = path.relative(root, target);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined {

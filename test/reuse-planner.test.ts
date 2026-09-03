@@ -30,7 +30,7 @@ describe("ProcessReusePlanner", () => {
 		const planner = new ProcessReusePlanner({ store: fixture.store });
 		const plan = await planner.plan({
 			prototype: fixture.prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		});
 
@@ -46,7 +46,7 @@ describe("ProcessReusePlanner", () => {
 		expect(
 			await planner.plan({
 				prototype: fixture.prototype,
-				contract: contract("completed_replay"),
+				contract: contract(),
 				validation: { resolvePath: () => fixture.input },
 			}),
 		).toMatchObject({
@@ -56,31 +56,25 @@ describe("ProcessReusePlanner", () => {
 		});
 	});
 
-	it("requires a buffered transactional observation contract and can salvage file artifacts", async () => {
-		const fixture = await fixtureWithCertificate(true);
+	it("requires a buffered transactional observation contract", async () => {
+		const fixture = await fixtureWithCertificate();
 		const planner = new ProcessReusePlanner({ store: fixture.store });
 		const validation = { resolvePath: () => fixture.input };
 
 		expect(
 			await planner.plan({
 				prototype: fixture.prototype,
-				contract: { ...contract("completed_replay"), sink: "pipe" },
+				contract: { ...contract(), sink: "pipe" },
 				validation,
 			}),
 		).toMatchObject({ kind: "miss", reasons: ["observation_contract_incompatible"] });
-		const salvage = await planner.plan({
-			prototype: fixture.prototype,
-			contract: contract("artifact_seed"),
-			validation,
-		});
-		expect(salvage).toMatchObject({ kind: "artifact_seed", effects: [{ kind: "workspace" }] });
 	});
 
 	it("lets the execution authority reject an otherwise matching producer proof", async () => {
 		const fixture = await fixtureWithCertificate();
 		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
 			prototype: fixture.prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 			acceptProducer: () => false,
 		});
@@ -93,7 +87,7 @@ describe("ProcessReusePlanner", () => {
 		const planner = new ProcessReusePlanner({ store: fixture.store });
 		const request = {
 			prototype: fixture.prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		};
 		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["certificate_tainted"] });
@@ -108,7 +102,7 @@ describe("ProcessReusePlanner", () => {
 		const get = vi.spyOn(fixture.store.artifacts, "get");
 		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
 			prototype: fixture.prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		});
 		expect(plan).toMatchObject({
@@ -141,7 +135,7 @@ describe("ProcessReusePlanner", () => {
 		const planner = new ProcessReusePlanner({ store: fixture.store });
 		const request = {
 			prototype: fixture.prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		};
 
@@ -186,7 +180,7 @@ describe("ProcessReusePlanner", () => {
 
 		const plan = await new ProcessReusePlanner({ store }).plan({
 			prototype,
-			contract: contract("completed_replay"),
+			contract: contract(),
 			validation: { resolvePath: () => input },
 		});
 
@@ -258,15 +252,11 @@ function processPrototype() {
 	});
 }
 
-function contract(mode: "completed_replay" | "artifact_seed") {
+function contract() {
 	return {
-		mode,
 		sink: "buffered" as const,
 		orderedJournal: true,
 		transactionalEffects: true,
-		...(mode === "artifact_seed"
-			? { seed: { acceptedPaths: ["/workspace/out.bin"], preconditionsValidated: true as const } }
-			: {}),
 	};
 }
 

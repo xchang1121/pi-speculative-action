@@ -102,8 +102,9 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("qualifies auto OverlayFS by the exact immutable baseline size", async () => {
-		if (!(await linuxOverlayfsCapability()).available) return;
+	it("qualifies auto OverlayFS by the exact immutable baseline size", async ({ skip }) => {
+		const overlay = await linuxOverlayfsCapability();
+		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot("overlay-auto-cost");
 		try {
 			await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
@@ -191,8 +192,9 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("seals copy-ups, creations, and whiteouts from the typed OverlayFS frontier", async () => {
-		if (!(await linuxOverlayfsCapability()).available) return;
+	it("seals copy-ups, creations, and whiteouts from the typed OverlayFS frontier", async ({ skip }) => {
+		const overlay = await linuxOverlayfsCapability();
+		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot("overlay-frontier");
 		try {
 			await mkdir(path.join(root, "replaced"));
@@ -244,10 +246,10 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("quarantines an unverified live mount without blocking pool shutdown", async () => {
-		if (process.platform !== "linux") return;
+	it("quarantines an unverified live mount without blocking pool shutdown", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
 		const host = await linuxOverlayfsCapability();
-		if (!host.available) return;
+		if (!host.available) return skip(host.detail);
 		const root = await temporaryRoot("overlay-quarantine");
 		const marker = path.join(root, "probe-unmounted");
 		const retainedTarget = path.join(root, "retained-mount");
@@ -629,8 +631,8 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("poisons reuse if the private change-clock identity is replaced", async () => {
-		if (process.platform === "win32") return;
+	it("poisons reuse if the private change-clock identity is replaced", async ({ skip }) => {
+		if (process.platform === "win32") return skip("hard-link identity semantics differ on Windows");
 		const root = await temporaryRoot("transaction-clock");
 		try {
 			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
@@ -650,8 +652,8 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("marks unsupported inode transitions incomplete without undoing the operation", async () => {
-		if (process.platform === "win32") return;
+	it("marks unsupported inode transitions incomplete without undoing the operation", async ({ skip }) => {
+		if (process.platform === "win32") return skip("symlink creation requires Windows privileges");
 		const root = await temporaryRoot("transaction-inode");
 		try {
 			await writeFile(path.join(root, "target.txt"), "target\n", "utf8");

@@ -10,10 +10,9 @@ This runner measures one speculative execution and reconstructs its serialized
 counterfactual from the same authoritative timeline. It never compares against
 a separately generated Actor trajectory.
 
-Ablation reports, preregistrations, and private recordings are intentionally
-kept outside this repository. The checked-in runner and suites remain the
-reproducible measurement surface. Machine-qualification results for the Linux
-process substrate contain no prompts or model data and live under `results/`.
+Ablation preregistrations, private recordings, and raw JSON runs are intentionally
+kept outside this repository. The checked-in runners remain the reproducible
+measurement surface.
 
 Measure the cost and semantic boundary of pass-through process tracing separately from provenance
 capture. The runner compares a fork/exec-event-only ptrace loop, ordinary process-filtered strace,

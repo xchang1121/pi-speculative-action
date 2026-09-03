@@ -59,6 +59,7 @@ describe("ActionSemanticsRegistry", () => {
 			input: { path: ".", limit: 500 },
 		});
 		expect(buildPiActionKey("ls", { path: "../outside" }, "/workspace")).toBeUndefined();
+		expect(buildPiActionKey("ls", { path: "..cache" }, "/workspace")).toBeDefined();
 		expect(buildPiActionKey("ls", { limit: 0 }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("ls", { limit: 1.5 }, "/workspace")).toBeUndefined();
 	});

@@ -21,7 +21,6 @@ export {
 	type ActionKeyMismatchReason,
 	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
-	actionKeyProjects,
 	BASH_TAIL_LINES_ACTION_KEY_PROJECTOR,
 	type BashTailLinesView,
 	bashTailLinesView,
@@ -67,7 +66,7 @@ export {
 	type SpeculativeToolSelectionInput,
 } from "./common.ts";
 export { calculateContextTokens as usageTokenCount } from "@earendil-works/pi-agent-core";
-export type { ActionReuseKind, ExecutionScope } from "./execution-world.ts";
+export type { ExecutionScope } from "./execution-world.ts";
 export {
 	createSpeculativeActionExtension,
 	type EffectiveSpeculativeActionSettings,

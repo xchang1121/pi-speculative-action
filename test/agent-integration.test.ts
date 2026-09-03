@@ -377,7 +377,7 @@ describe("speculative action host", () => {
 			},
 		};
 		const sandbox = mockRuntimeWorld(
-			async (context) => {
+			async () => {
 				sandboxExecutions++;
 				await sandboxGate;
 				const text = `${Array.from({ length: 60 }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
