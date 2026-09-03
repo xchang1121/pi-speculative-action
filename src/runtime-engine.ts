@@ -21,6 +21,7 @@ import {
 } from "./candidate-stores.ts";
 import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
 import { diagnosticAction } from "./diagnostics.ts";
+import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
 import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
@@ -2174,7 +2175,9 @@ export function makeStructuralSpeculativeActionRuntime<
 					const committed = await branch.commit();
 					if (choice.match.kind === "exact") output = committed;
 				} catch (error) {
-					const failure = cause("commit", "world_commit_failed", errorDetail(error));
+					const commitFailure = effectCommitFailure(error, "poisoned");
+					if (isPoisonedEffectCommit(commitFailure)) throw commitFailure;
+					const failure = cause("commit", "world_commit_failed", errorDetail(commitFailure));
 					attempt.rejectCandidate(candidate.id, choice.match, failure);
 					discardCandidate(state.session, candidate, failure);
 					continue;

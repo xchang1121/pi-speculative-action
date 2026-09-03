@@ -44,11 +44,15 @@ export {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
 export {
+	type EffectCommitDisposition,
+	EffectCommitFailure,
+	effectCommitFailure,
 	type EffectTransaction,
 	EffectTransactionCoordinator,
 	type EffectTransactionAttempt,
 	type EffectTransactionDescriptor,
 	type EffectTransactionState,
+	isPoisonedEffectCommit,
 } from "./effect-transaction.ts";
 export {
 	type CapturedExecutionWorldResult,

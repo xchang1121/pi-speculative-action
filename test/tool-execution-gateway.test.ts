@@ -4,6 +4,7 @@ import {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
 import type { ExecutionWorld } from "../src/execution-world.ts";
+import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway, type ToolOperation } from "../src/tool-execution-gateway.ts";
 
 type TestContext = { readonly value: string };
@@ -121,6 +122,19 @@ describe("ToolExecutionGateway", () => {
 		expect(observer).toHaveBeenCalledWith(
 			expect.objectContaining({ status: "failed", error: failure, durationMs: expect.any(Number) }),
 		);
+	});
+
+	it("never starts the Actor after an indeterminate reuse commit", async () => {
+		const gateway = new ToolExecutionGateway<TestContext, string>([]);
+		const executor = vi.fn(async () => "actor");
+		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
+
+		await expect(
+			gateway.executeAuthoritative({ tool: "write", input: {} }, executor, {
+				reuse: async () => Promise.reject(poisoned),
+			}),
+		).rejects.toBe(poisoned);
+		expect(executor).not.toHaveBeenCalled();
 	});
 });
 

@@ -54,6 +54,7 @@ import {
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
 import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
+import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -399,7 +400,7 @@ export class LinuxProcessReuseBackend {
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
 					this.counters.lastError = `actor_replay:${errorMessage(error)}`;
-					if (committed || error instanceof AggregateError) throw error;
+					if (committed || isPoisonedEffectCommit(error)) throw error;
 					return this.actorReplayMiss(host, request);
 				}
 			},

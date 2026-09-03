@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { type EffectTransaction, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
+import {
+	effectCommitFailure,
+	type EffectTransaction,
+	EffectTransactionCoordinator,
+} from "../src/effect-transaction.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "../src/execution-world.ts";
 
 const route: SpeculativeExecutionRoute = {
@@ -109,6 +113,46 @@ describe("EffectTransactionCoordinator", () => {
 		await abandoned.dispose();
 		expect(disposeCapture).toHaveBeenCalledOnce();
 		expect(abandonedAttempt.state).toBe("aborted");
+	});
+
+	it("distinguishes restored failures from indeterminate partial commits", async () => {
+		for (const disposition of ["recoverable", "poisoned"] as const) {
+			const dispose = vi.fn();
+			const failure = effectCommitFailure(new Error("commit failed"), disposition);
+			const coordinator = new EffectTransactionCoordinator<string>();
+			const transaction = await coordinator.execute(
+				coordinator.begin({ tool: "write", route }),
+				async () =>
+					branch({
+						validate: async () => ({ status: "valid", metrics: metrics() }),
+						commit: async () => Promise.reject(failure),
+						dispose,
+					}),
+			);
+			await transaction.validate();
+
+			await expect(transaction.commit()).rejects.toBe(failure);
+			expect(transaction.state).toBe(disposition === "poisoned" ? "poisoned" : "failed");
+			await transaction.abort();
+			expect(transaction.state).toBe(disposition === "poisoned" ? "poisoned" : "aborted");
+			expect(dispose).toHaveBeenCalledOnce();
+		}
+	});
+
+	it("treats an unclassified backend commit failure as poisoned", async () => {
+		const coordinator = new EffectTransactionCoordinator<string>();
+		const transaction = await coordinator.execute(
+			coordinator.begin({ tool: "custom", route }),
+			async () =>
+				branch({
+					validate: async () => ({ status: "valid", metrics: metrics() }),
+					commit: async () => Promise.reject(new Error("unknown state")),
+				}),
+		);
+		await transaction.validate();
+
+		await expect(transaction.commit()).rejects.toMatchObject({ disposition: "poisoned" });
+		expect(transaction.state).toBe("poisoned");
 	});
 });
 

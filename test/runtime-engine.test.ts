@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
+import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	emptyWorldReuseMetrics,
 	type SpeculativeExecutionRoute,
@@ -1189,6 +1190,33 @@ describe("structural speculative runtime", () => {
 
 		expect(await fixture.runtime.consume(call("turn", { path: "README.md", offset: 10, limit: 10 }))).toBeUndefined();
 		expect(commit).not.toHaveBeenCalled();
+	});
+
+	it("propagates an indeterminate commit instead of authorizing Actor fallback", async () => {
+		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
+		const source: Source = {
+			id: "source",
+			enabled: () => true,
+			propose: () => plan("source", "poisoned", { path: "README.md" }),
+		};
+		const fixture = harness({
+			source,
+			execute: () => ({
+				output: "speculative",
+				backend: "resource_version",
+				resources: [],
+				capturedBytes: 0,
+				executionMetrics: {},
+				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: "" },
+				commit: async () => Promise.reject(poisoned),
+				dispose: () => {},
+			}),
+		});
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await waitFor(() => fixture.runtime.inspect().sharedCandidates === 1);
+
+		await expect(fixture.runtime.consume(call("turn", { path: "README.md" }))).rejects.toBe(poisoned);
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
 	it("ignores a covering action that cannot prove K(a) containment", async () => {

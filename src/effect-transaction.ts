@@ -12,7 +12,33 @@ export type EffectTransactionState =
 	| "committed"
 	| "aborting"
 	| "aborted"
+	| "poisoned"
 	| "failed";
+
+export type EffectCommitDisposition = "recoverable" | "poisoned";
+
+/** A commit failure whose disposition decides whether authoritative execution may still begin. */
+export class EffectCommitFailure extends Error {
+	readonly disposition: EffectCommitDisposition;
+
+	constructor(disposition: EffectCommitDisposition, message: string, cause: unknown) {
+		super(message, { cause });
+		this.name = "EffectCommitFailure";
+		this.disposition = disposition;
+	}
+}
+
+export function effectCommitFailure(
+	error: unknown,
+	disposition: EffectCommitDisposition,
+	message = error instanceof Error ? error.message : String(error),
+): EffectCommitFailure {
+	return error instanceof EffectCommitFailure ? error : new EffectCommitFailure(disposition, message, error);
+}
+
+export function isPoisonedEffectCommit(error: unknown): error is EffectCommitFailure {
+	return error instanceof EffectCommitFailure && error.disposition === "poisoned";
+}
 
 export interface EffectTransactionDescriptor {
 	readonly tool: string;
@@ -211,7 +237,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 
 	async validate(): Promise<ResourceValidation> {
 		if (this.validationPromise) return this.validationPromise;
-		if (["aborted", "aborting", "failed"].includes(this.attempt.stateValue)) {
+		if (["aborted", "aborting", "poisoned", "failed"].includes(this.attempt.stateValue)) {
 			return {
 				status: "indeterminate",
 				cause: cause("freshness", "transaction_unavailable"),
@@ -268,8 +294,13 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 				this.attempt.stateValue = "committed";
 				return output;
 			} catch (error) {
-				this.attempt.stateValue = "failed";
-				throw error;
+				const failure = effectCommitFailure(
+					error,
+					"poisoned",
+					"effect commit failed without proof that its side effects were restored",
+				);
+				this.attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "failed";
+				throw failure;
 			}
 		})();
 		this.commitPromise = pending;
@@ -279,16 +310,17 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	abort(): Promise<void> {
 		if (this.cleanupPromise) return this.cleanupPromise;
 		const committed = this.attempt.stateValue === "committed";
+		const poisoned = this.attempt.stateValue === "poisoned";
 		const committing = this.commitPromise;
 		const validating = this.validationPromise;
-		if (!committed && !committing) this.attempt.stateValue = "aborting";
+		if (!committed && !poisoned && !committing) this.attempt.stateValue = "aborting";
 		const pending = (async () => {
 			try {
 				await validating?.catch(() => undefined);
 				await committing?.catch(() => undefined);
 				await this.branch.dispose();
 			} finally {
-				if (this.attempt.stateValue !== "committed") this.attempt.stateValue = "aborted";
+				if (!["committed", "poisoned"].includes(this.attempt.stateValue)) this.attempt.stateValue = "aborted";
 			}
 		})();
 		this.cleanupPromise = pending;

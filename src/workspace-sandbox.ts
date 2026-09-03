@@ -15,6 +15,7 @@ import type {
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
+import { effectCommitFailure } from "./effect-transaction.ts";
 import { filesystemPathKey } from "./filesystem-evidence.ts";
 import {
 	LinuxOverlayfsCapabilityRegistry,
@@ -982,13 +983,13 @@ async function commitSandboxExecution(
 					await restoreChanges(applied, baselines);
 					await removeCreatedDirectories(createdDirectories);
 				} catch (rollbackError) {
-					throw new AggregateError(
-						[error, rollbackError],
+					throw effectCommitFailure(
+						new AggregateError([error, rollbackError], "sandbox commit and rollback both failed", { cause: error }),
+						"poisoned",
 						"sandbox commit failed and the original workspace could not be fully restored",
-						{ cause: error },
 					);
 				}
-				throw error;
+				throw effectCommitFailure(error, "recoverable");
 			} finally {
 				await Promise.all(
 					[...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)),

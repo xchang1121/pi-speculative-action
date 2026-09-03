@@ -3,6 +3,7 @@ import type { EffectRequirements } from "./effect-model.ts";
 import {
 	EffectTransactionCoordinator,
 	type EffectTransaction,
+	isPoisonedEffectCommit,
 } from "./effect-transaction.ts";
 import {
 	type CapturedExecutionWorldResult,
@@ -46,7 +47,7 @@ export type AuthoritativeExecutionSettlement<Output> =
 	| { readonly status: "failed"; readonly error: unknown; readonly durationMs: number };
 
 export interface AuthoritativeExecutionHooks<Output> {
-	/** Optional speculative/cache provider. Failure is isolated and falls through to the Actor executor. */
+	/** Optional reuse provider. A poisoned commit propagates; non-commit provider failures fall through. */
 	readonly reuse?: () => Promise<Output | undefined>;
 	/** Best-effort authoritative observation. Failure never replaces the Actor result or error. */
 	readonly settled?: (settlement: AuthoritativeExecutionSettlement<Output>) => void | Promise<void>;
@@ -144,7 +145,8 @@ async function executeAuthoritativeLifecycle<Output>(
 		try {
 			const reused = await hooks.reuse();
 			if (reused !== undefined) return reused;
-		} catch {
+		} catch (error) {
+			if (isPoisonedEffectCommit(error)) throw error;
 			// Reuse is optional; the supplied Actor executor remains authoritative.
 		}
 	}

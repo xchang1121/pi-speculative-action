@@ -127,6 +127,7 @@ export interface WorldBranch<Output> {
 	readonly validate?: () => Promise<ResourceValidation>;
 	/** Subscribe to invalidation; the branch owns and releases the subscription. */
 	readonly watch?: (onInvalidated: (changedPath?: string) => void) => void;
+	/** Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */
 	readonly commit: () => Promise<Output>;
 	/** Idempotently release every branch-local handle. Must be safe before or after commit. */
 	readonly dispose: () => void | Promise<void>;
