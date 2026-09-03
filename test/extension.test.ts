@@ -362,7 +362,7 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
-		const fixture = await createFixture({ settings: { enabled: true } });
+		const fixture = await createFixture({ settings: { enabled: true }, defaultExecutionWorlds: true });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
 			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
 		}));
@@ -399,6 +399,7 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Each tool uses the first ready execution route"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Main-agent Bash reuse:"), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
@@ -513,6 +514,7 @@ describe("zero-modification Pi extension", () => {
 
 interface FixtureOptions {
 	readonly consume?: SpeculativeActionHost["consume"];
+	readonly defaultExecutionWorlds?: boolean;
 	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	readonly overriddenTools?: readonly string[];
 	readonly settings?: SpeculativeActionPackageSettings;
@@ -602,7 +604,7 @@ async function createFixture(options: FixtureOptions = {}) {
 			return host;
 		},
 		createSettingsStore: () => store,
-		createExecutionWorlds: () => options.executionWorlds ?? [],
+		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds: () => options.executionWorlds ?? [] }),
 	});
 	await factory(pi);
 	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {

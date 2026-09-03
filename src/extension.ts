@@ -417,13 +417,23 @@ async function installController(
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
+	let actorBashReuse: string | undefined;
 	const heldExec = processBackend && shell.commandTransport !== "stdin"
-		? await recoverSpeculation(() => processBackend.heldExecActorReplay({
-			sourceRoot: context.cwd,
-			realShell: shell.shell,
-			enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
-		}))
+		? await processBackend.heldExecActorReplay({
+				sourceRoot: context.cwd,
+				realShell: shell.shell,
+				enabled: () => currentSettings.enabled && currentSettings.tools.includes("bash"),
+			}).then((route) => {
+				actorBashReuse = "ready — previous matching Bash calls and completed/running child commands";
+				return route;
+			}, (error) => {
+				actorBashReuse = `partial — previous matching Bash calls only; child handoff unavailable (${error instanceof Error ? error.message : String(error)})`;
+				return undefined;
+			})
 		: undefined;
+	if (processBackend && !actorBashReuse) actorBashReuse = process.platform === "linux"
+		? "partial — previous matching Bash calls only; this shell cannot hold child commands"
+		: "unavailable — Linux or WSL 2 required";
 	const localProcessOperations = createLocalBashOperations({
 		shellPath: heldExec?.shellPath ?? shell.shell,
 	});
@@ -555,7 +565,7 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
-		executionSummary: () => executionWorldSummary(executionDiagnostics),
+		executionSummary: () => executionWorldSummary(executionDiagnostics, actorBashReuse),
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -677,7 +687,7 @@ async function installController(
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
-				executionWorldSummary(executionDiagnostics),
+				executionWorldSummary(executionDiagnostics, actorBashReuse),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
@@ -1217,7 +1227,7 @@ async function openToolsAndExecution(
 		if (choice === "Execution routes") {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(
-				`Each tool uses the first ready execution route whose guarantees cover its effects. Read-only tools can use validated results, write/edit can use private Git workspaces, and tools without a safe route remain with the Actor.\n${controller.executionSummary()}`,
+				`Each tool uses the first ready execution route whose guarantees cover its effects. The main-agent Bash reuse line is independent of early execution; tools without a safe route remain with the Actor.\n${controller.executionSummary()}`,
 				"info",
 			);
 		}
@@ -1718,10 +1728,11 @@ function formatSpeculativeFooter(
 	].join(" · ");
 }
 
-function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): string {
-	if (!worlds.length) return "Execution routes: unavailable";
+function executionWorldSummary(worlds: readonly ExecutionWorldDiagnosticSnapshot[], actorBashReuse?: string): string {
+	if (!worlds.length && !actorBashReuse) return "Execution routes: unavailable";
 	return [
 		"Execution routes:",
+		...(actorBashReuse ? [`- Main-agent Bash reuse: ${actorBashReuse}`] : []),
 		...worlds.map(
 			(world) =>
 				`- ${executionRouteKind(world.isolation)} (${world.id}): ${world.state} — ${world.detail}${
