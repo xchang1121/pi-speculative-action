@@ -50,6 +50,86 @@ describe("strace provenance decoder", () => {
 		}
 	});
 
+	test("reassembles completed syscalls before extracting dependencies and children", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-resumed-"));
+		const prefix = path.join(root, "process");
+		try {
+			await Promise.all([
+				fs.writeFile(
+					`${prefix}.150`,
+					[
+						'execve("/usr/bin/example", ["example"], 0x0) = 0',
+						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY <unfinished ...>',
+						'<... openat resumed>) = 3</work/input.txt>',
+						'clone(child_stack=NULL, flags=SIGCHLD <unfinished ...>',
+						'<... clone resumed>) = 151',
+						'socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>',
+						'<... socket resumed>) = 4',
+					].join("\n"),
+				),
+				fs.writeFile(`${prefix}.151`, 'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'),
+			]);
+
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
+			expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, incompleteReasons: [] });
+			expect(observation.taints).toContain("network");
+			expect(observation.paths).toEqual(
+				expect.arrayContaining([
+					{ path: "/work/input.txt", role: "input" },
+					{ path: "/work/child.txt", role: "input" },
+				]),
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("selects the shallowest matching exec from process topology", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-root-"));
+		const prefix = path.join(root, "process");
+		try {
+			await Promise.all([
+				fs.writeFile(
+					`${prefix}.700`,
+					[
+						'execve("/usr/bin/example", ["example"], 0x0) = 0',
+						'openat(AT_FDCWD, "/work/root.txt", O_RDONLY) = 3',
+						"clone(child_stack=NULL, flags=SIGCHLD) = 600",
+					].join("\n"),
+				),
+				fs.writeFile(
+					`${prefix}.600`,
+					[
+						'execve("/usr/bin/example", ["example"], 0x0) = 0',
+						'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3',
+					].join("\n"),
+				),
+			]);
+
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
+			expect(observation.complete).toBe(true);
+			expect(observation.paths).toEqual(expect.arrayContaining([{ path: "/work/root.txt", role: "input" }]));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed on an unmatched resumed syscall", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-orphan-resume-"));
+		const prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(
+				`${prefix}.175`,
+				'execve("/usr/bin/example", ["example"], 0x0) = 0\n<... openat resumed>) = 3</work/lost.txt>',
+			);
+			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
+			expect(observation.complete).toBe(false);
+			expect(observation.incompleteReasons).toContain("resumed_without_unfinished:175:openat");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("fails closed when a traced child transcript is absent", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-incomplete-"));
 		const prefix = path.join(root, "process");

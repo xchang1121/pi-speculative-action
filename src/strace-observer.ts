@@ -57,6 +57,88 @@ interface TraceFile {
 	readonly lines: readonly string[];
 }
 
+type TraceRoot = { readonly file: TraceFile; readonly start: number };
+const INCOMPLETE_TRACE_PREFIX = "# pi-trace-incomplete:";
+
+function reassembleSyscalls(lines: readonly string[], pid: number): readonly string[] {
+	const pending = new Map<string, string[]>();
+	const complete: string[] = [];
+	for (const line of lines) {
+		if (line.includes("<unfinished ...>")) {
+			const name = syscallName(line);
+			const prefix = line.replace(/\s*<unfinished \.\.\.>\s*$/, "");
+			if (!name || prefix === line) complete.push(incompleteTraceLine(`unfinished_unparsed:${pid}`));
+			else (pending.get(name) ?? pending.set(name, []).get(name)!).push(prefix);
+			continue;
+		}
+		const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(line);
+		if (!resumed) {
+			complete.push(line);
+			continue;
+		}
+		const name = resumed[1]!;
+		const queue = pending.get(name);
+		const prefix = queue?.shift();
+		if (!prefix) complete.push(incompleteTraceLine(`resumed_without_unfinished:${pid}:${name}`));
+		else complete.push(`${prefix}${resumed[2]}`);
+		if (queue?.length === 0) pending.delete(name);
+	}
+	for (const name of pending.keys()) complete.push(incompleteTraceLine(`unfinished:${pid}:${name}`));
+	return complete;
+}
+
+function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot | { readonly reason: string } {
+	const byPID = new Map(files.map((file) => [file.pid, file]));
+	const parent = new Map<number, number>();
+	const children = new Map<number, number[]>();
+	for (const file of files) {
+		for (const line of file.lines) {
+			const child = spawnedPID(line);
+			if (!child) continue;
+			const existing = parent.get(child);
+			if (existing !== undefined && existing !== file.pid) return { reason: `process_parent_ambiguous:${child}` };
+			parent.set(child, file.pid);
+			(children.get(file.pid) ?? children.set(file.pid, []).get(file.pid)!).push(child);
+		}
+	}
+	const roots = files.filter((file) => !parent.has(file.pid));
+	if (roots.length !== 1) return { reason: `trace_root_ambiguous:${roots.map(({ pid }) => pid).sort().join(",")}` };
+
+	const depth = new Map<number, number>([[roots[0]!.pid, 0]]);
+	const queue = [roots[0]!.pid];
+	while (queue.length) {
+		const pid = queue.shift()!;
+		for (const child of children.get(pid) ?? []) {
+			if (!byPID.has(child) || depth.has(child)) continue;
+			depth.set(child, depth.get(pid)! + 1);
+			queue.push(child);
+		}
+	}
+	const candidates: Array<TraceRoot & { readonly depth: number }> = [];
+	for (const file of files) {
+		const processDepth = depth.get(file.pid);
+		if (processDepth === undefined) continue;
+		const start = file.lines.findIndex((line) => {
+			if (!successfulExec(line)) return false;
+			const executable = quotedStrings(line)[0];
+			return executable !== undefined && path.posix.resolve(executable) === target;
+		});
+		if (start >= 0) candidates.push({ file, start, depth: processDepth });
+	}
+	if (!candidates.length) return { reason: "target_exec_not_found" };
+	const shallowest = Math.min(...candidates.map((candidate) => candidate.depth));
+	const matches = candidates.filter((candidate) => candidate.depth === shallowest);
+	return matches.length === 1 ? matches[0]! : { reason: `target_exec_ambiguous:${matches.map(({ file }) => file.pid).sort().join(",")}` };
+}
+
+function incompleteTraceLine(reason: string): string {
+	return `${INCOMPLETE_TRACE_PREFIX}${reason}`;
+}
+
+function incompleteTraceReason(line: string): string | undefined {
+	return line.startsWith(INCOMPLETE_TRACE_PREFIX) ? line.slice(INCOMPLETE_TRACE_PREFIX.length) : undefined;
+}
+
 /**
  * Decode a bounded strace -ff transcript. The parser deliberately fails closed: only the target
  * exec and its recursively identified descendants contribute a replayable certificate.
@@ -75,29 +157,17 @@ export async function observeStrace(
 		const pid = Number.parseInt(name.slice(prefix.length), 10);
 		if (!Number.isSafeInteger(pid) || pid <= 0) continue;
 		const contents = await readFile(path.join(directory, name), "utf8");
-		files.push({ pid, lines: contents.split(/\r?\n/) });
+		files.push({ pid, lines: reassembleSyscalls(contents.split(/\r?\n/), pid) });
 	}
 	const target = path.posix.resolve(executablePath);
-	let root: { readonly file: TraceFile; readonly start: number } | undefined;
-	for (const file of files) {
-		for (let index = 0; index < file.lines.length; index++) {
-			const line = file.lines[index]!;
-			if (!successfulExec(line)) continue;
-			const first = quotedStrings(line)[0];
-			if (first && path.posix.resolve(first) === target) {
-				root = { file, start: index };
-				break;
-			}
-		}
-		if (root) break;
-	}
-	if (!root) {
+	const root = selectTraceRoot(files, target);
+	if ("reason" in root) {
 		return {
 			complete: false,
 			paths: [],
 			taints: ["trace_incomplete"],
 			tracedProcesses: 0,
-			incompleteReasons: ["target_exec_not_found"],
+			incompleteReasons: [root.reason],
 		};
 	}
 
@@ -164,25 +234,14 @@ export async function observeStrace(
 			incompleteReasons.add(`cwd_unknown:${pid}`);
 			cwd = path.posix.resolve(initialCwd);
 		}
-		const unfinished = new Map<string, number>();
 		for (let index = start; index < file.lines.length; index++) {
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
 			const line = file.lines[index]!;
 			if (!line) continue;
-			if (line.includes("<unfinished ...>")) {
-				const name = syscallName(line);
-				if (name) unfinished.set(name, (unfinished.get(name) ?? 0) + 1);
-				else {
-					complete = false;
-					incompleteReasons.add(`unfinished_unparsed:${pid}`);
-				}
-				continue;
-			}
-			const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>/.exec(line)?.[1];
-			if (resumed) {
-				const count = unfinished.get(resumed) ?? 0;
-				if (count <= 1) unfinished.delete(resumed);
-				else unfinished.set(resumed, count - 1);
+			const traceFailure = incompleteTraceReason(line);
+			if (traceFailure) {
+				complete = false;
+				incompleteReasons.add(traceFailure);
 				continue;
 			}
 			if (line.startsWith("+++ killed by") || line.startsWith("--- SIG")) {
@@ -250,10 +309,6 @@ export async function observeStrace(
 			for (const observed of syscallPaths(line, syscall, cwd)) {
 				if (paths.get(observed) !== "executable") paths.set(observed, role);
 			}
-		}
-		if (unfinished.size) {
-			complete = false;
-			for (const name of unfinished.keys()) incompleteReasons.add(`unfinished:${pid}:${name}`);
 		}
 	}
 	if (!complete) taints.add("trace_incomplete");

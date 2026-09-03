@@ -2091,10 +2091,13 @@ async function runSpawn(
 		}, Math.max(1, options.timeoutSeconds * 1000));
 	}
 	try {
-		const result = await new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>((resolve, reject) => {
-			child.once("error", reject);
-			child.once("exit", (code, signal) => resolve({ code, signal }));
-		});
+		const result = await new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
+			(resolve, reject) => {
+				child.once("error", reject);
+				// `close` follows process exit and complete drainage of every stdio stream.
+				child.once("close", (code, signal) => resolve({ code, signal }));
+			},
+		);
 		if (options.signal?.aborted) throw new Error("aborted");
 		if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
 		return { ...result, output };
