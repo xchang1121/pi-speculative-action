@@ -56,7 +56,11 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
-	const backend = new LinuxProcessReuseBackend({ storeRoot });
+	const backend = new LinuxProcessReuseBackend({
+		storeRoot,
+		...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
+		...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}),
+	});
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace,

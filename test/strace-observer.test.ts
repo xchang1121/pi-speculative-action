@@ -144,9 +144,9 @@ describe("strace provenance decoder", () => {
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
 			expect(observation.taints).toEqual(expect.arrayContaining([
-				"network", "clock", "random", "pid_observation", "confinement_observation", "unsupported_syscall",
+				"network", "clock", "random", "pid_observation", "descriptor_observation", "confinement_observation",
 			]));
-			expect(observation.incompleteReasons).toContain("unparsed_metadata:fstat:400");
+			expect(observation.incompleteReasons).not.toContain("unparsed_metadata:fstat:400");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

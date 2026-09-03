@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
@@ -85,7 +86,7 @@ static char *take_env(const char *name) {
 	return copy;
 }
 
-static int has_extra_descriptors(void) {
+static int has_extra_descriptors(int ignored) {
 	DIR *directory = opendir("/proc/self/fd");
 	if (!directory) return -1;
 	int scan_fd = dirfd(directory), found = 0, saved = 0;
@@ -96,7 +97,7 @@ static int has_extra_descriptors(void) {
 		if (!entry) { saved = errno; break; }
 		char *end;
 		long fd = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || fd <= 2 || fd == scan_fd) continue;
+		if (!*entry->d_name || *end || fd <= 2 || fd == scan_fd || fd == ignored) continue;
 		errno = 0;
 		if (fcntl((int)fd, F_GETFD) >= 0) { found = 1; break; }
 		if (errno != EBADF) { saved = errno; break; }
@@ -106,44 +107,77 @@ static int has_extra_descriptors(void) {
 	return found;
 }
 
-static int native_bypass(const char *script, int argc, char **argv) {
-	FILE *file = fopen(script, "r");
+static int mapped_image(char *image, size_t capacity) {
+	FILE *maps = fopen("/proc/self/maps", "re");
 	char *line = NULL;
-	size_t capacity = 0;
-	int result = 125;
-	if (!file || getline(&line, &capacity, file) < 0 || getline(&line, &capacity, file) < 0) goto done;
-	const char marker[] = "//PI_SPEC_NATIVE ";
-	if (strncmp(line, marker, sizeof(marker) - 1)) goto done;
-	char *shadow = line + sizeof(marker) - 1;
-	shadow[strcspn(shadow, "\r\n")] = 0;
-	const char *name = strrchr(script, '/'); name = name ? name + 1 : script;
-	char target[PATH_MAX];
-	if (!*shadow || !*name || strchr(name, '/') ||
-		snprintf(target, sizeof(target), "%s/%s", shadow, name) >= (int)sizeof(target)) goto done;
-	fclose(file); file = NULL;
-	char **command = calloc((size_t)argc, sizeof(*command));
-	if (!command) goto done;
-	command[0] = (char *)name;
-	for (int index = 3; index < argc; index++) command[index - 2] = argv[index];
-	execv(target, command);
-	result = errno == ENOENT ? 127 : 126;
-done:
-	if (file) fclose(file);
+	size_t line_capacity = 0;
+	int result = -1;
+	while (maps && getline(&line, &line_capacity, maps) >= 0) {
+		if (!strstr(line, " r-xp ")) continue;
+		char *mapped = strchr(line, '/');
+		if (!mapped) continue;
+		mapped[strcspn(mapped, "\r\n")] = 0;
+		char *deleted = strstr(mapped, " (deleted)");
+		if (deleted) *deleted = 0;
+		if (snprintf(image, capacity, "%s", mapped) >= (int)capacity) errno = ENAMETOOLONG;
+		else result = 0;
+		break;
+	}
+	if (maps) fclose(maps);
 	free(line);
 	return result;
 }
 
-static int dispatch(const char *node, int argc, char **argv) {
-	if (argc < 3 || !*node) return 64;
-	int extra = has_extra_descriptors();
-	if (extra < 0) return 70;
-	if (extra) return native_bypass(argv[2], argc, argv);
-	char **command = calloc((size_t)argc, sizeof(*command));
-	if (!command) return 70;
-	command[0] = (char *)node;
-	for (int index = 2; index < argc; index++) command[index - 1] = argv[index];
-	execv(node, command);
-	return errno == ENOENT ? 127 : 126;
+/* An exec-only hardlink retains the target's argv[0]; its read-only sidecar supplies routing. */
+static int image_dispatch(int argc, char **argv) {
+	char image[PATH_MAX], sidecar[PATH_MAX], invoked[PATH_MAX], native[PATH_MAX];
+	if (mapped_image(image, sizeof(image)) < 0) return -1;
+	char *separator = strrchr(image, '/');
+	if (!separator || !separator[1]) return -1;
+	char *name = separator + 1;
+	*separator = 0;
+	if (snprintf(sidecar, sizeof(sidecar), "%s/.pi-spec-dispatch-v1", image) >= (int)sizeof(sidecar)) return 70;
+	FILE *file = fopen(sidecar, "re");
+	if (!file) return errno == ENOENT ? -1 : 70;
+	struct stat state;
+	char *line = NULL, *fields[5] = {0};
+	size_t capacity = 0;
+	int result = 70;
+	if (fstat(fileno(file), &state) < 0 || !S_ISREG(state.st_mode) || state.st_uid != geteuid() || (state.st_mode & 022)) goto done;
+	for (unsigned index = 0; index < 6; index++) {
+		if (getline(&line, &capacity, file) < 0) goto done;
+		line[strcspn(line, "\r\n")] = 0;
+		if (index == 0) {
+			if (strcmp(line, "PI_SPEC_DISPATCH_V1")) goto done;
+		} else if (*line != '/' || !(fields[index - 1] = strdup(line))) goto done;
+	}
+	fclose(file); file = NULL;
+	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[3], name) >= (int)sizeof(invoked) ||
+		snprintf(native, sizeof(native), "%s/%s", fields[4], name) >= (int)sizeof(native)) goto done;
+	int extra = has_extra_descriptors(-1);
+	if (extra < 0) goto done;
+	if (extra) {
+		execv(native, argv);
+		result = errno == ENOENT ? 127 : 126;
+		goto done;
+	}
+	char **command = calloc((size_t)argc + 6, sizeof(*command));
+	if (!command) goto done;
+	command[0] = fields[0];
+	command[1] = fields[1];
+	command[2] = "--native-dispatch";
+	command[3] = fields[2];
+	command[4] = invoked;
+	command[5] = argv[0];
+	for (int index = 1; index < argc; index++) command[index + 5] = argv[index];
+	execv(command[0], command);
+	result = errno == ENOENT ? 127 : 126;
+	free(command);
+done:
+	if (file) fclose(file);
+	free(line);
+	for (unsigned index = 0; index < 5; index++) free(fields[index]);
+	return result;
 }
 
 static int open_tracee_output(pid_t pid, unsigned fd) {
@@ -272,11 +306,16 @@ static int trace(char **command, const char *socket_path, const char *token, con
 }
 
 int main(int argc, char **argv) {
+	int dispatched = image_dispatch(argc, argv);
+	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
 		puts("2");
 		return 0;
 	}
-	if (argc >= 3 && !strncmp(argv[1], "--dispatch=", 11)) return dispatch(argv[1] + 11, argc, argv);
+	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
+		int extra = has_extra_descriptors(-1);
+		return extra < 0 ? 70 : extra ? 65 : 0;
+	}
 	if (getenv("PI_SPEC_HELD_EXEC_SHELL")) {
 		char *real_shell = take_env("PI_SPEC_HELD_EXEC_SHELL");
 		char *socket_path = take_env("PI_SPEC_HELD_EXEC_SOCKET");

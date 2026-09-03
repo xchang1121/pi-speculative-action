@@ -111,7 +111,7 @@ describe("speculative action package boundary", () => {
 		]);
 		expect(manifest.files).toEqual(["dist", "src", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
 		expect(manifest.scripts?.build).toBe(
-			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs && shx cp src/process-namespace-launcher.mjs dist/process-namespace-launcher.mjs",
+			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs",
 		);
 		expect(Object.keys(manifest.scripts ?? {})).not.toEqual(
 			expect.arrayContaining(["build:native", "build:worker", "generate:native-manifest", "smoke:native"]),

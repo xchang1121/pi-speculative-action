@@ -44,7 +44,7 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"check": "tsc --noEmit -p tsconfig.json",
-		"build": "shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs && shx cp src/process-namespace-launcher.mjs dist/process-namespace-launcher.mjs",
+		"build": "shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs",
 		"bench:ablation": "tsx ./bench/run.ts",
 		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:tape": "tsx ./bench/tape.ts",

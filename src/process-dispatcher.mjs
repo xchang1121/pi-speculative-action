@@ -6,21 +6,27 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-const configuration = globalThis.__PI_SPEC_PROCESS_DISPATCHER__;
+const nativeRequested = process.argv[2] === "--native-dispatch";
+const native = nativeInvocation();
+const configuration = globalThis.__PI_SPEC_PROCESS_DISPATCHER__ ?? native?.configuration;
 const socketPath = configuration?.socketPath;
 const token = configuration?.token;
-const invokedPath = process.argv[1] ?? "";
+const invokedPath = native?.invokedPath ?? process.argv[1] ?? "";
 const invoked = path.basename(invokedPath);
-const args = process.argv.slice(2);
+const argv0 = native?.argv0 ?? invoked;
+const args = native?.args ?? process.argv.slice(2);
 const environment = { ...process.env };
 // Node ignores SIGXFSZ at startup; an exec outlet must preserve the shell's default disposition.
 const resetXfsz = () => {};
 process.on("SIGXFSZ", resetXfsz);
 process.off("SIGXFSZ", resetXfsz);
 
-if (!configuration && args[0] === "--exec" && /^[12]{2}$/.test(args[1] ?? "") && args.length >= 4) {
+if (nativeRequested && (!native || !validConfiguration(configuration))) {
+	process.stderr.write("invalid native dispatch configuration\n");
+	process.exitCode = 125;
+} else if (!configuration && args[0] === "--exec" && /^[12]{2}$/.test(args[1] ?? "") && args.length >= 4) {
 	await run(args[3], args.slice(4), args[2], [Number(args[1][0]), Number(args[1][1])]);
-} else if (!configuration && args.length === 1 && args[0] === "--probe-context") {
+} else if (!configuration && args.length === 2 && args[0] === "--probe-context" && process.cwd() === args[1]) {
 	fs.writeSync(1, JSON.stringify(executionContext()));
 } else if (!validConfiguration(configuration) || !invoked) {
 	await fallback();
@@ -31,6 +37,7 @@ if (!configuration && args[0] === "--exec" && /^[12]{2}$/.test(args[1] ?? "") &&
 			token,
 			name: invoked,
 			invokedPath,
+			argv0,
 			args,
 			cwd: process.cwd(),
 			environment,
@@ -63,7 +70,7 @@ async function fallback(explicitExecutable) {
 		process.exitCode = 127;
 		return;
 	}
-	await run(executable, args, invoked);
+	await run(executable, args, argv0);
 }
 
 async function run(executable, commandArgs, argv0, outputRoute) {
@@ -80,11 +87,25 @@ async function run(executable, commandArgs, argv0, outputRoute) {
 function escapeExecutable(executable) {
 	if (!executable || !path.isAbsolute(executable)) return executable;
 	for (const directory of configuration?.directories ?? []) {
-		if (path.resolve(path.dirname(executable)) === path.resolve(directory.target)) {
+		if ([directory.target, directory.view].some((candidate) => path.resolve(path.dirname(executable)) === path.resolve(candidate))) {
 			return path.join(directory.shadow, path.basename(executable));
 		}
 	}
 	return executable;
+}
+
+function nativeInvocation() {
+	if (process.argv[2] !== "--native-dispatch" || process.argv.length < 6) return undefined;
+	try {
+		return {
+			configuration: JSON.parse(fs.readFileSync(process.argv[3], "utf8")),
+			invokedPath: process.argv[4],
+			argv0: process.argv[5],
+			args: process.argv.slice(6),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 function validConfiguration(value) {
@@ -96,7 +117,8 @@ function validConfiguration(value) {
 			Array.isArray(value.directories) &&
 			value.directories.every(
 				(directory) =>
-					directory && typeof directory.target === "string" && typeof directory.shadow === "string",
+					directory && typeof directory.target === "string" && typeof directory.view === "string" &&
+					typeof directory.shadow === "string",
 			),
 	);
 }
@@ -119,6 +141,7 @@ function executionContext() {
 			uid: process.getuid(), euid: process.geteuid(), gid: process.getgid(), egid: process.getegid(),
 			groups: process.getgroups().sort((left, right) => left - right),
 		},
+		systemMetadata: statIdentity("/bin/sh"),
 		signals: { blocked: status.SigBlk, ignored: status.SigIgn },
 		scheduling: {
 			nice: os.getPriority(), cpus: status.Cpus_allowed_list, memoryNodes: status.Mems_allowed_list,
@@ -138,6 +161,11 @@ function executionContext() {
 		descriptorTypes: descriptors.map(({ type }) => type),
 		outputEndpoints: [descriptors[1]?.endpoint ?? "", descriptors[2]?.endpoint ?? ""],
 	};
+}
+
+function statIdentity(target) {
+	const value = fs.statSync(target, { bigint: true });
+	return Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map((name) => [name, String(value[name])]));
 }
 
 function descriptor(fd, aliases) {

@@ -250,13 +250,13 @@ describe("workspace-branch ExecutionWorld", () => {
 		if (!host.available) return;
 		const root = await temporaryRoot("overlay-quarantine");
 		const marker = path.join(root, "probe-unmounted");
+		const retainedTarget = path.join(root, "retained-mount");
 		const wrapper = path.join(root, "fusermount-unresolved");
-		const mountsBefore = new Set(await fuseOverlayMountTargets());
 		let retainedMounts: string[] = [];
 		try {
 			await writeFile(
 				wrapper,
-				`#!/bin/sh\nif [ ! -e ${shellQuote(marker)} ]; then\n  : > ${shellQuote(marker)}\n  exec ${shellQuote(host.fusermountBinary)} "$@"\nfi\nexit 42\n`,
+				`#!/bin/sh\nif [ ! -e ${shellQuote(marker)} ]; then\n  : > ${shellQuote(marker)}\n  exec ${shellQuote(host.fusermountBinary)} "$@"\nfi\nfor target do :; done\nprintf '%s\\n' "$target" > ${shellQuote(retainedTarget)}\nexit 42\n`,
 				"utf8",
 			);
 			await chmod(wrapper, 0o755);
@@ -271,18 +271,12 @@ describe("workspace-branch ExecutionWorld", () => {
 					execute: async () => settlement("unsafe-unmount"),
 				}),
 			).rejects.toThrow(/cleanup|mounted|unmount/i);
-			retainedMounts = (await fuseOverlayMountTargets()).filter((target) => !mountsBefore.has(target));
-			expect(retainedMounts).toHaveLength(1);
+			retainedMounts = [(await readFile(retainedTarget, "utf8")).trim()];
+			expect(await fuseOverlayMountTargets()).toContain(retainedMounts[0]);
 			await completesWithin(closeWorkspaceSandboxPools([root]), 500);
 		} finally {
-			retainedMounts = [
-				...new Set([
-					...retainedMounts,
-					...(await fuseOverlayMountTargets()).filter((target) => !mountsBefore.has(target)),
-				]),
-			];
 			for (const target of retainedMounts) {
-				await runProgram(host.fusermountBinary, ["-u", target]);
+				await runProgram(host.fusermountBinary, ["-u", "-z", target]);
 				expect(await fuseOverlayMountTargets()).not.toContain(target);
 				await rm(path.dirname(path.dirname(target)), { recursive: true, force: true });
 			}

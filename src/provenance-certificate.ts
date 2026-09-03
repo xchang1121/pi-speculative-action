@@ -141,6 +141,7 @@ export type ProvenanceTaint =
 	| "clock"
 	| "random"
 	| "pid_observation"
+	| "descriptor_observation"
 	| "interactive_io"
 	| "untracked_fd"
 	| "confinement_observation"

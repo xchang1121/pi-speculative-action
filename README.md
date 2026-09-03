@@ -24,11 +24,11 @@ Execution routes use this fixed priority:
 | 2 | `workspace_branch` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
 | 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
 
-On Linux and WSL 2, the default extension includes a lightweight process world. It forks the operation into the same private Git workspace primitive used by mutation tools, then confines the process with user/PID/network/IPC/UTS and mount namespaces plus Sandlock's Landlock/seccomp policy. Failure of any kernel, binary, mount, or policy probe removes this route; Windows, macOS, WSL 1, and incomplete Linux installations therefore keep Pi's ordinary Actor execution rather than silently weakening isolation.
+On Linux and WSL 2, the default extension includes a lightweight process world. It forks the operation into the same private workspace primitive used by mutation tools, then confines it with Sandlock's Landlock/seccomp policy and virtual filesystem. The current provider deliberately creates no user, PID, or mount namespace, so commands retain the Actor's native identity. Failure of any kernel, binary, or policy probe removes this route; Windows, macOS, WSL 1, and incomplete Linux installations therefore keep Pi's ordinary Actor execution rather than silently weakening isolation.
 
 Tool policy is not hard-coded by platform or tool name. Startup diagnostics intersect each execution world's effect guarantees with each tool's requirements: Windows, macOS, WSL 1, and incompletely qualified Linux hosts configure `read`, `grep`, `find`, `ls`, `write`, and `edit` by default; a ready Linux/WSL 2 process world adds `bash`; and a host-injected all-effect world enables every tool. A selected tool with no safe route keeps its preference but remains inactive and is not sent to prediction sources.
 
-Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, mount-namespace views leave the command's `PATH` and environment unchanged while routing PATH-resolved execs to one broker. On x86-64 Linux, a native Actor boundary also stops real child `execve` events before their first instruction. Both routes use the same executable/argv/cwd/environment/process-context key, dependency certificates, result journal, and planner—not a Bash-text cache. A validated child can therefore be reused under a different parent Bash string, while a miss continues the Actor child exactly once.
+Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, exact exec-only mappings leave `PATH`, file opens, metadata, directory contents, writes, cwd, and environment unchanged while routing executable launches to one broker. On x86-64 Linux, a native Actor boundary also stops real child `execve` events before their first instruction. Both routes use the same executable/argv/cwd/environment/process-context key, dependency certificates, result journal, and planner—not a Bash-text cache. A validated child can therefore be reused under a different parent Bash string, while a miss continues the Actor child exactly once.
 
 Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, unsupported, or observably different confinement state fails closed.
 
@@ -44,7 +44,7 @@ Nested process misses use the same generic workspace-transaction outlet as the o
 - `K(a)` never changes because a different isolation backend is available.
 - In-flight and cached work is reused only when its producer proof is accepted by the consumer; observations of confinement state remain reusable inside the same confinement domain but cannot cross into the Actor domain.
 - Cross-parent process results are reusable across turns only after exact prototype matching and full dynamic-dependency validation; the parent shell command is deliberately absent from that nested key.
-- The Linux world preserves the visible `PATH`, mounts the private workspace over its logical source path only inside the namespace, denies common credential stores and the certificate store, and permits persistent writes only in the private branch.
+- The Linux world preserves native UID/GID/process identity and the visible `PATH`, maps only the private workspace onto its logical source path, denies common credential stores and the certificate store, and permits persistent writes only in the private branch.
 - Broker uncertainty is at-most-once: after a request may have executed, a lost reply returns an error instead of re-running the command.
 - On a read-only Actor fallback, a capture-capable world snapshots freshness before the host call and seals that same authoritative output into the shared cache. It never invokes the tool a second time; later turns still repeat authorization, exact freshness validation, compatibility, projection, and commit.
 - Actor adoption still requires action equivalence, permission, fresh resource evidence, compatible world evidence, successful projection, and successful commit.
@@ -74,18 +74,18 @@ Linux and WSL 2 expose independent capabilities rather than one all-or-nothing b
 | --- | --- |
 | Replay an existing complete command certificate | Node.js and the local certificate store; no Landlock or `strace` on the hit path |
 | Reuse a completed or running child under a different Actor Bash | x86-64 Linux, the small native helper, `ptrace`, and `pidfd_getfd` for Pi's pipe descriptors |
-| Produce new speculative Bash certificates | Git, `strace`, `util-linux`, the pinned Sandlock build, and a successfully qualified Landlock/seccomp/namespace policy |
+| Produce new speculative Bash certificates | Git, `strace`, a C/Rust build toolchain, the packaged pinned Sandlock build, and a successfully qualified Landlock/seccomp virtual-root policy |
 | Accelerate large workspace transactions | Optional, hash-verified `fuse-overlayfs`; Git remains the safe fallback |
 
 For all tiers, install the available system dependencies and run the best-effort qualifier:
 
 ```sh
-sudo apt-get install git strace util-linux build-essential
+sudo apt-get install git strace build-essential
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
-`setup:linux` qualifies and reports each row separately. It builds the packaged held-exec helper when a C compiler is available, installs the pinned `sandlock` CLI when the full producer dependencies exist, and optionally installs an official hash-verified `fuse-overlayfs` release under `~/.local`; it installs no daemon and does not alter Pi. Missing Landlock, Rust, `strace`, namespaces, FUSE, or the native helper disables only the dependent operation. Runtime probes repeat before use and fail closed. WSL must be version 2, and performance-sensitive workspaces should live in its native Linux filesystem. Detailed policy, transaction, and storage qualification is documented in the capability lattice.
+`setup:linux` qualifies and reports each row separately. It builds the packaged held-exec helper, applies the packaged transparent-exec change to the exact pinned Sandlock revision, installs the resulting plugin-specific binary only after behavioral probes pass, and optionally installs an official hash-verified `fuse-overlayfs` release under `~/.local`; it installs no daemon and does not alter Pi. Source/patch and installed-binary digests are stamped together. Missing Landlock, Rust, `strace`, FUSE, or the native helper disables only the dependent operation. Runtime probes repeat before use and fail closed. WSL must be version 2, and performance-sensitive workspaces should live in its native Linux filesystem. Detailed policy, transaction, and storage qualification is documented in the capability lattice.
 
 The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.
 

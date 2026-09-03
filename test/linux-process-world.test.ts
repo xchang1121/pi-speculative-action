@@ -77,7 +77,7 @@ describe("Linux process ExecutionWorld", () => {
 				callID: "driver-semantics-test",
 				signal: new AbortController().signal,
 			});
-			expect(branch.output.isError).toBe(false);
+			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const validation = await branch.validate?.();
 			expect(validation?.status).toBe("indeterminate");
 			expect(JSON.stringify(validation)).toContain("filesystem_semantics");

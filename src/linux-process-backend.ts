@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import {
 	access,
 	chmod,
+	copyFile,
 	link,
 	lstat,
 	mkdir,
@@ -13,7 +14,6 @@ import {
 	readlink,
 	realpath,
 	rm,
-	symlink,
 	writeFile,
 } from "node:fs/promises";
 import net from "node:net";
@@ -86,20 +86,21 @@ import {
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v14";
-const POLICY_ID = "sandlock-namespaced-transparent-exec-v11";
-const LEAF_POLICY_ID = "sandlock-host-context-leaf-v1";
+const BACKEND_EPOCH = "pi-linux-process-v15";
+const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
+const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v2";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
-const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>(["clock", "random", "pid_observation"]);
+const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>([
+	"clock", "random", "pid_observation", "descriptor_observation",
+]);
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
 	readonly store?: ProvenanceStoreOptions;
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
-	readonly unshareBinary?: string;
 	readonly heldExecBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
@@ -130,7 +131,6 @@ export interface LinuxProcessBackendStatus {
 	readonly fingerprint?: string;
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
-	readonly unshareBinary?: string;
 }
 
 export type LinuxProcessReuseMetrics = WorldReuseMetrics;
@@ -152,13 +152,11 @@ export interface LinuxProcessSession {
 interface ReadyBackend {
 	readonly sandlock: string;
 	readonly strace: string;
-	readonly unshare: string;
-	readonly mount: string;
 	readonly fingerprint: string;
 	readonly platformFingerprint: Sha256Digest;
 	readonly observerFingerprint: Sha256Digest;
 	readonly executionContext: DispatcherExecutionContext;
-	readonly dispatcher?: string;
+	readonly dispatcher: string;
 }
 
 interface InterposedDirectory {
@@ -166,12 +164,22 @@ interface InterposedDirectory {
 	readonly target: string;
 	readonly shadow: string;
 	readonly view: string;
-	readonly launcher: string;
+}
+
+interface SandboxMount {
+	readonly virtualPath: string;
+	readonly hostPath: string;
+	readonly readOnly: boolean;
+}
+
+interface ExecMount {
+	readonly virtualPath: string;
+	readonly hostPath: string;
 }
 
 interface ProcessInterposition {
-	readonly namespaceLauncher: string;
-	readonly planPath: string;
+	readonly mounts: readonly SandboxMount[];
+	readonly execMounts: readonly ExecMount[];
 	readonly directories: readonly InterposedDirectory[];
 	readonly executables: readonly (readonly [intercepted: string, original: string])[];
 	readonly dependencies: readonly DynamicDependency[];
@@ -182,6 +190,7 @@ interface DispatcherRequest {
 	readonly token: string;
 	readonly name: string;
 	readonly invokedPath: string;
+	readonly argv0: string;
 	readonly args: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
@@ -314,11 +323,10 @@ export class LinuxProcessReuseBackend {
 			const ready = await this.resolveReady();
 			return {
 				state: "ready",
-				detail: "Landlock/seccomp + user/PID/network/IPC namespaces + strace provenance ready",
+				detail: "Landlock/seccomp virtual filesystem + strace provenance ready",
 				fingerprint: ready.fingerprint,
 				sandlockBinary: ready.sandlock,
 				straceBinary: ready.strace,
-				unshareBinary: ready.unshare,
 			};
 		} catch (error) {
 			return { state: "unavailable", detail: errorMessage(error) };
@@ -432,24 +440,21 @@ export class LinuxProcessReuseBackend {
 			workspaceExcludes: input.workspace.observationExcludes,
 			token,
 			socketPath,
-			mountBinary: ready.mount,
-			...(ready.dispatcher ? { dispatcherBinary: ready.dispatcher } : {}),
+			dispatcherBinary: ready.dispatcher,
 			excludedExecutables: [
 				input.invocation.shell,
 				process.execPath,
-				...(ready.dispatcher ? [ready.dispatcher] : []),
+				ready.dispatcher,
 				ready.sandlock,
 				ready.strace,
-				ready.unshare,
-				ready.mount,
 			],
 		});
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
 		);
-		const producer = speculativeProducerProof(ready, deniedPaths);
-		const nestedProducer = speculativeProducerProof(ready, deniedPaths, "sandlock", LEAF_POLICY_ID);
+		const producer = speculativeProducerProof(ready, deniedPaths, POLICY_ID);
+		const nestedProducer = speculativeProducerProof(ready, deniedPaths, LEAF_POLICY_ID);
 		const session = {} as ActiveSession;
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		Object.assign(session, {
@@ -519,30 +524,27 @@ export class LinuxProcessReuseBackend {
 		if (process.platform !== "linux") throw new Error("Linux host required");
 		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
-		const [sandlock, strace, unshare, mount, dispatcher] = await Promise.all([
-			resolveBinary(this.options.sandlockBinary, "sandlock", [path.join(os.homedir(), ".local", "bin", "sandlock")]),
+		const [sandlock, strace, dispatcher] = await Promise.all([
+			resolveBinary(this.options.sandlockBinary, "pi-speculative-sandlock", [
+				path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock"),
+			]),
 			resolveBinary(this.options.straceBinary, "strace"),
-			resolveBinary(this.options.unshareBinary, "unshare"),
-			resolveBinary(undefined, "mount"),
-			resolveLinuxExecHelper(this.options.heldExecBinary).catch(() => undefined),
+			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
-		const [sandlockCheck, sandlockVersion, straceVersion, mountVersion, platformFingerprint] = await Promise.all([
+		const [sandlockCheck, sandlockVersion, straceVersion, platformFingerprint] = await Promise.all([
 			execText(sandlock, ["check"]),
 			execText(sandlock, ["--version"]),
 			execText(strace, ["-V"]),
-			execText(mount, ["--version"]),
 			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
-		await execText(unshare, namespaceArguments(["true"]));
-		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-mount-probe-"));
+		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: DispatcherExecutionContext | undefined;
 		try {
-			const source = path.join(mountProbe, "source");
-			const target = path.join(mountProbe, "target");
-			await Promise.all([mkdir(source), mkdir(target)]);
-			await execText(unshare, namespaceArguments([mount, "--bind", source, target]));
-			executionContext = await probeExecutionContext({ sandlock, strace, workspace: source, privateRoot: target });
+			const logicalRoot = path.join(mountProbe, "logical");
+			const physicalRoot = path.join(mountProbe, "physical");
+			await Promise.all([mkdir(logicalRoot), mkdir(physicalRoot)]);
+			executionContext = await probeExecutionContext({ sandlock, strace, logicalRoot, physicalRoot });
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
@@ -553,16 +555,14 @@ export class LinuxProcessReuseBackend {
 			policy: POLICY_ID,
 			sandlock: sandlockVersion.trim(),
 			strace: straceVersion.split(/\r?\n/)[0]?.trim(),
-			mount: mountVersion.split(/\r?\n/)[0]?.trim(),
 			platformFingerprint,
 			executionContext: sha256Digest(executionContext.key),
 			arch: process.arch,
 			deniedPaths: sensitivePaths(this.options.storeRoot, this.options.deniedPaths),
 		});
 		return {
-			sandlock, strace, unshare, mount, fingerprint, platformFingerprint, observerFingerprint,
-			executionContext,
-			...(dispatcher ? { dispatcher } : {}),
+			sandlock, strace, fingerprint, platformFingerprint, observerFingerprint,
+			executionContext, dispatcher,
 		};
 	}
 
@@ -577,6 +577,7 @@ export class LinuxProcessReuseBackend {
 		if (!physicalCwd || !pathContains(session.workspace.sandboxRoot, physicalCwd)) throw new Error("process cwd is unmapped");
 		const environment = normalizeEnvironment(request.environment);
 		const command = request.command;
+		const logicalCwd = session.projection.toLogical(physicalCwd);
 		const prototype = await this.topLevelPrototype(session, request, ready, environment);
 		this.add(session, "wholeCommandRequests");
 		const weakKey = processWeakKey(prototype);
@@ -592,10 +593,11 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
-			workspaceRoot: session.workspace.sandboxRoot,
-			privateRoot: session.workspace.processRoot,
-			cwd: physicalCwd,
+			cwd: logicalCwd,
 			deniedPaths: session.deniedPaths,
+			writablePaths: [session.workspace.sandboxRoot, session.socketPath],
+			mounts: session.interposition.mounts,
+			execMounts: session.interposition.execMounts,
 			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
@@ -607,13 +609,8 @@ export class LinuxProcessReuseBackend {
 		const processStarted = performance.now();
 		try {
 			outcome = await runSpawn(
-				ready.unshare,
-				namespaceArguments([
-					process.execPath,
-					session.interposition.namespaceLauncher,
-					session.interposition.planPath,
-					...traced,
-				]),
+				ready.strace,
+				traced.slice(1),
 				{
 					cwd: physicalCwd,
 					environment,
@@ -636,7 +633,7 @@ export class LinuxProcessReuseBackend {
 			};
 			try {
 				const after = await session.workspace.structure.capture();
-				const observation = await observeStrace(tracePrefix, session.invocation.shell, physicalCwd, {
+				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
 					interposedExecutables: session.interposition.executables,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
@@ -753,7 +750,8 @@ export class LinuxProcessReuseBackend {
 				.catch(async (error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
-					const request = parseDispatcherRequest(body);
+					const received = parseDispatcherRequest(body);
+					const request = received ? materializeDispatcherRequest(session, received) : undefined;
 					const executable = request ? await this.resolveRequestedExecutable(session, request).catch(() => undefined) : undefined;
 					socket.end(JSON.stringify({ version: 2, kind: "bypass", ...(executable ? { executable } : {}) }));
 				});
@@ -762,8 +760,10 @@ export class LinuxProcessReuseBackend {
 
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
 		const requestStarted = performance.now();
-		const request = parseDispatcherRequest(body);
-		if (!request || request.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
+		const received = parseDispatcherRequest(body);
+		if (!received || received.token !== session.token || session.closed) throw new Error("invalid dispatcher request");
+		const request = materializeDispatcherRequest(session, received);
+		if (!request) throw new Error("dispatcher cwd is unmapped");
 		this.add(session, "requests");
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
@@ -1040,13 +1040,16 @@ export class LinuxProcessReuseBackend {
 		let observedProcessMs: number | undefined;
 		let transactionFinishing = false;
 		try {
+			const logicalExecutable = session.projection.toLogical(executable);
+			const logicalCwd = session.projection.toLogical(request.cwd);
 			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,
 				...sandboxPolicyArguments(
-					session.workspace.sandboxRoot,
-					session.workspace.processRoot,
-					request.cwd,
+					logicalCwd,
 					session.deniedPaths,
+					[session.workspace.sandboxRoot],
+					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false }],
+					[],
 				),
 				"--",
 				process.execPath,
@@ -1054,20 +1057,20 @@ export class LinuxProcessReuseBackend {
 				"--exec",
 				outputRoute.join(""),
 				request.name,
-				executable,
+				logicalExecutable,
 				...request.args,
 			]);
 			const processStarted = performance.now();
 			outcome = await runSpawn(ready.strace, command.slice(1), {
 				cwd: request.cwd,
-				environment: executionEnvironment(request.environment, executable),
+				environment: executionEnvironment(request.environment),
 			});
 			observedProcessMs = Math.max(0, performance.now() - processStarted);
 			try {
 				transactionFinishing = true;
 				const [delta, observation] = await Promise.all([
 					transaction.finish(),
-					observeStrace(tracePrefix, executable, request.cwd, {
+					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 					}),
 				]);
@@ -1204,7 +1207,9 @@ export class LinuxProcessReuseBackend {
 		if (path.isAbsolute(request.invokedPath) && path.basename(request.invokedPath) === request.name) {
 			const invoked = path.resolve(request.invokedPath);
 			const covered = session.interposition.directories.find(
-				(directory) => path.resolve(path.dirname(invoked)) === path.resolve(directory.target),
+				(directory) => [directory.target, directory.view].some(
+					(candidate) => path.resolve(path.dirname(invoked)) === path.resolve(candidate),
+				),
 			);
 			if (covered) {
 				const resolved = await realpath(path.join(covered.source, request.name));
@@ -1240,12 +1245,12 @@ export class LinuxProcessReuseBackend {
 		const context = routedExecutionContext(ready.executionContext, outputRoute);
 		const contextDigest = sha256Digest(context.key);
 		const environment = Object.fromEntries(
-			Object.entries(executionEnvironment(request.environment, executable)).map(([name, value]) => [
+			Object.entries(executionEnvironment(request.environment)).map(([name, value]) => [
 				name,
 				session.projection.normalizeValue(value),
 			]),
 		);
-		const argv = [request.name, ...request.args].map((value) => session.projection.normalizeValue(value));
+		const argv = [request.argv0, ...request.args].map((value) => session.projection.normalizeValue(value));
 		return createExecPrototype({
 			executablePath: session.projection.toLogical(executable),
 			executableDigest: sha256Digest(content),
@@ -1467,7 +1472,7 @@ async function captureDependencies(
 
 	for (const item of observed) {
 		const observedPath = path.resolve(item.path);
-		if (interposedDirectoryFor(session, observedPath)) continue;
+		if (isInterposedLauncher(session, observedPath)) continue;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {
 			taints.add("escaped_sandbox");
 			incompleteReasons.add(`denied:${observedPath}`);
@@ -1546,12 +1551,9 @@ async function captureDependencies(
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
-function interposedDirectoryFor(session: ActiveSession, target: string): InterposedDirectory | undefined {
-	return session.interposition.directories.find(
-		(directory) => [directory.target, directory.shadow].some(
-			(parent) => path.resolve(path.dirname(target)) === path.resolve(parent),
-		),
-	);
+function isInterposedLauncher(session: ActiveSession, target: string): boolean {
+	const normalized = path.resolve(target);
+	return session.interposition.executables.some(([intercepted]) => path.resolve(intercepted) === normalized);
 }
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
@@ -1743,26 +1745,24 @@ async function createProcessInterposition(input: {
 	readonly workspaceExcludes: readonly string[];
 	readonly token: string;
 	readonly socketPath: string;
-	readonly mountBinary: string;
-	readonly dispatcherBinary?: string;
+	readonly dispatcherBinary: string;
 	readonly excludedExecutables: readonly string[];
 }): Promise<ProcessInterposition> {
 	const root = path.join(input.privateRoot, "process-interposition");
 	const viewRoot = path.join(root, "views");
 	const shadowRoot = path.join(root, "originals");
-	const launcherRoot = path.join(root, "launchers");
-	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true }), mkdir(launcherRoot, { recursive: true })]);
-	const dispatcher = new URL("./process-dispatcher.mjs", import.meta.url).href;
-	const namespaceLauncher = path.join(root, "process-namespace-launcher.mjs");
-	const namespaceModule = new URL("./process-namespace-launcher.mjs", import.meta.url).href;
+	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true })]);
+	const launcher = path.join(root, "dispatcher");
+	const dispatcher = fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url));
+	await copyFile(input.dispatcherBinary, launcher);
+	await chmod(launcher, 0o755);
 	const directories: InterposedDirectory[] = [];
-	const seenSources = new Set<string>();
-	const shebang = input.dispatcherBinary && !/\s/.test(input.dispatcherBinary) && !/[\r\n]/.test(process.execPath)
-		? `#!${input.dispatcherBinary} --dispatch=${process.execPath}`
-		: undefined;
-	for (const rawDirectory of shebang && Buffer.byteLength(shebang) < 128 ? input.pathValue.split(path.delimiter) : []) {
+	const seenTargets = new Set<string>();
+	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
 		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
 		const logicalDirectory = path.resolve(rawDirectory);
+		if (seenTargets.has(logicalDirectory)) continue;
+		seenTargets.add(logicalDirectory);
 		const projected = input.projection.toPhysical(logicalDirectory) ?? logicalDirectory;
 		let source: string;
 		try {
@@ -1771,31 +1771,24 @@ async function createProcessInterposition(input: {
 		} catch {
 			continue;
 		}
-		if (seenSources.has(source)) continue;
-		seenSources.add(source);
-		let target = logicalDirectory;
-		if (!input.projection.isWorkspacePhysical(source)) {
-			target = await realpath(logicalDirectory).catch(() => logicalDirectory);
-		}
 		const index = directories.length.toString().padStart(3, "0");
 		const shadow = path.join(shadowRoot, index);
-		if (/[\r\n]/.test(shadow)) continue;
+		if ([logicalDirectory, source, shadow, process.execPath, dispatcher].some((value) => /[\r\n]/.test(value))) continue;
 		directories.push({
 			source,
-			target,
+			target: logicalDirectory,
 			shadow,
 			view: path.join(viewRoot, index),
-			launcher: path.join(launcherRoot, `${index}.mjs`),
 		});
 	}
+	const configurationPath = path.join(root, "configuration.json");
 	const configuration = {
 		version: 2,
 		socketPath: input.socketPath,
 		token: input.token,
-		directories: directories.map(({ target, shadow }) => ({ target, shadow })),
+		directories: directories.map(({ target, view, shadow }) => ({ target, view, shadow })),
 	};
-	await writeFile(namespaceLauncher, `#!${process.execPath}\nawait import(${JSON.stringify(namespaceModule)});\n`, { mode: 0o755 });
-	await chmod(namespaceLauncher, 0o755);
+	await writeFile(configurationPath, JSON.stringify(configuration), { mode: 0o600 });
 
 	const excluded = new Set<string>();
 	for (const candidate of input.excludedExecutables) {
@@ -1806,16 +1799,16 @@ async function createProcessInterposition(input: {
 		}
 	}
 	const executables: Array<readonly [string, string]> = [];
+	const execMounts: ExecMount[] = [];
 	const dependencies: DynamicDependency[] = [];
+	const dependencySources = new Set<string>();
 	for (const directory of directories) {
-		await writeFile(
-			directory.launcher,
-			`${shebang}\n//PI_SPEC_NATIVE ${directory.shadow}\n` +
-				`globalThis.__PI_SPEC_PROCESS_DISPATCHER__=${JSON.stringify(configuration)};\nawait import(${JSON.stringify(dispatcher)});\n`,
-			{ mode: 0o755 },
-		);
-		await chmod(directory.launcher, 0o755);
 		await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
+		await writeFile(
+			path.join(directory.view, ".pi-spec-dispatch-v1"),
+			["PI_SPEC_DISPATCH_V1", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
+			{ mode: 0o600 },
+		);
 		let entries: string[];
 		try {
 			entries = await readdir(directory.source);
@@ -1823,11 +1816,10 @@ async function createProcessInterposition(input: {
 			continue;
 		}
 		for (const name of entries) {
-			if (!name || name.includes("/") || name.includes("\0")) continue;
+			if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) continue;
 			const sourceEntry = path.join(directory.source, name);
 			const viewEntry = path.join(directory.view, name);
 			try {
-				const linkStat = await lstat(sourceEntry);
 				const resolved = await realpath(sourceEntry);
 				const resolvedStat = await lstat(resolved);
 				let executable = resolvedStat.isFile() && !excluded.has(resolved);
@@ -1839,40 +1831,37 @@ async function createProcessInterposition(input: {
 					}
 				}
 				if (executable) {
-					if (linkStat.isSymbolicLink()) await symlink(directory.launcher, viewEntry);
-					else await link(directory.launcher, viewEntry);
-					executables.push([path.join(directory.target, name), path.join(directory.shadow, name)]);
-				} else {
-					await symlink(path.join(directory.shadow, name), viewEntry);
+					await link(launcher, viewEntry);
+					const intercepted = path.join(directory.target, name);
+					executables.push([intercepted, path.join(directory.shadow, name)]);
+					executables.push([viewEntry, path.join(directory.shadow, name)]);
+					execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
 				}
 			} catch {
-				// Preserve an unreadable entry through the shadow mount instead of guessing its type.
-				await symlink(path.join(directory.shadow, name), viewEntry).catch(() => undefined);
+				// An entry that cannot be proved executable remains visible through its original directory.
 			}
 		}
-		dependencies.push(
-			await captureDirectoryDependency(
-				directory.source,
-				slash(directory.target),
-				true,
-				path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
-			),
-		);
+		if (!dependencySources.has(directory.source)) {
+			dependencySources.add(directory.source);
+			dependencies.push(
+				await captureDirectoryDependency(
+					directory.source,
+					input.projection.isWorkspacePhysical(directory.source)
+						? input.projection.toLogical(directory.source)
+						: slash(directory.source),
+					true,
+					path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
+				),
+			);
+		}
 	}
-	const planPath = path.join(root, "mount-plan.json");
-	await writeFile(
-		planPath,
-		JSON.stringify({
-			version: 1,
-			mountBinary: input.mountBinary,
-			workspace: { source: input.workspaceRoot, target: input.sourceRoot },
-			directories,
-		}),
-		{ mode: 0o600 },
-	);
+	const mounts = uniqueSandboxMounts([
+		...directories.map(({ shadow, source }) => ({ virtualPath: shadow, hostPath: source, readOnly: true })),
+		{ virtualPath: input.sourceRoot, hostPath: input.workspaceRoot, readOnly: false },
+	]);
 	return {
-		namespaceLauncher,
-		planPath,
+		mounts,
+		execMounts: Object.freeze(execMounts),
 		directories: Object.freeze(directories),
 		executables: Object.freeze(executables),
 		dependencies: Object.freeze(dependencies),
@@ -1881,16 +1870,19 @@ async function createProcessInterposition(input: {
 
 function sandboxArguments(input: {
 	readonly ready: ReadyBackend;
-	readonly workspaceRoot: string;
-	readonly privateRoot: string;
 	readonly cwd: string;
 	readonly deniedPaths: readonly string[];
+	readonly writablePaths: readonly string[];
+	readonly mounts: readonly SandboxMount[];
+	readonly execMounts: readonly ExecMount[];
 	readonly command: readonly string[];
 	readonly timeoutSeconds?: number;
 }): readonly string[] {
 	return [
 		input.ready.sandlock,
-		...sandboxPolicyArguments(input.workspaceRoot, input.privateRoot, input.cwd, input.deniedPaths),
+		...sandboxPolicyArguments(
+			input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts,
+		),
 		...(input.timeoutSeconds !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeoutSeconds)))] : []),
 		"--",
 		...input.command,
@@ -1898,19 +1890,22 @@ function sandboxArguments(input: {
 }
 
 function sandboxPolicyArguments(
-	workspaceRoot: string,
-	privateRoot: string,
 	cwd: string,
 	deniedPaths: readonly string[],
+	writablePaths: readonly string[],
+	mounts: readonly SandboxMount[],
+	execMounts: readonly ExecMount[],
 ): readonly string[] {
 	return [
 		"run",
+		"--chroot",
+		"/",
+		...mounts.flatMap((mount) => ["--fs-mount", sandboxMountArgument(mount)]),
+		...execMounts.flatMap((mount) => ["--exec-mount", execMountArgument(mount)]),
 		"--fs-read",
 		"/",
-		"--fs-write",
-		workspaceRoot,
-		"--fs-write",
-		privateRoot,
+		...writablePaths.flatMap((target) => ["--fs-write", target]),
+		...mounts.filter((mount) => !mount.readOnly).flatMap((mount) => ["--fs-write", mount.virtualPath]),
 		...[...STABLE_SANDBOX_DEVICES].flatMap((target) => ["--fs-write", target]),
 		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
 		"--time-start",
@@ -1924,15 +1919,45 @@ function sandboxPolicyArguments(
 	];
 }
 
+function uniqueSandboxMounts(mounts: readonly SandboxMount[]): readonly SandboxMount[] {
+	const seen = new Set<string>();
+	return Object.freeze(
+		[...mounts]
+			.sort((left, right) => right.virtualPath.length - left.virtualPath.length)
+			.filter(({ virtualPath }) => {
+				const normalized = path.resolve(virtualPath);
+				if (seen.has(normalized)) return false;
+				seen.add(normalized);
+				return true;
+			}),
+	);
+}
+
+function sandboxMountArgument(mount: SandboxMount): string {
+	if (!path.isAbsolute(mount.virtualPath) || !path.isAbsolute(mount.hostPath) || [mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))) {
+		throw new Error(`Sandlock mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
+	}
+	return `${mount.virtualPath}:${mount.hostPath}:${mount.readOnly ? "ro" : "rw"}`;
+}
+
+function execMountArgument(mount: ExecMount): string {
+	if (!path.isAbsolute(mount.virtualPath) || !path.isAbsolute(mount.hostPath) || [mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))) {
+		throw new Error(`Sandlock exec mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
+	}
+	return `${mount.virtualPath}:${mount.hostPath}`;
+}
+
 async function probeExecutionContext(input: {
 	readonly sandlock: string;
 	readonly strace: string;
-	readonly workspace: string;
-	readonly privateRoot: string;
+	readonly logicalRoot: string;
+	readonly physicalRoot: string;
 }): Promise<DispatcherExecutionContext> {
-	const command = straceCommand(input.strace, path.join(input.privateRoot, "context"), [
+	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
-		...sandboxPolicyArguments(input.workspace, input.privateRoot, input.workspace, []),
+		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [
+			{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false },
+		], []),
 		"--",
 		process.execPath,
 		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
@@ -1942,11 +1967,12 @@ async function probeExecutionContext(input: {
 		process.execPath,
 		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
 		"--probe-context",
+		input.logicalRoot,
 	]);
 	const outcome = await runSpawn(
 		input.strace,
 		command.slice(1),
-		{ cwd: input.workspace, environment: normalizeEnvironment(process.env) },
+		{ cwd: input.physicalRoot, environment: normalizeEnvironment(process.env) },
 	);
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
@@ -1958,7 +1984,6 @@ async function probeExecutionContext(input: {
 function speculativeProducerProof(
 	ready: ReadyBackend,
 	deniedPaths: readonly string[],
-	provider = "sandlock+namespaces",
 	policy = POLICY_ID,
 ): ProcessProducerProof {
 	return Object.freeze({
@@ -1966,7 +1991,7 @@ function speculativeProducerProof(
 		execution: {
 			authority: "speculative",
 			confinement: {
-				provider,
+				provider: "sandlock",
 				fingerprint: digestObject({ policy, deniedPaths }),
 			},
 		},
@@ -1982,23 +2007,6 @@ function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessPr
 		expected.execution.confinement.provider === candidate.execution.confinement.provider &&
 		expected.execution.confinement.fingerprint === candidate.execution.confinement.fingerprint
 	);
-}
-
-function namespaceArguments(command: readonly string[]): readonly string[] {
-	return [
-		"--user",
-		"--map-current-user",
-		"--keep-caps",
-		"--mount",
-		"--pid",
-		"--fork",
-		"--mount-proc",
-		"--net",
-		"--ipc",
-		"--uts",
-		"--",
-		...command,
-	];
 }
 
 async function runSpawn(
@@ -2077,6 +2085,9 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 			typeof request.name !== "string" ||
 			typeof request.invokedPath !== "string" ||
 			request.invokedPath.includes("\0") ||
+			typeof request.argv0 !== "string" ||
+			request.argv0.length > 1024 * 1024 ||
+			request.argv0.includes("\0") ||
 			!Array.isArray(request.args) ||
 			!request.args.every((argument) => typeof argument === "string" && !argument.includes("\0")) ||
 			typeof request.cwd !== "string" ||
@@ -2097,6 +2108,14 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function materializeDispatcherRequest(
+	session: ActiveSession,
+	request: DispatcherRequest,
+): DispatcherRequest | undefined {
+	const cwd = session.projection.toPhysical(request.cwd);
+	return cwd ? { ...request, cwd } : undefined;
 }
 
 async function eligibleRequest(
@@ -2179,10 +2198,9 @@ function validDispatcherContext(value: unknown): value is DispatcherExecutionCon
 	);
 }
 
-function executionEnvironment(environment: Readonly<Record<string, string>>, executable: string): Record<string, string> {
+function executionEnvironment(environment: Readonly<Record<string, string>>): Record<string, string> {
 	const result = { ...environment };
 	for (const name of Object.keys(result)) if (name.startsWith("PI_SPEC_")) delete result[name];
-	result._ = executable;
 	return result;
 }
 
@@ -2248,10 +2266,10 @@ function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readon
 	if (producer.execution.authority === "actor") return true;
 	const confinement = producer.execution.confinement;
 	return (
-		(confinement.provider === "sandlock+namespaces" &&
-			confinement.fingerprint === digestObject({ policy: POLICY_ID, deniedPaths })) ||
-		(confinement.provider === "sandlock" &&
-			confinement.fingerprint === digestObject({ policy: LEAF_POLICY_ID, deniedPaths }))
+		confinement.provider === "sandlock" &&
+		[POLICY_ID, LEAF_POLICY_ID].some(
+			(policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }),
+		)
 	);
 }
 

@@ -1,0 +1,364 @@
+diff --git a/crates/sandlock-cli/src/main.rs b/crates/sandlock-cli/src/main.rs
+index 96309ec..1925e1c 100644
+--- a/crates/sandlock-cli/src/main.rs
++++ b/crates/sandlock-cli/src/main.rs
+@@ -98,6 +98,10 @@ struct RunArgs {
+     #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST[:ro]")]
+     fs_mount: Vec<String>,
+ 
++    /// Substitute an executable only when it is invoked; open/stat still see VIRTUAL.
++    #[arg(long = "exec-mount", value_name = "VIRTUAL:HOST")]
++    exec_mount: Vec<String>,
++
+     /// COW branch action on normal sandbox exit: commit | abort | keep
+     /// (default: commit).
+     #[arg(long = "on-exit", value_name = "ACTION")]
+@@ -644,6 +648,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+             builder.fs_mount(virt, host)
+         };
+     }
++    for spec in &args.exec_mount {
++        let (virt, host, read_only) = profile::parse_mount_spec(spec)?;
++        if read_only {
++            return Err(anyhow!("--exec-mount does not accept a :ro suffix"));
++        }
++        builder = builder.exec_mount(virt, host);
++    }
+     if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
+     match &args.gpu {
+         // `all` maps to an empty device list, which the core expands to every
+diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
+index 6e4ab93..67f53d6 100644
+--- a/crates/sandlock-core/src/chroot/dispatch.rs
++++ b/crates/sandlock-core/src/chroot/dispatch.rs
+@@ -76,6 +76,8 @@ pub(crate) struct ChrootCtx<'a> {
+     pub mounts: &'a [(PathBuf, PathBuf)],
+     /// Virtual paths of read-only mounts: reads allowed, writes denied.
+     pub mount_ro: &'a [PathBuf],
++    /// Exact exec-only substitutions; ordinary path operations remain untouched.
++    pub exec_mounts: &'a [(PathBuf, PathBuf)],
+     /// Per-process supervisor state, for handlers that track the caller's
+     /// filesystem context rather than just resolving one path.
+     pub processes: &'a Arc<ProcessIndex>,
+@@ -94,6 +96,7 @@ impl<'a> ChrootCtx<'a> {
+             denied: &policy.chroot_denied,
+             mounts: &policy.chroot_mounts,
+             mount_ro: &policy.chroot_mount_ro,
++            exec_mounts: &policy.chroot_exec_mounts,
+             processes,
+         }
+     }
+@@ -203,6 +206,12 @@ impl ChrootCtx<'_> {
+     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
+         crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
+     }
++
++    fn exec_target(&self, virtual_path: &Path) -> Option<&Path> {
++        self.exec_mounts.iter().find_map(|(virtual_exec, host_exec)| {
++            (virtual_exec == virtual_path).then_some(host_exec.as_path())
++        })
++    }
+ }
+ 
+ // ============================================================
+@@ -563,6 +572,32 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
+ // openat handler
+ // ============================================================
+ 
++fn chroot_open_allowed(ctx: &ChrootCtx<'_>, path: &Path, flags: u64) -> bool {
++    let writes = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
++    if writes { ctx.can_write(path) } else { ctx.can_read(path) }
++}
++
++fn inject_chroot_open(
++    ctx: &ChrootCtx<'_>,
++    notif: &SeccompNotif,
++    path: &Path,
++    flags: u64,
++    honored: u64,
++) -> NotifAction {
++    let flags_i = flags as i32;
++    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
++    let mode = if creates { 0o666 } else { 0 };
++    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
++        libc::O_CLOEXEC as u32
++    } else {
++        0
++    };
++    match open_in_namespace(ctx, notif.pid, path, flags_i, mode, honored) {
++        Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
++        Err(errno) => NotifAction::Errno(errno),
++    }
++}
++
+ pub(crate) async fn handle_chroot_open(
+     notif: &SeccompNotif,
+     _chroot_state: &Arc<Mutex<ChrootState>>,
+@@ -591,16 +626,20 @@ pub(crate) async fn handle_chroot_open(
+     // Resolve to get the virtual path for access control.
+     let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
+         Some(r) => r,
+-        None => return NotifAction::Errno(libc::EACCES),
++        None => {
++            let Some(unresolved) = build_virtual_path(notif, dirfd, &rel_path, ctx) else {
++                return NotifAction::Errno(libc::EACCES);
++            };
++            let virtual_path = crate::chroot::resolve::confine(&unresolved);
++            if !chroot_open_allowed(ctx, &virtual_path, flags) {
++                return NotifAction::Errno(libc::EACCES);
++            }
++            return inject_chroot_open(ctx, notif, &virtual_path, flags, honored);
++        }
+     };
+ 
+     // Access check: writes need can_write, reads need can_read
+-    let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+-    if is_write {
+-        if !ctx.can_write(&virtual_path) {
+-            return NotifAction::Errno(libc::EACCES);
+-        }
+-    } else if !ctx.can_read(&virtual_path) {
++    if !chroot_open_allowed(ctx, &virtual_path, flags) {
+         return NotifAction::Errno(libc::EACCES);
+     }
+ 
+@@ -657,25 +696,8 @@ pub(crate) async fn handle_chroot_open(
+     }
+ 
+     // Resolve the path to an fd to hand the child: either a freshly opened tree
+-    // file or a dup of one of the child's own fds (a magic link). See
+-    // `open_in_namespace`.
+-    //
+-    // openat2 rejects a non-zero mode unless O_CREAT/O_TMPFILE is set (stricter
+-    // than openat), so only supply a creation mode when the child asks to create.
+-    // O_TMPFILE is a composite (__O_TMPFILE | O_DIRECTORY), so it must be matched
+-    // as a full mask, not with a bitwise-and that any O_DIRECTORY open would trip.
+-    let flags_i = flags as i32;
+-    let creates = flags_i & libc::O_CREAT != 0 || flags_i & libc::O_TMPFILE == libc::O_TMPFILE;
+-    let mode = if creates { 0o666 } else { 0 };
+-    let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
+-        libc::O_CLOEXEC as u32
+-    } else {
+-        0
+-    };
+-    match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode, honored) {
+-        Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
+-        Err(errno) => NotifAction::Errno(errno),
+-    }
++    // file or a dup of one of the child's own fds (a magic link).
++    inject_chroot_open(ctx, notif, &virtual_path, flags, honored)
+ }
+ 
+ /// Open `virtual_path` within the child's virtual namespace, returning an fd to
+@@ -867,6 +889,12 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
+     None
+ }
+ 
++fn is_elf(fd: RawFd) -> bool {
++    let mut magic = [0u8; 4];
++    (unsafe { libc::pread(fd, magic.as_mut_ptr().cast(), magic.len(), 0) }) == magic.len() as isize
++        && magic == *b"\x7fELF"
++}
++
+ /// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
+ /// Uses sendfile for efficient kernel-to-kernel copy, then patches the
+ /// interpreter path in place.
+@@ -974,22 +1002,32 @@ pub(crate) async fn handle_chroot_exec(
+         return NotifAction::Errno(libc::EACCES);
+     }
+ 
+-    // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
+-    // open confined to the chroot root (or mount target) — no resolve-then-reopen TOCTOU gap.
+-    let (exec_root, exec_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
+-        (mt.to_path_buf(), sub)
++    // Exec-only mounts substitute the image without changing open/stat/directory semantics.
++    // Otherwise retain the atomic chroot/mount-confined open used for ordinary execution.
++    let src_fd = if let Some(target) = ctx.exec_target(&virtual_path) {
++        let target = match CString::new(target.to_string_lossy().as_bytes()) {
++            Ok(target) => target,
++            Err(_) => return NotifAction::Errno(libc::EINVAL),
++        };
++        let fd = unsafe {
++            libc::open(target.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
++        };
++        if fd < 0 {
++            return NotifAction::Errno(last_errno(libc::ENOENT));
++        }
++        fd
+     } else {
+-        (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
+-    };
+-    let src_fd = match openat2_in_root(
+-        &exec_root,
+-        &exec_path,
+-        libc::O_RDONLY | libc::O_CLOEXEC,
+-        0,
+-    ) {
+-        Ok(fd) => fd,
+-        Err(_) => return NotifAction::Errno(libc::ENOENT),
++        let (exec_root, exec_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
++            (mt.to_path_buf(), sub)
++        } else {
++            (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
++        };
++        match openat2_in_root(&exec_root, &exec_path, libc::O_RDONLY | libc::O_CLOEXEC, 0) {
++            Ok(fd) => fd,
++            Err(_) => return NotifAction::Errno(libc::ENOENT),
++        }
+     };
++    let executable_is_elf = is_elf(src_fd);
+ 
+     // Read PT_INTERP from the binary. If it has one, open the image's
+     // interpreter and create a memfd copy with PT_INTERP patched to
+@@ -1019,7 +1057,7 @@ pub(crate) async fn handle_chroot_exec(
+             flags: 0,
+             srcfd: interp_src as u32,
+             newfd: 0,
+-            newfd_flags: 0,
++            newfd_flags: libc::O_CLOEXEC as u32,
+         };
+         let child_interp_fd = unsafe {
+             libc::ioctl(
+@@ -1068,7 +1106,7 @@ pub(crate) async fn handle_chroot_exec(
+         flags: 0,
+         srcfd: exec_fd.as_raw_fd() as u32,
+         newfd: 0,
+-        newfd_flags: 0, // no O_CLOEXEC — must survive exec
++        newfd_flags: if executable_is_elf { libc::O_CLOEXEC as u32 } else { 0 },
+     };
+     let child_fd = unsafe {
+         libc::ioctl(
+@@ -2482,6 +2520,7 @@ mod mount_ro_tests {
+             denied: &[],
+             mounts,
+             mount_ro,
++            exec_mounts: &[],
+             processes,
+         }
+     }
+diff --git a/crates/sandlock-core/src/resource.rs b/crates/sandlock-core/src/resource.rs
+index 398d45a..56daf44 100644
+--- a/crates/sandlock-core/src/resource.rs
++++ b/crates/sandlock-core/src/resource.rs
+@@ -961,6 +961,7 @@ mod tests {
+             chroot_denied: Vec::new(),
+             chroot_mounts: Vec::new(),
+             chroot_mount_ro: Vec::new(),
++            chroot_exec_mounts: Vec::new(),
+             deterministic_dirs: false,
+             virtual_hostname: None,
+             has_http_acl: false,
+diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
+index 8d06d60..a9fb7b0 100644
+--- a/crates/sandlock-core/src/sandbox.rs
++++ b/crates/sandlock-core/src/sandbox.rs
+@@ -179,6 +179,7 @@ impl TryFrom<&Sandbox> for Confinement {
+         if sandbox.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
+         if sandbox.on_error != BranchAction::Abort { unsupported.push("on_error"); }
+         if !sandbox.fs_mount.is_empty() { unsupported.push("fs_mount"); }
++        if !sandbox.exec_mount.is_empty() { unsupported.push("exec_mount"); }
+         if sandbox.chroot.is_some() { unsupported.push("chroot"); }
+         if sandbox.clean_env { unsupported.push("clean_env"); }
+         if !sandbox.env.is_empty() { unsupported.push("env"); }
+@@ -498,6 +499,8 @@ pub struct Sandbox {
+     // Virtual paths (a subset of fs_mount destinations) mounted read-only:
+     // reads allowed, writes denied even on a writable rootfs.
+     pub fs_mount_ro: Vec<PathBuf>,
++    /// Exec-only substitutions: (virtual executable, host executable/script).
++    pub exec_mount: Vec<(PathBuf, PathBuf)>,
+ 
+     // Environment
+     pub chroot: Option<PathBuf>,
+@@ -644,6 +647,7 @@ impl Clone for Sandbox {
+             on_error: self.on_error.clone(),
+             fs_mount: self.fs_mount.clone(),
+             fs_mount_ro: self.fs_mount_ro.clone(),
++            exec_mount: self.exec_mount.clone(),
+             chroot: self.chroot.clone(),
+             in_child_main: self.in_child_main,
+             clean_env: self.clean_env,
+@@ -2136,6 +2140,7 @@ impl Sandbox {
+                 chroot_denied: self.fs_denied.clone(),
+                 chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
+                 chroot_mount_ro: self.fs_mount_ro.clone(),
++                chroot_exec_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.exec_mount),
+                 deterministic_dirs: self.deterministic_dirs,
+                 virtual_hostname: Some(rt_name),
+                 has_http_acl: resolved.features.http_acl,
+diff --git a/crates/sandlock-core/src/sandbox/builder.rs b/crates/sandlock-core/src/sandbox/builder.rs
+index 6eaa211..12fd461 100644
+--- a/crates/sandlock-core/src/sandbox/builder.rs
++++ b/crates/sandlock-core/src/sandbox/builder.rs
+@@ -169,6 +169,10 @@ pub struct SandboxBuilder {
+     #[cfg_attr(feature = "cli", clap(skip))]
+     pub fs_mount_ro: Vec<PathBuf>,
+ 
++    // Exec-only substitutions: ordinary filesystem operations keep seeing the virtual path.
++    #[cfg_attr(feature = "cli", clap(skip))]
++    pub exec_mount: Vec<(PathBuf, PathBuf)>,
++
+     #[cfg_attr(feature = "cli", arg(long = "chroot"))]
+     pub chroot: Option<PathBuf>,
+ 
+@@ -293,6 +297,7 @@ impl Default for SandboxBuilder {
+             on_error: None,
+             fs_mount: Vec::new(),
+             fs_mount_ro: Vec::new(),
++            exec_mount: Vec::new(),
+             chroot: None,
+             clean_env: false,
+             env: std::collections::HashMap::new(),
+@@ -357,6 +362,7 @@ impl Clone for SandboxBuilder {
+             on_error: self.on_error.clone(),
+             fs_mount: self.fs_mount.clone(),
+             fs_mount_ro: self.fs_mount_ro.clone(),
++            exec_mount: self.exec_mount.clone(),
+             chroot: self.chroot.clone(),
+             clean_env: self.clean_env,
+             env: self.env.clone(),
+@@ -696,6 +702,12 @@ impl SandboxBuilder {
+         self
+     }
+ 
++    /// Substitute one virtual executable without changing how that path is opened or inspected.
++    pub fn exec_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
++        self.exec_mount.push((virtual_path.into(), host_path.into()));
++        self
++    }
++
+     pub fn clean_env(mut self, v: bool) -> Self {
+         self.clean_env = v;
+         self
+@@ -1047,6 +1059,7 @@ impl SandboxBuilder {
+             on_error: self.on_error.unwrap_or_default(),
+             fs_mount: self.fs_mount,
+             fs_mount_ro: self.fs_mount_ro,
++            exec_mount: self.exec_mount,
+             chroot: self.chroot,
+             in_child_main: None,
+             clean_env: self.clean_env,
+diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
+index 3673d84..a6d0051 100644
+--- a/crates/sandlock-core/src/seccomp/dispatch.rs
++++ b/crates/sandlock-core/src/seccomp/dispatch.rs
+@@ -1146,6 +1146,7 @@ mod handler_tests {
+                 chroot_denied: Vec::new(),
+                 chroot_mounts: Vec::new(),
+                 chroot_mount_ro: Vec::new(),
++                chroot_exec_mounts: Vec::new(),
+                 deterministic_dirs: false,
+                 virtual_hostname: None,
+                 has_http_acl: false,
+diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
+index abcd92c..3ccac11 100644
+--- a/crates/sandlock-core/src/seccomp/notif.rs
++++ b/crates/sandlock-core/src/seccomp/notif.rs
+@@ -787,6 +787,8 @@ pub struct NotifPolicy {
+     /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
+     /// e.g. `/proc/sys/*` writable.
+     pub chroot_mount_ro: Vec<std::path::PathBuf>,
++    /// Exact exec-only substitutions; other syscalls continue to resolve the original path.
++    pub chroot_exec_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+     pub deterministic_dirs: bool,
+     pub virtual_hostname: Option<String>,
+     pub has_http_acl: bool,

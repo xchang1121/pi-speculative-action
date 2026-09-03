@@ -121,7 +121,6 @@ async function conversionAblation() {
 		storeRoot: fixture.storeRoot,
 		sandlockBinary: "/pi-dependency-disabled/sandlock",
 		straceBinary: "/pi-dependency-disabled/strace",
-		unshareBinary: "/pi-dependency-disabled/unshare",
 	});
 	try {
 		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
@@ -185,7 +184,7 @@ int main(int argc, char **argv) {
 			executionFingerprint,
 		});
 		try {
-			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)}`);
+			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)} ${JSON.stringify(fixture.backend.metrics())}`);
 			assert(fixture.backend.metrics().published > 0, `speculative child did not publish a reusable certificate: ${JSON.stringify(fixture.backend.metrics())}`);
 		} finally {
 			await branch.dispose();
@@ -199,6 +198,36 @@ int main(int argc, char **argv) {
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(hitMetrics.hits === 1, `held child was not reused: ${JSON.stringify(hitMetrics)}`);
+		let actorTurn = "benchmark";
+		const joiningActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: actorTurn }));
+
+		const cwdProducerBefore = fixture.backend.metrics();
+		const cwdBranch = await forkReusableBash(fixture, {
+			label: "held-cwd-producer",
+			command: "/bin/pwd",
+			actionNamespace: "pi-held-exec-production.v1",
+			executionFingerprint,
+		});
+		let cwdHits = -1;
+		try {
+			const cwdProduced = metricDelta(cwdProducerBefore, fixture.backend.metrics());
+			assert(textOutput(cwdBranch.output.result) === `${fixture.workspace}\n`, "speculative child observed a private cwd");
+			const cwdBefore = fixture.backend.metrics();
+			const cwdActor = await joiningActor.execute(
+				"held-cwd-actor",
+				{ command: "printf 'actor-cwd\\n'; /bin/pwd" },
+				new AbortController().signal,
+			);
+			const cwdMetrics = metricDelta(cwdBefore, fixture.backend.metrics());
+			cwdHits = cwdMetrics.hits;
+			assert(textOutput(cwdActor) === `actor-cwd\n${fixture.workspace}\n`, "transferred child observed a non-Actor cwd");
+			assert(
+				cwdMetrics.hits === 1,
+				`absolute PATH alias was not transferred: producer=${JSON.stringify(cwdProduced)} actor=${JSON.stringify(cwdMetrics)}`,
+			);
+		} finally {
+			await cwdBranch.dispose();
+		}
 
 		const securityBefore = fixture.backend.metrics();
 		const securityBranch = await forkReusableBash(fixture, {
@@ -245,7 +274,10 @@ int main(int argc, char **argv) {
 			);
 			const inodeMetrics = metricDelta(inodeBefore, replayBackend.metrics());
 			inodeHits = inodeMetrics.hits;
-			assert(textOutput(inodeActor).trim() === expectedInode, "Actor observed speculative inode metadata");
+			assert(
+				textOutput(inodeActor).trim() === expectedInode,
+				`Actor observed speculative inode metadata: expected ${expectedInode}, got ${JSON.stringify(textOutput(inodeActor).trim())}; ${JSON.stringify(inodeMetrics)}`,
+			);
 			assert(inodeMetrics.hits === 0 && inodeMetrics.misses >= 1, "non-equivalent inode metadata was reused");
 		} finally {
 			await inodeBranch.dispose();
@@ -264,8 +296,6 @@ int main(int argc, char **argv) {
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const joinBefore = fixture.backend.metrics();
-		let actorTurn = "benchmark";
-		const joiningActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: actorTurn }));
 		const joiningTask = forkReusableBash(fixture, {
 			label: "held-joining-producer",
 			command: ": speculative-join; worker joined.txt",
@@ -351,7 +381,10 @@ int main(int argc, char **argv) {
 			executionFingerprint,
 		});
 		try {
-			assert(!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok", "native descriptor bypass changed output");
+			assert(
+				!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok",
+				`native descriptor bypass changed output: ${JSON.stringify(descriptorBranch.output)}`,
+			);
 			const descriptorValidation = await descriptorBranch.validate?.();
 			assert(
 				descriptorValidation?.status === "indeterminate" &&
@@ -378,10 +411,11 @@ int main(int argc, char **argv) {
 				actorMs: hitMs,
 				hits: hitMetrics.hits,
 				avoidedProcessMs: hitMetrics.avoidedProcessMs,
-				producerDependenciesDisabledAtReplay: ["sandlock", "strace", "unshare"],
+				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
 			},
 			joining: { actorMs: joiningMs, leadMs, hits: joinMetrics.hits, joinedHits: joinMetrics.joinedHits },
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnRejected: true },
+			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },
 			inheritedDescriptor: { completedHandoffHits: 0, exactMetadataFallback: true },
 			changedInputMiss: { actorMs: missMs, hits: missMetrics.hits, misses: missMetrics.misses },
 			confinementMismatch: {

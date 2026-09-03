@@ -244,6 +244,7 @@ export async function inspectHeldExecProcess(pid: number): Promise<HeldExecSnaps
 		executionDomain: "ptrace-v1",
 		rlimits: limits.split("\n").slice(1).map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
+		systemMetadata: statIdentity(await stat("/bin/sh")),
 		signals: { blocked: statusField(status, "SigBlk"), ignored: statusField(status, "SigIgn") },
 		scheduling: {
 			nice: Number(processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[16]),
@@ -268,6 +269,10 @@ export async function inspectHeldExecProcess(pid: number): Promise<HeldExecSnaps
 		environment,
 		context: { key: JSON.stringify(semantic), umask: Number.parseInt(statusField(status, "Umask"), 8), descriptorTypes },
 	};
+}
+
+function statIdentity(value: Awaited<ReturnType<typeof stat>>): Readonly<Record<string, string>> {
+	return Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map((name) => [name, String(value[name as keyof typeof value])]));
 }
 
 function decodeNullFields(bytes: Buffer): string[] {

@@ -224,8 +224,11 @@ export async function observeStrace(
 					const metadataPaths = metadataSyscallPaths(line, syscall, cwd);
 					const digest = statObservationDigest(line);
 					if (!metadataPaths.length || !digest) {
-						taints.add("unsupported_syscall");
-						incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
+						if (syscall === "fstat" && descriptorTarget(line)) taints.add("descriptor_observation");
+						else {
+							taints.add("unsupported_syscall");
+							incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
+						}
 					}
 					if (digest) {
 						for (const observed of metadataPaths) observeMetadata(observed.path, observed.followSymlinks, digest);
@@ -510,6 +513,12 @@ function metadataSyscallPaths(
 	const descriptorPath = descriptor?.replace(/<[^<>]*>$/, "");
 	if (!descriptorPath?.startsWith("/") || descriptorPath.endsWith(" (deleted)")) return [];
 	return [{ path: path.posix.normalize(descriptorPath), followSymlinks }];
+}
+
+/** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
+function descriptorTarget(line: string): boolean {
+	const target = /^\s*fstat\(\d+<(.+?)>,/.exec(line)?.[1];
+	return Boolean(target && !target.startsWith("/"));
 }
 
 const STAT_MODE_BITS: Readonly<Record<string, bigint>> = {

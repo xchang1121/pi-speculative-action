@@ -24,11 +24,11 @@ Runtime 分为四个相互独立的层次：
 | 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
-在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有 Git 工作区原语，再用 user/PID/network/IPC/UTS/mount namespace 以及 Sandlock 的 Landlock/seccomp 策略限制进程。任何内核能力、binary、挂载或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
+在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有工作区原语，再用 Sandlock 的 Landlock/seccomp 策略与虚拟文件系统限制进程。当前实现刻意不创建 user、PID 或 mount namespace，因此命令保留 Actor 的原生身份。任何内核能力、binary 或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
 工具策略不按平台或工具名硬编码。启动诊断会把每个执行世界声明的效果保证与工具要求相交：Windows、macOS、WSL 1 和探测不完整的 Linux 默认可配置 `read`、`grep`、`find`、`ls`、`write`、`edit`；Linux/WSL 2 进程世界就绪后再加入 `bash`；宿主注入覆盖全部效果的世界时则可启用全部工具。设置中已选但当前无安全路线的工具会保留偏好但处于 inactive，不会发送给投机源。
 
-进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只替换动态作用域内的进程启动。mount namespace 中的可执行文件视图不改写命令可见的 `PATH` 和环境，却能把 PATH 解析出的 exec 统一送到 broker。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
+进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只对精确的 exec syscall 做映射，`PATH`、普通文件打开、metadata、目录内容、写入、cwd 与环境都保持原样。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
 
 每个可复用结果都是持久化 provenance certificate，包含动态观察到的文件、目录、负查找、symlink、executable/DSO 身份、有序 stdout/stderr、退出状态和原子 regular-file 效果。每次复用都会重新验证全部依赖。外层投机 branch 还会独立记录顶层进程 provenance，并在 Actor 采纳前再次验证；tainted、不完整、过期、交互式、可变宿主输入、网络、IPC 或不支持的观察一律关闭复用。
 
@@ -44,7 +44,7 @@ Replay 开始前会一次性装载并校验完整的 content-addressed 输出/�
 - 隔离后端变化不会改变 `K(a)`。
 - 进行中任务和缓存只在相同执行 route 内复用。
 - 跨父进程、跨轮次复用必须同时通过精确 exec prototype 与全部动态依赖验证；父 shell 命令刻意不进入子进程 key。
-- Linux 世界保留用户可见 `PATH`，只在 mount namespace 内把私有工作区映射到逻辑源码路径，拒绝读取常见 credential store 与证书仓，并只允许向私有 branch 写入持久效果。
+- Linux 世界保留原生 UID/GID/进程身份和用户可见 `PATH`，只把私有工作区映射到逻辑源码路径，拒绝读取常见 credential store 与证书仓，并只允许向私有 branch 写入持久效果。
 - Broker 遵守 at-most-once：请求可能已经执行后若响应丢失，会返回错误而不是再次运行命令。
 - 只读 Actor 回退时，支持结果捕获的 World 会在宿主调用前记录新鲜度基线，再把这一次权威输出封装进共享缓存；它不会再次调用工具。后续轮次仍须重新通过权限、精确新鲜度、兼容性、投影与提交检查。
 - Actor 采纳仍必须依次通过动作等价、权限、资源新鲜度、World 兼容性、投影与提交检查。
@@ -68,15 +68,15 @@ Pi 可以直接安装该仓库：
 pi install https://github.com/xchang1121/pi
 ```
 
-如需启用进程复用，请在 Linux 或 WSL 2 内运行 Pi 与项目。安装 Rust stable、Git、`strace` 和 `util-linux`，然后构建固定 revision 的 Sandlock：
+如需启用进程复用，请在 Linux 或 WSL 2 内运行 Pi 与项目。安装 Rust stable、Git、`strace` 与 C build toolchain，然后运行分级资格检查：
 
 ```sh
-sudo apt-get install git strace util-linux build-essential
+sudo apt-get install git strace build-essential
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
-`setup:linux` 会把固定版本的 `sandlock` CLI 安装到 `~/.local`；在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、非特权 namespace、bind mount、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。共享 lower 快照后，Linux 进程世界只有在探测通过且精确不可变基线至少包含 256 个条目（本机复测后的保守边界）时才自动选择 host-visible COW；小工作区以及通用 `write`/`edit` 后备继续使用 Git。每个 content commit 只预热并共享一份驱动原生 lower 结构快照；外层观察和嵌套事务用它与各自的类型化 upper journal 重建 merged tree。事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。若工作区内出现驱动导致的 `EXDEV`、`EOPNOTSUPP`、`ENOTSUP` 或 `ENOSYS`，完整 trace 会使该分支不可采纳；这覆盖 FUSE 无法透明复现的 lower 目录 rename 等操作。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
+`setup:linux` 会编译 held-exec helper，把透明 exec 修改应用到精确固定的 Sandlock revision，并在行为探针通过后安装插件专用 binary；source/patch 与实际安装文件的 digest 会一起盖章。在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，它还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。共享 lower 快照后，Linux 进程世界只有在探测通过且精确不可变基线至少包含 256 个条目（本机复测后的保守边界）时才自动选择 host-visible COW；小工作区以及通用 `write`/`edit` 后备继续使用 Git。每个 content commit 只预热并共享一份驱动原生 lower 结构快照；外层观察和嵌套事务用它与各自的类型化 upper journal 重建 merged tree。事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。若工作区内出现驱动导致的 `EXDEV`、`EOPNOTSUPP`、`ENOTSUP` 或 `ENOSYS`，完整 trace 会使该分支不可采纳；这覆盖 FUSE 无法透明复现的 lower 目录 rename 等操作。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 
