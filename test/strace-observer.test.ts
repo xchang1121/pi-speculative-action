@@ -17,6 +17,8 @@ describe("strace provenance decoder", () => {
 						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
 						'fstat(3</work/input.txt>, {st_dev=makedev(0x8, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=4, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
 						'chdir("/work/sub") = 0',
+						'openat(AT_FDCWD, "/work/final", O_RDONLY|O_DIRECTORY) = 4</work/final>',
+						'fchdir(4</work/final>) = 0',
 						"clone(child_stack=NULL, flags=SIGCHLD) = 101",
 						"+++ exited with 0 +++",
 					].join("\n"),
@@ -39,7 +41,8 @@ describe("strace provenance decoder", () => {
 					{ path: "/usr/bin/child", role: "executable" },
 					{ path: "/work/input.txt", role: "input" },
 					{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
-					{ path: "/work/sub/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
+					{ path: "/work/final", role: "input" },
+					{ path: "/work/final/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
 				]),
 			);
 		} finally {
@@ -53,12 +56,13 @@ describe("strace provenance decoder", () => {
 		try {
 			await fs.writeFile(
 				`${prefix}.200`,
-				'execve("/usr/bin/example", ["example"], 0x0) = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 201\n',
+				'execve("/usr/bin/example", ["example"], 0x0) = 0\nfchdir(9) = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 201\n',
 			);
 			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
 			expect(observation.complete).toBe(false);
 			expect(observation.taints).toContain("trace_incomplete");
 			expect(observation.incompleteReasons).toContain("child_trace_missing:201");
+			expect(observation.incompleteReasons).toContain("fchdir_unparsed:200");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

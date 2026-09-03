@@ -216,17 +216,13 @@ export async function observeStrace(
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if (syscall === "chdir" && syscallSucceeded(line)) {
-				const value = quotedStrings(line)[0];
-				if (value) cwd = resolveObservedPath(value, cwd);
+			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
+				const changed = tracedCwd(line, cwd);
+				if (changed) cwd = changed;
 				else {
 					complete = false;
-					incompleteReasons.add(`chdir_unparsed:${pid}`);
+					incompleteReasons.add(`${syscall}_unparsed:${pid}`);
 				}
-			}
-			if (syscall === "fchdir") {
-				complete = false;
-				incompleteReasons.add(`fchdir:${pid}`);
 			}
 			if (MODELED_METADATA_SYSCALLS.has(syscall)) {
 				if (syscallSucceeded(line)) {
@@ -292,6 +288,7 @@ const FILE_SYSCALLS = new Set([
 	"creat",
 	"execve",
 	"execveat",
+	"fchdir",
 	"faccessat",
 	"faccessat2",
 	"fchmodat",
@@ -471,7 +468,7 @@ function ignoredProcessSegments(
 function tracedCwd(line: string, cwd: string | undefined): string | undefined {
 	if (!syscallSucceeded(line)) return cwd;
 	const syscall = syscallName(line);
-	if (syscall === "fchdir") return undefined;
+	if (syscall === "fchdir") return fchdirPath(line);
 	if (syscall !== "chdir") return cwd;
 	const target = quotedStrings(line)[0];
 	return target ? tracedPath(target, cwd) : undefined;
@@ -515,6 +512,10 @@ function processLimitDenied(line: string, syscall: string): boolean {
 }
 
 function syscallPaths(line: string, syscall: string, cwd: string): readonly string[] {
+	if (syscall === "fchdir") {
+		const target = fchdirPath(line);
+		return target ? [target] : [];
+	}
 	const quoted = quotedStrings(line);
 	if (!quoted.length) return [];
 	let values: readonly string[];
@@ -532,6 +533,16 @@ function syscallPaths(line: string, syscall: string, cwd: string): readonly stri
 		.map((value) => resolveObservedPath(value, base));
 }
 
+function fchdirPath(line: string): string | undefined {
+	const descriptor = /^\s*fchdir\((.+)\)\s+=/.exec(line)?.[1];
+	return absoluteDescriptorPath(descriptor);
+}
+
+function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {
+	const target = /^\d+<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
+	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(target) : undefined;
+}
+
 function metadataSyscallPaths(
 	line: string,
 	syscall: string,
@@ -541,10 +552,8 @@ function metadataSyscallPaths(
 	const paths = syscall === "fstat" ? [] : syscallPaths(line, syscall, cwd);
 	if (paths.length) return paths.map((observedPath) => ({ path: observedPath, followSymlinks }));
 	if (syscall !== "fstat" && syscall !== "newfstatat") return [];
-	const descriptor = /^\s*(?:fstat|newfstatat)\(\d+<(.+?)>,/.exec(line)?.[1];
-	const descriptorPath = descriptor?.replace(/<[^<>]*>$/, "");
-	if (!descriptorPath?.startsWith("/") || descriptorPath.endsWith(" (deleted)")) return [];
-	return [{ path: path.posix.normalize(descriptorPath), followSymlinks }];
+	const descriptorPath = absoluteDescriptorPath(/^\s*(?:fstat|newfstatat)\((\d+<.+?>),/.exec(line)?.[1]);
+	return descriptorPath ? [{ path: descriptorPath, followSymlinks }] : [];
 }
 
 /** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
