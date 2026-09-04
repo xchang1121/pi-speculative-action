@@ -1260,7 +1260,7 @@ async function openToolsAndExecution(
 		if (choice === "Execution routes") {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(
-				`Predict controls which tools sources may propose. Replay, Observe, and Fork are independent runtime capabilities; unavailable work stays with the Actor.\n${controller.executionSummary()}`,
+				`Predict controls which tools sources may propose. Replay, Observe, and Fork are independent runtime capabilities; diagnostics refresh only while the plugin is enabled, and unavailable work stays with the Actor.\n${controller.executionSummary()}`,
 				"info",
 			);
 		}

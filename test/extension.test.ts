@@ -253,12 +253,18 @@ describe("zero-modification Pi extension", () => {
 		const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockReturnValue(pending);
 		try {
 			const fixture = await createFixture({ settings: { enabled: false }, defaultExecutionWorlds: true });
-			driveSettingsMenus(fixture, { "Speculative action": ["Enabled", "Apply changes", "Close"] });
+			driveSettingsMenus(fixture, {
+				"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
+				"Tools & execution": ["Execution routes", "Back"],
+			});
 			await fixture.emit("session_start", {}, fixture.context);
 			const applying = Promise.resolve(
 				fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
 			);
 			await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+			expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(2);
+			expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.every(([refresh]) => refresh === false)).toBe(true);
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("diagnostics refresh only while the plugin is enabled"), "info");
 			expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
 			release({ state: "unavailable", detail: "test route unavailable" });
 			await applying;
