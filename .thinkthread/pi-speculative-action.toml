@@ -49,8 +49,8 @@ PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/c
 [environment.child]
 PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/config"
 
-# Pi and self-contained stock-tool children inherit this policy. External-process
-# grep/find and Bash stay on the Actor path because their dependencies are not sealed.
+# Pi stock-tool children inherit this policy. Bash speculation is delegated to the
+# downstream native Linux process world, which owns its stronger process evidence.
 [environment.network]
 mode = "all"
 

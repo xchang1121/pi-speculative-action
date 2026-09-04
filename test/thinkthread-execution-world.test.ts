@@ -10,13 +10,15 @@ import {
 	parseThinkThreadId,
 } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
-import { buildPiActionKey } from "../src/action-semantics.ts";
+import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { EffectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
 } from "../src/effect-model.ts";
+import { ExecutionWorldRouter } from "../src/execution-world.ts";
 import { ThinkThreadDurableError } from "../src/thinkthread/errors.ts";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { encodeThinkThreadToolRunnerResponse } from "../src/thinkthread/tool-runner-protocol.ts";
@@ -38,6 +40,31 @@ describe("ThinkThread execution world", () => {
 		await expect(
 			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
 		).resolves.toContain("linux-execution-v10");
+	});
+
+	it("leaves Bash to the downstream native process provider without preparing ThinkThread", async () => {
+		const fixture = fakeClient();
+		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
+		const nativePrepare = vi.fn(async () => undefined);
+		const native = {
+			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
+			speculation: {
+				capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+				tools: PI_ACTION_SEMANTICS.toolNames("unbounded"),
+				prepare: nativePrepare,
+				execute: vi.fn(),
+			},
+		} as unknown as SpeculativeAgentExecutionWorld;
+		const router = new ExecutionWorldRouter([primary, native]);
+		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
+		const action = buildPiActionKey("bash", { command: "printf ok" }, cwd, "schema")!;
+
+		await expect(router.resolve({
+			effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, action,
+		}, { cwd })).resolves.toMatchObject({ backend: "linux_process_reuse" });
+		expect(fixture.selfView).not.toHaveBeenCalled();
+		expect(nativePrepare).toHaveBeenCalledOnce();
+		await router.dispose();
 	});
 
 	it("shares one BASE across eight sealed root executions and cleans it after the turn", async () => {
@@ -438,16 +465,17 @@ function fakeClient(
 		requestStatus: vi.fn(),
 		requestCancel: vi.fn(async () => ({ accepted: true, state: "running" as const })),
 	};
-	const client = {
-		selfView: vi.fn(async () => ({
+	const selfView = vi.fn(async () => ({
 			schemaVersion: 1,
 			thinkthreadId: ownerID,
 			capabilities: [{ id: "thinkthread.fs.self" as const, version: 1 }],
 			profiles: [],
-		})),
+		}));
+	const client = {
+		selfView,
 		fs,
 	} as unknown as AgentPosixClient;
-	return { client, snapshotCreate, snapshotRemove, run, apply, verify };
+	return { client, selfView, snapshotCreate, snapshotRemove, run, apply, verify };
 }
 
 function snapshotID(sequence: number) {
