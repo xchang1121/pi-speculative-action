@@ -45,6 +45,10 @@ describe("speculative action package boundary", () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
 		expect(manifest.exports["./thinkthread-extension"]).toBeDefined();
 		expect(manifest.peerDependenciesMeta["@thinkthread/agent-posix"]).toEqual({ optional: true });
+		expect(manifest.devDependencies["@thinkthread/agent-posix"]).toBe(
+			"file:vendor/thinkthread-agent-posix-0.1.0.tgz",
+		);
+		await expect(fs.stat(path.join(packageRoot, "vendor", "thinkthread-agent-posix-0.1.0.tgz"))).resolves.toBeDefined();
 		await expect(fs.stat(path.join(packageRoot, "scripts", "install-thinkthread-profile.sh"))).resolves.toBeDefined();
 	});
 

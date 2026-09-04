@@ -199,7 +199,7 @@ The external-process `grep` and `find` tools remain on the Actor path, but their
 
 `fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. The world therefore does not pre-execute `grep`, `find`, or `bash`, whose process dependencies are outside its workspace proof. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
 
-For development of this optional adapter, install the matching SDK tarball with `npm install --ignore-scripts --save-dev --package-lock=false /path/to/sdk.tgz`, then run `npm pkg delete 'devDependencies.@thinkthread/agent-posix'` before checks or packaging. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
+The pinned Agent POSIX SDK archive is a locked development dependency and the installer's default payload, so a clean `npm ci` can check, test, build, and pack the optional adapter without a sibling checkout or manifest mutation. `--agent-posix-package` remains available for an explicit offline override. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
 
 ## Runtime sandbox integration
 

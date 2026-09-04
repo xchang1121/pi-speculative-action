@@ -46,8 +46,10 @@ agent_posix_git_url="https://gitcode.com/aideveloper/capsule_public.git"
 agent_posix_git_tag="v0.1.0"
 agent_posix_git_commit="e7287acc187b4b17a9d2a0c8cad2f75f64ed538f"
 agent_posix_version="${agent_posix_git_tag#v}"
+agent_posix_package_sha256="0ed5adaadf5e4f6dee40d7c6b56a9e66e549338baf58f6d55a197f7ba02ca24a"
+vendored_sdk_package="$package_root/vendor/thinkthread-agent-posix-$agent_posix_version.tgz"
 sdk_package=""
-sdk_source_kind="tarball"
+sdk_source_kind="vendored"
 speculative_package=""
 tt_bin="${PI_SPECULATIVE_ACTION_TT:-}"
 requested_models=()
@@ -57,6 +59,7 @@ while (($# > 0)); do
         --agent-posix-package)
             (($# >= 2)) || die "$1 requires a file"
             sdk_package="$2"
+            sdk_source_kind="tarball"
             shift 2
             ;;
         --speculative-action-package)
@@ -85,9 +88,7 @@ while (($# > 0)); do
     esac
 done
 
-if [[ -n "$sdk_package" ]]; then
-    sdk_package="$(resolve_package "$sdk_package")"
-fi
+sdk_package="$(resolve_package "${sdk_package:-$vendored_sdk_package}")"
 if [[ -n "$speculative_package" ]]; then
     speculative_package="$(resolve_package "$speculative_package")"
 fi
@@ -95,11 +96,13 @@ fi
 command -v node >/dev/null 2>&1 || die "Node.js 22.19+ is required"
 command -v npm >/dev/null 2>&1 || die "npm is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
-if [[ -z "$sdk_package" ]]; then
-    command -v git >/dev/null 2>&1 || die "git is required to fetch the Agent POSIX SDK"
-fi
 node_version_ok="$(node -p 'const [major, minor] = process.versions.node.split(".").map(Number); major > 22 || (major === 22 && minor >= 19) ? "yes" : "no"')"
 [[ "$node_version_ok" == yes ]] || die "Node.js 22.19+ is required; found $(node --version)"
+if [[ "$sdk_source_kind" == vendored ]]; then
+    sdk_package_sha256="$(node --input-type=module -e 'import { createHash } from "node:crypto"; import { readFileSync } from "node:fs"; process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"));' "$sdk_package")"
+    [[ "$sdk_package_sha256" == "$agent_posix_package_sha256" ]] ||
+        die "vendored Agent POSIX package digest mismatch"
+fi
 
 if [[ -z "$tt_bin" ]]; then
     if [[ -x /usr/bin/tt ]]; then
@@ -143,31 +146,6 @@ trap rollback_and_cleanup EXIT
 package_output="$transaction_root/packages"
 mkdir -p -- "$package_output" "$payload_root/runtime/packages" "$payload_root/config"
 
-if [[ -z "$sdk_package" ]]; then
-    sdk_release="$transaction_root/thinkthread-release"
-    git init --quiet "$sdk_release"
-    git -C "$sdk_release" remote add origin "$agent_posix_git_url"
-    git -C "$sdk_release" fetch --quiet --depth 1 origin \
-        "refs/tags/$agent_posix_git_tag:refs/tags/$agent_posix_git_tag"
-    git -C "$sdk_release" -c advice.detachedHead=false checkout --quiet --detach \
-        "$agent_posix_git_tag^{commit}"
-    sdk_commit="$(git -C "$sdk_release" rev-parse HEAD)"
-    [[ "$sdk_commit" == "$agent_posix_git_commit" ]] || \
-        die "Agent POSIX release commit mismatch: expected $agent_posix_git_commit, found $sdk_commit"
-    sdk_source="$sdk_release/sdk/agent-posix/ts"
-    [[ -f "$sdk_source/package.json" && -f "$sdk_source/package-lock.json" ]] || \
-        die "Agent POSIX release does not contain sdk/agent-posix/ts"
-    (
-        cd -- "$sdk_source"
-        npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
-        npm run build
-        npm pack --ignore-scripts --pack-destination "$package_output" --loglevel=error >/dev/null
-    )
-    sdk_package="$(find "$package_output" -maxdepth 1 -type f -name 'thinkthread-agent-posix-*.tgz' -print -quit)"
-    sdk_source_kind="git"
-fi
-[[ -f "$sdk_package" ]] || die "Agent POSIX SDK package was not produced"
-
 if [[ -z "$speculative_package" ]]; then
     speculative_source="$transaction_root/speculative-source"
     mkdir -p -- "$speculative_source"
@@ -179,12 +157,6 @@ if [[ -z "$speculative_package" ]]; then
     (
         cd -- "$speculative_source"
         npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
-        # npm 11 may skip a --no-save install when the same package is an
-        # optional peer. Install it explicitly for compilation, then keep it
-        # out of the package manifest shipped to users.
-        npm install --ignore-scripts --save-dev --package-lock=false --no-audit --no-fund --loglevel=error \
-            "$sdk_package"
-        npm pkg delete 'devDependencies.@thinkthread/agent-posix'
         npm run build
         npm pack --ignore-scripts --pack-destination "$package_output" --loglevel=error >/dev/null
     )
@@ -259,9 +231,9 @@ if (sdkPackage.version !== expectedSdkVersion) {
 }
 const runnerSha256 = createHash("sha256").update(await readFile(runnerEntry)).digest("hex");
 const agentPosixTarballSha256 = createHash("sha256").update(await readFile(sdkArchive)).digest("hex");
-const agentPosixSource = sdkSourceKind === "git"
-    ? { kind: "git", url: sdkSourceUrl, tag: sdkSourceTag, commit: sdkSourceCommit }
-    : { kind: "tarball" };
+const agentPosixSource = sdkSourceKind === "tarball"
+    ? { kind: "tarball" }
+    : { kind: "git", url: sdkSourceUrl, tag: sdkSourceTag, commit: sdkSourceCommit };
 await writeFile(manifestPath, `${JSON.stringify({
     installedAt: new Date().toISOString(),
     speculativeActionVersion: speculativeVersion,

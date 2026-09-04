@@ -190,7 +190,7 @@ tt pi-speculative-action
 
 `fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。因此该 world 不提前执行进程依赖超出工作区证明范围的 `grep`、`find`、`bash`。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
-开发这个可选适配器时，先运行 `npm install --ignore-scripts --save-dev --package-lock=false /path/to/sdk.tgz` 安装匹配的 SDK，再运行 `npm pkg delete 'devDependencies.@thinkthread/agent-posix'`，然后执行检查或打包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
+固定版本的 Agent POSIX SDK 归档现在既是 lockfile 管理的开发依赖，也是安装器的默认载荷；干净 checkout 只需 `npm ci` 即可检查、测试、构建和打包可选适配器，不依赖兄弟仓，也不再临时改写 manifest。`--agent-posix-package` 仍可显式覆盖为离线包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 
 ## 接入 Runtime 沙箱
 
