@@ -47,8 +47,8 @@ describe("ThinkThread stock Pi tool runner", () => {
 
 	it.each([
 		["read", { path: "notes.txt" }],
-		["grep", { pattern: "beta", path: "." }],
-		["find", { pattern: "*.txt", path: "." }],
+		["grep", { pattern: "alpha", path: "." }],
+		["find", { pattern: "notes.txt", path: "." }],
 		["ls", { path: "." }],
 		["write", { path: "generated.txt", content: "generated\n" }],
 		["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
