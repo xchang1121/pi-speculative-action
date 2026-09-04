@@ -172,7 +172,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## ThinkThread Profile（Linux）
 
-可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行四个自包含 stock tools，并观察另外两个依赖外部进程的搜索工具的 Actor 结果，不修改 Pi 本体或默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
+可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行六个可移植的 Pi stock tools，不修改 Pi 本体，也不替换默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -184,12 +184,12 @@ tt pi-speculative-action
 
 适配器提供两条独立能力：
 
-- `speculation.execute`：`read`、`ls`、`write`、`edit` 同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
+- `speculation.execute`：`read`、`grep`、`find`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
 - `observation.capture`：在 Actor 的 `read`、`grep`、`find`、`ls` 执行前创建新快照，封装这一次 Actor 输出，供后续验证复用，不重复执行工具，也不依赖投机 runner。两条路径都由 `EffectTransaction` 统一管理采纳状态。
 
-依赖外部进程的 `grep`、`find` 留在 Actor 路径，但只要捕获的目录树未变化，其已完成的 Actor 结果仍可复用。Profile 会先尝试思程 world，并把原生 Linux 进程 provider 与 Git 工作区 provider 保留为后续路线。因此安装思程后，Bash 仍保有持久进程证书回放、跨父命令子进程复用、held-exec 接管和可复用命令历史。普通源码加载仍使用未改变的默认 provider，也不会加载可选 SDK。
+Profile 会先尝试思程 world，并把原生 Linux 进程 provider 与 Git 工作区 provider 保留为后续路线。Bash 刻意不进入可移植 runner，而是路由到原生进程 world；因此即使 Pi 本身运行在思程中，Bash 仍保有持久进程证书回放、跨父命令子进程复用、held-exec 接管和可复用命令历史。普通源码加载仍使用未改变的默认 provider，也不会加载可选 SDK。
 
-`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。因此该 world 不提前执行进程依赖超出工作区证明范围的 `grep`、`find`、`bash`。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
+`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收固定的 stock-tool runner：`grep`、`find` 以禁止写入的方式运行 Pi 原生 `rg`/`fd` 实现并验证目录树依赖；任意进程与 Bash 不在其能力声明中。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
 固定版本的 Agent POSIX SDK 归档现在既是 lockfile 管理的开发依赖，也是安装器的默认载荷；干净 checkout 只需 `npm ci` 即可检查、测试、构建和打包可选适配器，不依赖兄弟仓，也不再临时改写 manifest。`--agent-posix-package` 仍可显式覆盖为离线包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 

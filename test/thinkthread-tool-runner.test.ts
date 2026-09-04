@@ -1,7 +1,16 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
+import { withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
 	decodeThinkThreadToolRunnerRequest,
@@ -9,8 +18,10 @@ import {
 	encodeThinkThreadToolRunnerRequest,
 	encodeThinkThreadToolRunnerResponse,
 	THINKTHREAD_TOOL_RUNNER_VERSION,
+	type ThinkThreadToolRunnerRequestV1,
 	type ThinkThreadToolName,
 } from "../src/thinkthread/tool-runner-protocol.ts";
+import { toolErrorSettlement } from "../src/tool-settlement.ts";
 
 const roots: string[] = [];
 
@@ -34,33 +45,28 @@ describe("ThinkThread stock Pi tool runner", () => {
 		expect(() => decodeThinkThreadToolRunnerResponse(Buffer.from(`${frame}\nnoise`))).toThrow("frame");
 	});
 
-	it("executes the four self-contained stock tools with their normal result semantics", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-thinkthread-runner-"));
-		roots.push(root);
-		await writeFile(path.join(root, "notes.txt"), "alpha\nbeta\n", "utf8");
+	it.each([
+		["read", { path: "notes.txt" }],
+		["grep", { pattern: "beta", path: "." }],
+		["find", { pattern: "*.txt", path: "." }],
+		["ls", { path: "." }],
+		["write", { path: "generated.txt", content: "generated\n" }],
+		["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
+	] as const)("matches the native Pi %s result and workspace effects", async (tool, args) => {
+		const [nativeRoot, thinkThreadRoot] = await Promise.all([
+			mkdtemp(path.join(os.tmpdir(), "pi-native-tool-")),
+			mkdtemp(path.join(os.tmpdir(), "pi-thinkthread-tool-")),
+		]);
+		roots.push(nativeRoot, thinkThreadRoot);
+		await Promise.all([seed(nativeRoot), seed(thinkThreadRoot)]);
+		const request = runnerRequest(tool, args);
 
-		const read = await runThinkThreadTool(runnerRequest("read", { path: "notes.txt" }), root);
-		expect(text(read)).toContain("alpha");
-
-		const ls = await runThinkThreadTool(runnerRequest("ls", { path: "." }), root);
-		expect(text(ls)).toContain("notes.txt");
-
-		const write = await runThinkThreadTool(
-			runnerRequest("write", { path: "generated.txt", content: "generated\n" }),
-			root,
-		);
-		expect(write.isError).toBe(false);
-		expect(await readFile(path.join(root, "generated.txt"), "utf8")).toBe("generated\n");
-
-		const edit = await runThinkThreadTool(
-			runnerRequest("edit", {
-				path: "notes.txt",
-				edits: [{ oldText: "beta", newText: "gamma" }],
-			}),
-			root,
-		);
-		expect(edit.isError).toBe(false);
-		expect(await readFile(path.join(root, "notes.txt"), "utf8")).toContain("gamma");
+		const [native, isolated] = await Promise.all([
+			runNativeTool(request, nativeRoot),
+			runThinkThreadTool(request, thinkThreadRoot),
+		]);
+		expect(normalizeWorkspace(isolated, thinkThreadRoot)).toEqual(normalizeWorkspace(native, nativeRoot));
+		expect(await workspaceState(thinkThreadRoot)).toEqual(await workspaceState(nativeRoot));
 	});
 });
 
@@ -74,11 +80,40 @@ function runnerRequest(tool: ThinkThreadToolName, args: unknown) {
 	};
 }
 
-function text(settlement: Awaited<ReturnType<typeof runThinkThreadTool>>): string {
-	return settlement.result.content
-		.filter(
-			(item): item is Extract<(typeof settlement.result.content)[number], { type: "text" }> => item.type === "text",
-		)
-		.map((item) => item.text)
-		.join("\n");
+async function runNativeTool(request: ThinkThreadToolRunnerRequestV1, cwd: string) {
+	const tools = [
+		createReadToolDefinition(cwd, { autoResizeImages: request.autoResizeImages }),
+		createGrepToolDefinition(cwd), createFindToolDefinition(cwd), createLsToolDefinition(cwd),
+		createWriteToolDefinition(cwd), createEditToolDefinition(cwd),
+	];
+	const tool = tools.find((candidate) => candidate.name === request.tool)!;
+	try {
+		const result = withPiProjectionCoverage(request.tool, request.args,
+			await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never));
+		return { result, isError: false };
+	} catch (error) {
+		return toolErrorSettlement(error);
+	}
+}
+
+async function seed(root: string): Promise<void> {
+	await mkdir(path.join(root, "nested"));
+	await Promise.all([
+		writeFile(path.join(root, "notes.txt"), "alpha\nbeta\n", "utf8"),
+		writeFile(path.join(root, "nested", "todo.txt"), "beta\n", "utf8"),
+	]);
+}
+
+async function workspaceState(root: string): Promise<readonly (string | null)[]> {
+	return Promise.all(["notes.txt", "nested/todo.txt", "generated.txt"].map(async (file) => {
+		try { return await readFile(path.join(root, file), "utf8"); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+	}));
+}
+
+function normalizeWorkspace(value: unknown, root: string): unknown {
+	if (typeof value === "string") return value.split(root).join("<workspace>").split(root.replaceAll("\\", "/")).join("<workspace>");
+	if (Array.isArray(value)) return value.map((item) => normalizeWorkspace(item, root));
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalizeWorkspace(child, root)]));
 }

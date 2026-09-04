@@ -6,7 +6,7 @@ export const THINKTHREAD_TOOL_RUNNER_VERSION = 1 as const;
 const THINKTHREAD_TOOL_RUNNER_PREFIX = "PI_SPECULATIVE_ACTION_RESULT_V1:";
 export const THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES = 1024 * 1024;
 
-export const THINKTHREAD_TOOL_NAMES = ["read", "ls", "write", "edit"] as const;
+export const THINKTHREAD_TOOL_NAMES = ["read", "grep", "find", "ls", "write", "edit"] as const;
 export type ThinkThreadToolName = typeof THINKTHREAD_TOOL_NAMES[number];
 
 export interface ThinkThreadToolRunnerRequestV1 {

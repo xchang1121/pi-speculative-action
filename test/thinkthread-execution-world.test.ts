@@ -33,7 +33,7 @@ describe("ThinkThread execution world", () => {
 
 		expect(world.speculation.capabilities).toEqual(expect.arrayContaining([...RESOURCE_OBSERVATION_EFFECTS.capabilities]));
 		expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
-		expect(world.speculation.tools).toEqual(["read", "ls", "write", "edit"]);
+		expect(world.speculation.tools).toEqual(["read", "grep", "find", "ls", "write", "edit"]);
 		expect(world.observation?.tools).toEqual(["read", "grep", "find", "ls"]);
 		await expect(
 			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
@@ -88,6 +88,8 @@ describe("ThinkThread execution world", () => {
 
 	it.each([
 		["read", { path: "notes.txt" }, "deny", { path: "notes.txt", scope: "content" }],
+		["grep", { pattern: "alpha", path: "." }, "deny", { path: ".", scope: "tree_content" }],
+		["find", { pattern: "*.txt", path: "." }, "deny", { path: ".", scope: "tree_entries" }],
 		["ls", { path: "." }, "deny", { path: ".", scope: "tree_entries" }],
 		[
 			"write",

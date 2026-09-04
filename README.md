@@ -181,7 +181,7 @@ The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted on
 
 ## ThinkThread profile (Linux)
 
-The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute four self-contained stock tools and to observe Actor results from two external-process search tools, without changing Pi or the default Linux backend. Install and launch it from Linux (Orb on macOS):
+The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute the six portable Pi stock tools without changing Pi or replacing the default Linux backends. Install and launch it from Linux (Orb on macOS):
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -193,12 +193,12 @@ The installer accepts `--agent-posix-package /path/to/sdk.tgz` and `--speculativ
 
 The adapter supplies two independent operations:
 
-- `speculation.execute`: `read`, `ls`, `write`, and `edit` use a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
+- `speculation.execute`: `read`, `grep`, `find`, `ls`, `write`, and `edit` use Pi's stock implementations against a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
 - `observation.capture`: a fresh snapshot immediately before an Actor `read`, `grep`, `find`, or `ls`; the same Actor output is sealed for later validated reuse, without executing the tool again. This route does not require the speculative runner. `EffectTransaction` owns adoption state for both operations.
 
-The external-process `grep` and `find` tools remain on the Actor path, but their completed Actor results can be replayed while the captured tree is unchanged. The profile's ThinkThread world is tried first; the native Linux process provider and Git workspace provider remain downstream routes. Consequently Bash retains persistent process-certificate replay, cross-parent child reuse, held-exec handoff, and reusable-command storage instead of losing those capabilities when ThinkThread is installed. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
+The profile's ThinkThread world is tried first; the native Linux process provider and Git workspace provider remain downstream routes. Bash is intentionally outside the portable runner and is routed to the native process world, so it retains persistent process-certificate replay, cross-parent child reuse, held-exec handoff, and reusable-command storage when Pi itself runs under ThinkThread. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
 
-`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. The world therefore does not pre-execute `grep`, `find`, or `bash`, whose process dependencies are outside its workspace proof. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
+`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. Only the fixed stock-tool runner is admitted: `grep` and `find` execute their normal Pi `rg`/`fd` implementations with writes denied and tree dependencies verified, while arbitrary process execution and Bash are not advertised by this world. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
 
 The pinned Agent POSIX SDK archive is a locked development dependency and the installer's default payload, so a clean `npm ci` can check, test, build, and pack the optional adapter without a sibling checkout or manifest mutation. `--agent-posix-package` remains available for an explicit offline override. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
 

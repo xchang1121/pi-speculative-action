@@ -137,7 +137,7 @@ export function createThinkThreadExecutionWorld(
 				await fingerprint();
 				return {
 					state: "ready",
-					detail: "ThinkThread fs.run for read, ls, write, and edit; external-process tools remain on the Actor path",
+					detail: "ThinkThread fs.run for Pi read, grep, find, ls, write, and edit tools",
 				};
 			},
 			execute: (context) => execute(context, (world, input) =>

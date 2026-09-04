@@ -1,10 +1,9 @@
 import { pathToFileURL } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
-	createEditToolDefinition,
-	createLsToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
+	createEditTool,
+	createReadOnlyTools,
+	createWriteTool,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { withPiProjectionCoverage } from "../pi-read-projection.ts";
@@ -17,6 +16,7 @@ import {
 } from "./tool-runner-protocol.ts";
 
 interface RunnableTool {
+	readonly name: string;
 	readonly execute: (
 		callID: string,
 		args: never,
@@ -54,18 +54,14 @@ async function main(): Promise<void> {
 }
 
 function createTool(request: ThinkThreadToolRunnerRequestV1, cwd: string): RunnableTool {
-	switch (request.tool) {
-		case "read":
-			return createReadToolDefinition(cwd, {
-				autoResizeImages: request.autoResizeImages,
-			}) as unknown as RunnableTool;
-		case "ls":
-			return createLsToolDefinition(cwd) as unknown as RunnableTool;
-		case "write":
-			return createWriteToolDefinition(cwd) as unknown as RunnableTool;
-		case "edit":
-			return createEditToolDefinition(cwd) as unknown as RunnableTool;
-	}
+	const tools = [
+		...createReadOnlyTools(cwd, { read: { autoResizeImages: request.autoResizeImages } }),
+		createWriteTool(cwd),
+		createEditTool(cwd),
+	] as readonly RunnableTool[];
+	const tool = tools.find((candidate) => candidate.name === request.tool);
+	if (!tool) throw new Error(`ThinkThread tool runner does not support ${request.tool}`);
+	return tool;
 }
 
 async function readStdin(): Promise<Uint8Array> {
