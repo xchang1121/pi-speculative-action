@@ -17,6 +17,7 @@ import {
 	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
 import { ExecutionWorldRouter } from "../src/execution-world.ts";
 import { ThinkThreadDurableError } from "../src/thinkthread/errors.ts";
@@ -42,11 +43,11 @@ describe("ThinkThread execution world", () => {
 		).resolves.toContain("linux-execution-v10");
 	});
 
-	it("falls through an unsupported or unavailable ThinkThread route", async () => {
+	it("routes every stock tool through unified, native, then Actor capability layers", async () => {
 		const fixture = fakeClient();
 		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
 		const nativePrepare = vi.fn(async () => undefined);
-		const native = {
+		const processWorld = {
 			id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox",
 			speculation: {
 				capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
@@ -55,26 +56,65 @@ describe("ThinkThread execution world", () => {
 				execute: vi.fn(),
 			},
 		} as unknown as SpeculativeAgentExecutionWorld;
-		const portable = {
-			id: "resource_fallback", scope: "fallback", isolation: "resource_snapshot",
-			speculation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read"], execute: vi.fn() },
+		const workspace = {
+			id: "git_worktree", scope: "fallback", isolation: "workspace_branch",
+			speculation: {
+				capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+				tools: PI_ACTION_SEMANTICS.toolNames("workspace_mutation"),
+				execute: vi.fn(),
+			},
 		} as unknown as SpeculativeAgentExecutionWorld;
-		const router = new ExecutionWorldRouter([primary, native, portable]);
+		const router = new ExecutionWorldRouter([primary, processWorld, workspace]);
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		const bash = buildPiActionKey("bash", { command: "printf ok" }, cwd, "schema")!;
+		const cases = [
+			["read", { path: "notes.txt" }, "ThinkThread", undefined],
+			["grep", { pattern: "alpha", path: "." }, "ThinkThread", undefined],
+			["find", { pattern: "*.txt", path: "." }, "ThinkThread", undefined],
+			["ls", { path: "." }, "ThinkThread", undefined],
+			["write", { path: "generated.txt", content: "generated\n" }, "ThinkThread", "git_worktree"],
+			["edit", { path: "notes.txt", edits: [{ oldText: "alpha", newText: "beta" }] }, "ThinkThread", "git_worktree"],
+			["bash", { command: "printf ok" }, "linux_process_reuse", "linux_process_reuse"],
+		] as const;
 
-		await expect(router.resolve({
-			effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, action: bash,
-		}, { cwd })).resolves.toMatchObject({ backend: "linux_process_reuse" });
-		expect(fixture.selfView).not.toHaveBeenCalled();
-		expect(nativePrepare).toHaveBeenCalledOnce();
+		for (const [tool, args, allLayers, nativeOnly] of cases) {
+			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
+			const action = buildPiActionKey(tool, args, cwd, "schema")!;
+			const request = { effect: definition.effect, requirements: definition.requirements, action };
+			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: allLayers });
+			const native = await router.resolve(request, { cwd }, (backend) => backend !== "ThinkThread");
+			expect(native?.backend).toBe(nativeOnly);
+			const unified = await router.resolve(request, { cwd }, (backend) => backend === "ThinkThread");
+			expect(unified?.backend).toBe(tool === "bash" ? undefined : "ThinkThread");
+			await expect(router.resolve(request, { cwd }, () => false)).resolves.toBeUndefined();
+		}
 
-		fixture.selfView.mockRejectedValueOnce(new Error("ThinkThread unavailable"));
-		const read = buildPiActionKey("read", { path: "notes.txt" }, cwd, "schema")!;
-		await expect(router.resolve({
-			effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, action: read,
-		}, { cwd })).resolves.toMatchObject({ backend: "resource_fallback" });
-		expect(fixture.selfView).toHaveBeenCalledOnce();
+		expect(nativePrepare).toHaveBeenCalled();
+		expect(fixture.selfView).toHaveBeenCalled();
+		await router.dispose();
+	});
+
+	it("falls through a failed unified preparation without inventing a read fallback", async () => {
+		const fixture = fakeClient();
+		fixture.selfView.mockRejectedValue(new Error("ThinkThread unavailable"));
+		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
+		const workspace = {
+			id: "git_worktree", scope: "fallback", isolation: "workspace_branch",
+			speculation: { capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities, execute: vi.fn() },
+		} as unknown as SpeculativeAgentExecutionWorld;
+		const router = new ExecutionWorldRouter([primary, workspace]);
+		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
+		const route = async (tool: "read" | "write", args: unknown) => {
+			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
+			return router.resolve({
+				effect: definition.effect,
+				requirements: definition.requirements,
+				action: buildPiActionKey(tool, args, cwd, "schema")!,
+			}, { cwd });
+		};
+
+		await expect(route("read", { path: "notes.txt" })).resolves.toBeUndefined();
+		await expect(route("write", { path: "generated.txt", content: "generated\n" }))
+			.resolves.toMatchObject({ backend: "git_worktree" });
 		await router.dispose();
 	});
 
