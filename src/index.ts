@@ -161,6 +161,7 @@ export {
 	type ActorProbeSnapshot,
 } from "./actor-fork-plan-source.ts";
 export {
+	type ExecutionRoutingSettings,
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,

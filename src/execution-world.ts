@@ -309,8 +309,9 @@ export class ExecutionWorldRouter<Context, Output> {
 	async resolve(
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
+		enabled: (backend: string) => boolean = () => true,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		return this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route);
+		return this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route, enabled);
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
@@ -342,11 +343,20 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	/** Inspect every registered world without attempting a speculative action. */
-	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+	async diagnostics(
+		input: ExecutionWorldDiagnosticsContext,
+		enabled: (backend: string) => boolean = () => true,
+	): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return Promise.all(
 			this.worlds.map(async (world) => {
 				const speculation = world.speculation
-					? await this.diagnose(world.id, "speculation", world.speculation, input)
+					? enabled(world.id)
+						? await this.diagnose(world.id, "speculation", world.speculation, input)
+						: {
+								capabilities: world.speculation.capabilities,
+								state: "unavailable" as const,
+								detail: "Pre-execution disabled by routing policy",
+							}
 					: {
 							capabilities: Object.freeze([]),
 							state: "unavailable" as const,
@@ -383,10 +393,11 @@ export class ExecutionWorldRouter<Context, Output> {
 			world: ExecutionWorld<Context, Output>,
 			route: SpeculativeExecutionRoute,
 		) => Selected | undefined | Promise<Selected | undefined>,
+		enabled: (backend: string) => boolean = () => true,
 	): Promise<Selected | undefined> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worlds) {
-				if (world.scope !== scope) continue;
+				if (world.scope !== scope || !enabled(world.id)) continue;
 				const operation = operationFor(world);
 				if (!operation) continue;
 				try {

@@ -3,10 +3,16 @@ import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 
+export interface ExecutionRoutingSettings {
+	readonly primary?: boolean;
+	readonly nativeFallback?: boolean;
+}
+
 export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettingsInput {
 	readonly draftModel?: string;
 	readonly executionStoreMaxEntries?: number;
 	readonly executionStoreMaxBytes?: number;
+	readonly executionRouting?: ExecutionRoutingSettings;
 }
 
 export type SpeculativeSettingsScope = "global" | "project";

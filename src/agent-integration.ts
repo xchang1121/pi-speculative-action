@@ -116,6 +116,8 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly actorForkPlanSource?: ActorForkPlanSource;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
 	readonly executionWorlds?: readonly AgentExecutionWorld[];
+	/** Dynamic policy for pre-Actor execution only; observation and Actor result reuse stay independent. */
+	readonly speculativeExecutionWorldEnabled?: (backend: string) => boolean;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
 	/** Stable logical workspace identity when physical checkout paths are ephemeral. */
@@ -221,8 +223,9 @@ export function createSpeculativeActionHost(
 						effect: definition.effect,
 						requirements: definition.requirements,
 					},
-					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
-				)
+								{ cwd: options.cwd, ...(signal ? { signal } : {}) },
+								options.speculativeExecutionWorldEnabled,
+							)
 			: undefined;
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
@@ -369,6 +372,8 @@ export function createSpeculativeActionHost(
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
+			if (options.speculativeExecutionWorldEnabled?.(route.backend) === false)
+				return { ok: false, reason: "execution_route_disabled" };
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
@@ -381,6 +386,8 @@ export function createSpeculativeActionHost(
 				: result;
 		},
 		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
+			if (options.speculativeExecutionWorldEnabled?.(route.backend) === false)
+				return { ok: false, reason: "execution_route_disabled" };
 			const tool = stateData.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
 			const args = validateCandidateArguments(tool, toolName, concrete, "spec_authorize");
@@ -455,7 +462,10 @@ export function createSpeculativeActionHost(
 		sessionID,
 		runtime,
 		executionWorldDiagnostics: (refresh = false) =>
-			executionGateway.diagnostics({ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) }),
+			executionGateway.diagnostics(
+				{ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) },
+				options.speculativeExecutionWorldEnabled,
+			),
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),

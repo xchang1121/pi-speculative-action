@@ -71,6 +71,7 @@ export class ToolExecutionGateway<Context, Output> {
 	resolve(
 		requirement: ToolExecutionRequirement,
 		preparation: ExecutionWorldPreparation,
+		enabled?: (backend: string) => boolean,
 	): Promise<SpeculativeExecutionRoute | undefined> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.resolve(
@@ -80,11 +81,15 @@ export class ToolExecutionGateway<Context, Output> {
 				...(operation.action ? { action: operation.action } : {}),
 			},
 			preparation,
+			enabled,
 		);
 	}
 
-	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
-		return this.router.diagnostics(input);
+	diagnostics(
+		input: ExecutionWorldDiagnosticsContext,
+		enabled?: (backend: string) => boolean,
+	): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+		return this.router.diagnostics(input, enabled);
 	}
 
 	captureAuthoritativeResult(

@@ -200,6 +200,29 @@ describe("zero-modification Pi extension", () => {
 		]);
 	});
 
+	it("applies the primary and native pre-execution layers independently", async () => {
+		const primary = {
+			id: "primary_runtime", scope: "runtime", isolation: "runtime_sandbox", speculation: { capabilities: [] },
+		} as unknown as SpeculativeAgentExecutionWorld;
+		const fixture = await createFixture({ executionWorlds: [primary], settings: { enabled: true } });
+		const menus = driveSettingsMenus(fixture, {
+			"Speculative action": ["Tools & execution", "Apply changes", "Close"],
+			"Tools & execution": ["Execution routes", "Back"],
+			"Execution routes": ["[x] Unified execution environment", "[x] Native speculative fallback", "Back"],
+		});
+		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+
+		expect(menus.get("Execution routes")).toEqual(expect.arrayContaining([
+			expect.stringMatching(/^\[ \] Unified execution environment/u),
+			expect.stringMatching(/^\[ \] Native speculative fallback/u),
+			"Actor execution · always available",
+		]));
+		expect(fixture.store.effective()?.executionRouting).toEqual({ primary: false, nativeFallback: false });
+		expect(fixture.executionWorldEnabled("primary_runtime")).toBe(false);
+		expect(fixture.executionWorldEnabled("linux_process_reuse")).toBe(false);
+	});
+
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture({ settings: { enabled: true }, defaultExecutionWorlds: true });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
@@ -458,6 +481,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const store = memorySettingsStore(options.settings);
 	let getHostSettings: CreateSpeculativeActionHostOptions["getSettings"];
 	let hostExecutionWorlds: CreateSpeculativeActionHostOptions["executionWorlds"] = [];
+	let executionWorldEnabled: CreateSpeculativeActionHostOptions["speculativeExecutionWorldEnabled"];
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -481,6 +505,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		createHost: (_sessionID, hostOptions) => {
 			getHostSettings = hostOptions.getSettings;
 			hostExecutionWorlds = hostOptions.executionWorlds;
+			executionWorldEnabled = hostOptions.speculativeExecutionWorldEnabled;
 			return host;
 		},
 		createSettingsStore: () => store,
@@ -493,6 +518,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	return {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host,
 		executionWorlds: () => hostExecutionWorlds ?? [],
+		executionWorldEnabled: (backend: string) => executionWorldEnabled?.(backend),
 		hostSettings: async () => getHostSettings?.(), store, tools, ui,
 	};
 }

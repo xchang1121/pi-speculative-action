@@ -41,8 +41,10 @@ export function withThinkThreadProfileLifecycle(
 	world: ThinkThreadExecutionWorld,
 	options: CreateSpeculativeActionHostOptions,
 ): SpeculativeActionHost {
+	const activeTurns = new Set<string>();
+	const enabled = () => options.speculativeExecutionWorldEnabled?.(world.id) !== false;
 	const invalidateAfterActorMutation = async (tool: string): Promise<void> => {
-		if (inferredActionEffect(tool) === "observation") return;
+		if ((activeTurns.size === 0 && !enabled()) || inferredActionEffect(tool) === "observation") return;
 		// Invalidation clears BASE before releasing its owner. Cleanup failure must not replace Actor output.
 		await world.actorFallbackSettled().catch(() => undefined);
 	};
@@ -50,11 +52,14 @@ export function withThinkThreadProfileLifecycle(
 		...host,
 		startTurn: async (...args: Parameters<SpeculativeActionHost["startTurn"]>) => {
 			const [input, signal] = args;
+			if (!enabled()) return host.startTurn(...args);
 			await world.speculation.prepare?.({ cwd: options.cwd, ...(signal ? { signal } : {}) });
 			await world.beginTurn(input.turnID);
+			activeTurns.add(input.turnID);
 			try {
 				await host.startTurn(...args);
 			} catch (error) {
+				activeTurns.delete(input.turnID);
 				await world.finishTurn(input.turnID).catch(() => undefined);
 				throw error;
 			}
@@ -76,7 +81,7 @@ export function withThinkThreadProfileLifecycle(
 			try {
 				await host.finishTurn(...args);
 			} finally {
-				await world.finishTurn(turnID);
+				if (activeTurns.delete(turnID)) await world.finishTurn(turnID);
 			}
 		},
 	};

@@ -41,8 +41,27 @@ describe("ThinkThread profile extension lifecycle", () => {
 		const world = worldFixture();
 		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, hostOptions());
 
+		await wrapped.startTurn(startInput("turn-failed"));
 		await expect(wrapped.finishTurn("turn-failed")).rejects.toBe(settlementError);
 		expect(world.finishTurn).toHaveBeenCalledWith("turn-failed");
+	});
+
+	it("does not initialize ThinkThread when its pre-execution layer is disabled", async () => {
+		const host = hostFixture();
+		const world = worldFixture();
+		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, {
+			...hostOptions(),
+			speculativeExecutionWorldEnabled: () => false,
+		});
+
+		await wrapped.startTurn(startInput("turn-actor"));
+		await wrapped.actual(actualInput("write"));
+		await wrapped.finishTurn("turn-actor");
+		expect(host.startTurn).toHaveBeenCalledOnce();
+		expect(world.prepare).not.toHaveBeenCalled();
+		expect(world.beginTurn).not.toHaveBeenCalled();
+		expect(world.actorFallbackSettled).not.toHaveBeenCalled();
+		expect(world.finishTurn).not.toHaveBeenCalled();
 	});
 
 	it.each(["write", "edit", "bash"])("invalidates %s before the new host.execute reports Actor settlement", async (tool) => {
@@ -120,6 +139,7 @@ function worldFixture() {
 	const actorFallbackSettled = vi.fn(async () => undefined);
 	const finishTurn = vi.fn(async () => undefined);
 	const value = {
+		id: "thinkthread",
 		speculation: { prepare },
 		beginTurn,
 		actorFallbackSettled,

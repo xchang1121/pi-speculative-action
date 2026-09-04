@@ -139,7 +139,10 @@ describe("ExecutionWorldRouter", () => {
 			observation: { capabilities: "all", capture },
 		};
 		const router = new ExecutionWorldRouter([split]);
+		const observationRequest = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
 
+		expect(await router.resolve(observationRequest, preparation)).toBeDefined();
+		expect(await router.resolve(observationRequest, preparation, () => false)).toBeUndefined();
 		expect(
 			await router.resolve({ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, preparation),
 		).toBeUndefined();

@@ -85,6 +85,7 @@ import {
 	type SelfSpeculationSettings,
 } from "./self-speculation.ts";
 import {
+	type ExecutionRoutingSettings,
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
@@ -125,6 +126,7 @@ export interface EffectiveSpeculativeActionSettings {
 	readonly resourceCacheMaxBytes: number;
 	readonly executionStoreMaxEntries: number;
 	readonly executionStoreMaxBytes: number;
+	readonly executionRouting: Required<ExecutionRoutingSettings>;
 	readonly predictionTimeoutMs: number;
 	readonly patternAware: PatternAwareSettings;
 	readonly selfSpeculation: SelfSpeculationSettings;
@@ -219,6 +221,7 @@ type ExecutionRoutesSnapshot = {
 	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly actorProcessReplay?: ProcessRouteSnapshot;
 };
+type ExecutionLayerCounts = { readonly primary: number; readonly native: number };
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -243,6 +246,7 @@ interface SpeculativeActionController {
 	readonly recentEvents: () => readonly string[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
 	readonly executionSummary: () => string;
+	readonly executionLayers: () => ExecutionLayerCounts;
 	readonly maintainExecutionStorage: (operation: "gc" | "clear") => Promise<{ text: string; failed: boolean }>;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => Promise<void>;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
@@ -303,6 +307,10 @@ export function normalizeSpeculativeActionSettings(
 			DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates,
 		),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
+		executionRouting: {
+			primary: input?.executionRouting?.primary !== false,
+			nativeFallback: input?.executionRouting?.nativeFallback !== false,
+		},
 		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
 		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input?.selfSpeculation),
@@ -329,7 +337,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, replay confidence≥${formatPercent(settings.patternAware.minBindingReplayProbability)}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
-		"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
+		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
@@ -487,6 +495,11 @@ async function installController(
 			workspaceSandbox.createExecutionWorld(),
 		]),
 	];
+	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
+	const speculativeExecutionWorldEnabled = (backend: string): boolean =>
+		primaryExecutionWorldIDs.has(backend)
+			? currentSettings.executionRouting.primary
+			: currentSettings.executionRouting.nativeFallback;
 	const configureExecutionStorage = () => {
 		for (const world of executionWorlds)
 			world.storage?.configure({
@@ -497,7 +510,10 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => {
-		return { worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics() };
+		const worlds = executionDiagnostics.map((world) => speculativeExecutionWorldEnabled(world.id)
+			? world
+			: { ...world, state: "unavailable" as const, detail: "Pre-execution disabled by routing policy" });
+		return { worlds, actorProcessReplay: processCoordinator.actorDiagnostics() };
 	};
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -555,6 +571,7 @@ async function installController(
 			...(piToolSettings.shellCommandPrefix ? [] : [PI_BASH_TAIL_LINES_PROJECTION_RULE]),
 		],
 		executionWorlds,
+		speculativeExecutionWorldEnabled,
 		actorForkPlanSource: selfSpeculation.actorForkPlanSource,
 		patternStateDirectory: getAgentDir(),
 		patternWorkspaceIdentity,
@@ -593,6 +610,10 @@ async function installController(
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
 		executionSummary: () => executionWorldSummary(toolCapabilities(), executionRoutes()),
+		executionLayers: () => ({
+			primary: primaryExecutionWorldIDs.size,
+			native: executionWorlds.length - primaryExecutionWorldIDs.size,
+		}),
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -1252,14 +1273,54 @@ async function openToolsAndExecution(
 				controller.registeredTools(),
 				controller.toolConflicts(),
 			);
-		if (choice === "Execution routes") {
-			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-			ctx.ui.notify(
-				`Predict controls which tools sources may propose. Replay, Observe, and Fork are independent runtime capabilities; diagnostics refresh only while the plugin is enabled, and unavailable work stays with the Actor.\n${controller.executionSummary()}`,
-				"info",
-			);
-		}
+		if (choice === "Execution routes") await openExecutionRoutes(ctx, editor, controller);
 	}
+}
+
+async function openExecutionRoutes(
+	ctx: ExtensionContext,
+	editor: SpeculativeActionController,
+	controller: SpeculativeActionController,
+): Promise<void> {
+	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
+	ctx.ui.notify(
+		`Predict controls what sources may propose. Replay, Observe, and Fork are independent runtime capabilities. Pre-execution follows the configured hierarchy; diagnostics refresh only while the plugin is enabled, and unavailable work stays with the Actor.\n${controller.executionSummary()}`,
+		"info",
+	);
+	return runActionMenuLoop(ctx, "Execution routes", () => {
+		const settings = editor.settings();
+		const layers = controller.executionLayers();
+		const actions = new Map<string, MenuAction>();
+		if (layers.primary > 0) {
+			actions.set(
+				`${settings.executionRouting.primary ? "[x]" : "[ ]"} Unified execution environment · ${layers.primary} provider${layers.primary === 1 ? "" : "s"}`,
+				() => editor.setSettings({
+					...settings,
+					executionRouting: { ...settings.executionRouting, primary: !settings.executionRouting.primary },
+				}),
+			);
+		} else {
+			actions.set("[ ] Unified execution environment · not installed", () =>
+				ctx.ui.notify("No unified execution environment is installed for this profile.", "info"));
+		}
+		actions.set(
+			`${settings.executionRouting.nativeFallback ? "[x]" : "[ ]"} Native speculative fallback · ${layers.native} providers`,
+			() => editor.setSettings({
+				...settings,
+				executionRouting: {
+					...settings.executionRouting,
+					nativeFallback: !settings.executionRouting.nativeFallback,
+				},
+			}),
+		);
+		actions.set("Actor execution · always available", () =>
+			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"));
+		actions.set("Refresh and show capabilities", async () => {
+			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
+			ctx.ui.notify(controller.executionSummary(), "info");
+		});
+		return actions;
+	});
 }
 
 async function editToolPolicy(
