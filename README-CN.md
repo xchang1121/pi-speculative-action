@@ -186,7 +186,7 @@ tt pi-speculative-action
 - `speculation.execute`：`read`、`ls`、`write`、`edit` 同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
 - `observation.capture`：在 Actor 的 `read`、`grep`、`find`、`ls` 执行前创建新快照，封装这一次 Actor 输出，供后续验证复用，不重复执行工具，也不依赖投机 runner。两条路径都由 `EffectTransaction` 统一管理采纳状态。
 
-依赖外部进程的 `grep`、`find` 留在 Actor 路径，但只要捕获的目录树未变化，其已完成的 Actor 结果仍可复用。本 Profile 暂不支持默认 Linux 后端的持久进程证书回放、跨 Bash 父命令复用子进程或 held-exec 接管。它替换默认后端，不在 ThinkThread 内再嵌套 Git/namespace/ptrace 实现。状态会按工具显示独立的 ThinkThread 路线；适配器没有暴露证书仓，因此可复用命令历史的存储操作不可用。普通源码加载仍使用原默认后端，不加载可选 SDK。
+依赖外部进程的 `grep`、`find` 留在 Actor 路径，但只要捕获的目录树未变化，其已完成的 Actor 结果仍可复用。Profile 会先尝试思程 world，并把原生 Linux 进程 provider 与 Git 工作区 provider 保留为后续路线。因此安装思程后，Bash 仍保有持久进程证书回放、跨父命令子进程复用、held-exec 接管和可复用命令历史。普通源码加载仍使用未改变的默认 provider，也不会加载可选 SDK。
 
 `fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。因此该 world 不提前执行进程依赖超出工作区证明范围的 `grep`、`find`、`bash`。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
@@ -194,7 +194,7 @@ tt pi-speculative-action
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展默认先注册 Linux 进程世界，再注册 Git 工作区 fallback；宿主也可以通过 `executionWorlds` 替换这组世界。所有 World 都按 effect capability 而不是工具名声明能力；内置 runtime world 覆盖进程调用，宿主仍可注入覆盖范围更大的 runtime sandbox。Router 在返回 route 前确认后端可用，因此不可用的 Runtime 沙箱会自然降级到兼容的本地后备。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种封存 `WorldBranch` 载体；Gateway 再将其包装为唯一的 `EffectTransaction`，由事务独占新鲜度验证、采纳、放弃和提交状态，载体只保留兼容性证据与后端局部清理职责。
+Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不再替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表，供自行管理完整生命周期的嵌入方使用。所有 World 都按 effect capability 而不是工具名声明能力；Router 在返回 route 前确认后端可用，所以不可用的首选 Runtime 会自然降级到下一项兼容 provider。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种封存 `WorldBranch` 载体；Gateway 再将其包装为唯一的 `EffectTransaction`，由事务独占新鲜度验证、采纳、放弃和提交状态，载体只保留兼容性证据与后端局部清理职责。
 
 ```ts
 createSpeculativeActionHost(sessionID, {

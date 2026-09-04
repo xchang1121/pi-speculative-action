@@ -52,7 +52,6 @@ import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
-	emptyWorldReuseMetrics,
 	executionCapabilityStatus,
 	type ExecutionWorldDiagnosticSnapshot,
 	type ExecutionWorldHealthState,
@@ -442,19 +441,19 @@ async function installController(
 		loadPiToolSettings(context),
 		resolvePatternWorkspaceIdentity(context.cwd),
 	]);
-	let configuredExecutionWorlds = dependencies.createExecutionWorlds?.({
+	const primaryExecutionWorlds = dependencies.createExecutionWorlds?.({
 		cwd: context.cwd,
 		autoResizeImages: piToolSettings.autoResizeImages,
+	}) ?? [];
+	const processBackend = new LinuxProcessReuseBackend({
+		storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
 	});
-	const processBackend = configuredExecutionWorlds
-		? undefined
-		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
 	const processCoordinator = new ProcessExecutionCoordinator(
 		rawProcessExecutor,
-		processBackend ? {
+		{
 			enabled: actorReplayEnabled,
 			prepare: () => processBackend.prepareActorReplay(rawProcessExecutor, {
 				sourceRoot: context.cwd,
@@ -473,12 +472,12 @@ async function installController(
 				})?.process,
 			}),
 			reset: () => processBackend.resetActorReplay(),
-		} : undefined,
+		},
 	);
-	let workspaceSandbox: WorkspaceSandboxService | undefined;
-	if (!configuredExecutionWorlds) {
-		workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
-		configuredExecutionWorlds = [
+	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
+	const executionWorlds = [
+		...new Set([
+			...primaryExecutionWorlds,
 			createLinuxProcessExecutionWorld({
 				coordinator: processCoordinator,
 				backend: processBackend,
@@ -486,10 +485,7 @@ async function installController(
 				workspaceSandbox,
 			}),
 			workspaceSandbox.createExecutionWorld(),
-		];
-	}
-	const executionWorlds = [
-		...new Set(configuredExecutionWorlds),
+		]),
 	];
 	const configureExecutionStorage = () => {
 		for (const world of executionWorlds)
@@ -501,8 +497,7 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => {
-		const actor = processBackend ? processCoordinator.actorDiagnostics() : undefined;
-		return { worlds: executionDiagnostics, ...(actor ? { actorProcessReplay: actor } : {}) };
+		return { worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics() };
 	};
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -530,7 +525,7 @@ async function installController(
 	});
 	const visibleMetrics = (): SpeculativeActionMetrics => ({
 		...currentMetrics,
-		actorProcessReuse: processBackend?.actorMetrics() ?? emptyWorldReuseMetrics(),
+		actorProcessReuse: processBackend.actorMetrics(),
 	});
 	function renderFooter(): void {
 		if (!ui) return;
@@ -735,7 +730,7 @@ async function installController(
 				await host.dispose();
 			} finally {
 				try {
-					await workspaceSandbox?.dispose();
+					await workspaceSandbox.dispose();
 				} finally {
 					await selfSpeculation.dispose();
 				}

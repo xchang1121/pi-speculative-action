@@ -183,6 +183,23 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 	});
 
+	it("prepends configured runtime providers without removing native fallbacks", async () => {
+		const primary = {
+			id: "primary_runtime",
+			scope: "runtime",
+			isolation: "runtime_sandbox",
+			speculation: { capabilities: [] },
+		} as unknown as SpeculativeAgentExecutionWorld;
+		const fixture = await createFixture({ executionWorlds: [primary] });
+		await fixture.emit("session_start", {}, fixture.context);
+
+		expect(fixture.executionWorlds().map((world) => world.id)).toEqual([
+			"primary_runtime",
+			"linux_process_reuse",
+			"git_worktree",
+		]);
+	});
+
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture({ settings: { enabled: true }, defaultExecutionWorlds: true });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
@@ -440,6 +457,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	} as unknown as ExtensionContext;
 	const store = memorySettingsStore(options.settings);
 	let getHostSettings: CreateSpeculativeActionHostOptions["getSettings"];
+	let hostExecutionWorlds: CreateSpeculativeActionHostOptions["executionWorlds"] = [];
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -462,6 +480,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const factory = createSpeculativeActionExtension({
 		createHost: (_sessionID, hostOptions) => {
 			getHostSettings = hostOptions.getSettings;
+			hostExecutionWorlds = hostOptions.executionWorlds;
 			return host;
 		},
 		createSettingsStore: () => store,
@@ -473,6 +492,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	};
 	return {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host,
+		executionWorlds: () => hostExecutionWorlds ?? [],
 		hostSettings: async () => getHostSettings?.(), store, tools, ui,
 	};
 }
