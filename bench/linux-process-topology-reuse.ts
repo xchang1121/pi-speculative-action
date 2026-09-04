@@ -105,7 +105,7 @@ try {
 		? await prepareLinuxProcessReuse(fixture, { workspaceDriver, includeWorkspaceFingerprint: true })
 		: undefined;
 
-	const warmup = await runTask("warmup", "pi-topology-helper input.bin generated/nested/artifact.bin");
+	const warmup = await runTask("warmup", "./pi-topology-helper input.bin generated/nested/artifact.bin");
 	if (mode === "reuse") {
 		assert(warmup.metricDelta.misses === 1 && warmup.metricDelta.hits === 0, "warm-up did not execute once");
 		assert(warmup.metricDelta.published === 1 && warmup.metricDelta.tainted === 0, "warm-up was not safely published");
@@ -122,7 +122,7 @@ try {
 		await rm(outputDirectory, { recursive: true, force: true });
 		const run = await runTask(
 			`${mode}-${index + 1}`,
-			`printf 'parent-${index + 1}\\n'; command pi-topology-helper input.bin generated/nested/artifact.bin`,
+			`printf 'parent-${index + 1}\\n'; command ./pi-topology-helper input.bin generated/nested/artifact.bin`,
 		);
 		if (mode === "reuse") {
 			assert(run.metricDelta.hits === 1 && run.metricDelta.misses === 0, `reuse run ${index + 1} missed`);

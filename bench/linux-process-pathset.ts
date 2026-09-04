@@ -84,7 +84,7 @@ try {
 	for (let index = 0; index < HISTORY; index++) {
 		await writeInput(workspace, index);
 		await rm(path.join(workspace, "artifact.txt"), { force: true });
-		const run = await runTask(`history-${index}`, "pi-pathset-helper input.bin artifact.txt", executionFingerprint);
+		const run = await runTask(`history-${index}`, "./pi-pathset-helper input.bin artifact.txt", executionFingerprint);
 		assert(run.metricDelta.misses === 1 && run.metricDelta.hits === 0, `history ${index} was not a miss`);
 		histories.push(run);
 	}
@@ -93,7 +93,7 @@ try {
 	await rm(path.join(workspace, "artifact.txt"), { force: true });
 	const hit = await runTask(
 		"oldest-state-hit",
-		"printf 'different-parent\\n'; command pi-pathset-helper input.bin artifact.txt",
+		"printf 'different-parent\\n'; command ./pi-pathset-helper input.bin artifact.txt",
 		executionFingerprint,
 	);
 	assert(hit.metricDelta.hits === 1 && hit.metricDelta.misses === 0, "oldest historical state did not hit");

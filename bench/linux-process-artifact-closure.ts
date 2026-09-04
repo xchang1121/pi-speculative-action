@@ -70,7 +70,7 @@ const { backend, workspace } = fixture;
 try {
 	await prepareWorkspace(workspace);
 	const { status, executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-	const cold = await runTask("cold", "pi-artifact-helper input.bin artifact.bin", executionFingerprint);
+	const cold = await runTask("cold", "./pi-artifact-helper input.bin artifact.bin", executionFingerprint);
 	assert(cold.metricDelta.misses === 1 && cold.metricDelta.hits === 0, "cold execution was not published");
 	const expectedDigest = await fileDigest(path.join(workspace, "input.bin"));
 	assert((await fileDigest(path.join(workspace, "artifact.bin"))) === expectedDigest, "cold artifact differs");
@@ -80,7 +80,7 @@ try {
 		await rm(path.join(workspace, "artifact.bin"), { force: true });
 		const hit = await runTask(
 			`hit-${index + 1}`,
-			`printf 'parent-${index + 1}\\n'; command pi-artifact-helper input.bin artifact.bin`,
+			`printf 'parent-${index + 1}\\n'; command ./pi-artifact-helper input.bin artifact.bin`,
 			executionFingerprint,
 		);
 		assert(hit.metricDelta.hits === 1 && hit.metricDelta.misses === 0, `hit ${index + 1} missed`);
