@@ -1,5 +1,6 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
 	filesystemObservationDigest,
@@ -425,12 +426,7 @@ function workspaceDriverSemanticGap(
 	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line)) return false;
 	const referenced = new Set(syscallPaths(line, syscall, cwd));
 	for (const match of line.matchAll(/\d+<(\/[^>]+)>/g)) referenced.add(path.posix.normalize(match[1]!));
-	return [...referenced].some((candidate) => roots.some((root) => posixContains(root, candidate)));
-}
-
-function posixContains(root: string, candidate: string): boolean {
-	const relative = path.posix.relative(path.posix.resolve(root), path.posix.resolve(candidate));
-	return relative === "" || (relative !== ".." && !relative.startsWith("../") && !path.posix.isAbsolute(relative));
+	return [...referenced].some((candidate) => roots.some((root) => containsLogicalPath(root, candidate)));
 }
 
 const NETWORK_SYSCALLS = new Set([

@@ -95,7 +95,7 @@ import {
 	type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
-import { contains as pathContains, slash } from "./path-utils.ts";
+import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-v15";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
@@ -1427,8 +1427,8 @@ function transactionDependencySource(
 	}
 	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
 	const entry = (physicalPath: string): Promise<WorkspaceTreeEntry | undefined> => {
-		const relative = path.relative(snapshot.root, path.resolve(physicalPath));
-		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
+		if (relative === undefined) {
 			return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
 		}
 		const existing = cached.get(relative);

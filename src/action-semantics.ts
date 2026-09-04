@@ -1,5 +1,5 @@
 import path from "node:path";
-import { contains, slash } from "./path-utils.ts";
+import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import {
 	type EffectRequirements,
 	normalizeEffectRequirements,
@@ -752,9 +752,8 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 
 function normalizeWorkspacePath(value: string, cwd: string): string | undefined {
 	const root = path.resolve(cwd);
-	const absolute = path.resolve(root, value);
-	if (!contains(root, absolute)) return undefined;
-	return slash(path.relative(root, absolute) || ".");
+	const relative = relativeFilesystemPath(root, path.resolve(root, value));
+	return relative === undefined ? undefined : slash(relative || ".");
 }
 
 function normalizePositiveInteger(value: unknown, fallback: number): number {

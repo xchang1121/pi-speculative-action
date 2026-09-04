@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { asRecord } from "./action-semantics.ts";
-import { contains, slash } from "./path-utils.ts";
+import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,
@@ -17,7 +17,6 @@ import type {
 } from "./execution-world.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
-import { filesystemPathKey } from "./filesystem-evidence.ts";
 import {
 	LinuxOverlayfsCapabilityRegistry,
 	LinuxOverlayfsUnsafeCleanupError,
@@ -1133,7 +1132,7 @@ async function executeMutation(
 	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
 	const sourceRoot = path.resolve(context.cwd);
 	const target = path.resolve(sourceRoot, args.path);
-	if (!contains(sourceRoot, target) || target === sourceRoot) {
+	if (!containsFilesystemPath(sourceRoot, target) || target === sourceRoot) {
 		throw new Error(`sandbox mutation path escapes workspace: ${args.path}`);
 	}
 	await assertNoSymlinkPath(sourceRoot, target);
@@ -1863,9 +1862,9 @@ function throwIfAborted(signal?: AbortSignal): void {
 function incrementalPathspecs(root: string, changedPaths: readonly string[]): string[] | undefined {
 	const result = new Set<string>();
 	for (const changedPath of changedPaths) {
-		const relative = slash(path.relative(root, path.resolve(changedPath)) || ".");
-		if (relative === ".") return undefined;
-		if (relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) return undefined;
+		const nativeRelative = relativeFilesystemPath(root, changedPath);
+		if (!nativeRelative) return undefined;
+		const relative = slash(nativeRelative);
 		if (isSnapshotExcluded(relative)) continue;
 		result.add(relative);
 	}
@@ -1918,7 +1917,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 	for (const ancestor of lineage.reverse()) {
 		for (const change of orderSandboxChanges(ancestor.changes)) {
 			const target = path.resolve(workspace.sandboxRoot, change.resource);
-			if (!contains(workspace.sandboxRoot, target) || target === workspace.sandboxRoot) {
+			if (!containsFilesystemPath(workspace.sandboxRoot, target) || target === workspace.sandboxRoot) {
 				throw new Error(`execution checkpoint escapes workspace: ${change.resource}`);
 			}
 			await assertNoSymlinkPath(workspace.sandboxRoot, target);
@@ -1998,7 +1997,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promis
 		}
 		const target = path.resolve(workspace.sourceRoot, resource);
 		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
-		if (!contains(workspace.sourceRoot, target) || !contains(workspace.sandboxRoot, sandboxTarget)) {
+		if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) {
 			throw new Error(`sandbox change escapes workspace: ${resource}`);
 		}
 		await assertNoSymlinkPath(workspace.sourceRoot, target);
@@ -2088,7 +2087,7 @@ async function captureOverlayWorkspaceStructure(
 	}
 	for (const resource of [...frontier.refresh].sort(comparePathDepth)) {
 		const target = resource ? path.resolve(workspace.sandboxRoot, resource) : workspace.sandboxRoot;
-		if (!contains(workspace.sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
+		if (!containsFilesystemPath(workspace.sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
 		const entry = await captureWorkspaceStructureEntry(
 			target,
 			resource ? [] : workspace.observationExcludes,
@@ -2271,7 +2270,7 @@ async function readGitTreeRegularState(
 async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
 	const resolvedRoot = path.resolve(root);
 	const resolvedTarget = path.resolve(target);
-	if (!contains(resolvedRoot, resolvedTarget) && resolvedRoot !== resolvedTarget) {
+	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) {
 		throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
 	}
 	try {
@@ -2315,7 +2314,7 @@ async function assertNoDirectoryLinks(root: string, relative: string): Promise<v
 async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void> {
 	const root = path.resolve(change.root);
 	const target = path.resolve(change.target);
-	if (!contains(root, target) || target === root || target !== path.resolve(root, change.resource)) {
+	if (!containsFilesystemPath(root, target) || target === root || target !== path.resolve(root, change.resource)) {
 		throw new Error(`sandbox commit path escapes workspace: ${change.resource}`);
 	}
 	await assertNoSymlinkPath(root, target);
@@ -2589,8 +2588,8 @@ async function stageAtomicWrite(
 async function createParentDirectories(sourceRoot: string, target: string): Promise<string[]> {
 	const root = path.resolve(sourceRoot);
 	const parent = path.dirname(path.resolve(target));
-	const relative = path.relative(root, parent);
-	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+	const relative = relativeFilesystemPath(root, parent);
+	if (relative === undefined) {
 		throw new Error(`sandbox commit path escapes workspace: ${target}`);
 	}
 	const created: string[] = [];

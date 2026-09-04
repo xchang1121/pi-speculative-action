@@ -29,6 +29,7 @@ import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type Ret
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { containsLogicalPath } from "./path-utils.ts";
 import type {
 	AdoptedAction,
 	AuthoritativeResultCapture,
@@ -526,10 +527,7 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 }
 
 function resourcePathsOverlap(left: string, right: string): boolean {
-	const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-	const a = normalize(left);
-	const b = normalize(right);
-	return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+	return containsLogicalPath(left, right) || containsLogicalPath(right, left);
 }
 
 function uniqueCandidates<T extends object>(candidates: readonly T[]): T[] {

@@ -8,12 +8,8 @@ import {
 	PI_ACTION_SEMANTICS,
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
-import {
-	captureStableFile,
-	containsFilesystemPath,
-	filesystemPathKey,
-	sameFilesystemIdentity,
-} from "./filesystem-evidence.ts";
+import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -358,8 +354,8 @@ export function resourceDependencies(
 	if (scope === "tree_query") {
 		for (const resource of action.resources) {
 			const base = path.resolve(root, resource);
-			const relative = path.relative(root, base);
-			if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+			const relative = relativeFilesystemPath(root, base);
+			if (relative === undefined) continue;
 			let current = path.resolve(root);
 			for (const segment of relative.split(path.sep).filter(Boolean)) {
 				for (const control of QUERY_CONTROL_FILES) {
@@ -450,10 +446,9 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	if (dependency.scope === "content") {
 		if (dependencyPath === changed) return true;
 		// Some recursive watchers report only the containing directory for a file write.
-		return !preciseContent.has(dependencyPath) && dependencyPath.startsWith(`${changed}/`);
+		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
 	}
-	const inside = changed === dependencyPath || changed.startsWith(`${dependencyPath}/`);
-	if (!inside) return false;
+	if (!containsFilesystemPath(dependencyPath, changed)) return false;
 	if (path.basename(event.path).startsWith(".pi-speculative-")) return false;
 	const relative = path.relative(dependency.path, event.path);
 	if (relative === ".git" || relative.startsWith(`.git${path.sep}`)) return false;
@@ -702,8 +697,8 @@ function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Valu
 }
 
 function nestedGitBoundary(root: string, target: string) {
-	const relative = path.relative(root, target);
-	if (!relative || path.isAbsolute(relative)) return undefined;
+	const relative = relativeFilesystemPath(root, target);
+	if (!relative) return undefined;
 	const parts = relative.split(path.sep);
 	const index = parts.indexOf(".git");
 	return index < 0 ? undefined : path.resolve(root, ...parts.slice(0, index + 1));

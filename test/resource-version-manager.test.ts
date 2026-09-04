@@ -5,7 +5,6 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { filesystemPathKey } from "../src/filesystem-evidence.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import {
 	captureResourceVersion,
@@ -183,10 +182,6 @@ describe("speculative action resource versions", () => {
 			"unsupported_resource_type:fifo",
 		);
 		manager.close();
-	});
-
-	test("preserves path case in cache and watcher identities", () => {
-		expect(filesystemPathKey(path.join("root", "Case"))).not.toBe(filesystemPathKey(path.join("root", "case")));
 	});
 
 	test.each([

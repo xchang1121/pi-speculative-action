@@ -1,7 +1,7 @@
 import type { Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
-import { contains, slash } from "./path-utils.ts";
+import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import type { DynamicDependency, Sha256Digest } from "./provenance-certificate.ts";
 import {
 	digestObject,
@@ -42,15 +42,16 @@ export class ExecutionPathProjection {
 
 	toLogical(physicalPath: string): string {
 		const physical = path.resolve(physicalPath);
-		if (!contains(this.workspaceRoot, physical)) return slash(physical);
-		return slash(path.join(this.sourceRoot, path.relative(this.workspaceRoot, physical)));
+		const relative = relativeFilesystemPath(this.workspaceRoot, physical);
+		return relative === undefined ? slash(physical) : slash(path.join(this.sourceRoot, relative));
 	}
 
 	toPhysical(logicalPath: string): string | undefined {
 		const logical = path.resolve(logicalPath);
-		if (!contains(this.sourceRoot, logical)) return logical;
-		const physical = path.resolve(this.workspaceRoot, path.relative(this.sourceRoot, logical));
-		return contains(this.workspaceRoot, physical) ? physical : undefined;
+		const relative = relativeFilesystemPath(this.sourceRoot, logical);
+		if (relative === undefined) return logical;
+		const physical = path.resolve(this.workspaceRoot, relative);
+		return containsFilesystemPath(this.workspaceRoot, physical) ? physical : undefined;
 	}
 
 	normalizeValue(value: string): string {
@@ -60,7 +61,7 @@ export class ExecutionPathProjection {
 	}
 
 	isWorkspacePhysical(physicalPath: string): boolean {
-		return contains(this.workspaceRoot, path.resolve(physicalPath));
+		return containsFilesystemPath(this.workspaceRoot, physicalPath);
 	}
 }
 
@@ -211,7 +212,7 @@ export function diffWorkspaceStructures(
 	const byPath = new Map<string, WorkspaceRegularDelta>();
 	for (const delta of deltas) {
 		const relativePath = path.normalize(delta.relativePath);
-		if (!relativePath || path.isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${path.sep}`)) {
+		if (!relativePath || path.isAbsolute(relativePath) || relativeFilesystemPath(".", relativePath) === undefined) {
 			return { effects: [], complete: false, reason: `invalid_delta:${delta.relativePath}` };
 		}
 		if (byPath.has(relativePath)) return { effects: [], complete: false, reason: `duplicate_delta:${delta.relativePath}` };

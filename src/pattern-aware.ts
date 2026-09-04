@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import {
 	patternSessionBudgets,
 	type PatternPendingValidation,
@@ -2169,11 +2170,8 @@ function normalizeStructuredPaths(value: unknown, key: string, resourceRoot?: st
 function normalizeResourcePath(value: string, resourceRoot?: string) {
 	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
 	if (!resourceRoot || !path.isAbsolute(value)) return normalizePath(value);
-	const relative = path.relative(resourceRoot, value);
-	if (relative === "") return ".";
-	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
-		return normalizePath(value);
-	return normalizePath(relative);
+	const relative = relativeFilesystemPath(resourceRoot, value);
+	return relative === undefined ? normalizePath(value) : normalizePath(relative || ".");
 }
 
 function isPathField(key: string) {
@@ -2433,7 +2431,7 @@ function joinPath(left: string, right: string) {
 	const root = normalizePath(left);
 	const output = normalizePath(right);
 	const result =
-		output === root || output.startsWith(`${root}/`)
+		containsLogicalPath(root, output)
 			? output
 			: path.posix.basename(root) === output
 				? root
