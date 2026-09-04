@@ -2,13 +2,14 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import { SpeculationScheduler } from "../src/scheduler.ts";
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 import {
 	createLinuxProcessBenchmark,
@@ -17,6 +18,36 @@ import {
 } from "../bench/linux-process-harness.ts";
 
 describe("Linux process ExecutionWorld", () => {
+	test("skips completed replay lookup when Actor execution is cheaper", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");
+		const host = { execute: vi.fn(async () => ({ exitCode: 0 })) };
+		const planner = vi.spyOn(fixture.backend.planner, "plan");
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockReturnValue({
+			allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
+			speculativeSamples: 1, actorSamples: 1, adoptionSamples: 1,
+			expectedRemainingMs: 0, expectedAdoptionMs: 100,
+			expectedActorMs: 10, expectedNetBenefitMs: -90,
+		});
+		try {
+			const command = ":";
+			const executor = fixture.backend.completedReplayExecutor(host, {
+				sourceRoot: fixture.workspace,
+				invocation: () => resolvePiToolInvocation("bash", { command }, {
+					cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath,
+				})?.process,
+			});
+			await executor.execute({
+				command, cwd: fixture.workspace, environment: fixture.environment, onData: () => undefined,
+			});
+			expect(host.execute).toHaveBeenCalledOnce();
+			expect(planner).not.toHaveBeenCalled();
+		} finally {
+			admission.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
 	test("starts identical intercepted producers concurrently", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");

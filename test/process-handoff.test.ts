@@ -26,7 +26,6 @@ describe("ProcessHandoffRegistry", () => {
 			scope: SCOPE,
 			role: "actor",
 			lookup,
-			admitCompleted: () => true,
 			waitForRunning: async () => "miss",
 		});
 
@@ -56,7 +55,6 @@ describe("ProcessHandoffRegistry", () => {
 			scope: SCOPE,
 			role: "actor",
 			lookup: async (live) => live?.id,
-			admitCompleted: () => true,
 			waitForRunning: async () => "miss",
 		});
 		expect(actor).toMatchObject({ kind: "hit", plan: fixture.certificate.id });
@@ -90,7 +88,6 @@ describe("ProcessHandoffRegistry", () => {
 			scope: OTHER_SCOPE,
 			role: "actor",
 			lookup: async () => undefined,
-			admitCompleted: () => true,
 			waitForRunning,
 		})).resolves.toEqual({ kind: "miss", joined: false });
 		expect(waitForRunning).not.toHaveBeenCalled();
@@ -100,7 +97,6 @@ describe("ProcessHandoffRegistry", () => {
 			scope: SCOPE,
 			role: "actor",
 			lookup: async (live) => live?.id,
-			admitCompleted: () => true,
 			waitForRunning,
 		});
 		await waitEntered.promise;
@@ -109,36 +105,26 @@ describe("ProcessHandoffRegistry", () => {
 		await expect(sameScope).resolves.toMatchObject({ kind: "hit", joined: true });
 	});
 
-	it.each(["completion", "deadline"] as const)("settles a running join when %s wins", async (winner) => {
+	it("returns an Actor miss when the running-join deadline wins", async () => {
 		const fixture = await producer();
 		const waitEntered = deferred<void>();
 		const deadline = deferred<void>();
-		let executions = 1;
 		const actor = fixture.registry.acquire({
 			key: fixture.key,
 			scope: SCOPE,
 			role: "actor",
 			lookup: async (live) => live?.id,
-			admitCompleted: () => true,
-			waitForRunning: async (handoff) => {
+			waitForRunning: async () => {
 				waitEntered.resolve();
-				if (winner === "completion") {
-					await handoff.completion;
-					return "completed";
-				}
 				await deadline.promise;
 				return "miss";
 			},
 		});
 		await waitEntered.promise;
 
-		if (winner === "completion") await fixture.registry.publish(fixture.key, fixture.work, fixture.certificate, async () => false);
-		else deadline.resolve();
-		const acquired = await actor;
-		if (acquired.kind === "miss") executions++;
-		expect(acquired.kind).toBe(winner === "completion" ? "hit" : "miss");
-		expect(executions).toBe(winner === "completion" ? 1 : 2);
-		if (winner === "deadline") fixture.registry.complete(fixture.key, fixture.work);
+		deadline.resolve();
+		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
+		fixture.registry.complete(fixture.key, fixture.work);
 	});
 });
 

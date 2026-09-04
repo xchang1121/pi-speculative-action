@@ -401,13 +401,10 @@ export class LinuxProcessReuseBackend {
 						await this.resolvePlatformFingerprint(),
 					);
 					timing = processTimingIdentity(prototype, processWeakKey(prototype));
+					const admission = this.actorAdmission(timing, "succeeded");
+					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
 					const plan = await this.plan(prototype, projection, acceptProducer);
 					if (!plan) return this.actorReplayMiss(host, request, timing);
-					const expectedActorMs = this.processScheduler.assessCandidateJoin({
-						identity: timing,
-						state: "succeeded",
-						expectedSpeculativeDurationMs: 1,
-					}).expectedActorMs;
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
@@ -418,9 +415,9 @@ export class LinuxProcessReuseBackend {
 					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					this.addActor("wholeCommandHits");
 					this.processScheduler.observeAdoption(timing, hitLatencyMs);
-					if (expectedActorMs !== undefined) {
+					if (admission.expectedActorMs !== undefined) {
 						this.addActor("wholeCommandActorTimedHits");
-						this.addActor("wholeCommandActorBaselineMs", expectedActorMs);
+						this.addActor("wholeCommandActorBaselineMs", admission.expectedActorMs);
 						this.addActor("wholeCommandActorTimedHitLatencyMs", hitLatencyMs);
 					}
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
@@ -791,35 +788,24 @@ export class LinuxProcessReuseBackend {
 		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
-		let actorMs: number | undefined;
+		let admission = actor ? this.actorAdmission(actor.timing, "succeeded") : undefined;
+		if (admission && !admission.allowed) {
+			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
+		}
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
 			scope,
 			lookup,
 			...(actor ? {
 				role: "actor" as const,
-				admitCompleted: (joined: boolean) => {
-					if (joined) return true;
-					const decision = this.processScheduler.assessCandidateJoin({
-						identity: actor.timing,
-						state: "succeeded",
-						expectedSpeculativeDurationMs: 1,
-					});
-					actorMs = decision.expectedActorMs;
-					return decision.allowed;
-				},
 				waitForRunning: async (running: ProcessHandoff) => {
-					const decision = this.processScheduler.assessCandidateJoin({
-						identity: actor.timing,
-						state: "running",
-						expectedSpeculativeDurationMs: 1,
+					admission = this.actorAdmission(actor.timing, "running", {
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 						actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
 					});
-					actorMs = decision.expectedActorMs;
-					if (!decision.allowed) return "miss";
+					if (!admission.allowed) return "miss";
 					const waitStarted = performance.now();
-					const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
+					const finished = await waitForCandidate(running.completion, signal, admission.waitBudgetMs);
 					waitedMs += Math.max(0, performance.now() - waitStarted);
 					if (finished.status === "completed") return "completed";
 					throwIfAborted(signal);
@@ -832,8 +818,18 @@ export class LinuxProcessReuseBackend {
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
 			waitedMs,
-			...(actorMs === undefined ? {} : { actorMs }),
+			...(admission?.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }),
 		};
+	}
+
+	private actorAdmission(
+		identity: ServiceTimingIdentity,
+		state: "running" | "succeeded",
+		timing: { readonly elapsedMs?: number; readonly actorElapsedMs?: number } = {},
+	) {
+		return this.processScheduler.assessCandidateJoin({
+			identity, state, expectedSpeculativeDurationMs: 1, ...timing,
+		});
 	}
 
 	private async plan(

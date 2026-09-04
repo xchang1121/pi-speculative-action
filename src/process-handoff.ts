@@ -32,7 +32,6 @@ type AcquireOptions<Plan> = AcquireBase<Plan> & (
 	| { readonly role: "producer" }
 	| {
 			readonly role: "actor";
-			readonly admitCompleted: (joined: boolean) => boolean;
 			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss">;
 	  }
 );
@@ -55,9 +54,8 @@ export class ProcessHandoffRegistry {
 	async acquire<Plan>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		let joined = false;
 		while (true) {
-			const selected = await this.lookup(options, joined);
+			const selected = await this.lookup(options);
 			if (selected.kind === "hit") return { ...selected, joined };
-			if (selected.kind === "blocked") return this.miss(options, joined);
 			if (options.role === "producer" || !selected.running) return this.miss(options, joined);
 			if ((await options.waitForRunning(selected.running)) !== "completed") return this.miss(options, joined);
 			joined = true;
@@ -103,21 +101,18 @@ export class ProcessHandoffRegistry {
 
 	private async lookup<Plan>(
 		options: AcquireOptions<Plan>,
-		joined: boolean,
 	): Promise<
 		| { readonly kind: "hit"; readonly plan: Plan }
-		| { readonly kind: "blocked" }
 		| { readonly kind: "miss"; readonly running?: ProcessHandoff }
 	> {
 		const persisted = await options.lookup();
-		if (persisted) return this.admitted(options, joined) ? { kind: "hit", plan: persisted } : { kind: "blocked" };
+		if (persisted) return { kind: "hit", plan: persisted };
 		const records = this.byKey.get(options.key) ?? [];
 		for (const record of [...records].reverse()) {
 			if (record.state.status !== "completed" || !record.state.candidate || !sameScope(record.scope, options.scope)) continue;
 			const candidate = record.state.candidate;
 			const plan = await options.lookup(candidate);
 			if (!plan || record.state.status !== "completed" || record.state.candidate !== candidate) continue;
-			if (!this.admitted(options, joined)) return { kind: "blocked" };
 			record.state = { status: "claimed", candidate };
 			this.remove(options.key, record);
 			return { kind: "hit", plan };
@@ -132,10 +127,6 @@ export class ProcessHandoffRegistry {
 		return options.role === "producer"
 			? { kind: "work", work: this.reserve(options.key, options.scope), joined }
 			: { kind: "miss", joined };
-	}
-
-	private admitted<Plan>(options: AcquireOptions<Plan>, joined: boolean): boolean {
-		return options.role === "producer" || options.admitCompleted(joined);
 	}
 
 	private reserve(key: Sha256Digest, scope?: ExecutionScope): ProcessHandoff {
