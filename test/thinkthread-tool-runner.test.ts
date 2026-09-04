@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	createEditToolDefinition,
 	createFindToolDefinition,
@@ -10,6 +11,7 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import { withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
@@ -22,6 +24,7 @@ import {
 	type ThinkThreadToolName,
 } from "../src/thinkthread/tool-runner-protocol.ts";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
+import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
 
 const roots: string[] = [];
 
@@ -52,7 +55,7 @@ describe("ThinkThread stock Pi tool runner", () => {
 		["ls", { path: "." }],
 		["write", { path: "generated.txt", content: "generated\n" }],
 		["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
-	] as const)("matches the native Pi %s result and workspace effects", async (tool, args) => {
+	] as const)("matches the native fallback for Pi %s output and workspace effects", async (tool, args) => {
 		const [nativeRoot, thinkThreadRoot] = await Promise.all([
 			mkdtemp(path.join(os.tmpdir(), "pi-native-tool-")),
 			mkdtemp(path.join(os.tmpdir(), "pi-thinkthread-tool-")),
@@ -61,11 +64,11 @@ describe("ThinkThread stock Pi tool runner", () => {
 		await Promise.all([seed(nativeRoot), seed(thinkThreadRoot)]);
 		const request = runnerRequest(tool, args);
 
-		const [native, isolated] = await Promise.all([
-			runNativeTool(request, nativeRoot),
+		const [fallback, isolated] = await Promise.all([
+			runFallbackTool(request, nativeRoot),
 			runThinkThreadTool(request, thinkThreadRoot),
 		]);
-		expect(normalizeWorkspace(isolated, thinkThreadRoot)).toEqual(normalizeWorkspace(native, nativeRoot));
+		expect(normalizeWorkspace(isolated, thinkThreadRoot)).toEqual(normalizeWorkspace(fallback, nativeRoot));
 		expect(await workspaceState(thinkThreadRoot)).toEqual(await workspaceState(nativeRoot));
 	});
 });
@@ -81,12 +84,7 @@ function runnerRequest(tool: ThinkThreadToolName, args: unknown) {
 }
 
 async function runNativeTool(request: ThinkThreadToolRunnerRequestV1, cwd: string) {
-	const tools = [
-		createReadToolDefinition(cwd, { autoResizeImages: request.autoResizeImages }),
-		createGrepToolDefinition(cwd), createFindToolDefinition(cwd), createLsToolDefinition(cwd),
-		createWriteToolDefinition(cwd), createEditToolDefinition(cwd),
-	];
-	const tool = tools.find((candidate) => candidate.name === request.tool)!;
+	const tool = nativeTool(request, cwd);
 	try {
 		const result = withPiProjectionCoverage(request.tool, request.args,
 			await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never));
@@ -94,6 +92,46 @@ async function runNativeTool(request: ThinkThreadToolRunnerRequestV1, cwd: strin
 	} catch (error) {
 		return toolErrorSettlement(error);
 	}
+}
+
+async function runFallbackTool(request: ThinkThreadToolRunnerRequestV1, cwd: string) {
+	if (request.tool !== "write" && request.tool !== "edit") return runNativeTool(request, cwd);
+	const action = buildPiActionKey(request.tool, request.args, cwd);
+	if (!action) throw new Error(`No action key for ${request.tool}`);
+	const definition = nativeTool(request, cwd);
+	const tool: AgentTool = {
+		...definition,
+		execute: (callID, input, signal, onUpdate) =>
+			definition.execute(callID, input as never, signal, onUpdate as never, undefined as never),
+	};
+	const world = createWorkspaceSandbox({ driver: "git" });
+	try {
+		const branch = await world.speculation.execute({
+			cwd,
+			tool,
+			toolName: request.tool,
+			args: request.args,
+			action,
+			callID: request.callID,
+			signal: new AbortController().signal,
+		});
+		try {
+			return await branch.commit();
+		} finally {
+			await branch.dispose();
+		}
+	} finally {
+		await world.dispose?.();
+	}
+}
+
+function nativeTool(request: ThinkThreadToolRunnerRequestV1, cwd: string) {
+	const tools = [
+		createReadToolDefinition(cwd, { autoResizeImages: request.autoResizeImages }),
+		createGrepToolDefinition(cwd), createFindToolDefinition(cwd), createLsToolDefinition(cwd),
+		createWriteToolDefinition(cwd), createEditToolDefinition(cwd),
+	];
+	return tools.find((candidate) => candidate.name === request.tool)!;
 }
 
 async function seed(root: string): Promise<void> {
