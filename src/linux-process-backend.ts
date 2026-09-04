@@ -795,39 +795,37 @@ export class LinuxProcessReuseBackend {
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
 			scope,
-			create: !actor,
 			lookup,
-			admitCompleted: (joined) => {
-				if (!actor || joined) return true;
-				const decision = this.processScheduler.assessCandidateJoin({
-					identity: actor.timing,
-					state: "succeeded",
-					expectedSpeculativeDurationMs: 1,
-				});
-				actorMs = decision.expectedActorMs;
-				return decision.allowed;
-			},
-			waitForRunning: async (running) => {
-				if (!actor) {
-					await running.completion;
-					return "completed";
-				}
-				const decision = this.processScheduler.assessCandidateJoin({
-					identity: actor.timing,
-					state: "running",
-					expectedSpeculativeDurationMs: 1,
-					elapsedMs: Math.max(0, performance.now() - running.startedAt),
-					actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
-				});
-				actorMs = decision.expectedActorMs;
-				if (!decision.allowed) return "miss";
-				const waitStarted = performance.now();
-				const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
-				waitedMs += Math.max(0, performance.now() - waitStarted);
-				if (finished.status === "completed") return "completed";
-				throwIfAborted(signal);
-				return "miss";
-			},
+			...(actor ? {
+				role: "actor" as const,
+				admitCompleted: (joined: boolean) => {
+					if (joined) return true;
+					const decision = this.processScheduler.assessCandidateJoin({
+						identity: actor.timing,
+						state: "succeeded",
+						expectedSpeculativeDurationMs: 1,
+					});
+					actorMs = decision.expectedActorMs;
+					return decision.allowed;
+				},
+				waitForRunning: async (running: ProcessHandoff) => {
+					const decision = this.processScheduler.assessCandidateJoin({
+						identity: actor.timing,
+						state: "running",
+						expectedSpeculativeDurationMs: 1,
+						elapsedMs: Math.max(0, performance.now() - running.startedAt),
+						actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
+					});
+					actorMs = decision.expectedActorMs;
+					if (!decision.allowed) return "miss";
+					const waitStarted = performance.now();
+					const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
+					waitedMs += Math.max(0, performance.now() - waitStarted);
+					if (finished.status === "completed") return "completed";
+					throwIfAborted(signal);
+					return "miss";
+				},
+			} : { role: "producer" as const }),
 		});
 		return {
 			...(acquired.kind === "hit" ? { plan: acquired.plan } : {}),

@@ -24,7 +24,7 @@ describe("ProcessHandoffRegistry", () => {
 		const actor = fixture.registry.acquire({
 			key: fixture.key,
 			scope: SCOPE,
-			create: false,
+			role: "actor",
 			lookup,
 			admitCompleted: () => true,
 			waitForRunning: async () => "miss",
@@ -39,7 +39,6 @@ describe("ProcessHandoffRegistry", () => {
 	});
 
 	it.each([
-		["created", true, undefined],
 		["already present", false, undefined],
 		["failed", undefined, new Error("store unavailable")],
 	] as const)("publishes memory before persistence when the store is %s", async (_name, stored, failure) => {
@@ -55,7 +54,7 @@ describe("ProcessHandoffRegistry", () => {
 		const actor = await fixture.registry.acquire({
 			key: fixture.key,
 			scope: SCOPE,
-			create: false,
+			role: "actor",
 			lookup: async (live) => live?.id,
 			admitCompleted: () => true,
 			waitForRunning: async () => "miss",
@@ -73,6 +72,11 @@ describe("ProcessHandoffRegistry", () => {
 
 	it("joins only a running handoff in the same scope", async () => {
 		const fixture = await producer();
+		const parallelProducer = await fixture.registry.acquire({
+			key: fixture.key, scope: SCOPE, role: "producer", lookup: async () => undefined,
+		});
+		expect(parallelProducer.kind).toBe("work");
+		if (parallelProducer.kind === "work") fixture.registry.complete(fixture.key, parallelProducer.work);
 		const waitEntered = deferred<void>();
 		const releaseWait = deferred<void>();
 		const waitForRunning = vi.fn(async () => {
@@ -84,7 +88,7 @@ describe("ProcessHandoffRegistry", () => {
 		await expect(fixture.registry.acquire({
 			key: fixture.key,
 			scope: OTHER_SCOPE,
-			create: false,
+			role: "actor",
 			lookup: async () => undefined,
 			admitCompleted: () => true,
 			waitForRunning,
@@ -94,7 +98,7 @@ describe("ProcessHandoffRegistry", () => {
 		const sameScope = fixture.registry.acquire({
 			key: fixture.key,
 			scope: SCOPE,
-			create: false,
+			role: "actor",
 			lookup: async (live) => live?.id,
 			admitCompleted: () => true,
 			waitForRunning,
@@ -113,7 +117,7 @@ describe("ProcessHandoffRegistry", () => {
 		const actor = fixture.registry.acquire({
 			key: fixture.key,
 			scope: SCOPE,
-			create: false,
+			role: "actor",
 			lookup: async (live) => live?.id,
 			admitCompleted: () => true,
 			waitForRunning: async (handoff) => {
@@ -145,10 +149,8 @@ async function producer() {
 	const acquired = await registry.acquire({
 		key,
 		scope: SCOPE,
-		create: true,
+		role: "producer",
 		lookup: async () => undefined,
-		admitCompleted: () => true,
-		waitForRunning: async () => "miss",
 	});
 	if (acquired.kind !== "work") throw new Error("expected process work");
 	return { certificate, key, registry, work: acquired.work };

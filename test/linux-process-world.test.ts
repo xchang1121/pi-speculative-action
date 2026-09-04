@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
@@ -10,8 +10,41 @@ import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts"
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
+import {
+	createLinuxProcessBenchmark,
+	forkReusableBash,
+	prepareLinuxProcessReuse,
+} from "../bench/linux-process-harness.ts";
 
 describe("Linux process ExecutionWorld", () => {
+	test("starts identical intercepted producers concurrently", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
+		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") return skip(status.detail);
+			await writeFile(path.join(fixture.workspace, "barrier-worker"), [
+				"#!/bin/sh", "set -C",
+				"if : > \"$1/slot\" 2>/dev/null; then self=one other=two; else self=two other=one; fi",
+				": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
+			].join("\n"));
+			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			branch = await forkReusableBash(fixture, {
+				label: "concurrency",
+				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait",
+				actionNamespace: "process-concurrency-test.v1",
+				executionFingerprint,
+			});
+			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
+			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(2);
+		} finally {
+			await branch?.dispose();
+			await fixture.dispose();
+		}
+	}, 15_000);
+
 	test("defers native health and storage work until an explicit refresh", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
 		const storeRoot = path.join(root, "store");
