@@ -1,7 +1,46 @@
-import { describe, expect, it } from "vitest";
-import { type PredictionForecast, SpeculationScheduler } from "../src/scheduler.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	type CandidateJoinRequest,
+	type PredictionForecast,
+	type ServiceTimingIdentity,
+	SpeculationScheduler,
+	waitForCandidate,
+} from "../src/scheduler.ts";
+
+afterEach(() => vi.useRealTimers());
 
 describe("SpeculationScheduler", () => {
+	it.each(["resolve", "reject", "pre-abort", "abort", "deadline", "late resolve", "late reject"] as const)(
+		"settles candidate waits on %s and cleans every losing path",
+		async (winner) => {
+			vi.useFakeTimers();
+			const pending = deferred<number>();
+			const controller = new AbortController();
+			const remove = vi.spyOn(controller.signal, "removeEventListener");
+			if (winner === "pre-abort") controller.abort();
+			const waiting = waitForCandidate(pending.promise, controller.signal, 10);
+			const failure = new Error("candidate boundary failed");
+			if (winner === "resolve") pending.resolve(7);
+			else if (winner === "reject") pending.reject(failure);
+			else if (winner === "abort") controller.abort();
+			else if (winner !== "pre-abort") await vi.advanceTimersByTimeAsync(10);
+
+			if (winner === "reject") await expect(waiting).rejects.toBe(failure);
+			else {
+				const result = await waiting;
+				expect(result).toEqual(
+					winner === "resolve" ? { status: "completed", value: 7 } : { status: winner.includes("abort") ? "aborted" : "deadline" },
+				);
+			}
+			if (winner === "pre-abort") pending.reject(failure);
+			if (winner === "late resolve") pending.resolve(7);
+			if (winner === "late reject") pending.reject(failure);
+			await Promise.resolve();
+			expect(vi.getTimerCount()).toBe(0);
+			if (winner !== "pre-abort") expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+		},
+	);
+
 	it("does not evict foreground work during ordinary admission", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const first = {};
@@ -52,6 +91,13 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3 }), 10)).toBe(170);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10)).toBe(0);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
+		const actionSpecific = forecast({
+			expectedDurationMs: 500,
+			decisionBatchesUntilCall: 3,
+			actorPhase: { kind: "decision", elapsedMs: 20 },
+		});
+		expect(scheduler.evaluate([actionSpecific]).expectedDurationMs).toBe(500);
+		expect(scheduler.launchDelay(actionSpecific, 10)).toBe(0);
 	});
 
 	it("prioritizes explicit expected latency benefit without requiring it from every source", () => {
@@ -112,38 +158,21 @@ describe("SpeculationScheduler", () => {
 				}),
 			]),
 		).toMatchObject({ expectedDurationMs: 920 });
-		expect(
-			scheduler.assessCandidateJoin({
-				identity,
-				state: "running",
-				expectedSpeculativeDurationMs: 920,
-				elapsedMs: 100,
-			}),
-		).toMatchObject({
+		expect(joinDecision(scheduler, identity, { expectedSpeculativeDurationMs: 920, elapsedMs: 100 })).toMatchObject({
 			allowed: false,
 			reason: "fallback_faster",
 			expectedRemainingMs: 820,
 			expectedActorMs: 380,
 			expectedAdoptionMs: 70,
 		});
-		expect(
-			scheduler.assessCandidateJoin({
-				identity,
-				state: "succeeded",
-				expectedSpeculativeDurationMs: 920,
-			}),
-		).toMatchObject({ allowed: true, reason: "ready" });
+		expect(joinDecision(scheduler, identity, { state: "succeeded", expectedSpeculativeDurationMs: 920 }))
+			.toMatchObject({ allowed: true, reason: "ready" });
 
 		const tiny = new SpeculationScheduler<object>();
 		tiny.observeActorService(identity, 30);
 		tiny.observeAdoption(identity, 70);
-		expect(
-			tiny.assessCandidateJoin({
-				identity,
-				state: "succeeded",
-				expectedSpeculativeDurationMs: 920,
-			}),
-		).toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: -40 });
+		expect(joinDecision(tiny, identity, { state: "succeeded", expectedSpeculativeDurationMs: 920 }))
+			.toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: -40 });
 	});
 
 	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {
@@ -152,12 +181,7 @@ describe("SpeculationScheduler", () => {
 		heavy.observeActorService(identity, 2_687);
 		heavy.observeSpeculativeService(identity, 936);
 		heavy.observeAdoption(identity, 70);
-		const profitable = heavy.assessCandidateJoin({
-			identity,
-			state: "running",
-			expectedSpeculativeDurationMs: 2_687,
-			elapsedMs: 0,
-		});
+		const profitable = joinDecision(heavy, identity, { expectedSpeculativeDurationMs: 2_687 });
 		expect(profitable).toMatchObject({
 			allowed: true,
 			reason: "profitable",
@@ -169,13 +193,7 @@ describe("SpeculationScheduler", () => {
 		const boundary = new SpeculationScheduler<object>();
 		boundary.observeActorService(identity, 994);
 		boundary.observeSpeculativeService(identity, 973);
-		expect(
-			boundary.assessCandidateJoin({
-				identity,
-				state: "running",
-				expectedSpeculativeDurationMs: 994,
-			}),
-		).toMatchObject({
+		expect(joinDecision(boundary, identity, { expectedSpeculativeDurationMs: 994 })).toMatchObject({
 			allowed: false,
 			reason: "fallback_faster",
 			expectedNetBenefitMs: 21,
@@ -189,13 +207,7 @@ describe("SpeculationScheduler", () => {
 		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
 		for (const duration of [5, 10, 20]) scheduler.observeAdoption(identity, duration);
 
-		expect(
-			scheduler.assessCandidateJoin({
-				identity,
-				state: "running",
-				expectedSpeculativeDurationMs: 50,
-			}),
-		).toMatchObject({
+		expect(joinDecision(scheduler, identity, { expectedSpeculativeDurationMs: 50 })).toMatchObject({
 			allowed: false,
 			reason: "fallback_faster",
 			expectedActorMs: 100,
@@ -211,44 +223,20 @@ describe("SpeculationScheduler", () => {
 		});
 		const first = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "parent-a" };
 		const second = { ...first, actionKeyHash: "parent-b" };
-		expect(
-			scheduler.assessCandidateJoin({
-				identity: first,
-				state: "running",
-				expectedSpeculativeDurationMs: 1,
-			}),
-		).toMatchObject({
+		expect(joinDecision(scheduler, first)).toMatchObject({
 			allowed: true,
 			reason: "warmup_probe",
 			waitBudgetMs: Number.POSITIVE_INFINITY,
 			actorSamples: 0,
 		});
 		scheduler.observeActorService(first, 100);
-		expect(
-			scheduler.assessCandidateJoin({
-				identity: first,
-				state: "running",
-				expectedSpeculativeDurationMs: 1,
-			}),
-		).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25 });
-		expect(
-			scheduler.assessCandidateJoin({
-				identity: first,
-				state: "running",
-				expectedSpeculativeDurationMs: 1,
-				actorElapsedMs: 80,
-			}),
-		).toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: 19 });
+		expect(joinDecision(scheduler, first)).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25 });
+		expect(joinDecision(scheduler, first, { actorElapsedMs: 80 }))
+			.toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: 19 });
 
 		const cold = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 		cold.observeSpeculativeService(first, 900);
-		expect(
-			cold.assessCandidateJoin({
-				identity: second,
-				state: "running",
-				expectedSpeculativeDurationMs: 1,
-			}),
-		).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
+		expect(joinDecision(cold, second)).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
 		expect(
 			cold.evaluate([
 				forecast({
@@ -331,4 +319,27 @@ function forecast(overrides: Partial<PredictionForecast> = {}): PredictionForeca
 		decisionBatchesUntilCall: 1,
 		...overrides,
 	};
+}
+
+function joinDecision(
+	scheduler: SpeculationScheduler<object>,
+	identity: ServiceTimingIdentity,
+	overrides: Partial<Omit<CandidateJoinRequest, "identity">> = {},
+) {
+	return scheduler.assessCandidateJoin({
+		identity,
+		state: "running",
+		expectedSpeculativeDurationMs: 1,
+		...overrides,
+	});
+}
+
+function deferred<Value>() {
+	let resolve!: (value: Value) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
 }

@@ -96,23 +96,29 @@ export async function waitForCandidate<T>(
 	signal?: AbortSignal,
 	waitBudgetMs?: number,
 ): Promise<CandidateWaitResult<T>> {
-	if (signal?.aborted) return { status: "aborted" };
+	if (signal?.aborted) {
+		void promise.catch(() => undefined);
+		return { status: "aborted" };
+	}
 	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
 	if (!signal && !bounded) return { status: "completed", value: await promise };
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const finish = (result: CandidateWaitResult<T>) => {
+		const finish = (complete: () => void) => {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
 			signal?.removeEventListener("abort", aborted);
-			resolve(result);
+			complete();
 		};
-		const aborted = () => finish({ status: "aborted" });
+		const aborted = () => finish(() => resolve({ status: "aborted" }));
 		signal?.addEventListener("abort", aborted, { once: true });
-		if (bounded) timer = setTimeout(() => finish({ status: "deadline" }), Math.max(0, waitBudgetMs));
-		void promise.then((value) => finish({ status: "completed", value }));
+		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, waitBudgetMs));
+		void promise.then(
+			(value) => finish(() => resolve({ status: "completed", value })),
+			(error) => finish(() => reject(error)),
+		);
 	});
 }
 
