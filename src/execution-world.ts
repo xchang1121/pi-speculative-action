@@ -292,11 +292,13 @@ export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, O
 /** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
 export class ExecutionWorldRouter<Context, Output> {
 	private readonly worlds: readonly ExecutionWorld<Context, Output>[];
+	private readonly speculationEnabled: (backend: string) => boolean;
 	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output>>();
 	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
 
-	constructor(worlds: readonly ExecutionWorld<Context, Output>[]) {
+	constructor(worlds: readonly ExecutionWorld<Context, Output>[], speculationEnabled: (backend: string) => boolean = () => true) {
 		this.worlds = [...new Set(worlds)];
+		this.speculationEnabled = speculationEnabled;
 		for (const world of this.worlds) {
 			if (!world.id.trim()) throw new Error("execution world id must not be empty");
 			if (!world.speculation && !world.observation) throw new Error(`execution world ${world.id} provides no operation`);
@@ -309,9 +311,8 @@ export class ExecutionWorldRouter<Context, Output> {
 	async resolve(
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
-		enabled: (backend: string) => boolean = () => true,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		return this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route, enabled);
+		return this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route);
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
@@ -343,14 +344,11 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	/** Inspect every registered world without attempting a speculative action. */
-	async diagnostics(
-		input: ExecutionWorldDiagnosticsContext,
-		enabled: (backend: string) => boolean = () => true,
-	): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return Promise.all(
 			this.worlds.map(async (world) => {
 				const speculation = world.speculation
-					? enabled(world.id)
+					? this.speculationEnabled(world.id)
 						? await this.diagnose(world.id, "speculation", world.speculation, input)
 						: {
 								capabilities: world.speculation.capabilities,
@@ -393,11 +391,10 @@ export class ExecutionWorldRouter<Context, Output> {
 			world: ExecutionWorld<Context, Output>,
 			route: SpeculativeExecutionRoute,
 		) => Selected | undefined | Promise<Selected | undefined>,
-		enabled: (backend: string) => boolean = () => true,
 	): Promise<Selected | undefined> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worlds) {
-				if (world.scope !== scope || !enabled(world.id)) continue;
+				if (world.scope !== scope || (kind === "speculation" && !this.speculationEnabled(world.id))) continue;
 				const operation = operationFor(world);
 				if (!operation) continue;
 				try {

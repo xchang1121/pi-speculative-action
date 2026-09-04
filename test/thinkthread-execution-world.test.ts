@@ -64,7 +64,8 @@ describe("ThinkThread execution world", () => {
 				execute: vi.fn(),
 			},
 		} as unknown as SpeculativeAgentExecutionWorld;
-		const router = new ExecutionWorldRouter([primary, processWorld, workspace]);
+		let enabled: (backend: string) => boolean = () => true;
+		const router = new ExecutionWorldRouter([primary, processWorld, workspace], (backend) => enabled(backend));
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
 		const cases = [
 			["read", { path: "notes.txt" }, "ThinkThread", undefined],
@@ -80,12 +81,16 @@ describe("ThinkThread execution world", () => {
 			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
 			const action = buildPiActionKey(tool, args, cwd, "schema")!;
 			const request = { effect: definition.effect, requirements: definition.requirements, action };
+			enabled = () => true;
 			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: allLayers });
-			const native = await router.resolve(request, { cwd }, (backend) => backend !== "ThinkThread");
+			enabled = (backend) => backend !== "ThinkThread";
+			const native = await router.resolve(request, { cwd });
 			expect(native?.backend).toBe(nativeOnly);
-			const unified = await router.resolve(request, { cwd }, (backend) => backend === "ThinkThread");
+			enabled = (backend) => backend === "ThinkThread";
+			const unified = await router.resolve(request, { cwd });
 			expect(unified?.backend).toBe(tool === "bash" ? undefined : "ThinkThread");
-			await expect(router.resolve(request, { cwd }, () => false)).resolves.toBeUndefined();
+			enabled = () => false;
+			await expect(router.resolve(request, { cwd })).resolves.toBeUndefined();
 		}
 
 		expect(nativePrepare).toHaveBeenCalled();

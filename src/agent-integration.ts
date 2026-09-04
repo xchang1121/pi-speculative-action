@@ -208,7 +208,7 @@ export function createSpeculativeActionHost(
 	) {
 		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
 	}
-	const executionGateway = new ToolExecutionGateway(executionWorlds);
+	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
 		const definition = actionSemantics.definition(tool);
 		return definition
@@ -223,9 +223,8 @@ export function createSpeculativeActionHost(
 						effect: definition.effect,
 						requirements: definition.requirements,
 					},
-								{ cwd: options.cwd, ...(signal ? { signal } : {}) },
-								options.speculativeExecutionWorldEnabled,
-							)
+					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
+				)
 			: undefined;
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
@@ -462,10 +461,7 @@ export function createSpeculativeActionHost(
 		sessionID,
 		runtime,
 		executionWorldDiagnostics: (refresh = false) =>
-			executionGateway.diagnostics(
-				{ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) },
-				options.speculativeExecutionWorldEnabled,
-			),
+			executionGateway.diagnostics({ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) }),
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),

@@ -64,14 +64,13 @@ export class ToolExecutionGateway<Context, Output> {
 	private readonly router: ExecutionWorldRouter<Context, Output>;
 	private readonly transactions = new EffectTransactionCoordinator<Output>();
 
-	constructor(worlds: readonly ExecutionWorld<Context, Output>[]) {
-		this.router = new ExecutionWorldRouter(worlds);
+	constructor(worlds: readonly ExecutionWorld<Context, Output>[], speculationEnabled?: (backend: string) => boolean) {
+		this.router = new ExecutionWorldRouter(worlds, speculationEnabled);
 	}
 
 	resolve(
 		requirement: ToolExecutionRequirement,
 		preparation: ExecutionWorldPreparation,
-		enabled?: (backend: string) => boolean,
 	): Promise<SpeculativeExecutionRoute | undefined> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.resolve(
@@ -81,15 +80,11 @@ export class ToolExecutionGateway<Context, Output> {
 				...(operation.action ? { action: operation.action } : {}),
 			},
 			preparation,
-			enabled,
 		);
 	}
 
-	diagnostics(
-		input: ExecutionWorldDiagnosticsContext,
-		enabled?: (backend: string) => boolean,
-	): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
-		return this.router.diagnostics(input, enabled);
+	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
+		return this.router.diagnostics(input);
 	}
 
 	captureAuthoritativeResult(
