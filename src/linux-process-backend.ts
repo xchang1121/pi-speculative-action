@@ -80,6 +80,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
+import { ProcessHandoffRegistry, type ProcessHandoff } from "./process-handoff.ts";
 import {
 	commitSandboxDelta,
 	readSandboxDirectoryState,
@@ -270,15 +271,6 @@ interface SpawnOutcome {
 	readonly output: readonly BufferedOutput[];
 }
 
-interface ProcessTransfer {
-	readonly completion: Promise<void>;
-	readonly finish: () => void;
-	readonly startedAt: number;
-	readonly scope: ExecutionScope | undefined;
-	candidate?: ProcessProvenanceCertificate;
-	state: "running" | "completed" | "claimed";
-}
-
 type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay" }>;
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
@@ -292,7 +284,7 @@ export class LinuxProcessReuseBackend {
 	private heldExecBoundary?: LinuxHeldExecBoundary;
 	private heldExecOpening?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
-	private readonly transfers = new Map<Sha256Digest, ProcessTransfer[]>();
+	private readonly handoffs: ProcessHandoffRegistry;
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly processScheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
@@ -302,13 +294,14 @@ export class LinuxProcessReuseBackend {
 		this.options = options;
 		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
+		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates);
 		this.storage = {
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
-				this.trimTransfers();
+				this.handoffs.configure(this.store.limits.maxCertificates);
 			},
 			maintain: async (operation) => {
-				this.trimTransfers(true);
+				this.handoffs.clearCompleted();
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
 				if (operation === "clear") this.certificateScopes.clear();
 				return {
@@ -512,11 +505,8 @@ export class LinuxProcessReuseBackend {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
-		const running = [...this.transfers.values()].flat().filter((transfer) => transfer.state === "running");
-		for (const work of running) work.finish();
-		await Promise.allSettled(running.map((work) => work.completion));
+		this.handoffs.dispose();
 		await this.heldExecBoundary?.close();
-		this.transfers.clear();
 		this.certificateScopes.clear();
 	}
 
@@ -776,7 +766,7 @@ export class LinuxProcessReuseBackend {
 		try {
 			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work);
 		} finally {
-			acquired.work.finish();
+			this.handoffs.complete(weakKey, acquired.work);
 		}
 	}
 
@@ -786,104 +776,53 @@ export class LinuxProcessReuseBackend {
 		signal?: AbortSignal,
 		scope?: ExecutionScope,
 		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessTransfer; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
-		let joined = false;
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
 		let actorMs: number | undefined;
-		const miss = () => actor ? { joined, waitedMs } : { work: this.claimProcessWork(weakKey, scope), joined, waitedMs };
-		const hit = (plan: CompletedProcessPlan) => ({
-			plan, joined, waitedMs, ...(actorMs === undefined ? {} : { actorMs }),
-		});
-		const admitCompleted = () => {
-			if (!actor || joined) return true;
-			const decision = this.processScheduler.assessCandidateJoin({
-				identity: actor.timing,
-				state: "succeeded",
-				expectedSpeculativeDurationMs: 1,
-			});
-			actorMs = decision.expectedActorMs;
-			return decision.allowed;
-		};
-		while (true) {
-			const completed = await lookup();
-			if (completed) return admitCompleted() ? hit(completed) : miss();
-			const transfers = this.transfers.get(weakKey) ?? [];
-			for (const transfer of [...transfers].reverse()) {
-				if (transfer.state !== "completed" || !transfer.candidate || !sameScope(transfer.scope, scope)) continue;
-				const plan = await lookup(transfer.candidate);
-				if (plan && transfer.state === "completed") {
-					if (!admitCompleted()) return miss();
-					transfer.state = "claimed";
-					this.removeTransfer(weakKey, transfer);
-					return hit(plan);
-				}
-			}
-			const running = transfers.find((transfer) => transfer.state === "running" && sameScope(transfer.scope, scope));
-			if (!running) return miss();
-			if (!actor) {
-				joined = true;
-				await running.completion;
-				continue;
-			}
-			const decision = this.processScheduler.assessCandidateJoin({
-				identity: actor.timing,
-				state: "running",
-				expectedSpeculativeDurationMs: 1,
-				elapsedMs: Math.max(0, performance.now() - running.startedAt),
-				actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
-			});
-			actorMs = decision.expectedActorMs;
-			if (!decision.allowed) return miss();
-			const waitStarted = performance.now();
-			const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
-			waitedMs += Math.max(0, performance.now() - waitStarted);
-			if (finished.status !== "completed") {
-				throwIfAborted(signal);
-				return miss();
-			}
-			joined = true;
-		}
-	}
-
-	private claimProcessWork(weakKey: Sha256Digest, scope?: ExecutionScope): ProcessTransfer {
-		let settle!: () => void;
-		const completion = new Promise<void>((resolve) => {
-			settle = resolve;
-		});
-		const work: ProcessTransfer = {
-			completion,
-			startedAt: performance.now(),
+		const acquired = await this.handoffs.acquire({
+			key: weakKey,
 			scope,
-			state: "running",
-			finish: () => {
-				if (work.state !== "running") return;
-				work.state = "completed";
-				if (!work.candidate || !work.scope) this.removeTransfer(weakKey, work);
-				else this.trimTransfers();
-				settle();
+			create: !actor,
+			lookup,
+			admitCompleted: (joined) => {
+				if (!actor || joined) return true;
+				const decision = this.processScheduler.assessCandidateJoin({
+					identity: actor.timing,
+					state: "succeeded",
+					expectedSpeculativeDurationMs: 1,
+				});
+				actorMs = decision.expectedActorMs;
+				return decision.allowed;
 			},
+			waitForRunning: async (running) => {
+				if (!actor) {
+					await running.completion;
+					return "completed";
+				}
+				const decision = this.processScheduler.assessCandidateJoin({
+					identity: actor.timing,
+					state: "running",
+					expectedSpeculativeDurationMs: 1,
+					elapsedMs: Math.max(0, performance.now() - running.startedAt),
+					actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
+				});
+				actorMs = decision.expectedActorMs;
+				if (!decision.allowed) return "miss";
+				const waitStarted = performance.now();
+				const finished = await waitForCandidate(running.completion, signal, decision.waitBudgetMs);
+				waitedMs += Math.max(0, performance.now() - waitStarted);
+				if (finished.status === "completed") return "completed";
+				throwIfAborted(signal);
+				return "miss";
+			},
+		});
+		return {
+			...(acquired.kind === "hit" ? { plan: acquired.plan } : {}),
+			...(acquired.kind === "work" ? { work: acquired.work } : {}),
+			joined: acquired.joined,
+			waitedMs,
+			...(actorMs === undefined ? {} : { actorMs }),
 		};
-		const transfers = this.transfers.get(weakKey) ?? [];
-		transfers.push(work);
-		this.transfers.set(weakKey, transfers);
-		return work;
-	}
-
-	private removeTransfer(weakKey: Sha256Digest, transfer: ProcessTransfer): void {
-		const retained = this.transfers.get(weakKey)?.filter((candidate) => candidate !== transfer) ?? [];
-		if (retained.length) this.transfers.set(weakKey, retained);
-		else this.transfers.delete(weakKey);
-	}
-
-	private trimTransfers(clear = false): void {
-		let excess = clear ? Number.POSITIVE_INFINITY :
-			[...this.transfers.values()].flat().filter((transfer) => transfer.state === "completed").length - this.store.limits.maxCertificates;
-		if (excess <= 0) return;
-		for (const [weakKey, transfers] of this.transfers) {
-			const retained = transfers.filter((transfer) => transfer.state === "running" || excess-- <= 0);
-			if (retained.length) this.transfers.set(weakKey, retained);
-			else this.transfers.delete(weakKey);
-		}
 	}
 
 	private async plan(
@@ -1065,7 +1004,7 @@ export class LinuxProcessReuseBackend {
 		prototype: ExecPrototype,
 		weakKey: Sha256Digest,
 		outputRoute: OutputRoute,
-		work: ProcessTransfer,
+		work: ProcessHandoff,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -1178,9 +1117,14 @@ export class LinuxProcessReuseBackend {
 				});
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				this.rememberScope(certificate.id, session.scope);
-				if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
+				if (await this.handoffs.publish(
+					weakKey,
+					work,
+					certificate,
+					() => this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS),
+				)) {
 					this.add(session, "published");
-				} else work.candidate = certificate;
+				}
 				if (taints.size) {
 					this.add(session, "tainted");
 					this.setError(session, `tainted:${[...taints].join(",")}`);
