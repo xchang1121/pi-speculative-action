@@ -57,7 +57,7 @@ export class ProcessExecutionCoordinator {
 	actorDiagnostics(): ProcessRouteSnapshot {
 		if (this.disposed) return { state: "unavailable", detail: "Process route disposed" };
 		if (!this.actorRoute) return { state: "unavailable", detail: "Actor process reuse is not configured" };
-		if (!this.actorRoute.enabled()) return { state: "disabled", detail: "Speculative Bash is disabled" };
+		if (!this.actorRoute.enabled()) return { state: "disabled", detail: "Actor process reuse is disabled" };
 		return this.preparedActor ?? (this.actorPreparation
 			? { state: "probing", detail: "Checking Actor process reuse" }
 			: { state: "idle", detail: "Checked on first Bash execution" });

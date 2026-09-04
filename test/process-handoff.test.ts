@@ -37,34 +37,30 @@ describe("ProcessHandoffRegistry", () => {
 		expect(lookup).toHaveBeenCalledTimes(2);
 	});
 
-	it.each([
-		["already present", false, undefined],
-		["failed", undefined, new Error("store unavailable")],
-	] as const)("publishes memory before persistence when the store is %s", async (_name, stored, failure) => {
-		const fixture = await producer();
-		const persistenceStarted = deferred<void>();
-		const persistence = deferred<boolean>();
-		const publishing = fixture.registry.publish(fixture.key, fixture.work, fixture.certificate, () => {
-			persistenceStarted.resolve();
-			return persistence.promise;
-		});
-		await persistenceStarted.promise;
+	it("publishes memory before noncreating or failed persistence outcomes", async () => {
+		for (const [stored, failure] of [[false, undefined], [undefined, new Error("store unavailable")]] as const) {
+			const fixture = await producer();
+			const persistenceStarted = deferred<void>();
+			const persistence = deferred<boolean>();
+			const publishing = fixture.registry.publish(fixture.key, fixture.work, fixture.certificate, () => {
+				persistenceStarted.resolve();
+				return persistence.promise;
+			});
+			await persistenceStarted.promise;
 
-		const actor = await fixture.registry.acquire({
-			key: fixture.key,
-			scope: SCOPE,
-			role: "actor",
-			lookup: async (live) => live?.id,
-			waitForRunning: async () => "miss",
-		});
-		expect(actor).toMatchObject({ kind: "hit", plan: fixture.certificate.id });
+			const actor = await fixture.registry.acquire({
+				key: fixture.key, scope: SCOPE, role: "actor",
+				lookup: async (live) => live?.id, waitForRunning: async () => "miss",
+			});
+			expect(actor).toMatchObject({ kind: "hit", plan: fixture.certificate.id });
 
-		if (failure) {
-			persistence.reject(failure);
-			await expect(publishing).rejects.toBe(failure);
-		} else {
-			persistence.resolve(stored!);
-			await expect(publishing).resolves.toBe(stored);
+			if (failure) {
+				persistence.reject(failure);
+				await expect(publishing).rejects.toBe(failure);
+			} else {
+				persistence.resolve(stored!);
+				await expect(publishing).resolves.toBe(stored);
+			}
 		}
 	});
 

@@ -82,7 +82,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断在会话启动时运行，只有显式打开“Execution routes”才刷新提供者。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
+在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断在会话启动时运行；显式打开“Execution routes”会刷新全部提供者，而应用总开关时会先刷新 Actor Bash 路线，再更新完成提示与 footer。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
 
 配置由 package 自己管理：
 

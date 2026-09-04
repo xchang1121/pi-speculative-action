@@ -31,6 +31,7 @@ import {
 	createSpeculativeActionExtension,
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
 
@@ -188,9 +189,9 @@ describe("zero-modification Pi extension", () => {
 			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
 		}));
 		const menus = driveSettingsMenus(fixture, {
-			"Speculative action": ["Tools & execution", "Prediction sources", "Enabled", "Discard changes", "Save settings to", "Close"],
+			"Speculative action": ["Tools & execution", "Prediction sources", "Apply changes", "Status", "Enabled", "Discard changes", "Save settings to", "Close"],
 			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
-			"Tool policy · [x] prediction on · [ ] prediction off": ["[x] bash", "[ ] bash", "Back"],
+			"Tool policy · [x] prediction on · [ ] prediction off": ["[x] bash", "Back"],
 			"Prediction sources": ["Actor probe", "Back"],
 			"Actor probe": ["Back"],
 			"Save settings to": ["This project"],
@@ -207,11 +208,11 @@ describe("zero-modification Pi extension", () => {
 			]),
 		);
 		expect(menus.get("Tools & execution")).toEqual(
-			expect.arrayContaining(["Tool policy › 7/7 enabled for prediction", "Execution routes"]),
+			expect.arrayContaining(["Tool policy › 6/7 enabled for prediction", "Execution routes"]),
 		);
 		expect(menus.get("Tool policy · [x] prediction on · [ ] prediction off")).toEqual(expect.arrayContaining([
 			expect.stringMatching(new RegExp(
-				"^\\[x\\] bash · Predict On · Replay Check · Observe Unavailable · Fork Unavailable",
+				"^\\[ \\] bash · Predict Off · Replay Check · Observe Unavailable · Fork Unavailable",
 			)),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
@@ -227,19 +228,45 @@ describe("zero-modification Pi extension", () => {
 			"info",
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/bash\s+Off\s+(Ready|Unavailable)/u), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
-		expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(2);
+		expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(3);
 		expect(JSON.stringify([...menus.values()])).not.toContain("sandbox");
-		expect(await fixture.hostSettings()).toMatchObject({ tools: ["read", "grep", "find", "ls", "bash", "write", "edit"] });
+		expect((await fixture.hostSettings())?.tools).not.toContain("bash");
 		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
 		expect(footer).toContain("tools reused 0/0 (n/a)");
 		expect(footer).toContain("reuse history 3 entries (2 KiB)");
+		expect(footer).toMatch(/providers \d\/4 ready/u);
 		expect(footer).not.toContain("Bash");
-		expect(fixture.store.effective()).toEqual({ enabled: true });
+		expect(fixture.store.effective()).toMatchObject({ enabled: true });
+		expect(fixture.store.effective()?.tools).not.toContain("bash");
 		expect(fixture.store.scope).toBe("project");
+	});
+
+	it("publishes applied settings only after the Actor route refresh settles", async () => {
+		type Prepared = Awaited<ReturnType<LinuxProcessReuseBackend["prepareActorReplay"]>>;
+		let release!: (route: Prepared) => void;
+		const pending = new Promise<Prepared>((resolve) => { release = resolve; });
+		const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockReturnValue(pending);
+		try {
+			const fixture = await createFixture({ settings: { enabled: false }, defaultExecutionWorlds: true });
+			driveSettingsMenus(fixture, { "Speculative action": ["Enabled", "Apply changes", "Close"] });
+			await fixture.emit("session_start", {}, fixture.context);
+			const applying = Promise.resolve(
+				fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
+			);
+			await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+			expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
+			release({ state: "unavailable", detail: "test route unavailable" });
+			await applying;
+			expect(fixture.ui.notify).toHaveBeenCalledWith("Speculative-action settings applied.", "info");
+			expect(vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1]).toContain("providers 1/4 ready");
+		} finally {
+			prepare.mockRestore();
+		}
 	});
 
 	it("keeps only direct choices in the Model Drafter menu", async () => {

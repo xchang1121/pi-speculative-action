@@ -216,6 +216,10 @@ export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
 
 type CapabilityState = "on" | "off" | ExecutionWorldHealthState;
 type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "fork", CapabilityState>>;
+type ExecutionRoutesSnapshot = {
+	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
+	readonly actorProcessReplay?: ProcessRouteSnapshot;
+};
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -241,7 +245,7 @@ interface SpeculativeActionController {
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
 	readonly executionSummary: () => string;
 	readonly maintainExecutionStorage: (operation: "gc" | "clear") => Promise<{ text: string; failed: boolean }>;
-	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => void;
+	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => Promise<void>;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
 	readonly detachUI: () => void;
 	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
@@ -446,12 +450,12 @@ async function installController(
 		? undefined
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
-	const bashReuseEnabled = () => currentSettings.enabled && currentSettings.tools.includes("bash");
+	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
 	const processCoordinator = new ProcessExecutionCoordinator(
 		rawProcessExecutor,
 		processBackend ? {
-			enabled: bashReuseEnabled,
+			enabled: actorReplayEnabled,
 			prepare: () => processBackend.prepareActorReplay(rawProcessExecutor, {
 				sourceRoot: context.cwd,
 				...(shell.commandTransport !== "stdin" ? { held: {
@@ -471,8 +475,6 @@ async function installController(
 			reset: () => processBackend.resetActorReplay(),
 		} : undefined,
 	);
-	const actorProcessReplay = (): ProcessRouteSnapshot | undefined =>
-		processBackend ? processCoordinator.actorDiagnostics() : undefined;
 	let workspaceSandbox: WorkspaceSandboxService | undefined;
 	if (!configuredExecutionWorlds) {
 		workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
@@ -498,7 +500,10 @@ async function installController(
 	};
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
-	let executionDiagnosticsKnown = false;
+	const executionRoutes = (): ExecutionRoutesSnapshot => {
+		const actor = processBackend ? processCoordinator.actorDiagnostics() : undefined;
+		return { worlds: executionDiagnostics, ...(actor ? { actorProcessReplay: actor } : {}) };
+	};
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
@@ -517,12 +522,7 @@ async function installController(
 		[...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]),
 	);
 	const toolCapabilities = () => resolveToolCapabilities(
-		currentSettings,
-		baseDefinitions.keys(),
-		toolConflicts,
-		executionDiagnostics,
-		executionDiagnosticsKnown,
-		actorProcessReplay(),
+		currentSettings, baseDefinitions.keys(), toolConflicts, executionRoutes(),
 	);
 	const runtimeSettings = () => ({
 		...currentSettings,
@@ -536,7 +536,7 @@ async function installController(
 		if (!ui) return;
 		ui.setStatus(
 			STATUS_KEY,
-			formatSpeculativeFooter(settings(), visibleMetrics(), executionDiagnostics, toolConflicts.size),
+			formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes(), toolConflicts.size),
 		);
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
@@ -577,9 +577,11 @@ async function installController(
 		},
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
-		if (refresh && bashReuseEnabled()) await processCoordinator.refreshActorRoute();
-		executionDiagnostics = await host.executionWorldDiagnostics(refresh && bashReuseEnabled());
-		executionDiagnosticsKnown = true;
+		const [, diagnostics] = await Promise.all([
+			refresh && actorReplayEnabled() ? processCoordinator.refreshActorRoute() : undefined,
+			host.executionWorldDiagnostics(refresh && currentSettings.enabled),
+		]);
+		executionDiagnostics = diagnostics;
 		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 		renderFooter();
 	};
@@ -595,7 +597,7 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
-		executionSummary: () => executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay()),
+		executionSummary: () => executionWorldSummary(toolCapabilities(), executionRoutes()),
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -613,17 +615,17 @@ async function installController(
 			await recoverSpeculation(() => refreshExecutionDiagnostics(true));
 			return { text: `Reusable command history ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
 		},
-		setSettings: (value) => {
-			const wasBashReuseEnabled = bashReuseEnabled();
+		setSettings: async (value) => {
+			const wasActorReplayEnabled = actorReplayEnabled();
 			if (value)
 				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
-			if (wasBashReuseEnabled !== bashReuseEnabled())
-				void recoverSpeculation(async () => { await processCoordinator.refreshActorRoute(); });
-			void recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
+			if (wasActorReplayEnabled !== actorReplayEnabled())
+				await recoverSpeculation(() => processCoordinator.refreshActorRoute());
+			await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 			renderFooter();
 		},
 		attachUI: (nextUI) => {
@@ -720,7 +722,7 @@ async function installController(
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
-				executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay()),
+				executionWorldSummary(toolCapabilities(), executionRoutes()),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
@@ -871,12 +873,12 @@ async function runCommand(
 	}
 	const command = args.trim().toLowerCase();
 	if (command === "on" || command === "off") {
-		controller.setSettings({ ...controller.settings(), enabled: command === "on" });
+		await controller.setSettings({ ...controller.settings(), enabled: command === "on" });
 		ctx.ui.notify(`Speculative action ${command === "on" ? "enabled" : "disabled"}.`, "info");
 		return;
 	}
 	if (command === "reset") {
-		controller.setSettings(undefined);
+		await controller.setSettings(undefined);
 		ctx.ui.notify("Active speculative action settings reset.", "info");
 		return;
 	}
@@ -902,7 +904,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	const editor: SpeculativeActionController = {
 		...controller,
 		settings: () => draft,
-		setSettings: (value) => {
+		setSettings: async (value) => {
 			draft = cloneSettings(normalizeSpeculativeActionSettings(value));
 		},
 	};
@@ -936,7 +938,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			continue;
 		}
 		if (choice.startsWith("Enabled:")) {
-			editor.setSettings({ ...draft, enabled: !draft.enabled });
+			await editor.setSettings({ ...draft, enabled: !draft.enabled });
 			continue;
 		}
 		if (choice.startsWith("Save settings to:")) {
@@ -967,7 +969,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 				ctx.ui.notify("No pending speculative-action changes.", "info");
 				continue;
 			}
-			controller.setSettings(draft);
+			await controller.setSettings(draft);
 			reload();
 			ctx.ui.notify("Speculative-action settings applied.", "info");
 			continue;
@@ -994,7 +996,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			)
 				continue;
 			const defaults = normalizeSpeculativeActionSettings(undefined);
-			editor.setSettings({
+			await editor.setSettings({
 				...defaults,
 				enabled: draft.enabled,
 				drafterEnabled: draft.drafterEnabled,
@@ -1106,7 +1108,7 @@ function openActorForkSettings(
 			actions.set(`Integration: ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, async () => {
 				const selected = await ctx.ui.select("Actor probe integration", ["Provider-integrated", "Sidecar service", BACK]);
 				if (selected === "Provider-integrated" || selected === "Sidecar service")
-					updateSelfSpeculation(controller, settings, { forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
+					await updateSelfSpeculation(controller, settings, { forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
 			});
 			if (self.forkTransport === "sidecar") {
 				actions.set(`Control service URL: ${self.endpoint}`, () => edit("endpoint"));
@@ -1282,7 +1284,8 @@ async function editToolPolicy(
 			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
 			const selected = supported && settings.tools.includes(tool);
 			const capability = capabilities.get(tool);
-			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(capability)}`, tool);
+			const staged = capability ? { ...capability, predict: selected ? "on" as const : "off" as const } : undefined;
+			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, tool);
 		}
 		const choice = await ctx.ui.select("Tool policy · [x] prediction on · [ ] prediction off", [...labels.keys(), BACK]);
 		if (!choice || choice === BACK) return;
@@ -1304,7 +1307,7 @@ async function editToolPolicy(
 			continue;
 		}
 		const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
-		controller.setSettings({ ...settings, tools: next });
+		await controller.setSettings({ ...settings, tools: next });
 	}
 }
 
@@ -1312,8 +1315,8 @@ function updateSelfSpeculation(
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
 	update: Partial<SelfSpeculationSettings>,
-): void {
-	controller.setSettings({
+): Promise<void> {
+	return controller.setSettings({
 		...settings,
 		selfSpeculation: { ...settings.selfSpeculation, ...update },
 	});
@@ -1359,7 +1362,7 @@ async function editRootSetting<Field extends RootInputField>(
 		settings[field],
 		inputDescriptor<EffectiveSpeculativeActionSettings, Field>(ROOT_SETTING_INPUTS, field),
 	);
-	if (edited.accepted) controller.setSettings(replaceSetting(settings, field, edited.value));
+	if (edited.accepted) await controller.setSettings(replaceSetting(settings, field, edited.value));
 }
 
 async function editSelfSpeculationSetting<Field extends SelfSpeculationInputField>(
@@ -1374,7 +1377,7 @@ async function editSelfSpeculationSetting<Field extends SelfSpeculationInputFiel
 		inputDescriptor<SelfSpeculationSettings, Field>(SELF_SPECULATION_INPUTS, field),
 	);
 	if (edited.accepted) {
-		controller.setSettings({
+		await controller.setSettings({
 			...settings,
 			selfSpeculation: replaceSetting(settings.selfSpeculation, field, edited.value),
 		});
@@ -1393,7 +1396,7 @@ async function editPatternSetting<Field extends PatternInputField>(
 		inputDescriptor<PatternAwareSettings, Field>(PATTERN_SETTING_INPUTS, field),
 	);
 	if (edited.accepted) {
-		controller.setSettings({
+		await controller.setSettings({
 			...settings,
 			patternAware: replaceSetting(settings.patternAware, field, edited.value),
 		});
@@ -1412,7 +1415,7 @@ async function editDrafterTemperatureRange(
 	);
 	if (!edited.accepted) return;
 	const [drafterTemperatureMin, drafterTemperatureMax] = edited.value;
-	controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
+	await controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
 }
 
 async function editDraftModel(
@@ -1433,14 +1436,14 @@ async function editDraftModel(
 	if (!choice || choice === BACK) return;
 	const { draftModel: _previousDraftModel, ...baseSettings } = settings;
 	if (choice === active) {
-		controller.setSettings(baseSettings);
+		await controller.setSettings(baseSettings);
 		return;
 	}
 	if (choice === CUSTOM_MODEL) {
 		const value = await ctx.ui.input("Custom drafter model", "provider/model");
 		if (value === undefined) return;
 		const draftModel = value.trim();
-		controller.setSettings({ ...baseSettings, ...(draftModel ? { draftModel } : {}) });
+		await controller.setSettings({ ...baseSettings, ...(draftModel ? { draftModel } : {}) });
 		return;
 	}
 	const provider = providerLabels.get(choice);
@@ -1457,7 +1460,7 @@ async function editDraftModel(
 	const selected = await ctx.ui.select(`${provider} models`, [...labels.keys(), BACK]);
 	if (!selected || selected === BACK) return;
 	const draftModel = labels.get(selected);
-	if (draftModel) controller.setSettings({ ...baseSettings, draftModel });
+	if (draftModel) await controller.setSettings({ ...baseSettings, draftModel });
 }
 
 function showRecentEvents(ctx: ExtensionContext, controller: SpeculativeActionController): void {
@@ -1665,23 +1668,19 @@ function resolveToolCapabilities(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: Iterable<string>,
 	conflicts: ReadonlyMap<string, string>,
-	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
-	known = true,
-	actorProcessReplay?: ProcessRouteSnapshot,
+	routes: ExecutionRoutesSnapshot,
 ): ReadonlyMap<string, ToolCapabilityRow> {
 	const registeredTools = new Set(registered);
+	const { worlds, actorProcessReplay } = routes;
 	return new Map<string, ToolCapabilityRow>(
 		KEYABLE_TOOLS.map((tool): [string, ToolCapabilityRow] => {
 			const requirements = PI_ACTION_SEMANTICS.requirements(tool);
-			const pending = { state: "registered" as const, candidates: [] };
-			const fork = requirements && known ? executionCapabilityStatus(requirements, worlds, "speculation", tool) : pending;
-			const observe = requirements && known
-				? executionCapabilityStatus(requirements, worlds, "observation", tool)
-				: pending;
 			const unavailable = conflicts.get(tool) ?? (!registeredTools.has(tool) ? "not registered" : undefined);
-			if (unavailable) {
+			if (unavailable || !requirements) {
 				return [tool, { predict: "unavailable", replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
 			}
+			const fork = executionCapabilityStatus(requirements, worlds, "speculation", tool);
+			const observe = executionCapabilityStatus(requirements, worlds, "observation", tool);
 			const replay = bestCapabilityState([
 				fork.state,
 				observe.state,
@@ -1768,11 +1767,14 @@ function toolsSummary(tools: readonly string[]): string {
 function formatSpeculativeFooter(
 	settings: EffectiveSpeculativeActionSettings,
 	metrics: SpeculativeActionMetrics,
-	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
+	routes: ExecutionRoutesSnapshot,
 	conflicts: number,
 ): string {
 	if (!settings.enabled) return "spec: off";
-	const ready = worlds.filter((world) => world.state === "ready" || world.observation?.state === "ready").length;
+	const { worlds, actorProcessReplay } = routes;
+	const providers = worlds.length + (actorProcessReplay ? 1 : 0);
+	const ready = worlds.filter((world) => world.state === "ready" || world.observation?.state === "ready").length +
+		(actorProcessReplay && processRouteCapability(actorProcessReplay.state) === "ready" ? 1 : 0);
 	const reuse = metrics.actorProcessReuse;
 	const storageWorlds = worlds.filter((world) => world.storage);
 	const storedEntries = storageWorlds.reduce((total, world) => total + (world.storage?.entries ?? 0), 0);
@@ -1784,7 +1786,7 @@ function formatSpeculativeFooter(
 		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
-		worlds.length > 0 ? `providers ${ready}/${worlds.length} ready` : "providers probing",
+		providers > 0 ? `providers ${ready}/${providers} ready` : "providers probing",
 		"unsafe→Actor",
 		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
 	].join(" · ");
@@ -1792,9 +1794,9 @@ function formatSpeculativeFooter(
 
 function executionWorldSummary(
 	tools: ReadonlyMap<string, ToolCapabilityRow>,
-	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
-	actorProcessReplay?: ProcessRouteSnapshot,
+	routes: ExecutionRoutesSnapshot,
 ): string {
+	const { worlds, actorProcessReplay } = routes;
 	if (!worlds.length && !actorProcessReplay) return "Execution capabilities: unavailable";
 	return [
 		"Execution capabilities:",
