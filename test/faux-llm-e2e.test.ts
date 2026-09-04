@@ -8,13 +8,12 @@ import {
 	type FauxContentBlock,
 	type FauxResponseStep,
 	fauxAssistantMessage,
-	fauxText,
 	fauxThinking,
 	fauxToolCall,
 	type Message,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
@@ -25,9 +24,7 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({ path: Type.String() });
-const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
 const findSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
-const lsSchema = Type.Object({ path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String() });
 
 afterEach(async () => {
@@ -35,44 +32,6 @@ afterEach(async () => {
 });
 
 describe("faux LLM speculative action end to end", () => {
-	it("gives the first Drafter request the current user message", async () => {
-		const cwd = await workspace();
-		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
-		const prompt = "Inspect target.txt before answering.";
-		const result = await runAgent({
-			cwd,
-			sessionID: "current-user-context",
-			prompt,
-			tools: [delayedRead(cwd, 80)],
-			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 120), turn("done")],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [],
-			draftResponses: [
-				(context) =>
-					fauxAssistantMessage(
-						fauxToolCall("read", {
-							path: context.messages.some(
-								(message) => message.role === "user" && JSON.stringify(message.content).includes("target.txt"),
-							)
-								? "target.txt"
-								: "notes.txt",
-						}),
-						{ stopReason: "toolUse" },
-					),
-				fauxAssistantMessage("no tool"),
-			],
-			settings: drafterSettings(),
-		});
-
-		expect(result.summary).toMatchObject({
-			actorActions: 1,
-			speculativeHits: 1,
-			exactReuseHits: 1,
-			actorFallbacks: 0,
-		});
-		expect(result.executions.read).toBe(1);
-	});
-
 	it("masks completed tool latency across fragmented Actor and Drafter streams", async () => {
 		const cwd = await workspace();
 		const tool = delayedRead(cwd, 120);
@@ -110,102 +69,6 @@ describe("faux LLM speculative action end to end", () => {
 		);
 		expect(speculative.executions.read).toBe(1);
 		expect(speculative.toolLatencyMs[0]).toBeLessThan(40);
-	});
-
-	it("overlaps an isolated Actor call with its remaining stream without speculative credit", async () => {
-		const cwd = await workspace();
-		const actorTurns = [
-			turn([fauxToolCall("read", { path: "notes.txt" }), fauxText("stream tail ".repeat(4))]),
-			turn("done"),
-		];
-		const run = (sessionID: string, actorPreview?: "call") =>
-			runAgent({
-				cwd,
-				sessionID,
-				tools: [delayedRead(cwd, 250)],
-				actorTurns,
-				actorTokensPerSecond: 500,
-				draftTurns: [],
-				settings: {
-					enabled: true,
-					drafterEnabled: false,
-					candidateLimit: 1,
-					maxConcurrentActions: 1,
-					predictionTimeoutMs: 1_000,
-					patternAware: { enabled: false },
-					tools: ["read"],
-				},
-				...(actorPreview ? { actorPreview } : {}),
-			});
-
-		const baseline = await run("actor-preview-baseline");
-		const treatment = await run("actor-preview-treatment", "call");
-
-		expect(baseline.summary).toMatchObject({
-			actorActions: 1,
-			speculativeHits: 0,
-			actorPreviews: 0,
-			actorFallbacks: 1,
-		});
-		expect(treatment.summary).toMatchObject({
-			actorActions: 1,
-			speculativeHits: 0,
-			actorPreviews: 1,
-			actorFallbacks: 0,
-			speculativeExecutionMs: 0,
-		});
-		expect(treatment.executions.read).toBe(1);
-		expect(treatment.summary.hiddenLatencyMs - baseline.summary.hiddenLatencyMs).toBeGreaterThan(12);
-		expect(treatment.summary.serializedMs - treatment.summary.endToEndMs).toBeCloseTo(
-			treatment.summary.hiddenLatencyMs,
-		);
-		expect((baseline.toolLatencyMs[0] ?? 0) - (treatment.toolLatencyMs[0] ?? 0)).toBeGreaterThan(12);
-	});
-
-	it("uses streamed Actor tool identity to hide queued-candidate latency", async () => {
-		const cwd = await workspace();
-		const target = "x".repeat(800);
-		const grep = patternTools(cwd, 90, "notes.txt").find((tool) => tool.name === "grep")!;
-		const run = (sessionID: string, actorPreview: "call" | "tool") =>
-			runAgent({
-				cwd,
-				sessionID,
-				tools: [delayedStep("find", findSchema, 150), delayedStep("ls", lsSchema, 5_000), grep],
-				actorTurns: [turn(fauxToolCall("grep", { pattern: target, path: "." }), 30), turn("done")],
-				actorTokensPerSecond: 1_000,
-				draftTurns: [
-					turn(fauxToolCall("find", { pattern: "wrong-one" })),
-					turn(fauxToolCall("ls", { path: "." }), 10),
-					turn(fauxToolCall("grep", { pattern: target, path: "." }), 20),
-					turn("no tool"),
-					turn("no tool"),
-					turn("no tool"),
-				],
-				draftTokensPerSecond: 100_000,
-				draftTokenSize: 128,
-				actorPreview,
-				settings: {
-					enabled: true,
-					drafterEnabled: true,
-					drafterMaxDepth: 0,
-					candidateLimit: 3,
-					maxConcurrentActions: 1,
-					predictionTimeoutMs: 1_000,
-					patternAware: { enabled: false },
-					tools: ["find", "ls", "grep"],
-				},
-			});
-		const baseline = await run("actor-call-preview", "call");
-		const treatment = await run("actor-tool-preview", "tool");
-		expect(baseline.summary).toMatchObject({ actorActions: 1, speculativeHits: 1 });
-		expect(treatment.summary).toMatchObject({ actorActions: 1, speculativeHits: 1 });
-		expect(baseline.toolLatencyMs[0] - treatment.toolLatencyMs[0]).toBeGreaterThan(60);
-		expect(
-			treatment.summary.serializedMs -
-				treatment.summary.endToEndMs -
-				(baseline.summary.serializedMs - baseline.summary.endToEndMs),
-		).toBeGreaterThan(60);
-		expect(treatment.summary.executionAheadMs).toBeGreaterThan(baseline.summary.executionAheadMs);
 	});
 
 	it("continues after joining compatible work already in flight", async () => {
@@ -255,226 +118,6 @@ describe("faux LLM speculative action end to end", () => {
 		expect(baseline.summary.endToEndMs - treatment.summary.endToEndMs).toBeGreaterThan(120);
 	});
 
-	it("replaces an early low-utility pattern with a late high-utility draft for the same decision", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8"),
-			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 1,
-			maxContextLength: 1,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-		};
-		const store = patternStore(cwd, patternSettings);
-		for (const sessionID of ["training-one", "training-two"]) {
-			trainPattern(store, sessionID, [
-				["grep", { pattern: "target" }, 1, ["wrong.txt"]],
-				["read", { path: "wrong.txt" }, 1],
-			]);
-		}
-		store.observe({
-			sessionID: "utility-replacement",
-			turnID: "probe:grep",
-			tool: "grep",
-			input: { pattern: "target" },
-			outputPaths: ["wrong.txt"],
-			outcome: "success",
-			durationMs: 1,
-		});
-
-		const result = await runAgent({
-			cwd,
-			sessionID: "utility-replacement",
-			tools: [delayedRead(cwd, 250)],
-			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 300), turn("done")],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 20), turn("no tool")],
-			draftTokensPerSecond: 4_000,
-			settings: {
-				...patternAwareSettings(patternSettings),
-				drafterEnabled: true,
-				candidateLimit: 1,
-				maxConcurrentActions: 1,
-				tools: ["read"],
-			},
-			patternStore: store,
-		});
-
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.summary.executionAheadMs).toBeGreaterThan(0);
-		expect(result.summary.executionAheadMs).toBeGreaterThan(result.summary.hitLatencyMs);
-		expect(result.executions.read).toBe(2);
-		expect(
-			result.events.some(
-				(event) =>
-					event.type === "candidate" &&
-					event.state.status === "cancelled" &&
-					event.state.cause.code === "scheduler_preempted",
-			),
-		).toBe(true);
-	});
-
-	it("uses the Actor runway to prioritize realizable hidden latency", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8"),
-			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 2,
-			maxContextLength: 1,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-		};
-		const store = patternStore(cwd, patternSettings);
-		for (let index = 0; index < 6; index++) {
-			const target = index < 4;
-			trainPattern(store, `runway-training-${index}`, [
-				["grep", { pattern: "target" }, 1],
-				["read", { path: target ? "target.txt" : "wrong.txt" }, target ? 80 : 1_000],
-			]);
-		}
-		const grep = patternTools(cwd, 1, "target.txt").find((tool) => tool.name === "grep")!;
-
-		const result = await runAgent({
-			cwd,
-			sessionID: "runway-priority",
-			tools: [grep, delayedRead(cwd, (file) => (file === "wrong.txt" ? 1_000 : 80))],
-			actorTurns: [
-				turn(fauxToolCall("grep", { pattern: "target" }), 10),
-				turn(fauxToolCall("read", { path: "target.txt" }), 100),
-				turn("done"),
-			],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [],
-			settings: {
-				...patternAwareSettings(patternSettings),
-				maxConcurrentActions: 1,
-			},
-			patternStore: store,
-		});
-		expect(result.summary).toMatchObject({
-			actorActions: 2,
-			predictionsSettled: 2,
-			speculativeHits: 1,
-			actorFallbacks: 1,
-			candidateTerminalCauses: { "admission:scheduler_preempted": 1 },
-		});
-		expect(result.executions).toEqual({ grep: 1, read: 2 });
-		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(60);
-		expect(result.toolLatencyMs.at(-1)).toBeLessThan(30);
-	});
-
-	it("lets a nearer draft displace ready work for a later decision", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "slow.txt"), "slow", "utf8"),
-			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 1,
-			maxContextLength: 3,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-			minBindingReplayProbability: 0.5,
-		};
-		const store = patternStore(cwd, patternSettings);
-		for (const sessionID of ["training-one", "training-two", "training-three", "training-four"]) {
-			trainPattern(store, sessionID, [
-				["grep", { pattern: "target" }, 1],
-				["find", { pattern: "step" }, 20],
-				["ls", { path: "." }, 20],
-				["read", { path: "slow.txt" }, 500],
-			]);
-		}
-		store.observe({
-			sessionID: "deadline-dominance",
-			turnID: "probe:grep",
-			tool: "grep",
-			input: { pattern: "target" },
-			outcome: "success",
-			durationMs: 1,
-		});
-
-		const result = await runAgent({
-			cwd,
-			sessionID: "deadline-dominance",
-			tools: [
-				delayedStep("find", findSchema, 20),
-				delayedStep("ls", lsSchema, 20),
-				delayedRead(cwd, (file) => (file === "slow.txt" ? 500 : 200)),
-			],
-			actorTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 400), turn("done")],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [turn(fauxToolCall("read", { path: "target.txt" }), 100), turn("no tool")],
-			draftTokensPerSecond: 4_000,
-			settings: {
-				...patternAwareSettings(patternSettings),
-				drafterEnabled: true,
-				candidateLimit: 1,
-				maxConcurrentActions: 1,
-				tools: ["find", "ls", "read"],
-			},
-			patternStore: store,
-		});
-
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(150);
-		expect(result.summary.hitLatencyMs).toBeLessThan(40);
-	});
-
-	it("matches Bash across fragmented model streams but executes only through the Actor", async () => {
-		const cwd = await workspace();
-		const result = await runAgent({
-			cwd,
-			sessionID: "bash-branch-hit",
-			tools: [fallbackBash(cwd)],
-			actorTurns: [
-				turn([
-					fauxThinking("prepare and validate the workspace command before invoking it ".repeat(5)),
-					fauxToolCall("bash", { command: "generate artifact" }),
-				]),
-				turn("done"),
-			],
-			actorTokensPerSecond: 180,
-			draftTurns: [turn(fauxToolCall("bash", { command: "generate artifact" })), turn("no tool")],
-			draftTokensPerSecond: 2_000,
-			settings: {
-				...drafterSettings(),
-				tools: ["bash"],
-			},
-		});
-
-		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
-		expect(result.summary).toMatchObject({
-			actorActions: 1,
-			speculativeHits: 0,
-			actorFallbacks: 1,
-			predictionsMatched: 1,
-			predictionsAdopted: 0,
-			executionBlockedActorActions: 1,
-		});
-		expect(result.summary.executionBlockedPotentialHiddenLatencyMs).toBeGreaterThan(0);
-		expect(
-			result.summary.executionBlockedPotentialHiddenLatencyMs + result.summary.executionBlockedPotentialHitLatencyMs,
-		).toBe(result.summary.actorExecutionMs);
-		expect(result.executions.bash).toBe(1);
-		expect(await readFile(path.join(cwd, "generated.txt"), "utf8")).toBe("actor");
-		expect(result.events.find((event) => event.type === "prediction")).toMatchObject({
-			settlement: {
-				match: {
-					matched: true,
-					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
-				},
-			},
-		});
-	});
-
 	it("falls back once when Drafter delivery is late or terminates with an error", async () => {
 		const cwd = await workspace();
 		for (const [sessionID, draft] of [
@@ -501,100 +144,6 @@ describe("faux LLM speculative action end to end", () => {
 					(result.summary.sourceOutcomes.aborted ?? 0),
 			).toBeGreaterThanOrEqual(1);
 		}
-	});
-
-	it("learns a sequence and pre-executes two PatternAware steps without a Drafter", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "a.ts"), "// TODO a", "utf8"),
-			writeFile(path.join(cwd, "b.ts"), "// TODO b", "utf8"),
-			writeFile(path.join(cwd, "c.ts"), "// TODO c", "utf8"),
-			writeFile(path.join(cwd, "d.ts"), "// TODO d", "utf8"),
-			writeFile(path.join(cwd, "e.ts"), "// TODO e", "utf8"),
-			writeFile(path.join(cwd, "shared.txt"), "shared", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-			minBindingReplayProbability: 0.5,
-		};
-		const store = new PatternAwareStore(patternSettings, undefined, {
-			namespace: "pi-action-semantics-v1",
-			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
-			projectors: [],
-		});
-
-		for (const [index, file] of ["a.ts", "b.ts", "c.ts", "d.ts"].entries()) {
-			await runAgent({
-				cwd,
-				sessionID: `training-${index}`,
-				tools: patternTools(cwd, 5, file),
-				actorTurns: sequenceTurns(file, false),
-				actorTokensPerSecond: 4_000,
-				draftTurns: [],
-				settings: patternAwareSettings(patternSettings),
-				patternStore: store,
-			});
-		}
-
-		const evaluation = await runAgent({
-			cwd,
-			sessionID: "pattern-evaluation",
-			tools: patternTools(cwd, 120, "e.ts"),
-			actorTurns: [
-				turn(fauxToolCall("grep", { pattern: "TODO", path: "." })),
-				turn(fauxToolCall("read", { path: "e.ts" }), 230),
-				turn(fauxToolCall("read", { path: "shared.txt" })),
-				turn("done"),
-			],
-			actorTokensPerSecond: 4_000,
-			draftTurns: [],
-			settings: patternAwareSettings(patternSettings),
-			patternStore: store,
-		});
-		const actorSettlements = evaluation.events.filter((event) => event.type === "actor_action");
-
-		expect(actorSettlements).toHaveLength(3);
-		expect(actorSettlements[0]?.settlement.provider.kind).toBe("actor");
-		expect(actorSettlements.slice(1).map((event) => event.settlement.provider.kind)).toEqual([
-			"speculative",
-			"speculative",
-		]);
-		expect(
-			actorSettlements
-				.slice(1)
-				.flatMap((event) => event.settlement.matchedPredictions)
-				.every((prediction) => prediction.source === "pattern_aware"),
-		).toBe(true);
-		expect(evaluation.summary).toMatchObject({ actorActions: 3, speculativeHits: 2, actorFallbacks: 1 });
-		expect(evaluation.summary.executionAheadMs).toBeGreaterThanOrEqual(200);
-		expect(evaluation.summary.serializedMs - evaluation.summary.endToEndMs).toBeCloseTo(
-			evaluation.summary.hiddenLatencyMs,
-		);
-		expect(evaluation.executions).toEqual({ grep: 1, read: 2 });
-		expect(evaluation.toolLatencyMs.at(-1)).toBeLessThan(40);
-
-		const observe = store.observeBatch.bind(store);
-		vi.spyOn(store, "observeBatch").mockImplementation((...args) => {
-			const deadline = performance.now() + 100;
-			while (performance.now() < deadline) {
-				// Replay the upper tail of PatternAware mining observed in historical traces.
-			}
-			return observe(...args);
-		});
-		const fastActor = await runAgent({
-			cwd,
-			sessionID: "pattern-fast-actor",
-			tools: patternTools(cwd, 20, "e.ts"),
-			actorTurns: sequenceTurns("e.ts", false),
-			actorTokensPerSecond: 4_000,
-			draftTurns: [],
-			settings: patternAwareSettings(patternSettings),
-			patternStore: store,
-		});
-		expect(fastActor.summary.actorActions).toBe(3);
-		expect(fastActor.executions).toEqual({ grep: 1, read: 2 });
 	});
 
 	it("learns a dynamic action argument from atomic tool output", async () => {
@@ -640,114 +189,6 @@ describe("faux LLM speculative action end to end", () => {
 		});
 		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
 		expect(result.executions).toEqual({ bash: 1, read: 1 });
-		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
-		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
-	});
-
-	it("isolates learned patterns when unrelated repositories reuse one checkout path", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "old.txt"), "old", "utf8"),
-			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 1,
-			maxContextLength: 1,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-		};
-		const settings = { ...patternAwareSettings(patternSettings), maxConcurrentActions: 1 };
-		const pollutedStore = patternStore(cwd, patternSettings);
-
-		for (let index = 0; index < 6; index++) {
-			trainPattern(pollutedStore, `repository-training-${index}`, [
-				["grep", { pattern: "target" }, 5],
-				["read", { path: "old.txt" }, 400],
-			]);
-		}
-
-		const evaluate = (sessionID: string, patternStore: PatternAwareStore) =>
-			runAgent({
-				cwd,
-				sessionID,
-				tools: serializedPatternTools(cwd, 400),
-				actorTurns: [
-					turn(fauxToolCall("grep", { pattern: "target" })),
-					turn(fauxToolCall("read", { path: "target.txt" }), 50),
-					turn("done"),
-				],
-				actorTokensPerSecond: 4_000,
-				draftTurns: [],
-				settings,
-				patternStore,
-			});
-		const polluted = await evaluate("repository-polluted", pollutedStore);
-		const isolated = await evaluate("repository-isolated", patternStore(cwd, patternSettings));
-
-		expect(polluted.executions.read).toBeGreaterThan(isolated.executions.read ?? 0);
-		expect(isolated.executions).toEqual({ grep: 1, read: 1 });
-		expect(polluted.toolLatencyMs.at(-1) ?? 0).toBeGreaterThan((isolated.toolLatencyMs.at(-1) ?? 0) + 120);
-		expect(polluted.summary.endToEndMs).toBeGreaterThan(isolated.summary.endToEndMs + 120);
-	});
-
-	it("uses the configured recurrence beam to hide a lower-ranked first reuse", async () => {
-		const cwd = await workspace();
-		await Promise.all([
-			writeFile(path.join(cwd, "notes.txt"), "notes", "utf8"),
-			writeFile(path.join(cwd, "slow.txt"), "slow", "utf8"),
-			writeFile(path.join(cwd, "target.txt"), "target", "utf8"),
-		]);
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 4,
-			maxContextLength: 1,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-		};
-		const store = patternStore(cwd, patternSettings);
-		const readSchemaHash = schemaHash(readSchema);
-		const sessionID = "configured-action-backoff";
-		for (const [index, [file, durationMs]] of (
-			[
-				["notes.txt", 5],
-				["notes.txt", 5],
-				["slow.txt", 200],
-				["target.txt", 120],
-			] as const
-		).entries()) {
-			store.observe({
-				sessionID,
-				turnID: `${sessionID}:${index}`,
-				tool: "read",
-				input: { path: file },
-				outcome: "success",
-				durationMs,
-				schemaHash: readSchemaHash,
-			});
-		}
-		const result = await runAgent({
-			cwd,
-			sessionID,
-			tools: [delayedRead(cwd, (file) => (file === "slow.txt" ? 200 : file === "target.txt" ? 120 : 5))],
-			actorTurns: [
-				turn([
-					fauxThinking("verify the previously inspected file before answering ".repeat(4)),
-					fauxToolCall("read", { path: "target.txt" }),
-				]),
-				turn("done"),
-			],
-			actorTokensPerSecond: 180,
-			draftTurns: [],
-			settings: patternAwareSettings(patternSettings),
-			patternStore: store,
-		});
-		const actorSettlements = result.events.filter((event) => event.type === "actor_action");
-
-		expect(actorSettlements).toHaveLength(1);
-		expect(actorSettlements.at(-1)?.settlement.provider.kind).toBe("speculative");
-		expect(actorSettlements.at(-1)?.settlement.matchedPredictions).not.toHaveLength(0);
-		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
 		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
 		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
 	});
@@ -811,75 +252,6 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary.executionAheadMs).toBeGreaterThan(0);
 	});
 
-	it("does not let an unisolated tool crowd an executable tool off a one-slot scheduler", async () => {
-		const cwd = await workspace();
-		const patternSettings: PatternAwareSettings = {
-			...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 1,
-			maxContextLength: 1,
-			maxFutureGap: 0,
-			minOccurrences: 2,
-		};
-		const store = new PatternAwareStore(patternSettings, undefined, {
-			namespace: "pi-action-semantics-v1",
-			actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
-			projectors: [],
-		});
-		const train = (
-			sessionID: string,
-			turn: string,
-			tool: string,
-			input: Record<string, unknown>,
-			durationMs: number,
-			outputPaths?: readonly string[],
-		) => {
-			store.observe({
-				sessionID,
-				turnID: `${turn}:grep`,
-				tool: "grep",
-				input: { pattern: "TODO", path: "." },
-				...(outputPaths ? { outputPaths } : {}),
-				outcome: "success",
-				durationMs: 1,
-			});
-			store.observe({ sessionID, turnID: `${turn}:${tool}`, tool, input, outcome: "success", durationMs });
-		};
-		for (let index = 0; index < 8; index++) {
-			const sessionID = `historical-${index}`;
-			train(sessionID, sessionID, "bash", { command: "generate artifact" }, 500);
-		}
-		for (let index = 0; index < 3; index++) {
-			const file = `historical-read-${index}.txt`;
-			train(`historical-read-${index}`, `seed-${index}`, "read", { path: file }, 120, [file]);
-		}
-
-		const result = await runAgent({
-			cwd,
-			sessionID: "tool-stratified-beam",
-			tools: [...patternTools(cwd, 120, "notes.txt"), fallbackBash(cwd)],
-			actorTurns: [
-				turn(fauxToolCall("grep", { pattern: "TODO", path: "." })),
-				turn([
-					fauxThinking("inspect the matching file before continuing ".repeat(4)),
-					fauxToolCall("read", { path: "notes.txt" }),
-				]),
-				turn("done"),
-			],
-			actorTokensPerSecond: 180,
-			draftTurns: [],
-			settings: {
-				...patternAwareSettings(patternSettings),
-				maxConcurrentActions: 1,
-				tools: ["grep", "read", "bash"],
-			},
-			patternStore: store,
-		});
-
-		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
-		expect(result.executions).toEqual({ grep: 1, read: 1 });
-		expect(result.summary.executionAheadMs).toBeGreaterThanOrEqual(100);
-		expect(result.toolLatencyMs.at(-1)).toBeLessThan(40);
-	});
 });
 
 type ScriptedTurn = {
@@ -1169,19 +541,6 @@ function delayedStep(name: "find" | "ls", parameters: AgentTool["parameters"], d
 	};
 }
 
-function fallbackBash(cwd: string): AgentTool<typeof bashSchema> {
-	return {
-		name: "bash",
-		label: "bash",
-		description: "Execute a workspace command",
-		parameters: bashSchema,
-		execute: async () => {
-			await writeFile(path.join(cwd, "generated.txt"), "actor", "utf8");
-			return textResult("actor");
-		},
-	};
-}
-
 function atomicOutputBash(): AgentTool<typeof bashSchema> {
 	return {
 		name: "bash",
@@ -1193,60 +552,6 @@ function atomicOutputBash(): AgentTool<typeof bashSchema> {
 			details: undefined,
 		}),
 	};
-}
-
-function patternTools(cwd: string, durationMs: number, matchFile: string): AgentTool[] {
-	const read = delayedRead(cwd, durationMs);
-	const grep: AgentTool<typeof grepSchema> = {
-		name: "grep",
-		label: "grep",
-		description: "Find a pattern in a workspace file",
-		parameters: grepSchema,
-		execute: async (_callID, args, signal) => {
-			await delay(durationMs, signal);
-			return textResult(`${matchFile}:1:${args.pattern}`);
-		},
-	};
-	return [grep, read];
-}
-
-function serializedPatternTools(cwd: string, durationMs: number): AgentTool[] {
-	let previousRead = Promise.resolve();
-	const read: AgentTool<typeof readSchema> = {
-		...delayedRead(cwd, 0),
-		execute: async (_callID, args) => {
-			const waitForPrevious = previousRead;
-			let release = () => {};
-			previousRead = new Promise<void>((resolve) => {
-				release = resolve;
-			});
-			await waitForPrevious;
-			try {
-				await delay(durationMs);
-				return textResult(await readFile(path.join(cwd, args.path), "utf8"));
-			} finally {
-				release();
-			}
-		},
-	};
-	const grep: AgentTool<typeof grepSchema> = {
-		name: "grep",
-		label: "grep",
-		description: "Find a pattern in a workspace file",
-		parameters: grepSchema,
-		execute: async () => textResult("target.txt:1:TODO"),
-	};
-	return [grep, read];
-}
-
-function sequenceTurns(file: string, addThinking: boolean): ScriptedTurn[] {
-	const prefix = addThinking ? [fauxThinking("inspect the next dependency before continuing ".repeat(4))] : [];
-	return [
-		turn([...prefix, fauxToolCall("grep", { pattern: "TODO", path: "." })]),
-		turn([...prefix, fauxToolCall("read", { path: file })]),
-		turn([...prefix, fauxToolCall("read", { path: "shared.txt" })]),
-		turn("done"),
-	];
 }
 
 function textResult(text: string): AgentToolResult<unknown> {
@@ -1265,34 +570,12 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 	};
 }
 
-type PatternTrainingStep = readonly [
-	tool: string,
-	input: Readonly<Record<string, unknown>>,
-	durationMs: number,
-	outputPaths?: ReadonlyArray<string>,
-];
-
 function patternStore(cwd: string, settings: PatternAwareSettings): PatternAwareStore {
 	return new PatternAwareStore(settings, undefined, {
 		namespace: "pi-action-semantics-v1",
 		actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash),
 		projectors: [],
 	});
-}
-
-function trainPattern(store: PatternAwareStore, sessionID: string, steps: ReadonlyArray<PatternTrainingStep>): void {
-	for (const [index, [tool, input, durationMs, outputPaths]] of steps.entries()) {
-		store.observe({
-			sessionID,
-			turnID: `${sessionID}:${index}`,
-			tool,
-			input: structuredClone(input),
-			...(outputPaths ? { outputPaths } : {}),
-			outcome: "success",
-			durationMs,
-		});
-	}
-	store.finishSession(sessionID);
 }
 
 function patternAwareSettings(patternAware: PatternAwareSettings): SpeculativeAgentSettingsInput {

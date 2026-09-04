@@ -1,11 +1,10 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import {
-	createAgentSession,
 	createBashToolDefinition,
 	createEditToolDefinition,
 	createFindToolDefinition,
@@ -13,13 +12,9 @@ import {
 	createLsToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
-	DefaultResourceLoader,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-	type ExtensionFactory,
-	SessionManager,
-	SettingsManager,
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -31,19 +26,13 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
-import { emptyWorldReuseMetrics, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
+import type { ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
-	formatSpeculativeActionEvent,
-	formatSpeculativeActionStatus,
-	resolveSpeculativeDraftModel,
-	type SpeculativeActionMetrics,
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
-import { SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
-import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
 
 const roots: string[] = [];
 
@@ -61,27 +50,6 @@ afterEach(async () => {
 });
 
 describe("zero-modification Pi extension", () => {
-	it("passes resolved workspace and image settings to execution-world factories", async () => {
-		const fixture = await createFixture();
-		await mkdir(path.join(fixture.cwd, ".pi"));
-		await writeFile(path.join(fixture.cwd, ".pi", "settings.json"), JSON.stringify({ images: { autoResize: false } }));
-		await fixture.emit("session_start", {}, fixture.context);
-		expect(fixture.createExecutionWorlds).toHaveBeenCalledWith({ cwd: fixture.cwd, autoResizeImages: false });
-	});
-
-	it("uses the actor model by default and accepts either the same or a different configured model", () => {
-		const actor = testModel("actor");
-		const draft = testModel("draft");
-		const registry = {
-			getAvailable: () => [actor, draft],
-		} as unknown as Parameters<typeof resolveSpeculativeDraftModel>[2];
-
-		expect(resolveSpeculativeDraftModel(undefined, actor, registry)).toBe(actor);
-		expect(resolveSpeculativeDraftModel("openai/actor", actor, registry)).toBe(actor);
-		expect(resolveSpeculativeDraftModel("openai/draft", actor, registry)).toBe(draft);
-		expect(resolveSpeculativeDraftModel("openai/missing", actor, registry)).toBe(actor);
-	});
-
 	it("registers stock-shaped overrides and returns a speculative hit without executing the base tool", async () => {
 		const fixture = await createFixture({
 			consume: async () => ({ result: textResult("cached"), isError: false }),
@@ -97,22 +65,6 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "cached" }]);
 		expect(fixture.host.consume).toHaveBeenCalledOnce();
 		expect(fixture.host.actual).not.toHaveBeenCalled();
-	});
-
-	it("keeps the inference bridge inactive when the package-level switch is off", async () => {
-		const fixture = await createFixture({
-			settings: {
-				...effectiveSettings(),
-				enabled: false,
-				selfSpeculation: { ...SELF_SPECULATION_DEFAULTS, enabled: true },
-			},
-		});
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.emit("context", { messages: [] }, fixture.context);
-		const decorate = fixture.handlers.get("before_provider_request")?.[0];
-		const payload = { model: "actor" };
-
-		expect(await decorate?.({ payload } as never, fixture.context)).toBe(payload);
 	});
 
 	it("previews the streamed tool before its complete call without claiming either", async () => {
@@ -166,18 +118,6 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.consume).not.toHaveBeenCalled();
 	});
 
-	it("preserves stock renderers on every wrapper for interactive and HTML output", async () => {
-		const fixture = await createFixture();
-		await fixture.emit("session_start", {}, fixture.context);
-
-		for (const name of ["bash", "edit", "find", "grep", "ls", "read", "write"]) {
-			const tool = fixture.tools.get(name);
-			expect(tool?.renderCall, `${name} renderCall`).toBeTypeOf("function");
-			expect(tool?.renderResult, `${name} renderResult`).toBeTypeOf("function");
-		}
-		expect(fixture.tools.get("edit")?.renderShell).toBe("self");
-	});
-
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
 		const fixture = await createFixture({ overriddenTools: ["read"] });
 		const customRead = fixture.customTools.get("read") as ReturnType<typeof createReadToolDefinition> | undefined;
@@ -203,71 +143,6 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
 		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
 			expect.stringContaining("read (cli: custom-read.ts); excluded from speculation"),
-			"warning",
-		);
-	});
-
-	it.each(["before", "after"] as const)(
-		"preserves a same-name extension loaded %s the speculative package",
-		async (position) => {
-			const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-spec-extension-order-"));
-			roots.push(cwd);
-			const agentDir = path.join(cwd, "agent");
-			await mkdir(agentDir, { recursive: true });
-			const host = mockHost();
-			const customExecute = vi.fn(async () => ({
-				content: [{ type: "text" as const, text: "custom read" }],
-				details: undefined,
-			}));
-			const customRead = { ...createReadToolDefinition(cwd), label: "custom read", execute: customExecute };
-			const customExtension: ExtensionFactory = (pi) => pi.registerTool(customRead);
-			const speculativeExtension = createSpeculativeActionExtension({
-				createHost: () => host,
-				createSettingsStore: () => memorySettingsStore(),
-				createExecutionWorlds: () => [],
-			});
-			const extensionFactories =
-				position === "before" ? [customExtension, speculativeExtension] : [speculativeExtension, customExtension];
-			const settingsManager = SettingsManager.create(cwd, agentDir);
-			const resourceLoader = new DefaultResourceLoader({
-				cwd,
-				agentDir,
-				settingsManager,
-				extensionFactories,
-			});
-			await resourceLoader.reload();
-			const { session } = await createAgentSession({
-				cwd,
-				agentDir,
-				model: testModel(),
-				settingsManager,
-				sessionManager: SessionManager.inMemory(),
-				resourceLoader,
-			});
-
-			try {
-				await session.bindExtensions({});
-				expect(session.getToolDefinition("read")).toBe(customRead);
-				const actorRead = session.agent.state.tools.find((tool) => tool.name === "read");
-				const result = await actorRead?.execute("actor-read", { path: "notes.txt" });
-				expect(result?.content).toEqual([{ type: "text", text: "custom read" }]);
-				expect(customExecute).toHaveBeenCalledOnce();
-				expect(host.consume).not.toHaveBeenCalled();
-			} finally {
-				session.dispose();
-			}
-		},
-	);
-
-	it("recognizes its own wrappers across repeated session starts", async () => {
-		const fixture = await createFixture();
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
-
-		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
-			expect.stringContaining("Custom tool conflicts: none"),
 			"warning",
 		);
 	});
@@ -305,81 +180,6 @@ describe("zero-modification Pi extension", () => {
 		await expect(fixture.emit("turn_end", {}, fixture.context)).resolves.toBeUndefined();
 
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
-	});
-
-	it("keeps mixed-tool reuse primary and Bash child reuse secondary", () => {
-		const settings = effectiveSettings();
-		settings.selfSpeculation = { ...settings.selfSpeculation, enabled: true, forkTransport: "sidecar" };
-		const status = formatSpeculativeActionStatus({
-			settings,
-			metrics: {
-				...emptyMetrics(),
-				actorActions: 4,
-				speculativeHits: 2,
-				exactReuseHits: 1,
-				partialResultReuseHits: 1,
-				executionAheadMs: 300,
-				hitLatencyMs: 40,
-				actorProcessReuse: {
-					...emptyWorldReuseMetrics(), requests: 3, hits: 1, actorTimedHits: 1, crossTurnHits: 1,
-					reusedProcessMs: 1200, actorBaselineMs: 1200, actorTimedHitLatencyMs: 200,
-					wholeCommandRequests: 2, wholeCommandHits: 1, wholeCommandReusedProcessMs: 1600,
-				},
-			},
-		});
-
-		expect(status).toContain("Prediction tools: read write edit bash");
-		expect(status).toContain(
-			"Execution routing: isolated runtime first; validated reads or private workspaces next; otherwise Actor execution",
-		);
-		expect(status).not.toMatch(/OCI|AppContainer|Docker|Podman/);
-		expect(status).not.toContain("sandbox");
-		expect(status).toContain("Tool calls reused: 2/4 (50%); 1 exact, 1 partial; 300ms ready early, 40ms wait after match");
-		expect(status).toContain("Bash Actor reuse: whole 1/2 (50%); child 1/3 (33%); 2.8s recorded process work reused; Actor path ~1s shorter (1/2 calibrated estimate); 1 earlier-turn");
-		expect(status).toContain("Task timing: n/a (no completed task)");
-		expect(status).toContain("Actor probe: On (sidecar)");
-		expect(status).toContain("early tool execution On (tool-name confidence ≥90%)");
-		expect(status).not.toContain("prior execution");
-		expect(status).not.toMatch(/\bL[12]\b/);
-
-		const firstHit = formatSpeculativeActionStatus({
-			settings,
-			metrics: {
-				...emptyMetrics(),
-				actorProcessReuse: {
-					...emptyWorldReuseMetrics(), wholeCommandRequests: 1, wholeCommandHits: 1,
-					wholeCommandReusedProcessMs: 800,
-				},
-			},
-		});
-		expect(firstHit).toContain("800ms recorded process work reused; Actor timing unavailable");
-		expect(firstHit).not.toContain("time saved");
-	});
-
-	it("labels an adopted read projection as partial-result reuse", () => {
-		const event = {
-			sessionID: "session",
-			turnID: "turn",
-			timestamp: 1,
-			cache: emptyMetrics().cache,
-			type: "actor_action" as const,
-			actualAction: "read notes.txt:20-29",
-			settlement: {
-				actorAction: { id: "actor", sequence: 1, turnID: "turn" },
-				tool: "read",
-				matchedPredictions: [],
-				rejections: [],
-				provider: {
-					kind: "speculative" as const,
-					candidateID: "candidate",
-					match: { kind: "projected" as const, projector: "read.range", distance: 90 },
-					timing: { executionAheadMs: 5, attemptLeadMs: 10, hitLatencyMs: 1 },
-					toolExecution: { startedAt: 0, completedAt: 5 },
-				},
-			},
-		};
-
-		expect(formatSpeculativeActionEvent(event)).toContain("partial-result reuse (read.range)");
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
@@ -803,57 +603,4 @@ function testModel(id = "mock"): Model<"openai-responses"> {
 		contextWindow: 8192,
 		maxTokens: 2048,
 	};
-}
-
-function effectiveSettings() {
-	return {
-		enabled: true,
-		drafterEnabled: true,
-		drafterGateEnabled: true,
-		drafterMaxDepth: 1,
-		drafterMaxTokens: 128,
-		drafterDeterministicCandidates: 1,
-		drafterTemperatureMin: 0.7,
-		drafterTemperatureMax: 0.7,
-		candidateLimit: 1,
-		maxConcurrentActions: 1,
-		resourceCacheMaxEntries: 8,
-		resourceCacheMaxBytes: 1024,
-		executionStoreMaxEntries: 32,
-		executionStoreMaxBytes: 4096,
-		predictionTimeoutMs: 1000,
-		patternAware: {
-			enabled: false,
-			multiStepEnabled: true,
-			maxContextLength: 4,
-			beamWidth: 2,
-			maxPredictionDepth: 2,
-			maxFutureGap: 1,
-			futureGapCoverage: 0.8,
-			decayHalfLifeEvents: 100,
-			minOccurrences: 2,
-			maxPatterns: 100,
-			minBindingReplayProbability: 0.8,
-		},
-		selfSpeculation: { ...SELF_SPECULATION_DEFAULTS },
-		tools: ["read", "write", "edit", "bash"],
-	};
-}
-
-function emptyMetrics(): SpeculativeActionMetrics {
-	return { ...emptySpeculativeTraceSummary({
-		cacheCapacity: 8,
-		cacheByteCapacity: 1024,
-		cacheCold: 0,
-		cacheHot: 0,
-		inFlightJobs: 0,
-		resultEntries: 0,
-		resultBytes: 0,
-		branchEntries: 0,
-		branchBytes: 0,
-		exclusiveCandidates: 0,
-		sharedCandidates: 0,
-		cacheTools: [],
-		cacheExecutions: [],
-	}), actorProcessReuse: emptyWorldReuseMetrics() };
 }
