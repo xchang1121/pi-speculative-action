@@ -1,4 +1,5 @@
 import path from "node:path";
+import { UNBOUNDED_ACTION_TOOLS } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import {
@@ -20,7 +21,7 @@ export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOp
 	readonly workspaceSandbox?: WorkspaceSandboxService;
 }
 
-/** Generic process world; eligibility follows invocation/effect capabilities, never a tool name. */
+/** Generic process world; eligibility follows action semantics and a structured process invocation. */
 export function createLinuxProcessExecutionWorld(
 	options: LinuxProcessExecutionWorldOptions,
 ): SpeculativeAgentExecutionWorld {
@@ -44,9 +45,11 @@ export function createLinuxProcessExecutionWorld(
 		storage: backend.storage,
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+			tools: UNBOUNDED_ACTION_TOOLS,
 			fingerprint: async (request) => {
 				backendChecked = true;
 				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
+				if (request.action && !invocation) throw new Error("execution action has no process invocation");
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
 					invocation?.cwd

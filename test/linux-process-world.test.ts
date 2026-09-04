@@ -87,6 +87,7 @@ describe("Linux process ExecutionWorld", () => {
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
 		try {
+			expect(world.speculation.tools).toEqual(PI_ACTION_SEMANTICS.toolNames("unbounded"));
 			const lazy = await world.speculation.diagnostics?.({ cwd: root });
 			expect(lazy).toEqual({ state: "registered", detail: "Checked on first process fork" });
 			await expect(stat(storeRoot)).rejects.toThrow();
