@@ -48,7 +48,7 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("starts identical intercepted producers concurrently", async ({ skip }) => {
+	test("keeps eligible producers concurrent and classifies an ineligible sibling", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
@@ -61,15 +61,19 @@ describe("Linux process ExecutionWorld", () => {
 				": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
 			].join("\n"));
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
+			await writeFile(path.join(fixture.workspace, "redirect-worker"), "#!/bin/sh\nprintf 'redirected\\n'\n");
+			await chmod(path.join(fixture.workspace, "redirect-worker"), 0o755);
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait",
+				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }",
 				actionNamespace: "process-concurrency-test.v1",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(2);
+			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);
+			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
 		} finally {
 			await branch?.dispose();
 			await fixture.dispose();

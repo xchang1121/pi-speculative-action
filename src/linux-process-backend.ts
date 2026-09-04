@@ -53,11 +53,12 @@ import {
 	type WorkspaceStructureSnapshot,
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
-import type {
-	PreparedProcessExecutionRoute,
-	ProcessExecutionRequest,
-	ProcessExecutionResult,
-	ProcessExecutor,
+import {
+	definedProcessEnvironment,
+	type PreparedProcessExecutionRoute,
+	type ProcessExecutionRequest,
+	type ProcessExecutionResult,
+	type ProcessExecutor,
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
@@ -212,6 +213,7 @@ interface DispatcherExecutionContext {
 }
 
 type OutputRoute = readonly [1 | 2, 1 | 2];
+type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
 
 interface BufferedOutput {
 	readonly fd: 1 | 2;
@@ -587,7 +589,7 @@ export class LinuxProcessReuseBackend {
 		if (!pathContains(session.sourceRoot, invocationCwd)) throw new Error("process cwd escapes source workspace");
 		const physicalCwd = session.projection.toPhysical(invocationCwd);
 		if (!physicalCwd || !pathContains(session.workspace.sandboxRoot, physicalCwd)) throw new Error("process cwd is unmapped");
-		const environment = normalizeEnvironment(request.environment);
+		const environment = definedProcessEnvironment(request.environment);
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
 		const prototype = await topLevelProcessPrototype(
@@ -756,12 +758,13 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "requests");
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
-		const outputRoute = await eligibleRequest(session, request, executable, ready.executionContext);
-		if (!outputRoute) {
+		const eligibility = await eligibleRequest(session, request, ready.executionContext);
+		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
-			session.incompleteReasons.add(`broker_bypass:${request.name}`);
+			session.incompleteReasons.add(`broker_bypass:${request.name}:${eligibility.reason}`);
 			return { version: 2, kind: "bypass", executable };
 		}
+		const outputRoute = eligibility.route;
 		const prototype = await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
@@ -1986,7 +1989,7 @@ async function probeExecutionContext(input: {
 	const outcome = await runSpawn(
 		input.strace,
 		command.slice(1),
-		{ cwd: input.physicalRoot, environment: normalizeEnvironment(process.env) },
+		{ cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) },
 	);
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
@@ -2138,21 +2141,27 @@ function materializeDispatcherRequest(
 async function eligibleRequest(
 	session: ActiveSession,
 	request: DispatcherRequest,
-	executable: string,
 	expectedContext: DispatcherExecutionContext,
-): Promise<OutputRoute | undefined> {
-	const endpoints = await session.topLevelOutputEndpoints?.catch(() => undefined);
-	if (
-		!executable || !endpoints || !pathContains(session.workspace.sandboxRoot, request.cwd) ||
-		request.args.length > 4096 || request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024
-	) return undefined;
+): Promise<RequestEligibility> {
+	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
+	if (request.args.length > 4096) return { reason: "argument_count_limit" };
+	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };
+	if (!session.topLevelOutputEndpoints) return { reason: "output_endpoint_capture_missing" };
+	let endpoints: readonly [string, string];
+	try {
+		endpoints = await session.topLevelOutputEndpoints;
+	} catch (error) {
+		return { reason: `output_endpoint_capture_failed:${errorMessage(error)}` };
+	}
+	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
 	const routeOf = (endpoint: string): 0 | 1 | 2 => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : 0;
-	const stdout = routeOf(request.context.outputEndpoints[0]);
-	const stderr = routeOf(request.context.outputEndpoints[1]);
-	if (!stdout || !stderr) return undefined;
-	const route: OutputRoute = [stdout, stderr];
-	const context = routedExecutionContext(expectedContext, route);
-	return request.context.launchKey === context.launchKey && request.context.umask === context.umask ? route : undefined;
+	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
+	if (!route[0] || !route[1]) return { reason: "output_endpoint_mismatch" };
+	const outputRoute: OutputRoute = [route[0], route[1]];
+	const context = routedExecutionContext(expectedContext, outputRoute);
+	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
+	if (request.context.umask !== context.umask) return { reason: "umask_mismatch" };
+	return { route: outputRoute };
 }
 
 function routedExecutionContext(context: DispatcherExecutionContext, route: OutputRoute): DispatcherExecutionContext {
@@ -2215,10 +2224,6 @@ function validDispatcherContext(value: unknown): value is DispatcherExecutionCon
 	);
 }
 
-function normalizeEnvironment(environment: Readonly<Record<string, string | undefined>>): Record<string, string> {
-	return Object.fromEntries(Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined));
-}
-
 function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
 	return invocation.commandTransport === "argv" ? [...invocation.shellArgs, command] : [...invocation.shellArgs];
 }
@@ -2229,7 +2234,7 @@ async function actorTopLevelPrototype(
 	projection: ExecutionPathProjection,
 	platformFingerprint: Sha256Digest,
 ): Promise<ExecPrototype> {
-	return topLevelProcessPrototype(invocation, request, normalizeEnvironment(request.environment), projection, platformFingerprint);
+	return topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint);
 }
 
 async function topLevelProcessPrototype(
@@ -2312,7 +2317,7 @@ function assertInvocationMatches(invocation: ToolProcessInvocation, request: Pro
 		throw new Error("process cwd differs from the action execution context");
 	}
 	if (request.timeout !== invocation.timeout) throw new Error("process timeout differs from the action execution context");
-	if (digestObject(normalizeEnvironment(request.environment)) !== digestObject(invocation.environment)) {
+	if (digestObject(definedProcessEnvironment(request.environment)) !== digestObject(invocation.environment)) {
 		throw new Error("process environment differs from the action execution context");
 	}
 }
