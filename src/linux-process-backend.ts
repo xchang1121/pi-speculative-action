@@ -53,7 +53,12 @@ import {
 	type WorkspaceStructureSnapshot,
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
-import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
+import type {
+	PreparedProcessExecutionRoute,
+	ProcessExecutionRequest,
+	ProcessExecutionResult,
+	ProcessExecutor,
+} from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import {
@@ -117,15 +122,12 @@ export interface CompletedProcessReplayOptions {
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 }
 
-export interface HeldExecActorReplayOptions {
-	readonly sourceRoot: string;
-	readonly realShell: string;
-	readonly scope?: () => ExecutionScope | undefined;
-}
-
-export interface HeldExecActorReplayRoute {
-	readonly shellPath: string;
-	readonly executor: (host: ProcessExecutor, fallback?: ProcessExecutor) => ProcessExecutor;
+export interface ActorProcessReplayOptions extends CompletedProcessReplayOptions {
+	readonly held?: {
+		readonly realShell: string;
+		readonly executor: (shellPath: string) => ProcessExecutor;
+		readonly scope?: () => ExecutionScope | undefined;
+	};
 }
 
 export interface LinuxProcessBackendStatus {
@@ -281,8 +283,7 @@ export class LinuxProcessReuseBackend {
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
 	private platformFingerprint?: Promise<Sha256Digest>;
-	private heldExecBoundary?: LinuxHeldExecBoundary;
-	private heldExecOpening?: Promise<LinuxHeldExecBoundary>;
+	private heldExec?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry;
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
@@ -344,21 +345,33 @@ export class LinuxProcessReuseBackend {
 		return Object.freeze({ ...this.actorCounters });
 	}
 
-	/** Hold real Actor child execs; a miss continues exactly once and requires no Fork dependencies. */
-	async heldExecActorReplay(options: HeldExecActorReplayOptions): Promise<HeldExecActorReplayRoute> {
-		const boundary = await (this.heldExecOpening ??= LinuxHeldExecBoundary.open({
-			storeRoot: this.options.storeRoot,
-			...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
-		}));
-		this.heldExecBoundary = boundary;
-		return {
-			shellPath: boundary.shellPath,
-			executor: (host, fallback) => boundary.executor(host, {
-				realShell: options.realShell,
+	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions): Promise<PreparedProcessExecutionRoute> {
+		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
+		let executor = host;
+		let state: "degraded" | "ready" = "degraded";
+		let detail = "matching whole Bash calls; this shell cannot hold child processes";
+		if (options.held) try {
+			const boundary = await (this.heldExec ??= LinuxHeldExecBoundary.open({
+				storeRoot: this.options.storeRoot,
+				...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
+			}));
+			executor = boundary.executor(options.held.executor(boundary.shellPath), {
+				realShell: options.held.realShell,
 				sourceRoot: path.resolve(options.sourceRoot),
-				decide: (process) => this.decideHeldExec(process, options.scope?.()),
-			}, fallback),
-		};
+				decide: (process) => this.decideHeldExec(process, options.held?.scope?.()),
+			}, host);
+			state = "ready";
+			detail = "matching whole Bash calls plus completed or running child processes";
+		} catch (error) {
+			detail = `matching whole Bash calls; child handoff unavailable (${errorMessage(error)})`;
+		}
+		return { state, detail, executor: this.completedReplayExecutor(executor, options) };
+	}
+
+	async resetActorReplay(): Promise<void> {
+		const heldExec = this.heldExec;
+		this.heldExec = undefined;
+		await heldExec?.then((boundary) => boundary.close(), () => undefined);
 	}
 
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
@@ -506,7 +519,7 @@ export class LinuxProcessReuseBackend {
 	async dispose(): Promise<void> {
 		this.disposed = true;
 		this.handoffs.dispose();
-		await this.heldExecBoundary?.close();
+		await this.resetActorReplay();
 		this.certificateScopes.clear();
 	}
 

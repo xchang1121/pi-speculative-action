@@ -469,13 +469,17 @@ async function heldActor(
 	backend: LinuxProcessReuseBackend,
 	scope = () => ({ sessionID: "benchmark", turnID: "benchmark" }),
 ) {
-	const route = await backend.heldExecActorReplay({
+	const route = await backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 		sourceRoot: fixture.workspace,
-		realShell: fixture.shellPath,
-		scope,
+		invocation: () => undefined,
+		held: {
+			realShell: fixture.shellPath,
+			executor: (shellPath) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })),
+			scope,
+		},
 	});
-	const operations = createLocalBashOperations({ shellPath: route.shellPath });
-	const coordinator = new ProcessExecutionCoordinator(route.executor(adaptProcessToolOperations(operations)));
+	if (!("executor" in route)) throw new Error(route.detail);
+	const coordinator = new ProcessExecutionCoordinator(route.executor);
 	return createBashTool(fixture.workspace, {
 		operations: coordinator.operations,
 		shellPath: fixture.shellPath,

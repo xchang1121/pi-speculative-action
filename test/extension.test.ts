@@ -411,7 +411,7 @@ describe("zero-modification Pi extension", () => {
 		);
 		expect(menus.get("Tool policy · [x] prediction on · [ ] prediction off")).toEqual(expect.arrayContaining([
 			expect.stringMatching(new RegExp(
-				`^\\[x\\] bash · Predict On · Replay ${process.platform === "linux" ? "Ready" : "Unavailable"} · Observe Unavailable · Fork Unavailable`,
+				"^\\[x\\] bash · Predict On · Replay Check · Observe Unavailable · Fork Unavailable",
 			)),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
@@ -422,7 +422,10 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
 		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Replay, Observe, and Fork are independent"), "info");
-		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Actor Bash history:"), "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining(`Actor Bash history: ${process.platform === "linux" ? "Ready" : "Unavailable"}`),
+			"info",
+		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(

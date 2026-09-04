@@ -59,7 +59,13 @@ import {
 	type SpeculativeExecution,
 	type WorldReuseMetrics,
 } from "./execution-world.ts";
-import { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessToolOperations } from "./process-execution.ts";
+import {
+	adaptProcessToolOperations,
+	definedProcessEnvironment,
+	ProcessExecutionCoordinator,
+	type ProcessRouteSnapshot,
+	type ProcessToolOperations,
+} from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import {
@@ -210,10 +216,6 @@ export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
 
 type CapabilityState = "on" | "off" | ExecutionWorldHealthState;
 type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "fork", CapabilityState>>;
-interface ActorProcessReplayCapability {
-	readonly state: ExecutionWorldHealthState;
-	readonly detail: string;
-}
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -445,51 +447,32 @@ async function installController(
 		: new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const bashReuseEnabled = () => currentSettings.enabled && currentSettings.tools.includes("bash");
-	let actorProcessReplay: ActorProcessReplayCapability | undefined;
-	const heldExec = processBackend && shell.commandTransport !== "stdin"
-		? await processBackend.heldExecActorReplay({
-				sourceRoot: context.cwd,
-				realShell: shell.shell,
-				scope: executionScope,
-			}).then((route) => {
-				actorProcessReplay = {
-					state: "ready",
-					detail: "matching whole Bash calls plus completed or running child processes",
-				};
-				return route;
-			}, (error) => {
-				actorProcessReplay = process.platform === "linux"
-					? {
-							state: "ready",
-							detail: `matching whole Bash calls; child handoff unavailable (${error instanceof Error ? error.message : String(error)})`,
-						}
-					: { state: "unavailable", detail: "Linux or WSL 2 required" };
-				return undefined;
-			})
-		: undefined;
-	if (processBackend && !actorProcessReplay) actorProcessReplay = process.platform === "linux"
-		? { state: "ready", detail: "matching whole Bash calls; this shell cannot hold child processes" }
-		: { state: "unavailable", detail: "Linux or WSL 2 required" };
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
-	const heldProcessExecutor = heldExec?.executor(
-		adaptProcessToolOperations(createLocalBashOperations({ shellPath: heldExec.shellPath })),
-		rawProcessExecutor,
-	) ?? rawProcessExecutor;
-	const actorProcessExecutor = processBackend?.completedReplayExecutor(heldProcessExecutor, {
-			sourceRoot: context.cwd,
-			invocation: (request) =>
-				resolvePiToolInvocation("bash", { command: request.command, ...(request.timeout !== undefined ? { timeout: request.timeout } : {}) }, {
-					cwd: request.cwd,
-					environment: Object.fromEntries(
-						Object.entries(request.environment).filter((entry): entry is [string, string] => entry[1] !== undefined),
-					),
-					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
-				})?.process,
-		}) ?? heldProcessExecutor;
 	const processCoordinator = new ProcessExecutionCoordinator(
 		rawProcessExecutor,
-		processBackend ? { enabled: bashReuseEnabled, executor: actorProcessExecutor } : undefined,
+		processBackend ? {
+			enabled: bashReuseEnabled,
+			prepare: () => processBackend.prepareActorReplay(rawProcessExecutor, {
+				sourceRoot: context.cwd,
+				...(shell.commandTransport !== "stdin" ? { held: {
+					realShell: shell.shell,
+					executor: (shellPath) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })),
+					scope: executionScope,
+				} } : {}),
+				invocation: (request) => resolvePiToolInvocation("bash", {
+					command: request.command,
+					...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
+				}, {
+					cwd: request.cwd,
+					environment: definedProcessEnvironment(request.environment),
+					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
+				})?.process,
+			}),
+			reset: () => processBackend.resetActorReplay(),
+		} : undefined,
 	);
+	const actorProcessReplay = (): ProcessRouteSnapshot | undefined =>
+		processBackend ? processCoordinator.actorDiagnostics() : undefined;
 	let workspaceSandbox: WorkspaceSandboxService | undefined;
 	if (!configuredExecutionWorlds) {
 		workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
@@ -539,7 +522,7 @@ async function installController(
 		toolConflicts,
 		executionDiagnostics,
 		executionDiagnosticsKnown,
-		actorProcessReplay,
+		actorProcessReplay(),
 	);
 	const runtimeSettings = () => ({
 		...currentSettings,
@@ -594,7 +577,8 @@ async function installController(
 		},
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
-		executionDiagnostics = await host.executionWorldDiagnostics(refresh);
+		if (refresh && bashReuseEnabled()) await processCoordinator.refreshActorRoute();
+		executionDiagnostics = await host.executionWorldDiagnostics(refresh && bashReuseEnabled());
 		executionDiagnosticsKnown = true;
 		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 		renderFooter();
@@ -611,7 +595,7 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
-		executionSummary: () => executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay),
+		executionSummary: () => executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay()),
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -630,12 +614,15 @@ async function installController(
 			return { text: `Reusable command history ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
 		},
 		setSettings: (value) => {
+			const wasBashReuseEnabled = bashReuseEnabled();
 			if (value)
 				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
+			if (wasBashReuseEnabled !== bashReuseEnabled())
+				void recoverSpeculation(async () => { await processCoordinator.refreshActorRoute(); });
 			void recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 			renderFooter();
 		},
@@ -733,7 +720,7 @@ async function installController(
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
 				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
-				executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay),
+				executionWorldSummary(toolCapabilities(), executionDiagnostics, actorProcessReplay()),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
@@ -741,6 +728,7 @@ async function installController(
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
 			await settingsStore.flush();
+			await processCoordinator.dispose().catch(() => undefined);
 			try {
 				await host.dispose();
 			} finally {
@@ -856,9 +844,7 @@ function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, 
 		environment.PI_MODEL = context.model.id;
 	}
 	if (context.thinkingLevel) environment.PI_REASONING_LEVEL = context.thinkingLevel;
-	return Object.fromEntries(
-		Object.entries(environment).filter((entry): entry is [string, string] => entry[1] !== undefined),
-	);
+	return definedProcessEnvironment(environment);
 }
 
 function loadPiToolSettings(context: ExtensionContext): PiToolSettings {
@@ -1681,7 +1667,7 @@ function resolveToolCapabilities(
 	conflicts: ReadonlyMap<string, string>,
 	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
 	known = true,
-	actorProcessReplay?: ActorProcessReplayCapability,
+	actorProcessReplay?: ProcessRouteSnapshot,
 ): ReadonlyMap<string, ToolCapabilityRow> {
 	const registeredTools = new Set(registered);
 	return new Map<string, ToolCapabilityRow>(
@@ -1699,7 +1685,7 @@ function resolveToolCapabilities(
 			const replay = bestCapabilityState([
 				fork.state,
 				observe.state,
-				...(tool === "bash" && actorProcessReplay ? [actorProcessReplay.state] : []),
+				...(tool === "bash" && actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
 			]);
 			return [tool, {
 				predict: settings.tools.includes(tool) ? "on" : "off",
@@ -1731,6 +1717,16 @@ function toolPolicyCounts(
 
 function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): ExecutionWorldHealthState {
 	return states.includes("ready") ? "ready" : states.includes("registered") ? "registered" : "unavailable";
+}
+
+function processRouteCapability(state: ProcessRouteSnapshot["state"]): ExecutionWorldHealthState {
+	return state === "ready" || state === "degraded"
+		? "ready"
+		: state === "idle" || state === "probing" ? "registered" : "unavailable";
+}
+
+function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {
+	return { disabled: "Disabled", idle: "Idle", probing: "Checking", ready: "Ready", degraded: "Limited", unavailable: "Unavailable" }[state];
 }
 
 function executionRouteKind(isolation: SpeculativeExecution): string {
@@ -1797,7 +1793,7 @@ function formatSpeculativeFooter(
 function executionWorldSummary(
 	tools: ReadonlyMap<string, ToolCapabilityRow>,
 	worlds: readonly ExecutionWorldDiagnosticSnapshot[],
-	actorProcessReplay?: ActorProcessReplayCapability,
+	actorProcessReplay?: ProcessRouteSnapshot,
 ): string {
 	if (!worlds.length && !actorProcessReplay) return "Execution capabilities: unavailable";
 	return [
@@ -1805,7 +1801,7 @@ function executionWorldSummary(
 		capabilityTable(tools),
 		"Providers:",
 		...(actorProcessReplay
-			? [`- Actor Bash history: ${capabilityLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]
+			? [`- Actor Bash history: ${processRouteLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]
 			: []),
 		...worlds.map(
 			(world) =>

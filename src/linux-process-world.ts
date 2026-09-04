@@ -30,6 +30,7 @@ export function createLinuxProcessExecutionWorld(
 	const workspaceOptions = pickWorkspaceOptions(options);
 	const roots = new Set<string>();
 	const qualifiedDrivers = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>();
+	let backendChecked = false;
 	const qualify = async (sourceRoot: string) => {
 		const root = path.resolve(sourceRoot);
 		const selected = await workspaceSandbox.qualify(workspaceOptions, root);
@@ -44,6 +45,7 @@ export function createLinuxProcessExecutionWorld(
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			fingerprint: async (request) => {
+				backendChecked = true;
 				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
@@ -54,6 +56,9 @@ export function createLinuxProcessExecutionWorld(
 				return `${processFingerprint}:${workspaceFingerprint}`;
 			},
 			diagnostics: async ({ cwd, refresh }) => {
+				if (!refresh && !backendChecked)
+					return { state: "registered" as const, detail: "Checked on first process fork" };
+				backendChecked = true;
 				const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
 				const storage = {
 					entries: store.certificates,
@@ -74,6 +79,7 @@ export function createLinuxProcessExecutionWorld(
 				};
 			},
 			prepare: async ({ cwd, signal }) => {
+				backendChecked = true;
 				const status = await backend.check();
 				if (status.state !== "ready") throw new Error(status.detail);
 				roots.add(path.resolve(cwd));

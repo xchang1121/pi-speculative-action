@@ -12,12 +12,16 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 
 describe("Linux process ExecutionWorld", () => {
-	test("reports backend health without claiming that registration is availability", async () => {
+	test("defers native health and storage work until an explicit refresh", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
-		const backend = new LinuxProcessReuseBackend({ storeRoot: path.join(root, "store") });
+		const storeRoot = path.join(root, "store");
+		const backend = new LinuxProcessReuseBackend({ storeRoot });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
-		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot: path.join(root, "store") });
+		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
 		try {
+			const lazy = await world.speculation.diagnostics?.({ cwd: root });
+			expect(lazy).toEqual({ state: "registered", detail: "Checked on first process fork" });
+			await expect(stat(storeRoot)).rejects.toThrow();
 			const expected = await backend.check(true);
 			const actual = await world.speculation.diagnostics?.({ cwd: root, refresh: true });
 			expect(actual?.state).toBe(expected.state === "ready" ? "ready" : "unavailable");
