@@ -1291,28 +1291,22 @@ async function openExecutionRoutes(
 		const settings = editor.settings();
 		const layers = controller.executionLayers();
 		const actions = new Map<string, MenuAction>();
-		if (layers.primary > 0) {
+		const routes = [
+			["primary", "Unified execution environment", layers.primary, layers.primary > 0],
+			["nativeFallback", "Native speculative fallback", layers.native, true],
+		] as const;
+		for (const [field, label, providers, available] of routes) {
+			const status = available ? `${providers} provider${providers === 1 ? "" : "s"}` : "not installed";
 			actions.set(
-				`${settings.executionRouting.primary ? "[x]" : "[ ]"} Unified execution environment · ${layers.primary} provider${layers.primary === 1 ? "" : "s"}`,
-				() => editor.setSettings({
-					...settings,
-					executionRouting: { ...settings.executionRouting, primary: !settings.executionRouting.primary },
-				}),
+				`${available && settings.executionRouting[field] ? "[x]" : "[ ]"} ${label} · ${status}`,
+				available
+					? () => editor.setSettings({
+							...settings,
+							executionRouting: { ...settings.executionRouting, [field]: !settings.executionRouting[field] },
+						})
+					: () => ctx.ui.notify("No unified execution environment is installed for this profile.", "info"),
 			);
-		} else {
-			actions.set("[ ] Unified execution environment · not installed", () =>
-				ctx.ui.notify("No unified execution environment is installed for this profile.", "info"));
 		}
-		actions.set(
-			`${settings.executionRouting.nativeFallback ? "[x]" : "[ ]"} Native speculative fallback · ${layers.native} providers`,
-			() => editor.setSettings({
-				...settings,
-				executionRouting: {
-					...settings.executionRouting,
-					nativeFallback: !settings.executionRouting.nativeFallback,
-				},
-			}),
-		);
 		actions.set("Actor execution · always available", () =>
 			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"));
 		actions.set("Refresh and show capabilities", async () => {
