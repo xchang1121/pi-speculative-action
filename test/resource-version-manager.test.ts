@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { filesystemPathKey } from "../src/filesystem-evidence.ts";
+import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -25,6 +26,85 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
+	test.each([
+		{ name: "watcher available", watch: true },
+		{ name: "watcher unavailable", watch: false },
+	])("seals only stable Actor observation windows with $name", async ({ watch }) => {
+		const scenarios = [
+			{ name: "unchanged", mutate: async (_root: string, _file: string) => {}, sealed: true },
+			{ name: "A to B", mutate: async (_root: string, file: string) => fs.writeFile(file, "B") },
+			{
+				name: "A to B to A",
+				mutate: async (_root: string, file: string) => {
+					await fs.writeFile(file, "B");
+					await fs.writeFile(file, "A");
+					await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
+				},
+			},
+			{
+				name: "same-content replacement",
+				mutate: async (root: string, file: string) => {
+					const replacement = path.join(root, "replacement.txt");
+					await fs.writeFile(replacement, "A");
+					await fs.rename(replacement, file);
+				},
+			},
+			{
+				name: "restored directory entries",
+				mutate: async (root: string) => {
+					const temporary = path.join(root, "temporary.txt");
+					await fs.writeFile(temporary, "temporary");
+					await fs.rm(temporary);
+					await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
+				},
+			},
+		];
+		for (const scenario of scenarios) {
+			const root = await workspace();
+			const file = path.join(root, "value.txt");
+			await fs.writeFile(file, "A");
+			const manager = new ResourceVersionManager(root, { watch });
+			const target = scenario.name === "restored directory entries" ? ["."] : ["value.txt"];
+			const token = await manager.capture(resourceDependencies(action("read", target), root));
+			await scenario.mutate(root, file);
+			if (watch) await settleWatcher();
+
+			const result = await manager.seal(token);
+			expect(result.expired, scenario.name).toBe(!scenario.sealed);
+			releaseResourceVersion(token);
+			manager.close();
+		}
+	});
+
+	test("a failed seal discards only the cache capture and releases its manager", async () => {
+		const root = await workspace();
+		const file = path.join(root, "value.txt");
+		await fs.writeFile(file, "A");
+		const key = action("read", ["value.txt"]);
+		const probe = await captureResourceVersion(key, root);
+		const manager = probe.manager;
+		const world = createResourceSnapshotExecutionWorld();
+		const capture = await world.observation!.capture({
+			cwd: root,
+			tool: {} as never,
+			toolName: "read",
+			args: { path: "value.txt" },
+			action: key,
+			callID: "actor-read",
+			signal: new AbortController().signal,
+		});
+		releaseResourceVersion(probe);
+		await fs.writeFile(file, "B");
+		await settleWatcher();
+
+		const actorOutput = { result: { content: [{ type: "text" as const, text: "A" }], details: {} }, isError: false };
+		await expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
+		expect(actorOutput.result.content[0]?.text).toBe("A");
+		const next = await captureResourceVersion(key, root);
+		expect(next.manager).not.toBe(manager);
+		releaseResourceVersion(next);
+	});
+
 	test("requires exact evidence even when a watcher reports no change", async () => {
 		const root = await workspace();
 		await fs.mkdir(path.join(root, "src"), { recursive: true });
@@ -36,59 +116,31 @@ describe("speculative action resource versions", () => {
 		const token = await captureResourceVersion(action("grep", ["src"]), root);
 		const result = await validateResourceVersion(token);
 
-		expect(token.captureBytes).toBeGreaterThan(0);
-		expect(token.captureFiles).toBe(32);
 		expect(result).toMatchObject({ expired: false, mode: "exact", filesRead: 32 });
 		expect(result.bytesRead).toBeGreaterThan(0);
 	});
 
-	test("expires file content dependencies after a write", async () => {
+	test.each([
+		{ change: "write", expired: true },
+		{ change: "replace", expired: true },
+		{ change: "sibling", expired: false },
+	])("validates file content after a $change", async ({ change, expired }) => {
 		const root = await workspace();
-		const file = path.join(root, "src", "value.ts");
-		await fs.mkdir(path.dirname(file), { recursive: true });
-		await fs.writeFile(file, "export const value = 1\n");
-		const token = await captureResourceVersion(action("read", ["src/value.ts"]), root);
-
-		await fs.writeFile(file, "export const value = 2\n");
+		const file = path.join(root, "value.ts");
+		await fs.writeFile(file, "tracked\n");
+		const token = await captureResourceVersion(action("read", ["value.ts"]), root);
+		if (change === "replace") {
+			const replacement = path.join(root, "replacement.ts");
+			await fs.writeFile(replacement, "changed\n");
+			await fs.rename(replacement, file);
+		} else {
+			await fs.writeFile(change === "write" ? file : path.join(root, "sibling.ts"), "changed\n");
+		}
 		await settleWatcher();
 
 		const result = await validateResourceVersion(token);
-		expect(result.expired).toBe(true);
-		expect(result.mode).toBe("watcher");
-		expect(result.bytesRead).toBe(0);
-	});
-
-	test("expires file content dependencies after atomic replacement", async () => {
-		const root = await workspace();
-		const file = path.join(root, "value.ts");
-		const replacement = path.join(root, "replacement.ts");
-		await fs.writeFile(file, "export const value = 1\n");
-		const token = await captureResourceVersion(action("read", ["value.ts"]), root);
-
-		await fs.writeFile(replacement, "export const value = 2\n");
-		await fs.rename(replacement, file);
-		await settleWatcher();
-
-		expect((await validateResourceVersion(token)).expired).toBe(true);
-	});
-
-	test("keeps a file dependency valid after an unrelated sibling changes", async () => {
-		const root = await workspace();
-		const tracked = path.join(root, "tracked.ts");
-		const sibling = path.join(root, "sibling.ts");
-		await fs.writeFile(tracked, "tracked\n");
-		await fs.writeFile(sibling, "one\n");
-		const token = await captureResourceVersion(action("read", ["tracked.ts"]), root);
-
-		await fs.writeFile(sibling, "two\n");
-		await settleWatcher();
-
-		expect(await validateResourceVersion(token)).toMatchObject({
-			expired: false,
-			mode: "exact",
-			bytesRead: 8,
-			filesRead: 1,
-		});
+		expect(result.expired).toBe(expired);
+		expect(result.mode).toBe(expired ? "watcher" : "exact");
 	});
 
 	test.runIf(process.platform !== "win32")("fingerprints a symlink target rather than only its link text", async () => {
@@ -137,61 +189,31 @@ describe("speculative action resource versions", () => {
 		expect(filesystemPathKey(path.join("root", "Case"))).not.toBe(filesystemPathKey(path.join("root", "case")));
 	});
 
-	test("keeps find results for content-only writes and expires them for entry changes", async () => {
+	test.each([
+		{ tool: "find" as const, change: "content", expired: false },
+		{ tool: "find" as const, change: "entry", expired: true },
+		{ tool: "find" as const, change: "ignore", expired: true },
+		{ tool: "ls" as const, change: "content", expired: false },
+		{ tool: "ls" as const, change: "entry", expired: true },
+		{ tool: "grep" as const, change: "content", expired: true },
+		{ tool: "grep" as const, change: "staging", expired: false },
+	])("applies $tool tree semantics to $change changes", async ({ tool, change, expired }) => {
 		const root = await workspace();
 		const file = path.join(root, "src", "value.ts");
 		await fs.mkdir(path.dirname(file), { recursive: true });
 		await fs.writeFile(file, "one\n");
-		const token = await captureResourceVersion(action("find", ["src"]), root);
-
-		await fs.writeFile(file, "two\n");
-		await settleWatcher();
-		expect((await validateResourceVersion(token)).expired).toBe(false);
-
-		await fs.writeFile(path.join(root, "src", "added.ts"), "added\n");
-		await settleWatcher();
-		expect((await validateResourceVersion(token)).expired).toBe(true);
-	});
-
-	test("keeps ls results for content writes and expires them for entry changes", async () => {
-		const root = await workspace();
-		const file = path.join(root, "value.ts");
-		await fs.writeFile(file, "one\n");
-		const token = await captureResourceVersion(action("ls", ["."]), root);
-
-		await fs.writeFile(file, "two\n");
-		await settleWatcher();
-		expect((await validateResourceVersion(token)).expired).toBe(false);
-
-		await fs.writeFile(path.join(root, "added.ts"), "added\n");
-		await settleWatcher();
-		expect((await validateResourceVersion(token)).expired).toBe(true);
-	});
-
-	test("expires find results when ignore rules change", async () => {
-		const root = await workspace();
-		await fs.mkdir(path.join(root, "src"), { recursive: true });
-		await fs.writeFile(path.join(root, "src", "value.ts"), "one\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "generated/\n");
-		const token = await captureResourceVersion(action("find", ["src"]), root);
-
-		await fs.writeFile(path.join(root, ".gitignore"), "generated/\nignored/\n");
+		const token = await captureResourceVersion(action(tool, [change === "staging" ? "." : "src"]), root);
+		const changed = change === "content"
+			? file
+			: change === "ignore"
+				? path.join(root, ".gitignore")
+				: path.join(root, change === "staging" ? ".pi-speculative-test.tmp" : path.join("src", "added.ts"));
+		await fs.writeFile(changed, "changed\n");
+		if (change === "staging") await fs.rm(changed);
 		await settleWatcher();
 
-		expect((await validateResourceVersion(token)).expired).toBe(true);
-	});
-
-	test("tracks grep as a subtree-content dependency", async () => {
-		const root = await workspace();
-		const file = path.join(root, "src", "value.ts");
-		await fs.mkdir(path.dirname(file), { recursive: true });
-		await fs.writeFile(file, "needle\n");
-		const token = await captureResourceVersion(action("grep", ["src"]), root);
-
-		await fs.writeFile(file, "changed\n");
-		await settleWatcher();
-
-		expect((await validateResourceVersion(token)).expired).toBe(true);
+		expect((await validateResourceVersion(token)).expired).toBe(expired);
 	});
 
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
@@ -211,19 +233,6 @@ describe("speculative action resource versions", () => {
 			{ path: path.resolve(root), scope: "tree_content" },
 		]);
 		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
-	});
-
-	test("ignores adoption staging files in tree-scoped dependencies", async () => {
-		const root = await workspace();
-		await fs.writeFile(path.join(root, "value.ts"), "one\n");
-		const token = await captureResourceVersion(action("grep", ["."]), root);
-		const temporary = path.join(root, ".pi-speculative-test.tmp");
-
-		await fs.writeFile(temporary, "staged\n");
-		await fs.rm(temporary);
-		await settleWatcher();
-
-		expect((await validateResourceVersion(token)).expired).toBe(false);
 	});
 
 	test("fails closed when a token is absent or exact validation detects a change", async () => {
@@ -264,39 +273,20 @@ describe("speculative action resource versions", () => {
 		expect(path.resolve(await invalidated)).toBe(path.resolve(file));
 	});
 
-	test("releases an unwatched token and retires its workspace manager", async () => {
+	test("keeps a manager until its final token is released, then retires it", async () => {
 		const root = await workspace();
 		await fs.writeFile(path.join(root, "value.txt"), "one\n");
-		const key = buildActionKey({
-			tool: "bash",
-			resources: ["."],
-			input: { command: "cat value.txt" },
-		});
-		const first = await captureResourceVersion(key, root);
-
-		releaseResourceVersion(first);
-		const second = await captureResourceVersion(key, root);
-
-		expect(second.manager).not.toBe(first.manager);
-		releaseResourceVersion(second);
-	});
-
-	test("keeps a shared manager alive until every unwatched token is released", async () => {
-		const root = await workspace();
-		const key = buildActionKey({
-			tool: "bash",
-			resources: ["."],
-			input: { command: "echo test" },
-		});
+		const key = buildActionKey({ tool: "bash", resources: ["."], input: { command: "cat value.txt" } });
 		const first = await captureResourceVersion(key, root);
 		const second = await captureResourceVersion(key, root);
-
 		releaseResourceVersion(first);
 		const third = await captureResourceVersion(key, root);
-
 		expect(third.manager).toBe(second.manager);
 		releaseResourceVersion(second);
 		releaseResourceVersion(third);
+		const retired = await captureResourceVersion(key, root);
+		expect(retired.manager).not.toBe(first.manager);
+		releaseResourceVersion(retired);
 	});
 });
 

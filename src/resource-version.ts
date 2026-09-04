@@ -41,12 +41,11 @@ export type ResourceVersionToken = {
 	readonly root: string;
 	readonly dependencies: ReadonlyArray<ResourceDependency>;
 	readonly epoch: number;
+	readonly watching: boolean;
 	readonly versions: ReadonlyArray<number>;
 	readonly preciseContent: ReadonlyArray<string>;
 	readonly exact: ReadonlyArray<string>;
-	readonly captureMs: number;
-	readonly captureBytes: number;
-	readonly captureFiles: number;
+	readonly stamps: ReadonlyArray<string>;
 	readonly manager: ResourceVersionManager;
 	readonly release: () => void;
 };
@@ -55,7 +54,6 @@ type ResourceEvent = {
 	readonly epoch: number;
 	readonly path: string;
 	readonly type: "change" | "rename" | "unknown";
-	readonly source: "root" | "precise";
 };
 
 type ResourceSubscriber = {
@@ -74,13 +72,12 @@ export class ResourceVersionManager {
 	private readonly events: ResourceEvent[] = [];
 	private readonly subscribers = new Set<ResourceSubscriber>();
 	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
-	private readonly treeContentVersions = new Map<string, number>();
-	private readonly treeEntryVersions = new Map<string, number>();
-	private readonly treeQueryVersions = new Map<string, number>();
+	private readonly treeVersions = new Map<string, number>();
 	private references = 0;
 	private watcher?: FSWatcher;
 	private reliable = false;
 	private ready: Promise<void> = Promise.resolve();
+	private open = true;
 	readonly root: string;
 	private readonly options: { readonly watch?: boolean; readonly onIdle?: () => void };
 
@@ -91,11 +88,11 @@ export class ResourceVersionManager {
 		try {
 			this.watcher = watch(root, { recursive: true }, (event, filename) => {
 				const changed = filename ? path.resolve(root, filename) : root;
-				this.changed(changed, event, "root");
+				this.changed(changed, event);
 			});
 			this.watcher.on("error", () => {
 				this.reliable = false;
-				this.changed(root, "unknown", "root");
+				this.changed(root, "unknown");
 			});
 			this.reliable = true;
 			this.ready = watcherTurn();
@@ -105,24 +102,19 @@ export class ResourceVersionManager {
 	}
 
 	async capture(dependencies: ReadonlyArray<ResourceDependency>): Promise<ResourceVersionToken> {
-		const started = performance.now();
+		if (!this.open) throw new Error("resource_version_manager_closed");
 		const reference = this.acquireReference();
-		let normalized: ReadonlyArray<ResourceDependency>;
+		let release = reference;
 		try {
 			await this.ready;
-			normalized = normalizeDependencies(this.root, dependencies);
-		} catch (error) {
-			reference();
-			throw error;
-		}
-		const precise = this.reliable
-			? this.acquirePreciseWatches(normalized)
-			: { paths: [] as string[], release: () => {} };
-		const release = releaseOnce(() => {
-			precise.release();
-			reference();
-		});
-		try {
+			const normalized = normalizeDependencies(this.root, dependencies);
+			const precise = this.reliable
+				? this.acquirePreciseWatches(normalized)
+				: { paths: [] as string[], release: () => {} };
+			release = releaseOnce(() => {
+				precise.release();
+				reference();
+			});
 			const exact = await fingerprintDependencies(normalized, this.root);
 			await watcherTurn();
 			const epoch = this.epoch;
@@ -131,12 +123,11 @@ export class ResourceVersionManager {
 				root: this.root,
 				dependencies: normalized,
 				epoch,
+				watching: this.reliable,
 				versions,
 				preciseContent: precise.paths,
 				exact: exact.fingerprints,
-				captureMs: elapsed(started),
-				captureBytes: exact.bytesRead,
-				captureFiles: exact.filesRead,
+				stamps: exact.stamps,
 				manager: this,
 				release,
 			};
@@ -147,29 +138,41 @@ export class ResourceVersionManager {
 	}
 
 	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
+		return this.inspect(token, false);
+	}
+
+	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
+		return this.inspect(token, true);
+	}
+
+	private async inspect(token: ResourceVersionToken, sealing: boolean): Promise<ResourceVersionValidation> {
 		const started = performance.now();
-		if (token.manager !== this || token.root !== this.root) {
-			return validation(started, true, "resource_version_owner_changed", "exact");
-		}
+		if (!this.owns(token)) return validation(started, true, "resource_version_owner_changed", "exact");
 		await watcherTurn();
-		if (this.watcherInvalidated(token)) {
-			return validation(started, true, "resource_changed", "watcher");
-		}
+		const watcherFailure = this.invalidation(token, sealing);
+		if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
 		try {
-			const exact = await fingerprintDependencies(token.dependencies, this.root);
+			const current = await fingerprintDependencies(token.dependencies, this.root);
 			await watcherTurn();
-			if (this.watcherInvalidated(token)) {
-				return validation(started, true, "resource_changed", "watcher");
-			}
-			const expired = !sameStrings(exact.fingerprints, token.exact);
+			const lateFailure = this.invalidation(token, sealing);
+			if (lateFailure) return validation(started, true, lateFailure, "watcher");
+			const expired =
+				!sameValues(current.fingerprints, token.exact) ||
+				(sealing && !sameValues(current.stamps, token.stamps));
+			const reason = sealing ? "resource_observation_window_changed" : "resource_fingerprint_changed";
 			return {
 				expired,
-				...validationMetrics(started, exact.bytesRead, exact.filesRead, "exact"),
-				...(expired ? { reason: "resource_fingerprint_changed" } : {}),
+				...validationMetrics(started, current.bytesRead, current.filesRead, "exact"),
+				...(expired ? { reason } : {}),
 			};
 		} catch {
-			return validation(started, true, "resource_validation_failed", "exact");
+			const reason = sealing ? "resource_observation_window_unprovable" : "resource_validation_failed";
+			return validation(started, true, reason, "exact");
 		}
+	}
+
+	private invalidation(token: ResourceVersionToken, sealing: boolean): string | undefined {
+		return sealing ? this.windowFailure(token) : this.watcherInvalidated(token) ? "resource_changed" : undefined;
 	}
 
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
@@ -194,17 +197,15 @@ export class ResourceVersionManager {
 			callback,
 		};
 		this.subscribers.add(subscriber);
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
+		return releaseOnce(() => {
 			this.subscribers.delete(subscriber);
 			token.release();
 			this.checkIdle();
-		};
+		});
 	}
 
 	close() {
+		this.open = false;
 		this.watcher?.close();
 		this.watcher = undefined;
 		this.reliable = false;
@@ -212,9 +213,7 @@ export class ResourceVersionManager {
 		this.preciseWatches.clear();
 		this.subscribers.clear();
 		this.events.length = 0;
-		this.treeContentVersions.clear();
-		this.treeEntryVersions.clear();
-		this.treeQueryVersions.clear();
+		this.treeVersions.clear();
 	}
 
 	private acquireReference(): () => void {
@@ -240,7 +239,7 @@ export class ResourceVersionManager {
 		return (
 			this.reliable &&
 			token.versions.length === token.dependencies.length &&
-			(!sameNumbers(
+			(!sameValues(
 				token.dependencies.map((dependency) => this.dependencyVersion(dependency)),
 				token.versions,
 			) ||
@@ -248,9 +247,20 @@ export class ResourceVersionManager {
 		);
 	}
 
-	private changed(changedPath: string, type: ResourceEvent["type"], source: ResourceEvent["source"]) {
+	private owns(token: ResourceVersionToken): boolean {
+		return this.open && token.manager === this && token.root === this.root;
+	}
+
+	private windowFailure(token: ResourceVersionToken): string | undefined {
+		if (!this.owns(token)) return "resource_version_owner_changed";
+		if (!token.watching) return undefined;
+		if (!this.reliable || this.changesSince(token).uncertain) return "resource_observation_window_unprovable";
+		return this.watcherInvalidated(token) ? "resource_observation_window_changed" : undefined;
+	}
+
+	private changed(changedPath: string, type: ResourceEvent["type"]) {
 		const absolute = path.resolve(changedPath);
-		const event = { epoch: ++this.epoch, path: absolute, type, source };
+		const event = { epoch: ++this.epoch, path: absolute, type };
 		this.events.push(event);
 		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
 		this.updateTreeVersions(event);
@@ -262,11 +272,7 @@ export class ResourceVersionManager {
 	}
 
 	private dependencyVersion(dependency: ResourceDependency): number {
-		const key = filesystemPathKey(dependency.path);
-		if (dependency.scope === "tree_content") return this.treeContentVersions.get(key) ?? 0;
-		if (dependency.scope === "tree_entries") return this.treeEntryVersions.get(key) ?? 0;
-		if (dependency.scope === "tree_query") return this.treeQueryVersions.get(key) ?? 0;
-		return 0;
+		return this.treeVersions.get(`${dependency.scope}:${filesystemPathKey(dependency.path)}`) ?? 0;
 	}
 
 	private updateTreeVersions(event: ResourceEvent): void {
@@ -282,9 +288,9 @@ export class ResourceVersionManager {
 			(event.type === "change" && QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase()));
 		for (let current = absolute; ; current = path.dirname(current)) {
 			const key = filesystemPathKey(current);
-			this.treeContentVersions.set(key, event.epoch);
-			if (entries) this.treeEntryVersions.set(key, event.epoch);
-			if (query) this.treeQueryVersions.set(key, event.epoch);
+			this.treeVersions.set(`tree_content:${key}`, event.epoch);
+			if (entries) this.treeVersions.set(`tree_entries:${key}`, event.epoch);
+			if (query) this.treeVersions.set(`tree_query:${key}`, event.epoch);
 			if (current === root || current === gitBoundary) break;
 		}
 	}
@@ -302,10 +308,10 @@ export class ResourceVersionManager {
 				continue;
 			}
 			try {
-				const watcher = watch(target, (event) => this.changed(target, event, "precise"));
+				const watcher = watch(target, (event) => this.changed(target, event));
 				watcher.on("error", () => {
 					this.reliable = false;
-					this.changed(target, "unknown", "precise");
+					this.changed(target, "unknown");
 				});
 				this.preciseWatches.set(key, { watcher, references: 1 });
 				paths.push(target);
@@ -313,12 +319,9 @@ export class ResourceVersionManager {
 				// A missing file is covered conservatively by its nearest root-watcher event.
 			}
 		}
-		let released = false;
 		return {
 			paths,
-			release: () => {
-				if (released) return;
-				released = true;
+			release: releaseOnce(() => {
 				for (const target of paths) {
 					const key = filesystemPathKey(target);
 					const current = this.preciseWatches.get(key);
@@ -328,7 +331,7 @@ export class ResourceVersionManager {
 					current.watcher.close();
 					this.preciseWatches.delete(key);
 				}
-			},
+			}),
 		};
 	}
 
@@ -379,17 +382,9 @@ export function captureResourceVersion(
 }
 
 export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
-	if (!isResourceVersionToken(token)) {
-		return Promise.resolve({
-			expired: true,
-			reason: "resource_version_missing",
-			durationMs: 0,
-			bytesRead: 0,
-			filesRead: 0,
-			mode: "exact",
-		});
-	}
-	return token.manager.validate(token);
+	return isResourceVersionToken(token)
+		? token.manager.validate(token)
+		: Promise.resolve(validation(performance.now(), true, "resource_version_missing", "exact"));
 }
 
 export function watchResourceVersion(token: unknown, callback: (path: string) => void) {
@@ -408,10 +403,8 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 	return (
 		typeof token.root === "string" &&
 		typeof token.epoch === "number" &&
-		Array.isArray(token.dependencies) &&
-		Array.isArray(token.versions) &&
-		Array.isArray(token.preciseContent) &&
-		Array.isArray(token.exact) &&
+		typeof token.watching === "boolean" &&
+		[token.dependencies, token.versions, token.preciseContent, token.exact, token.stamps].every(Array.isArray) &&
 		typeof token.release === "function" &&
 		token.manager instanceof ResourceVersionManager
 	);
@@ -478,6 +471,7 @@ async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDepen
 	);
 	return {
 		fingerprints: results.map((result) => result.fingerprint),
+		stamps: results.map((result) => result.stamp),
 		bytesRead: results.reduce((total, result) => total + result.bytesRead, 0),
 		filesRead: results.reduce((total, result) => total + result.filesRead, 0),
 	};
@@ -486,11 +480,8 @@ async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDepen
 async function fingerprintDependency(dependency: ResourceDependency, realRoot: string) {
 	const result = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set());
 	return {
-		fingerprint: createHash("sha256")
-			.update(
-				JSON.stringify({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value: result.value }),
-			)
-			.digest("hex"),
+		fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value: result.value }),
+		stamp: result.stamp,
 		bytesRead: result.bytesRead,
 		filesRead: result.filesRead,
 	};
@@ -498,6 +489,7 @@ async function fingerprintDependency(dependency: ResourceDependency, realRoot: s
 
 type FingerprintResult = {
 	readonly value: unknown;
+	readonly stamp: string;
 	readonly bytesRead: number;
 	readonly filesRead: number;
 };
@@ -513,8 +505,12 @@ async function fingerprintPath(
 		info = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
 	} catch (error) {
 		if (!missingResource(error)) throw error;
-		await assertNearestExistingInside(realRoot, target);
-		return { value: { exists: false, error: errorCode(error) }, bytesRead: 0, filesRead: 0 };
+		return {
+			value: { exists: false, error: errorCode(error) },
+			stamp: digest([filesystemPathKey(target), await nearestExistingInside(realRoot, target)]),
+			bytesRead: 0,
+			filesRead: 0,
+		};
 	}
 	const realTarget = await fingerprintIO(() => fs.realpath(target));
 	assertInside(realRoot, realTarget);
@@ -535,6 +531,7 @@ async function fingerprintPath(
 				resolved: identity,
 				target: followed.value,
 			},
+			stamp: digest(["symlink", link, statStamp(after), followed.stamp]),
 			bytesRead: followed.bytesRead,
 			filesRead: followed.filesRead,
 		};
@@ -556,6 +553,7 @@ async function fingerprintPath(
 				hash: content.hash,
 				resolved: filesystemPathKey(content.realPath),
 			},
+			stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
 			bytesRead: content.bytesRead,
 			filesRead: 1,
 		};
@@ -577,7 +575,7 @@ async function fingerprintPath(
 	if (
 		!after.isDirectory() ||
 		!sameFilesystemIdentity(info, after) ||
-		!sameStrings(selected.map(entryIdentity), selectEntries(afterEntries).map(entryIdentity))
+		!sameValues(selected.map(entryIdentity), selectEntries(afterEntries).map(entryIdentity))
 	) {
 		throw new Error(`resource_directory_changed:${target}`);
 	}
@@ -588,6 +586,7 @@ async function fingerprintPath(
 			resolved: identity,
 			children: children.map((child) => ({ name: child.name, value: child.value })),
 		},
+		stamp: digest([statStamp(after), children.map((child) => [child.name, child.stamp])]),
 		bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
 		filesRead: children.reduce((total, child) => total + child.filesRead, 0),
 	};
@@ -602,7 +601,12 @@ async function stableFileEntry(
 	if (!after.isFile() || !sameFilesystemIdentity(before, after)) {
 		throw new Error(`resource_file_changed:${target}`);
 	}
-	return { value: { type: "file", mode: Number(after.mode), resolved }, bytesRead: 0, filesRead: 0 };
+	return {
+		value: { type: "file", mode: Number(after.mode), resolved },
+		stamp: digest(["file", statStamp(after), resolved]),
+		bytesRead: 0,
+		filesRead: 0,
+	};
 }
 
 function selectEntries(entries: ReadonlyArray<import("node:fs").Dirent>) {
@@ -616,29 +620,25 @@ function entryIdentity(entry: import("node:fs").Dirent): string {
 }
 
 function specialFileType(value: import("node:fs").Stats | import("node:fs").BigIntStats | import("node:fs").Dirent) {
-	return value.isFile()
-		? "file"
-		: value.isDirectory()
-			? "directory"
-			: value.isSymbolicLink()
-				? "symlink"
-				: value.isFIFO()
-					? "fifo"
-					: value.isSocket()
-						? "socket"
-						: value.isCharacterDevice()
-							? "character_device"
-							: value.isBlockDevice()
-								? "block_device"
-								: "other";
+	if (value.isFile()) return "file";
+	if (value.isDirectory()) return "directory";
+	if (value.isSymbolicLink()) return "symlink";
+	if (value.isFIFO()) return "fifo";
+	if (value.isSocket()) return "socket";
+	if (value.isCharacterDevice()) return "character_device";
+	return value.isBlockDevice() ? "block_device" : "other";
 }
 
-async function assertNearestExistingInside(realRoot: string, target: string): Promise<void> {
+async function nearestExistingInside(realRoot: string, target: string): Promise<string> {
 	let current = path.resolve(target);
 	for (;;) {
 		try {
-			assertInside(realRoot, await fingerprintIO(() => fs.realpath(current)));
-			return;
+			const [real, stat] = await Promise.all([
+				fingerprintIO(() => fs.realpath(current)),
+				fingerprintIO(() => fs.lstat(current, { bigint: true })),
+			]);
+			assertInside(realRoot, real);
+			return digest([filesystemPathKey(real), statStamp(stat)]);
 		} catch (error) {
 			if (!missingResource(error)) throw error;
 		}
@@ -646,6 +646,15 @@ async function assertNearestExistingInside(realRoot: string, target: string): Pr
 		if (parent === current) throw new Error(`resource_path_unresolved:${target}`);
 		current = parent;
 	}
+}
+
+function statStamp(stat: import("node:fs").BigIntStats): string {
+	return [stat.dev, stat.ino, stat.mode, stat.nlink, stat.rdev, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs]
+		.join(":");
+}
+
+function digest(value: unknown): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function assertInside(realRoot: string, target: string): void {
@@ -685,18 +694,10 @@ function validationMetrics(
 	filesRead: number,
 	mode: ResourceValidationMetrics["mode"],
 ): ResourceValidationMetrics {
-	return { durationMs: elapsed(started), bytesRead, filesRead, mode };
+	return { durationMs: Math.max(0, performance.now() - started), bytesRead, filesRead, mode };
 }
 
-function elapsed(started: number) {
-	return Math.max(0, performance.now() - started);
-}
-
-function sameStrings(left: ReadonlyArray<string>, right: ReadonlyArray<string>) {
-	return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function sameNumbers(left: ReadonlyArray<number>, right: ReadonlyArray<number>) {
+function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Value>) {
 	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
@@ -717,12 +718,8 @@ function errorCode(error: unknown) {
 }
 
 function missingResource(error: unknown): boolean {
-	return Boolean(
-		error &&
-			typeof error === "object" &&
-			"code" in error &&
-			(error.code === "ENOENT" || error.code === "ENOTDIR"),
-	);
+	const code = errorCode(error);
+	return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function releaseOnce(release: () => void): () => void {
@@ -737,14 +734,9 @@ function releaseOnce(release: () => void): () => void {
 class AsyncGate {
 	private active = 0;
 	private readonly waiting: Array<() => void> = [];
-	private readonly limit: number;
-
-	constructor(limit: number) {
-		this.limit = limit;
-	}
 
 	async run<Value>(task: () => Promise<Value>) {
-		if (this.active < this.limit) this.active++;
+		if (this.active < FINGERPRINT_CONCURRENCY) this.active++;
 		else await new Promise<void>((resolve) => this.waiting.push(resolve));
 		try {
 			return await task();
@@ -756,7 +748,7 @@ class AsyncGate {
 	}
 }
 
-const fingerprintGate = new AsyncGate(FINGERPRINT_CONCURRENCY);
+const fingerprintGate = new AsyncGate();
 
 function fingerprintIO<Value>(task: () => Promise<Value>) {
 	return fingerprintGate.run(task);

@@ -83,6 +83,11 @@ class ResourceSnapshotCapture implements WorldResultCapture<ToolSettlement> {
 
 	async seal(output: ToolSettlement): Promise<WorldBranch<ToolSettlement>> {
 		if (this.state !== "open") throw new Error(`resource snapshot capture is already ${this.state}`);
+		const validation = await this.version.manager.seal(this.version);
+		if (validation.expired) {
+			this.dispose();
+			throw new Error(validation.reason ?? "resource observation window changed");
+		}
 		const branch = new ResourceSnapshotBranch(output, this.version, this.executionFingerprint, this.setupMs);
 		this.state = "sealed";
 		return branch;
