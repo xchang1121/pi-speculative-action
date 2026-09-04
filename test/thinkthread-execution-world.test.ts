@@ -42,7 +42,7 @@ describe("ThinkThread execution world", () => {
 		).resolves.toContain("linux-execution-v10");
 	});
 
-	it("leaves Bash to the downstream native process provider without preparing ThinkThread", async () => {
+	it("falls through an unsupported or unavailable ThinkThread route", async () => {
 		const fixture = fakeClient();
 		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
 		const nativePrepare = vi.fn(async () => undefined);
@@ -55,15 +55,26 @@ describe("ThinkThread execution world", () => {
 				execute: vi.fn(),
 			},
 		} as unknown as SpeculativeAgentExecutionWorld;
-		const router = new ExecutionWorldRouter([primary, native]);
+		const portable = {
+			id: "resource_fallback", scope: "fallback", isolation: "resource_snapshot",
+			speculation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read"], execute: vi.fn() },
+		} as unknown as SpeculativeAgentExecutionWorld;
+		const router = new ExecutionWorldRouter([primary, native, portable]);
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		const action = buildPiActionKey("bash", { command: "printf ok" }, cwd, "schema")!;
+		const bash = buildPiActionKey("bash", { command: "printf ok" }, cwd, "schema")!;
 
 		await expect(router.resolve({
-			effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, action,
+			effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, action: bash,
 		}, { cwd })).resolves.toMatchObject({ backend: "linux_process_reuse" });
 		expect(fixture.selfView).not.toHaveBeenCalled();
 		expect(nativePrepare).toHaveBeenCalledOnce();
+
+		fixture.selfView.mockRejectedValueOnce(new Error("ThinkThread unavailable"));
+		const read = buildPiActionKey("read", { path: "notes.txt" }, cwd, "schema")!;
+		await expect(router.resolve({
+			effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, action: read,
+		}, { cwd })).resolves.toMatchObject({ backend: "resource_fallback" });
+		expect(fixture.selfView).toHaveBeenCalledOnce();
 		await router.dispose();
 	});
 
@@ -200,8 +211,8 @@ describe("ThinkThread execution world", () => {
 		const fixture = fakeClient();
 		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		await world.speculation.prepare?.({ cwd });
 		await world.beginTurn("capture-turn");
+		await world.speculation.prepare?.({ cwd });
 		const input = context("read", { path: "notes.txt" }, cwd, "actor-read");
 		const speculative = await world.speculation.execute(input);
 		const capture = await world.observation!.capture(input);
@@ -346,8 +357,8 @@ async function startWorld(fixture: ReturnType<typeof fakeClient>, turnID: string
 		nodePath: "/usr/bin/node",
 	});
 	const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-	await world.speculation.prepare?.({ cwd });
 	await world.beginTurn(turnID);
+	await world.speculation.prepare?.({ cwd });
 	return { world, cwd };
 }
 

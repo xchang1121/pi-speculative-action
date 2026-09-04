@@ -67,12 +67,13 @@ export function createThinkThreadExecutionWorld(
 	const nodePath = options.nodePath ?? process.execPath;
 	const autoResizeImages = options.autoResizeImages ?? true;
 	let prepared: Promise<PreparedWorld> | undefined;
+	let activeTurn: string | undefined;
 	let runnerFingerprint: Promise<string> | undefined;
 	const lifetime = new AbortController();
 	const pending = new Set<Promise<unknown>>();
 	let disposal: Promise<void> | undefined;
 
-	const prepare = (cwd: string): Promise<PreparedWorld> => {
+	const prepare = async (cwd: string): Promise<PreparedWorld> => {
 		lifetime.signal.throwIfAborted();
 		if (!prepared) {
 			const attempt = prepareWorld(cwd, options.clientFactory).catch((error) => {
@@ -81,7 +82,9 @@ export function createThinkThreadExecutionWorld(
 			});
 			prepared = attempt;
 		}
-		return prepared;
+		const world = await prepared;
+		if (activeTurn) await world.pool.beginTurn(activeTurn);
+		return world;
 	};
 	const fingerprint = async (request?: ExecutionWorldRequest): Promise<string> => {
 		if (request?.action) toolName(request.action.tool);
@@ -160,15 +163,14 @@ export function createThinkThreadExecutionWorld(
 			capture: (context) => execute(context, captureThinkThreadResult),
 		},
 		beginTurn: async (turnID) => {
-			const world = await prepared;
-			if (!world) throw new Error("ThinkThread execution world must be prepared before a turn starts");
-			await world.pool.beginTurn(turnID);
+			activeTurn = turnID;
 		},
 		actorFallbackSettled: async () => {
 			const world = await prepared;
 			await world?.pool.invalidate();
 		},
 		finishTurn: async (turnID) => {
+			if (activeTurn === turnID) activeTurn = undefined;
 			const world = await prepared;
 			await world?.pool.finishTurn(turnID);
 		},

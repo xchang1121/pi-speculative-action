@@ -51,10 +51,9 @@ export function withThinkThreadProfileLifecycle(
 	return {
 		...host,
 		startTurn: async (...args: Parameters<SpeculativeActionHost["startTurn"]>) => {
-			const [input, signal] = args;
+			const [input] = args;
 			if (!enabled()) return host.startTurn(...args);
-			await world.speculation.prepare?.({ cwd: options.cwd, ...(signal ? { signal } : {}) });
-			await world.beginTurn(input.turnID);
+			await world.beginTurn(input.turnID).catch(() => undefined);
 			activeTurns.add(input.turnID);
 			try {
 				await host.startTurn(...args);

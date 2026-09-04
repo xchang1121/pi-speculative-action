@@ -4,13 +4,13 @@ import type { ThinkThreadExecutionWorld } from "../src/thinkthread/execution-wor
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 
 describe("ThinkThread profile extension lifecycle", () => {
-	it("prepares each turn and invalidates BASE only after mutating Actor fallbacks", async () => {
+	it("registers each turn lazily and invalidates BASE only after mutating Actor fallbacks", async () => {
 		const host = hostFixture();
 		const world = worldFixture();
 		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, hostOptions());
 
 		await wrapped.startTurn(startInput("turn-1"));
-		expect(world.prepare).toHaveBeenCalledWith({ cwd: "/workspace" });
+		expect(world.prepare).not.toHaveBeenCalled();
 		expect(world.beginTurn).toHaveBeenCalledWith("turn-1");
 		expect(world.beginTurn.mock.invocationCallOrder[0]).toBeLessThan(host.startTurn.mock.invocationCallOrder[0]!);
 
