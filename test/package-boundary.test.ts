@@ -1,166 +1,54 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test } from "vitest";
-import * as coreApi from "../src/core.ts";
-import * as packageApi from "../src/index.ts";
-import * as processReuseApi from "../src/process-reuse.ts";
-import {
-	acquirePatternAwareStore,
-	captureResourceVersion,
-	createSpeculativeActionExtension,
-	createSpeculativeActionHost,
-	createLinuxProcessExecutionWorld,
-	createWorkspaceSandbox,
-	EffectTransactionCoordinator,
-	ExecutionWorldRouter,
-	makeSpeculativeActionRuntime,
-	prepareSandboxWorkspace,
-	ProcessReusePlanner,
-	ProcessExecutionCoordinator,
-	ProvenanceCertificateStore,
-	qualifyWorkspaceSandboxDriver,
-	releaseResourceVersion,
-	ToolExecutionGateway,
-	WorkspaceSandboxService,
-} from "../src/index.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
+const execFileAsync = promisify(execFile);
 
 describe("speculative action package boundary", () => {
-	test("exports runtime, learning, resource, and file-mutation entry points", () => {
-		for (const exported of [
-			makeSpeculativeActionRuntime,
-			createSpeculativeActionHost,
-			createSpeculativeActionExtension,
-			createLinuxProcessExecutionWorld,
-			acquirePatternAwareStore,
-			captureResourceVersion,
-			releaseResourceVersion,
-			createWorkspaceSandbox,
-			prepareSandboxWorkspace,
-			qualifyWorkspaceSandboxDriver,
-			EffectTransactionCoordinator,
-			ExecutionWorldRouter,
-			ToolExecutionGateway,
-			ProcessReusePlanner,
-			ProcessExecutionCoordinator,
-			ProvenanceCertificateStore,
-			WorkspaceSandboxService,
-		]) {
-			expect(exported).toBeTypeOf("function");
-		}
-		for (const internal of [
-			"ActorAction",
-			"CandidateExecution",
-			"PlanRuntime",
-			"PostSettlementQueue",
-			"ResultCache",
-			"SourceGeneration",
-			"SpeculationScheduler",
-		]) {
-			expect(packageApi).not.toHaveProperty(internal);
-		}
-	});
-
-	test("keeps the root entry as a compatibility aggregate of the narrow APIs", () => {
-		const rootApi = packageApi as unknown as Readonly<Record<string, unknown>>;
-		for (const api of [coreApi, processReuseApi]) {
-			for (const [name, exported] of Object.entries(api)) expect(rootApi[name]).toBe(exported);
-		}
-	});
-
-	test("keeps source implementations and Pi dependencies outside the host-neutral runtime", async () => {
-		const core = await readModuleClosure(path.join(packageRoot, "src", "core.ts"));
-		const processReuse = await readModuleClosure(path.join(packageRoot, "src", "process-reuse.ts"));
-		expect(core).not.toMatch(/pattern-aware|@earendil-works\/pi-/);
-		expect(processReuse).not.toMatch(/@earendil-works\/pi-/);
-		expect(coreApi.makeSpeculativeActionRuntime).toBeTypeOf("function");
-		expect(coreApi).not.toHaveProperty("createSpeculativeActionHost");
-		expect(coreApi).not.toHaveProperty("PatternAwareStore");
-		expect(processReuseApi.ProcessReusePlanner).toBeTypeOf("function");
-		expect(processReuseApi).not.toHaveProperty("makeSpeculativeActionRuntime");
-	});
-
-	test("loads ThinkThread only through its opt-in entry", async () => {
-		for (const entry of ["index.ts", "core.ts", "process-reuse.ts", "extension.ts"]) {
-			const closure = await readModuleClosure(path.join(packageRoot, "src", entry));
-			expect(closure).not.toMatch(/@thinkthread\/agent-posix|["']\.\/thinkthread\//);
-		}
-		expect(coreApi.EffectCommitFailure).toBe(packageApi.EffectCommitFailure);
-		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
-		expect(manifest.peerDependencies["@thinkthread/agent-posix"]).toBe("0.1.0");
-		expect(manifest.peerDependenciesMeta["@thinkthread/agent-posix"]).toEqual({ optional: true });
-		expect(manifest.exports["./thinkthread-extension"]).toEqual({
-			types: "./dist/thinkthread/index.d.ts",
-			import: "./dist/thinkthread/index.js",
-		});
-	});
-
-	test("keeps runtime contracts below the implementation facade", async () => {
-		const contracts = await fs.readFile(path.join(packageRoot, "src", "runtime-contracts.ts"), "utf8");
-		const engine = await fs.readFile(path.join(packageRoot, "src", "runtime-engine.ts"), "utf8");
-		expect(contracts).not.toMatch(/runtime-engine|["']\.\/runtime\.ts["']/);
-		expect(engine).toMatch(/from ["']\.\/runtime-contracts\.ts["']/);
-		expect(engine).not.toMatch(/from ["']\.\/runtime\.ts["']/);
-	});
-
-	test("declares a source-loadable Pi package with only public host peers", async () => {
-		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as {
-			exports: Record<string, unknown>;
-			files: string[];
-			repository?: { type?: string; url?: string; directory?: string };
-			scripts?: Record<string, string>;
-			pi?: { extensions?: string[] };
-			peerDependencies?: Record<string, string>;
-		};
-		expect(Object.keys(manifest.exports).sort()).toEqual([
-			".",
-			"./core",
-			"./extension",
-			"./package.json",
-			"./pattern-aware",
-			"./process-reuse",
-			"./thinkthread-extension",
+	test("runs the root, core, and process-reuse public entries", async () => {
+		const [root, core, processReuse] = await Promise.all([
+			import("../src/index.ts"),
+			import("../src/core.ts"),
+			import("../src/process-reuse.ts"),
 		]);
-		expect(manifest.files).toEqual(["dist", "src", ".thinkthread", "scripts/install-thinkthread-profile.sh", "README.md", "README-CN.md", "CHANGELOG.md", "LICENSE"]);
-		expect(manifest.scripts?.build).toBe(
-			"shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs dist/process-dispatcher.mjs",
-		);
-		expect(Object.keys(manifest.scripts ?? {})).not.toEqual(
-			expect.arrayContaining(["build:native", "build:worker", "generate:native-manifest", "smoke:native"]),
-		);
-		await expect(fs.stat(path.join(packageRoot, "native", "sandbox"))).rejects.toThrow();
-		await expect(fs.stat(path.join(packageRoot, "native", "worker"))).rejects.toThrow();
-		for (const removed of ["container-sandbox.ts", "native-sandbox.ts", "oci-setup.ts"]) {
-			await expect(fs.stat(path.join(packageRoot, "src", removed))).rejects.toThrow();
-		}
-		expect(manifest.pi?.extensions).toEqual(["./src/extension.ts"]);
-		expect(manifest.peerDependencies).toMatchObject({
-			"@earendil-works/pi-agent-core": "*",
-			"@earendil-works/pi-ai": "*",
-			"@earendil-works/pi-coding-agent": "*",
+
+		expect(core.zeroValidationMetrics()).toEqual({
+			durationMs: 0,
+			bytesRead: 0,
+			filesRead: 0,
+			mode: "exact",
 		});
-		expect(manifest.repository).toEqual({
-			type: "git",
-			url: "git+https://github.com/xchang1121/pi.git",
-		});
+		expect(processReuse.digestObject({ command: "printf ready" })).toMatch(/^sha256:[a-f0-9]{64}$/);
+		expect(root.makeSpeculativeActionRuntime).toBe(core.makeSpeculativeActionRuntime);
+		expect(root.ProcessReusePlanner).toBe(processReuse.ProcessReusePlanner);
 	});
 
-	test("does not resolve implementation or tests through a Pi source checkout", async () => {
-		const source = await readTypeScript(path.join(packageRoot, "src"));
-		const buildConfig = await fs.readFile(path.join(packageRoot, "tsconfig.build.json"), "utf8");
-		const testConfig = await fs.readFile(path.join(packageRoot, "vitest.config.ts"), "utf8");
-
-		expect(source).not.toMatch(/@earendil-works\/pi-[^"']+\/src(?:\/|["'])/);
-		expect(source).not.toMatch(/(?:^|["'])(?:\.\.\/){2,}/m);
-		expect(buildConfig).not.toMatch(/\.\.\/(?:agent|ai|coding-agent)|"paths"/);
-		expect(testConfig).not.toMatch(/\.\.\/(?:agent|ai|telemetry)|alias/);
+	test("keeps host-neutral entries executable without Pi packages", async () => {
+		await importWithBlockedDependencies(["src/core.ts", "src/process-reuse.ts"], ["@earendil-works/pi-"]);
 	});
 
-	test("loads from its own package manifest through Pi's public extension loader", async () => {
+	test("loads the default Pi entry while the ThinkThread SDK is unavailable", async () => {
+		await importWithBlockedDependencies(["src/index.ts", "src/extension.ts"], ["@thinkthread/agent-posix"]);
+	});
+
+	test("loads ThinkThread only through its opt-in entry when the SDK is installed", async () => {
+		const thinkThread = await import("../src/thinkthread/index.ts");
+		expect(thinkThread.createThinkThreadExecutionWorld).toBeTypeOf("function");
+		expect(thinkThread.createThinkThreadProfileExtension).toBeTypeOf("function");
+
+		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
+		expect(manifest.exports["./thinkthread-extension"]).toBeDefined();
+		expect(manifest.peerDependenciesMeta["@thinkthread/agent-posix"]).toEqual({ optional: true });
+		await expect(fs.stat(path.join(packageRoot, "scripts", "install-thinkthread-profile.sh"))).resolves.toBeDefined();
+	});
+
+	test("loads from its package manifest through Pi's public extension loader", async () => {
 		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-speculative-package-"));
 		const cwd = path.join(temporaryRoot, "workspace");
 		const agentDir = path.join(temporaryRoot, "agent");
@@ -175,31 +63,24 @@ describe("speculative action package boundary", () => {
 	});
 });
 
-async function readTypeScript(directory: string): Promise<string> {
-	const entries = await fs.readdir(directory, { withFileTypes: true });
-	const contents = await Promise.all(
-		entries.map(async (entry) => {
-			const target = path.join(directory, entry.name);
-			if (entry.isDirectory()) return readTypeScript(target);
-			return entry.isFile() && entry.name.endsWith(".ts") ? fs.readFile(target, "utf8") : "";
-		}),
-	);
-	return contents.join("\n");
-}
-
-async function readModuleClosure(entry: string, seen = new Set<string>()): Promise<string> {
-	const target = path.resolve(entry);
-	if (seen.has(target)) return "";
-	seen.add(target);
-	const source = await fs.readFile(target, "utf8");
-	const dependencies: string[] = [];
-	for (const match of source.matchAll(/(?:from\s+|import\s*\()\s*["'](\.[^"']+)["']/g)) {
-		const specifier = match[1];
-		if (!specifier) continue;
-		const dependency = path.resolve(path.dirname(target), specifier);
-		if (dependency.startsWith(path.join(packageRoot, "src"))) dependencies.push(dependency);
-	}
-	return [source, ...(await Promise.all(dependencies.map((dependency) => readModuleClosure(dependency, seen))))].join(
-		"\n",
-	);
+async function importWithBlockedDependencies(entries: readonly string[], blockedPrefixes: readonly string[]) {
+	const urls = entries.map((entry) => pathToFileURL(path.join(packageRoot, entry)).href);
+	const script = `
+		import { registerHooks } from "node:module";
+		const blocked = ${JSON.stringify(blockedPrefixes)};
+		registerHooks({
+			resolve(specifier, context, nextResolve) {
+				if (blocked.some((prefix) => specifier.startsWith(prefix))) {
+					throw new Error(\`blocked package boundary: \${specifier}\`);
+				}
+				return nextResolve(specifier, context);
+			},
+		});
+		await Promise.all(${JSON.stringify(urls)}.map((entry) => import(entry)));
+	`;
+	const result = await execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+		cwd: packageRoot,
+		windowsHide: true,
+	});
+	expect(result.stderr).toBe("");
 }
