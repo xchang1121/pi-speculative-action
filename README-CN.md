@@ -166,6 +166,12 @@ D3 默认上限为 28 个 draft token。严格 DeepSeek tokenizer tape 回放中
 
 JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、tool-call 格式、decoder、温度和专家级语法覆盖。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
 
+对于 Qwen3.5 系列（包括 Qwen3.8 部署别名），如果 Actor provider 使用模型原生的
+`tools=` chat template，应把 `draftFormat` 设为 `qwen_xml`。只有 Actor 请求本身也通过配套
+`self-speculation` 包按论文 JSON 协议渲染时，才使用 `tagged_json`。只把 sidecar fork 改成
+JSON 会导致其 token 前缀与 Actor 不同，无法精确复用 KV cache。Pi 不内置 Qwen 边界 token
+ID；推理集成始终使用目标 tokenizer 派生边界。
+
 PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor 采纳的 Drafter 结果——都会连同真实输出一起做一次不修改学习状态的同轮重基准；正式学习仍在权威 batch 边界进行。若跨轮的 `K(a)` 与 horizon 集合完全不变，则沿用提前签发的机会而不重复创建，避免共享命中被采纳后又启动同组落选候选。
 
 旧的 `resourceCached` / `sandbox` / `predictionOnly` 三组对象仅作为迁移输入继续识别，读取后统一规范化为一个 `tools` 数组。

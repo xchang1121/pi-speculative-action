@@ -256,7 +256,11 @@ npm run bench:suite -- \
 
 The suite runner fails immediately if a task process fails, writes every task to
 its own result file, and emits `suite-result.json`. Pooled acceleration is the
-ratio of total serialized time to total actual time, and pooled hit rate is total
-hits divided by total Actor actions. Runs that fail `patchCandidate` remain
-listed with explicit reasons but are excluded from pooled latency and hit-rate
-statistics. Use `--output-root` to choose the artifact directory.
+ratio of mean serialized time to mean actual time (equivalently, the ratio of
+their totals), never the mean of per-task ratios. The report includes a seeded
+95% task-cluster bootstrap interval that keeps repeats of one instance together,
+plus nearest-rank p95 latency. Pooled hit rate is total hits divided by total
+Actor actions. Runs that fail `patchCandidate` remain listed with explicit reasons
+but are excluded from pooled latency and hit-rate statistics. This screening is
+not an official correctness grade; use the dataset harness for that guardrail.
+Use `--output-root` to choose the artifact directory.

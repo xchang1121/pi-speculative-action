@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { type SuiteBenchmarkRun, summarizeSuite } from "../bench/suite-report.ts";
+import {
+	nearestRank,
+	pairedLatencyStatistics,
+	type SuiteBenchmarkRun,
+	summarizeSuite,
+} from "../bench/suite-report.ts";
 
 describe("ablation suite report", () => {
 	it("pools only completed patch candidates and exposes every screening failure", () => {
@@ -29,6 +34,12 @@ describe("ablation suite report", () => {
 			runs: 3,
 			patchCandidates: 2,
 			allRunsScreenedIn: false,
+			statistics: {
+				primaryEstimator: "ratio_of_means",
+				cluster: "instance",
+				bootstrapSamples: 10_000,
+				seed: 42,
+			},
 			implementationCommits: ["commit"],
 			pooled: {
 				runs: 2,
@@ -52,6 +63,40 @@ describe("ablation suite report", () => {
 				reasons: ["timed_out", "patch_not_clean", "no_changed_files", "no_gold_file_overlap"],
 			},
 		]);
+	});
+
+	it("uses nearest-rank p95 and a task-cluster bootstrap for paired repeats", () => {
+		const report = summarizeSuite(
+			[
+				run("task-a", 1, { actualEndToEndMs: 5, serializedCounterfactualMs: 10 }),
+				run("task-a", 2, { actualEndToEndMs: 10, serializedCounterfactualMs: 20 }),
+				run("task-b", 1, { actualEndToEndMs: 15, serializedCounterfactualMs: 30 }),
+				run("task-b", 2, { actualEndToEndMs: 20, serializedCounterfactualMs: 40 }),
+			],
+			{ bootstrapSamples: 200, seed: 7 },
+		);
+
+		expect(nearestRank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95)).toBe(10);
+		expect(report.pooled).toMatchObject({
+			instanceClusters: 2,
+			accelerationRatio: 2,
+			accelerationRatioCI95: [2, 2],
+			actualEndToEndP95Ms: 20,
+			serializedCounterfactualP95Ms: 40,
+		});
+	});
+
+	it("reports ratio of means rather than averaging per-task speedups", () => {
+		const statistics = pairedLatencyStatistics(
+			[
+				{ cluster: "short", baselineMs: 1, treatmentMs: 0.5 },
+				{ cluster: "long", baselineMs: 100, treatmentMs: 200 },
+			],
+			{ bootstrapSamples: 50 },
+		);
+
+		expect(statistics.ratioOfMeans).toBeCloseTo(101 / 200.5, 12);
+		expect(statistics.ratioOfMeans).toBeLessThan(1);
 	});
 });
 

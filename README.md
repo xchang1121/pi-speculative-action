@@ -175,6 +175,15 @@ The default D3 cap is 28 draft tokens. In the strict DeepSeek-tokenizer tape rep
 
 The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format, decoder, temperature, and expert syntax overrides. Boundary and forced-prefix overrides default to `auto`, so the inference adapter derives CoT closure, the name-aligned probe prefix, parser framing, and D3 boundary from one model format. An explicit override must describe that same format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
 
+For Qwen3.5-family checkpoints, including Qwen3.8 deployment aliases, set
+`draftFormat` to `qwen_xml` when the Actor provider uses the model's native
+`tools=` chat template. Keep `tagged_json` only when the Actor request itself is
+rendered with the paper-aligned JSON protocol provided by the companion
+`self-speculation` package. Changing only the sidecar fork to JSON would make its
+prefix differ from the Actor and prevent exact KV-cache reuse. Pi never embeds a
+Qwen boundary token ID; the inference integration derives it with the target
+tokenizer.
+
 When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
 
 The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.

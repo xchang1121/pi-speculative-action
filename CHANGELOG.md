@@ -25,6 +25,9 @@
 
 ### Added
 
+- Added task-clustered bootstrap confidence intervals and nearest-rank p95 to
+  suite latency reports; pooled acceleration remains a ratio of means, and
+  repeats of the same instance stay in one resampled cluster.
 - Added an optional ThinkThread profile that pre-executes self-contained `read`, `ls`, `write`,
   and `edit` calls and captures Actor-authorized `grep`/`find` results for later validation.
   External-process search and Bash remain on the Actor path when their dependencies are unsealed.
