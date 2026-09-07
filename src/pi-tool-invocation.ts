@@ -1,5 +1,28 @@
-import { getShellConfig } from "@earendil-works/pi-coding-agent";
+import {
+	createReadToolDefinition, createBashToolDefinition, createEditToolDefinition,
+	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
+	getShellConfig, type ToolsOptions,
+} from "@earendil-works/pi-coding-agent";
 import type { ToolInvocation } from "./tool-settlement.ts";
+
+export type PiToolDefinition = ReturnType<
+	| typeof createReadToolDefinition | typeof createBashToolDefinition | typeof createEditToolDefinition
+	| typeof createWriteToolDefinition | typeof createGrepToolDefinition | typeof createFindToolDefinition | typeof createLsToolDefinition
+>;
+
+/** Stock definitions and their public operation seams; shared by Actor and isolated runners. */
+export function createPiToolDefinitions(cwd: string, options: ToolsOptions = {}): Map<string, PiToolDefinition> {
+	const definitions = [
+		createReadToolDefinition(cwd, options.read),
+		createBashToolDefinition(cwd, options.bash),
+		createEditToolDefinition(cwd, options.edit),
+		createWriteToolDefinition(cwd, options.write),
+		createGrepToolDefinition(cwd, options.grep),
+		createFindToolDefinition(cwd, options.find),
+		createLsToolDefinition(cwd, options.ls),
+	];
+	return new Map(definitions.map((definition) => [definition.name, definition]));
+}
 
 export interface PiToolInvocationOptions {
 	readonly cwd: string;

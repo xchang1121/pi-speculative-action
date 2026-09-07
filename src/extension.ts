@@ -4,14 +4,7 @@ import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback 
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
-	createBashToolDefinition,
 	createLocalBashOperations,
-	createEditToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -48,7 +41,7 @@ import {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
-import { resolvePiToolInvocation } from "./pi-tool-invocation.ts";
+import { createPiToolDefinitions, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
@@ -63,7 +56,6 @@ import {
 	definedProcessEnvironment,
 	ProcessExecutionCoordinator,
 	type ProcessRouteSnapshot,
-	type ProcessToolOperations,
 } from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
@@ -100,15 +92,6 @@ const BACK = "Back";
 const USE_ACTIVE_MODEL = "Use active model";
 const CUSTOM_MODEL = "Custom model...";
 const RECENT_EVENT_LIMIT = 50;
-
-type BaseToolDefinition =
-	| ReturnType<typeof createReadToolDefinition>
-	| ReturnType<typeof createBashToolDefinition>
-	| ReturnType<typeof createEditToolDefinition>
-	| ReturnType<typeof createWriteToolDefinition>
-	| ReturnType<typeof createGrepToolDefinition>
-	| ReturnType<typeof createFindToolDefinition>
-	| ReturnType<typeof createLsToolDefinition>;
 
 export interface EffectiveSpeculativeActionSettings {
 	readonly enabled: boolean;
@@ -517,7 +500,14 @@ async function installController(
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
 	// wrappers can be intercepted without silently substituting different tool semantics.
 	const baseDefinitions = new Map(
-		[...createBaseToolDefinitions(context.cwd, piToolSettings, processCoordinator.operations)].filter(([name]) => {
+		[...createPiToolDefinitions(context.cwd, {
+			read: { autoResizeImages: piToolSettings.autoResizeImages },
+			bash: {
+				operations: processCoordinator.operations,
+				shellPath: piToolSettings.shellPath,
+				commandPrefix: piToolSettings.shellCommandPrefix,
+			},
+		})].filter(([name]) => {
 			const available = availableTools.get(name);
 			if (!available) return false;
 			const source = toolSourceFingerprint(available.sourceInfo);
@@ -781,30 +771,7 @@ interface PiToolSettings {
 	readonly autoResizeImages: boolean;
 }
 
-function createBaseToolDefinitions(
-	cwd: string,
-	settings: PiToolSettings,
-	processOperations: ProcessToolOperations,
-): Map<string, BaseToolDefinition> {
-	return new Map<string, BaseToolDefinition>([
-		["read", createReadToolDefinition(cwd, { autoResizeImages: settings.autoResizeImages })],
-		[
-			"bash",
-			createBashToolDefinition(cwd, {
-				operations: processOperations,
-				...(settings.shellPath ? { shellPath: settings.shellPath } : {}),
-				...(settings.shellCommandPrefix ? { commandPrefix: settings.shellCommandPrefix } : {}),
-			}),
-		],
-		["edit", createEditToolDefinition(cwd)],
-		["write", createWriteToolDefinition(cwd)],
-		["grep", createGrepToolDefinition(cwd)],
-		["find", createFindToolDefinition(cwd)],
-		["ls", createLsToolDefinition(cwd)],
-	]);
-}
-
-function speculativeToolDefinition(base: BaseToolDefinition, controller: SpeculativeActionController): ToolDefinition {
+function speculativeToolDefinition(base: PiToolDefinition, controller: SpeculativeActionController): ToolDefinition {
 	return {
 		...base,
 		renderCall: base.renderCall as ToolDefinition["renderCall"],
@@ -827,7 +794,7 @@ function toolConflictSummary(conflicts: ReadonlyMap<string, string>): string {
 		.join(", ");
 }
 
-function toAgentTool(base: BaseToolDefinition, context: () => ExtensionContext): AgentTool {
+function toAgentTool(base: PiToolDefinition, context: () => ExtensionContext): AgentTool {
 	return {
 		...base,
 		execute: async (callID, input, signal, onUpdate) =>

@@ -1,12 +1,6 @@
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import {
-	createEditTool,
-	createReadOnlyTools,
-	createWriteTool,
-	type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { createPiToolDefinitions } from "../pi-tool-invocation.ts";
 import { withPiProjectionCoverage } from "../pi-read-projection.ts";
 import { buildPiActionKey } from "../action-semantics.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
@@ -18,17 +12,6 @@ import {
 	type ThinkThreadToolRunnerRequestV1,
 } from "./tool-runner-protocol.ts";
 
-interface RunnableTool {
-	readonly name: string;
-	readonly execute: (
-		callID: string,
-		args: never,
-		signal?: AbortSignal,
-		onUpdate?: undefined,
-		context?: ExtensionContext,
-	) => Promise<AgentToolResult<unknown>>;
-}
-
 export async function runThinkThreadTool(
 	request: ThinkThreadToolRunnerRequestV1,
 	cwd = process.cwd(),
@@ -36,12 +19,13 @@ export async function runThinkThreadTool(
 	const action = buildPiActionKey(request.tool, request.args, cwd);
 	if (!action) throw new Error("Runner cannot prove the stock tool path identity");
 	for (const resource of action.resources) await assertNoSymlinkPath(cwd, path.resolve(cwd, resource));
-	const tool = createTool(request, cwd);
+	const tool = createPiToolDefinitions(cwd, { read: { autoResizeImages: request.autoResizeImages } }).get(request.tool);
+	if (!tool) throw new Error(`ThinkThread tool runner does not support ${request.tool}`);
 	try {
 		const result = withPiProjectionCoverage(
 			request.tool,
 			request.args,
-			await tool.execute(request.callID, request.args as never),
+			await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never),
 		);
 		return { result, isError: false };
 	} catch (error) {
@@ -57,17 +41,6 @@ async function main(): Promise<void> {
 		process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
 		process.exitCode = 2;
 	}
-}
-
-function createTool(request: ThinkThreadToolRunnerRequestV1, cwd: string): RunnableTool {
-	const tools = [
-		...createReadOnlyTools(cwd, { read: { autoResizeImages: request.autoResizeImages } }),
-		createWriteTool(cwd),
-		createEditTool(cwd),
-	] as readonly RunnableTool[];
-	const tool = tools.find((candidate) => candidate.name === request.tool);
-	if (!tool) throw new Error(`ThinkThread tool runner does not support ${request.tool}`);
-	return tool;
 }
 
 async function readStdin(): Promise<Uint8Array> {
