@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 
@@ -48,16 +49,16 @@ export class SpeculativeActionSettingsStore {
 	}
 
 	effective(): SpeculativeActionPackageSettings | undefined {
-		return mergeSettings(this.global, this.project);
+		return applyOverlay(this.global, this.project);
 	}
 
 	editable(scope = this.scopeValue): SpeculativeActionPackageSettings | undefined {
-		return mergeSettings(this.global, scope === "project" ? this.project : undefined);
+		return applyOverlay(this.global, scope === "project" ? this.project : undefined);
 	}
 
 	setEffective(value: SpeculativeActionPackageSettings, inherited = this.editable("global")): void {
-		if (this.scopeValue === "project") this.project = settingsDiff(inherited as SettingsOverlay | undefined, value);
-		else this.global = clone(value) as SettingsOverlay;
+		if (this.scopeValue === "project") this.project = diffRecord(inherited as SettingsOverlay ?? {}, value as SettingsOverlay);
+		else this.global = structuredClone(value) as SettingsOverlay;
 		this.persistSelected();
 	}
 
@@ -70,7 +71,7 @@ export class SpeculativeActionSettingsStore {
 	private persistSelected(): void {
 		const value = this.scopeValue === "project" ? this.project : this.global;
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
-		const snapshot = clone(value);
+		const snapshot = structuredClone(value);
 		this.writeQueue = this.writeQueue.then(() => writeSettings(target, snapshot)).then(
 			(value) => ({ status: "fulfilled", value }),
 			(reason: unknown) => ({ status: "rejected", reason }),
@@ -116,43 +117,27 @@ async function writeSettings(file: string, value: SettingsOverlay | undefined): 
 	}
 }
 
-function mergeSettings(
-	global: SettingsOverlay | undefined,
-	project: SettingsOverlay | undefined,
-): SpeculativeActionPackageSettings | undefined {
-	const merged = applyOverlay(global, project);
-	return merged && Object.keys(merged).length > 0 ? (merged as SpeculativeActionPackageSettings) : undefined;
-}
-
-function settingsDiff(
-	base: SettingsOverlay | undefined,
-	target: SpeculativeActionPackageSettings,
-): SettingsOverlay | undefined {
-	const difference = diffRecord(base ?? {}, target as SettingsOverlay);
-	return Object.keys(difference).length > 0 ? difference : undefined;
-}
-
 function applyOverlay(
 	base: SettingsOverlay | undefined,
 	overlay: SettingsOverlay | undefined,
 ): SettingsOverlay | undefined {
 	if (!base && !overlay) return undefined;
-	const result: SettingsOverlay = clone(base) ?? {};
+	const result: SettingsOverlay = structuredClone(base) ?? {};
 	for (const [key, value] of Object.entries(overlay ?? {})) {
 		if (value === null) {
 			delete result[key];
 		} else if (isRecord(value)) {
 			const nested = applyOverlay(isRecord(result[key]) ? result[key] : undefined, value);
-			if (nested && Object.keys(nested).length > 0) result[key] = nested;
+			if (nested) result[key] = nested;
 			else delete result[key];
 		} else {
-			result[key] = clone(value);
+			result[key] = structuredClone(value);
 		}
 	}
-	return result;
+	return Object.keys(result).length ? result : undefined;
 }
 
-function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOverlay {
+function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOverlay | undefined {
 	const result: SettingsOverlay = {};
 	for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
 		const baseHas = Object.hasOwn(base, key);
@@ -163,33 +148,15 @@ function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOve
 		}
 		const before = base[key];
 		const after = target[key];
-		if (equalValue(before, after)) continue;
+		if (isDeepStrictEqual(before, after)) continue;
 		if (isRecord(before) && isRecord(after)) {
 			const nested = diffRecord(before, after);
-			if (Object.keys(nested).length > 0) result[key] = nested;
+			if (nested) result[key] = nested;
 		} else {
-			result[key] = clone(after);
+			result[key] = structuredClone(after);
 		}
 	}
-	return result;
-}
-
-function equalValue(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (Array.isArray(left) && Array.isArray(right)) {
-		return left.length === right.length && left.every((value, index) => equalValue(value, right[index]));
-	}
-	if (!isRecord(left) || !isRecord(right)) return false;
-	const leftKeys = Object.keys(left);
-	const rightKeys = Object.keys(right);
-	return (
-		leftKeys.length === rightKeys.length &&
-		leftKeys.every((key) => Object.hasOwn(right, key) && equalValue(left[key], right[key]))
-	);
-}
-
-function clone<T>(value: T | undefined): T | undefined {
-	return value === undefined ? undefined : structuredClone(value);
+	return Object.keys(result).length ? result : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

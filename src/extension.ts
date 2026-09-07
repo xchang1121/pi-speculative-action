@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
@@ -831,26 +832,26 @@ async function runCommand(
 }
 
 async function openSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	let applied = cloneSettings(controller.editableSettings());
-	let draft = cloneSettings(applied);
+	let applied = structuredClone(controller.editableSettings());
+	let draft = structuredClone(applied);
 	const editor: SpeculativeActionController = {
 		...controller,
 		settings: () => draft,
 		setSettings: async (value) => {
-			draft = cloneSettings(normalizeSpeculativeActionSettings(value));
+			draft = structuredClone(normalizeSpeculativeActionSettings(value));
 		},
 	};
 	const reload = () => {
-		applied = cloneSettings(controller.editableSettings());
-		draft = cloneSettings(applied);
+		applied = structuredClone(controller.editableSettings());
+		draft = structuredClone(applied);
 	};
 	while (true) {
-		const dirty = !sameSettings(draft, applied);
+		const dirty = !isDeepStrictEqual(draft, applied);
 		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools());
 		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
 		const choice = await ctx.ui.select("Speculative action", [
 			`Enabled: ${draft.enabled ? "On" : "Off"}`,
-			`Save settings to: ${scope}${sameSettings(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
+			`Save settings to: ${scope}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
 			`Prediction sources › ${sourceSummary(draft)}`,
 			`Tools & execution › ${toolPolicy.enabled}/${toolPolicy.available} enabled for prediction`,
 			"Advanced settings › tuning, decoding, scheduling, storage",
@@ -907,7 +908,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			continue;
 		}
 		if (choice === "Discard changes") {
-			draft = cloneSettings(applied);
+			draft = structuredClone(applied);
 			continue;
 		}
 		if (choice === "Status") {
@@ -1527,14 +1528,6 @@ function mebibyteInput(title: string): SettingInputDescriptor<number> {
 		format: (bytes) => String(Math.max(1, Math.round(bytes / (1024 * 1024)))),
 		transform: (mebibytes) => mebibytes * 1024 * 1024,
 	});
-}
-
-function cloneSettings(settings: EffectiveSpeculativeActionSettings): EffectiveSpeculativeActionSettings {
-	return structuredClone(settings);
-}
-
-function sameSettings(left: EffectiveSpeculativeActionSettings, right: EffectiveSpeculativeActionSettings): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {

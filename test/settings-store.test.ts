@@ -15,10 +15,10 @@ describe("extension-owned speculative settings", () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.setEffective({ enabled: true, candidateLimit: 4, patternAware: { enabled: true, beamWidth: 2 } });
+		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true } });
 		await store.flush();
 		store.setScope("project");
-		store.setEffective({ enabled: true, candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 } });
+		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 } });
 		await store.flush();
 		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
 			candidateLimit: 2,
