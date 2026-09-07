@@ -13,7 +13,7 @@ import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
-	readonly scope: ResourceDependencyScope;
+	readonly scope: ResourceDependencyScope | "stat" | "names" | "binding";
 };
 
 export type ResourceValidationMetrics = {
@@ -35,12 +35,11 @@ export type ResourceChangeSet = {
 
 export type ResourceVersionToken = {
 	readonly root: string;
-	readonly dependencies: ReadonlyArray<ResourceDependency>;
+	readonly physicalRoot: string;
+	readonly observations: ReadonlyMap<string, ResourceDependency & { readonly fingerprint: string; readonly stamp?: string }>;
 	readonly epoch: number;
 	readonly watching: boolean;
 	readonly preciseContent: ReadonlyArray<string>;
-	readonly exact: ReadonlyArray<string>;
-	readonly stamps: ReadonlyArray<string>;
 	readonly manager: ResourceVersionManager;
 	/** Best-effort retained inputs; absence never weakens the token's exact freshness evidence. */
 	readonly view?: ResourceReadView;
@@ -48,9 +47,10 @@ export type ResourceVersionToken = {
 };
 
 type CapturedResource =
-	| { readonly type: "file"; readonly content?: Buffer }
+	| { readonly type: "file"; readonly content?: Buffer; readonly size?: number }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
 	| { readonly type: "alias"; readonly target: string }
+	| { readonly type: "special" }
 	| { readonly type: "missing" };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
@@ -60,21 +60,25 @@ export class ResourceReadView {
 	private failure?: Error;
 	private capturedBytes = 0;
 	private sealed = false;
+	private pending?: Promise<void>;
 	private readonly maxBytes: number;
-	constructor(maxBytes: number) {
+	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
+	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>) {
 		if (!Number.isFinite(maxBytes) || maxBytes < 0) throw new Error("resource_snapshot_budget_invalid");
 		this.maxBytes = maxBytes;
+		this.load = load;
 	}
 	get bytes(): number { return this.capturedBytes; }
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
 
 	reserve(bytes: number): boolean {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
-		if (this.failure) return false;
+		if (this.failure) { if (this.load) throw this.failure; return false; }
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("resource_snapshot_budget_invalid");
 		if (this.bytes + bytes > this.maxBytes) {
 			this.failure = new Error("resource_snapshot_budget_exceeded");
 			this.entries.clear();
+			if (this.load) throw this.failure;
 			return false;
 		}
 		this.capturedBytes += bytes;
@@ -86,7 +90,7 @@ export class ResourceReadView {
 			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
-		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined) ||
+		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined)) return;
 		this.entries.set(key, entry);
 	}
@@ -95,28 +99,27 @@ export class ResourceReadView {
 		this.entry(source);
 		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
 	}
-	exists = (target: string): boolean => this.entry(target).type !== "missing";
-	stat = (target: string): { isDirectory: () => boolean; size?: number } => {
-		const entry = this.entry(target);
+	exists = async (target: string): Promise<boolean> => (await this.get(target, "stat")).type !== "missing";
+	stat = async (target: string): Promise<{ isDirectory: () => boolean; size?: number }> => {
+		const entry = await this.get(target, "stat");
 		if (entry.type === "missing") return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory", size: entry.type === "file" ? entry.content?.length : undefined };
+		return { isDirectory: () => entry.type === "directory", size: entry.type === "file" ? entry.content?.length ?? entry.size : undefined };
 	};
-	readdir = (target: string): string[] => {
-		const entry = this.entry(target);
+	readdir = async (target: string): Promise<string[]> => {
+		const entry = await this.get(target, "names");
 		return entry.type === "directory" && entry.entries ? [...entry.entries] : this.unproven(target);
 	};
 	readFile = async (target: string, maxBytes?: number): Promise<Buffer> => {
-		const entry = this.entry(target);
+		const entry = await this.get(target, "content");
 		return entry.type === "file" && entry.content !== undefined ? Buffer.from(entry.content.subarray(0, maxBytes)) : this.unproven(target);
 	};
 	access = async (target: string): Promise<void> => {
-		const entry = this.entry(target);
+		const entry = await this.get(target, "content");
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
 	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>): Promise<T> {
-		this.assertComplete();
-		if (!this.sealed) throw new Error("resource_snapshot_not_sealed");
+		this.assertComplete(true);
 		const view = new ResourceReadView(0);
 		view.entries = this.entries; view.owner = this; view.sealed = true;
 		try {
@@ -125,9 +128,26 @@ export class ResourceReadView {
 			return output;
 		} finally { view.dispose(); }
 	}
-	assertComplete(): void { this.owner?.assertComplete(); if (this.failure) throw this.failure; }
-	seal(): void { this.assertComplete(); this.sealed = true; }
+	assertComplete(sealed = false): void {
+		this.owner?.assertComplete(); if (this.failure) throw this.failure;
+		if (sealed && !this.sealed) throw new Error("resource_snapshot_not_sealed");
+	}
+	seal(): void {
+		if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending");
+		this.assertComplete(); this.sealed = true;
+	}
 	dispose(): void { if (!this.owner) this.entries.clear(); this.failure = new Error("resource_snapshot_disposed"); }
+	private async get(target: string, scope: ResourceDependency["scope"]) {
+		this.assertComplete();
+		if (this.load && !this.sealed) {
+			const pending = (this.pending ?? Promise.resolve()).then(() => { this.assertComplete(); return this.load!({ path: target, scope }); });
+			this.pending = pending;
+			try { await pending; }
+			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
+			finally { if (this.pending === pending) this.pending = undefined; }
+		}
+		return this.entry(target);
+	}
 	private entry(target: string): Exclude<CapturedResource, { type: "alias" }> {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
@@ -198,39 +218,42 @@ export class ResourceVersionManager {
 		}
 	}
 
-	async capture(dependencies: ReadonlyArray<ResourceDependency>, retainBytes?: number): Promise<ResourceVersionToken> {
+	/** Undefined dependencies grant only bounded on-demand captures; observation of host tools stays eager. */
+	async capture(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
-		if (!dependencies.length) throw new Error("resource_dependencies_unproven");
-		const view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes);
-		const reference = this.acquireReference();
-		let release = reference;
+		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
+		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>(), preciseContent: string[] = [];
+		const releases = [this.acquireReference()];
+		let view: ResourceReadView | undefined;
+		const release = releaseOnce(() => { view?.dispose(); observations.clear(); for (const stop of releases.reverse()) stop(); });
 		try {
 			await this.ready;
-			const normalized = normalizeDependencies(this.root, dependencies);
-			const precise = this.reliable
-				? this.acquirePreciseWatches(normalized)
-				: { paths: [] as string[], release: () => {} };
-			release = releaseOnce(() => {
-				view?.dispose();
-				precise.release();
-				reference();
-			});
-			const exact = await fingerprintDependencies(normalized, this.root, view);
+			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
+			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
+				const normalized = normalizeDependencies(this.root, requested).filter((dependency) => !observations.has(dependencyKey(dependency)));
+				if (!normalized.length) return;
+				// A leaf's identity does not prove its name stayed bound through ancestor A→B→A.
+				const ancestors = dependencies ? normalized.map((dependency) => dependency.path) : [];
+				while (ancestors.length) {
+					const target = ancestors.pop()!, dependency = { path: target, scope: "binding" as const };
+					if (observations.has(dependencyKey(dependency))) continue;
+					const binding = await fingerprintBinding(dependency);
+					observations.set(dependencyKey(dependency), binding);
+					if (path.dirname(target) !== target) ancestors.push(path.dirname(target));
+					if (binding.link !== undefined) ancestors.push(path.resolve(path.dirname(target), binding.link));
+				}
+				const precise = this.reliable ? this.acquirePreciseWatches(normalized) : undefined;
+				if (precise) { releases.push(precise.release); preciseContent.push(...precise.paths); }
+				for (const observation of await fingerprintDependencies(normalized, physicalRoot, view)) observations.set(dependencyKey(observation), observation);
+			};
+			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
+			if (dependencies) await capture(dependencies);
 			await watcherTurn();
 			const retained = view?.retained ? view : undefined;
-			retained?.seal();
-			const epoch = this.epoch;
+			if (dependencies) retained?.seal();
 			return {
-				root: this.root,
-				dependencies: normalized,
-				epoch,
-				watching: this.reliable,
-				preciseContent: precise.paths,
-				exact: exact.fingerprints,
-				stamps: exact.stamps,
-				manager: this,
-				...(retained ? { view: retained } : {}),
-				release,
+				root: this.root, physicalRoot, observations, epoch: this.epoch, watching: this.reliable, preciseContent,
+				manager: this, ...(retained ? { view: retained } : {}), release,
 			};
 		} catch (error) {
 			release();
@@ -250,21 +273,26 @@ export class ResourceVersionManager {
 		const started = performance.now();
 		if (!this.open || token.manager !== this || token.root !== this.root)
 			return validation(started, true, "resource_version_owner_changed", "exact");
-		await watcherTurn();
-		const watcherFailure = this.invalidation(token, sealing);
-		if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
 		try {
-			const current = await fingerprintDependencies(token.dependencies, this.root);
+			if (sealing) token.view?.seal(); else token.view?.assertComplete(true);
+			// Host windows need eager binding evidence; Windows can restore a junction without changing its stamps.
+			if (sealing && (process.platform === "win32" || !token.observations.has(`binding:${filesystemPathKey(this.root)}`))) throw new Error("resource_path_binding_window_unprovable");
+			if (!token.observations.size) throw new Error("resource_dependencies_unproven");
+			await watcherTurn();
+			const watcherFailure = this.invalidation(token, sealing);
+			if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
+			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot);
 			await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
 			if (lateFailure) return validation(started, true, lateFailure, "watcher");
-			const expired =
-				!sameValues(current.fingerprints, token.exact) ||
-				(sealing && !sameValues(current.stamps, token.stamps));
+			const expired = !current.length || current.some((entry) => {
+				const captured = token.observations.get(dependencyKey(entry));
+				return entry.fingerprint !== captured?.fingerprint || (sealing && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp));
+			});
 			const reason = sealing ? "resource_observation_window_changed" : "resource_fingerprint_changed";
 			return {
 				expired,
-				...validationMetrics(started, current.bytesRead, current.filesRead, "exact"),
+				...validationMetrics(started, current.reduce((sum, entry) => sum + entry.bytesRead, 0), current.reduce((sum, entry) => sum + entry.filesRead, 0), "exact"),
 				...(expired ? { reason } : {}),
 			};
 		} catch {
@@ -275,13 +303,12 @@ export class ResourceVersionManager {
 
 	private invalidation(token: ResourceVersionToken, sealing: boolean): string | undefined {
 		if (!this.open || token.manager !== this || token.root !== this.root) return "resource_version_owner_changed";
-		if (!token.watching) return undefined;
-		if (!this.reliable) return sealing ? "resource_observation_window_unprovable" : undefined;
-		if (this.changesSince(token).uncertain) return sealing ? "resource_observation_window_unprovable" : "resource_changed";
+		if (!sealing || !token.watching) return undefined; // Future reuse compares semantics; events only disprove a host execution window.
+		if (!this.reliable || this.changesSince(token).uncertain) return "resource_observation_window_unprovable";
 		const precise = new Set(token.preciseContent.map(filesystemPathKey));
 		const changed = this.events.some((event) => event.epoch > token.epoch &&
-			token.dependencies.some((dependency) => affects(dependency, event, precise)));
-		return changed ? sealing ? "resource_observation_window_changed" : "resource_changed" : undefined;
+			[...token.observations.values()].some((dependency) => affects(dependency, event, precise, sealing)));
+		return changed ? "resource_observation_window_changed" : undefined;
 	}
 
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
@@ -301,7 +328,7 @@ export class ResourceVersionManager {
 
 	subscribe(token: ResourceVersionToken, callback: (path: string) => void) {
 		const subscriber: ResourceSubscriber = {
-			dependencies: token.dependencies,
+			dependencies: [...token.observations.values()],
 			preciseContent: new Set(token.preciseContent.map(filesystemPathKey)),
 			callback,
 		};
@@ -396,7 +423,7 @@ export function resourceDependencies(
 	action: ActionKey,
 	root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-): ReadonlyArray<ResourceDependency> {
+) {
 	const definition = actionSemantics.definition(action.tool);
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined) return [];
@@ -407,12 +434,12 @@ export function resourceDependencies(
 }
 
 export function captureResourceVersion(
-	action: ActionKey,
+	action: ActionKey | undefined,
 	root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 	retainBytes?: number,
 ) {
-	return resourceVersionManager(root).capture(resourceDependencies(action, root, actionSemantics), retainBytes);
+	return resourceVersionManager(root).capture(action ? resourceDependencies(action, root, actionSemantics) : undefined, retainBytes);
 }
 
 export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
@@ -436,9 +463,10 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 	const token = value as Partial<ResourceVersionToken>;
 	return (
 		typeof token.root === "string" &&
+		typeof token.physicalRoot === "string" &&
 		typeof token.epoch === "number" &&
 		typeof token.watching === "boolean" &&
-		[token.dependencies, token.preciseContent, token.exact, token.stamps].every(Array.isArray) &&
+		token.observations instanceof Map && Array.isArray(token.preciseContent) &&
 		typeof token.release === "function" &&
 		token.manager instanceof ResourceVersionManager
 	);
@@ -472,43 +500,51 @@ function normalizeDependencies(root: string, dependencies: ReadonlyArray<Resourc
 		if (!containsFilesystemPath(root, absolute)) {
 			throw new Error(`resource dependency escapes workspace: ${dependency.path}`);
 		}
-		result.set(`${dependency.scope}:${filesystemPathKey(absolute)}`, { path: absolute, scope: dependency.scope });
+		const normalized = { path: absolute, scope: dependency.scope };
+		result.set(dependencyKey(normalized), normalized);
 	}
 	return [...result.values()];
 }
 
-function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
+const dependencyKey = (dependency: ResourceDependency) => `${dependency.scope}:${filesystemPathKey(dependency.path)}`;
+
+function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>, sealing = false) {
+	if (dependency.scope === "binding") return sealing && event.type === "rename" && filesystemPathKey(dependency.path) === filesystemPathKey(event.path);
 	if (event.type === "unknown") return true;
 	const dependencyPath = filesystemPathKey(dependency.path);
 	const changed = filesystemPathKey(event.path);
-	if (dependency.scope === "content") {
+	if (dependency.scope === "content" || dependency.scope === "stat") {
 		if (dependencyPath === changed) return true;
 		// Some recursive watchers report only the containing directory for a file write.
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
 	}
 	if (!containsFilesystemPath(dependencyPath, changed)) return false;
-	if (dependency.scope === "entries") {
+	if (dependency.scope === "entries" || dependency.scope === "names") {
 		return event.type !== "change" && (dependencyPath === changed || dependencyPath === filesystemPathKey(path.dirname(event.path)));
 	}
 	return true;
 }
 
-async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, root: string, view?: ResourceReadView) {
-	const realRoot = await fingerprintIO(() => fs.realpath(root));
-	const results = await mapLimit(dependencies, FINGERPRINT_CONCURRENCY, (dependency) =>
-		fingerprintDependency(dependency, realRoot, view),
-	);
-	return {
-		fingerprints: results.map((result) => result.fingerprint),
-		stamps: results.map((result) => result.stamp),
-		bytesRead: results.reduce((total, result) => total + result.bytesRead, 0),
-		filesRead: results.reduce((total, result) => total + result.filesRead, 0),
-	};
+async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, view?: ResourceReadView) {
+	return mapLimit(dependencies, FINGERPRINT_CONCURRENCY, async (dependency) => {
+		if (dependency.scope === "binding") return fingerprintBinding(dependency);
+		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
+		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
+	});
 }
 
-async function fingerprintDependency(dependency: ResourceDependency, realRoot: string, view?: ResourceReadView) {
-	const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
-	return { fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
+async function fingerprintBinding(dependency: ResourceDependency) {
+	let stamp: string | undefined, link: string | undefined;
+	try {
+		const before = await fingerprintIO(() => fs.lstat(dependency.path, { bigint: true }));
+		if (before.isSymbolicLink()) link = await fingerprintIO(() => fs.readlink(dependency.path));
+		const after = await fingerprintIO(() => fs.lstat(dependency.path, { bigint: true }));
+		stamp = sameFilesystemIdentity(before, after) ? digest([statStamp(after), link]) : undefined;
+	} catch (error) {
+		if (!missingResource(error)) throw error;
+		stamp = errorCode(error);
+	}
+	return { ...dependency, fingerprint: "binding", stamp, link, bytesRead: 0, filesRead: 0 };
 }
 
 type FingerprintResult = {
@@ -520,7 +556,7 @@ type FingerprintResult = {
 
 async function fingerprintPath(
 	target: string,
-	scope: ResourceDependencyScope,
+	scope: ResourceDependency["scope"],
 	realRoot: string,
 	ancestors: ReadonlySet<string>,
 	view?: ResourceReadView,
@@ -565,9 +601,10 @@ async function fingerprintPath(
 			filesRead: followed.filesRead,
 		};
 	}
-	if ((scope === "entries" && !descend) || ((scope === "entries" || scope === "tree_entries") && !info.isDirectory())) {
-		view?.capture(target, { type: info.isDirectory() ? "directory" : "file" });
-		return stableEntry(target, info, identity);
+	if (scope === "stat" || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
+		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special",
+			...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
+		return stableEntry(target, info, identity, scope);
 	}
 	if (info.isFile()) {
 		// Reserve before yielding: concurrent captures cannot each spend the entire token budget.
@@ -594,7 +631,7 @@ async function fingerprintPath(
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
 	const selected = [...entries].sort((left, right) => left.name.localeCompare(right.name));
 	const descendants = new Set(ancestors).add(identity);
-	const children = await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
+	const children = scope === "names" ? [] : await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
 		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
@@ -628,13 +665,14 @@ async function stableEntry(
 	target: string,
 	before: import("node:fs").BigIntStats,
 	resolved: string,
+	scope: ResourceDependency["scope"],
 ): Promise<FingerprintResult> {
 	const after = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
 	if (!sameFilesystemIdentity(before, after)) {
 		throw new Error(`resource_file_changed:${target}`);
 	}
 	return {
-		value: { type: specialFileType(after), mode: Number(after.mode), resolved },
+		value: { type: specialFileType(after), mode: Number(after.mode), resolved, size: scope === "stat" && after.isFile() ? Number(after.size) : undefined },
 		stamp: digest([statStamp(after), resolved]),
 		bytesRead: 0,
 		filesRead: 0,

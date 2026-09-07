@@ -30,7 +30,7 @@ export interface ToolFilesystemOperations {
 	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
 	readonly access: (target: string, writable?: boolean) => Promise<void>;
 	readonly exists?: (target: string) => boolean | Promise<boolean>;
-	readonly stat?: (target: string) => { isDirectory: () => boolean } | Promise<{ isDirectory: () => boolean }>;
+	readonly stat?: (target: string) => { isDirectory: () => boolean; size?: number } | Promise<{ isDirectory: () => boolean; size?: number }>;
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;

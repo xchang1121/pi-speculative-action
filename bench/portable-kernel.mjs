@@ -153,6 +153,7 @@ async function qualifyPiSearch(worker) {
 	const tool = createGrepToolDefinition(root), definition = { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: profile.id,
 		effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
 	const semantics = new ActionSemanticsRegistry([definition]);
+	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: ["grep"], maxBytes: () => profile.limits.inputBytes });
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const signal = new AbortController().signal, journeys = [];
 	const args = { pattern: "needle", path: ".", context: 1, limit: 1000 };
@@ -168,7 +169,7 @@ async function qualifyPiSearch(worker) {
 			draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall("grep", args), { stopReason: "toolUse" }),
 			actionSemantics: semantics, resolveInvocation: () => invocation,
 			preflight: () => { if (actorWaiting) authorized.resolve(); return true; },
-			executionWorlds: [createResourceSnapshotExecutionWorld(semantics, { tools: ["grep"], maxBytes: () => profile.limits.inputBytes })],
+			executionWorlds: [resources],
 			onEvent: (event) => {
 				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate.resolve(event.state);
 			},
@@ -198,8 +199,9 @@ async function qualifyPiSearch(worker) {
 		assert.deepEqual(actorWorker.profile, profile, "independent execution capacity must keep the same identity");
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(path.join(root, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
-		await fs.writeFile(path.join(root, ".gitignore"), "ignored.txt\n");
-		await fs.writeFile(path.join(root, "ignored.txt"), Buffer.alloc(16 * 1024 * 1024, "x"));
+		await fs.writeFile(path.join(root, ".gitignore"), "ignored.*\n");
+		await fs.writeFile(path.join(root, "ignored.bin"), Buffer.alloc(16 * 1024 * 1024, "x"));
+		await fs.writeFile(path.join(root, "ignored.txt"), "needle ignored\n");
 		await fs.writeFile(path.join(root, "notes.txt"), "before\nneedle\nafter\n");
 		for (let index = 0; index < 16; index++) await fs.writeFile(path.join(root, "data-" + index + ".txt"), "no match\n".repeat(8192) + "needle " + index + "\n");
 		const sample = async (execute) => {
@@ -209,13 +211,11 @@ async function qualifyPiSearch(worker) {
 		};
 		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
-		assert.ok(!reads.has("/workspace/ignored.txt"), "the broker transferred ignored content");
-		await assert.rejects(execute("actor", fs, { args: { ...args, path: "ignored.txt" }, signal }), /input byte budget/);
+		assert.ok(!reads.has("/workspace/ignored.bin") && !reads.has("/workspace/ignored.txt"), "the broker transferred ignored content");
+		await assert.rejects(execute("actor", fs, { args: { ...args, path: "ignored.bin" }, signal }), /input byte budget/);
 		await assert.rejects(actorWorker.request({ kind: "grep", root, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
-		// Transport is on demand; ResourceVersionManager still captures static tree_content dependencies.
-		await fs.writeFile(path.join(root, "ignored.txt"), "needle ignored\n");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
 		const ready = journey(); await ready.start("produce");
 		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
@@ -228,9 +228,10 @@ async function qualifyPiSearch(worker) {
 			const actor = await execute("actor", fs, { args: query, signal });
 			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
 			assert.deepEqual(reconstructed.output, actor.result);
-			assert.equal(reconstructed.settlement.provider.match?.projector, "resource.inputs");
+			assert.equal(reconstructed.settlement.provider.kind, query.glob ? "actor" : "speculative");
+			if (!query.glob) assert.equal(reconstructed.settlement.provider.match?.projector, "resource.inputs");
 		}
-		assert.equal(ready.actorCalls(), 0);
+		assert.equal(ready.actorCalls(), 1, "a new query cannot extend a sealed candidate's input authority");
 		const reached = Promise.withResolvers(), resume = Promise.withResolvers();
 		const running = journey(async () => { reached.resolve(); await resume.promise; });
 		await running.start("running");
@@ -245,21 +246,22 @@ async function qualifyPiSearch(worker) {
 		} finally { resume.resolve(); await running.host.dispose(); }
 		await fs.writeFile(path.join(root, "notes.txt"), "changed\n");
 		const stale = await ready.actor("stale");
-		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 1);
+		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 2);
 		assert.notDeepEqual(stale.output, expected);
 		await ready.start("observed", false);
 		const observed = await ready.actor("observed");
 		assert.deepEqual(observed.output, stale.output);
-		if (observed.settlement.provider.kind === "actor") {
+		if (!resources.observation.capabilities.length) assert.equal(observed.settlement.provider.kind, "actor", "unproven host observations cannot be promoted");
+		else if (observed.settlement.provider.kind === "actor") {
 			const gate = observed.settlement.rejections.find((rejection) => rejection.cause.code === "candidate_join_not_profitable");
 			assert.ok(gate, JSON.stringify(observed.settlement)); assert.ok(JSON.parse(gate.cause.detail).expectedNetBenefitMs < 0);
 		}
 		assert.equal(counts.producer, beforeHit + queries.length + 1, "rejected completed replay must not execute guest code");
-		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 2 : 1);
+		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 3 : 2);
 		const changed = journey(() => fs.writeFile(path.join(root, "notes.txt"), "changed during search\n"));
 		await changed.start("changing");
 		const failed = await bounded(changed.candidate, "changed search");
-		assert.equal(failed.status, "failed"); assert.match(JSON.stringify(failed.cause), /resource_observation_window_changed/);
+		assert.equal(failed.status, "failed"); assert.match(JSON.stringify(failed.cause), /resource_fingerprint_changed/);
 		assert.deepEqual((await changed.actor("changed")).output, stale.output); assert.equal(changed.actorCalls(), 1);
 		const paused = Promise.withResolvers(), released = Promise.withResolvers();
 		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 2);
@@ -282,7 +284,7 @@ async function qualifyPiSearch(worker) {
 		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
 		assert.ok(counts.contextReads > 0, "the original Pi context reread was not exercised");
 		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, inputTransport, speculativeMs: completed.executionMs,
-			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length, ...counts,
+			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
 			actorRanWhileProducerPaused: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1, actorWorkerPreparationMs: actorWorker.preparationMs,

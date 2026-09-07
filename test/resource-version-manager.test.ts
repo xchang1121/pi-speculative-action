@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createFindTool, createGrepTool, createLsTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -13,7 +12,6 @@ import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
-	ResourceReadView,
 	ResourceVersionManager,
 	releaseResourceVersion,
 	resourceDependencies,
@@ -29,13 +27,20 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
-	test.each([true, false])("seals only stable Actor observation windows (watch=%s)", async (watch) => {
-		for (const change of ["unchanged", "sibling", "write", "restore", "replace", "entries"] as const) {
+	test.each([true, false])("seals eager observations and on-demand inputs (watch=%s)", async (watch) => {
+		for (const onDemand of [false, true]) for (const change of ["unchanged", "sibling", "write", "restore", "replace", "entries"] as const) {
 			const root = await workspace({ "value.txt": "A" });
 			const file = path.join(root, "value.txt");
 			const manager = new ResourceVersionManager(root, { watch });
 			const target = change === "entries" ? ["."] : ["value.txt"];
-			const token = await manager.capture(resourceDependencies(action(change === "entries" ? "ls" : "read", target), root));
+			const token = await manager.capture(onDemand ? undefined : resourceDependencies(action(change === "entries" ? "ls" : "read", target), root), 8192);
+			if (onDemand) {
+				expect((await manager.validate(token)).expired).toBe(true); // Open capture is never an adoptable certificate.
+				const value = change === "entries" ? root : file, view = token.view!;
+				const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
+				for (const capture of watch ? inputs : inputs.reverse()) await capture();
+				expect(change === "entries" ? await view.readdir(root) : (await view.readFile(file)).toString()).toEqual(change === "entries" ? ["value.txt"] : "A");
+			}
 			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
 			if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
 			if (change === "restore") {
@@ -51,20 +56,20 @@ describe("speculative action resource versions", () => {
 					await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
 				}
 			}
-			if (watch) await settleWatcher();
-			const changed = change !== "unchanged" && change !== "sibling";
-			expect((await manager.validate(token)).expired, change).toBe(watch ? changed : change === "write");
-			expect((await manager.seal(token)).expired, change).toBe(changed);
+			token.view!.seal();
+			expect((await manager.validate(token)).expired, change).toBe(change === "write");
+			expect((await manager.seal(token)).expired, change).toBe(onDemand || process.platform === "win32" || change !== "unchanged");
+			const released = manager.validate(token);
 			releaseResourceVersion(token);
+			expect((await released).expired).toBe(true); // Release during validation retires the evidence, not just its payload.
 			manager.close();
 		}
 	});
 
 	test("owns bounded immutable inputs and never converts unproven access into absence", async () => {
 		expect((await validateResourceVersion(undefined)).expired).toBe(true);
-		const root = await workspace(), file = path.join(root, "value.txt");
 		const payload = Buffer.concat([Buffer.alloc(1024 * 1024, 65), Buffer.alloc(1024 * 1024, 66), Buffer.from("end")]);
-		await fs.writeFile(file, payload);
+		const root = await workspace({ "value.txt": payload }), file = path.join(root, "value.txt");
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const dependencies = resourceDependencies(action("read", ["value.txt", "missing"]), root);
 		for (const [budget, paths] of [[0, dependencies], [payload.length, dependencies.slice(0, 1)]] as const) {
@@ -72,21 +77,21 @@ describe("speculative action resource versions", () => {
 			const observed = await manager.capture(paths, budget);
 			expect(opened).toHaveBeenCalledOnce(); opened.mockRestore();
 			expect(observed.view).toBeUndefined(); // No partial input authority after either payload or metadata exhaustion.
-			expect((await manager.seal(observed)).expired).toBe(false);
+			expect((await manager.validate(observed)).expired).toBe(false);
 			observed.release();
 		}
 		const token = await manager.capture(dependencies, 3 * 1024 * 1024), view = token.view!;
 		await expect(view.evaluate(async (scope) => {
-			try { scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
+			try { await scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
 		})).rejects.toThrow("resource_access_unproven");
 		expect(await view.evaluate((scope) => scope.readFile(file))).toEqual(payload);
 		expect((await captureStableFile(file)).hash).toBe(createHash("sha256").update(payload).digest("hex"));
 		(await view.readFile(file)).fill(66);
 		await fs.writeFile(file, "B");
-		expect([await view.readFile(file), view.stat(file).size]).toEqual([payload, payload.length]);
-		expect(view.exists(path.join(root, "missing"))).toBe(false);
+		expect([await view.readFile(file), (await view.stat(file)).size]).toEqual([payload, payload.length]);
+		expect(await view.exists(path.join(root, "missing"))).toBe(false);
 		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
-		expect(() => view.exists(path.join(root, "unknown"))).toThrow("resource_access_unproven");
+		await expect(view.exists(path.join(root, "unknown"))).rejects.toThrow("resource_access_unproven");
 		expect(() => view.assertComplete()).toThrow("resource_access_unproven");
 		expect((await manager.seal(token)).expired).toBe(true);
 		releaseResourceVersion(token);
@@ -95,24 +100,26 @@ describe("speculative action resource versions", () => {
 		manager.close();
 	});
 
-	test("retains payloads across both orders of overlapping metadata captures", async () => {
-		for (const reverse of [false, true]) {
-			const view = new ResourceReadView(4096), root = path.resolve("sealed"), file = path.join(root, "value");
-			const captures = [() => { view.capture(root, { type: "directory", entries: ["value"] }); view.capture(file, { type: "file", content: Buffer.from("A") }); },
-				() => { view.capture(root, { type: "directory" }); view.capture(file, { type: "file", content: undefined }); }];
-			for (const capture of reverse ? captures.reverse() : captures) capture();
-			view.seal();
-			expect(view.readdir(root)).toEqual(["value"]);
-			expect([(await view.readFile(file)).toString(), view.stat(file).size]).toEqual(["A", 1]);
-			expect(() => view.capture(file, { type: "file" })).toThrow("not_capturing");
-			view.dispose();
-		}
+	test("coalesces capture of one input but never seals or leaks a pending read", async () => {
+		const root = await workspace({ value: "A" }), manager = new ResourceVersionManager(root, { watch: false });
+		let notify!: () => void, resume!: () => void;
+		const entered = new Promise<void>((resolve) => { notify = resolve; }), gate = new Promise<void>((resolve) => { resume = resolve; });
+		const handle = await fs.open(path.join(root, "value"), "r");
+		const open = vi.spyOn(fs, "open").mockImplementationOnce(async () => { notify(); await gate; return handle; });
+		const token = await manager.capture(undefined, 8192), read = () => token.view!.readFile(path.join(root, "value"));
+		const pending = Promise.allSettled([read(), read()]);
+		try {
+			await entered;
+			expect((await manager.seal(token)).expired).toBe(true);
+			token.release(); resume();
+			expect((await pending).map((entry) => entry.status)).toEqual(["rejected", "rejected"]);
+			expect(handle.fd).toBe(-1); expect(open).toHaveBeenCalledOnce();
+		} finally { resume(); await pending; token.release(); open.mockRestore(); manager.close(); }
 	});
 
 	test("re-evaluates original read arguments over sealed bytes, not parsed output notices", async () => {
-		const root = await workspace(), file = path.join(root, "value.txt");
 		const text = "first\r\n\n[999 more lines in file. Use offset=3 to continue.]\n" + "x".repeat(60_000) + "\nlast";
-		await fs.writeFile(file, text);
+		const root = await workspace({ "value.txt": text }), file = path.join(root, "value.txt");
 		const args = { path: "value.txt", offset: 1, limit: 1 }, native = createReadTool(root);
 		const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
 		const key = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { fingerprint: "original", context: invocation })!;
@@ -132,7 +139,7 @@ describe("speculative action resource versions", () => {
 		} finally { await branch.dispose(); }
 	});
 
-	test.each([false, true])("capture and branch share one resource lifetime (changed=%s)", async (changed) => {
+	test.runIf(process.platform !== "win32")("capture and branch share one resource lifetime", async () => {
 		const root = await workspace({ "value.txt": "A" });
 		const file = path.join(root, "value.txt");
 		const key = action("read", ["value.txt"]);
@@ -144,22 +151,15 @@ describe("speculative action resource versions", () => {
 			action: key, callID: "actor-read", signal: new AbortController().signal,
 		});
 		const actorOutput = { result: { content: [{ type: "text" as const, text: "A" }], details: {} }, isError: false };
-		if (changed) {
-			await fs.writeFile(file, "B");
-			await settleWatcher();
-			await expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
-		} else {
-			const branch = await capture.seal(actorOutput);
-			await capture.dispose(); // A sealed capture no longer owns the token.
-			expect(await branch.commit()).toBe(actorOutput);
-			const invalidated = new Promise<string | undefined>((resolve) => branch.watch?.(resolve));
-			await fs.writeFile(file, "B");
-			expect(await invalidated).toBe(file);
-			await branch.dispose();
-			await branch.dispose();
-			expect((await branch.validate?.())?.status).toBe("stale");
-			await expect(branch.commit()).rejects.toThrow("disposed");
-		}
+		const branch = await capture.seal(actorOutput);
+		await capture.dispose(); // A sealed capture no longer owns the token.
+		expect(await branch.commit()).toBe(actorOutput);
+		const invalidated = new Promise<string | undefined>((resolve) => branch.watch?.(resolve));
+		await fs.writeFile(file, "B");
+		expect(await invalidated).toBe(file);
+		await branch.dispose(); await branch.dispose();
+		expect((await branch.validate?.())?.status).toBe("stale");
+		await expect(branch.commit()).rejects.toThrow("disposed");
 		await expect(capture.seal(actorOutput)).rejects.toThrow("already consumed");
 		expect(actorOutput.result.content[0]?.text).toBe("A");
 		const next = await captureResourceVersion(key, root);
@@ -172,11 +172,8 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.runIf(process.platform === "linux").each(["grep", "find"] as const)("does not certify %s from workspace-only evidence", async (name) => {
-		const root = await workspace(), config = await workspace();
-		await fs.mkdir(path.join(config, "fd"));
+		const root = await workspace({ "value.ts": "alpha\n" }), config = await workspace({ [name === "grep" ? "rg" : "fd/ignore"]: "" });
 		const configuration = path.join(config, name === "grep" ? "rg" : "fd/ignore");
-		await fs.writeFile(configuration, "");
-		await fs.writeFile(path.join(root, "value.ts"), "alpha\n");
 		vi.stubEnv("XDG_CONFIG_HOME", config);
 		vi.stubEnv("RIPGREP_CONFIG_PATH", path.join(config, "rg"));
 		try {
@@ -216,11 +213,9 @@ describe("speculative action resource versions", () => {
 
 	test.for(["file", "directory"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
 		if (kind === "file" && process.platform === "win32") return skip("file symlinks require Windows privileges");
-		const root = await workspace(), outside = await workspace(), directory = kind === "directory";
+		const directory = kind === "directory", root = await workspace({ [directory ? "tree/value.txt" : "value.txt"]: "before" }), outside = await workspace({ "value.txt": "external" });
 		const target = path.join(root, "value.txt"), alias = path.join(root, "alias"), link = path.join(root, "input");
 		const tree = path.join(root, "tree"), content = directory ? path.join(tree, "value.txt") : target;
-		if (directory) await fs.mkdir(tree);
-		await fs.writeFile(content, "before");
 		const type = directory ? process.platform === "win32" ? "junction" : "dir" : "file";
 		await fs.symlink(directory ? tree : target, link, type); await fs.symlink(link, alias, type);
 		const manager = new ResourceVersionManager(root, { watch: false });
@@ -234,14 +229,24 @@ describe("speculative action resource versions", () => {
 			const expected = await native.execute("actor", args);
 			expect(actual.result.content).toEqual(expected.content);
 			expect(Object.entries(actual.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
+			const leaf = directory ? path.join(alias, "value.txt") : alias, parked = path.join(root, "parked");
+			const observed = await manager.capture([{ path: leaf, scope: "content" }]);
+			await fs.rename(link, parked);
+			try {
+				await fs.symlink(directory ? outside : path.join(outside, "value.txt"), link, type);
+				expect(await fs.readFile(leaf, "utf8")).toBe("external"); // Actual Actor sees B, not the captured A.
+			} finally { await fs.rm(link, { force: true }); await fs.rename(parked, link); }
+			try {
+				expect(await fs.readFile(leaf, "utf8")).toBe("before");
+				expect((await manager.seal(observed)).expired).toBe(true); // Restoring the SAME junction can preserve Windows inode/ctime.
+			} finally { observed.release(); }
 			await fs.writeFile(content, "after!");
 			expect((await token.view!.readFile(directory ? path.join(alias, "value.txt") : alias)).toString()).toBe("before");
 			expect(await manager.validate(token)).toMatchObject({ expired: true, mode: "exact", bytesRead: 6 });
-			await fs.writeFile(path.join(outside, "value.txt"), "external");
 			const escape = path.join(root, "escape");
 			await fs.symlink(directory ? outside : path.join(outside, "value.txt"), escape, type);
 			await expect(manager.capture([{ path: escape, scope: "tree_content" }], 8192)).rejects.toThrow("resource_symlink_escapes_workspace");
-			expect(() => token.view!.exists(path.join(alias, "unproven"))).toThrow("resource_access_unproven");
+			await expect(token.view!.exists(path.join(alias, "unproven"))).rejects.toThrow("resource_access_unproven");
 		} finally { token.release(); manager.close(); }
 	});
 
@@ -265,9 +270,7 @@ describe("speculative action resource versions", () => {
 	])("validates exactly the declared $scope, without guessing configuration paths", async ({ scope, stale }) => {
 		for (const [change, relative] of Object.entries({ content: "src/value.ts", entry: "src/added.ts",
 			deep: "src/nested/added.ts", outside: ".gitignore", restore: "src/transient" })) {
-			const root = await workspace();
-			await fs.mkdir(path.join(root, "src/nested"), { recursive: true });
-			await fs.writeFile(path.join(root, "src/value.ts"), "one\n");
+			const root = await workspace({ "src/value.ts": "one\n", "src/nested/existing.ts": "" });
 			const manager = new ResourceVersionManager(root, { watch: false });
 			const token = await manager.capture([{ path: "src", scope }]);
 			await fs.writeFile(path.join(root, relative), "changed\n");
@@ -296,21 +299,16 @@ describe("speculative action resource versions", () => {
 
 });
 
-function action(tool: string, resources: ReadonlyArray<string>) {
-	return buildActionKey({
-		tool,
-		resources,
-		input: tool === "read" || tool === "ls" ? { path: resources[0] } : { path: resources[0], pattern: "*" },
-	});
+function action(tool: "read" | "ls", resources: ReadonlyArray<string>) {
+	return buildActionKey({ tool, resources, input: { path: resources[0] } });
 }
 
 async function workspace(files: Readonly<Record<string, string | Buffer>> = {}) {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-resource-version-"));
+	const root = await fs.mkdtemp(path.join(process.cwd(), "test", "pi-resource-version-"));
 	roots.push(root);
-	await Promise.all(Object.entries(files).map(([name, content]) => fs.writeFile(path.join(root, name), content)));
+	await Promise.all(Object.entries(files).map(async ([name, content]) => {
+		await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+		await fs.writeFile(path.join(root, name), content);
+	}));
 	return root;
-}
-
-async function settleWatcher() {
-	await new Promise((resolve) => setTimeout(resolve, 80));
 }

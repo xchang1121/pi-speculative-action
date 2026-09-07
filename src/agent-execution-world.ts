@@ -44,17 +44,19 @@ export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 	operations?: { readonly tools: readonly string[]; readonly maxBytes: () => number },
 ): AgentExecutionWorld {
+	const canObserve = process.platform !== "win32";
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-		fingerprint: () => "resource-version:v2",
+		fingerprint: () => "resource-version:v3",
 		diagnostics: () => ({
 			state: "ready" as const,
 			detail: "Resource-version snapshots are available",
 		}),
 	};
-	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
+	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
+		if (!onDemand && !canObserve) throw new Error("Windows path binding stamps cannot certify host execution windows");
 		const setupStarted = performance.now();
-		let version: ResourceVersionToken | undefined = await captureResourceVersion(context.action, context.cwd, actionSemantics, retainBytes);
+		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, context.cwd, actionSemantics, retainBytes);
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
 			view: version.view,
@@ -63,9 +65,9 @@ export function createResourceSnapshotExecutionWorld(
 				version = undefined;
 				if (!owned) throw new Error("resource snapshot capture is already consumed");
 				try {
-					const validation = await owned.manager.seal(owned);
+					owned.view?.seal();
+					const validation = await (onDemand ? owned.manager.validate(owned) : owned.manager.seal(owned));
 					if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
-					owned.view?.assertComplete();
 					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs);
 				} catch (error) {
 					releaseResourceVersion(owned);
@@ -79,7 +81,9 @@ export function createResourceSnapshotExecutionWorld(
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		observation: { ...route, capture: (context) => capture(context,
+		observation: { ...route, capabilities: canObserve ? route.capabilities : [],
+			diagnostics: () => canObserve ? route.diagnostics() : { state: "unavailable", detail: "Host path-binding observation is unproven on Windows; captured-input execution remains available" },
+			capture: (context) => capture(context,
 			operations?.tools.includes(context.toolName) && (context.action.executionContext as ToolInvocation | undefined)?.filesystem
 				? operations.maxBytes() : undefined) },
 		...(operations?.tools.length ? { speculation: {
@@ -95,10 +99,10 @@ export function createResourceSnapshotExecutionWorld(
 				const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				context.signal.throwIfAborted();
-				const owned = await capture(context, operations.maxBytes());
+				const owned = await capture(context, operations.maxBytes(), true);
 				try {
 					if (!owned.view) throw new Error("resource_snapshot_budget_exceeded");
-					const output = await owned.view.evaluate((view) => execute(view, context));
+					const output = await execute(owned.view, context);
 					context.signal.throwIfAborted();
 					return await owned.seal(output);
 				} finally { await owned.dispose(); }
