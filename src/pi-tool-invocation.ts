@@ -7,7 +7,10 @@ import type { ToolInvocation } from "./tool-settlement.ts";
 import { withPiProjectionCoverage } from "./pi-read-projection.ts";
 
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
-export const PI_RESOURCE_TOOLS: readonly string[] = VERSION === "0.84.1" ? ["read", "ls"] : [];
+export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "process", readonly string[]>> = {
+	resources: VERSION === "0.84.1" ? ["read", "ls"] : [],
+	process: ["bash"],
+};
 
 export type PiToolDefinition = ReturnType<
 	| typeof createReadToolDefinition | typeof createBashToolDefinition | typeof createEditToolDefinition
@@ -43,7 +46,7 @@ export function resolvePiToolInvocation(
 	input: unknown,
 	options: PiToolInvocationOptions,
 ): ToolInvocation | undefined {
-	if (PI_RESOURCE_TOOLS.includes(tool)) {
+	if (PI_OPERATION_TOOLS.resources.includes(tool)) {
 		const cwd = options.cwd;
 		const autoResizeImages = options.autoResizeImages ?? true;
 		const modelSupportsImages = options.modelSupportsImages ?? true;
@@ -70,7 +73,7 @@ export function resolvePiToolInvocation(
 			},
 		};
 	}
-	if (tool !== "bash" || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
+	if (!PI_OPERATION_TOOLS.process.includes(tool) || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const record = input as Record<string, unknown>;
 	if (typeof record.command !== "string") return undefined;
 	const shell = getShellConfig(options.shellPath);

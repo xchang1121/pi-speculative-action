@@ -1,5 +1,4 @@
 import path from "node:path";
-import { UNBOUNDED_ACTION_TOOLS } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import {
@@ -16,6 +15,8 @@ import {
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
+	/** Tools whose complete process outlet is bound by this host, not all process-shaped effect contracts. */
+	readonly tools: readonly string[];
 	readonly backend?: LinuxProcessReuseBackend;
 	/** Shared explicitly with sibling execution worlds when they belong to one host lifecycle. */
 	readonly workspaceSandbox?: WorkspaceSandboxService;
@@ -46,7 +47,7 @@ export function createLinuxProcessExecutionWorld(
 		storage: backend.storage,
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-			tools: UNBOUNDED_ACTION_TOOLS,
+			tools: options.tools,
 			fingerprint: async (request) => {
 				backendChecked = true;
 				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;

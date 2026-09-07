@@ -12,7 +12,7 @@ import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWor
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
 import { withPiProjectionCoverage } from "../src/pi-read-projection.ts";
-import { PI_RESOURCE_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
@@ -65,7 +65,7 @@ export async function qualifyStockTool(
 	const operation = { tool: name, input: args, action, callID: context.callID };
 	let primaryEnabled = false;
 	const fallback = createWorkspaceSandbox({ driver: "git" });
-	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_RESOURCE_TOOLS, maxBytes: () => 1024 * 1024 });
+	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_OPERATION_TOOLS.resources, maxBytes: () => 1024 * 1024 });
 	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([
 		...(primary ? [primary.world] : []), fallback, resources,
 	], (id) => id !== primary?.world.id || primaryEnabled);

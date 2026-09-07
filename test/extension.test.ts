@@ -183,22 +183,26 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 	});
 
-	it("prepends configured runtime providers without removing native fallbacks", async () => {
+	it("preserves provider priority and admits only bound process tools before probing", async () => {
 		const primary = {
-			id: "primary_runtime",
-			scope: "runtime",
-			isolation: "runtime_sandbox",
+			id: "primary_runtime", scope: "runtime", isolation: "runtime_sandbox",
 			speculation: { capabilities: [] },
 		} as unknown as SpeculativeAgentExecutionWorld;
 		const fixture = await createFixture({ executionWorlds: [primary] });
 		await fixture.emit("session_start", {}, fixture.context);
 
-		expect(fixture.executionWorlds().map((world) => world.id)).toEqual([
-			"primary_runtime",
-			"linux_process_reuse",
-			"git_worktree",
-			"resource_version",
-		]);
+		const worlds = fixture.executionWorlds();
+		expect(worlds.map((world) => world.id)).toEqual(["primary_runtime", "linux_process_reuse", "git_worktree", "resource_version"]);
+		const native = worlds[1]!.speculation!;
+		const prepare = vi.spyOn(native, "prepare").mockResolvedValue(undefined);
+		vi.spyOn(native, "fingerprint").mockReturnValue("qualified-test-process");
+		const router = new ExecutionWorldRouter(worlds);
+		for (const tool of ["grep", "find", "bash"]) {
+			// Even a process-only request needs a binding; effect coverage alone must not launch a probe.
+			const route = await router.resolve({ tool, effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, { cwd: fixture.cwd });
+			expect(route?.backend).toBe(tool === "bash" ? "linux_process_reuse" : undefined);
+		}
+		expect(prepare).toHaveBeenCalledOnce();
 	});
 
 	it("applies the primary and native pre-execution layers independently", async () => {
@@ -212,14 +216,14 @@ describe("zero-modification Pi extension", () => {
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Apply changes", "Close"],
 			"Tools & execution": ["Execution routes", "Back"],
-			"Execution routes": ["[x] Unified execution environment", "[x] Native speculative fallback", "Back"],
+			"Execution routes": ["[x] Unified execution environment", "[x] Local safe fallback", "Back"],
 		});
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(menus.get("Execution routes")).toEqual(expect.arrayContaining([
 			expect.stringMatching(/^\[ \] Unified execution environment/u),
-			expect.stringMatching(/^\[ \] Native speculative fallback/u),
+			expect.stringMatching(/^\[ \] Local safe fallback/u),
 			"Actor execution · always available",
 		]));
 		expect(fixture.store.effective()?.executionRouting).toEqual({ primary: false, nativeFallback: false });
@@ -265,17 +269,12 @@ describe("zero-modification Pi extension", () => {
 			expect.arrayContaining(["Tool policy › 6/7 enabled for prediction", "Execution routes"]),
 		);
 		expect(menus.get("Tool policy · [x] prediction on · [ ] prediction off")).toEqual(expect.arrayContaining([
-			expect.stringMatching(new RegExp(
-				"^\\[ \\] bash · Predict Off · Replay Check · Observe Unavailable · Fork Unavailable",
-			)),
+			expect.stringMatching(/^\[ \] bash · Predict Off · Replay Check · Observe Unavailable · Fork Unavailable/u),
+			expect.stringMatching(/read · Predict On · Replay Ready · Observe Ready · Fork Ready/u),
+			expect.stringMatching(/find · Predict On · Replay Unavailable · Observe Unavailable · Fork Unavailable/u),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
-		expect(menus.get("Actor probe")).not.toEqual(
-			expect.arrayContaining([expect.stringMatching(/^Use forked calls/)]),
-		);
-		expect(menus.get("Actor probe")).not.toEqual(
-			expect.arrayContaining([expect.stringMatching(/^Minimum tool-name confidence/)]),
-		);
+		expect(menus.get("Actor probe")?.some((label) => /^(Use forked calls|Minimum tool-name confidence)/u.test(label))).toBe(false);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Replay, Observe, and Fork are independent"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining(`Actor Bash history: ${process.platform === "linux" ? "Ready" : "Unavailable"}`),
@@ -316,7 +315,7 @@ describe("zero-modification Pi extension", () => {
 			);
 			await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
 			expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.map(([refresh]) => refresh)).toEqual([false, false, true]);
-			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("diagnostics refresh only while the plugin is enabled"), "info");
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Diagnostics refresh enabled providers only"), "info");
 			expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
 			release({ state: "unavailable", detail: "test route unavailable" });
 			await applying;
@@ -645,7 +644,7 @@ function portableDiagnostics(
 		},
 		{
 			id: "resource_version", scope: "fallback", isolation: "resource_snapshot",
-			capabilities: [], state: "unavailable", detail: "Speculative execution is not provided",
+			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read", "ls"], state: "ready", detail: "Sealed file inputs ready",
 			observation: {
 				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 				state: "ready", detail: "Resource validation ready",

@@ -19,14 +19,17 @@ Runtime 分为四个相互独立的层次：
 
 | 优先级 | 路线 | 范围 |
 |---|---|---|
-| 1 | `runtime_sandbox` | 内置 Linux/WSL 进程世界或宿主注入的 Runtime 全局世界；探测通过时优先 |
-| 2 | `resource_snapshot` | 只观察 Actor 已授权的 `read`、`ls` 结果；不授权提前执行 host function |
+| 1 | 已安装的统一执行环境 | 宿主注入的 Runtime 全局世界；探测通过且能够覆盖当前工具时优先 |
+| 2 | 本地 `runtime_sandbox` | 合格的 Linux/WSL 进程世界；独立于统一环境开关 |
+| 2 | `resource_snapshot` | 观察 Actor 结果，或让显式绑定的原版 `read`、`ls` 操作读取封存输入；不授权提前执行任意 host function |
 | 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
 在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有工作区原语，再用 Sandlock 的 Landlock/seccomp 策略与虚拟文件系统限制进程。当前实现刻意不创建 user、PID 或 mount namespace，因此命令保留 Actor 的原生身份。任何内核能力、binary 或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
-工具策略不按平台或工具名硬编码。启动诊断会把每个执行世界声明的效果保证与工具要求相交：Windows、macOS、WSL 1 和探测不完整的 Linux 默认可配置 `read`、`ls`、`write`、`edit`；Linux/WSL 2 进程世界就绪后再加入 `bash`；宿主注入覆盖全部效果的世界时则可启用全部工具。设置中已选但当前无安全路线的工具会保留偏好但处于 inactive，不会发送给投机源。
+能力由提供者的效果保证、已验证的工具绑定和当前设置共同决定：Pi 0.84.1 的封存资源绑定支持 `read`、`ls`，Git 支持 `write`、`edit`，合格 Linux/WSL 2 进程世界再支持 `bash`。这不是按操作系统写一套工具规则；Windows 与 Linux 共用文件操作实现，macOS 使用同一实现但尚缺真机资格测试。没有安全路线的工具保留预测偏好，但不会提前执行。
+
+封存资源沿用现有 token 的预算、所有权和释放机制，不增加缓存层；原版 Pi 负责图片、截断和结果格式。未知资源访问、预算超限、链接逸出、特殊文件内容或执行窗口变化都会拒绝投机。图片缩放设置和 Actor 模型的图片能力进入执行身份。由于路径/MIME helper 不是 Pi 公共 API，其他 Pi 版本仅保留观察，不假定具备提前执行资格。原生 `grep/find` 还需要完整进程提供者，不能只观察 rg/fd 而遗漏配置、子进程或 Pi 回读文件。
 
 进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只对精确的 exec syscall 做映射，`PATH`、普通文件打开、metadata、目录内容、写入、cwd 与环境都保持原样。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
 
@@ -82,7 +85,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、原生投机 fallback 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关或层级策略时，会先完成路由诊断更新，再提示完成并刷新 footer。回合登记只修改内存，支持回合中途启用思程层；显式刷新也会重新检查已经断开的 Runtime。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
+在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、本地安全 fallback（封存输入、工作区事务或合格进程） 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关或层级策略时，会先完成路由诊断更新，再提示完成并刷新 footer。回合登记只修改内存，支持回合中途启用思程层；显式刷新也会重新检查已经断开的 Runtime。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
 
 配置由 package 自己管理：
 

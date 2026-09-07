@@ -41,7 +41,7 @@ import {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
-import { createPiToolDefinitions, PI_RESOURCE_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
+import { createPiToolDefinitions, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
@@ -203,8 +203,8 @@ type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "for
 type ExecutionRoutesSnapshot = {
 	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly actorProcessReplay?: ProcessRouteSnapshot;
+	readonly primaryIDs: ReadonlySet<string>;
 };
-type ExecutionLayerCounts = { readonly primary: number; readonly native: number };
 
 export interface SpeculativeSettingsStore {
 	readonly scope: SpeculativeSettingsScope;
@@ -228,8 +228,7 @@ interface SpeculativeActionController {
 	readonly toolConflicts: () => ReadonlyMap<string, string>;
 	readonly recentEvents: () => readonly string[];
 	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
-	readonly executionSummary: () => string;
-	readonly executionLayers: () => ExecutionLayerCounts;
+	readonly executionRoutes: () => ExecutionRoutesSnapshot;
 	readonly maintainExecutionStorage: (operation: "gc" | "clear") => Promise<{ text: string; failed: boolean }>;
 	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => Promise<void>;
 	readonly attachUI: (ui: ExtensionUIContext) => void;
@@ -471,13 +470,14 @@ async function installController(
 			...primaryExecutionWorlds,
 			createLinuxProcessExecutionWorld({
 				coordinator: processCoordinator,
+				tools: PI_OPERATION_TOOLS.process,
 				backend: processBackend,
 				storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
 				workspaceSandbox,
 			}),
 			workspaceSandbox.createExecutionWorld(),
 			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
-				tools: PI_RESOURCE_TOOLS, maxBytes: () => currentSettings.resourceCacheMaxBytes,
+				tools: PI_OPERATION_TOOLS.resources, maxBytes: () => currentSettings.resourceCacheMaxBytes,
 			}),
 		]),
 	];
@@ -496,7 +496,7 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
-		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(),
+		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
 	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -601,11 +601,7 @@ async function installController(
 		toolConflicts: () => new Map(toolConflicts),
 		recentEvents: () => [...recentEvents],
 		refreshExecutionDiagnostics,
-		executionSummary: () => executionWorldSummary(toolCapabilities(), executionRoutes()),
-		executionLayers: () => ({
-			primary: primaryExecutionWorldIDs.size,
-			native: executionWorlds.length - primaryExecutionWorldIDs.size,
-		}),
+		executionRoutes,
 		maintainExecutionStorage: async (operation) => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
@@ -1254,16 +1250,16 @@ async function openExecutionRoutes(
 ): Promise<void> {
 	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 	ctx.ui.notify(
-		`Predict controls what sources may propose. Replay, Observe, and Fork are independent runtime capabilities. Pre-execution follows the configured hierarchy; diagnostics refresh only while the plugin is enabled, and unavailable work stays with the Actor.\n${controller.executionSummary()}`,
+		`Predict controls what sources may propose. Replay, Observe, and Fork are independent runtime capabilities. Order: unified environment → local safe fallback → Actor. Local routes include sealed file inputs, private workspace transactions, and qualified native processes. Diagnostics refresh enabled providers only.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
 		"info",
 	);
 	return runActionMenuLoop(ctx, "Execution routes", () => {
 		const settings = editor.settings();
-		const layers = controller.executionLayers();
+		const { worlds, primaryIDs } = controller.executionRoutes();
 		const actions = new Map<string, MenuAction>();
 		const routes = [
-			["primary", "Unified execution environment", layers.primary, layers.primary > 0],
-			["nativeFallback", "Native speculative fallback", layers.native, true],
+			["primary", "Unified execution environment", primaryIDs.size, primaryIDs.size > 0],
+			["nativeFallback", "Local safe fallback", worlds.filter((world) => !primaryIDs.has(world.id)).length, true],
 		] as const;
 		for (const [field, label, providers, available] of routes) {
 			const status = available ? `${providers} provider${providers === 1 ? "" : "s"}` : "not installed";
@@ -1281,7 +1277,7 @@ async function openExecutionRoutes(
 			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"));
 		actions.set("Refresh and show capabilities", async () => {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-			ctx.ui.notify(controller.executionSummary(), "info");
+			ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
 		});
 		return actions;
 	});
@@ -1751,7 +1747,7 @@ function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {
 function executionRouteKind(isolation: SpeculativeExecution): string {
 	switch (isolation) {
 		case "runtime_sandbox": return "isolated runtime";
-		case "resource_snapshot": return "validated read";
+		case "resource_snapshot": return "sealed file inputs";
 		case "workspace_branch": return "private workspace";
 	}
 }

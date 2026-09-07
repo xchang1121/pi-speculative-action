@@ -12,7 +12,7 @@ import { LinuxHeldExecBoundary } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
@@ -134,7 +134,7 @@ describe("Linux process ExecutionWorld", () => {
 		const storeRoot = path.join(root, "store");
 		const backend = new LinuxProcessReuseBackend({ storeRoot });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
-		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
+		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
 		let payload = "";
 		const close = vi.fn(async () => {});
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
@@ -177,7 +177,7 @@ describe("Linux process ExecutionWorld", () => {
 		const operations = createLocalBashOperations({ shellPath });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(operations));
 		const backend = new LinuxProcessReuseBackend({ storeRoot });
-		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot, driver: "overlayfs" });
+		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot, driver: "overlayfs" });
 		const tool = createBashTool(workspace, {
 			operations: coordinator.operations,
 			shellPath,

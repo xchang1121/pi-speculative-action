@@ -14,7 +14,7 @@ import {
 	type LinuxProcessReuseMetrics,
 } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { workspaceSandboxFingerprint, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 
@@ -76,6 +76,7 @@ export async function createLinuxProcessBenchmark(
 	);
 	const world = createLinuxProcessExecutionWorld({
 		coordinator,
+		tools: PI_OPERATION_TOOLS.process,
 		backend,
 		storeRoot,
 		...(workspaceDriver ? { driver: workspaceDriver } : {}),
