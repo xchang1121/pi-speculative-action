@@ -31,9 +31,10 @@ describe("ProcessExecutionCoordinator", () => {
 
 	test("owns disabled, lazy, shared preparation, refresh, and disposal states", async () => {
 		const calls: string[] = [];
-		const pending = deferred<PreparedProcessExecutionRoute>();
+		let complete!: (route: PreparedProcessExecutionRoute) => void;
+		const pending = new Promise<PreparedProcessExecutionRoute>((resolve) => { complete = resolve; });
 		let enabled = false;
-		const prepare = vi.fn(() => pending.promise);
+		const prepare = vi.fn(() => pending);
 		const reset = vi.fn(async () => undefined);
 		const coordinator = new ProcessExecutionCoordinator(executor("raw", calls), {
 			enabled: () => enabled,
@@ -50,7 +51,7 @@ describe("ProcessExecutionCoordinator", () => {
 		const second = invoke(coordinator, "second");
 		await vi.waitFor(() => expect(coordinator.actorDiagnostics().state).toBe("probing"));
 		expect(prepare).toHaveBeenCalledTimes(1);
-		pending.resolve({ state: "ready", detail: "ready", executor: executor("reuse", calls) });
+		complete({ state: "ready", detail: "ready", executor: executor("reuse", calls) });
 		await Promise.all([first, second]);
 		expect(coordinator.actorDiagnostics().state).toBe("ready");
 		await coordinator.runWith(executor("world", calls), () => invoke(coordinator, "scoped"));
@@ -85,13 +86,3 @@ describe("ProcessExecutionCoordinator", () => {
 		expect(calls).toEqual(["raw:actor", "raw:later"]);
 	});
 });
-
-function deferred<Value>() {
-	let resolve!: (value: Value) => void;
-	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<Value>((accept, fail) => {
-		resolve = accept;
-		reject = fail;
-	});
-	return { promise, resolve, reject };
-}

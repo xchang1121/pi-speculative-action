@@ -28,7 +28,8 @@ export function createLinuxProcessExecutionWorld(
 	const backend = options.backend ?? new LinuxProcessReuseBackend(options);
 	const workspaceSandbox = options.workspaceSandbox ?? new WorkspaceSandboxService();
 	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
-	const workspaceOptions = pickWorkspaceOptions(options);
+	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
+	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary };
 	const roots = new Set<string>();
 	const qualifiedDrivers = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>();
 	let backendChecked = false;
@@ -99,10 +100,7 @@ export function createLinuxProcessExecutionWorld(
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const selected = await qualify(sourceRoot);
-			let validate: LinuxProcessSession["validate"] | undefined;
-			let seal: LinuxProcessSession["seal"] | undefined;
-			let close: LinuxProcessSession["close"] | undefined;
-			let metrics: LinuxProcessSession["metrics"] | undefined;
+			let session: LinuxProcessSession | undefined;
 			try {
 				return await workspaceSandbox.fork({
 				cwd: sourceRoot,
@@ -110,54 +108,49 @@ export function createLinuxProcessExecutionWorld(
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 				...workspaceOptions,
 				driver: selected.driver,
-				executionMetrics: () => (metrics ? { reuse: metrics() } : {}),
+				executionMetrics: () => (session ? { reuse: session.metrics() } : {}),
 				validate: async () =>
-					validate
-						? validate()
+					session
+						? session.validate()
 						: {
 								status: "indeterminate",
 								cause: { stage: "freshness", code: "process_evidence_missing" },
 								metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
 							},
 				afterCapture: async (_workspace, capture) => {
-					if (!seal) throw new Error("process evidence sealer is missing");
-					return seal(capture.changes);
+					if (!session) throw new Error("process evidence sealer is missing");
+					return session.seal(capture.changes);
 				},
 				execute: async (workspace) => {
-					const session = await backend.open({
+					session = await backend.open({
 						sourceRoot,
 						workspace,
 						invocation,
 						...(context.executionScope ? { scope: context.executionScope } : {}),
 						signal: context.signal,
 					});
-					validate = session.validate;
-					seal = session.seal;
-					close = session.close;
-					metrics = session.metrics;
+					const executor = session.executor;
 					let launches = 0;
 					try {
 						const result = await options.coordinator.runWith(
 							{
 								execute: (request) => {
 									launches++;
-									return session.executor.execute(request);
+									return executor.execute(request);
 								},
 							},
 							() => context.tool.execute(context.callID, context.args as never, context.signal),
 						);
 						if (launches === 0) throw new Error("process-backed tool bypassed the process execution outlet");
-						return {
-							result: replacePhysicalPaths(result, workspace.sandboxRoot, sourceRoot),
-							isError: false,
-						};
+						// The virtual root already preserves logical paths. Output bytes are data, not paths to rewrite.
+						return { result, isError: false };
 					} catch (error) {
-						return toolErrorSettlement(replaceMessagePath(error, workspace.sandboxRoot, sourceRoot));
+						return toolErrorSettlement(error);
 					}
 				},
 				});
 			} finally {
-				await close?.();
+				await session?.close();
 			}
 			},
 		},
@@ -175,15 +168,6 @@ export function createLinuxProcessExecutionWorld(
 	};
 }
 
-function pickWorkspaceOptions(options: LinuxProcessExecutionWorldOptions): WorkspaceSandboxOptions {
-	return {
-		...(options.gitBinary ? { gitBinary: options.gitBinary } : {}),
-		...(options.driver ? { driver: options.driver } : {}),
-		...(options.overlayfsBinary ? { overlayfsBinary: options.overlayfsBinary } : {}),
-		...(options.fusermountBinary ? { fusermountBinary: options.fusermountBinary } : {}),
-	};
-}
-
 function processInvocation(value: unknown): ToolInvocation["process"] | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const processValue = (value as ToolInvocation).process;
@@ -198,20 +182,4 @@ function processInvocation(value: unknown): ToolInvocation["process"] | undefine
 		return undefined;
 	}
 	return processValue;
-}
-
-function replaceMessagePath(error: unknown, from: string, to: string): unknown {
-	if (!(error instanceof Error)) return error;
-	const replacement = new Error(error.message.split(from).join(to), { cause: error.cause });
-	replacement.name = error.name;
-	return replacement;
-}
-
-function replacePhysicalPaths<Value>(value: Value, from: string, to: string): Value {
-	if (typeof value === "string") return value.split(from).join(to) as Value;
-	if (Array.isArray(value)) return value.map((item) => replacePhysicalPaths(item, from, to)) as Value;
-	if (!value || typeof value !== "object") return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, replacePhysicalPaths(child, from, to)]),
-	) as Value;
 }

@@ -16,6 +16,7 @@ import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
+import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import {
 	createLinuxProcessBenchmark,
 	forkReusableBash,
@@ -128,21 +129,30 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	}, 15_000);
 
-	test("defers native health and storage work until an explicit refresh", async () => {
+	test("defers native initialization and preserves opaque process output without path rewriting", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
 		const storeRoot = path.join(root, "store");
 		const backend = new LinuxProcessReuseBackend({ storeRoot });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, backend, storeRoot });
+		let payload = "";
+		const close = vi.fn(async () => {});
+		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
+			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
+			metrics: emptyWorldReuseMetrics, seal: async () => [], close,
+			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
+		}));
 		try {
-			expect(world.speculation.tools).toEqual(PI_ACTION_SEMANTICS.toolNames("unbounded"));
-			const lazy = await world.speculation.diagnostics?.({ cwd: root });
-			expect(lazy).toEqual({ state: "registered", detail: "Checked on first process fork" });
+			expect(await world.speculation.diagnostics?.({ cwd: root })).toMatchObject({ state: "registered" });
 			await expect(stat(storeRoot)).rejects.toThrow();
-			const expected = await backend.check(true);
-			const actual = await world.speculation.diagnostics?.({ cwd: root, refresh: true });
-			expect(actual?.state).toBe(expected.state === "ready" ? "ready" : "unavailable");
-			expect(actual?.detail).toContain(expected.detail);
+			const args = { command: "opaque" };
+			const invocation = resolvePiToolInvocation("bash", args, { cwd: root, environment: {} })!;
+			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, root, "", { fingerprint: "fake-process", context: invocation })!;
+			const branch = await world.speculation.execute({ cwd: root, toolName: "bash", args, action, callID: "opaque",
+				tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal });
+			try { expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]); }
+			finally { await branch.dispose(); }
+			expect(close).toHaveBeenCalledOnce();
 		} finally {
 			await world.dispose?.();
 			await rm(root, { recursive: true, force: true });
