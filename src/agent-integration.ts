@@ -77,6 +77,24 @@ export interface SpeculativeAgentSettingsInput {
 	readonly tools?: SpeculativeToolSelectionInput;
 }
 
+/** Shared host/package boundary: the TUI and runtime must interpret saved policy identically. */
+export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSettingsInput = {}, allowed = DEFAULTS.tools) {
+	return {
+		...normalizeDrafterRequestSettings(input),
+		enabled: typeof input.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
+		drafterEnabled: typeof input.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
+		drafterGateEnabled: typeof input.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
+		candidateLimit: clampCandidateLimit(input.candidateLimit ?? DEFAULTS.candidateLimit),
+		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
+		resourceCacheMaxEntries: normalizePositiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
+		resourceCacheMaxBytes: normalizePositiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
+		predictionTimeoutMs: normalizeTimeout(input.predictionTimeoutMs),
+		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
+		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
+		tools: normalizeSpeculativeToolSelection(input.tools, allowed),
+	} as const;
+}
+
 export interface SpeculativeAgentPreflightContext {
 	readonly tool: AgentTool;
 	readonly toolName: string;
@@ -232,31 +250,14 @@ export function createSpeculativeActionHost(
 			: undefined;
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
-		const settings = (await options.getSettings?.()) ?? {};
-		const drafter = normalizeDrafterRequestSettings(settings);
-		const selfSpeculation = normalizeSelfSpeculationSettings(settings.selfSpeculation);
+		const { patternAware, selfSpeculation, drafterGateEnabled, drafterMaxDepth, drafterMaxTokens,
+			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, ...policy } =
+			normalizeSpeculativeAgentSettings(await options.getSettings?.(), actionSemantics.toolNames());
 		return {
-			enabled: typeof settings.enabled === "boolean" ? settings.enabled : DEFAULTS.enabled,
-			drafterEnabled:
-				typeof settings.drafterEnabled === "boolean" ? settings.drafterEnabled : DEFAULTS.drafterEnabled,
-			candidateLimit: clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
-			maxConcurrentActions: clampCandidateLimit(settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
-			resourceCacheMaxEntries: normalizePositiveInteger(
-				settings.resourceCacheMaxEntries,
-				DEFAULTS.resourceCacheMaxEntries,
-			),
-			resourceCacheMaxBytes: normalizePositiveInteger(
-				settings.resourceCacheMaxBytes,
-				DEFAULTS.resourceCacheMaxBytes,
-			),
-			predictionTimeoutMs: normalizeTimeout(settings.predictionTimeoutMs),
+			...policy,
 			sourceConfig: {
-				...drafter,
-				drafterGateEnabled:
-					typeof settings.drafterGateEnabled === "boolean"
-						? settings.drafterGateEnabled
-						: DEFAULTS.drafterGateEnabled,
-				patternAware: patternAwareSettings(settings.patternAware ?? PATTERN_AWARE_DEFAULTS),
+				drafterMaxDepth, drafterMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax,
+				drafterGateEnabled, patternAware,
 				actorForkActionEnabled:
 					options.actorForkPlanSource !== undefined &&
 					selfSpeculation.enabled &&
@@ -264,7 +265,6 @@ export function createSpeculativeActionHost(
 					selfSpeculation.forkActionEnabled &&
 					selfSpeculation.forkTransport === "sidecar",
 			},
-			tools: normalizeSpeculativeToolSelection(settings.tools, actionSemantics.toolNames()),
 		};
 	};
 	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {

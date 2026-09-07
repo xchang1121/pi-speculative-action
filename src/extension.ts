@@ -26,15 +26,13 @@ import {
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
-import { createSpeculativeActionHost } from "./agent-integration.ts";
+import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
 	DEFAULTS,
-	normalizeDrafterRequestSettings,
-	normalizeSpeculativeToolSelection,
 } from "./common.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
-import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, patternAwareSettings } from "./pattern-aware.ts";
+import type { PatternAwareSettings } from "./pattern-aware.ts";
 import {
 	canPreviewIncompletePiCall,
 	PI_READ_RANGE_PROJECTION_RULE,
@@ -70,13 +68,11 @@ import {
 	type SettingInputDescriptor,
 } from "./setting-input.ts";
 import {
-	normalizeSelfSpeculationSettings,
 	SelfSpeculationCoordinator,
 	type SelfSpeculationCoordinatorSnapshot,
 	type SelfSpeculationSettings,
 } from "./self-speculation.ts";
 import {
-	type ExecutionRoutingSettings,
 	type SpeculativeActionPackageSettings,
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
@@ -92,28 +88,7 @@ const USE_ACTIVE_MODEL = "Use active model";
 const CUSTOM_MODEL = "Custom model...";
 const RECENT_EVENT_LIMIT = 50;
 
-export interface EffectiveSpeculativeActionSettings {
-	readonly enabled: boolean;
-	readonly drafterEnabled: boolean;
-	readonly drafterGateEnabled: boolean;
-	readonly drafterMaxDepth: number;
-	readonly drafterMaxTokens?: number;
-	readonly drafterDeterministicCandidates: number;
-	readonly drafterTemperatureMin: number;
-	readonly drafterTemperatureMax: number;
-	readonly draftModel?: string;
-	readonly candidateLimit: number;
-	readonly maxConcurrentActions: number;
-	readonly resourceCacheMaxEntries: number;
-	readonly resourceCacheMaxBytes: number;
-	readonly executionStoreMaxEntries: number;
-	readonly executionStoreMaxBytes: number;
-	readonly executionRouting: Required<ExecutionRoutingSettings>;
-	readonly predictionTimeoutMs: number;
-	readonly patternAware: PatternAwareSettings;
-	readonly selfSpeculation: SelfSpeculationSettings;
-	readonly tools: readonly string[];
-}
+export type EffectiveSpeculativeActionSettings = ReturnType<typeof normalizeSpeculativeActionSettings>;
 
 type SettingInputDescriptors<T, K extends keyof T> = {
 	readonly [Field in K]: SettingInputDescriptor<T[Field]>;
@@ -126,7 +101,7 @@ const ROOT_SETTING_INPUTS = {
 	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
+	predictionTimeoutMs: nonNegativeIntegerInput("Prediction wait limit (ms)"),
 	drafterMaxTokens: optionalPositiveIntegerInput("Maximum Drafter output tokens (blank for provider default)"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
@@ -205,16 +180,8 @@ type ExecutionRoutesSnapshot = {
 	readonly primaryIDs: ReadonlySet<string>;
 };
 
-export interface SpeculativeSettingsStore {
-	readonly scope: SpeculativeSettingsScope;
-	readonly load: () => Promise<void>;
-	readonly effective: () => SpeculativeActionPackageSettings | undefined;
-	readonly editable: (scope?: SpeculativeSettingsScope) => SpeculativeActionPackageSettings | undefined;
-	readonly setEffective: (settings: SpeculativeActionPackageSettings, inherited?: SpeculativeActionPackageSettings) => void;
-	readonly clear: () => void;
-	readonly setScope: (scope: SpeculativeSettingsScope) => void;
-	readonly flush: () => Promise<void>;
-}
+export type SpeculativeSettingsStore = Pick<SpeculativeActionSettingsStore,
+	"scope" | "load" | "effective" | "editable" | "setEffective" | "clear" | "setScope" | "flush">;
 
 interface SpeculativeActionController {
 	readonly settings: () => EffectiveSpeculativeActionSettings;
@@ -268,21 +235,12 @@ export interface SpeculativeActionExecutionWorldContext {
 
 export function normalizeSpeculativeActionSettings(
 	input: SpeculativeActionPackageSettings | undefined,
-): EffectiveSpeculativeActionSettings {
-	const drafter = normalizeDrafterRequestSettings(input);
+) {
 	return {
-		enabled: typeof input?.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
-		drafterEnabled: typeof input?.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
-		drafterGateEnabled:
-			typeof input?.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
-		...drafter,
+		...normalizeSpeculativeAgentSettings(input),
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
-		candidateLimit: clampCandidateLimit(input?.candidateLimit ?? DEFAULTS.candidateLimit),
-		maxConcurrentActions: clampCandidateLimit(input?.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
-		resourceCacheMaxEntries: positiveInteger(input?.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
-		resourceCacheMaxBytes: positiveInteger(input?.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
 		executionStoreMaxEntries: positiveInteger(
 			input?.executionStoreMaxEntries,
 			DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates,
@@ -292,11 +250,7 @@ export function normalizeSpeculativeActionSettings(
 			primary: input?.executionRouting?.primary !== false,
 			nativeFallback: input?.executionRouting?.nativeFallback !== false,
 		},
-		predictionTimeoutMs: positiveInteger(input?.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
-		patternAware: patternAwareSettings(input?.patternAware ?? PATTERN_AWARE_DEFAULTS),
-		selfSpeculation: normalizeSelfSpeculationSettings(input?.selfSpeculation),
-		tools: normalizeSpeculativeToolSelection(input?.tools, KEYABLE_TOOLS),
-	};
+	} as const;
 }
 
 export function formatSpeculativeActionStatus(input: {
@@ -1025,7 +979,7 @@ function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActi
 function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	return runActionMenuLoop(ctx, "Model Drafter", () => {
 		const settings = controller.settings();
-		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
+		const edit = (field: RootInputField) => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
 		return new Map<string, MenuAction>([
 			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
 			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
@@ -1038,7 +992,7 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 function openDrafterAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	return runActionMenuLoop(ctx, "Model Drafter advanced", () => {
 		const settings = controller.settings();
-		const edit = (field: RootInputField) => editRootSetting(ctx, controller, settings, field);
+		const edit = (field: RootInputField) => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
 		return new Map<string, MenuAction>([
 			[`Pause when measured cost exceeds benefit: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
 			[`Follow-up tool steps: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
@@ -1067,7 +1021,8 @@ function openActorForkSettings(
 	return runActionMenuLoop(ctx, titles[menu], () => {
 		const settings = controller.settings();
 		const self = settings.selfSpeculation;
-		const edit = (field: SelfSpeculationInputField) => editSelfSpeculationSetting(ctx, controller, settings, field);
+		const edit = (field: SelfSpeculationInputField) => editSetting(ctx, self, field, SELF_SPECULATION_INPUTS,
+			(selfSpeculation) => controller.setSettings({ ...settings, selfSpeculation }));
 		const actions = new Map<string, MenuAction>();
 		if (menu === "basic") {
 			const active = self.enabled && self.forkEnabled;
@@ -1150,7 +1105,8 @@ async function openPatternAdvancedGroup(
 	return runActionMenuLoop(ctx, group === "learning" ? "Learning history" : "Multi-step search", () => {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
-		const edit = (field: PatternInputField) => editPatternSetting(ctx, controller, settings, field);
+		const edit = (field: PatternInputField) => editSetting(ctx, pattern, field, PATTERN_SETTING_INPUTS,
+			(patternAware) => controller.setSettings({ ...settings, patternAware }));
 		const actions = group === "learning"
 			? new Map<string, () => Promise<void>>([
 				[`Previous actions used as context: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
@@ -1195,7 +1151,7 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 			continue;
 		}
 		const field = fields.get(choice);
-		if (field) await editRootSetting(ctx, controller, settings, field);
+		if (field) await editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
 	}
 }
 
@@ -1338,81 +1294,28 @@ async function promptSetting<T>(
 	ctx: ExtensionContext,
 	current: T,
 	descriptor: SettingInputDescriptor<T>,
-): Promise<{ readonly accepted: false } | { readonly accepted: true; readonly value: T }> {
+	publish: (value: T) => Promise<void>,
+): Promise<void> {
 	const input = await ctx.ui.input(descriptor.title, descriptor.format(current));
-	if (input === undefined) return { accepted: false };
+	if (input === undefined) return;
 	const parsed = descriptor.parse(input);
-	if (!parsed.ok) {
-		ctx.ui.notify(parsed.error, "warning");
-		return { accepted: false };
-	}
-	return { accepted: true, value: parsed.value };
+	if (!parsed.ok) ctx.ui.notify(parsed.error, "warning");
+	else await publish(parsed.value);
 }
 
-function replaceSetting<T extends object, Field extends keyof T>(current: T, field: Field, value: T[Field]): T {
-	const next = { ...current };
-	if (value === undefined) Reflect.deleteProperty(next, field);
-	else Object.assign(next, { [field]: value });
-	return next;
-}
-
-function inputDescriptor<T, Field extends keyof T>(
-	descriptors: Partial<SettingInputDescriptors<T, keyof T>>,
-	field: Field,
-): SettingInputDescriptor<T[Field]> {
-	return descriptors[field] as SettingInputDescriptor<T[Field]>;
-}
-
-async function editRootSetting<Field extends RootInputField>(
+function editSetting<T extends object, Field extends keyof T>(
 	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
+	current: T,
 	field: Field,
+	descriptors: SettingInputDescriptors<T, Field>,
+	publish: (value: T) => Promise<void>,
 ): Promise<void> {
-	const edited = await promptSetting(
-		ctx,
-		settings[field],
-		inputDescriptor<EffectiveSpeculativeActionSettings, Field>(ROOT_SETTING_INPUTS, field),
-	);
-	if (edited.accepted) await controller.setSettings(replaceSetting(settings, field, edited.value));
-}
-
-async function editSelfSpeculationSetting<Field extends SelfSpeculationInputField>(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: Field,
-): Promise<void> {
-	const edited = await promptSetting(
-		ctx,
-		settings.selfSpeculation[field],
-		inputDescriptor<SelfSpeculationSettings, Field>(SELF_SPECULATION_INPUTS, field),
-	);
-	if (edited.accepted) {
-		await controller.setSettings({
-			...settings,
-			selfSpeculation: replaceSetting(settings.selfSpeculation, field, edited.value),
-		});
-	}
-}
-
-async function editPatternSetting<Field extends PatternInputField>(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	field: Field,
-): Promise<void> {
-	const edited = await promptSetting(
-		ctx,
-		settings.patternAware[field],
-		inputDescriptor<PatternAwareSettings, Field>(PATTERN_SETTING_INPUTS, field),
-	);
-	if (edited.accepted) {
-		await controller.setSettings({
-			...settings,
-			patternAware: replaceSetting(settings.patternAware, field, edited.value),
-		});
-	}
+	return promptSetting(ctx, current[field], descriptors[field], async (value) => {
+		const next = { ...current };
+		if (value === undefined) Reflect.deleteProperty(next, field);
+		else Object.assign(next, { [field]: value });
+		await publish(next);
+	});
 }
 
 async function editDrafterTemperatureRange(
@@ -1420,14 +1323,14 @@ async function editDrafterTemperatureRange(
 	controller: SpeculativeActionController,
 	settings: EffectiveSpeculativeActionSettings,
 ): Promise<void> {
-	const edited = await promptSetting(
+	await promptSetting(
 		ctx,
 		[settings.drafterTemperatureMin, settings.drafterTemperatureMax] as const,
 		DRAFTER_TEMPERATURE_INPUT,
+		async ([drafterTemperatureMin, drafterTemperatureMax]) => {
+			await controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
+		},
 	);
-	if (!edited.accepted) return;
-	const [drafterTemperatureMin, drafterTemperatureMax] = edited.value;
-	await controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
 }
 
 async function editDraftModel(

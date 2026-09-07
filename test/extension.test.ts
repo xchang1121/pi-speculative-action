@@ -326,44 +326,17 @@ describe("zero-modification Pi extension", () => {
 		}
 	});
 
-	it("keeps only direct choices in the Model Drafter menu", async () => {
-		const fixture = await createFixture();
-		const menus = driveSettingsMenus(fixture, {
-			"Speculative action": ["Prediction sources", "Close"],
-			"Prediction sources": ["Model Drafter", "Back"],
-			"Model Drafter": ["Advanced settings", "Back"],
-			"Model Drafter advanced": ["Back"],
-		});
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
-
-		expect(menus.get("Model Drafter")).toEqual(
-			expect.arrayContaining(["Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2"]),
-		);
-		expect(menus.get("Model Drafter")).not.toEqual(
-			expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]),
-		);
-		expect(menus.get("Model Drafter advanced")).toEqual(
-			expect.arrayContaining([
-				"Pause when measured cost exceeds benefit: On",
-				"Follow-up tool steps: 1",
-				"Maximum output tokens: Provider default",
-				"Temperature-0 candidates: 1",
-				"Sampling temperature: 0.7-0.7",
-			]),
-		);
-	});
-
 	it("binds typed inputs through the advanced hierarchy", async () => {
 		const configure = vi.fn();
 		const maintain = vi.fn(async () => ({ removedEntries: 2, removedArtifacts: 3, removedBytes: 4096 }));
 		const fixture = await createFixture({
+			settings: { drafterMaxTokens: 10 },
 			executionWorlds: [{ storage: { configure, maintain } } as unknown as SpeculativeAgentExecutionWorld],
 		});
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
 			"Advanced settings": ["Scheduling and storage", "Actor probe and target verification", "Learned-pattern tuning", "Back"],
-			"Scheduling and storage": ["Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
+			"Scheduling and storage": ["Prediction wait limit", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
 			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
 			"Integration and authentication": ["Integration", "Control service URL", "Back"],
 			"Fork decoding": ["Back"],
@@ -372,12 +345,16 @@ describe("zero-modification Pi extension", () => {
 			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back"],
 			"Learning history": ["Early-prediction coverage", "Back"],
 			"Multi-step search": ["Back"],
-			"Prediction sources": ["Actor probe", "Back"],
+			"Prediction sources": ["Model Drafter", "Actor probe", "Back"],
+			"Model Drafter": ["Advanced settings", "Back"],
+			"Model Drafter advanced": ["Maximum output tokens", "Follow-up tool steps", "Back"],
 			"Actor probe": ["Minimum tool-name confidence", "Back"],
 			"Actor probe integration": ["Sidecar service"],
 		});
 		fixture.ui.input = async (title) =>
 			({
+				"Prediction wait limit (ms)": "0",
+				"Maximum Drafter output tokens (blank for provider default)": "",
 				"Live result memory (MiB)": "96",
 				"Reusable command history entries": "2048",
 				"Reusable command history memory (MiB)": "768",
@@ -391,6 +368,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
+			predictionTimeoutMs: 0, drafterMaxDepth: 1,
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
@@ -401,6 +379,15 @@ describe("zero-modification Pi extension", () => {
 			},
 			patternAware: { futureGapCoverage: 0.8 },
 		});
+		expect(fixture.store.effective()).not.toHaveProperty("drafterMaxTokens");
+		expect(menus.get("Model Drafter")).toEqual(expect.arrayContaining([
+			"Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2",
+		]));
+		expect(menus.get("Model Drafter")).not.toEqual(expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]));
+		expect(menus.get("Model Drafter advanced")).toEqual(expect.arrayContaining([
+			"Pause when measured cost exceeds benefit: On", "Follow-up tool steps: 1", "Maximum output tokens: Provider default",
+			"Temperature-0 candidates: 1", "Sampling temperature: 0.7-0.7",
+		]));
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
 		expect(maintain.mock.calls).toEqual([["gc"], ["clear"]]);
 		expect(menus.get("Fork decoding")).not.toEqual(
