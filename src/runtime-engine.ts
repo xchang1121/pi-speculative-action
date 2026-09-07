@@ -2962,6 +2962,9 @@ export function makeStructuralSpeculativeActionRuntime<
 				const match = actionKeyMatch(candidate.key, action, runtimeState.projectionRules);
 				if (!match || !activeExecution(candidate)) return [];
 				const execution = candidate.work.execution;
+				// Input recall is not a proof that unfinished work can satisfy this Actor query.
+				if (execution.status !== "succeeded" && match.kind === "projected" &&
+					!canShareInFlight(candidate, action, match, runtimeState.projectionRules)) return [];
 				const remainingMs =
 					execution.status === "running"
 						? Math.max(0, candidate.expectedDurationMs - (now - execution.startedAt))

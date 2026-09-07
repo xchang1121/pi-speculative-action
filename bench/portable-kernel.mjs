@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -89,7 +88,7 @@ async function prepareWorker() {
 	});
 	try {
 		const { profile, engines } = await ready;
-		return { profile, engines, preparationMs: performance.now() - started, closed: () => closed,
+		return { profile, engines, preparationMs: performance.now() - started, closed: () => closed, closure,
 			dispose: async () => { if (!closed) terminate(new Error("worker disposed")); await closure; },
 			request: (input, { signal, timeoutMs = 5000, onStarted, onCheckpoint } = {}) => new Promise((resolve, reject) => {
 				if (signal?.aborted) { reject(signal.reason); return; }
@@ -109,16 +108,17 @@ async function prepareWorker() {
 	} catch (error) { terminate(error); await closure; throw error; }
 }
 
-/** Full original Pi tool in a worker; evidence capture, validation, and adoption stay in the parent. */
+/** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
 async function qualifyPiSearch(worker) {
 	const { createGrepToolDefinition } = await import("@earendil-works/pi-coding-agent");
+	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
+	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
 	const { RESOURCE_OBSERVATION_EFFECTS } = await import("../dist/effect-model.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
-	const { ToolExecutionGateway } = await import("../dist/tool-execution-gateway.js");
-	const { waitForCandidate } = await import("../dist/scheduler.js");
-	const profile = worker.profile, fingerprint = createHash("sha256").update(JSON.stringify(profile)).digest("hex");
+	const profile = worker.profile;
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-"));
+	let actorWorker;
 	const virtual = (target) => path.posix.join("/workspace", path.relative(root, target).split(path.sep).join("/"));
 	const collect = async (source, target = root, image = { files: {}, directories: [] }) => {
 		if ((await source.stat(target)).isDirectory()) {
@@ -127,22 +127,60 @@ async function qualifyPiSearch(worker) {
 		} else image.files[virtual(target)] = await source.readFile(target);
 		return image;
 	};
-	let executions = 0, contextReads = 0, afterSearch;
-	const execute = async (image, request) => {
-		executions++;
-		const output = await worker.request({ kind: "grep", image, root, args: request.args, pause: !!afterSearch },
-			{ signal: request.signal, onCheckpoint: afterSearch });
-		contextReads += output.contextReads;
+	const counts = { producer: 0, actor: 0, contextReads: 0 };
+	const execute = async (role, image, request, checkpoint) => {
+		counts[role]++;
+		const output = await (role === "producer" ? worker : actorWorker).request({ kind: "grep", image, root, args: request.args, pause: !!checkpoint },
+			{ signal: request.signal, onCheckpoint: checkpoint });
+		counts.contextReads += output.contextReads;
 		return { result: output.result, isError: output.isError };
 	};
 	const tool = createGrepToolDefinition(root), definition = { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: profile.id,
 		effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
 	const semantics = new ActionSemanticsRegistry([definition]);
-	const invocation = { executor: profile.id, identity: profile, filesystem: async (view, request) => execute(await collect(view), request) };
-	const world = createResourceSnapshotExecutionWorld(semantics, { tools: ["grep"], maxBytes: () => profile.limits.inputBytes });
-	const gateway = new ToolExecutionGateway([world]), signal = new AbortController().signal, cases = [];
+	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
+	const signal = new AbortController().signal, journeys = [];
 	const args = { pattern: "needle", path: ".", context: 1, limit: 1000 };
+	function journey(checkpoint, capacity = 1) {
+		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
+		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
+		const invocation = { executor: profile.id, identity: profile,
+			filesystem: async (view, request) => execute("producer", await collect(view), request, checkpoint) };
+		const host = createSpeculativeActionHost("portable-" + journeys.length, {
+			cwd: root, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
+				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? ["grep"] : [],
+				patternAware: { enabled: false }, selfSpeculation: { enabled: false } }),
+			draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall("grep", args), { stopReason: "toolUse" }),
+			actionSemantics: semantics, resolveInvocation: () => invocation,
+			preflight: () => { if (actorWaiting) authorized.resolve(); return true; },
+			executionWorlds: [createResourceSnapshotExecutionWorld(semantics, { tools: ["grep"], maxBytes: () => profile.limits.inputBytes })],
+			onEvent: (event) => {
+				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate.resolve(event.state);
+			},
+			onActorActionSettled: ({ settlement }) => feedback?.resolve(settlement),
+		});
+		journeys.push(host);
+		return { host, candidate: candidate.promise, authorized: authorized.promise, actorCalls: () => actorCalls,
+			start: async (id, predict = true) => {
+				if (turnID) await host.finishTurn(turnID);
+				turnID = id; prediction = predict;
+				await host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools: [tool],
+					context: { systemPrompt: "qualification", messages: [], tools: [tool] } });
+			},
+			actor: async (id, query = args) => {
+				actorWaiting = true; feedback = Promise.withResolvers();
+				const arrived = performance.now();
+				const output = await host.execute({ turnID, id, tool: "grep", args: query, tools: [tool] }, signal, async (operation) => {
+					actorCalls++; return (await execute("actor", await collect(fs), { args: operation.input, signal: operation.signal })).result;
+				});
+				actorWaiting = false;
+				return { output, totalMs: performance.now() - arrived, settlement: await bounded(feedback.promise, "Actor settlement") };
+			},
+		};
+	}
 	try {
+		actorWorker = await prepareWorker();
+		assert.deepEqual(actorWorker.profile, profile, "independent execution capacity must keep the same identity");
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(path.join(root, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "ignored.txt\n");
@@ -154,73 +192,86 @@ async function qualifyPiSearch(worker) {
 			for (let index = 0; index < 3; index++) { const started = performance.now(); output = await execute(); times.push(performance.now() - started); }
 			return { output, medianMs: times.sort((a, b) => a - b)[1] };
 		};
-		const baseline = await sample(async () => execute(await collect(fs), { args, callID: "profile-actor", signal }));
-		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output;
-		const action = semantics.buildKey("grep", args, root, "", { fingerprint, context: invocation });
-		const operation = { tool: "grep", input: args, action, callID: "profile-speculation", signal };
-		const route = await gateway.resolve({ operation, ...definition }, { cwd: root }); assert.ok(route);
-		const started = performance.now();
-		const branch = await gateway.executeSpeculative(operation, route, () => ({ cwd: root, tool, toolName: "grep", args, action, callID: operation.callID, signal }));
-		const speculativeMs = performance.now() - started, beforeHit = executions;
+		const baseline = await sample(async () => execute("actor", await collect(fs), { args, signal }));
+		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
+		const ready = journey(); await ready.start("produce");
+		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
+		await ready.start("recall", false);
+		const beforeHit = counts.producer, adopted = await ready.actor("ready");
+		assert.deepEqual(adopted.output, expected); assert.equal(adopted.settlement.provider.kind, "speculative");
+		assert.equal(counts.producer, beforeHit, "completed adoption executed the search again");
+		const queries = [{ ...args, pattern: "after", limit: 1 }, { ...args, pattern: "absent" }, { ...args, glob: "*.txt", context: 0 }];
+		for (const query of queries) {
+			const actor = await execute("actor", await collect(fs), { args: query, signal });
+			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
+			assert.deepEqual(reconstructed.output, actor.result);
+			assert.equal(reconstructed.settlement.provider.match?.projector, "resource.inputs");
+		}
+		assert.equal(ready.actorCalls(), 0);
+		const reached = Promise.withResolvers(), resume = Promise.withResolvers();
+		const running = journey(async () => { reached.resolve(); await resume.promise; });
+		await running.start("running");
 		try {
-			const arrived = performance.now(); assert.equal((await branch.validate()).status, "valid");
-			assert.deepEqual(await branch.commit(), expected);
-			const readyAdoptionMs = performance.now() - arrived;
-			assert.equal(executions, beforeHit, "adoption executed the search again");
-			for (const query of [{ ...args, pattern: "after", limit: 1 }, { ...args, pattern: "absent" }, { ...args, glob: "*.txt", context: 0 }]) {
-				const actor = await execute(await collect(fs), { args: query, callID: "other-query", signal });
-				const key = semantics.buildKey("grep", query, root, "", { fingerprint, context: invocation });
-				assert.equal((await branch.validate()).status, "valid");
-				assert.deepEqual(await branch.reconstruct({ action: key, args: query, callID: "retained-inputs", signal }), actor);
-				assert.equal((await branch.validate()).status, "valid"); cases.push(query);
-			}
-			const reached = Promise.withResolvers(), resume = Promise.withResolvers();
-			afterSearch = async () => { reached.resolve(); await resume.promise; };
-			const running = gateway.executeSpeculative(operation, route, () => ({ cwd: root, tool, toolName: "grep", args, action, callID: "running", signal }));
-			let runningActorCalls = 0;
-			try {
-				assert.equal(await Promise.race([reached.promise, running]), undefined, "search must reach its context-read barrier");
-				const joined = gateway.executeAuthoritative(operation, async () => { runningActorCalls++; throw new Error("unexpected Actor reexecution"); }, {
-					reuse: async () => {
-						const wait = await waitForCandidate(running, signal, 1000);
-						assert.equal(wait.status, "completed"); assert.equal((await wait.value.validate()).status, "valid");
-						return wait.value.commit();
-					},
-				});
-				resume.resolve(); assert.deepEqual(await joined, expected); assert.equal(runningActorCalls, 0);
-			} finally { resume.resolve(); afterSearch = undefined; await running.then((branch) => branch.dispose(), () => {}); }
-			await fs.writeFile(path.join(root, "notes.txt"), "changed\n");
-			assert.equal((await branch.validate()).status, "stale");
-			let fallbacks = 0;
-			const stale = await gateway.executeAuthoritative(operation, async () => {
-				fallbacks++; return execute(await collect(fs), { args, callID: "stale-actor", signal });
-			}, { reuse: async () => (await branch.validate()).status === "valid" ? branch.commit() : undefined });
-			assert.equal(fallbacks, 1); assert.notDeepEqual(stale, expected);
-			afterSearch = () => fs.writeFile(path.join(root, "notes.txt"), "changed during search\n");
-			await assert.rejects(gateway.executeSpeculative(operation, route, () => ({ cwd: root, tool, toolName: "grep", args, action, callID: "changing", signal })), /resource_observation_window_changed/);
-			const cancellation = new AbortController();
-			afterSearch = () => cancellation.abort(new Error("cancelled before Pi context reread"));
-			const abandoned = gateway.executeSpeculative({ ...operation, signal: cancellation.signal }, route,
-				() => ({ cwd: root, tool, toolName: "grep", args, action, callID: "cancelled", signal: cancellation.signal }));
-			await assert.rejects(abandoned, /cancelled before Pi context reread/);
-			assert.ok(worker.closed(), "cancelled producer must be gone before Actor fallback");
-			afterSearch = undefined;
-			const recovered = await prepareWorker(); let recoveryActorCalls = 0;
-			try {
-				assert.deepEqual(recovered.profile, profile, "recovery must keep the same execution identity");
-				const fresh = await gateway.executeAuthoritative(operation, async () => {
-					recoveryActorCalls++;
-					const output = await recovered.request({ kind: "grep", root, args, image: await collect(fs) });
-					return { result: output.result, isError: output.isError };
-				}, { reuse: () => abandoned.then((branch) => branch.commit()) });
-				assert.deepEqual(fresh, stale); assert.equal(recoveryActorCalls, 1);
-			} finally { await recovered.dispose(); }
-			assert.ok(contextReads > 0, "the original Pi context reread was not exercised");
-			return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, speculativeMs, readyAdoptionMs,
-				retainedInputQueries: cases.length, staleActorExecutions: fallbacks, contextReads, freshAdoption: true,
-				changedInputRejected: true, changedDuringSearchRejected: true, runningGatewayJoin: true, runningActorCalls,
-				cancelledFullToolDiscarded: true, recoveryActorCalls,
-				scope: "explicit common-profile full-tool IPC; not native equivalence or production enablement" };
-		} finally { await branch.dispose(); }
-	} finally { await gateway.dispose(); assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true }); }
+			assert.equal(await bounded(Promise.race([reached.promise, running.candidate]), "running search checkpoint"), undefined);
+			const joined = running.actor("join");
+			assert.equal(await bounded(Promise.race([running.authorized, joined]), "Runtime running admission"), undefined);
+			resume.resolve();
+			const hit = await joined;
+			assert.deepEqual(hit.output, expected); assert.equal(hit.settlement.provider.kind, "speculative");
+			assert.equal(running.actorCalls(), 0);
+		} finally { resume.resolve(); await running.host.dispose(); }
+		await fs.writeFile(path.join(root, "notes.txt"), "changed\n");
+		const stale = await ready.actor("stale");
+		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 1);
+		assert.notDeepEqual(stale.output, expected);
+		await ready.start("observed", false);
+		const observed = await ready.actor("observed");
+		assert.deepEqual(observed.output, stale.output);
+		if (observed.settlement.provider.kind === "actor") {
+			const gate = observed.settlement.rejections.find((rejection) => rejection.cause.code === "candidate_join_not_profitable");
+			assert.ok(gate, JSON.stringify(observed.settlement)); assert.ok(JSON.parse(gate.cause.detail).expectedNetBenefitMs < 0);
+		}
+		assert.equal(counts.producer, beforeHit + queries.length + 1, "rejected completed replay must not execute guest code");
+		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 2 : 1);
+		const changed = journey(() => fs.writeFile(path.join(root, "notes.txt"), "changed during search\n"));
+		await changed.start("changing");
+		const failed = await bounded(changed.candidate, "changed search");
+		assert.equal(failed.status, "failed"); assert.match(JSON.stringify(failed.cause), /resource_observation_window_changed/);
+		assert.deepEqual((await changed.actor("changed")).output, stale.output); assert.equal(changed.actorCalls(), 1);
+		const paused = Promise.withResolvers(), released = Promise.withResolvers();
+		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 2);
+		const disabled = { enabled: false, resourceCacheMaxEntries: 32, predictionTimeoutMs: 5000, tools: ["grep"] };
+		await cancelled.start("cancelled");
+		try {
+			assert.equal(await bounded(Promise.race([paused.promise, cancelled.candidate]), "independent Actor checkpoint"), undefined);
+			const different = { ...args, pattern: "absent" };
+			const direct = await execute("actor", await collect(fs), { args: different, signal });
+			const fallback = await cancelled.actor("independent", different);
+			assert.deepEqual(fallback.output, direct.result); assert.equal(fallback.settlement.provider.kind, "actor");
+			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running");
+			assert.ok(!worker.closed(), "Actor fallback must not depend on producer termination");
+			await cancelled.host.runtime.settingsChanged(disabled);
+		} finally { released.resolve(); }
+		assert.equal((await bounded(cancelled.candidate, "cancelled candidate")).status, "cancelled");
+		await bounded(worker.closure, "cancelled worker retirement"); assert.ok(worker.closed());
+		await cancelled.host.runtime.settingsChanged({ ...disabled, enabled: true });
+		await cancelled.start("recovery", false);
+		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
+		assert.ok(counts.contextReads > 0, "the original Pi context reread was not exercised");
+		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, speculativeMs: completed.executionMs,
+			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length, ...counts,
+			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
+			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
+			actorRanWhileProducerPaused: true, recoveryActorCalls: 1, actorWorkerPreparationMs: actorWorker.preparationMs,
+			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence or production enablement" };
+	} finally {
+		await Promise.all(journeys.map((host) => host.dispose())); await actorWorker?.dispose();
+		assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
+function bounded(promise, label) {
+	let timer;
+	return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + " deadline")), 15_000); })])
+		.finally(() => clearTimeout(timer));
 }

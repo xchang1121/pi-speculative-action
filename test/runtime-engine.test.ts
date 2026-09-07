@@ -127,6 +127,7 @@ function harness(input: {
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly preflight?: (signal: AbortSignal) => CandidatePreflight | Promise<CandidatePreflight>;
+	readonly authorize?: () => CandidatePreflight;
 	readonly projection?: boolean;
 	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
@@ -171,6 +172,7 @@ function harness(input: {
 			: {}),
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
 		preflightCandidate: ({ signal }) => input.preflight?.(signal) ?? { ok: true },
+		authorizeCandidate: input.authorize,
 		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
 			const version =
@@ -841,49 +843,53 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted"] as const)(
+	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-covered"] as const)(
 	"adopts reconstructed input only after a stable, successful evaluation: %s", async (scenario) => {
 		const commit = vi.fn(async () => "committed");
 		const candidateReady = candidateSucceeded();
 		const entered = barrier(), release = barrier(), controller = new AbortController();
+		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
+		const succeeds = scenario === "valid" || scenario === "running-covered";
 		let changed = false;
-		const actor = call("turn", { path: "README.md", offset: 10, limit: 10 });
+		const actor = call("turn", { path: "README.md", offset: scenario === "running-unproven" ? 200 : 10, limit: 10 });
 		const reconstruct: NonNullable<WorldBranch<string>["reconstruct"]> = async (request) => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
 			entered.arrive(); await release.promise;
 			if (scenario === "rejected") throw new Error("evaluation failed");
 			return scenario === "uncovered" ? undefined : "narrow";
 		};
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "projection", { path: "README.md", offset: 1, limit: 100 }),
-		};
 		const fixture = harness({
-			source,
+			source: { id: "source", enabled: () => true,
+				propose: () => plan("source", "projection", { path: "README.md", offset: 1, limit: 100 }) },
 			projection: true,
-			execute: () => ({
+			authorize: () => { authorized.arrive(); return { ok: true }; },
+			execute: async () => { started.arrive(); if (running) await completion.promise; return {
 				...world("wide", { validate: async () => changed
 					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
 					: { status: "valid", metrics: zeroValidationMetrics() } }),
 				...(scenario === "legacy-miss" ? {} : { reconstruct }),
 				commit,
-			}),
+			}; },
 			onEvent: candidateReady.observe,
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await candidateReady.promise;
-
+		await (running ? started.promise : candidateReady.promise);
 		const consumed = fixture.runtime.consume(actor, controller.signal);
-		if (scenario !== "legacy-miss") {
-			await entered.promise;
-			changed = scenario === "changed";
-			if (scenario === "aborted") controller.abort();
-			release.arrive();
+		try {
+			if (running) {
+				expect(await Promise.race([consumed, authorized.promise.then(() => "joined")])).toBe(succeeds ? "joined" : undefined);
+				completion.arrive(); release.arrive();
+			} else if (scenario !== "legacy-miss") {
+				await entered.promise; changed = scenario === "changed";
+				if (scenario === "aborted") controller.abort();
+				release.arrive();
+			}
+			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
+			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+		} finally {
+			completion.arrive(); release.arrive(); await consumed;
+			await fixture.runtime.finishTurn({ ...actor, terminal: true });
 		}
-		expect(await consumed).toBe(scenario === "valid" ? "narrow" : undefined);
-		expect(commit).toHaveBeenCalledTimes(scenario === "valid" ? 1 : 0);
-		await fixture.runtime.finishTurn({ ...actor, terminal: true });
 	});
 
 	it("propagates an indeterminate commit instead of authorizing Actor fallback", async () => {
@@ -897,14 +903,8 @@ describe("structural speculative runtime", () => {
 		const fixture = harness({
 			source,
 			execute: () => ({
-				output: "speculative",
-				backend: "resource_version",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: "" },
+				...world("speculative", { backend: "resource_version" }),
 				commit: async () => Promise.reject(poisoned),
-				dispose: () => {},
 			}),
 			onEvent: candidateReady.observe,
 		});
@@ -930,14 +930,9 @@ describe("structural speculative runtime", () => {
 		const fixture = harness({
 			source,
 			execute: () => ({
-				output: "sealed",
-				backend: "test",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
+				...world("sealed"),
 				compatibility: { status: "indeterminate", backend: "test", code: "attestation_missing" },
 				commit,
-				dispose: () => {},
 			}),
 			onEvent: candidateReady.observe,
 		});

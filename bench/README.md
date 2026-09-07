@@ -306,9 +306,12 @@ node bench/portable-kernel.mjs <包含 node_modules 的外部目录>
 
 增加 `--pi-tools` 可验证显式共同配置下的完整 Pi grep，先执行 `npm run build`。
 原版 Pi 0.84.1 的完整 grep、上下文回读及两个私有 imports 绑定都位于 worker；父进程只做
-原生对照和现有资源/事务验证。共同 profile 的 Actor 与投机都使用同一只读输入、虚拟时间、
-随机种子和 guest 环境。检查完成采纳、三种输入重算、gateway 运行中 join、宿主变化拒绝，
-以及完整工具取消后相同 profile 恢复、Actor 单次 fallback；尚未测试 Runtime 的收益准入。
+原生对照和现有 Runtime/资源/事务验证。共同 profile 的 Actor 与投机使用相同的输入语义、
+虚拟时间、随机种子和 guest 环境，但有独立执行进程。仅模型预测使用 Faux，工具输出不做 mock。
+检查跨轮次完成采纳、三种输入重算、Runtime 运行中 join、宿主变化拒绝及真实收益门控；
+不同查询的 Actor 能在 producer 暂停期间独立完成，不把资源召回关系当作运行中覆盖证明。
+插件总开关禁用后检查 worker/stdio 自然关闭，再启用时同一 profile 的 Actor 单次 fallback。
+报告保留校准后的实际采纳或拒绝及原因，不为了保证命中而伪造耗时或绕开调度器。
 原生 Actor 与共同配置的暖执行均取三次中位数；准备、IPC/捕获、投机和采纳成本不混为一种指标。
 写入/管道配额和稀疏文件分配拒绝另有定向检查，后者直接测试 store，不冒充真实 Bash 命令。
 任意可写 shell、开放描述符快照、完整导入配额及原生等价性仍未获资格，不据此启用生产工具。
