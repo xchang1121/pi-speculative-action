@@ -91,7 +91,10 @@ export class EffectTransactionCoordinator<Output> {
 	private sequence = 0;
 
 	begin(descriptor: EffectTransactionDescriptor): EffectTransactionAttempt {
-		const attempt = new TransactionAttempt(`tx_${++this.sequence}`, descriptor);
+		const attempt: MutableEffectTransactionAttempt = {
+			id: `tx_${++this.sequence}`, descriptor: Object.freeze({ ...descriptor }), stateValue: "begun",
+			get state() { return this.stateValue; },
+		};
 		this.attempts.add(attempt);
 		return attempt;
 	}
@@ -168,21 +171,6 @@ export class EffectTransactionCoordinator<Output> {
 			throw new Error(`effect transaction ${attempt.id} is ${attempt.stateValue}, expected ${expected}`);
 		}
 		attempt.stateValue = next;
-	}
-}
-
-class TransactionAttempt implements MutableEffectTransactionAttempt {
-	readonly id: string;
-	readonly descriptor: EffectTransactionDescriptor;
-	stateValue: EffectTransactionState = "begun";
-
-	constructor(id: string, descriptor: EffectTransactionDescriptor) {
-		this.id = id;
-		this.descriptor = Object.freeze({ ...descriptor });
-	}
-
-	get state(): EffectTransactionState {
-		return this.stateValue;
 	}
 }
 

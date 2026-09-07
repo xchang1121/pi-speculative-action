@@ -23,6 +23,8 @@ describe("EffectTransactionCoordinator", () => {
 		const coordinator = new EffectTransactionCoordinator<string>();
 		const attempt = coordinator.begin({ tool: "arbitrary", callID: "call-1", route });
 		expect(attempt.state).toBe("begun");
+		for (const unowned of [{ ...attempt }, new EffectTransactionCoordinator<string>().begin(attempt.descriptor)])
+			await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
 
 		const transaction = await coordinator.execute(attempt, async () =>
 			branch({
@@ -31,8 +33,7 @@ describe("EffectTransactionCoordinator", () => {
 				dispose,
 			}),
 		);
-		expect(transaction.state).toBe("sealed");
-		expect(attempt.state).toBe(transaction.state);
+		expect([transaction.state, attempt.state]).toEqual(["sealed", "sealed"]);
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 		const validation = transaction.validate();
 		if (!pending) { release(); await validation; }
@@ -41,8 +42,7 @@ describe("EffectTransactionCoordinator", () => {
 		const [first, second] = await Promise.all(commits);
 		expect([first, second]).toEqual(["committed", "committed"]);
 		expect(commit).toHaveBeenCalledOnce();
-		expect(transaction.state).toBe("committed");
-		expect(attempt.state).toBe(transaction.state);
+		expect([transaction.state, attempt.state]).toEqual(["committed", "committed"]);
 		await transaction.abort();
 		expect(dispose).toHaveBeenCalledOnce();
 		expect(transaction.state).toBe("committed");
@@ -67,16 +67,14 @@ describe("EffectTransactionCoordinator", () => {
 		);
 
 		const validation = transaction.validate();
-		expect(transaction.state).toBe("validating");
-		expect(attempt.state).toBe(transaction.state);
+		expect([transaction.state, attempt.state]).toEqual(["validating", "validating"]);
 		const aborted = transaction.abort();
 		expect(transaction.state).toBe("aborting");
 		releaseValidation?.();
 		await validation;
 		await aborted;
 
-		expect(transaction.state).toBe("aborted");
-		expect(attempt.state).toBe(transaction.state);
+		expect([transaction.state, attempt.state]).toEqual(["aborted", "aborted"]);
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
