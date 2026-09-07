@@ -204,7 +204,8 @@ export class ResourceVersionManager {
 
 	private async inspect(token: ResourceVersionToken, sealing: boolean): Promise<ResourceVersionValidation> {
 		const started = performance.now();
-		if (!this.owns(token)) return validation(started, true, "resource_version_owner_changed", "exact");
+		if (!this.open || token.manager !== this || token.root !== this.root)
+			return validation(started, true, "resource_version_owner_changed", "exact");
 		await watcherTurn();
 		const watcherFailure = this.invalidation(token, sealing);
 		if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
@@ -229,7 +230,14 @@ export class ResourceVersionManager {
 	}
 
 	private invalidation(token: ResourceVersionToken, sealing: boolean): string | undefined {
-		return sealing ? this.windowFailure(token) : this.watcherInvalidated(token) ? "resource_changed" : undefined;
+		if (!this.open || token.manager !== this || token.root !== this.root) return "resource_version_owner_changed";
+		if (!token.watching) return undefined;
+		if (!this.reliable) return sealing ? "resource_observation_window_unprovable" : undefined;
+		if (this.changesSince(token).uncertain) return sealing ? "resource_observation_window_unprovable" : "resource_changed";
+		const precise = new Set(token.preciseContent.map(filesystemPathKey));
+		const changed = this.events.some((event) => event.epoch > token.epoch &&
+			token.dependencies.some((dependency) => affects(dependency, event, precise)));
+		return changed ? sealing ? "resource_observation_window_changed" : "resource_changed" : undefined;
 	}
 
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
@@ -278,25 +286,6 @@ export class ResourceVersionManager {
 			this.references = Math.max(0, this.references - 1);
 			this.checkIdle();
 		});
-	}
-
-	private watcherInvalidated(token: ResourceVersionToken): boolean {
-		if (!this.reliable || !token.watching) return false;
-		if (this.changesSince(token).uncertain) return true;
-		const precise = new Set(token.preciseContent.map(filesystemPathKey));
-		return this.events.some((event) => event.epoch > token.epoch &&
-			token.dependencies.some((dependency) => affects(dependency, event, precise)));
-	}
-
-	private owns(token: ResourceVersionToken): boolean {
-		return this.open && token.manager === this && token.root === this.root;
-	}
-
-	private windowFailure(token: ResourceVersionToken): string | undefined {
-		if (!this.owns(token)) return "resource_version_owner_changed";
-		if (!token.watching) return undefined;
-		if (!this.reliable || this.changesSince(token).uncertain) return "resource_observation_window_unprovable";
-		return this.watcherInvalidated(token) ? "resource_observation_window_changed" : undefined;
 	}
 
 	private changed(changedPath: string, type: ResourceEvent["type"]) {

@@ -77,7 +77,7 @@ describe("speculative action resource versions", () => {
 		manager.close();
 	});
 
-	test("a failed seal discards only the cache capture and releases its manager", async () => {
+	test.each([false, true])("capture and branch share one resource lifetime (changed=%s)", async (changed) => {
 		const root = await workspace();
 		const file = path.join(root, "value.txt");
 		await fs.writeFile(file, "A");
@@ -86,26 +86,33 @@ describe("speculative action resource versions", () => {
 		const manager = probe.manager;
 		const world = createResourceSnapshotExecutionWorld();
 		const capture = await world.observation!.capture({
-			cwd: root,
-			tool: {} as never,
-			toolName: "read",
-			args: { path: "value.txt" },
-			action: key,
-			callID: "actor-read",
-			signal: new AbortController().signal,
+			cwd: root, tool: {} as never, toolName: "read", args: { path: "value.txt" },
+			action: key, callID: "actor-read", signal: new AbortController().signal,
 		});
-		releaseResourceVersion(probe);
-		await fs.writeFile(file, "B");
-		await settleWatcher();
-
 		const actorOutput = { result: { content: [{ type: "text" as const, text: "A" }], details: {} }, isError: false };
-		const sealing = expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
+		if (changed) {
+			await fs.writeFile(file, "B");
+			await settleWatcher();
+			await expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
+		} else {
+			const branch = await capture.seal(actorOutput);
+			await capture.dispose(); // A sealed capture no longer owns the token.
+			expect(await branch.commit()).toBe(actorOutput);
+			branch.watch?.(() => {});
+			await branch.dispose();
+			await branch.dispose();
+			expect((await branch.validate?.())?.status).toBe("stale");
+			await expect(branch.commit()).rejects.toThrow("disposed");
+		}
 		await expect(capture.seal(actorOutput)).rejects.toThrow("already consumed");
-		await sealing;
 		expect(actorOutput.result.content[0]?.text).toBe("A");
 		const next = await captureResourceVersion(key, root);
-		expect(next.manager).not.toBe(manager);
+		expect(next.manager).toBe(manager); // The unrelated probe still owns a reference.
+		releaseResourceVersion(probe);
 		releaseResourceVersion(next);
+		const retired = await captureResourceVersion(key, root);
+		expect(retired.manager).not.toBe(manager);
+		releaseResourceVersion(retired);
 	});
 
 	test.runIf(process.platform === "linux").each(["grep", "find"] as const)("does not certify %s from workspace-only evidence", async (name) => {
@@ -273,21 +280,6 @@ describe("speculative action resource versions", () => {
 		expect(path.resolve(await invalidated)).toBe(path.resolve(file));
 	});
 
-	test("keeps a manager until its final token is released, then retires it", async () => {
-		const root = await workspace();
-		await fs.writeFile(path.join(root, "value.txt"), "one\n");
-		const key = action("read", ["value.txt"]);
-		const first = await captureResourceVersion(key, root);
-		const second = await captureResourceVersion(key, root);
-		releaseResourceVersion(first);
-		const third = await captureResourceVersion(key, root);
-		expect(third.manager).toBe(second.manager);
-		releaseResourceVersion(second);
-		releaseResourceVersion(third);
-		const retired = await captureResourceVersion(key, root);
-		expect(retired.manager).not.toBe(first.manager);
-		releaseResourceVersion(retired);
-	});
 });
 
 function action(tool: string, resources: ReadonlyArray<string>) {
