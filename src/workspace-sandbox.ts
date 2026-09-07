@@ -888,7 +888,6 @@ async function commitSandboxExecution(
 			const staged = new Map<SandboxFileChange, string>();
 			const descriptors = new Map<SandboxFileChange, FileHandle>();
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
-			const commitModes = new Map<SandboxFileChange, number | undefined>();
 			const applied: SandboxWorkspaceChange[] = [];
 			const createdDirectories: string[] = [];
 			let bytesValidated = 0;
@@ -912,18 +911,15 @@ async function commitSandboxExecution(
 					if (!sameSandboxBaseline(current, change)) {
 						throw new Error(`resource changed before commit: ${change.resource}`);
 					}
-					if (change.kind !== "directory") {
-						commitModes.set(change, resolveCommitMode(current as RegularFileState | undefined, change));
-						if (change.operation) {
-							if (change.after === undefined) throw new Error("A content write cannot delete a file");
-							const before = current as RegularFileState | undefined;
-							if (before) {
-								const descriptor = await open(change.target, fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
-								descriptors.set(change, descriptor);
-								const identity = await descriptor.stat({ bigint: true });
-								if (identity.nlink !== 1n || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
-									throw new Error(`content write identity is not representable: ${change.resource}`);
-								}
+					if (change.kind !== "directory" && change.operation) {
+						if (change.after === undefined) throw new Error("A content write cannot delete a file");
+						const before = current as RegularFileState | undefined;
+						if (before) {
+							const descriptor = await open(change.target, fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+							descriptors.set(change, descriptor);
+							const identity = await descriptor.stat({ bigint: true });
+							if (identity.nlink !== 1n || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
+								throw new Error(`content write identity is not representable: ${change.resource}`);
 							}
 						}
 					}
@@ -962,7 +958,7 @@ async function commitSandboxExecution(
 					const temporary = staged.get(change);
 					if (temporary) {
 						await createParentDirectories(change.root, change.target, createdDirectories);
-						await replaceFile(temporary, change.target, commitModes.get(change));
+						await replaceFile(temporary, change.target, resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change));
 						staged.delete(change);
 					} else {
 						await rm(change.target, { force: true });
@@ -2319,16 +2315,6 @@ export async function readSandboxDirectoryState(target: string): Promise<Sandbox
 }
 
 
-function sameBaselineState(current: RegularFileState | undefined, change: SandboxFileChange): boolean {
-	if (current === undefined || change.before === undefined) {
-		return current === undefined && change.before === undefined;
-	}
-	if (!sameBytes(current.content, change.before)) return false;
-	return (
-		change.beforeMode === undefined || change.beforeMode === 0 || sameExecutableMode(current.mode, change.beforeMode)
-	);
-}
-
 function sameDirectoryState(
 	left: SandboxDirectoryState | undefined,
 	right: SandboxDirectoryState | undefined,
@@ -2348,12 +2334,13 @@ function sameSandboxBaseline(
 ): boolean {
 	return change.kind === "directory"
 		? sameDirectoryState(current as SandboxDirectoryState | undefined, change.before)
-		: sameBaselineState(current as RegularFileState | undefined, change);
+		: sameOptionalState(current as RegularFileState | undefined, change.before === undefined
+			? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
 }
 
 function sameOptionalState(left: RegularFileState | undefined, right: RegularFileState | undefined): boolean {
 	if (!left || !right) return left === right;
-	if (!sameBytes(left.content, right.content)) return false;
+	if (Buffer.compare(left.content, right.content) !== 0) return false;
 	return right.mode === 0 || sameExecutableMode(left.mode, right.mode);
 }
 
@@ -2590,13 +2577,7 @@ async function exists(target: string): Promise<boolean> {
 
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
 	if (left === undefined || right === undefined) return left === right;
-	return sameBytes(left, right);
-}
-
-function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
-	if (left.length !== right.length) return false;
-	for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
-	return true;
+	return Buffer.compare(left, right) === 0;
 }
 
 function parseNullList(value: Uint8Array): string[] {
