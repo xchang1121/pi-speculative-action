@@ -166,7 +166,7 @@ export {
 	SpeculativeActionSettingsStore,
 	type SpeculativeSettingsScope,
 } from "./settings-store.ts";
-export type { ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
+export type { ToolFilesystemOperations, ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
 export {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,

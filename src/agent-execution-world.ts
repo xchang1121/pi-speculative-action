@@ -84,13 +84,13 @@ export function createResourceSnapshotExecutionWorld(
 			...route,
 			tools: operations.tools,
 			fingerprint: (request) => {
-				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.resources) {
+				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.filesystem) {
 					throw new Error("Resource execution requires an explicitly bound operation");
 				}
 				return route.fingerprint();
 			},
 			execute: async (context) => {
-				const execute = (context.action.executionContext as ToolInvocation | undefined)?.resources;
+				const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				context.signal.throwIfAborted();
 				const owned = await capture(context, operations.maxBytes());

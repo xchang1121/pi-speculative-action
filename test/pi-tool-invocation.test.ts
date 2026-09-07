@@ -14,7 +14,7 @@ describe("stock Pi invocation identity", () => {
 		expect(invocation.identity).toEqual({ ...processIdentity, executor: "pi.bash.local.v2", commandPrefix: "set -e" });
 		expect(resolvePiToolInvocation("bash", { command: "printf other", timeout: 9 }, options)?.identity).toEqual(invocation.identity);
 		const read = resolvePiToolInvocation("read", { path: "a.ts" }, options)!;
-		expect(read.resources).toBeTypeOf("function");
+		expect(read.filesystem).toBeTypeOf("function");
 		expect(read.process).toBeUndefined();
 		expect(resolvePiToolInvocation("read", { path: "b.ts", offset: 2 }, options)?.identity).toEqual(read.identity);
 		for (const setting of [{ autoResizeImages: false }, { modelSupportsImages: false }]) {

@@ -122,7 +122,7 @@ describe("speculative action host", () => {
 				const cwd = await temporaryWorkspace();
 				const turnID = `${phase}-${toolName}`;
 				const invocation = resolvePiToolInvocation(toolName, args, { cwd, environment: {} });
-				const resourceExecution = invocation?.resources;
+				const resourceExecution = PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? invocation?.filesystem : undefined;
 				const expected = resourceExecution ? toolName === "read" ? "one\ntwo\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
 				let release!: () => void;
 				const gate = new Promise<void>((resolve) => {
@@ -154,7 +154,7 @@ describe("speculative action host", () => {
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: args }], "toolUse"),
 					preflight: () => true,
-					resolveInvocation: () => resourceExecution ? { ...invocation!, resources: async (view, request) => {
+					resolveInvocation: () => resourceExecution ? { ...invocation!, filesystem: async (view, request) => {
 						await speculativeExecution();
 						return resourceExecution(view, request);
 					} } : invocation,

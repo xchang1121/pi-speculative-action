@@ -98,7 +98,7 @@ export async function qualifyStockTool(
 			const route = await gateway.resolve({ operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
 			const preparationMs = performance.now() - preparedAt;
 			if (requirePrimary) assert.equal(route?.backend, primary?.world.id, `${name}: primary fell back; not a Runtime pass`);
-			else assert.equal(route?.backend, invocation?.resources ? resources.id : semantics.effect === "workspace_mutation" ? fallback.id : undefined,
+			else assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : invocation?.filesystem ? resources.id : undefined,
 				`${name}: native route differs from its stock fallback`);
 			const started = performance.now();
 			let output: ToolSettlement;

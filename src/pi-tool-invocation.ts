@@ -7,8 +7,9 @@ import type { ToolInvocation } from "./tool-settlement.ts";
 import { withPiProjectionCoverage } from "./pi-read-projection.ts";
 
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
-export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "process", readonly string[]>> = {
+export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "process", readonly string[]>> = {
 	resources: VERSION === "0.84.1" ? ["read", "ls"] : [],
+	workspace: VERSION === "0.84.1" ? ["write", "edit"] : [],
 	process: ["bash"],
 };
 
@@ -46,15 +47,17 @@ export function resolvePiToolInvocation(
 	input: unknown,
 	options: PiToolInvocationOptions,
 ): ToolInvocation | undefined {
-	if (PI_OPERATION_TOOLS.resources.includes(tool)) {
+	if ([...PI_OPERATION_TOOLS.resources, ...PI_OPERATION_TOOLS.workspace].includes(tool)) {
 		const cwd = options.cwd;
 		const autoResizeImages = options.autoResizeImages ?? true;
 		const modelSupportsImages = options.modelSupportsImages ?? true;
-		const executor = "pi.file-operations.local.v1";
+		const executor = "pi.filesystem.local.v2";
 		return {
 			executor,
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
-			resources: async (view, request) => {
+			filesystem: async (view, request) => {
+				const denied = (): never => { throw new Error("Filesystem operation is not authorized by this execution world"); };
+				const writeFile = view.writeFile ?? denied;
 				const definitions = createPiToolDefinitions(cwd, {
 					read: { autoResizeImages, operations: {
 						access: view.access, readFile: view.readFile,
@@ -63,12 +66,13 @@ export function resolvePiToolInvocation(
 							return mime.detectSupportedImageMimeType(await view.readFile(target, 4100));
 						},
 					} },
-					ls: { operations: view },
+					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ?? denied, readdir: view.readdir ?? denied } },
+					write: { operations: { writeFile, mkdir: view.mkdir ?? denied } },
+					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile } },
 				});
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				const result = await definitions.get(tool)!.execute(request.callID, request.args as never, request.signal, undefined, context);
-				view.assertComplete();
 				return { result: withPiProjectionCoverage(tool, request.args, result), isError: false };
 			},
 		};

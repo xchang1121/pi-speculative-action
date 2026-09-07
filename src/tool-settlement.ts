@@ -1,6 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { formatThrownValue } from "@earendil-works/pi-ai";
-import type { ResourceReadView } from "./resource-version.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -26,6 +25,17 @@ export interface ToolProcessInvocation {
 	readonly timeout?: number;
 }
 
+/** Filesystem capabilities supplied by an execution world, never ambient host defaults. */
+export interface ToolFilesystemOperations {
+	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
+	readonly access: (target: string, writable?: boolean) => Promise<void>;
+	readonly exists?: (target: string) => boolean | Promise<boolean>;
+	readonly stat?: (target: string) => { isDirectory: () => boolean } | Promise<{ isDirectory: () => boolean }>;
+	readonly readdir?: (target: string) => string[] | Promise<string[]>;
+	readonly writeFile?: (target: string, content: string) => Promise<void>;
+	readonly mkdir?: (target: string) => Promise<void>;
+}
+
 /** Versioned identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
@@ -33,8 +43,8 @@ export interface ToolInvocation {
 	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
-	readonly resources?: (
-		view: ResourceReadView,
+	readonly filesystem?: (
+		view: ToolFilesystemOperations,
 		request: { readonly args: unknown; readonly callID: string; readonly signal: AbortSignal },
 	) => Promise<ToolSettlement>;
 }

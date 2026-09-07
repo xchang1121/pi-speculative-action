@@ -1,11 +1,10 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir } from "node:fs/promises";
+import { access, chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { asRecord, normalizeRelativeRoot } from "./action-semantics.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
@@ -35,7 +34,7 @@ import {
 } from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import type { ToolSettlement } from "./tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import {
 	deferredWorkspaceTransactionDriver,
 	type WorkspaceRegularDelta,
@@ -788,8 +787,11 @@ function createWorkspaceSandboxFor(
 		isolation: "workspace_branch",
 		speculation: {
 			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-			fingerprint: () => {
+			fingerprint: ({ action }) => {
 				assertWorkspaceSandboxOpen(state);
+				if (action && !(action.executionContext as ToolInvocation | undefined)?.filesystem) {
+					throw new Error("Workspace execution requires an explicitly bound filesystem operation");
+				}
 				return workspaceSandboxFingerprintFor(state, resolvedOptions);
 			},
 			prepare: async ({ cwd, signal }) => {
@@ -1106,33 +1108,28 @@ async function executeMutation(
 	context: SpeculativeToolExecutionContext,
 	options: WorkspaceSandboxOptions,
 ): Promise<WorldBranch<ToolSettlement>> {
-	const args = asRecord(context.args);
-	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
+	const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
+	if (!execute) throw new Error("Workspace execution requires an explicitly bound filesystem operation");
 	const sourceRoot = path.resolve(context.cwd);
-	const resource = normalizeRelativeRoot(args.path, sourceRoot);
-	if (resource === undefined || resource === "." || resource !== context.action.resources[0]) {
-		throw new Error(`sandbox mutation path escapes workspace: ${args.path}`);
-	}
-	const target = path.resolve(sourceRoot, resource);
-	await assertNoSymlinkPath(sourceRoot, target);
-	const requestedPath = args.path;
 	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot,
 		action: context.action,
 		...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 		...options,
 		execute: async (workspace) => {
-			const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
-			await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
-			const redirected = { ...args, path: sandboxTarget };
-			const result = await context.tool.execute(context.callID, redirected as never, context.signal);
-			return {
-				result: replacePaths(result, [
-					[sandboxTarget, requestedPath],
-					[workspace.sandboxRoot, sourceRoot],
-				]),
-				isError: false,
+			const physical = async (logical: string) => {
+				const relative = relativeFilesystemPath(sourceRoot, logical);
+				if (relative === undefined) throw new Error("Filesystem operation escapes workspace");
+				const target = path.resolve(workspace.sandboxRoot, relative);
+				await assertNoSymlinkPath(workspace.sandboxRoot, target);
+				return target;
 			};
+			return execute({
+				readFile: async (target, limit) => (await readFile(await physical(target))).subarray(0, limit),
+				access: async (target, writable) => access(await physical(target), fsConstants.R_OK | (writable ? fsConstants.W_OK : 0)),
+				writeFile: async (target, content) => writeFile(await physical(target), content, "utf8"),
+				mkdir: async (target) => { await mkdir(await physical(target), { recursive: true }); },
+			}, context);
 		},
 	});
 }
@@ -2591,20 +2588,6 @@ function parseNullList(value: Uint8Array): string[] {
 		.split("\0")
 		.filter(Boolean)
 		.map((item) => slash(item));
-}
-
-function replacePaths<T>(value: T, replacements: readonly (readonly [string, string])[]): T {
-	if (typeof value === "string") {
-		let result: string = value;
-		for (const [from, to] of replacements) result = result.replaceAll(from, to);
-		return result as T;
-	}
-	if (Array.isArray(value)) return value.map((item) => replacePaths(item, replacements)) as T;
-	if (!value || typeof value !== "object" || value instanceof Uint8Array) return value;
-	if (Object.getPrototypeOf(value) !== Object.prototype) return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, replacePaths(item, replacements)]),
-	) as T;
 }
 
 function git(

@@ -3,11 +3,11 @@ import { chmod, type FileHandle, mkdir, mkdtemp, readFile, readdir, rm, stat, sy
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { createEditTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	effectCapabilitiesCover,
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -28,39 +28,8 @@ import {
 	workspaceSandboxFingerprint,
 } from "../src/workspace-sandbox.ts";
 
-const writeParameters = Type.Object({ path: Type.String(), content: Type.String() });
-const editParameters = Type.Object({
-	path: Type.String(),
-	edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() })),
-});
-
-const writeTool: AgentTool<typeof writeParameters> = {
-	name: "write",
-	label: "write",
-	description: "write",
-	parameters: writeParameters,
-	async execute(_callID, args) {
-		await mkdir(path.dirname(args.path), { recursive: true });
-		await writeFile(args.path, args.content, "utf8");
-		return { content: [{ type: "text", text: `Successfully wrote ${args.path}` }], details: undefined };
-	},
-};
-
-const editTool: AgentTool<typeof editParameters> = {
-	name: "edit",
-	label: "edit",
-	description: "edit",
-	parameters: editParameters,
-	async execute(_callID, args) {
-		let content = await readFile(args.path, "utf8");
-		for (const edit of args.edits) {
-			if (!content.includes(edit.oldText)) throw new Error("oldText missing");
-			content = content.replace(edit.oldText, edit.newText);
-		}
-		await writeFile(args.path, content, "utf8");
-		return { content: [{ type: "text", text: `Successfully edited ${args.path}` }], details: undefined };
-	},
-};
+const writeTool = createWriteTool(process.cwd());
+const editTool = createEditTool(process.cwd());
 
 const testRoots = new Set<string>();
 
@@ -129,32 +98,38 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("accepts workspace mutations and commits a sealed write exactly once", async () => {
+	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {
 		const root = await temporaryRoot("write");
 		try {
-			const args = { path: "@nested/created.txt", content: "isolated\n" };
 			const world = createWorkspaceSandbox({ driver: "git" });
 			expect(world.scope).toBe("fallback");
-			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
 			expect(effectCapabilitiesCover(world.speculation.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
 			expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
-			expect(
-				await world.speculation.fingerprint?.({
-					effect: "workspace_mutation",
-					requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-				}),
-			).toBe("git-worktree:v1");
-			const branch = await world.speculation.execute(context(root, "write", writeTool, args));
-
-			expect(branch.commitMetrics).toBeUndefined();
-			expect(branch.resources).toEqual(["nested/created.txt"]);
-			await expect(stat(path.join(root, args.path))).rejects.toThrow();
-			const first = branch.commit();
-			expect(branch.commit()).toBe(first);
-			await first;
-			expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
-			expect(await readFile(path.join(root, "nested/created.txt"), "utf8")).toBe("isolated\n");
-			await expect(stat(path.join(root, args.path))).rejects.toThrow();
+			const target = path.join(root, "nested/created.txt"), before = `\uFEFFbefore ${root}\r\n`;
+			const forbidden = { ...writeTool, execute: vi.fn(async () => { throw new Error("host function invoked"); }) };
+			for (const [name, args] of [
+				["write", { path: "@nested/created.txt", content: before }],
+				["edit", { path: target, edits: [{ oldText: "before", newText: "after" }] }],
+			] as const) {
+				const native = name === "write" ? createWriteTool(root) : createEditTool(root);
+				const expected = await native.execute("actor", args as never);
+				const expectedBytes = await readFile(target);
+				if (name === "write") await rm(path.dirname(target), { recursive: true, force: true });
+				else await writeFile(target, before);
+				const request = context(root, name, forbidden, args);
+				await expect(world.speculation.execute({ ...request, action: { ...request.action, executionContext: undefined } }))
+					.rejects.toThrow("explicitly bound");
+				const branch = await world.speculation.execute(request);
+				expect(branch.output).toEqual({ result: expected, isError: false });
+				if (name === "write") await expect(stat(target)).rejects.toThrow();
+				else expect(await readFile(target, "utf8")).toBe(before);
+				const first = branch.commit();
+				expect(branch.commit()).toBe(first);
+				await first;
+				expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
+				expect(await readFile(target)).toEqual(expectedBytes);
+			}
+			expect(forbidden.execute).not.toHaveBeenCalled();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -520,9 +495,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(execute(escapingInput)).rejects.toThrow();
 			await symlink(outside, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
 			const linked = { path: "linked/out.txt", content: "no" };
-			await expect(execute(linked)).rejects.toThrow(
-				"contains symlink",
-			);
+			await expect(execute(linked)).rejects.toThrow(/symlink/);
 			expect(executions).toBe(0);
 			await expect(stat(path.join(outside, "out.txt"))).rejects.toThrow();
 		} finally {
@@ -726,7 +699,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 });
 
-function context<Schema extends typeof writeParameters | typeof editParameters>(
+function context<Schema extends (typeof writeTool)["parameters"] | (typeof editTool)["parameters"]>(
 	root: string,
 	toolName: "write" | "edit",
 	tool: AgentTool<Schema>,
@@ -737,9 +710,10 @@ function context<Schema extends typeof writeParameters | typeof editParameters>(
 		tool,
 		toolName,
 		args,
-		action:
-			buildPiActionKey(toolName, args, root) ??
-			requiredAction("write", { path: "safe.txt", content: "boundary probe" }, root),
+		action: {
+			...(buildPiActionKey(toolName, args, root) ?? requiredAction("write", { path: "safe.txt", content: "boundary probe" }, root)),
+			executionContext: resolvePiToolInvocation(toolName, args, { cwd: root, environment: {} }),
+		},
 		callID: `spec-${toolName}`,
 		signal: new AbortController().signal,
 	};

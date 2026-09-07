@@ -237,7 +237,7 @@ describe("speculative action resource versions", () => {
 				const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {}, modelSupportsImages, autoResizeImages })!;
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				const expected = await createReadToolDefinition(root, { autoResizeImages }).execute("actor", args, undefined, undefined, context);
-				const output = await invocation.resources!(token.view!, { args, callID: "speculate", signal: new AbortController().signal });
+				const output = await invocation.filesystem!(token.view!, { args, callID: "speculate", signal: new AbortController().signal });
 				expect(expected.content.some((item) => item.type === "image")).toBe(true);
 				expect(output.result).toEqual(expected);
 			}
