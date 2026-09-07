@@ -5,9 +5,10 @@ import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm, stat }
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
 
-const HELPER_PROTOCOL_VERSION = 3;
+const HELPER_PROTOCOL_VERSION = 4;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -58,7 +59,9 @@ interface ActiveExecution {
 	readonly sourceRoot: string;
 	readonly signal?: AbortSignal;
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
-	readonly observations: Set<Promise<void>>;
+	readonly pending: Set<Promise<void>>;
+	readonly controller: AbortController;
+	failure?: Error;
 }
 
 interface WireRequest {
@@ -84,6 +87,7 @@ export class LinuxHeldExecBoundary {
 		this.socketPath = socketPath;
 		this.server = net.createServer({ allowHalfOpen: true }, (socket) => {
 			this.sockets.add(socket);
+			socket.on("error", () => socket.destroy());
 			socket.once("close", () => this.sockets.delete(socket));
 			void this.serve(socket);
 		});
@@ -108,27 +112,29 @@ export class LinuxHeldExecBoundary {
 
 	executor(
 		host: ProcessExecutor,
-		options: Omit<ActiveExecution, "observations"> & { readonly realShell: string },
+		options: Pick<ActiveExecution, "sourceRoot" | "decide"> & { readonly realShell: string },
 		fallback: ProcessExecutor = host,
 	): ProcessExecutor {
 		return {
 			execute: async (request) => {
 				// The transport never owns caller-provided environment entries. A collision
 				// therefore disables handoff for this launch and preserves stock Bash semantics.
-				if (request.signal?.aborted || PRIVATE_ENV_NAMES.some((name) => Object.hasOwn(request.environment, name))) {
+				if (this.closed || request.signal?.aborted || PRIVATE_ENV_NAMES.some((name) => Object.hasOwn(request.environment, name))) {
 					return fallback.execute(request);
 				}
 				const execution = randomBytes(24).toString("hex");
-				const active = {
+				const controller = new AbortController();
+				const active: ActiveExecution = {
 					sourceRoot: options.sourceRoot,
 					decide: options.decide,
-					observations: new Set<Promise<void>>(),
-					...(request.signal ? { signal: request.signal } : {}),
+					pending: new Set<Promise<void>>(), controller,
+					signal: AbortSignal.any([controller.signal, ...(request.signal ? [request.signal] : [])]),
 				};
 				this.active.set(execution, active);
 				try {
 					return await host.execute({
 						...request,
+						signal: active.signal,
 						environment: {
 							...request.environment,
 							[PRIVATE_ENV.shell]: options.realShell,
@@ -138,8 +144,9 @@ export class LinuxHeldExecBoundary {
 						},
 					});
 				} finally {
-					await Promise.allSettled(active.observations);
+					await Promise.allSettled(active.pending);
 					this.active.delete(execution);
+					if (active.failure) throw active.failure;
 				}
 			},
 		};
@@ -148,7 +155,7 @@ export class LinuxHeldExecBoundary {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
-		this.active.clear();
+		for (const active of this.active.values()) active.controller.abort(new Error("held-exec boundary disposed"));
 		for (const socket of this.sockets) socket.destroy();
 		await new Promise<void>((resolve) => this.server.close(() => resolve()));
 		await rm(this.socketPath, { force: true }).catch(() => undefined);
@@ -156,9 +163,13 @@ export class LinuxHeldExecBoundary {
 
 	private async serve(socket: net.Socket): Promise<void> {
 		let prepared = false;
+		let active: ActiveExecution | undefined;
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
 		try {
 			const request = parseRequest(await readLine(socket));
-			const active = request?.token === this.token ? this.active.get(request.execution) : undefined;
+			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
+			active?.pending.add(pending);
 			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) {
 				return void socket.end("C\n");
 			}
@@ -171,30 +182,34 @@ export class LinuxHeldExecBoundary {
 			});
 			if (decision.kind === "continue") {
 				if (!decision.observeCompletion) return void socket.end("C\n");
-				const observation = observeCompletion(socket, decision.observeCompletion);
-				active.observations.add(observation);
-				try {
-					await observation;
-				} finally {
-					active.observations.delete(observation);
-				}
+				await observeCompletion(socket, decision.observeCompletion);
 				return;
 			}
 			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0);
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) return void socket.end("C\n");
+			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
+			prepared = true;
 			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total}\n`));
 			for (const event of decision.output) {
 				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
 				await write(socket, event.data);
 			}
-			if ((await readLine(socket)) !== "A") return void socket.end();
-			prepared = true;
+			if ((await readLine(socket)) !== "A") throw new Error("held-exec adoption was not acknowledged");
 			throwIfAborted(active.signal);
 			await decision.commit();
-			socket.end("R\n");
-		} catch {
-			if (!socket.destroyed) socket.end(prepared ? "F\n" : "C\n");
+			await write(socket, Buffer.from("R\n"));
+			if ((await readLine(socket)) !== "D") throw new Error("held-exec adoption completion is unknown");
+			socket.end();
+		} catch (error) {
+			if (active && (prepared || isPoisonedEffectCommit(error))) {
+				// The logical call, not just the held child, owns an irreversible handoff.
+				active.failure ??= effectCommitFailure(new Error("held-exec handoff failed", { cause: error }), "poisoned");
+			}
+			if (!socket.destroyed) socket.end(active?.failure ? "F\n" : "C\n");
+		} finally {
+			active?.pending.delete(pending);
+			release();
 		}
 	}
 }
@@ -365,6 +380,7 @@ async function readLine(socket: net.Socket): Promise<string> {
 			socket.pause();
 			socket.off("data", onData);
 			socket.off("end", onEnd);
+			socket.off("close", onEnd);
 			socket.off("error", onError);
 		};
 		const finish = (error?: unknown, value?: string) => {
@@ -381,6 +397,7 @@ async function readLine(socket: net.Socket): Promise<string> {
 		const onError = (error: Error) => finish(error);
 		socket.on("data", onData);
 		socket.once("end", onEnd);
+		socket.once("close", onEnd);
 		socket.once("error", onError);
 		socket.resume();
 	});

@@ -1,10 +1,14 @@
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
+import { LinuxHeldExecBoundary } from "../src/linux-held-exec.ts";
+import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -18,6 +22,38 @@ import {
 } from "../bench/linux-process-harness.ts";
 
 describe("Linux process ExecutionWorld", () => {
+	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
+		const binary = path.join(root, "helper");
+		execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
+		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
+		try {
+			for (const disposition of [undefined, "recoverable", "poisoned"] as const) {
+				const after = path.join(root, `after-${disposition}`);
+				const commit = vi.fn(async () => {
+					if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
+				});
+				const executor = boundary.executor(adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary })), {
+					sourceRoot: root, realShell: "/bin/bash",
+					decide: async () => ({ kind: "replay", output: [], exitCode: 0, commit }),
+				});
+				const run = executor.execute({ command: `/bin/true; printf continued > '${after}'`, cwd: root,
+					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5 });
+				if (disposition) {
+					await expect(run).rejects.toMatchObject({ disposition: "poisoned" });
+					await expect(stat(after)).rejects.toThrow();
+				} else {
+					expect(await run).toEqual({ exitCode: 0 });
+					expect(await readFile(after, "utf8")).toBe("continued");
+				}
+				expect(commit).toHaveBeenCalledOnce();
+			}
+		} finally {
+			await boundary.close();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	test("skips completed replay lookup when Actor execution is cheaper", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");

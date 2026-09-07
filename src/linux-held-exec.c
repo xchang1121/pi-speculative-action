@@ -30,10 +30,10 @@ struct output_event {
 	unsigned char *data;
 };
 
-struct completion_observer {
+struct traced_process {
 	pid_t pid;
 	int fd;
-	struct completion_observer *next;
+	struct traced_process *next;
 };
 
 static int replace_with_exit(pid_t pid, unsigned code) {
@@ -227,6 +227,7 @@ static int actor_decision(pid_t pid, const char *socket_path, const char *token,
 	if (request_length < 0 || request_length >= (int)sizeof(line) ||
 		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) goto done;
 	if (!strcmp(line, "C")) goto done;
+	if (!strcmp(line, "F")) { observer = -2; goto done; }
 	if (!strcmp(line, "O")) { observer = connection; connection = -1; goto done; }
 	if (sscanf(line, "P %u %u %zu", &code, &count, &total) != 3 || code > 255 ||
 		count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) goto done;
@@ -244,12 +245,16 @@ static int actor_decision(pid_t pid, const char *socket_path, const char *token,
 		if (length && (!(events[index].data = malloc(length)) || transfer(connection, events[index].data, length, 0) < 0)) goto done;
 		received += length;
 	}
-	if (received != total || replace_with_exit(pid, 125) < 0) goto done;
+	if (received != total) goto done;
+	observer = -2; /* From the first text mutation onward, failure terminates the entire trace tree. */
+	if (replace_with_exit(pid, 125) < 0) goto done;
 	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		if (transfer(outputs[events[index].fd], events[index].data, events[index].length, 1) < 0) goto done;
 	}
 	if (replace_with_exit(pid, code) < 0) goto done;
+	if (transfer(connection, "D\n", 2, 1) < 0) goto done;
+	observer = -1;
 done:
 	if (connection >= 0) close(connection);
 	for (unsigned fd = 1; fd <= 2; fd++) if (outputs[fd] >= 0) close(outputs[fd]);
@@ -257,21 +262,22 @@ done:
 	return observer;
 }
 
-static void observe_completion(struct completion_observer **observers, pid_t pid, int fd) {
-	struct completion_observer *observer = malloc(sizeof(*observer));
-	if (!observer) { close(fd); return; }
-	*observer = (struct completion_observer){.pid = pid, .fd = fd, .next = *observers};
-	*observers = observer;
+static int track_process(struct traced_process **processes, pid_t pid) {
+	struct traced_process *observer = malloc(sizeof(*observer));
+	if (!observer) return -1;
+	*observer = (struct traced_process){.pid = pid, .fd = -1, .next = *processes};
+	*processes = observer;
+	return 0;
 }
 
-static void complete_observers(struct completion_observer **observers, pid_t pid) {
-	struct completion_observer **cursor = observers;
+static void release_process(struct traced_process **processes, pid_t pid) {
+	struct traced_process **cursor = processes;
 	while (*cursor) {
-		struct completion_observer *observer = *cursor;
+		struct traced_process *observer = *cursor;
 		if (observer->pid != pid) { cursor = &observer->next; continue; }
 		*cursor = observer->next;
 		size_t sent = 0;
-		while (sent < 2) {
+		while (observer->fd >= 0 && sent < 2) {
 			ssize_t moved = send(observer->fd, "D\n" + sent, 2 - sent, MSG_NOSIGNAL);
 			if (moved < 0 && errno == EINTR) continue;
 			if (moved <= 0) break;
@@ -306,7 +312,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	close(gate[1]);
 	int status = 0;
 	unsigned exec_events = 0;
-	struct completion_observer *observers = NULL;
+	struct traced_process *processes = NULL;
+	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); return 70; }
 	for (;;) {
 		pid_t pid = waitpid(-1, &status, __WALL);
 		if (pid < 0) {
@@ -315,7 +322,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			return 74;
 		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
-			complete_observers(&observers, pid);
+			release_process(&processes, pid);
 			if (pid != root) continue;
 			if (WIFEXITED(status)) return WEXITSTATUS(status);
 			signal(WTERMSIG(status), SIG_DFL);
@@ -325,6 +332,10 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		if (!WIFSTOPPED(status)) continue;
 		unsigned event = (unsigned)status >> 16;
 		int delivered = WSTOPSIG(status);
+		if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+			unsigned long child;
+			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0 || track_process(&processes, (pid_t)child) < 0) goto fatal;
+		}
 		if (event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
 			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) return 75;
 			continue;
@@ -333,19 +344,24 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (skip && replace_with_exit(pid, skip_code) < 0) return 76;
 			if (socket_path) {
 				int observer = actor_decision(pid, socket_path, token, execution_id);
-				if (observer >= 0) observe_completion(&observers, pid, observer);
+				if (observer == -2) goto fatal;
+				for (struct traced_process *item = processes; item; item = item->next)
+					if (item->pid == pid && observer >= 0) { close(item->fd); item->fd = observer; }
 			}
 		}
 		if (event != 0) delivered = 0;
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) return 75;
 	}
+fatal:
+	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
+	return 125;
 }
 
 int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("3");
+		puts("4");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
