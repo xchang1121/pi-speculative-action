@@ -98,7 +98,7 @@ import {
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v15";
+const BACKEND_EPOCH = "pi-linux-process-v16";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v2";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;

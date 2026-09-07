@@ -3,6 +3,7 @@ import path from "node:path";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
+	type FilesystemObservationEvidence,
 	filesystemObservationDigest,
 	type ProvenanceTaint,
 	type Sha256Digest,
@@ -55,36 +56,86 @@ export interface StraceObservationOptions {
 
 interface TraceFile {
 	readonly pid: number;
-	readonly lines: readonly string[];
+	readonly lines: readonly TraceLine[];
 }
 
 type TraceRoot = { readonly file: TraceFile; readonly start: number };
-const INCOMPLETE_TRACE_PREFIX = "# pi-trace-incomplete:";
+interface TraceLine {
+	readonly name: string;
+	readonly args: readonly string[];
+	readonly result: string;
+	readonly failure?: string;
+}
+const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" };
 
-function reassembleSyscalls(lines: readonly string[], pid: number): readonly string[] {
+/** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax. */
+function parseTraceLine(line: string): TraceLine {
+	const head = /^\s*([a-zA-Z0-9_]+)\(/.exec(line);
+	const empty = { name: head?.[1] ?? "", args: [], result: "" };
+	if (!head && (!line.trim() || /^(?:\+\+\+|---)/.test(line))) return empty;
+	const failure = { ...empty, failure: `syscall_unparsed:${empty.name}` };
+	if (!head) return failure;
+	const args: string[] = [], stack: string[] = [];
+	let start = head[0].length, quoted = false;
+	for (let index = start; index < line.length; index++) {
+		const character = line[index]!;
+		const context = stack.at(-1);
+		if (character === "\\" && (quoted || context?.endsWith(">"))) { index++; continue; }
+		if (quoted) { if (character === '"') quoted = false; continue; }
+		// -yy sockets use -> for peers; filesystem paths escape literal angle brackets.
+		if (context?.endsWith(">")) {
+			if (character === "<") stack.push(">");
+			if (character === ">" && (context === "/>" || line[index - 1] !== "-")) stack.pop();
+			continue;
+		}
+		if (character === '"') { quoted = true; continue; }
+		if (line.startsWith("/*", index)) {
+			const end = line.indexOf("*/", index + 2);
+			if (end < 0) return failure;
+			index = end + 1;
+			continue;
+		}
+		const closing = TRACE_DELIMITERS[character];
+		if (closing) { stack.push(character === "<" && line[index + 1] === "/" ? "/>" : closing); continue; }
+		if (character === ")" && !stack.length) {
+			const result = /^\s+=\s+(.*)$/.exec(line.slice(index + 1))?.[1];
+			if (!result) return failure;
+			if (index > start || args.length) args.push(line.slice(start, index).trim());
+			return { name: head[1]!, args, result };
+		}
+		if (")]}".includes(character)) {
+			if (stack.pop() !== character) return failure;
+		} else if (character === "," && !stack.length) {
+			args.push(line.slice(start, index).trim());
+			start = index + 1;
+		}
+	}
+	return failure;
+}
+
+function reassembleSyscalls(lines: readonly string[], pid: number): readonly TraceLine[] {
 	const pending = new Map<string, string[]>();
-	const complete: string[] = [];
+	const complete: TraceLine[] = [];
 	for (const line of lines) {
-		if (line.includes("<unfinished ...>")) {
-			const name = syscallName(line);
-			const prefix = line.replace(/\s*<unfinished \.\.\.>\s*$/, "");
-			if (!name || prefix === line) complete.push(incompleteTraceLine(`unfinished_unparsed:${pid}`));
-			else (pending.get(name) ?? pending.set(name, []).get(name)!).push(prefix);
+		const unfinished = /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(line);
+		if (unfinished) {
+			const name = unfinished[1]!;
+			(pending.get(name) ?? pending.set(name, []).get(name)!).push(line.replace(/\s*<unfinished \.\.\.>\s*$/, ""));
 			continue;
 		}
 		const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(line);
 		if (!resumed) {
-			complete.push(line);
+			complete.push(parseTraceLine(line));
 			continue;
 		}
 		const name = resumed[1]!;
 		const queue = pending.get(name);
 		const prefix = queue?.shift();
-		if (!prefix) complete.push(incompleteTraceLine(`resumed_without_unfinished:${pid}:${name}`));
-		else complete.push(`${prefix}${resumed[2]}`);
+		if (!prefix) complete.push({ name, args: [], result: "", failure: `resumed_without_unfinished:${pid}:${name}` });
+		else complete.push(parseTraceLine(`${prefix}${resumed[2]}`));
 		if (queue?.length === 0) pending.delete(name);
 	}
-	for (const name of pending.keys()) complete.push(incompleteTraceLine(`unfinished:${pid}:${name}`));
+	for (const name of pending.keys()) complete.push({ name, args: [], result: "", failure: `unfinished:${pid}:${name}` });
 	return complete;
 }
 
@@ -130,14 +181,6 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 	const shallowest = Math.min(...candidates.map((candidate) => candidate.depth));
 	const matches = candidates.filter((candidate) => candidate.depth === shallowest);
 	return matches.length === 1 ? matches[0]! : { reason: `target_exec_ambiguous:${matches.map(({ file }) => file.pid).sort().join(",")}` };
-}
-
-function incompleteTraceLine(reason: string): string {
-	return `${INCOMPLETE_TRACE_PREFIX}${reason}`;
-}
-
-function incompleteTraceReason(line: string): string | undefined {
-	return line.startsWith(INCOMPLETE_TRACE_PREFIX) ? line.slice(INCOMPLETE_TRACE_PREFIX.length) : undefined;
 }
 
 /**
@@ -239,16 +282,13 @@ export async function observeStrace(
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
 			const line = file.lines[index]!;
 			if (!line) continue;
-			const traceFailure = incompleteTraceReason(line);
+			const traceFailure = line.failure;
 			if (traceFailure) {
 				complete = false;
 				incompleteReasons.add(traceFailure);
 				continue;
 			}
-			if (line.startsWith("+++ killed by") || line.startsWith("--- SIG")) {
-				continue;
-			}
-			const syscall = syscallName(line);
+			const syscall = line.name;
 			if (!syscall) continue;
 			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") {
 				taints.add("pid_observation");
@@ -287,7 +327,7 @@ export async function observeStrace(
 			if (MODELED_METADATA_SYSCALLS.has(syscall)) {
 				if (syscallSucceeded(line)) {
 					const metadataPaths = metadataSyscallPaths(line, syscall, cwd);
-					const digest = statObservationDigest(line);
+					const digest = statObservationDigest(line.args[syscall === "newfstatat" ? 2 : 1] ?? "");
 					if (!metadataPaths.length || !digest) {
 						if (syscall === "fstat" && descriptorTarget(line)) taints.add("descriptor_observation");
 						else {
@@ -408,24 +448,25 @@ const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
 ]);
 
 const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC_SETFLAGS|FS_IOC_SETVERSION|FS_IOC_FSSETXATTR)\b/;
-const DRIVER_SEMANTIC_GAP_RESULT = /=\s*-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
+const DRIVER_SEMANTIC_GAP_RESULT = /^-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
 
-function unmodeledFileIoctl(line: string): boolean {
+function unmodeledFileIoctl(line: TraceLine): boolean {
 	if (!syscallSucceeded(line)) return false;
-	if (UNMODELED_MUTATING_IOCTL.test(line)) return true;
-	const descriptorPath = /^\s*ioctl\(\d+<([^>]+)>/.exec(line)?.[1];
-	return descriptorPath?.startsWith("/") ?? false;
+	return UNMODELED_MUTATING_IOCTL.test(line.args[1] ?? "") || absoluteDescriptorPath(line.args[0]) !== undefined;
 }
 
 function workspaceDriverSemanticGap(
-	line: string,
+	line: TraceLine,
 	syscall: string,
 	cwd: string,
 	roots: readonly string[],
 ): boolean {
-	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line)) return false;
+	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line.result)) return false;
 	const referenced = new Set(syscallPaths(line, syscall, cwd));
-	for (const match of line.matchAll(/\d+<(\/[^>]+)>/g)) referenced.add(path.posix.normalize(match[1]!));
+	for (const argument of line.args) {
+		const target = absoluteDescriptorPath(argument);
+		if (target) referenced.add(target);
+	}
 	return [...referenced].some((candidate) => roots.some((root) => containsLogicalPath(root, candidate)));
 }
 
@@ -455,9 +496,9 @@ const IPC_SYSCALLS = new Set([
 const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
 const RANDOM_SYSCALLS = new Set(["getrandom"]);
 
-function resourceLimitMutation(line: string, syscall: string): boolean {
+function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
 	if (!syscallSucceeded(line)) return false;
-	return syscall === "setrlimit" || (syscall === "prlimit64" && !/^\s*prlimit64\([^,]+,[^,]+,\s*NULL\s*,/.test(line));
+	return syscall === "setrlimit" || (syscall === "prlimit64" && line.args[2] !== "NULL");
 }
 
 function ignoredProcessSegments(
@@ -516,11 +557,10 @@ function ignoredProcessSegments(
 	return ignored;
 }
 
-function tracedCwd(line: string, cwd: string | undefined): string | undefined {
+function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined {
 	if (!syscallSucceeded(line)) return cwd;
-	const syscall = syscallName(line);
-	if (syscall === "fchdir") return fchdirPath(line);
-	if (syscall !== "chdir") return cwd;
+	if (line.name === "fchdir") return absoluteDescriptorPath(line.args[0]);
+	if (line.name !== "chdir") return cwd;
 	const target = quotedStrings(line)[0];
 	return target ? tracedPath(target, cwd) : undefined;
 }
@@ -529,42 +569,35 @@ function tracedPath(target: string, cwd: string | undefined): string | undefined
 	return path.posix.isAbsolute(target) ? path.posix.resolve(target) : cwd ? path.posix.resolve(cwd, target) : undefined;
 }
 
-function successfulExec(line: string): boolean {
-	return /\bexecve(?:at)?\(/.test(line) && syscallSucceeded(line);
+function successfulExec(line: TraceLine): boolean {
+	return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line);
 }
 
-function spawnedPID(line: string): number | undefined {
-	if (!/^\s*(?:clone|clone3|fork|vfork)\(/.test(line)) return undefined;
-	const match = /=\s*(\d+)\s*$/.exec(line);
-	if (!match) return undefined;
-	const pid = Number.parseInt(match[1]!, 10);
+function spawnedPID(line: TraceLine): number | undefined {
+	if (!["clone", "clone3", "fork", "vfork"].includes(line.name)) return undefined;
+	const pid = Number(line.result);
 	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
-function syscallName(line: string): string | undefined {
-	return /^\s*([a-zA-Z0-9_]+)\(/.exec(line)?.[1];
+function syscallSucceeded(line: TraceLine): boolean {
+	return /^(?:0x[0-9a-f]+|[0-9]+)(?:\b|<)/i.test(line.result);
 }
 
-function syscallSucceeded(line: string): boolean {
-	const result = /=\s*([^\s]+)/.exec(line)?.[1];
-	return result !== undefined && result !== "-1" && result !== "?";
+function confinementDenied(line: TraceLine): boolean {
+	return /^-1 (?:EACCES|EPERM)\b/.test(line.result);
 }
 
-function confinementDenied(line: string): boolean {
-	return /\)\s+= -1 (?:EACCES|EPERM)\b/.test(line);
+function prctlConfinementSensitive(line: TraceLine, syscall: string): boolean {
+	return syscall === "prctl" && !/^PR_SET_(?:NAME|VMA)\b/.test(line.args[0] ?? "");
 }
 
-function prctlConfinementSensitive(line: string, syscall: string): boolean {
-	return syscall === "prctl" && !/^prctl\(PR_SET_(?:NAME|VMA)\b/.test(line);
+function processLimitDenied(line: TraceLine, syscall: string): boolean {
+	return ["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result);
 }
 
-function processLimitDenied(line: string, syscall: string): boolean {
-	return ["clone", "clone3", "fork", "vfork"].includes(syscall) && /\)\s+= -1 EAGAIN\b/.test(line);
-}
-
-function syscallPaths(line: string, syscall: string, cwd: string): readonly string[] {
+function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] {
 	if (syscall === "fchdir") {
-		const target = fchdirPath(line);
+		const target = absoluteDescriptorPath(line.args[0]);
 		return target ? [target] : [];
 	}
 	const quoted = quotedStrings(line);
@@ -573,43 +606,34 @@ function syscallPaths(line: string, syscall: string, cwd: string): readonly stri
 	if (syscall === "symlink" || syscall === "symlinkat") values = quoted.slice(-1);
 	else if (["rename", "renameat", "renameat2", "link", "linkat"].includes(syscall)) values = quoted.slice(0, 2);
 	else values = quoted.slice(0, 1);
-	const dirfd = /(?:openat2?|newfstatat|statx|faccessat2?|readlinkat|mkdirat|unlinkat|execveat)\(([^,]+),/.exec(line)?.[1];
-	let base = cwd;
-	if (dirfd && dirfd !== "AT_FDCWD") {
-		const descriptorPath = /^\d+<([^>]+)>$/.exec(dirfd.trim())?.[1];
-		if (descriptorPath) base = descriptorPath;
-	}
+	const dirfd = /^(?:openat2?|newfstatat|statx|faccessat2?|readlinkat|mkdirat|unlinkat|execveat)$/.test(syscall) ? line.args[0] : undefined;
+	const base = absoluteDescriptorPath(dirfd) ?? cwd;
 	return values
 		.filter((value) => value.length > 0)
 		.map((value) => resolveObservedPath(value, base));
 }
 
-function fchdirPath(line: string): string | undefined {
-	const descriptor = /^\s*fchdir\((.+)\)\s+=/.exec(line)?.[1];
-	return absoluteDescriptorPath(descriptor);
-}
-
 function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {
 	const target = /^\d+<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
-	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(target) : undefined;
+	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(decodeCString(target)) : undefined;
 }
 
 function metadataSyscallPaths(
-	line: string,
+	line: TraceLine,
 	syscall: string,
 	cwd: string,
 ): readonly { readonly path: string; readonly followSymlinks: boolean }[] {
-	const followSymlinks = syscall !== "lstat" && !/\bAT_SYMLINK_NOFOLLOW\b/.test(line);
+	const followSymlinks = syscall !== "lstat" && !(syscall === "newfstatat" && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[3] ?? ""));
 	const paths = syscall === "fstat" ? [] : syscallPaths(line, syscall, cwd);
 	if (paths.length) return paths.map((observedPath) => ({ path: observedPath, followSymlinks }));
 	if (syscall !== "fstat" && syscall !== "newfstatat") return [];
-	const descriptorPath = absoluteDescriptorPath(/^\s*(?:fstat|newfstatat)\((\d+<.+?>),/.exec(line)?.[1]);
+	const descriptorPath = absoluteDescriptorPath(line.args[0]);
 	return descriptorPath ? [{ path: descriptorPath, followSymlinks }] : [];
 }
 
 /** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
-function descriptorTarget(line: string): boolean {
-	const target = /^\s*fstat\(\d+<(.+?)>,/.exec(line)?.[1];
+function descriptorTarget(line: TraceLine): boolean {
+	const target = /^\d+<(.+)>$/.exec(line.args[0] ?? "")?.[1];
 	return Boolean(target && !target.startsWith("/"));
 }
 
@@ -641,6 +665,10 @@ function statObservationDigest(line: string): Sha256Digest | undefined {
 		const bits = STAT_MODE_BITS[token] ?? parseInteger(token);
 		return bits === undefined || combined === undefined ? undefined : combined | bits;
 	}, 0n);
+	const time = (name: string): bigint | undefined => {
+		const seconds = field(name), nanos = field(`${name}_nsec`);
+		return seconds === undefined || nanos === undefined ? undefined : seconds * 1_000_000_000n + nanos;
+	};
 	const evidence = {
 		dev: device("st_dev"),
 		ino: field("st_ino"),
@@ -652,29 +680,12 @@ function statObservationDigest(line: string): Sha256Digest | undefined {
 		size: field("st_size"),
 		blksize: field("st_blksize"),
 		blocks: field("st_blocks"),
-		atime: field("st_atime"),
-		atimeNsec: field("st_atime_nsec"),
-		mtime: field("st_mtime"),
-		mtimeNsec: field("st_mtime_nsec"),
-		ctime: field("st_ctime"),
-		ctimeNsec: field("st_ctime_nsec"),
+		atimeNs: time("st_atime"),
+		mtimeNs: time("st_mtime"),
+		ctimeNs: time("st_ctime"),
 	};
 	if (Object.values(evidence).some((value) => value === undefined)) return undefined;
-	return filesystemObservationDigest({
-		dev: evidence.dev!,
-		ino: evidence.ino!,
-		mode: evidence.mode!,
-		nlink: evidence.nlink!,
-		uid: evidence.uid!,
-		gid: evidence.gid!,
-		rdev: evidence.rdev!,
-		size: evidence.size!,
-		blksize: evidence.blksize!,
-		blocks: evidence.blocks!,
-		atimeNs: evidence.atime! * 1_000_000_000n + evidence.atimeNsec!,
-		mtimeNs: evidence.mtime! * 1_000_000_000n + evidence.mtimeNsec!,
-		ctimeNs: evidence.ctime! * 1_000_000_000n + evidence.ctimeNsec!,
-	});
+	return filesystemObservationDigest(evidence as FilesystemObservationEvidence);
 }
 
 function parseInteger(value: string | undefined): bigint | undefined {
@@ -706,39 +717,26 @@ function resolveObservedPath(value: string, cwd: string): string {
 	return path.posix.resolve(cwd, value);
 }
 
-function quotedStrings(line: string): string[] {
-	const values: string[] = [];
-	for (const match of line.matchAll(/"((?:\\.|[^"\\])*)"/g)) values.push(decodeCString(match[1]!));
-	return values;
+function quotedStrings(line: TraceLine): string[] {
+	return line.args.flatMap((argument) => {
+		const match = /^"((?:\\.|[^"\\])*)"$/.exec(argument);
+		return match ? [decodeCString(match[1]!)] : [];
+	});
 }
 
 function decodeCString(value: string): string {
-	let decoded = "";
-	for (let index = 0; index < value.length; index++) {
-		const character = value[index]!;
-		if (character !== "\\") {
-			decoded += character;
-			continue;
-		}
-		const next = value[++index];
-		if (next === undefined) break;
-		if (next === "x") {
-			const hex = value.slice(index + 1, index + 3);
-			if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-				decoded += String.fromCharCode(Number.parseInt(hex, 16));
-				index += 2;
-				continue;
-			}
-		}
-		if (/[0-7]/.test(next)) {
-			const octal = `${next}${value.slice(index + 1).match(/^[0-7]{0,2}/)?.[0] ?? ""}`;
-			decoded += String.fromCharCode(Number.parseInt(octal, 8));
-			index += octal.length - 1;
-			continue;
-		}
-		decoded += next === "n" ? "\n" : next === "r" ? "\r" : next === "t" ? "\t" : next;
+	const chunks: Buffer[] = [];
+	let start = 0;
+	for (const match of value.matchAll(/\\(?:x([0-9a-fA-F]{2})|([0-7]{1,3})|(.))/g)) {
+		chunks.push(Buffer.from(value.slice(start, match.index), "utf8"));
+		const byte = match[1] ? Number.parseInt(match[1], 16) : match[2] ? Number.parseInt(match[2], 8) :
+			({ a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11 } as Record<string, number>)[match[3]!] ?? match[3]!.charCodeAt(0);
+		chunks.push(Buffer.from([byte]));
+		start = match.index + match[0].length;
 	}
-	return decoded;
+	chunks.push(Buffer.from(value.slice(start), "utf8"));
+	// strace escapes bytes, not Unicode code points. Refuse identities Node cannot represent losslessly.
+	return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
 }
 
 function sharedObjectRole(observedPath: string, role: DependencyRole): DependencyRole {

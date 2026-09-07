@@ -2,343 +2,161 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { observeStrace } from "../src/strace-observer.ts";
+import { filesystemObservationDigest } from "../src/provenance-certificate.ts";
+import { observeStrace, type StraceObservationOptions } from "../src/strace-observer.ts";
+
+const EXEC = 'execve("/usr/bin/example", ["example"], 0x0) = 0';
+const STAT = "{st_dev=makedev(0, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=0, st_gid=0, st_rdev=0, st_size=4, st_blksize=4096, st_blocks=8, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}";
+const STAT_DIGEST = filesystemObservationDigest({
+	dev: 1n, ino: 42n, mode: 0o100644n, nlink: 1n, uid: 0n, gid: 0n, rdev: 0n,
+	size: 4n, blksize: 4096n, blocks: 8n,
+	atimeNs: 10_000_000_001n, mtimeNs: 11_000_000_002n, ctimeNs: 12_000_000_003n,
+});
+
+/** Owns a complete per-PID transcript, including its filesystem lifetime. */
+async function observe(processes: Record<number, readonly string[]>, options?: StraceObservationOptions) {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-observer-"));
+	const prefix = path.join(root, "process");
+	try {
+		await Promise.all(Object.entries(processes).map(([pid, lines]) => fs.writeFile(prefix + "." + pid, lines.join("\n"))));
+		return await observeStrace(prefix, "/usr/bin/example", "/work", options);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}
 
 describe("strace provenance decoder", () => {
-	test("follows the target exec and recursively identified descendants", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-observer-"));
-		const prefix = path.join(root, "process");
-		try {
-			await Promise.all([
-				fs.writeFile(
-					`${prefix}.100`,
-					[
-						'execve("/usr/bin/example", ["example"], 0x0) = 0',
-						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
-						'fstat(3</work/input.txt>, {st_dev=makedev(0x8, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=4, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
-						'chdir("/work/sub") = 0',
-						'openat(AT_FDCWD, "/work/final", O_RDONLY|O_DIRECTORY) = 4</work/final>',
-						'fchdir(4</work/final>) = 0',
-						"clone(child_stack=NULL, flags=SIGCHLD) = 101",
-						"+++ exited with 0 +++",
-					].join("\n"),
-				),
-				fs.writeFile(
-					`${prefix}.101`,
-					[
-						'execve("/usr/bin/child", ["child"], 0x0) = 0',
-						'newfstatat(AT_FDCWD, "relative.dat", {st_dev=makedev(0x8, 1), st_ino=43, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=5, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}, 0) = 0',
-						"+++ exited with 0 +++",
-					].join("\n"),
-				),
-			]);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.complete).toBe(true);
-			expect(observation.tracedProcesses).toBe(2);
-			expect(observation.paths).toEqual(
-				expect.arrayContaining([
-					{ path: "/usr/bin/example", role: "executable" },
-					{ path: "/usr/bin/child", role: "executable" },
-					{ path: "/work/input.txt", role: "input" },
-					{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
-					{ path: "/work/final", role: "input" },
-					{ path: "/work/final/relative.dat", role: "metadata", followSymlinks: true, digest: expect.stringMatching(/^sha256:/) },
-				]),
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
+	test("separates pathname and descriptor data from syscall evidence", async () => {
+		for (const name of ["st_ino=99", "AT_SYMLINK_NOFOLLOW", "<unfinished ...>", 'nested(,){ }[ ] "quote"', "café", "result=-1", "ending-"]) {
+			const target = "/work/" + name;
+			const quoted = JSON.stringify(target).replace("é", "\\303\\251");
+			const descriptor = target.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("<", "\\074").replaceAll(">", "\\076").replace("é", "\\xc3\\xa9");
+			const observation = await observe({ 100: [
+				EXEC,
+				"newfstatat(AT_FDCWD, " + quoted + ", " + STAT + ", 0) = 0",
+				"fstat(3<" + descriptor + ">, " + STAT + ") = 0",
+			] });
+			expect(observation, name).toMatchObject({ complete: true, taints: [], incompleteReasons: [] });
+			expect(observation.paths, name).toContainEqual({ path: target, role: "metadata", followSymlinks: true, digest: STAT_DIGEST });
 		}
+		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
+		expect(failed).toMatchObject({ complete: true, taints: [], incompleteReasons: [] });
+		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
+		await expect(observe({ 100: [EXEC, 'openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3'] })).rejects.toThrow();
+	});
+
+	test("follows target descendants and descriptor-relative metadata without confusing data with flags", async () => {
+		const observation = await observe({
+			100: [EXEC, 'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
+				"fstat(3</work/input.txt>, " + STAT + ") = 0", 'chdir("/work/sub") = 0',
+				'openat(AT_FDCWD, "/work/final", O_RDONLY|O_DIRECTORY) = 4</work/final>',
+				"fchdir(4</work/final>) = 0", "clone(child_stack=NULL, flags=SIGCHLD) = 101", "+++ exited with 0 +++"],
+			101: ['execve("/usr/bin/child", ["child"], 0x0) = 0',
+				'newfstatat(AT_FDCWD, "relative.dat", ' + STAT + ", 0) = 0",
+				'newfstatat(5</work/other>, "link", ' + STAT + ", AT_SYMLINK_NOFOLLOW) = 0", "+++ exited with 0 +++"],
+		});
+		expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, taints: [] });
+		expect(observation.paths).toEqual(expect.arrayContaining([
+			{ path: "/usr/bin/example", role: "executable" }, { path: "/usr/bin/child", role: "executable" },
+			{ path: "/work/input.txt", role: "input" }, { path: "/work/final", role: "input" },
+			{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
+			{ path: "/work/final/relative.dat", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
+			{ path: "/work/other/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST },
+		]));
 	});
 
 	test("reassembles completed syscalls before extracting dependencies and children", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-resumed-"));
-		const prefix = path.join(root, "process");
-		try {
-			await Promise.all([
-				fs.writeFile(
-					`${prefix}.150`,
-					[
-						'execve("/usr/bin/example", ["example"], 0x0) = 0',
-						'openat(AT_FDCWD, "/work/input.txt", O_RDONLY <unfinished ...>',
-						'<... openat resumed>) = 3</work/input.txt>',
-						'clone(child_stack=NULL, flags=SIGCHLD <unfinished ...>',
-						'<... clone resumed>) = 151',
-						'socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>',
-						'<... socket resumed>) = 4',
-					].join("\n"),
-				),
-				fs.writeFile(`${prefix}.151`, 'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'),
-			]);
-
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, incompleteReasons: [] });
-			expect(observation.taints).toContain("network");
-			expect(observation.paths).toEqual(
-				expect.arrayContaining([
-					{ path: "/work/input.txt", role: "input" },
-					{ path: "/work/child.txt", role: "input" },
-				]),
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		const observation = await observe({
+			150: [EXEC, 'openat(AT_FDCWD, "/work/input.txt", O_RDONLY <unfinished ...>',
+				"<... openat resumed>) = 3</work/input.txt>", "clone(child_stack=NULL, flags=SIGCHLD <unfinished ...>",
+				"<... clone resumed>) = 151", "socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>",
+				"<... socket resumed>) = 4"],
+			151: ['openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'],
+		});
+		expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, incompleteReasons: [] });
+		expect(observation.taints).toContain("network");
+		expect(observation.paths).toEqual(expect.arrayContaining([
+			{ path: "/work/input.txt", role: "input" }, { path: "/work/child.txt", role: "input" },
+		]));
 	});
 
 	test("selects the shallowest matching exec from process topology", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-root-"));
-		const prefix = path.join(root, "process");
-		try {
-			await Promise.all([
-				fs.writeFile(
-					`${prefix}.700`,
-					[
-						'execve("/usr/bin/example", ["example"], 0x0) = 0',
-						'openat(AT_FDCWD, "/work/root.txt", O_RDONLY) = 3',
-						"clone(child_stack=NULL, flags=SIGCHLD) = 600",
-					].join("\n"),
-				),
-				fs.writeFile(
-					`${prefix}.600`,
-					[
-						'execve("/usr/bin/example", ["example"], 0x0) = 0',
-						'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3',
-					].join("\n"),
-				),
-			]);
-
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.complete).toBe(true);
-			expect(observation.paths).toEqual(expect.arrayContaining([{ path: "/work/root.txt", role: "input" }]));
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		const observation = await observe({
+			700: [EXEC, 'openat(AT_FDCWD, "/work/root.txt", O_RDONLY) = 3', "clone(child_stack=NULL, flags=SIGCHLD) = 600"],
+			600: [EXEC, 'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'],
+		});
+		expect(observation.complete).toBe(true);
+		expect(observation.paths).toContainEqual({ path: "/work/root.txt", role: "input" });
 	});
 
-	test("fails closed on an unmatched resumed syscall", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-orphan-resume-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.175`,
-				'execve("/usr/bin/example", ["example"], 0x0) = 0\n<... openat resumed>) = 3</work/lost.txt>',
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.complete).toBe(false);
-			expect(observation.incompleteReasons).toContain("resumed_without_unfinished:175:openat");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("fails closed when a traced child transcript is absent", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-incomplete-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.200`,
-				'execve("/usr/bin/example", ["example"], 0x0) = 0\nfchdir(9) = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 201\n',
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.complete).toBe(false);
+	test("fails closed on missing process evidence or malformed syntax", async () => {
+		for (const [lines, reasons] of [
+			[["<... openat resumed>) = 3</work/lost.txt>"], ["resumed_without_unfinished:100:openat"]],
+			[["fchdir(9) = 0", "clone(child_stack=NULL, flags=SIGCHLD) = 201"], ["child_trace_missing:201", "fchdir_unparsed:100"]],
+			[['openat(AT_FDCWD, "file", O_RDONLY <unfinished ...>'], ["unfinished:100:openat"]],
+			[['newfstatat(AT_FDCWD, "file", {st_ino=42], 0) = 0'], ["syscall_unparsed:newfstatat"]],
+			[['openat(AT_FDCWD, "unterminated, O_RDONLY) = 0'], ["syscall_unparsed:openat"]],
+		]) {
+			const observation = await observe({ 100: [EXEC, ...lines!] });
+			expect(observation).toMatchObject({ complete: false, incompleteReasons: reasons });
 			expect(observation.taints).toContain("trace_incomplete");
-			expect(observation.incompleteReasons).toContain("child_trace_missing:201");
-			expect(observation.incompleteReasons).toContain("fchdir_unparsed:200");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
-	test("cuts dispatcher implementation subtrees at an interposed exec", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-dispatcher-"));
-		const prefix = path.join(root, "process");
-		try {
-			await Promise.all([
-				fs.writeFile(
-					`${prefix}.300`,
-					'execve("/bin/bash", ["bash"], 0x0) = 0\nchdir("/usr/bin") = 0\nclone(child_stack=NULL, flags=SIGCHLD) = 301\n',
-				),
-				fs.writeFile(
-					`${prefix}.301`,
-					[
-						'newfstatat(AT_FDCWD, "/usr/bin/sleep", {st_mode=S_IFREG|0755}, 0) = 0',
-						'execve("./sleep", ["sleep", "1"], 0x0) = 0',
-						'socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3',
-					].join("\n"),
-				),
-			]);
-			const observation = await observeStrace(prefix, "/bin/bash", "/work", {
-				interposedExecutables: [["/usr/bin/sleep", "/private/original/sleep"]],
-			});
-			expect(observation.complete).toBe(true);
-			expect(observation.taints).not.toContain("network");
-			expect(observation.paths).not.toContainEqual({ path: "/usr/bin/sleep", role: "executable" });
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("resumes provenance after a native descriptor-preserving bypass", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-native-bypass-"));
-		const prefix = path.join(root, "process");
-		try {
-			await Promise.all([
-				fs.writeFile(`${prefix}.310`, [
-					'execve("/bin/bash", ["bash"], 0x0) = 0',
-					"clone(child_stack=NULL, flags=SIGCHLD) = 311",
-				].join("\n")),
-				fs.writeFile(`${prefix}.311`, [
-					'execve("/usr/bin/tool", ["tool"], 0x0) = 0',
-					"getpid() = 311",
+	test("cuts dispatcher subtrees but resumes provenance at a descriptor-preserving native exec", async () => {
+		for (const bypass of [false, true]) {
+			const observation = await observe({
+				300: [EXEC, 'chdir("/usr/bin") = 0', "clone(child_stack=NULL, flags=SIGCHLD) = 301"],
+				301: ['execve("./tool", ["tool"], 0x0) = 0', "getpid() = 301",
 					'openat(AT_FDCWD, "/private/launcher", O_RDONLY) = 4',
-					'execve("/private/original/tool", ["tool"], 0x0) = 0',
-					'openat(AT_FDCWD, "/work/input", O_RDONLY) = 4',
-				].join("\n")),
-			]);
-			const observation = await observeStrace(prefix, "/bin/bash", "/work", {
-				interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]],
-			});
-			expect(observation.complete).toBe(true);
-			expect(observation.taints).not.toContain("pid_observation");
-			expect(observation.paths).toEqual(expect.arrayContaining([
-				{ path: "/private/original/tool", role: "executable" },
-				{ path: "/work/input", role: "input" },
+					...(bypass ? ['execve("/private/original/tool", ["tool"], 0x0) = 0',
+						'openat(AT_FDCWD, "/work/input", O_RDONLY) = 4'] : ["socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3"])],
+			}, { interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]] });
+			expect(observation).toMatchObject({ complete: true, taints: [] });
+			expect(observation.paths).not.toContainEqual({ path: "/usr/bin/tool", role: "executable" });
+			expect(observation.paths).not.toContainEqual({ path: "/private/launcher", role: "input" });
+			if (bypass) expect(observation.paths).toEqual(expect.arrayContaining([
+				{ path: "/private/original/tool", role: "executable" }, { path: "/work/input", role: "input" },
 			]));
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
-	test("distinguishes local broker sockets from external nondeterminism", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-taints-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.400`,
-				[
-					'execve("/usr/bin/example", ["example"], 0x0) = 0',
-					'socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1]>',
-					'socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 4',
-					'clock_gettime(CLOCK_REALTIME, {tv_sec=1, tv_nsec=2}) = 0',
-					'getrandom("abc", 3, 0) = 3',
-					'getpid() = 2',
-					'fstat(1<pipe:[7]>, {st_dev=makedev(0, 0xf), st_ino=7, st_mode=S_IFIFO|0600, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=0, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}) = 0',
-					'prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1',
-					'openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)',
-					'clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)',
-				].join("\n"),
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.taints).toEqual(expect.arrayContaining([
-				"network", "clock", "random", "pid_observation", "descriptor_observation", "confinement_observation",
-			]));
-			expect(observation.incompleteReasons).not.toContain("unparsed_metadata:fstat:400");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("allows captured resource-limit reads but rejects mutations", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-limits-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(`${prefix}.425`, [
-				'execve("/usr/bin/example", ["example"], 0x0) = 0',
-				'prctl(PR_SET_NAME, "worker") = 0',
-				'prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0',
-			].join("\n"));
-			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toEqual([]);
-			await fs.appendFile(`${prefix}.425`, '\nsetrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0\n');
-			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toContain("unsupported_syscall");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("treats Unix-domain communication as external input unless a provider removes it from the trace", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-unix-socket-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(`${prefix}.450`, [
-				'execve("/usr/bin/example", ["example"], 0x0) = 0',
-				'socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1]>',
-			].join("\n"));
-			expect((await observeStrace(prefix, "/usr/bin/example", "/work")).taints).toContain("network");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("taints persistent file semantics outside the typed transaction", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-file-semantics-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.500`,
-				[
-					'execve("/usr/bin/example", ["example"], 0x0) = 0',
-					'setxattr("/work/output", "user.pi", "x", 1, 0) = 0',
-					'getxattr("/work/input", "user.pi", NULL, 0) = -1 ENODATA (No data available)',
-					'prlimit64(0, RLIMIT_CORE, NULL, {rlim_cur=0, rlim_max=RLIM64_INFINITY}) = 0',
-					'utimensat(AT_FDCWD, "/work/output", NULL, 0) = 0',
-					'fallocate(3</work/output>, 0, 0, 4096) = 0',
-					'ioctl(3</work/output>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0',
-				].join("\n"),
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.taints).toContain("unsupported_syscall");
-			expect(observation.paths).toEqual(
-				expect.arrayContaining([
-					{ path: "/work/input", role: "input" },
-					{ path: "/work/output", role: "input" },
-				]),
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	test("does not taint a failed file-descriptor ioctl", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-failed-ioctl-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.501`,
-				[
-					'execve("/usr/bin/example", ["example"], 0x0) = 0',
-					'ioctl(1</dev/null<char 1:3>>, TCGETS, 0x7fff0000) = -1 ENOTTY (Inappropriate ioctl for device)',
-				].join("\n"),
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work");
-			expect(observation.taints).not.toContain("unsupported_syscall");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
+	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
+		for (const [line, taints] of [
+			['prctl(PR_SET_NAME, "worker socket(AF_UNIX) = -1 EPERM") = 0', []],
+			['prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0', []],
+			['setrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0', ["unsupported_syscall"]],
+			['socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1->2]>', ["network"]],
+			['socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 4', ["network"]],
+			['clock_gettime(CLOCK_REALTIME, {tv_sec=1, tv_nsec=2}) = 0', ["clock"]],
+			['getrandom("abc", 3, 0) = 3', ["random"]],
+			['getpid() = 2', ["pid_observation"]],
+			['fstat(1<pipe:[7]>, ' + STAT + ') = 0', ["descriptor_observation"]],
+			['prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1', ["confinement_observation"]],
+			['openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)', ["confinement_observation"]],
+			['clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)', ["confinement_observation"]],
+			['setxattr("/work/output", "user.pi", "x", 1, 0) = 0', ["unsupported_syscall"]],
+			['getxattr("/work/input", "user.pi", NULL, 0) = -1 ENODATA (No data available)', ["unsupported_syscall"]],
+			['utimensat(AT_FDCWD, "/work/output", NULL, 0) = 0', ["unsupported_syscall"]],
+			['fallocate(3</work/output>, 0, 0, 4096) = 0', ["unsupported_syscall"]],
+			['ioctl(3</work/output>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0', ["unsupported_syscall"]],
+			['ioctl(1</dev/null<char 1:3>>, TCGETS, 0x7fff0000) = -1 ENOTTY (Inappropriate ioctl for device)', []],
+		] as const) {
+			const observation = await observe({ 100: [EXEC, line] });
+			expect(observation, line).toMatchObject({ complete: true, taints, incompleteReasons: [] });
+			if (line.includes('"/work/input"')) expect(observation.paths).toContainEqual({ path: "/work/input", role: "input" });
+			if (line.startsWith("setxattr")) expect(observation.paths).toContainEqual({ path: "/work/output", role: "input" });
 		}
 	});
 
 	test("fails closed on COW-driver semantic gaps inside the workspace only", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-driver-gap-"));
-		const prefix = path.join(root, "process");
-		try {
-			await fs.writeFile(
-				`${prefix}.502`,
-				[
-					'execve("/usr/bin/example", ["example"], 0x0) = 0',
-					'rename("source", "moved") = -1 EXDEV (Invalid cross-device link)',
-					'openat(AT_FDCWD, ".", O_RDWR|O_TMPFILE, 0600) = -1 EOPNOTSUPP (Operation not supported)',
-					'rename("/outside/source", "/outside/moved") = -1 EXDEV (Invalid cross-device link)',
-				].join("\n"),
-			);
-			const observation = await observeStrace(prefix, "/usr/bin/example", "/work", {
-				guardFilesystemSemanticsWithin: ["/work"],
-			});
-			expect(observation.complete).toBe(false);
-			expect(observation.taints).toEqual(expect.arrayContaining(["unsupported_syscall", "trace_incomplete"]));
-			expect(observation.incompleteReasons).toEqual([
-				"filesystem_semantics:openat:502",
-				"filesystem_semantics:rename:502",
-			]);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		const observation = await observe({ 502: [EXEC,
+			'rename("source", "moved") = -1 EXDEV (Invalid cross-device link)',
+			'openat(AT_FDCWD, ".", O_RDWR|O_TMPFILE, 0600) = -1 EOPNOTSUPP (Operation not supported)',
+			'rename("/outside/source", "/outside/moved") = -1 EXDEV (Invalid cross-device link)',
+		] }, { guardFilesystemSemanticsWithin: ["/work"] });
+		expect(observation.complete).toBe(false);
+		expect(observation.taints).toEqual(expect.arrayContaining(["unsupported_syscall", "trace_incomplete"]));
+		expect(observation.incompleteReasons).toEqual(["filesystem_semantics:openat:502", "filesystem_semantics:rename:502"]);
 	});
 });

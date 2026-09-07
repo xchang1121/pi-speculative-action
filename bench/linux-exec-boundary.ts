@@ -241,11 +241,12 @@ int main(int argc, char **argv) {
 		});
 		try {
 			assert(textOutput(securityBranch.output.result).includes("nnp:1"), "producer confinement probe was not active");
+			const produced = metricDelta(securityBefore, fixture.backend.metrics());
+			assert(produced.tainted === 1 && produced.published === 1,
+				`confinement evidence was not retained: ${JSON.stringify(produced)}; validation=${JSON.stringify(await securityBranch.validate?.())}`);
 		} finally {
 			await securityBranch.dispose();
 		}
-		const securityProduced = metricDelta(securityBefore, fixture.backend.metrics());
-		assert(securityProduced.tainted === 1 && securityProduced.published === 1, `confinement evidence was not retained: ${JSON.stringify(securityProduced)}`);
 		const securityActorBefore = replayBackend.actorMetrics();
 		const securityActor = await actor.execute(
 			"held-security-actor",
