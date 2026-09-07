@@ -56,7 +56,8 @@ export async function qualifyStockTool(
 		execute: (callID, value, signal, onUpdate) =>
 			definition.execute(callID, value as never, signal, onUpdate as never, undefined as never),
 	};
-	const context = { cwd, tool, toolName: name, args, action, callID: `qualify-${name}`, signal: new AbortController().signal };
+	const context = { cwd, tool, toolName: name, args, action, callID: `qualify-${name}`, signal: new AbortController().signal,
+		executionScope: { sessionID: root, turnID: name } };
 	const operation = { tool: name, input: args, action, callID: context.callID };
 	let primaryEnabled = false;
 	const fallback = createWorkspaceSandbox({ driver: "git" });

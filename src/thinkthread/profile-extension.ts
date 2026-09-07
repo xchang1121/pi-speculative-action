@@ -40,7 +40,6 @@ export function withThinkThreadProfileLifecycle(
 	host: SpeculativeActionHost,
 	world: ThinkThreadExecutionWorld,
 ): SpeculativeActionHost {
-	const activeTurns = new Set<string>();
 	const invalidateAfterActorMutation = async (tool: string): Promise<void> => {
 		if (inferredActionEffect(tool) === "observation") return;
 		// Invalidation clears BASE before releasing its owner. Cleanup failure must not replace Actor output.
@@ -48,19 +47,6 @@ export function withThinkThreadProfileLifecycle(
 	};
 	return {
 		...host,
-		startTurn: async (...args: Parameters<SpeculativeActionHost["startTurn"]>) => {
-			const [input] = args;
-			// Turn registration is memory-only, so enabling this layer mid-turn needs no restart.
-			await world.beginTurn(input.turnID).catch(() => undefined);
-			activeTurns.add(input.turnID);
-			try {
-				await host.startTurn(...args);
-			} catch (error) {
-				activeTurns.delete(input.turnID);
-				await world.finishTurn(input.turnID).catch(() => undefined);
-				throw error;
-			}
-		},
 		execute: (input, signal, executor) => host.execute(input, signal, async (operation) => {
 			try {
 				return await executor(operation);
@@ -78,7 +64,7 @@ export function withThinkThreadProfileLifecycle(
 			try {
 				await host.finishTurn(...args);
 			} finally {
-				if (activeTurns.delete(turnID)) await world.finishTurn(turnID);
+				await world.finishTurn(turnID);
 			}
 		},
 	};

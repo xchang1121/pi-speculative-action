@@ -129,7 +129,7 @@ describe("ThinkThread execution world", () => {
 
 	it("shares one BASE across eight sealed root executions and cleans it after the turn", async () => {
 		const fixture = fakeClient();
-		const { world, cwd } = await startWorld(fixture, "turn-1");
+		const { world, cwd } = await startWorld(fixture);
 
 		const branches = await Promise.all(
 			Array.from({ length: 8 }, (_, index) =>
@@ -142,7 +142,7 @@ describe("ThinkThread execution world", () => {
 		expect(fixture.run.mock.calls.every(([params]) => params.writes === "deny")).toBe(true);
 		expect(new Set(branches.map((branch) => branch.checkpoint?.id)).size).toBe(1);
 
-		await world.finishTurn("turn-1");
+		await world.finishTurn("turn");
 		expect(fixture.snapshotRemove).not.toHaveBeenCalled();
 		await Promise.all(branches.map((branch) => branch.dispose()));
 		expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
@@ -151,7 +151,7 @@ describe("ThinkThread execution world", () => {
 
 	it("seals workspace mutations and joins one conflict-checked apply", async () => {
 		const fixture = fakeClient();
-		const { world, cwd } = await startWorld(fixture, "turn-2");
+		const { world, cwd } = await startWorld(fixture);
 		const branch = await world.speculation.execute(
 			context("write", { path: "generated.txt", content: "generated\n" }, cwd, "write-1"),
 		);
@@ -169,7 +169,7 @@ describe("ThinkThread execution world", () => {
 		});
 		expect(branch.commitMetrics?.resourcesCommitted).toBe(1);
 		await branch.dispose();
-		await world.finishTurn("turn-2");
+		await world.finishTurn("turn");
 		await world.dispose?.();
 	});
 
@@ -192,7 +192,7 @@ describe("ThinkThread execution world", () => {
 		],
 	] as const)("maps %s to its exact fs.run and dependency policy", async (tool, args, writes, dependency) => {
 		const fixture = fakeClient();
-		const { world, cwd } = await startWorld(fixture, `turn-${tool}`);
+		const { world, cwd } = await startWorld(fixture);
 		const branch = await world.speculation.execute(context(tool, args, cwd, `${tool}-1`));
 
 		expect(fixture.run.mock.calls[0]?.[0]).toMatchObject({ writes });
@@ -205,29 +205,29 @@ describe("ThinkThread execution world", () => {
 		});
 
 		await branch.dispose();
-		await world.finishTurn(`turn-${tool}`);
+		await world.finishTurn("turn");
 		await world.dispose?.();
 	});
 
 	it("rejects a run whose returned key does not match the preflight key", async () => {
 		const fixture = fakeClient({ returnedRunKey: "unexpected-run-key" });
-		const { world, cwd } = await startWorld(fixture, "turn-run-key");
+		const { world, cwd } = await startWorld(fixture);
 
 		await expect(world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read-key"))).rejects.toThrow(
 			"unexpected run key",
 		);
-		await world.finishTurn("turn-run-key");
+		await world.finishTurn("turn");
 		await world.dispose?.();
 	});
 
 	it("rejects a truncated tool settlement instead of adopting partial output", async () => {
 		const fixture = fakeClient({ outputTruncated: true });
-		const { world, cwd } = await startWorld(fixture, "turn-truncated");
+		const { world, cwd } = await startWorld(fixture);
 
 		await expect(world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read-truncated"))).rejects.toThrow(
 			"exceeded 512 KiB",
 		);
-		await world.finishTurn("turn-truncated");
+		await world.finishTurn("turn");
 		await world.dispose?.();
 	});
 
@@ -239,7 +239,7 @@ describe("ThinkThread execution world", () => {
 			"workspace changed",
 		);
 		const fixture = fakeClient({ applyError: conflict });
-		const { world, cwd } = await startWorld(fixture, "turn-conflict");
+		const { world, cwd } = await startWorld(fixture);
 		const branch = await world.speculation.execute(
 			context("write", { path: "generated.txt", content: "generated\n" }, cwd, "write-conflict"),
 		);
@@ -254,13 +254,13 @@ describe("ThinkThread execution world", () => {
 		expect(fixture.apply).toHaveBeenCalledOnce();
 
 		await branch.dispose();
-		await world.finishTurn("turn-conflict");
+		await world.finishTurn("turn");
 		await world.dispose?.();
 	});
 
 	it("rejects stale snapshot executions at adoption", async () => {
 		const fixture = fakeClient({ verifyStatus: "stale" });
-		const { world, cwd } = await startWorld(fixture, "stale");
+		const { world, cwd } = await startWorld(fixture);
 		const branch = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
 		await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
 		await expect(branch.commit()).rejects.toMatchObject({
@@ -307,7 +307,7 @@ describe("ThinkThread execution world", () => {
 		const entered = new Promise<void>((resolve) => { enter = resolve; });
 		const snapshot = new Promise<ReturnType<typeof snapshotView>>((resolve) => { release = resolve; });
 		fixture.snapshotCreate.mockImplementationOnce(() => { enter(); return snapshot; });
-		const { world, cwd } = await startWorld(fixture, "late-base");
+		const { world, cwd } = await startWorld(fixture);
 		const controller = new AbortController();
 		const input = { ...context("read", { path: "notes.txt" }, cwd, "read"), signal: controller.signal };
 		const rejected = expect(world.speculation.execute(input)).rejects.toThrow();
@@ -324,10 +324,10 @@ describe("ThinkThread execution world", () => {
 
 	it.each(["truncated", "cancelled"])("reclaims a mutation TARGET after %s", async (exit) => {
 		const fixture = fakeClient({ outputTruncated: exit === "truncated", cancelled: exit === "cancelled" });
-		const { world, cwd } = await startWorld(fixture, "truncated-write");
+		const { world, cwd } = await startWorld(fixture);
 		await expect(world.speculation.execute(context("write", { path: "a", content: "b" }, cwd, "write")))
 			.rejects.toThrow(exit === "truncated" ? "exceeded 512 KiB" : "failed (cancelled)");
-		await world.finishTurn("truncated-write");
+		await world.finishTurn("turn");
 		expect(fixture.snapshotRemove).toHaveBeenCalledTimes(2);
 		await world.dispose?.();
 	});
@@ -344,10 +344,11 @@ function context(toolName: string, args: unknown, cwd: string, callID: string) {
 		action,
 		callID,
 		signal: new AbortController().signal,
+		executionScope: { sessionID: "session", turnID: "turn" },
 	};
 }
 
-async function startWorld(fixture: ReturnType<typeof fakeClient>, turnID: string) {
+async function startWorld(fixture: ReturnType<typeof fakeClient>) {
 	const world = createThinkThreadExecutionWorld({
 		clientFactory: () => fixture.client,
 		runnerPath: "/opt/pi-speculative-action/tool-runner.js",
@@ -355,7 +356,6 @@ async function startWorld(fixture: ReturnType<typeof fakeClient>, turnID: string
 		nodePath: "/usr/bin/node",
 	});
 	const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-	await world.beginTurn(turnID);
 	await world.speculation.prepare?.({ cwd });
 	return { world, cwd };
 }

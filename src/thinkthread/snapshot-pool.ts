@@ -1,9 +1,9 @@
 import type { FsSnapshotId } from "@thinkthread/agent-posix";
-import type { WorldCheckpoint } from "../execution-world.ts";
+import type { ExecutionScope, WorldCheckpoint } from "../execution-world.ts";
 import type { DurableFsExecutor } from "./durable-fs.ts";
 
 interface ActiveTurn {
-	readonly id: string;
+	readonly scope: ExecutionScope;
 	generation: number;
 	base?: Promise<SnapshotLease>;
 	closed: boolean;
@@ -114,16 +114,16 @@ export class ThinkThreadSnapshotPool {
 		this.durable = durable;
 	}
 
-	async beginTurn(turnID: string): Promise<void> {
+	async acquireRoot(scope: ExecutionScope): Promise<{ readonly lease: SnapshotLease; readonly lineage: string; readonly depth: 0 }> {
 		if (this.disposed) throw new Error("ThinkThread snapshot pool is disposed");
-		if (this.active?.id === turnID && !this.active.closed) return;
-		await this.finishActive();
-		this.active = { id: turnID, generation: 0, closed: false };
-	}
-
-	async acquireRoot(): Promise<{ readonly lease: SnapshotLease; readonly lineage: string; readonly depth: 0 }> {
-		const turn = this.active;
-		if (!turn || turn.closed) throw new Error("ThinkThread execution world has no active turn");
+		let turn = this.active;
+		if (!turn || turn.scope.sessionID !== scope.sessionID || turn.scope.turnID !== scope.turnID) {
+			const cleanup = this.finishActive();
+			// Publish ownership before awaiting cleanup; concurrent acquisitions see one BASE.
+			this.active = turn = { scope, generation: 0, closed: false };
+			await cleanup;
+		}
+		if (turn.closed) throw new Error("ThinkThread execution scope was closed");
 		if (!turn.base) {
 			const attempt = this.createBase();
 			turn.base = attempt;
@@ -131,10 +131,12 @@ export class ThinkThreadSnapshotPool {
 				if (turn.base === attempt) turn.base = undefined;
 			});
 		}
+		const generation = turn.generation;
 		const owner = await turn.base;
+		if (turn.closed) throw new Error("ThinkThread execution scope was closed");
 		return {
 			lease: owner.retain(),
-			lineage: `${turn.id}:${turn.generation}:${owner.id}`,
+			lineage: JSON.stringify([scope.sessionID, scope.turnID, generation, owner.id]),
 			depth: 0,
 		};
 	}
@@ -185,7 +187,7 @@ export class ThinkThreadSnapshotPool {
 	}
 
 	async finishTurn(turnID: string): Promise<void> {
-		if (this.active?.id !== turnID) return;
+		if (this.active?.scope.turnID !== turnID) return;
 		await this.finishActive();
 	}
 

@@ -57,7 +57,6 @@ export interface ThinkThreadExecutionWorldOptions {
 }
 
 export type ThinkThreadExecutionWorld = SpeculativeAgentExecutionWorld & {
-	readonly beginTurn: (turnID: string) => Promise<void>;
 	readonly actorFallbackSettled: () => Promise<void>;
 	readonly finishTurn: (turnID: string) => Promise<void>;
 };
@@ -69,7 +68,6 @@ export function createThinkThreadExecutionWorld(
 	const nodePath = options.nodePath ?? process.execPath;
 	const autoResizeImages = options.autoResizeImages ?? true;
 	let prepared: Promise<PreparedWorld> | undefined;
-	let activeTurn: string | undefined;
 	let runnerFingerprint: Promise<string> | undefined;
 	const lifetime = new AbortController();
 	const pending = new Set<Promise<unknown>>();
@@ -84,9 +82,7 @@ export function createThinkThreadExecutionWorld(
 			});
 			prepared = attempt;
 		}
-		const world = await prepared;
-		if (activeTurn) await world.pool.beginTurn(activeTurn);
-		return world;
+		return prepared;
 	};
 	const fingerprint = async (request?: ExecutionWorldRequest): Promise<string> => {
 		if (request?.action) toolName(request.action.tool);
@@ -150,15 +146,11 @@ export function createThinkThreadExecutionWorld(
 			execute: (context) => execute(context, (world, input) =>
 				forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages)),
 		},
-		beginTurn: async (turnID) => {
-			activeTurn = turnID;
-		},
 		actorFallbackSettled: async () => {
 			const world = await prepared;
 			await world?.pool.invalidate();
 		},
 		finishTurn: async (turnID) => {
-			if (activeTurn === turnID) activeTurn = undefined;
 			const world = await prepared;
 			await world?.pool.finishTurn(turnID);
 		},
@@ -208,7 +200,7 @@ async function forkThinkThreadWorld(
 	const dependencies = actionDependencies(context);
 	const source = context.parentCheckpoint
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
-		: await world.pool.acquireRoot();
+		: await world.pool.acquireRoot(context.executionScope ?? { sessionID: context.cwd, turnID: context.callID });
 	let target: SnapshotLease | undefined;
 	try {
 		context.signal.throwIfAborted();
