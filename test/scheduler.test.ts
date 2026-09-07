@@ -173,6 +173,13 @@ describe("SpeculationScheduler", () => {
 		tiny.observeAdoption(identity, 70);
 		expect(joinDecision(tiny, identity, { state: "succeeded", expectedSpeculativeDurationMs: 920 }))
 			.toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: -40 });
+		for (let index = 0; index < 1100; index++) {
+			const newer = { ...identity, executionFingerprint: `world-${index}` };
+			scheduler.observeActorService(newer, 1);
+			scheduler.observeSpeculativeService(newer, 2);
+			scheduler.observeAdoption(newer, 3);
+		}
+		expect(joinDecision(scheduler, identity)).toMatchObject({ actorSamples: 0, speculativeSamples: 0, adoptionSamples: 0 });
 	});
 
 	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {

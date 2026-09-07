@@ -1,3 +1,4 @@
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { SpeculativeExecution, WorldCompatibilityEvidence } from "./execution-world.ts";
 import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
 import type {
@@ -147,9 +148,9 @@ interface SchedulerEntry<Job> {
 /** Owns forecast aggregation, timing observations, capacity, and preemption. */
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
-	private readonly speculativeServiceTimes = new Map<string, SampleWindow>();
-	private readonly actorServiceTimes = new Map<string, SampleWindow>();
-	private readonly adoptionTimes = new Map<string, SampleWindow>();
+	private readonly speculativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
+	private readonly actorServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
+	private readonly adoptionTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorDecisionDurations = new SampleWindow();
 	private readonly actorCycles = new SampleWindow();
 	private readonly candidateJoinPolicy: CandidateJoinPolicy;
@@ -420,7 +421,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private observeTiming(
-		windows: Map<string, SampleWindow>,
+		windows: BoundedRecencyMap<string, SampleWindow>,
 		identity: ServiceTimingIdentity,
 		durationMs: number,
 	): void {
@@ -432,7 +433,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private timingEstimate(
-		windows: ReadonlyMap<string, SampleWindow>,
+		windows: BoundedRecencyMap<string, SampleWindow>,
 		identity: ServiceTimingIdentity,
 		quantile: number,
 		selection: QuantileSelection = "lower",
@@ -444,7 +445,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private exactTimingEstimate(
-		windows: ReadonlyMap<string, SampleWindow>,
+		windows: BoundedRecencyMap<string, SampleWindow>,
 		identity: ServiceTimingIdentity,
 		quantile: number,
 		selection: QuantileSelection = "lower",
@@ -454,7 +455,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private classTimingEstimate(
-		windows: ReadonlyMap<string, SampleWindow>,
+		windows: BoundedRecencyMap<string, SampleWindow>,
 		identity: ServiceTimingIdentity,
 		quantile: number,
 		selection: QuantileSelection = "lower",
