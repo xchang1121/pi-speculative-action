@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -20,6 +21,8 @@ import {
 	forkReusableBash,
 	prepareLinuxProcessReuse,
 } from "../bench/linux-process-harness.ts";
+
+vi.mock("node:child_process", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
@@ -84,9 +87,16 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("keeps eligible producers concurrent and classifies an ineligible sibling", async ({ skip }) => {
+	test("waits for descriptor publication, keeps producers concurrent and classifies an ineligible sibling", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
+		const { spawn: nativeSpawn } = await vi.importActual<typeof childProcess>("node:child_process");
+		const spawning = vi.spyOn(childProcess, "spawn").mockImplementation((...args: Parameters<typeof childProcess.spawn>) => {
+			const child = nativeSpawn(...args), pid = child.pid;
+			Object.defineProperty(child, "pid", { configurable: true, value: process.pid });
+			child.prependOnceListener("spawn", () => Object.defineProperty(child, "pid", { value: pid }));
+			return child;
+		});
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		try {
 			const status = await fixture.backend.check(true);
@@ -109,8 +119,10 @@ describe("Linux process ExecutionWorld", () => {
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(2);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);
+			expect(spawning).toHaveBeenCalled();
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
 		} finally {
+			spawning.mockRestore();
 			await branch?.dispose();
 			await fixture.dispose();
 		}

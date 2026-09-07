@@ -253,7 +253,7 @@ interface ActiveSession {
 		readonly observedProcessMs: number;
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
-	topLevelOutputEndpoints?: Promise<readonly [string, string]>;
+	topLevelOutputEndpoints?: Promise<{ readonly endpoints: readonly [string, string] } | { readonly reason: string }>;
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -631,7 +631,10 @@ export class LinuxProcessReuseBackend {
 						session.topLevelOutputEndpoints = Promise.all([
 							readlink(`/proc/${pid}/fd/1`),
 							readlink(`/proc/${pid}/fd/2`),
-						]).then(([stdout, stderr]) => [stdout, stderr] as const);
+						]).then(
+							([stdout, stderr]) => ({ endpoints: [stdout, stderr] as const }),
+							(error) => ({ reason: `output_endpoint_capture_failed:${errorMessage(error)}` }),
+						);
 					},
 					...(session.invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
 					...(request.signal ? { signal: request.signal } : {}),
@@ -2047,7 +2050,8 @@ async function runSpawn(
 		stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"],
 	});
 	const output: BufferedOutput[] = [];
-	if (child.pid) options.onSpawn?.(child.pid);
+	// A PID alone does not publish initialized stdio; capture only after spawn succeeds.
+	child.once("spawn", () => { if (child.pid) options.onSpawn?.(child.pid); });
 	const append = (fd: 1 | 2, value: Buffer) => {
 		const event = { fd, data: Buffer.from(value) } as const;
 		const previous = output.at(-1);
@@ -2147,16 +2151,13 @@ async function eligibleRequest(
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
 	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };
 	if (!session.topLevelOutputEndpoints) return { reason: "output_endpoint_capture_missing" };
-	let endpoints: readonly [string, string];
-	try {
-		endpoints = await session.topLevelOutputEndpoints;
-	} catch (error) {
-		return { reason: `output_endpoint_capture_failed:${errorMessage(error)}` };
-	}
+	const captured = await session.topLevelOutputEndpoints;
+	if ("reason" in captured) return captured;
+	const { endpoints } = captured;
 	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
 	const routeOf = (endpoint: string): 0 | 1 | 2 => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : 0;
 	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
-	if (!route[0] || !route[1]) return { reason: "output_endpoint_mismatch" };
+	if (!route[0] || !route[1]) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
 	const outputRoute: OutputRoute = [route[0], route[1]];
 	const context = routedExecutionContext(expectedContext, outputRoute);
 	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
