@@ -2,59 +2,7 @@ import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
 
-export interface SpeculativeTraceSummary {
-	readonly sourceRequests: number;
-	readonly sourceOutcomes: Readonly<Record<string, number>>;
-	readonly predictionsSettled: number;
-	readonly predictionsObserved: number;
-	readonly predictionsMatched: number;
-	readonly predictionsAdopted: number;
-	readonly predictionPrecision: number;
-	readonly adoptionYield: number;
-	readonly predictionUnobserved: Readonly<Record<string, number>>;
-	readonly predictionRejectedAfterMatch: Readonly<Record<string, number>>;
-	readonly candidateStarted: number;
-	readonly candidateSucceeded: number;
-	readonly candidateFailed: number;
-	readonly candidateCancelled: number;
-	readonly candidateTerminalCauses: Readonly<Record<string, number>>;
-	readonly actorActions: number;
-	readonly speculativeHits: number;
-	/** Adopted identical K(a) results. */
-	readonly exactReuseHits: number;
-	/** Adopted lossless result views from a different speculative K(a); the speculative action ran in full. */
-	readonly partialResultReuseHits: number;
-	readonly partialResultReuseByProjector: Readonly<Record<string, number>>;
-	readonly actorPreviews: number;
-	readonly actorFallbacks: number;
-	readonly hitRate: number;
-	readonly actorCandidateRejections: Readonly<Record<string, number>>;
-	readonly tasks: number;
-	readonly endToEndMs: number;
-	readonly nonToolMs: number;
-	readonly actorPhaseMs: number;
-	readonly orchestrationMs: number;
-	readonly toolExecutionMs: number;
-	readonly serializedMs: number;
-	readonly hiddenLatencyMs: number;
-	readonly speculativeExecutionMs: number;
-	readonly actorExecutionMs: number;
-	readonly executionAheadMs: number;
-	readonly attemptLeadMs: number;
-	readonly hitLatencyMs: number;
-	/** Actor actions whose matched prediction was deliberately not executed. */
-	readonly executionBlockedActorActions: number;
-	/** Earliest matching prediction intent to Actor interception. */
-	readonly executionBlockedAttemptLeadMs: number;
-	/** Actor execution time that a safe speculative backend could have hidden. */
-	readonly executionBlockedPotentialHiddenLatencyMs: number;
-	/** Actor execution time that would still have remained after that overlap. */
-	readonly executionBlockedPotentialHitLatencyMs: number;
-	readonly totalDraftTokens: number;
-	/** Process reuse performed inside speculative execution worlds, never on the Actor path. */
-	readonly processReuse: WorldReuseMetrics;
-	readonly cache: SpeculativeCacheSnapshot;
-}
+export type SpeculativeTraceSummary = Readonly<ReturnType<typeof emptySpeculativeTraceSummary>>;
 
 const EMPTY_CACHE: SpeculativeCacheSnapshot = {
 	cacheCapacity: 0,
@@ -72,32 +20,32 @@ const EMPTY_CACHE: SpeculativeCacheSnapshot = {
 	cacheExecutions: [],
 };
 
-export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = EMPTY_CACHE): SpeculativeTraceSummary {
+export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | Pick<SpeculativeCacheSnapshot, "cacheCapacity" | "cacheByteCapacity"> = EMPTY_CACHE) {
 	return {
 		sourceRequests: 0,
-		sourceOutcomes: {},
+		sourceOutcomes: {} as Readonly<Record<string, number>>,
 		predictionsSettled: 0,
 		predictionsObserved: 0,
 		predictionsMatched: 0,
 		predictionsAdopted: 0,
 		predictionPrecision: 0,
 		adoptionYield: 0,
-		predictionUnobserved: {},
-		predictionRejectedAfterMatch: {},
+		predictionUnobserved: {} as Readonly<Record<string, number>>,
+		predictionRejectedAfterMatch: {} as Readonly<Record<string, number>>,
 		candidateStarted: 0,
 		candidateSucceeded: 0,
 		candidateFailed: 0,
 		candidateCancelled: 0,
-		candidateTerminalCauses: {},
+		candidateTerminalCauses: {} as Readonly<Record<string, number>>,
 		actorActions: 0,
 		speculativeHits: 0,
-		exactReuseHits: 0,
-		partialResultReuseHits: 0,
-		partialResultReuseByProjector: {},
+		exactReuseHits: 0, // Adopted identical K(a) results.
+		partialResultReuseHits: 0, // Adopted lossless views from a different K(a); its execution ran in full.
+		partialResultReuseByProjector: {} as Readonly<Record<string, number>>,
 		actorPreviews: 0,
 		actorFallbacks: 0,
 		hitRate: 0,
-		actorCandidateRejections: {},
+		actorCandidateRejections: {} as Readonly<Record<string, number>>,
 		tasks: 0,
 		endToEndMs: 0,
 		nonToolMs: 0,
@@ -111,13 +59,13 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot = E
 		executionAheadMs: 0,
 		attemptLeadMs: 0,
 		hitLatencyMs: 0,
-		executionBlockedActorActions: 0,
-		executionBlockedAttemptLeadMs: 0,
-		executionBlockedPotentialHiddenLatencyMs: 0,
-		executionBlockedPotentialHitLatencyMs: 0,
+		executionBlockedActorActions: 0, // Matched predictions deliberately not executed.
+		executionBlockedAttemptLeadMs: 0, // Earliest matching intent to Actor interception.
+		executionBlockedPotentialHiddenLatencyMs: 0, // Counterfactual safe overlap, not measured speedup.
+		executionBlockedPotentialHitLatencyMs: 0, // Actor work remaining after that overlap.
 		totalDraftTokens: 0,
-		processReuse: emptyWorldReuseMetrics(),
-		cache: cloneCache(cache),
+		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
+		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
 	};
 }
 

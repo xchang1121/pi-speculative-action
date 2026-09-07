@@ -30,7 +30,6 @@ import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "
 import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
-	DEFAULTS,
 } from "./common.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
@@ -359,7 +358,6 @@ async function installController(
 	wrapperSources: Map<string, string>,
 	providerRequest: AsyncLocalStorage<"drafter">,
 ): Promise<SpeculativeActionController> {
-	let currentMetrics: SpeculativeTraceSummary = emptyMetrics();
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
 	let currentTurnID: string | undefined;
@@ -373,6 +371,9 @@ async function installController(
 		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
 	await settingsStore.load();
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
+	let currentMetrics: SpeculativeTraceSummary = emptySpeculativeTraceSummary({
+		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
+	});
 	const settings = () => currentSettings;
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
@@ -1498,24 +1499,6 @@ function findExactModelReferenceMatch(reference: string, models: readonly Model<
 	if (canonical.length > 1 || normalized.includes("/")) return undefined;
 	const byID = models.filter((model) => model.id.toLowerCase() === normalized);
 	return byID.length === 1 ? byID[0] : undefined;
-}
-
-function emptyMetrics(): SpeculativeTraceSummary {
-	return emptySpeculativeTraceSummary({
-		cacheCapacity: DEFAULTS.resourceCacheMaxEntries,
-		cacheByteCapacity: DEFAULTS.resourceCacheMaxBytes,
-		cacheCold: 0,
-		cacheHot: 0,
-		inFlightJobs: 0,
-		resultEntries: 0,
-		resultBytes: 0,
-		branchEntries: 0,
-		branchBytes: 0,
-		exclusiveCandidates: 0,
-		sharedCandidates: 0,
-		cacheTools: [],
-		cacheExecutions: [],
-	});
 }
 
 function positiveInteger(value: unknown, fallback: number): number {

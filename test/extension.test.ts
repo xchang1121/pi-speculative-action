@@ -242,7 +242,7 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
-		const fixture = await createFixture({ settings: { enabled: true }, defaultExecutionWorlds: true });
+		const fixture = await createFixture({ settings: { enabled: true, resourceCacheMaxEntries: 37 }, defaultExecutionWorlds: true });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
 			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
 		}));
@@ -292,7 +292,7 @@ describe("zero-modification Pi extension", () => {
 		expect(footer).toContain("tools reused 0/0 (n/a)");
 		expect(footer).toContain("reuse history 3 entries (2 KiB)");
 		expect(footer).toMatch(/providers \d\/4 ready/u);
-		expect(footer).not.toContain("Bash");
+		expect(footer).toContain("live results 0/37");
 		expect(fixture.store.effective()).toMatchObject({ enabled: true });
 		expect(fixture.store.effective()?.tools).not.toContain("bash");
 		expect(fixture.store.scope).toBe("project");
