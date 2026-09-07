@@ -40,7 +40,7 @@ describe("ThinkThread execution world", () => {
 		expect(world.observation).toBeUndefined();
 		await expect(
 			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
-		).resolves.toContain("linux-execution-v10");
+		).resolves.toContain("linux-execution-v11");
 	});
 
 	it.each([false, true])("routes every stock tool through the same capability layers (warmup=%s)", async (warmup) => {
@@ -175,8 +175,8 @@ describe("ThinkThread execution world", () => {
 
 	it.each([
 		["read", { path: "notes.txt" }, "deny", { path: "notes.txt", scope: "content" }],
-		["grep", { pattern: "alpha", path: "." }, "deny", { path: ".", scope: "tree_content" }],
-		["find", { pattern: "*.txt", path: "." }, "deny", { path: ".", scope: "tree_entries" }],
+		["grep", { pattern: "alpha", path: "nested" }, "deny", { path: "nested", scope: "tree_content" }],
+		["find", { pattern: "*.txt", path: "nested" }, "deny", { path: "nested", scope: "tree_content" }],
 		["ls", { path: "." }, "deny", { path: ".", scope: "tree_entries" }],
 		[
 			"write",
@@ -199,7 +199,9 @@ describe("ThinkThread execution world", () => {
 		await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
 		expect(fixture.verify).toHaveBeenCalledWith({
 			snapshotId: expect.any(String),
-			dependencies: [dependency],
+			dependencies: [dependency, ...(dependency.scope === "tree_content"
+				? [".gitignore", ".ignore", ".rgignore", ".fdignore", ".git/info/exclude"].map((path) => ({ path, scope: "content" }))
+				: [])],
 		});
 
 		await branch.dispose();

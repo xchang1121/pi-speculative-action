@@ -123,11 +123,14 @@ describe("speculative action resource versions", () => {
 		{ change: "write", expired: true },
 		{ change: "replace", expired: true },
 		{ change: "sibling", expired: false },
-	])("validates file content after a $change", async ({ change, expired }) => {
+	].flatMap((scenario) => [true, false].map((watch) => ({ ...scenario, watch }))))(
+	"validates file content after a $change (watch=$watch)", async ({ change, expired, watch }) => {
+		expect((await validateResourceVersion(undefined)).expired).toBe(true);
 		const root = await workspace();
 		const file = path.join(root, "value.ts");
 		await fs.writeFile(file, "tracked\n");
-		const token = await captureResourceVersion(action("read", ["value.ts"]), root);
+		const manager = new ResourceVersionManager(root, { watch });
+		const token = await manager.capture(resourceDependencies(action("read", ["value.ts"]), root));
 		if (change === "replace") {
 			const replacement = path.join(root, "replacement.ts");
 			await fs.writeFile(replacement, "changed\n");
@@ -135,11 +138,13 @@ describe("speculative action resource versions", () => {
 		} else {
 			await fs.writeFile(change === "write" ? file : path.join(root, "sibling.ts"), "changed\n");
 		}
-		await settleWatcher();
+		if (watch) await settleWatcher();
 
 		const result = await validateResourceVersion(token);
 		expect(result.expired).toBe(expired);
-		expect(result.mode).toBe(expired ? "watcher" : "exact");
+		expect(result.mode).toBe(expired && watch ? "watcher" : "exact");
+		releaseResourceVersion(token);
+		manager.close();
 	});
 
 	test.runIf(process.platform !== "win32")("fingerprints a symlink target rather than only its link text", async () => {
@@ -188,9 +193,11 @@ describe("speculative action resource versions", () => {
 		{ tool: "find" as const, change: "content", expired: false },
 		{ tool: "find" as const, change: "entry", expired: true },
 		{ tool: "find" as const, change: "ignore", expired: true },
+		{ tool: "find" as const, change: "fdignore", expired: true },
 		{ tool: "ls" as const, change: "content", expired: false },
 		{ tool: "ls" as const, change: "entry", expired: true },
 		{ tool: "grep" as const, change: "content", expired: true },
+		{ tool: "grep" as const, change: "ignore", expired: true },
 		{ tool: "grep" as const, change: "staging", expired: false },
 	])("applies $tool tree semantics to $change changes", async ({ tool, change, expired }) => {
 		const root = await workspace();
@@ -198,17 +205,23 @@ describe("speculative action resource versions", () => {
 		await fs.mkdir(path.dirname(file), { recursive: true });
 		await fs.writeFile(file, "one\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "generated/\n");
-		const token = await captureResourceVersion(action(tool, [change === "staging" ? "." : "src"]), root);
+		await fs.writeFile(path.join(root, "src", ".fdignore"), "hidden.ts\n");
+		const manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture(resourceDependencies(action(tool, [change === "staging" ? "." : "src"]), root));
 		const changed = change === "content"
 			? file
 			: change === "ignore"
 				? path.join(root, ".gitignore")
+				: change === "fdignore" ? path.join(root, "src", ".fdignore")
 				: path.join(root, change === "staging" ? ".pi-speculative-test.tmp" : path.join("src", "added.ts"));
 		await fs.writeFile(changed, "changed\n");
 		if (change === "staging") await fs.rm(changed);
-		await settleWatcher();
-
-		expect((await validateResourceVersion(token)).expired).toBe(expired);
+		try {
+			expect((await manager.validate(token)).expired).toBe(expired);
+		} finally {
+			releaseResourceVersion(token);
+			manager.close();
+		}
 	});
 
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
@@ -226,27 +239,9 @@ describe("speculative action resource versions", () => {
 
 		expect(resourceDependencies(processAction, root, semantics)).toEqual([
 			{ path: path.resolve(root), scope: "tree_content" },
+			{ path: path.join(root, ".git", "info", "exclude"), scope: "content" },
 		]);
 		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
-	});
-
-	test("fails closed when a token is absent or exact validation detects a change", async () => {
-		expect((await validateResourceVersion(undefined)).expired).toBe(true);
-
-		const root = await workspace();
-		const file = path.join(root, "value.ts");
-		await fs.writeFile(file, "one\n");
-		const key = action("read", ["value.ts"]);
-		const manager = new ResourceVersionManager(root, { watch: false });
-		const token = await manager.capture(resourceDependencies(key, root));
-
-		await fs.writeFile(file, "two\n");
-		const result = await manager.validate(token);
-		manager.close();
-
-		expect(result.expired).toBe(true);
-		expect(result.mode).toBe("exact");
-		expect(result.bytesRead).toBeGreaterThan(0);
 	});
 
 	test("notifies active cache owners when a dependency becomes stale", async () => {

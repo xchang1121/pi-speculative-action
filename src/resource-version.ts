@@ -61,7 +61,7 @@ type ResourceSubscriber = {
 const MAX_EVENT_HISTORY = 4096;
 const FINGERPRINT_CONCURRENCY = 12;
 const IGNORED_DIRECTORIES = new Set([".git"]);
-const QUERY_CONTROL_FILES = new Set([".gitignore", ".ignore", ".rgignore"]);
+const QUERY_CONTROL_FILES = new Set([".gitignore", ".ignore", ".rgignore", ".fdignore"]);
 
 export class ResourceVersionManager {
 	private epoch = 0;
@@ -351,7 +351,7 @@ export function resourceDependencies(
 		path: path.resolve(root, resource),
 		scope,
 	}));
-	if (scope === "tree_query") {
+	if (scope === "tree_query" || scope === "tree_content") {
 		for (const resource of action.resources) {
 			const base = path.resolve(root, resource);
 			const relative = relativeFilesystemPath(root, base);

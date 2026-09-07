@@ -24,6 +24,8 @@ import {
 	type WorldCompatibilityEvidence,
 } from "../execution-world.ts";
 import { effectCommitFailure } from "../effect-transaction.ts";
+import { relativeFilesystemPath, slash } from "../path-utils.ts";
+import { resourceDependencies } from "../resource-version.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "../tool-settlement.ts";
 import { DurableFsExecutor } from "./durable-fs.ts";
@@ -38,7 +40,7 @@ import {
 } from "./tool-runner-protocol.ts";
 
 const WORLD_ID = "ThinkThread";
-const LINUX_EXECUTION_BACKEND_EPOCH = "linux-execution-v10";
+const LINUX_EXECUTION_BACKEND_EPOCH = "linux-execution-v11";
 const RUNNER_MAX_OUTPUT_BYTES = 512 * 1024;
 const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DIFF_PAGE_LIMIT = 256;
@@ -202,6 +204,7 @@ async function forkThinkThreadWorld(
 	autoResizeImages: boolean,
 ): Promise<WorldBranch<ToolSettlement>> {
 	const setupStarted = performance.now();
+	const dependencies = actionDependencies(context);
 	const source = context.parentCheckpoint
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
 		: await world.pool.acquireRoot();
@@ -247,7 +250,6 @@ async function forkThinkThreadWorld(
 			? await changedResources(world.client, source.lease.id, target.id)
 			: [...context.action.resources];
 		const setupMs = Math.max(0, performance.now() - setupStarted - run.metrics.executeMs - run.metrics.sealMs);
-		const dependencies = actionDependencies(context);
 		return new ThinkThreadWorldBranch({
 			output,
 			source: source.lease,
@@ -410,24 +412,16 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 }
 
 function actionDependencies(context: SpeculativeToolExecutionContext): readonly FsDependency[] {
-	const scope = dependencyScope(context.toolName);
-	return context.action.resources.map((resource) => ({ path: resource, scope }));
-}
-
-function dependencyScope(tool: string): FsDependency["scope"] {
-	switch (tool) {
-		case "read":
-		case "write":
-		case "edit":
-			return "content";
-		case "grep":
-			return "tree_content";
-		case "find":
-		case "ls":
-			return "tree_entries";
-		default:
-			throw new Error(`ThinkThread has no dependency scope for ${tool}`);
-	}
+	const observed = resourceDependencies(context.action, context.cwd);
+	const dependencies = observed.length ? observed : context.action.resources.map((resource) => ({
+		path: path.resolve(context.cwd, resource), scope: "content" as const,
+	}));
+	return dependencies.map((dependency) => {
+		const relative = relativeFilesystemPath(context.cwd, dependency.path);
+		if (relative === undefined) throw new Error("ThinkThread dependency escapes its snapshot");
+		// The SDK cannot prove query control-file contents with tree_entries.
+		return { path: slash(relative) || ".", scope: dependency.scope === "tree_query" ? "tree_content" : dependency.scope };
+	});
 }
 
 function toolName(tool: string): ThinkThreadToolName {
