@@ -196,6 +196,7 @@ async function qualifyPiSearch(worker, name) {
 				actorWaiting = true; feedback = Promise.withResolvers();
 				const arrived = performance.now();
 				const output = await host.execute({ turnID, id, tool: name, args: query, tools: [tool] }, signal, async (operation) => {
+					assert.deepEqual(operation.action?.executionContext?.identity, profile, "Actor execution must retain the identity used for admission");
 					actorCalls++; return (await execute("actor", fs, { args: operation.input, signal: operation.signal })).result;
 				});
 				actorWaiting = false;

@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "../src/action-semantics.ts";
-import { buildPiActionKey } from "../src/action-semantics.ts";
+import { buildPiActionKey, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR, type ActionKey } from "../src/action-semantics.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	type SpeculativeExecutionRoute,
@@ -1081,28 +1080,27 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
-	it("shares only an unchanged K(a) computation still in flight from Actor preview", async () => {
-		for (const [label, formalPath, settlePreview, callsBeforeRelease] of [
-			["unchanged", "preview.ts", false, 1],
-			["changed", "formal.ts", false, 2],
-			["already-settled", "preview.ts", true, 2],
+	it("binds the actual executor independently from pending or completed preview identity", async () => {
+		for (const [formalPath, settlePreview] of [
+			["preview.ts", false], ["formal.ts", false], ["preview.ts", true],
 		] as const) {
-			const gate = barrier();
-			const firstKeyStarted = barrier();
-			const secondKeyStarted = barrier();
-			let actionKeys = 0;
+			const gate = barrier(), firstKeyStarted = barrier();
+			let executor = "preview", actionKeys = 0, captured: ActionKey | undefined;
 			const fixture = harness({
 				source: { id: "disabled", enabled: () => false, propose: () => undefined },
 				actionKey: async (tool, input) => {
+					const identity = executor;
 					actionKeys++;
 					if (actionKeys === 1) {
 						firstKeyStarted.arrive();
 						await gate.promise;
-					} else secondKeyStarted.arrive();
-					return buildPiActionKey(tool, input, "/workspace");
+					}
+					return PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: identity });
 				},
+				resolveExecution: () => undefined,
+				captureAuthoritativeResult: (action) => { captured = action; return undefined; },
 			});
-			const turnID = `in-flight-key:${label}`;
+			const turnID = `in-flight-key:${formalPath}:${settlePreview}`;
 			await fixture.runtime.startTurn({ sessionID: "session", turnID });
 			const previewCall = call(turnID, { path: "preview.ts" });
 			const preview = fixture.runtime.previewActorCall(previewCall);
@@ -1111,14 +1109,15 @@ describe("structural speculative runtime", () => {
 				gate.arrive();
 				await preview;
 			}
+			executor = "actor";
 			const actorCall = { ...previewCall, input: { path: formalPath } };
 			const consumed = fixture.runtime.consume(actorCall);
-			if (callsBeforeRelease === 2) await secondKeyStarted.promise;
-			expect(actionKeys, label).toBe(callsBeforeRelease);
-			if (!settlePreview) gate.arrive();
-			await preview;
-			if ((await consumed) === undefined)
-				await fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" });
+			gate.arrive(); await preview;
+			expect(await consumed).toBeUndefined();
+			expect(captured?.executionFingerprint).toBe("actor");
+			expect(captured?.input.path).toBe(formalPath);
+			expect(actionKeys).toBe(2);
+			await fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" });
 			await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
 		}
 	});
@@ -1152,10 +1151,7 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
-			actionKey: (tool, input) => {
-				planKeyed.arrive();
-				return buildPiActionKey(tool, input, "/workspace");
-			},
+			onCandidateMaterialized: () => planKeyed.arrive(),
 			execute: () => {
 				executionStarted.arrive();
 				return "future";

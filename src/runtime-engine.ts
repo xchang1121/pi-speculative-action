@@ -1,5 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
-
 import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
 import type {
 	ActionKey,
@@ -396,10 +394,6 @@ function callKey(turnID: string, callID: string): string {
 	return JSON.stringify([turnID, callID]);
 }
 
-function sameActualToolCall(left: ActualToolCall, right: ActualToolCall): boolean {
-	return left.id === right.id && left.tool === right.tool && isDeepStrictEqual(left.input, right.input);
-}
-
 function closeActorPhase<SessionID, Output, StartInput, StateData>(
 	turn: TurnState<SessionID, Output, StartInput, StateData>,
 	completedAt: number,
@@ -643,9 +637,7 @@ type ActorPreviewState =
 	| { readonly status: "cancelled" };
 
 interface ActorPreviewRecord {
-	readonly call: ActualToolCall;
 	readonly actionKey: Promise<ActionKey | undefined>;
-	readonly actionKeyPending: () => boolean;
 	task: Promise<void>;
 	state: ActorPreviewState;
 }
@@ -1837,14 +1829,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!actualCall.id) return promoteActorCall(state, input, actualCall, undefined, signal);
 		const existing = state.actorPreviews.get(actualCall.id);
 		if (existing) return existing.task;
-		let actionKeyPending = true;
-		const actionKey = actorActionKey(input, actualCall).finally(() => {
-			actionKeyPending = false;
-		});
 		const record: ActorPreviewRecord = {
-			call: actualCall,
-			actionKey,
-			actionKeyPending: () => actionKeyPending,
+			actionKey: actorActionKey(input, actualCall),
 			task: Promise.resolve(),
 			state: { status: "pending" },
 		};
@@ -2233,8 +2219,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		const actualCall = adapter.actual(input) as ActualToolCall;
 		let preview = actualCall.id ? state.actorPreviews.get(actualCall.id) : undefined;
 		if (actualCall.id) state.actorPreviews.delete(actualCall.id);
-		const previewActionKey =
-			preview?.actionKeyPending() && sameActualToolCall(preview.call, actualCall) ? preview.actionKey : undefined;
 		if (preview?.state.status === "pending") {
 			preview.state = { status: "cancelled" };
 			preview = undefined;
@@ -2263,7 +2247,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			turnID: input.turnID,
 		};
 		const admission = enterActorAdmission(state.session);
-		const actualKey = await (previewActionKey ?? actorActionKey(input, actualCall));
+		const actualKey = await actorActionKey(input, actualCall);
 		const actorAction = new ActorAction({
 			identity,
 			tool: actualCall.tool,

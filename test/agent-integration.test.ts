@@ -126,10 +126,7 @@ describe("speculative action host", () => {
 				const invocation = resolvePiToolInvocation(toolName, args, { cwd, environment: {} });
 				const resourceExecution = PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? invocation?.filesystem : undefined;
 				const expected = resourceExecution ? toolName === "read" ? "two\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
-				let release!: () => void;
-				const gate = new Promise<void>((resolve) => {
-					release = resolve;
-				});
+				const { promise: gate, resolve: release } = deferred<void>();
 				const speculativeExecution = vi.fn(async () => {
 					await gate;
 					return { content: [{ type: "text" as const, text: expected }], details: {} };
@@ -261,94 +258,39 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); }
 	});
 
-	it("matches Bash intent but leaves the only process execution to the Actor", async () => {
+	it("binds one Actor operation through matching, fallback and settlement", async () => {
 		const cwd = await temporaryWorkspace();
-		let executions = 0;
-		let preflights = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
-		const turnStarts: Array<{ turnID: string; decisionSequence: number }> = [];
+		let profile = "initial", boundKey: unknown;
+		const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
+		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "built" }], details: {} }));
+		const settled = vi.fn();
+		const resolveInvocation = vi.fn(async () => {
+			const invocation = { executor: profile };
+			bindingStarted.resolve(); await releaseBinding.promise;
+			return invocation;
+		});
 		const tool: AgentTool<typeof bashSchema> = {
-			name: "bash",
-			label: "bash",
-			description: "bash",
-			parameters: bashSchema,
-			execute: async () => {
-				executions++;
-				return { content: [{ type: "text", text: "built" }], details: {} };
-			},
+			name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor,
 		};
 		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({
-				...settings(),
-				tools: ["bash"],
-			}),
-			draftModel: model("draft"),
-			complete: async () =>
-				assistant(
-					[{ type: "toolCall", id: "draft-bash", name: "bash", arguments: { command: "npm test" } }],
-					"toolUse",
-				),
-			preflight: () => {
-				preflights++;
-				return true;
-			},
-			onTurnStarted: ({ turnID, decisionSequence }) => {
-				turnStarts.push({ turnID, decisionSequence });
-			},
-			onCandidateMaterialized: (candidate) => {
-				materialized.push(candidate);
-			},
-			onEvent: (event) => {
-				events.push(event);
-			},
+			cwd, getSettings: () => ({ ...settings(), drafterEnabled: false, tools: ["bash"] }),
+			complete: async () => { throw new Error("prediction disabled"); },
+			resolveInvocation, onActorActionSettled: settled,
 		});
-
-		await host.startTurn(startInput(tool));
-		await waitFor(() => host.runtime.inspect("session").executionBlockedPlanActions === 1);
-		await waitFor(() => materialized.length === 1);
-		expect(turnStarts).toEqual([{ turnID: "turn-1", decisionSequence: 1 }]);
-		expect(host.runtime.inspect("session")).toMatchObject({
-			exclusiveCandidates: 0,
-			sharedCandidates: 0,
-		});
-		expect(executions).toBe(0);
-		expect(preflights).toBe(0);
-		expect(events.some((event) => event.type === "candidate")).toBe(false);
-		expect(materialized).toMatchObject([
-			{
-				sessionID: "session",
-				turnID: "turn-1",
-				expectedDecisionSequence: 1,
-				latestDecisionSequence: 1,
-				source: "drafter",
-				tool: "bash",
-				input: { command: "npm test" },
-				predictedAction: { tool: "bash", input: { command: "npm test" } },
-				executionAction: { tool: "bash", input: { command: "npm test" } },
-			},
-		]);
-
-		const call = { turnID: "turn-1", id: "actor-bash", tool: "bash", args: { command: "npm test" }, tools: [tool] };
-		expect(await host.consume(call)).toBeUndefined();
-		expect(executions).toBe(0);
-		const result = await tool.execute("actor-bash", { command: "npm test" });
-		await host.actual({ ...call, durationMs: 5, output: { result, isError: false } });
-		await host.finishTurn("turn-1", true);
-
-		await waitFor(() => events.some((event) => event.type === "prediction"));
-		expect(executions).toBe(1);
-		expect(events.find((event) => event.type === "prediction")).toMatchObject({
-			settlement: {
-				observation: "observed",
-				match: {
-					matched: true,
-					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
-				},
-			},
-		});
-		await host.dispose();
+		try {
+			await host.startTurn(startInput(tool));
+			const call = { turnID: "turn-1", id: "actor-bash", tool: "bash", args: { command: "npm test" }, tools: [tool] };
+			const pending = host.execute(call, undefined, async (operation) => {
+				expect(operation.action?.executionContext).toEqual({ executor: "initial" });
+				boundKey = operation.action;
+				return actor();
+			});
+			await bindingStarted.promise; profile = "next"; releaseBinding.resolve();
+			expect((await pending).content[0]).toEqual({ type: "text", text: "built" });
+			await host.finishTurn("turn-1", true);
+			expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledOnce();
+			expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey);
+		} finally { releaseBinding.resolve(); await host.dispose(); }
 	});
 
 	it("adopts an in-flight projected Bash view from a runtime-wide sandbox", async () => {
@@ -875,6 +817,12 @@ async function patternRebaseFixture() {
 	};
 	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };
+}
+
+function deferred<Value>() {
+	let resolve!: (value: Value | PromiseLike<Value>) => void;
+	const promise = new Promise<Value>((done) => { resolve = done; });
+	return { promise, resolve };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

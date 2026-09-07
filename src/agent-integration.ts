@@ -49,6 +49,9 @@ import { stableValueHash } from "./stable-value-hash.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
+const ACTOR_OPERATION = Symbol("actor-operation");
+type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation> };
+
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
 	readonly drafterEnabled?: boolean;
@@ -283,6 +286,13 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
+	const resolveActionKey = async (tool: string, input: unknown, schemaHash: string | undefined) => {
+		try {
+			const invocation = await options.resolveInvocation?.(tool, input);
+			return actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
+				? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation } : undefined);
+		} catch { return undefined; }
+	};
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		ToolSettlement,
@@ -310,6 +320,8 @@ export function createSpeculativeActionHost(
 			let tool: AgentTool | undefined;
 			let validated: unknown;
 			if (context.type === "consume") {
+				const bind = (context.consumeInput as BoundActorCall)[ACTOR_OPERATION];
+				if (bind) return (await bind()).action;
 				tool = context.consumeInput.tools.find((candidate) => candidate.name === toolName);
 				validated = input;
 			} else {
@@ -319,26 +331,9 @@ export function createSpeculativeActionHost(
 				if (validated === undefined) return undefined;
 			}
 			if (!tool) return undefined;
-			let invocation: ToolInvocation | undefined;
-			try {
-				invocation = await options.resolveInvocation?.(toolName, validated);
-			} catch {
-				return undefined;
-			}
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
-			return actionSemantics.buildKey(
-				toolName,
-				validated,
-				options.cwd,
-				schemaHash,
-				invocation
-					? {
-							fingerprint: stableValueHash(invocation.identity ?? invocation),
-							context: invocation,
-						}
-					: undefined,
-			);
+			return resolveActionKey(toolName, validated, schemaHash);
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
 		captureAuthoritativeResult: async ({ startInput, data, tool: toolName, concrete, action, callID, signal }) => {
@@ -470,8 +465,16 @@ export function createSpeculativeActionHost(
 				...(input.id ? { callID: input.id } : {}),
 				...(signal ? { signal } : {}),
 			};
+			let binding: Promise<ToolOperation> | undefined;
+			// One invocation owns its binding; resolve inside consume so Actor arrival includes binding cost.
+			const bind = () => binding ??= (async () => {
+				const tool = input.tools.find((tool) => tool.name === input.tool);
+				const action = tool ? await resolveActionKey(input.tool, input.args, stableValueHash(tool.parameters ?? null)) : undefined;
+				return Object.freeze({ ...operation, ...(action ? { action } : {}) });
+			})();
 			const actorCall = input.turnID
 				? {
+						[ACTOR_OPERATION]: bind,
 						turnID: input.turnID,
 						id: input.id,
 						tool: input.tool,
@@ -479,7 +482,7 @@ export function createSpeculativeActionHost(
 						tools: input.tools,
 					}
 				: undefined;
-			return executionGateway.executeAuthoritative(operation, executor, {
+			return executionGateway.executeAuthoritative(operation, () => bind().then(executor), {
 				...(actorCall
 					? {
 							reuse: async () => (await runtime.consume({ ...actorCall, sessionID }, signal))?.result,
