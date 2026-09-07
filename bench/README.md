@@ -288,3 +288,17 @@ Actor actions. Runs that fail `patchCandidate` remain listed with explicit reaso
 but are excluded from pooled latency and hit-rate statistics. This screening is
 not an official correctness grade; use the dataset harness for that guardrail.
 Use `--output-root` to choose the artifact directory.
+
+## 可移植执行内核资格实验
+
+`portable-kernel.mjs` 使用外部目录中显式安装的 `wasi-sh@0.11.0` 和 `ripgrep@0.3.1`：
+
+```text
+node bench/portable-kernel.mjs <包含 node_modules 的外部目录>
+```
+
+不自动下载、不增加生产依赖、不改 Actor 工具。固定命令检查 shell 与 rg 共用内存文件系统、
+写时复制、未授予宿主端口及实际 WASM 内存增长限制，并确定性复现相同输入字节的时间戳漂移。
+子进程总耗时包含启动；内核时间不含工作区捕获/验证，不能作为 Pi 加速比。
+64 MiB 限制通过当前 Node/V8 的命令行参数实测，并不覆盖全部 JS/文件系统/管道内存；
+该参数也没有跨版本稳定保证。实验成功不代表完整工具语义、取消、事务采纳或沙箱资格通过。
