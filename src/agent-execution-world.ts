@@ -12,6 +12,7 @@ import type {
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureResourceVersion,
+	type ResourceReadView,
 	type ResourceVersionToken,
 	releaseResourceVersion,
 	validateResourceVersion,
@@ -19,7 +20,7 @@ import {
 } from "./resource-version.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { cause } from "./settlement.ts";
-import type { ToolSettlement } from "./tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
 export interface SpeculativeToolExecutionContext {
@@ -40,23 +41,25 @@ export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & {
 	readonly speculation: NonNullable<AgentExecutionWorld["speculation"]>;
 };
 
-/** Observe Actor-authorized reads and retain their result while the exact resources remain current. */
+/** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+	operations?: { readonly tools: readonly string[]; readonly maxBytes: () => number },
 ): AgentExecutionWorld {
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-		fingerprint: () => "resource-version:v1",
+		fingerprint: () => "resource-version:v2",
 		diagnostics: () => ({
 			state: "ready" as const,
 			detail: "Resource-version snapshots are available",
 		}),
 	};
-	const capture = async (context: SpeculativeToolExecutionContext): Promise<WorldResultCapture<ToolSettlement>> => {
+	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
 		const setupStarted = performance.now();
-		let version: ResourceVersionToken | undefined = await captureResourceVersion(context.action, context.cwd, actionSemantics);
+		let version: ResourceVersionToken | undefined = await captureResourceVersion(context.action, context.cwd, actionSemantics, retainBytes);
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
+			view: version.view,
 			seal: async (output) => {
 				const owned = version;
 				version = undefined;
@@ -79,6 +82,27 @@ export function createResourceSnapshotExecutionWorld(
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, capture },
+		...(operations?.tools.length ? { speculation: {
+			...route,
+			tools: operations.tools,
+			fingerprint: (request) => {
+				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.resources) {
+					throw new Error("Resource execution requires an explicitly bound operation");
+				}
+				return route.fingerprint();
+			},
+			execute: async (context) => {
+				const execute = (context.action.executionContext as ToolInvocation | undefined)?.resources;
+				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
+				context.signal.throwIfAborted();
+				const owned = await capture(context, operations.maxBytes());
+				try {
+					const output = await execute(owned.view!, context);
+					context.signal.throwIfAborted();
+					return await owned.seal(output);
+				} finally { await owned.dispose(); }
+			},
+		} } : {}),
 	};
 }
 

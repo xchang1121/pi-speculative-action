@@ -197,6 +197,7 @@ describe("zero-modification Pi extension", () => {
 			"primary_runtime",
 			"linux_process_reuse",
 			"git_worktree",
+			"resource_version",
 		]);
 	});
 

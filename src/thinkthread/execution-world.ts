@@ -408,8 +408,7 @@ function actionDependencies(context: SpeculativeToolExecutionContext): readonly 
 	return dependencies.map((dependency) => {
 		const relative = relativeFilesystemPath(context.cwd, dependency.path);
 		if (relative === undefined) throw new Error("ThinkThread dependency escapes its snapshot");
-		// The SDK cannot prove query control-file contents with tree_entries.
-		return { path: slash(relative) || ".", scope: dependency.scope === "tree_query" ? "tree_content" : dependency.scope };
+		return { path: slash(relative) || ".", scope: dependency.scope };
 	});
 }
 

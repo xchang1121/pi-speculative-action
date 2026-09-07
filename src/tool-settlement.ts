@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { formatThrownValue } from "@earendil-works/pi-ai";
+import type { ResourceReadView } from "./resource-version.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -31,4 +32,9 @@ export interface ToolInvocation {
 	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */
 	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;
+	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
+	readonly resources?: (
+		view: ResourceReadView,
+		request: { readonly args: unknown; readonly callID: string; readonly signal: AbortSignal },
+	) => Promise<ToolSettlement>;
 }

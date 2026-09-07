@@ -14,7 +14,7 @@ import { stableStringify } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
-export type ResourceDependencyScope = "content" | "tree_entries" | "tree_query" | "tree_content";
+export type ResourceDependencyScope = "content" | "entries" | "tree_entries" | "tree_content";
 
 export interface ReadActionRange {
 	readonly path: string;
@@ -266,10 +266,10 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "ls",
-		epoch: "pi.ls.v2",
+		epoch: "pi.ls.v3",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "tree_entries",
+		resourceScope: "entries",
 		canonicalize: canonicalLs,
 	},
 	{

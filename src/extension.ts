@@ -25,7 +25,7 @@ import {
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
-import type { AgentExecutionWorld } from "./agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost } from "./agent-integration.ts";
 import {
 	clampCandidateLimit,
@@ -41,7 +41,7 @@ import {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
-import { createPiToolDefinitions, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
+import { createPiToolDefinitions, PI_RESOURCE_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
@@ -476,6 +476,9 @@ async function installController(
 				workspaceSandbox,
 			}),
 			workspaceSandbox.createExecutionWorld(),
+			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
+				tools: PI_RESOURCE_TOOLS, maxBytes: () => currentSettings.resourceCacheMaxBytes,
+			}),
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
@@ -550,6 +553,8 @@ async function installController(
 			resolvePiToolInvocation(tool, input, {
 				cwd: latestContext.cwd,
 				environment: piShellEnvironment(latestContext),
+				autoResizeImages: piToolSettings.autoResizeImages,
+				modelSupportsImages: latestContext.model?.input.includes("image") ?? true,
 				...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 				...(piToolSettings.shellCommandPrefix ? { shellCommandPrefix: piToolSettings.shellCommandPrefix } : {}),
 			}),

@@ -3,11 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { createFindTool, createGrepTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { createFindTool, createGrepTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -34,7 +35,7 @@ describe("speculative action resource versions", () => {
 			await fs.writeFile(file, "A");
 			const manager = new ResourceVersionManager(root, { watch });
 			const target = change === "entries" ? ["."] : ["value.txt"];
-			const token = await manager.capture(resourceDependencies(action("read", target), root));
+			const token = await manager.capture(resourceDependencies(action(change === "entries" ? "ls" : "read", target), root));
 			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
 			if (change === "restore") {
 				await fs.writeFile(file, "A");
@@ -201,40 +202,39 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.each([
-		{ scope: "tree_query" as const, change: "content", expired: false },
-		{ scope: "tree_query" as const, change: "entry", expired: true },
-		{ scope: "tree_query" as const, change: "ignore", expired: true },
-		{ scope: "tree_query" as const, change: "fdignore", expired: true },
-		{ scope: "tree_entries" as const, change: "content", expired: false },
-		{ scope: "tree_entries" as const, change: "entry", expired: true },
-		{ scope: "tree_entries" as const, change: "git", expired: true },
-		{ scope: "tree_content" as const, change: "content", expired: true },
-		{ scope: "tree_content" as const, change: "ignore", expired: true },
-		{ scope: "tree_content" as const, change: "staging", expired: false },
-	])("applies $scope evidence to $change changes", async ({ scope, change, expired }) => {
-		const root = await workspace();
-		const file = path.join(root, "src", "value.ts");
-		await fs.mkdir(path.dirname(file), { recursive: true });
-		await fs.writeFile(file, "one\n");
-		await fs.writeFile(path.join(root, ".gitignore"), "generated/\n");
-		await fs.writeFile(path.join(root, "src", ".fdignore"), "hidden.ts\n");
-		const manager = new ResourceVersionManager(root, { watch: false });
-		const semantics = new ActionSemanticsRegistry([{ ...PI_ACTION_SEMANTICS.definition("ls")!, tool: "query", resourceScope: scope }]);
-		const token = await manager.capture(resourceDependencies(action("query", [change === "staging" ? "." : "src"]), root, semantics));
-		const changed = change === "git" ? path.join(root, "src", ".git") : change === "content"
-			? file
-			: change === "ignore"
-				? path.join(root, ".gitignore")
-				: change === "fdignore" ? path.join(root, "src", ".fdignore")
-				: path.join(root, change === "staging" ? ".pi-speculative-test.tmp" : path.join("src", "added.ts"));
-		await fs.writeFile(changed, "changed\n");
-		if (change === "staging") await fs.rm(changed);
-		try {
-			expect((await manager.validate(token)).expired).toBe(expired);
-		} finally {
+		{ scope: "entries" as const, stale: ["entry"] },
+		{ scope: "tree_entries" as const, stale: ["entry", "deep"] },
+		{ scope: "tree_content" as const, stale: ["content", "entry", "deep"] },
+	])("validates exactly the declared $scope, without guessing configuration paths", async ({ scope, stale }) => {
+		for (const [change, relative] of Object.entries({ content: "src/value.ts", entry: "src/added.ts",
+			deep: "src/nested/added.ts", outside: ".gitignore", restore: "src/transient" })) {
+			const root = await workspace();
+			await fs.mkdir(path.join(root, "src/nested"), { recursive: true });
+			await fs.writeFile(path.join(root, "src/value.ts"), "one\n");
+			const manager = new ResourceVersionManager(root, { watch: false });
+			const token = await manager.capture([{ path: "src", scope }]);
+			await fs.writeFile(path.join(root, relative), "changed\n");
+			if (change === "restore") await fs.rm(path.join(root, relative));
+			expect((await manager.validate(token)).expired, change).toBe(stale.includes(change));
 			releaseResourceVersion(token);
 			manager.close();
 		}
+	});
+
+	test("executes the stock image renderer with the captured vision and resizing identity", async () => {
+		const root = await workspace(), args = { path: "pixel.gif" };
+		await fs.writeFile(path.join(root, args.path), Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"));
+		const token = await captureResourceVersion(PI_ACTION_SEMANTICS.buildKey("read", args, root)!, root, PI_ACTION_SEMANTICS, 4096);
+		try {
+			for (const modelSupportsImages of [true, false]) for (const autoResizeImages of [true, false]) {
+				const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {}, modelSupportsImages, autoResizeImages })!;
+				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
+				const expected = await createReadToolDefinition(root, { autoResizeImages }).execute("actor", args, undefined, undefined, context);
+				const output = await invocation.resources!(token.view!, { args, callID: "speculate", signal: new AbortController().signal });
+				expect(expected.content.some((item) => item.type === "image")).toBe(true);
+				expect(output.result).toEqual(expected);
+			}
+		} finally { releaseResourceVersion(token); }
 	});
 
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
@@ -250,7 +250,6 @@ describe("speculative action resource versions", () => {
 
 		expect(resourceDependencies(processAction, root, semantics)).toEqual([
 			{ path: path.resolve(root), scope: "tree_content" },
-			{ path: path.join(root, ".git", "info", "exclude"), scope: "content" },
 		]);
 		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
 	});

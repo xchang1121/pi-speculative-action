@@ -34,7 +34,7 @@ describe("ActionSemanticsRegistry", () => {
 		});
 		expect(PI_ACTION_SEMANTICS.definition("ls")).toMatchObject({
 			effect: "observation",
-			resourceScope: "tree_entries",
+			resourceScope: "entries",
 		});
 		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
 			effect: "unbounded",
@@ -54,7 +54,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(implicit?.key).toBe(explicit?.key);
 		expect(implicit).toMatchObject({
 			tool: "ls",
-			semanticsEpoch: "pi.ls.v2",
+			semanticsEpoch: "pi.ls.v3",
 			resources: ["."],
 			input: { path: ".", limit: 500 },
 		});

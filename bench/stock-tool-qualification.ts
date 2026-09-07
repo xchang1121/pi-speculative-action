@@ -7,11 +7,13 @@ import {
 	createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition,
 	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
 import { withPiProjectionCoverage } from "../src/pi-read-projection.ts";
+import { PI_RESOURCE_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
 	decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse, THINKTHREAD_TOOL_RUNNER_VERSION,
@@ -43,7 +45,9 @@ export async function qualifyStockTool(
 	assert.equal(path.dirname(root), fixtureParent);
 	const cwd = primary?.cwd ?? root;
 	const args = { ...input, path: slash(path.join(path.relative(cwd, root), input.path)) };
-	const action = buildPiActionKey(name, args, cwd);
+	const invocation = resolvePiToolInvocation(name, args, { cwd, environment: {} });
+	const action = PI_ACTION_SEMANTICS.buildKey(name, args, cwd, "", invocation
+		? { fingerprint: stableValueHash(invocation.identity), context: invocation } : undefined);
 	assert.ok(action);
 	const semantics = PI_ACTION_SEMANTICS.definition(name)!;
 	const tools = [
@@ -61,8 +65,9 @@ export async function qualifyStockTool(
 	const operation = { tool: name, input: args, action, callID: context.callID };
 	let primaryEnabled = false;
 	const fallback = createWorkspaceSandbox({ driver: "git" });
+	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_RESOURCE_TOOLS, maxBytes: () => 1024 * 1024 });
 	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([
-		...(primary ? [primary.world] : []), fallback,
+		...(primary ? [primary.world] : []), fallback, resources,
 	], (id) => id !== primary?.world.id || primaryEnabled);
 	const actor = async (): Promise<ToolSettlement> => {
 		try {
@@ -93,7 +98,7 @@ export async function qualifyStockTool(
 			const route = await gateway.resolve({ operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
 			const preparationMs = performance.now() - preparedAt;
 			if (requirePrimary) assert.equal(route?.backend, primary?.world.id, `${name}: primary fell back; not a Runtime pass`);
-			else assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : undefined,
+			else assert.equal(route?.backend, invocation?.resources ? resources.id : semantics.effect === "workspace_mutation" ? fallback.id : undefined,
 				`${name}: native route differs from its stock fallback`);
 			const started = performance.now();
 			let output: ToolSettlement;

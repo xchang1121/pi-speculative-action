@@ -9,7 +9,7 @@ import {
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
 import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
-import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
+import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -48,7 +48,7 @@ export type ResourceVersionToken = {
 
 type CapturedResource =
 	| { readonly type: "file"; readonly content?: Buffer }
-	| { readonly type: "directory"; readonly entries: readonly string[] }
+	| { readonly type: "directory"; readonly entries?: readonly string[] }
 	| { readonly type: "missing" };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
@@ -73,7 +73,7 @@ export class ResourceReadView {
 	}
 	capture(target: string, entry: CapturedResource): void {
 		this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
-			? entry.entries.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) : 0));
+			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0 : 0));
 		this.entries.set(filesystemPathKey(target), entry);
 	}
 	alias(target: string, source: string): void { this.capture(target, this.entry(source)); }
@@ -85,11 +85,11 @@ export class ResourceReadView {
 	};
 	readdir = (target: string): string[] => {
 		const entry = this.entry(target);
-		return entry.type === "directory" ? [...entry.entries] : this.unproven(target);
+		return entry.type === "directory" && entry.entries ? [...entry.entries] : this.unproven(target);
 	};
-	readFile = async (target: string): Promise<Buffer> => {
+	readFile = async (target: string, maxBytes?: number): Promise<Buffer> => {
 		const entry = this.entry(target);
-		return entry.type === "file" && entry.content !== undefined ? Buffer.from(entry.content) : this.unproven(target);
+		return entry.type === "file" && entry.content !== undefined ? Buffer.from(entry.content.subarray(0, maxBytes)) : this.unproven(target);
 	};
 	access = async (target: string): Promise<void> => {
 		const entry = this.entry(target);
@@ -121,7 +121,6 @@ type ResourceSubscriber = {
 
 const MAX_EVENT_HISTORY = 4096;
 const FINGERPRINT_CONCURRENCY = 12;
-const QUERY_CONTROL_FILES = new Set([".gitignore", ".ignore", ".rgignore", ".fdignore"]);
 
 export class ResourceVersionManager {
 	private epoch = 0;
@@ -368,26 +367,10 @@ export function resourceDependencies(
 	const definition = actionSemantics.definition(action.tool);
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined) return [];
-	const dependencies = action.resources.map((resource) => ({
+	return action.resources.map((resource) => ({
 		path: path.resolve(root, resource),
 		scope,
 	}));
-	if (scope === "tree_query" || scope === "tree_content") {
-		for (const resource of action.resources) {
-			const base = path.resolve(root, resource);
-			const relative = relativeFilesystemPath(root, base);
-			if (relative === undefined) continue;
-			let current = path.resolve(root);
-			for (const segment of relative.split(path.sep).filter(Boolean)) {
-				for (const control of QUERY_CONTROL_FILES) {
-					dependencies.push({ path: path.join(current, control), scope: "content" });
-				}
-				current = path.join(current, segment);
-			}
-		}
-		dependencies.push({ path: path.resolve(root, ".git", "info", "exclude"), scope: "content" });
-	}
-	return dependencies;
 }
 
 export function captureResourceVersion(
@@ -471,9 +454,8 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
 	}
 	if (!containsFilesystemPath(dependencyPath, changed)) return false;
-	if (dependency.scope === "tree_entries") return event.type !== "change";
-	if (dependency.scope === "tree_query") {
-		return event.type !== "change" || QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase());
+	if (dependency.scope === "entries") {
+		return event.type !== "change" && (dependencyPath === changed || dependencyPath === filesystemPathKey(path.dirname(event.path)));
 	}
 	return true;
 }
@@ -514,6 +496,7 @@ async function fingerprintPath(
 	realRoot: string,
 	ancestors: ReadonlySet<string>,
 	view?: ResourceReadView,
+	descend = true,
 ): Promise<FingerprintResult> {
 	let info: import("node:fs").BigIntStats;
 	try {
@@ -539,7 +522,7 @@ async function fingerprintPath(
 			throw new Error(`resource_symlink_changed:${target}`);
 		}
 		const source = path.resolve(path.dirname(target), link);
-		const followed = await fingerprintPath(source, scope, realRoot, ancestors, view);
+		const followed = await fingerprintPath(source, scope, realRoot, ancestors, view, descend);
 		view?.alias(target, source);
 		return {
 			value: {
@@ -554,11 +537,11 @@ async function fingerprintPath(
 			filesRead: followed.filesRead,
 		};
 	}
+	if ((scope === "entries" && !descend) || ((scope === "entries" || scope === "tree_entries") && !info.isDirectory())) {
+		view?.capture(target, { type: info.isDirectory() ? "directory" : "file" });
+		return stableEntry(target, info, identity);
+	}
 	if (info.isFile()) {
-		if (scope === "tree_entries" || (scope === "tree_query" && !QUERY_CONTROL_FILES.has(path.basename(target).toLowerCase()))) {
-			view?.capture(target, { type: "file" });
-			return stableFileEntry(target, info, identity);
-		}
 		// Reserve before yielding: concurrent captures cannot each spend the entire token budget.
 		view?.reserve(Number(info.size));
 		const content = await fingerprintIO(() => captureStableFile(target, view ? Number(info.size) : undefined, view !== undefined));
@@ -577,14 +560,14 @@ async function fingerprintPath(
 			filesRead: 1,
 		};
 	}
-	if (!info.isDirectory()) {
+	if (!info.isDirectory() || scope === "content") {
 		throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 	}
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
 	const selected = selectEntries(entries);
 	const descendants = new Set(ancestors).add(identity);
 	const children = await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
-		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view);
+		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
 	const [afterEntries, after] = await Promise.all([
@@ -613,18 +596,18 @@ async function fingerprintPath(
 	};
 }
 
-async function stableFileEntry(
+async function stableEntry(
 	target: string,
 	before: import("node:fs").BigIntStats,
 	resolved: string,
 ): Promise<FingerprintResult> {
 	const after = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
-	if (!after.isFile() || !sameFilesystemIdentity(before, after)) {
+	if (!sameFilesystemIdentity(before, after)) {
 		throw new Error(`resource_file_changed:${target}`);
 	}
 	return {
-		value: { type: "file", mode: Number(after.mode), resolved },
-		stamp: digest(["file", statStamp(after), resolved]),
+		value: { type: specialFileType(after), mode: Number(after.mode), resolved },
+		stamp: digest([statStamp(after), resolved]),
 		bytesRead: 0,
 		filesRead: 0,
 	};

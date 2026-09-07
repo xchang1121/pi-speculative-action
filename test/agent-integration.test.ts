@@ -9,7 +9,7 @@ import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-exte
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
@@ -121,7 +121,9 @@ describe("speculative action host", () => {
 			for (const [toolName, args] of mockToolCalls) {
 				const cwd = await temporaryWorkspace();
 				const turnID = `${phase}-${toolName}`;
-				const expected = `${phase}:${toolName}`;
+				const invocation = resolvePiToolInvocation(toolName, args, { cwd, environment: {} });
+				const resourceExecution = invocation?.resources;
+				const expected = resourceExecution ? toolName === "read" ? "one\ntwo\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
 				let release!: () => void;
 				const gate = new Promise<void>((resolve) => {
 					release = resolve;
@@ -136,10 +138,12 @@ describe("speculative action host", () => {
 					label: toolName,
 					description: toolName,
 					parameters: mockToolSchema,
-					execute: speculativeExecution,
+					execute: resourceExecution ? async () => { throw new Error("Host tool must not execute speculatively"); } : speculativeExecution,
 				};
 				const events: SpeculativeActionEvent<string>[] = [];
-				const sandbox = mockRuntimeWorld(async (context) => ({
+				const sandbox = resourceExecution
+					? createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [toolName], maxBytes: () => 1024 * 1024 })
+					: mockRuntimeWorld(async (context) => ({
 					result: await context.tool.execute(context.callID, context.args as never, context.signal),
 					isError: false,
 				}));
@@ -150,6 +154,10 @@ describe("speculative action host", () => {
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: args }], "toolUse"),
 					preflight: () => true,
+					resolveInvocation: () => resourceExecution ? { ...invocation!, resources: async (view, request) => {
+						await speculativeExecution();
+						return resourceExecution(view, request);
+					} } : invocation,
 					executionWorlds: [sandbox],
 					onEvent: (event) => {
 						events.push(event);

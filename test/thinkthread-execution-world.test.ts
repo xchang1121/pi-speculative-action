@@ -176,7 +176,7 @@ describe("ThinkThread execution world", () => {
 
 	it.each([
 		["read", { path: "notes.txt" }, "deny", { path: "notes.txt", scope: "content" }],
-		["ls", { path: "." }, "deny", { path: ".", scope: "tree_entries" }],
+		["ls", { path: "." }, "deny", { path: ".", scope: "entries" }],
 		[
 			"write",
 			{ path: "generated.txt", content: "generated\n" },
