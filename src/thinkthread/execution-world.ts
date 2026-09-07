@@ -133,7 +133,7 @@ export function createThinkThreadExecutionWorld(
 			])],
 			tools: THINKTHREAD_TOOL_NAMES,
 			fingerprint,
-			prepare: async ({ cwd }) => { await prepare(cwd); },
+			prepare: async ({ cwd }) => { await (await prepare(cwd)).client.fs.stat(); },
 			diagnostics: async ({ cwd, refresh }) => {
 				if (!prepared && !refresh) return { state: "registered", detail: "ThinkThread is checked on first use or refresh" };
 				const world = await prepare(cwd);
@@ -190,7 +190,6 @@ async function prepareWorld(cwd: string, clientFactory: (() => AgentPosixClient)
 	if (!self.capabilities.some((capability) => capability.id === "thinkthread.fs.self" && capability.version === 1)) {
 		throw new Error("ThinkThread profile does not delegate thinkthread.fs.self@1");
 	}
-	await client.fs.stat();
 	const durable = new DurableFsExecutor(client);
 	return { client, durable, pool: new ThinkThreadSnapshotPool(durable) };
 }

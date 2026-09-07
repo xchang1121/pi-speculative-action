@@ -98,9 +98,8 @@ describe("ThinkThread execution world", () => {
 		await router.dispose();
 	});
 
-	it("falls through a failed unified preparation without inventing a read fallback", async () => {
+	it.each(["startup", "disconnected"])("falls through %s failure without inventing a read fallback", async (failure) => {
 		const fixture = fakeClient();
-		fixture.selfView.mockRejectedValue(new Error("ThinkThread unavailable"));
 		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
 		const workspace = {
 			id: "git_worktree", scope: "fallback", isolation: "workspace_branch",
@@ -108,6 +107,11 @@ describe("ThinkThread execution world", () => {
 		} as unknown as SpeculativeAgentExecutionWorld;
 		const router = new ExecutionWorldRouter([primary, workspace]);
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
+		if (failure === "startup") fixture.selfView.mockRejectedValue(new Error("ThinkThread unavailable"));
+		else {
+			await primary.speculation.prepare?.({ cwd });
+			vi.mocked(fixture.client.fs.stat).mockRejectedValue(new Error("Runtime disconnected"));
+		}
 		const route = async (tool: "read" | "write", args: unknown) => {
 			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
 			return router.resolve({
