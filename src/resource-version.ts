@@ -49,6 +49,7 @@ export type ResourceVersionToken = {
 type CapturedResource =
 	| { readonly type: "file"; readonly content?: Buffer }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
+	| { readonly type: "alias"; readonly target: string }
 	| { readonly type: "missing" };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
@@ -73,10 +74,14 @@ export class ResourceReadView {
 	}
 	capture(target: string, entry: CapturedResource): void {
 		this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
-			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0 : 0));
+			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
+			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0));
 		this.entries.set(filesystemPathKey(target), entry);
 	}
-	alias(target: string, source: string): void { this.capture(target, this.entry(source)); }
+	alias(target: string, source: string): void {
+		this.entry(source);
+		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
+	}
 	exists = (target: string): boolean => this.entry(target).type !== "missing";
 	stat = (target: string): { isDirectory: () => boolean } => {
 		const entry = this.entry(target);
@@ -98,9 +103,22 @@ export class ResourceReadView {
 	assertComplete(): void { if (this.failure) throw this.failure; }
 	seal(): void { this.assertComplete(); this.sealed = true; }
 	dispose(): void { this.entries.clear(); this.failure = new Error("resource_snapshot_disposed"); }
-	private entry(target: string): CapturedResource {
+	private entry(target: string): Exclude<CapturedResource, { type: "alias" }> {
 		this.assertComplete();
-		return this.entries.get(filesystemPathKey(target)) ?? this.unproven(target);
+		let current = filesystemPathKey(target);
+		const visited = new Set<string>();
+		while (!visited.has(current) && visited.size <= this.entries.size) {
+			visited.add(current);
+			const exact = this.entries.get(current);
+			if (exact?.type === "alias") { current = exact.target; continue; }
+			if (exact) return exact;
+			let parent = path.dirname(current);
+			while (parent !== path.dirname(parent) && this.entries.get(parent)?.type !== "alias") parent = path.dirname(parent);
+			const alias = this.entries.get(parent);
+			if (alias?.type !== "alias") break;
+			current = filesystemPathKey(path.resolve(alias.target, path.relative(parent, current)));
+		}
+		return this.unproven(target);
 	}
 	private unproven(target: string): never {
 		throw (this.failure ??= new Error(`resource_access_unproven:${target}`));

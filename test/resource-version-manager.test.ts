@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { createFindTool, createGrepTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createFindTool, createGrepTool, createLsTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
@@ -165,34 +165,35 @@ describe("speculative action resource versions", () => {
 		manager.close();
 	});
 
-	test.runIf(process.platform !== "win32")("fingerprints a symlink target rather than only its link text", async () => {
-		const root = await workspace();
-		const target = path.join(root, "target.txt");
-		const link = path.join(root, "input.txt");
-		await fs.writeFile(target, "before");
-		await fs.symlink("target.txt", link);
+	test.for(["file", "directory"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
+		if (kind === "file" && process.platform === "win32") return skip("file symlinks require Windows privileges");
+		const root = await workspace(), outside = await workspace(), directory = kind === "directory";
+		const target = path.join(root, "value.txt"), alias = path.join(root, "alias"), link = path.join(root, "input");
+		const tree = path.join(root, "tree"), content = directory ? path.join(tree, "value.txt") : target;
+		if (directory) await fs.mkdir(tree);
+		await fs.writeFile(content, "before");
+		const type = directory ? process.platform === "win32" ? "junction" : "dir" : "file";
+		await fs.symlink(directory ? tree : target, link, type); await fs.symlink(link, alias, type);
 		const manager = new ResourceVersionManager(root, { watch: false });
-		const token = await manager.capture(resourceDependencies(action("read", ["input.txt"]), root));
-
-		await fs.writeFile(target, "after!");
-		const result = await manager.validate(token);
-		manager.close();
-
-		expect(result).toMatchObject({ expired: true, mode: "exact" });
-		expect(result.bytesRead).toBe(6);
-	});
-
-	test.runIf(process.platform !== "win32")("rejects resource symlinks that escape the workspace", async () => {
-		const root = await workspace();
-		const outside = await workspace();
-		await fs.writeFile(path.join(outside, "secret.txt"), "secret");
-		await fs.symlink(path.join(outside, "secret.txt"), path.join(root, "input.txt"));
-		const manager = new ResourceVersionManager(root, { watch: false });
-
-		await expect(manager.capture(resourceDependencies(action("read", ["input.txt"]), root))).rejects.toThrow(
-			"resource_symlink_escapes_workspace",
-		);
-		manager.close();
+		const token = await manager.capture([{ path: alias, scope: directory ? "tree_content" : "content" }], 8192);
+		try {
+			const name = directory ? "ls" : "read", args = { path: alias };
+			const native = directory ? createLsTool(root) : createReadTool(root);
+			const actual = await resolvePiToolInvocation(name, args, { cwd: root, environment: {} })!.filesystem!(token.view!,
+				{ args, callID: "spec", signal: new AbortController().signal });
+			token.view!.assertComplete();
+			const expected = await native.execute("actor", args);
+			expect(actual.result.content).toEqual(expected.content);
+			expect(Object.entries(actual.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
+			await fs.writeFile(content, "after!");
+			expect((await token.view!.readFile(directory ? path.join(alias, "value.txt") : alias)).toString()).toBe("before");
+			expect(await manager.validate(token)).toMatchObject({ expired: true, mode: "exact", bytesRead: 6 });
+			await fs.writeFile(path.join(outside, "value.txt"), "external");
+			const escape = path.join(root, "escape");
+			await fs.symlink(directory ? outside : path.join(outside, "value.txt"), escape, type);
+			await expect(manager.capture([{ path: escape, scope: "tree_content" }], 8192)).rejects.toThrow("resource_symlink_escapes_workspace");
+			expect(() => token.view!.exists(path.join(alias, "unproven"))).toThrow("resource_access_unproven");
+		} finally { token.release(); manager.close(); }
 	});
 
 	test.runIf(process.platform === "linux")("rejects special files without opening them", async () => {
