@@ -6,9 +6,9 @@ import path from "node:path";
 import { serialize } from "node:v8";
 
 // Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
-// Dependencies are explicitly installed outside this package; never downloaded by this script.
+// CLI-bearing ripgrep stays in an explicit external directory, never the Actor's npm PATH.
 const dependencyRoot = process.argv[2];
-assert.ok(dependencyRoot, "Usage: node bench/portable-kernel.mjs <directory containing node_modules> [--pi-tools]");
+assert.ok(dependencyRoot, "Usage: node bench/portable-kernel.mjs <external ripgrep dependency directory> [--pi-tools]");
 const started = performance.now(), worker = await prepareWorker();
 try {
 	const seed = { "/workspace/a.txt": Buffer.from("before\nneedle\nafter\n"), "/workspace/sub/b.txt": Buffer.from("needle two\n") };

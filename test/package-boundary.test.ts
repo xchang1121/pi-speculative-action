@@ -33,8 +33,8 @@ describe("speculative action package boundary", () => {
 		await importWithBlockedDependencies(["src/core.ts", "src/process-reuse.ts"], ["@earendil-works/pi-"]);
 	});
 
-	test("loads the default Pi entry while the ThinkThread SDK is unavailable", async () => {
-		await importWithBlockedDependencies(["src/index.ts", "src/extension.ts"], ["@thinkthread/agent-posix"]);
+	test("loads the default Pi entry without initializing opt-in engines", async () => {
+		await importWithBlockedDependencies(["src/index.ts", "src/extension.ts"], ["@thinkthread/agent-posix", "wasi-sh", "ripgrep", "globby"]);
 	});
 
 	test("loads ThinkThread only through its opt-in entry when the SDK is installed", async () => {

@@ -31,6 +31,9 @@
 
 ### Added
 
+- Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
+  implementation used by qualification. Native Actor defaults are unchanged; production worker
+  ownership, binary delivery, and TUI profile selection remain pending.
 - Added task-clustered bootstrap confidence intervals and nearest-rank p95 to
   suite latency reports; pooled acceleration remains a ratio of means, and
   repeats of the same instance stay in one resampled cluster.
