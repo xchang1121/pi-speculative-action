@@ -8,13 +8,8 @@ import type {
 } from "./resource-budget.ts";
 import { resourceProfile, speculativeResourceBudget } from "./resource-budget.ts";
 
-export interface PredictionForecast {
-	readonly tool: string;
+export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly execution: SpeculativeExecution;
-	/** Stable execution environment shared by comparable Actor and speculative samples. */
-	readonly executionFingerprint?: string;
-	/** Exact K(a), used before falling back to the wider tool/environment timing class. */
-	readonly actionKeyHash?: string;
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
@@ -40,8 +35,12 @@ export interface ScheduledWork {
 
 export interface ServiceTimingIdentity {
 	readonly tool: string;
+	/** Stable execution environment shared by comparable service samples. */
 	readonly executionFingerprint?: string;
+	/** Exact K(a) or producer/consumer pair, before falling back to the wider timing class. */
 	readonly actionKeyHash?: string;
+	/** Distinct work within one executor, such as exact adoption versus input re-evaluation. */
+	readonly operation?: string;
 }
 
 export interface CandidateJoinPolicy {
@@ -62,7 +61,10 @@ const DEFAULT_CANDIDATE_JOIN_POLICY: CandidateJoinPolicy = Object.freeze({
 });
 
 export interface CandidateJoinRequest {
+	/** Producer service; omitted consumer/adoption identities preserve exact-replay callers. */
 	readonly identity: ServiceTimingIdentity;
+	readonly actorIdentity?: ServiceTimingIdentity;
+	readonly adoptionIdentity?: ServiceTimingIdentity;
 	readonly state: "queued" | "running" | "succeeded";
 	readonly expectedSpeculativeDurationMs: number;
 	readonly elapsedMs?: number;
@@ -285,10 +287,8 @@ export class SpeculationScheduler<Job extends object> {
 	assessCandidateJoin(request: CandidateJoinRequest): CandidateJoinDecision {
 		const policy = this.candidateJoinPolicy;
 		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
-		const actorExact = this.exactTimingEstimate(this.actorServiceTimes, request.identity, 0.25);
-		const actorClass = this.classTimingEstimate(this.actorServiceTimes, request.identity, 0.25);
-		const adoption = this.timingEstimate(this.adoptionTimes, request.identity, 0.75, "upper");
-		const actor = actorExact ?? actorClass;
+		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
+		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
 		const expectedActorMs = actor?.value;
 		const expectedSpeculativeMs =
 			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, 1);
@@ -412,7 +412,7 @@ export class SpeculationScheduler<Job extends object> {
 		const actionDuration = positive(forecast.expectedDurationMs, 1);
 		const observed = this.timingEstimate(
 			this.speculativeServiceTimes,
-			timingIdentity(forecast),
+			forecast,
 			quantile,
 		)?.value;
 		// A source's action-specific estimate remains a lower bound. Wider timing classes can
@@ -438,29 +438,11 @@ export class SpeculationScheduler<Job extends object> {
 		quantile: number,
 		selection: QuantileSelection = "lower",
 	): TimingEstimate | undefined {
-		return (
-			this.exactTimingEstimate(windows, identity, quantile, selection) ??
-			this.classTimingEstimate(windows, identity, quantile, selection)
-		);
-	}
-
-	private exactTimingEstimate(
-		windows: BoundedRecencyMap<string, SampleWindow>,
-		identity: ServiceTimingIdentity,
-		quantile: number,
-		selection: QuantileSelection = "lower",
-	): TimingEstimate | undefined {
-		const key = exactTimingKey(identity);
-		return key ? windowEstimate(windows.get(key), quantile, selection) : undefined;
-	}
-
-	private classTimingEstimate(
-		windows: BoundedRecencyMap<string, SampleWindow>,
-		identity: ServiceTimingIdentity,
-		quantile: number,
-		selection: QuantileSelection = "lower",
-	): TimingEstimate | undefined {
-		return windowEstimate(windows.get(classTimingKey(identity)), quantile, selection);
+		for (const key of timingKeys(identity)) {
+			const window = windows.get(key), value = window?.estimate(quantile, selection);
+			if (value !== undefined) return { value, samples: window!.count };
+		}
+		return undefined;
 	}
 }
 
@@ -487,52 +469,20 @@ class SampleWindow {
 		return this.estimate(value) ?? positive(fallback, 1);
 	}
 
-	estimate(value: number): number | undefined {
+	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
 		if (!this.values.length) return undefined;
 		const sorted = [...this.values].sort((left, right) => left - right);
-		return sorted[Math.floor((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
-	}
-
-	estimateUpper(value: number): number | undefined {
-		if (!this.values.length) return undefined;
-		const sorted = [...this.values].sort((left, right) => left - right);
-		return sorted[Math.ceil((sorted.length - 1) * Math.max(0, Math.min(1, value)))]!;
+		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
+		return sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!;
 	}
 }
 
 type QuantileSelection = "lower" | "upper";
 
-function timingIdentity(forecast: PredictionForecast): ServiceTimingIdentity {
-	return {
-		tool: forecast.tool,
-		...(forecast.executionFingerprint ? { executionFingerprint: forecast.executionFingerprint } : {}),
-		...(forecast.actionKeyHash ? { actionKeyHash: forecast.actionKeyHash } : {}),
-	};
-}
-
 function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
-	const exact = exactTimingKey(identity);
-	const wider = classTimingKey(identity);
-	return exact && exact !== wider ? [exact, wider] : [wider];
-}
-
-function exactTimingKey(identity: ServiceTimingIdentity): string | undefined {
-	return identity.actionKeyHash
-		? JSON.stringify(["action", identity.tool, identity.executionFingerprint ?? "", identity.actionKeyHash])
-		: undefined;
-}
-
-function classTimingKey(identity: ServiceTimingIdentity): string {
-	return JSON.stringify(["class", identity.tool, identity.executionFingerprint ?? ""]);
-}
-
-function windowEstimate(
-	window: SampleWindow | undefined,
-	quantile: number,
-	selection: QuantileSelection = "lower",
-): TimingEstimate | undefined {
-	const value = selection === "upper" ? window?.estimateUpper(quantile) : window?.estimate(quantile);
-	return value === undefined || !window ? undefined : { value, samples: window.count };
+	const group = [identity.tool, identity.executionFingerprint ?? "", identity.operation ?? ""];
+	return [...(identity.actionKeyHash ? [JSON.stringify(["action", ...group, identity.actionKeyHash])] : []),
+		JSON.stringify(["class", ...group])];
 }
 
 function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | undefined): CandidateJoinPolicy {

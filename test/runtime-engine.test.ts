@@ -18,6 +18,7 @@ import type {
 	SpeculativePlanSource,
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
+import { SpeculationScheduler } from "../src/scheduler.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 
 interface Start {
@@ -845,6 +846,8 @@ describe("structural speculative runtime", () => {
 
 	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-covered"] as const)(
 	"adopts reconstructed input only after a stable, successful evaluation: %s", async (scenario) => {
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed");
 		const candidateReady = candidateSucceeded();
 		const entered = barrier(), release = barrier(), controller = new AbortController();
@@ -886,9 +889,18 @@ describe("structural speculative runtime", () => {
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+			if (succeeds) {
+				const request = admission.mock.lastCall![0], actorHash = buildPiActionKey(actor.tool, actor.input, "/workspace")!.hash;
+				expect(request.actorIdentity?.actionKeyHash).toBe(actorHash);
+				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
+				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
+					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
+						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, "read.range"]) });
+			}
 		} finally {
 			completion.arrive(); release.arrive(); await consumed;
 			await fixture.runtime.finishTurn({ ...actor, terminal: true });
+			admission.mockRestore(); adoption.mockRestore();
 		}
 	});
 

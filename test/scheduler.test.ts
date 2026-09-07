@@ -137,36 +137,36 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([withoutPhase]).priorityMs).toBe(240);
 	});
 
-	it("keeps Actor, speculative-world, and adoption timing distributions separate", () => {
+	it("separates producer, consumer, and adoption work while retaining exact/class quantiles and bounded history", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		const identity = {
-			tool: "bash",
-			executionFingerprint: "linux-world:v1",
-			actionKeyHash: "action-a",
-		};
+		const identity = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "producer" };
+		const actorIdentity = { ...identity, actionKeyHash: "consumer" };
+		const exact = { ...actorIdentity, operation: "route:exact" }, inputs = { ...actorIdentity, operation: "route:inputs" };
 		scheduler.observeActorService(identity, 380);
-		scheduler.observeSpeculativeService(identity, 920);
 		scheduler.observeAdoption(identity, 70);
-
-		expect(
-			scheduler.evaluate([
-				forecast({
-					tool: "bash",
-					executionFingerprint: identity.executionFingerprint,
-					actionKeyHash: identity.actionKeyHash,
-					expectedDurationMs: 380,
-				}),
-			]),
-		).toMatchObject({ expectedDurationMs: 920 });
-		expect(joinDecision(scheduler, identity, { expectedSpeculativeDurationMs: 920, elapsedMs: 100 })).toMatchObject({
-			allowed: false,
-			reason: "fallback_faster",
-			expectedRemainingMs: 820,
-			expectedActorMs: 380,
-			expectedAdoptionMs: 70,
+		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
+		for (const duration of [100, 110, 120]) scheduler.observeActorService(actorIdentity, duration);
+		for (const duration of [5, 10, 20]) scheduler.observeAdoption(exact, duration);
+		for (const duration of [150, 160, 200]) scheduler.observeAdoption(inputs, duration);
+		expect(scheduler.evaluate([forecast({ ...identity, expectedDurationMs: 1 })]).expectedDurationMs).toBe(50);
+		expect(joinDecision(scheduler, identity)).toMatchObject({ expectedRemainingMs: 90, expectedActorMs: 380, expectedAdoptionMs: 70 });
+		for (const [adoptionIdentity, expectedAdoptionMs] of [[exact, 20], [inputs, 200]] as const) {
+			expect(joinDecision(scheduler, identity, { actorIdentity, adoptionIdentity, state: "succeeded" })).toMatchObject({
+				allowed: expectedAdoptionMs < 100, expectedActorMs: 100, expectedAdoptionMs, expectedNetBenefitMs: 100 - expectedAdoptionMs,
+			});
+		}
+		expect(joinDecision(scheduler, identity, { actorIdentity, adoptionIdentity: exact })).toMatchObject({
+			allowed: false, expectedActorMs: 100, expectedRemainingMs: 90, expectedAdoptionMs: 20, expectedNetBenefitMs: -10,
 		});
-		expect(joinDecision(scheduler, identity, { state: "succeeded", expectedSpeculativeDurationMs: 920 }))
-			.toMatchObject({ allowed: true, reason: "ready" });
+		for (const [adoptionIdentity, expectedAdoptionMs] of [
+			[{ ...exact, actionKeyHash: "new pair" }, 20],
+			[{ ...exact, operation: "other route:exact" }, 0],
+			[{ ...exact, executionFingerprint: "other executor" }, 0],
+		] as const) {
+			expect(joinDecision(scheduler, identity, {
+				actorIdentity: { ...actorIdentity, actionKeyHash: "new query" }, adoptionIdentity, state: "succeeded",
+			})).toMatchObject({ expectedActorMs: 100, expectedAdoptionMs });
+		}
 
 		const tiny = new SpeculationScheduler<object>();
 		tiny.observeActorService(identity, 30);
@@ -204,23 +204,6 @@ describe("SpeculationScheduler", () => {
 			allowed: false,
 			reason: "fallback_faster",
 			expectedNetBenefitMs: 21,
-		});
-	});
-
-	it("uses upper empirical speculative and adoption quantiles against a lower Actor quantile", () => {
-		const scheduler = new SpeculationScheduler<object>();
-		const identity = { tool: "bash", executionFingerprint: "linux-world:v1" };
-		for (const duration of [100, 110, 120]) scheduler.observeActorService(identity, duration);
-		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
-		for (const duration of [5, 10, 20]) scheduler.observeAdoption(identity, duration);
-
-		expect(joinDecision(scheduler, identity, { expectedSpeculativeDurationMs: 50 })).toMatchObject({
-			allowed: false,
-			reason: "fallback_faster",
-			expectedActorMs: 100,
-			expectedRemainingMs: 90,
-			expectedAdoptionMs: 20,
-			expectedNetBenefitMs: -10,
 		});
 	});
 

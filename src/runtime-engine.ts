@@ -2037,8 +2037,16 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const choice of ranked) {
 			const candidate = choice.candidate;
 			const executionAtDecision = candidate.work.execution;
+			const actorIdentity = actionTimingIdentity(actualKey), route = candidate.route;
+			const adoptionIdentity = {
+				...actorIdentity,
+				actionKeyHash: JSON.stringify([candidate.key.hash, actualKey.hash]),
+				operation: JSON.stringify([route.backend, route.fingerprint, route.scope, route.isolation, route.reuse,
+					choice.match.kind === "exact" ? "exact" : choice.match.projector]),
+			};
 			const join = state.session.scheduler.assessCandidateJoin({
 				identity: actionTimingIdentity(candidate.key),
+				actorIdentity, adoptionIdentity,
 				state:
 					executionAtDecision.status === "succeeded"
 						? "succeeded"
@@ -2184,7 +2192,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 				const adoptedAt = performance.now();
 				state.session.scheduler.observeAdoption(
-					actionTimingIdentity(candidate.key),
+					adoptionIdentity,
 					Math.max(0, adoptedAt - Math.max(actorArrivedAt, execution.completedAt)),
 				);
 				const timing = {
