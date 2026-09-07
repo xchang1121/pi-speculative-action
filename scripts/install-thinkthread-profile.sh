@@ -116,27 +116,36 @@ fi
 mkdir -p -- "$(dirname -- "$install_root")" "$profile_root"
 transaction_root="$(mktemp -d "$(dirname -- "$install_root")/.pi-speculative-action-install.XXXXXX")"
 payload_root="$transaction_root/payload"
-previous_install="$transaction_root/previous-install"
-previous_profile="$transaction_root/previous-profile.toml"
-installed_new=false
-profile_replaced=false
+# The journal owns old targets before the first rename, including interrupted publication.
+replacements=()
+creations=()
 success=false
 
+replace_path() {
+    local source="$1" target="$2" backup="$transaction_root/previous-${#replacements[@]}"
+    if [[ -e "$target" || -L "$target" ]]; then
+        replacements+=("$target" "$backup")
+        mv -- "$target" "$backup"
+    else
+        creations+=("$target")
+    fi
+    mv -- "$source" "$target"
+}
+
 rollback_and_cleanup() {
-    status=$?
+    local status=$? failed=false target backup index
     if [[ "$success" != true ]]; then
-        if [[ "$profile_replaced" == true ]]; then
-            rm -f -- "$profile_path"
-            if [[ -f "$previous_profile" ]]; then
-                mv -- "$previous_profile" "$profile_path"
+        for ((index=${#replacements[@]}-2; index>=0; index-=2)); do
+            target="${replacements[index]}" backup="${replacements[index+1]}"
+            if [[ -e "$backup" || -L "$backup" ]]; then
+                { rm -rf -- "$target" && mv -- "$backup" "$target"; } || failed=true
             fi
-        fi
-        if [[ "$installed_new" == true ]]; then
-            rm -rf -- "$install_root"
-            if [[ -d "$previous_install" ]]; then
-                mv -- "$previous_install" "$install_root"
-            fi
-        fi
+        done
+        for target in "${creations[@]}"; do rm -rf -- "$target" || failed=true; done
+    fi
+    if [[ "$failed" == true ]]; then
+        printf 'Rollback incomplete; recovery files retained at %s\\n' "$transaction_root" >&2
+        exit 1
     fi
     rm -rf -- "$transaction_root"
     exit "$status"
@@ -246,17 +255,9 @@ await writeFile(manifestPath, `${JSON.stringify({
 }, null, 2)}\n`);
 NODE
 
-if [[ -d "$install_root" ]]; then
-    mv -- "$install_root" "$previous_install"
-fi
-mv -- "$payload_root" "$install_root"
-installed_new=true
-
-if [[ -f "$profile_path" ]]; then
-    mv -- "$profile_path" "$previous_profile"
-fi
-install -m 0600 "$package_root/.thinkthread/pi-speculative-action.toml" "$profile_path"
-profile_replaced=true
+install -m 0600 "$package_root/.thinkthread/pi-speculative-action.toml" "$transaction_root/profile.toml"
+replace_path "$payload_root" "$install_root"
+replace_path "$transaction_root/profile.toml" "$profile_path"
 
 "$tt_bin" profile show pi-speculative-action >/dev/null
 for model in "${requested_models[@]}"; do

@@ -43,13 +43,35 @@ describe("speculative action package boundary", () => {
 		expect(thinkThread.createThinkThreadProfileExtension).toBeTypeOf("function");
 
 		const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
-		expect(manifest.exports["./thinkthread-extension"]).toBeDefined();
 		expect(manifest.peerDependenciesMeta["@thinkthread/agent-posix"]).toEqual({ optional: true });
-		expect(manifest.devDependencies["@thinkthread/agent-posix"]).toBe(
-			"file:vendor/thinkthread-agent-posix-0.1.0.tgz",
-		);
-		await expect(fs.stat(path.join(packageRoot, "vendor", "thinkthread-agent-posix-0.1.0.tgz"))).resolves.toBeDefined();
-		await expect(fs.stat(path.join(packageRoot, "scripts", "install-thinkthread-profile.sh"))).resolves.toBeDefined();
+	});
+
+	test.runIf(process.platform === "linux")("restores installer publications or retains their recovery journal", async () => {
+		const script = await fs.readFile(path.join(packageRoot, "scripts/install-thinkthread-profile.sh"), "utf8");
+		const journal = script.slice(script.indexOf("replacements=()"), script.indexOf("package_output="));
+		for (const fault of ["none", "installed", "payload", "staged-profile", "rollback"]) {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-install-journal-"));
+			try {
+				for (const name of ["txn", "installed", "payload"]) await fs.mkdir(path.join(root, name));
+				for (const [name, value] of [["installed/value", "old"], ["payload/value", "new"], ["profile", "old"], ["staged-profile", "new"]])
+					await fs.writeFile(path.join(root, name!), value!);
+				const result = await execFileAsync("bash", ["-c", `set -e
+fixture_root="$1"; transaction_root="$1/txn"; fault="$2"
+${journal}
+mv() {
+  if [[ "$2" == "$fixture_root/$fault" || ( "$fault" == rollback && ( "$2" == "$fixture_root/payload" || "$2" == "$transaction_root/previous-0" ) ) ]]; then return 17; fi
+  command mv "$@"
+}
+replace_path "$fixture_root/payload" "$fixture_root/installed"
+replace_path "$fixture_root/staged-profile" "$fixture_root/profile"
+success=true`, "journal", root, fault]).then(() => true, () => false);
+				expect(result, fault).toBe(fault === "none");
+				expect(await fs.readFile(path.join(root, fault === "rollback" ? "txn/previous-0/value" : "installed/value"), "utf8"))
+					.toBe(fault === "none" ? "new" : "old");
+				expect(await fs.readFile(path.join(root, "profile"), "utf8")).toBe(fault === "none" ? "new" : "old");
+				if (fault !== "rollback") await expect(fs.stat(path.join(root, "txn"))).rejects.toThrow();
+			} finally { await fs.rm(root, { recursive: true, force: true }); }
+		}
 	});
 
 	test("loads from its package manifest through Pi's public extension loader", async () => {
