@@ -292,15 +292,16 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	async commit(): Promise<Output> {
 		if (this.commitPromise) return this.commitPromise;
 		if (this.attempt.stateValue === "committed") return this.branch.output;
-		if (this.validationPromise) await this.validationPromise;
-		if (this.validation?.status !== "valid") {
+		if (!this.validationPromise && this.validation?.status !== "valid") {
 			throw new Error(`effect transaction ${this.transactionID} requires successful validation before commit`);
 		}
-		if (this.attempt.stateValue !== "validated") {
-			throw new Error(`effect transaction ${this.transactionID} cannot commit from ${this.attempt.stateValue}`);
-		}
-		this.attempt.stateValue = "committing";
-		const pending = (async () => {
+		// Reserve the entire validation → commit operation before yielding, not just its effect.
+		return this.commitPromise = (async () => {
+			await this.validationPromise;
+			if (this.validation?.status !== "valid" || this.attempt.stateValue !== "validated") {
+				throw new Error(`effect transaction ${this.transactionID} cannot commit from ${this.attempt.stateValue}`);
+			}
+			this.attempt.stateValue = "committing";
 			try {
 				const output = await this.branch.commit();
 				this.attempt.stateValue = "committed";
@@ -315,8 +316,6 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 				throw failure;
 			}
 		})();
-		this.commitPromise = pending;
-		return pending;
 	}
 
 	abort(): Promise<void> {

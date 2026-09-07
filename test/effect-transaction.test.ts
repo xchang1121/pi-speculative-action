@@ -15,7 +15,9 @@ const route: SpeculativeExecutionRoute = {
 };
 
 describe("EffectTransactionCoordinator", () => {
-	it("enforces validate-before-commit and joins an at-most-once commit", async () => {
+	it.each([false, true])("owns concurrent commit across pending validation=%s", async (pending) => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
 		const commit = vi.fn(async () => "committed");
 		const dispose = vi.fn(async () => {});
 		const coordinator = new EffectTransactionCoordinator<string>();
@@ -24,7 +26,7 @@ describe("EffectTransactionCoordinator", () => {
 
 		const transaction = await coordinator.execute(attempt, async () =>
 			branch({
-				validate: async () => ({ status: "valid", metrics: metrics() }),
+				validate: async () => { await gate; return { status: "valid", metrics: metrics() }; },
 				commit,
 				dispose,
 			}),
@@ -32,11 +34,11 @@ describe("EffectTransactionCoordinator", () => {
 		expect(transaction.state).toBe("sealed");
 		expect(attempt.state).toBe(transaction.state);
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
-		expect(await transaction.validate()).toMatchObject({ status: "valid" });
-		expect(transaction.state).toBe("validated");
-		expect(attempt.state).toBe(transaction.state);
-
-		const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
+		const validation = transaction.validate();
+		if (!pending) { release(); await validation; }
+		const commits = [transaction.commit(), transaction.commit()];
+		release();
+		const [first, second] = await Promise.all(commits);
 		expect([first, second]).toEqual(["committed", "committed"]);
 		expect(commit).toHaveBeenCalledOnce();
 		expect(transaction.state).toBe("committed");
@@ -115,10 +117,10 @@ describe("EffectTransactionCoordinator", () => {
 		expect(abandonedAttempt.state).toBe("aborted");
 	});
 
-	it("distinguishes restored failures from indeterminate partial commits", async () => {
-		for (const disposition of ["recoverable", "poisoned"] as const) {
+	it("classifies failures once, including unclassified partial commits", async () => {
+		for (const disposition of ["recoverable", "poisoned", undefined] as const) {
 			const dispose = vi.fn();
-			const failure = effectCommitFailure(new Error("commit failed"), disposition);
+			const failure = disposition ? effectCommitFailure(new Error("commit failed"), disposition) : new Error("unknown state");
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const transaction = await coordinator.execute(
 				coordinator.begin({ tool: "write", route }),
@@ -131,29 +133,16 @@ describe("EffectTransactionCoordinator", () => {
 			);
 			await transaction.validate();
 
-			await expect(transaction.commit()).rejects.toBe(failure);
-			expect(transaction.state).toBe(disposition === "poisoned" ? "poisoned" : "failed");
+			const commits = await Promise.allSettled([transaction.commit(), transaction.commit()]);
+			expect(commits[0]).toEqual(commits[1]);
+			expect(commits[0]).toMatchObject({ status: "rejected", reason: { disposition: disposition ?? "poisoned" } });
+			expect(transaction.state).toBe(disposition === "recoverable" ? "failed" : "poisoned");
 			await transaction.abort();
-			expect(transaction.state).toBe(disposition === "poisoned" ? "poisoned" : "aborted");
+			expect(transaction.state).toBe(disposition === "recoverable" ? "aborted" : "poisoned");
 			expect(dispose).toHaveBeenCalledOnce();
 		}
 	});
 
-	it("treats an unclassified backend commit failure as poisoned", async () => {
-		const coordinator = new EffectTransactionCoordinator<string>();
-		const transaction = await coordinator.execute(
-			coordinator.begin({ tool: "custom", route }),
-			async () =>
-				branch({
-					validate: async () => ({ status: "valid", metrics: metrics() }),
-					commit: async () => Promise.reject(new Error("unknown state")),
-				}),
-		);
-		await transaction.validate();
-
-		await expect(transaction.commit()).rejects.toMatchObject({ disposition: "poisoned" });
-		expect(transaction.state).toBe("poisoned");
-	});
 });
 
 function branch(overrides: Partial<WorldBranch<string>> = {}): WorldBranch<string> {
