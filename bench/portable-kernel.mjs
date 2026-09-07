@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { serialize } from "node:v8";
-import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
+import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
+import { createClosedSearchProfile, readClosedSearchInput } from "../dist/pi-tool-invocation.js";
 
 // Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
 // Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
@@ -34,12 +35,19 @@ try {
 	assert.equal((await kernel([{ name: "sh", args: ["-c", "cat /workspace/a.txt"] }]))[0].stdout, seed["/workspace/a.txt"].toString());
 	for (let repeat = 0; repeat < 2; repeat++) assert.equal((await kernel([{ name: "sh", args: ["-c", "stat -c %Y /workspace/a.txt"] }]))[0].stdout, "1700000000\n");
 	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
+	const rejectedModules = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-module-"));
+	try {
+		for (const [file, bytes, reason] of [["wrong", 4, /Requalify the search module/], ["large", 4 * 1024 * 1024 + 1, /search module byte budget/],
+			...(process.platform === "linux" ? [["fifo", undefined, /search module must be a regular file/]] : [])]) {
+			const target = path.join(rejectedModules, file);
+			if (bytes === undefined) execFileSync("mkfifo", [target]); else await fs.writeFile(target, Buffer.alloc(bytes));
+			const denied = launchClosedSearchWorker(target);
+			try { await assert.rejects(denied.ready, reason); assert.ok(denied.closed()); }
+			finally { await denied.dispose(); }
+		}
+	} finally { assert.equal(path.dirname(rejectedModules), path.resolve(os.tmpdir())); await fs.rm(rejectedModules, { recursive: true, force: true }); }
 	const pi = {};
-	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) {
-		const executor = new ClosedSearchProcessPool(moduleFile);
-		try { pi[name] = await qualifyPiSearch(executor, name, worker.profile); }
-		finally { await executor.dispose(); }
-	}
+	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) pi[name] = await qualifyPiSearch(name);
 	const cancellation = [];
 	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
 		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
@@ -78,15 +86,15 @@ async function prepareWorker(qualification = false) {
 }
 
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
-async function qualifyPiSearch(pool, name, profile) {
+async function qualifyPiSearch(name) {
 	const { createGrepToolDefinition, createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
 	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
-	const { RESOURCE_OBSERVATION_EFFECTS } = await import("../dist/effect-model.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
 	const { captureResourceVersion } = await import("../dist/resource-version.js");
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-")), searchRoot = path.join(root, "search");
+	const { pool, profile, invocations } = await createClosedSearchProfile(root, moduleFile), bound = invocations.get(name);
 	const counts = { producer: 0, actor: 0, contextReads: 0 }, reads = new Set();
 	let inputRequests = 0, inputBytes = 0;
 	const execute = async (role, source, request, checkpoint) => {
@@ -98,7 +106,7 @@ async function qualifyPiSearch(pool, name, profile) {
 				{ signal: request.signal, onInput: async (operation, target) => {
 					inputRequests++;
 					if (operation === "readFile") reads.add(target);
-					const value = await readInput(inputs?.view ?? source, root, operation, target, profile.limits.inputBytes);
+					const value = await readClosedSearchInput(inputs?.view ?? source, root, operation, target, profile.limits.inputBytes);
 					inputBytes += serialize(value).byteLength;
 					if (checkpoint && !checkpointReached && operation === "readFile" && target === "/workspace/.gitignore") {
 						checkpointReached = true; await checkpoint();
@@ -109,8 +117,7 @@ async function qualifyPiSearch(pool, name, profile) {
 			return { result: output.result, isError: output.isError };
 		} finally { inputs?.release(); }
 	};
-	const tool = ({ grep: createGrepToolDefinition, find: createFindToolDefinition })[name](root), definition = { ...PI_ACTION_SEMANTICS.definition(name), epoch: profile.id,
-		effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
+	const tool = ({ grep: createGrepToolDefinition, find: createFindToolDefinition })[name](root);
 	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
@@ -119,8 +126,11 @@ async function qualifyPiSearch(pool, name, profile) {
 	function journey(checkpoint, capacity = 1) {
 		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
-		const invocation = { executor: profile.id, identity: profile, semantics: definition,
-			filesystem: async (view, request) => execute("producer", view, request, checkpoint) };
+		const invocation = { ...bound,
+			filesystem: async (view, request) => {
+				if (checkpoint) return execute("producer", view, request, checkpoint);
+				counts.producer++; return bound.filesystem(view, request);
+			} };
 		const host = createSpeculativeActionHost("portable-" + journeys.length, {
 			cwd: root, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
 				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? [name] : [],
@@ -146,8 +156,9 @@ async function qualifyPiSearch(pool, name, profile) {
 				actorWaiting = true; feedback = Promise.withResolvers();
 				const arrived = performance.now();
 				const output = await host.execute({ turnID, id, tool: name, args: query, tools: [tool] }, signal, async (operation) => {
-					assert.deepEqual(operation.invocation?.identity, profile, "Actor execution must retain the selected executor independently of K(a)");
-					actorCalls++; return (await execute("actor", fs, { args: operation.input, signal: operation.signal })).result;
+					assert.deepEqual(operation.invocation?.identity, bound.identity, "Actor execution must retain the selected executor independently of K(a)");
+					actorCalls++; counts.actor++;
+					return (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: id })).result;
 				});
 				actorWaiting = false;
 				return { output, totalMs: performance.now() - arrived, settlement: await bounded(feedback.promise, "Actor settlement") };
@@ -312,31 +323,6 @@ async function qualifyPiSearch(pool, name, profile) {
 		await Promise.all(journeys.map((host) => host.dispose())); await pool.dispose();
 		assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
 	}
-}
-
-/** The same closed namespace for live Actor fixture IO and token-owned sealed inputs. */
-async function readInput(source, root, operation, target, maxBytes) {
-	assert.ok(["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
-	const fail = (code) => { throw Object.assign(new Error(`${code}: ${target}`), { code }); };
-	const normalized = path.posix.normalize(target);
-	if (normalized === "/") return operation === "stat" ? { directory: true, size: 0 } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
-	const relative = path.posix.relative("/workspace", normalized);
-	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT"); // Closed virtual namespace, never the host root.
-	let physical = root;
-	for (const segment of relative ? relative.split("/") : []) {
-		if (!(await source.stat(physical)).isDirectory()) return fail("ENOTDIR");
-		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT"); // Negative evidence comes from captured entries.
-		physical = path.join(physical, segment);
-	}
-	const stat = await source.stat(physical), directory = stat.isDirectory();
-	if (operation === "stat") {
-		assert.ok(directory || Number.isSafeInteger(stat.size), "file size is not proven by retained content");
-		return { directory, size: directory ? 0 : stat.size };
-	}
-	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
-	if (directory) return fail("EISDIR");
-	assert.ok(stat.size <= maxBytes, "input byte budget");
-	return source.readFile(physical);
 }
 
 function bounded(promise, label) {

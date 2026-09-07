@@ -3,7 +3,10 @@ import {
 	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
 	getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
-import type { ToolInvocation } from "./tool-settlement.ts";
+import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
+import { captureResourceVersion } from "./resource-version.ts";
 
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
 export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "process", readonly string[]>> = {
@@ -104,3 +107,62 @@ export function resolvePiToolInvocation(
 		},
 	};
 }
+
+/** Explicit common search semantics. Creating the profile does not launch processes or access host input. */
+export async function createClosedSearchProfile(cwd: string, moduleFile: string) {
+	const { CLOSED_SEARCH_PROFILE: profile } = await import(new URL("./closed-search-kernel.mjs", import.meta.url).href) as {
+		CLOSED_SEARCH_PROFILE: Readonly<{ id: string; limits: { inputBytes: number } }>;
+	};
+	const { ClosedSearchProcessPool } = await import(new URL("./closed-search-process.mjs", import.meta.url).href);
+	const pool = new ClosedSearchProcessPool(moduleFile) as {
+		request(role: "actor" | "producer", input: unknown, options: { signal?: AbortSignal; onInput: (operation: string, target: string) => Promise<unknown> }): Promise<ToolSettlement>;
+		dispose(): Promise<void>;
+	};
+	const invocations = new Map<string, ToolInvocation>();
+	for (const tool of ["grep", "find"]) {
+		const execute = async (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => {
+			const capture = view ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
+			try {
+				const input = view ?? capture?.view;
+				if (!input) throw new Error("closed search input capture unavailable");
+				return await pool.request(view ? "producer" : "actor", { kind: tool, root: cwd, args: request.args }, {
+					signal: request.signal, onInput: (operation, target) => readClosedSearchInput(input, cwd, operation, target, profile.limits.inputBytes),
+				});
+			} finally { capture?.release(); }
+		};
+		invocations.set(tool, Object.freeze({
+			executor: profile.id, identity: Object.freeze({ profile, cwd }),
+			semantics: Object.freeze({ ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: profile.id,
+				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" }),
+			authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
+		} satisfies ToolInvocation));
+	}
+	return { profile, pool, invocations: invocations as ReadonlyMap<string, ToolInvocation> };
+}
+
+/** Translate a closed namespace using only captured positive/negative evidence, never ambient host fs. */
+export async function readClosedSearchInput(source: ToolFilesystemOperations, root: string, operation: string, target: string, maxBytes: number): Promise<unknown> {
+	assert.ok(source.stat && source.readdir && ["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
+	const fail = (code: string): never => { throw Object.assign(new Error(`${code}: ${target}`), { code }); };
+	const normalized = path.posix.normalize(target);
+	if (normalized === "/") return operation === "stat" ? { directory: true, size: 0 } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
+	const relative = path.posix.relative("/workspace", normalized);
+	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT");
+	let physical = root;
+	for (const segment of relative ? relative.split("/") : []) {
+		if (!(await source.stat(physical)).isDirectory()) return fail("ENOTDIR");
+		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT");
+		physical = path.join(physical, segment);
+	}
+	const stat = await source.stat(physical), directory = stat.isDirectory();
+	if (operation === "stat") {
+		assert.ok(directory || Number.isSafeInteger(stat.size), "file size is not proven by retained content");
+		return { directory, size: directory ? 0 : stat.size };
+	}
+	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
+	if (directory) return fail("EISDIR");
+	assert.ok(typeof stat.size === "number" && stat.size <= maxBytes, "input byte budget");
+	return source.readFile(physical);
+}
+import assert from "node:assert/strict";
+import path from "node:path";

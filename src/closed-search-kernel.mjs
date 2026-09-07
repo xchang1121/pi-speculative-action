@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -66,7 +67,17 @@ export function connectClosedSearchWorker(entry) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const readInput = connectClosedSearchWorker(import.meta.url);
 	if (readInput) {
-		const kernel = await createClosedSearchKernel(await readFile(process.argv[2]));
+		const handle = await open(process.argv[2], constants.O_RDONLY | constants.O_NONBLOCK), bytes = Buffer.alloc(4 * 1024 * 1024 + 1);
+		let size = 0;
+		try {
+			assert.ok((await handle.stat()).isFile(), "search module must be a regular file");
+			while (size < bytes.length) {
+				const { bytesRead } = await handle.read(bytes, size, bytes.length - size, size);
+				if (!bytesRead) break; size += bytesRead;
+			}
+			assert.ok(size < bytes.length, "search module byte budget");
+		} finally { await handle.close(); }
+		const kernel = await createClosedSearchKernel(bytes.subarray(0, size));
 		let active = false;
 		parentPort.on("message", async ({ type, id, input }) => {
 			assert.ok(!active && type === "request" && Number.isSafeInteger(id) && id > 0, "unowned search invocation");

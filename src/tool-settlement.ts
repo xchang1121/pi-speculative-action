@@ -45,6 +45,8 @@ export interface ToolInvocation {
 	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */
 	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;
+	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
+	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
 	readonly filesystem?: (
 		view: ToolFilesystemOperations,
