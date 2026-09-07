@@ -34,10 +34,11 @@ if (isMainThread) {
 } else {
 	const dependencyRoot = process.argv[2], require = createRequire(path.join(dependencyRoot, "package.json"));
 	const load = (name) => import(pathToFileURL(require.resolve(name)).href);
-	for (const [name, version] of [["wasi-sh", "0.11.0"], ["ripgrep", "0.3.1"]]) {
+	for (const [name, version] of [["wasi-sh", "0.11.0"], ["ripgrep", "0.3.1"], ["globby", "16.2.4"]]) {
 		assert.equal(JSON.parse(await readFile(path.join(dependencyRoot, "node_modules", name, "package.json"), "utf8")).version, version);
 	}
 	const { WasiShim, WasiExit } = await load("wasi-sh/shim"), { memoryFs, fsError } = await load("wasi-sh/fs");
+	const { globbySync } = await load("globby");
 	const { getCompressedBytes } = await import(new URL("./_rg.wasm.mjs", pathToFileURL(require.resolve("ripgrep"))).href);
 	const binaries = { sh: await readFile(require.resolve("wasi-sh/busybox.wasm")), rg: brotliDecompressSync(getCompressedBytes()) };
 	const modules = {}, engines = {}, current = new AsyncLocalStorage();
@@ -53,9 +54,11 @@ if (isMainThread) {
 	assert.equal(VERSION, "0.84.1", "Requalify the stock tool import and operation boundary");
 	const limits = { inputBytes: 8 * 1024 * 1024, entries: 4096, writeBytes: 1024 * 1024, readBytes: 64 * 1024 * 1024,
 		requestBytes: 9 * 1024 * 1024, resultBytes: 1024 * 1024, hostCalls: 100_000 };
-	const profile = { id: "qualification.closed-grep.v3", pi: VERSION, rg: engines.rg.sha256, runtime: "wasi-sh@0.11.0",
+	const profile = { id: "qualification.closed-search.v4", pi: VERSION, rg: engines.rg.sha256, runtime: "wasi-sh@0.11.0",
+		find: { globby: "16.2.4", gitignore: true, globalGitignore: false, caseSensitiveMatch: true, onlyFiles: false, dot: true,
+			expandDirectories: false, followSymbolicLinks: false, baseNameMatch: true, markDirectories: true, absolute: true },
 		platform: process.platform, node: process.version, environment: { PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" },
-		filesystem: "readonly input broker; virtual metadata/first-access inode; no ambient home/config", dateMs: 1_700_000_000_000, seed: "qualification", limits };
+		filesystem: "readonly broker; normalized in-root aliases; virtual metadata/first-access inode; no ambient home/config", dateMs: 1_700_000_000_000, seed: "qualification", limits };
 	Date.now = () => profile.dateMs;
 	const mutations = ["createFileSync", "mkdirSync", "writeSync", "touchSync", "unlinkSync", "rmdirSync", "renameSync", "linkSync"];
 	let sequence = 0;
@@ -163,6 +166,28 @@ if (isMainThread) {
 		return path.posix.join("/workspace", relative.split(path.sep).join("/"));
 	};
 	const logical = (target) => path.resolve(current.getStore().root, path.posix.relative("/workspace", target));
+	function nodeFilesystem(store) {
+		const input = (target) => { try { return virtual(target); } catch { throw fsError("ENOENT"); } }; // Closed namespace, not host absence.
+		const statSync = (target) => {
+			const stat = store.statSync(input(target));
+			return { ...stat, name: path.basename(target), parentPath: path.dirname(target),
+				...Object.fromEntries(Object.entries({ isFile: 0o100000, isDirectory: 0o040000, isSymbolicLink: 0o120000,
+					isFIFO: 0o010000, isSocket: 0o140000, isCharacterDevice: 0o020000, isBlockDevice: 0o060000 })
+					.map(([name, mode]) => [name, () => (stat.mode & 0o170000) === mode])) };
+		};
+		const operations = { stat: statSync, lstat: statSync,
+			readdir: (target, options) => store.readdirSync(input(target)).map((name) => options?.withFileTypes ? statSync(path.join(target, name)) : name),
+			readFile: (target, encoding) => {
+				const file = input(target), bytes = Buffer.alloc(store.statSync(file).size);
+				store.readSync(file, bytes, 0, bytes.length); return encoding ? bytes.toString(encoding) : bytes;
+			} };
+		// Override EVERY FS method used by globby/fast-glob, including their sync, callback and promise variants.
+		return { promises: Object.fromEntries(Object.entries(operations).map(([name, run]) => [name, async (...args) => run(...args)])),
+			...Object.fromEntries(Object.entries(operations).flatMap(([name, run]) => [[name + "Sync", run], [name, (...args) => {
+				const callback = args.pop(); let value;
+				try { value = run(...args); } catch (error) { callback(error); return; } callback(null, value);
+			}]])) };
+	}
 	const entry = new URL("./core/tools/grep.js?closed-profile", import.meta.resolve("@earendil-works/pi-coding-agent")).href;
 	globalThis.__piQualificationSpawn = (command, input) => {
 		assert.equal(command, "qualified:rg");
@@ -192,6 +217,7 @@ if (isMainThread) {
 		return next(specifier, context);
 	} });
 	const { createGrepToolDefinition } = await import(entry);
+	const { createFindToolDefinition } = await import(new URL("./core/tools/find.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 	let active;
 	parentPort.on("message", async (message) => {
 		if (message.type === "resume") { if (active?.id === message.id) active.resume?.(); return; }
@@ -211,11 +237,17 @@ if (isMainThread) {
 			} else {
 				const state = { root: input.root, store: filesystem.store, contextReads: 0,
 					checkpoint: input.pause ? () => new Promise((resolve) => { active.resume = resolve; parentPort.postMessage({ type: "checkpoint", id }); }) : undefined };
-				const tool = createGrepToolDefinition(input.root, { operations: {
+				const operations = nodeFilesystem(state.store);
+				const tool = input.kind === "find" ? createFindToolDefinition(input.root, { operations: {
+					exists: (target) => { try { operations.statSync(target); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; } },
+					glob: async (pattern, cwd, options) => {
+						const results = globbySync(pattern, { ...profile.find, cwd, fs: operations, ignore: options.ignore }).sort().slice(0, options.limit);
+						await state.checkpoint?.(); return results;
+					},
+				} }) : createGrepToolDefinition(input.root, { operations: {
 					isDirectory: (target) => (state.store.statSync(virtual(target)).mode & 0o170000) === 0o040000,
 					readFile: (target) => {
-						state.contextReads++; const file = virtual(target), bytes = Buffer.alloc(state.store.statSync(file).size);
-						state.store.readSync(file, bytes, 0, bytes.length); return bytes.toString("utf8");
+						state.contextReads++; return operations.readFileSync(target, "utf8");
 					},
 				} });
 				result = { result: await current.run(state, () => tool.execute(String(id), input.args)).finally(filesystem.verify), isError: false, contextReads: state.contextReads };
