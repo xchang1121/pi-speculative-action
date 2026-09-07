@@ -7,6 +7,7 @@ import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { captureStableFile } from "../src/filesystem-evidence.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -185,6 +186,7 @@ describe("speculative action resource versions", () => {
 		const root = await workspace();
 		const fifo = path.join(root, "input.pipe");
 		await execFileAsync("mkfifo", [fifo]);
+		await expect(captureStableFile(fifo)).rejects.toThrow("not_regular_file");
 		const manager = new ResourceVersionManager(root, { watch: false });
 
 		await expect(manager.capture(resourceDependencies(action("read", ["input.pipe"]), root))).rejects.toThrow(

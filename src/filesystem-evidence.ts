@@ -24,7 +24,8 @@ export async function captureStableFile(
 	maxBytes = Number.POSITIVE_INFINITY,
 ): Promise<StableFileCapture> {
 	const beforePath = await fs.realpath(target);
-	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	// Descriptor admission must not perform blocking device/FIFO IO before the type proof.
+	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 	try {
 		const before = await handle.stat({ bigint: true });
 		if (!before.isFile()) throw new Error("not_regular_file");
