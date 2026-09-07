@@ -634,7 +634,7 @@ export class WorkspaceSandboxService {
 
 	async fingerprint(options: WorkspaceSandboxOptions = {}, sourceRoot?: string): Promise<string> {
 		assertWorkspaceSandboxOpen(this.state);
-		return await workspaceSandboxFingerprintFor(this.state, options, sourceRoot);
+		return (await resolveWorkspaceDriver(this.state, options, sourceRoot)).fingerprint;
 	}
 
 	async qualify(
@@ -666,7 +666,7 @@ export class WorkspaceSandboxService {
 		gitBinary = "git",
 	): Promise<T> {
 		assertWorkspaceSandboxOpen(this.state);
-		return await withSandboxWorkspaceFor(this.state, cwd, run, gitBinary);
+		return await withPrivateSandboxWorkspace(this.state, cwd, gitBinary, "git", {}, run);
 	}
 
 	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
@@ -698,16 +698,6 @@ export async function workspaceSandboxFingerprint(
 	sourceRoot?: string,
 ): Promise<string> {
 	return defaultWorkspaceSandboxService.fingerprint(options, sourceRoot);
-}
-
-async function workspaceSandboxFingerprintFor(
-	state: WorkspaceSandboxState,
-	options: WorkspaceSandboxOptions,
-	sourceRoot?: string,
-): Promise<string> {
-	return sourceRoot
-		? (await resolveWorkspaceDriver(state, options, sourceRoot)).fingerprint
-		: (await resolveWorkspaceDriver(state, options)).fingerprint;
 }
 
 /**
@@ -790,12 +780,12 @@ function createWorkspaceSandboxFor(
 		isolation: "workspace_branch",
 		speculation: {
 			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-			fingerprint: ({ action }) => {
+			fingerprint: async ({ action }) => {
 				assertWorkspaceSandboxOpen(state);
 				if (action && !(action.executionContext as ToolInvocation | undefined)?.filesystem) {
 					throw new Error("Workspace execution requires an explicitly bound filesystem operation");
 				}
-				return workspaceSandboxFingerprintFor(state, resolvedOptions);
+				return (await resolveWorkspaceDriver(state, resolvedOptions)).fingerprint;
 			},
 			prepare: async ({ cwd, signal }) => {
 				assertWorkspaceSandboxOpen(state);
@@ -1031,20 +1021,6 @@ export async function withSandboxWorkspace<T>(
 	gitBinary = "git",
 ): Promise<T> {
 	return defaultWorkspaceSandboxService.withWorkspace(cwd, run, gitBinary);
-}
-
-async function withSandboxWorkspaceFor<T>(
-	state: WorkspaceSandboxState,
-	cwd: string,
-	run: (workspace: SandboxWorkspaceContext) => Promise<T>,
-	gitBinary: string,
-): Promise<T> {
-	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, "git", {});
-	try {
-		return await run(workspace);
-	} finally {
-		await cleanupPrivateSandboxWorkspace(workspace);
-	}
 }
 
 /**
