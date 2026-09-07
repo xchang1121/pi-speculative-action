@@ -21,7 +21,7 @@ import {
 } from "../src/thinkthread/tool-runner-protocol.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../src/tool-settlement.ts";
-import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 
 export const STOCK_TOOL_CASES = [
 	["read", { path: "notes.txt" }],
@@ -64,7 +64,7 @@ export async function qualifyStockTool(
 		executionScope: { sessionID: root, turnID: name } };
 	const operation = { tool: name, input: args, action, callID: context.callID };
 	let primaryEnabled = false;
-	const fallback = createWorkspaceSandbox({ driver: "git" });
+	const workspaceSandbox = new WorkspaceSandboxService(), fallback = workspaceSandbox.createExecutionWorld({ driver: "git" });
 	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_OPERATION_TOOLS.resources, maxBytes: () => 1024 * 1024 });
 	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([
 		...(primary ? [primary.world] : []), fallback, resources,
@@ -142,7 +142,7 @@ export async function qualifyStockTool(
 		if (poisoned) console.error(`Indeterminate adoption: retain fixture without further writes at ${root}`);
 		throw error;
 	} finally {
-		try { await gateway.dispose(); }
+		try { try { await gateway.dispose(); } finally { await workspaceSandbox.dispose(); } }
 		finally { if (!poisoned) await rm(root, { recursive: true, force: true }); }
 	}
 }

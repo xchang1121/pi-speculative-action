@@ -221,11 +221,14 @@ The pinned Agent POSIX SDK archive is a locked development dependency and the in
 The Pi extension registers configured runtime providers first, then preserves the native Linux process world and Git workspace fallback. `createExecutionWorlds` therefore extends the route hierarchy instead of replacing its safety fallback. The lower-level host API still accepts an explicit `executionWorlds` list for embedders that own the complete lifecycle. Each world declares effect guarantees and, where needed, a supported tool scope; both constrain routing, including warm-up before a concrete action exists. The router confirms availability before returning a route and rechecks routing policy before execution. An unavailable primary falls through before execution; a failed execution is not blindly rerun in another provider. Every successful backend—including process provenance, resource snapshots and Git worktrees—returns the same sealed `WorldBranch` artifact. The gateway wraps it in one `EffectTransaction`, which exclusively owns freshness validation, adoption, abort and commit state while the artifact retains compatibility evidence and backend-local cleanup.
 
 ```ts
-createSpeculativeActionHost(sessionID, {
+const workspace = new WorkspaceSandboxService();
+const host = createSpeculativeActionHost(sessionID, {
   cwd,
-  executionWorlds: [runtimeSandbox, createWorkspaceSandbox()],
+  executionWorlds: [runtimeSandbox, workspace.createExecutionWorld()],
   // model, policy, and tool integration omitted
-})
+});
+// At the end of the owning session:
+try { await host.dispose(); } finally { await workspace.dispose(); }
 ```
 
 The first available runtime-wide world wins for every process-backed tool whose execution context can be proven. Without one, the router considers fallback worlds compatible with the action's declared effects. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback. Resolution, preparation, fork, and disposal all pass through the same router; tools cannot retain a direct backend handle. Persisted process certificates live under `<agent-dir>/speculative-action/process-reuse` and are content-addressed, policy-versioned, and safe to discard.

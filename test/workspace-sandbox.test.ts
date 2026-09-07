@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createEditTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -19,31 +19,23 @@ import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import {
-	closeWorkspaceSandboxPools,
-	commitSandboxDelta,
-	createWorkspaceSandbox,
-	forkSandboxWorkspace,
-	prepareSandboxWorkspace,
 	readSandboxDirectoryState,
-	withSandboxWorkspace,
 	WorkspaceSandboxService,
-	workspaceSandboxFingerprint,
 	type SandboxFileChange,
 } from "../src/workspace-sandbox.ts";
 
 const writeTool = createWriteTool(process.cwd());
 const editTool = createEditTool(process.cwd());
 
-const testRoots = new Set<string>();
+let sandbox: WorkspaceSandboxService;
+beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
 	return { ...fs, mkdir: vi.fn(fs.mkdir) };
 });
 
 afterEach(async () => {
-	const roots = [...testRoots];
-	testRoots.clear();
-	await closeWorkspaceSandboxPools(roots);
+	await sandbox.dispose();
 });
 
 describe("workspace-branch ExecutionWorld", () => {
@@ -86,20 +78,20 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot("overlay-auto-cost");
 		try {
 			await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
-			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+			expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
 			await Promise.all(
 				Array.from({ length: 100 }, (_value, index) =>
 					writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
 				),
 			);
-			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+			expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
 			await Promise.all(
 				Array.from({ length: 160 }, (_value, index) => {
 					const ordinal = index + 100;
 					return writeFile(path.join(root, `${ordinal.toString().padStart(4, "0")}.txt`), `${ordinal}\n`, "utf8");
 				}),
 			);
-			expect(await workspaceSandboxFingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v1:/);
+			expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v1:/);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -108,7 +100,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {
 		const root = await temporaryRoot("write");
 		try {
-			const world = createWorkspaceSandbox({ driver: "git" });
+			const world = sandbox.createExecutionWorld({ driver: "git" });
 			expect(world.scope).toBe("fallback");
 			expect(effectCapabilitiesCover(world.speculation.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
 			expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
@@ -150,7 +142,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			const action = buildPiActionKey("write", { path: "value.txt", content: "after\n" }, root);
 			if (!action) throw new Error("action key missing");
 			let observed: { readonly content: string; readonly before: string; readonly after: string } | undefined;
-			const branch = await forkSandboxWorkspace({
+			const branch = await sandbox.fork({
 				cwd: root,
 				action,
 				execute: async (workspace) => {
@@ -189,7 +181,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8"),
 				writeFile(path.join(root, "replaced", "lower.txt"), "lower\n", "utf8"),
 			]);
-			const branch = await forkSandboxWorkspace({
+			const branch = await sandbox.fork({
 				cwd: root,
 				driver: "overlayfs",
 				action: requiredAction("write", { path: "changed.txt", content: "after\n" }, root),
@@ -251,7 +243,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			const options = { fusermountBinary: wrapper };
 			expect((await linuxOverlayfsCapability(options)).available).toBe(true);
 			await expect(
-				forkSandboxWorkspace({
+				sandbox.fork({
 					cwd: root,
 					driver: "overlayfs",
 					...options,
@@ -261,7 +253,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			).rejects.toThrow(/cleanup|mounted|unmount/i);
 			retainedMounts = [(await readFile(retainedTarget, "utf8")).trim()];
 			expect(await fuseOverlayMountTargets()).toContain(retainedMounts[0]);
-			await completesWithin(closeWorkspaceSandboxPools([root]), 500);
+			await completesWithin(sandbox.closePools([root]), 500);
 		} finally {
 			for (const target of retainedMounts) {
 				await runProgram(host.fusermountBinary, ["-u", "-z", target]);
@@ -278,7 +270,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			await writeFile(target, "base\n", "utf8");
 			const args = { path: "value.txt", edits: [{ oldText: "base", newText: "speculative" }] };
-			const branch = await createWorkspaceSandbox().speculation.execute(context(root, "edit", editTool, args));
+			const branch = await sandbox.createExecutionWorld().speculation.execute(context(root, "edit", editTool, args));
 			await writeFile(target, "actor\n", "utf8");
 
 			const failed = branch.commit();
@@ -296,7 +288,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const target = path.join(root, "lineage.txt");
 		try {
 			await writeFile(target, "base\n", "utf8");
-			const world = createWorkspaceSandbox();
+			const world = sandbox.createExecutionWorld();
 			const parentArgs = { path: "lineage.txt", content: "parent\n" };
 			const parent = await world.speculation.execute(context(root, "write", writeTool, parentArgs));
 			const childArgs = { path: "lineage.txt", edits: [{ oldText: "parent", newText: "child" }] };
@@ -321,7 +313,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot("directory-lineage");
 		const directory = path.join(root, "generated");
 		try {
-			const parent = await forkSandboxWorkspace({
+			const parent = await sandbox.fork({
 				cwd: root,
 				action: requiredAction("write", { path: "generated", content: "" }, root),
 				execute: async (workspace) => {
@@ -334,7 +326,7 @@ describe("workspace-branch ExecutionWorld", () => {
 					return [{ kind: "directory", root, target: directory, resource: "generated", after }];
 				},
 			});
-			const child = await forkSandboxWorkspace({
+			const child = await sandbox.fork({
 				cwd: root,
 				action: requiredAction("write", { path: "generated/value.txt", content: "child\n" }, root),
 				parentCheckpoint: parent.checkpoint,
@@ -378,7 +370,7 @@ describe("workspace-branch ExecutionWorld", () => {
 					nativeCalls++;
 					await expect(stat(directory)).rejects.toThrow();
 					return settlement("actor");
-				}, { reuse: () => commitSandboxDelta({ output: settlement("reused"), changes: fault === "topology"
+				}, { reuse: () => sandbox.commitDelta({ output: settlement("reused"), changes: fault === "topology"
 					? [{ kind: "directory", root, target: directory, resource: "generated", after: expectedEmpty }, file] : [file] }) })
 					.then(() => undefined, (failure: unknown) => failure);
 				expect(nativeCalls, fault).toBe(fault === "foreign" ? 0 : 1);
@@ -407,7 +399,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				stat(target),
 			]);
 			if (!outerBefore || !innerBefore) throw new Error("directory baseline missing");
-			await commitSandboxDelta({
+			await sandbox.commitDelta({
 				output: settlement("deleted"),
 				changes: [
 					{ kind: "directory", root, target: outer, resource: "generated", before: outerBefore },
@@ -443,7 +435,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				const poisoned = fault === "write" || fault === "close";
 				const native = async () => { nativeCalls++; await writeFile(target, "after"); return settlement("done"); };
 				const error = await gateway.executeAuthoritative({ tool: "write", input: {} }, native, {
-					reuse: () => commitSandboxDelta({ output: settlement("done"), changes: [
+					reuse: () => sandbox.commitDelta({ output: settlement("done"), changes: [
 						{ ...fileTransition(root, "value.txt", "before", "after"), operation: "write_contents" },
 					] }),
 				}).then(() => undefined, (failure: unknown) => failure);
@@ -468,7 +460,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(target, "base\n", "utf8");
 			const stale = path.join(root, "z-stale.txt");
 			await writeFile(stale, "actor");
-			await expect(commitSandboxDelta({ output: settlement("unused"), changes: [
+			await expect(sandbox.commitDelta({ output: settlement("unused"), changes: [
 				fileTransition(root, "value.txt", "base\n", "invalid"), fileTransition(root, "z-stale.txt", "base", "invalid"),
 			] })).rejects.toThrow("resource changed before commit: z-stale.txt");
 			expect(await readFile(target, "utf8")).toBe("base\n");
@@ -486,13 +478,16 @@ describe("workspace-branch ExecutionWorld", () => {
 				return new Promise<void>((resolve) => (releaseBlock = resolve));
 			});
 			await entered;
-			const pending = Promise.allSettled(deltas.map(commitSandboxDelta));
+			const pending = Promise.allSettled(deltas.map((delta) => sandbox.commitDelta(delta)));
+			const retirement = sandbox.dispose();
+			expect(sandbox.dispose()).toBe(retirement);
+			await expect(sandbox.commitDelta(deltas[0]!)).rejects.toThrow("service is disposed");
 			expect(
-				await Promise.race([pending.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))]),
+				await Promise.race([retirement.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))]),
 			).toBe(false);
 			releaseBlock();
 			const results = await pending;
-			await blocker;
+			await Promise.all([blocker, retirement]);
 			expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
 			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
 			expect(["first\n", "second\n"]).toContain(await readFile(target, "utf8"));
@@ -513,7 +508,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			},
 		};
 		const execute = (args: { path: string; content: string }) => route === "native"
-			? createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, args))
+			? sandbox.createExecutionWorld().speculation.execute(context(root, "write", countingTool, args))
 			: runThinkThreadTool({ version: 1, tool: "write", callID: "guard", args, autoResizeImages: true }, root);
 		try {
 			const escapingInput = { path: "../outside.txt", content: "no" };
@@ -542,7 +537,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			const beforeStatus = await runProgram("git", ["status", "--short"], root);
 			const beforeBranch = await runProgram("git", ["branch", "--show-current"], root);
 			const args = { path: "created.txt", content: "speculative\n" };
-			await createWorkspaceSandbox().speculation.execute(context(root, "write", writeTool, args));
+			await sandbox.createExecutionWorld().speculation.execute(context(root, "write", writeTool, args));
 
 			expect(await runProgram("git", ["status", "--short"], root)).toBe(beforeStatus);
 			expect(await runProgram("git", ["branch", "--show-current"], root)).toBe(beforeBranch);
@@ -558,7 +553,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
 			const values = await Promise.all(
 				["first\n", "second\n"].map((content) =>
-					withSandboxWorkspace(root, async (workspace) => {
+					sandbox.withWorkspace(root, async (workspace) => {
 						await writeFile(path.join(workspace.sandboxRoot, "value.txt"), content, "utf8");
 						return {
 							root: workspace.sandboxRoot,
@@ -582,7 +577,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
 			await writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8");
 			await writeFile(path.join(root, "untouched.txt"), "stable\n", "utf8");
-			await withSandboxWorkspace(root, async (workspace) => {
+			await sandbox.withWorkspace(root, async (workspace) => {
 				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
 				await expect(stat(clock)).rejects.toThrow();
 				const initial = await workspace.transactions.begin();
@@ -645,7 +640,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot("transaction-inode");
 		try {
 			await writeFile(path.join(root, "target.txt"), "target\n", "utf8");
-			await withSandboxWorkspace(root, async (workspace) => {
+			await sandbox.withWorkspace(root, async (workspace) => {
 				const capture = await workspace.transactions.begin();
 				const linkPath = path.join(workspace.sandboxRoot, "link.txt");
 				await symlink("target.txt", linkPath);
@@ -663,7 +658,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot("transaction-overlap");
 		try {
 			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
-			await withSandboxWorkspace(root, async (workspace) => {
+			await sandbox.withWorkspace(root, async (workspace) => {
 				const first = await workspace.transactions.begin();
 				const second = await workspace.transactions.begin();
 				await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "overlap\n", "utf8");
@@ -698,7 +693,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const controller = new AbortController();
 		controller.abort(new Error("cancelled"));
 		try {
-			await expect(prepareSandboxWorkspace(root, { signal: controller.signal })).rejects.toThrow("cancelled");
+			await expect(sandbox.prepare(root, { signal: controller.signal })).rejects.toThrow("cancelled");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -741,9 +736,7 @@ function fileTransition(root: string, resource: string, before: string | undefin
 }
 
 async function temporaryRoot(label: string): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
-	testRoots.add(root);
-	return root;
+	return mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
 }
 
 function runProgram(executable: string, args: readonly string[], cwd?: string): Promise<string> {

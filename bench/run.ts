@@ -27,7 +27,7 @@ import {
 } from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { createWorkspaceSandbox } from "../src/workspace-sandbox.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 
 const DATASET_ROWS =
 	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
@@ -228,7 +228,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		createEditTool(task.workspace),
 		createWriteTool(task.workspace),
 	].map((tool) => instrumentTool(tool, profile[tool.name as keyof typeof profile] ?? 0, counters));
-	const sandbox = createWorkspaceSandbox();
+	const workspaceSandbox = new WorkspaceSandboxService(), sandbox = workspaceSandbox.createExecutionWorld();
 	const resolveInvocation = (tool: string, args: unknown) =>
 		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
 	let drafterCost = 0;
@@ -441,7 +441,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		taskCompletedAt = performance.now();
 		clearTimeout(timeout);
 		if (lastTurnID) await host.finishTurn(lastTurnID, true);
-		await host.dispose();
+		try { await host.dispose(); } finally { await workspaceSandbox.dispose(); }
 	}
 	const summary = summarizeSpeculativeTrace(events);
 	const sourceRequestKinds: Record<string, number> = {};

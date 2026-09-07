@@ -89,7 +89,7 @@ import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffRegistry, type ProcessHandoff } from "./process-handoff.ts";
 import {
-	commitSandboxDelta,
+	WorkspaceSandboxService,
 	readSandboxDirectoryState,
 	type SandboxDirectoryChange,
 	type SandboxFileChange,
@@ -293,6 +293,8 @@ export class LinuxProcessReuseBackend {
 	private readonly processScheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
+	private readonly replayWorkspace = new WorkspaceSandboxService();
+	private disposal?: Promise<void>;
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
@@ -410,7 +412,7 @@ export class LinuxProcessReuseBackend {
 					if (!plan) return this.actorReplayMiss(host, request, timing);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
-					await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
@@ -516,11 +518,12 @@ export class LinuxProcessReuseBackend {
 		};
 	}
 
-	async dispose(): Promise<void> {
+	dispose(): Promise<void> {
+		if (this.disposal) return this.disposal;
 		this.disposed = true;
 		this.handoffs.dispose();
-		await this.resetActorReplay();
 		this.certificateScopes.clear();
+		return this.disposal = this.resetActorReplay().finally(() => this.replayWorkspace.dispose());
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -679,7 +682,7 @@ export class LinuxProcessReuseBackend {
 	): Promise<{ exitCode: number | null }> {
 		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
-		await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+		await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 		const after = await session.workspace.structure.capture();
 		session.nestedEvidence.push(plan.certificate.dependencyCertificate);
 		session.topLevelCapture = {
@@ -953,7 +956,7 @@ export class LinuxProcessReuseBackend {
 					const started = performance.now();
 					try {
 						throwIfAborted(process.signal);
-						await replayFilesystemEffects(plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+						await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 						this.recordHit(plan.certificate, acquired.joined, undefined, scope);
 						this.processScheduler.observeAdoption(
 							timing,
@@ -991,7 +994,7 @@ export class LinuxProcessReuseBackend {
 		try {
 			const { artifacts, certificate } = plan;
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
-			await replayFilesystemEffects(artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(certificate, joined, session);
 			replayed = true;
@@ -1657,6 +1660,7 @@ async function nearestMissingPath(target: string): Promise<string> {
 }
 
 async function replayFilesystemEffects(
+	owner: WorkspaceSandboxService,
 	artifacts: VerifiedArtifactClosure,
 	journal: readonly OrderedEffectEvent[],
 	projection: ExecutionPathProjection,
@@ -1692,7 +1696,7 @@ async function replayFilesystemEffects(
 		});
 	}
 	if (!changes.length) return;
-	await commitSandboxDelta({
+	await owner.commitDelta({
 		output: { result: { content: [], details: {} }, isError: false },
 		changes,
 	});

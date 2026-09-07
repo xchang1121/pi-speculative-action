@@ -164,12 +164,7 @@ export {
 } from "./settings-store.ts";
 export type { ToolFilesystemOperations, ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
 export {
-	closeWorkspaceSandboxPools,
-	commitSandboxDelta,
-	createWorkspaceSandbox,
 	type PrepareSandboxWorkspaceOptions,
-	prepareSandboxWorkspace,
-	qualifyWorkspaceSandboxDriver,
 	type QualifiedWorkspaceSandboxDriver,
 	readSandboxDirectoryState,
 	type SandboxDirectoryChange,
@@ -182,9 +177,6 @@ export {
 	type WorkspaceSandboxOptions,
 	type WorkspaceSandboxDriver,
 	WorkspaceSandboxService,
-	forkSandboxWorkspace,
-	withSandboxWorkspace,
-	workspaceSandboxFingerprint,
 } from "./workspace-sandbox.ts";
 export {
 	linuxOverlayfsCapability,

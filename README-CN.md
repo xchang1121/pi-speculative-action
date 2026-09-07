@@ -209,11 +209,14 @@ Profile 会先尝试思程 world，并保留原生 Linux 进程 provider 与 Git
 Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表。World 同时声明 effect guarantee 与必要的工具作用域；没有具体 action 的预热也遵守作用域。Router 在返回 route 前确认后端可用，执行前再次检查层级策略；首选 provider 不可用时在执行前降级，已经执行失败的动作不会盲目换环境重跑。每个成功后端返回同一种 `WorldBranch`，Gateway 将其包装为 `EffectTransaction`，统一管理新鲜度验证、采纳、放弃与提交；载体保留兼容性证据与后端局部清理职责。
 
 ```ts
-createSpeculativeActionHost(sessionID, {
+const workspace = new WorkspaceSandboxService();
+const host = createSpeculativeActionHost(sessionID, {
   cwd,
-  executionWorlds: [runtimeSandbox, createWorkspaceSandbox()],
+  executionWorlds: [runtimeSandbox, workspace.createExecutionWorld()],
   // 省略模型、权限与工具接入
-})
+});
+// 所属会话结束时：
+try { await host.dispose(); } finally { await workspace.dispose(); }
 ```
 
 第一个可用的 Runtime 全局沙箱会覆盖所有能够证明 execution context 的进程型工具；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。持久进程证书位于 `<agent-dir>/speculative-action/process-reuse`，使用 content address 与策略版本隔离，可以随时删除。

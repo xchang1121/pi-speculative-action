@@ -16,7 +16,7 @@ import {
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
-import { workspaceSandboxFingerprint, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
+import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 
 export type NumericMetrics = Readonly<Record<string, number>>;
 const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
@@ -34,6 +34,7 @@ export interface LinuxProcessBenchmark {
 	readonly environment: Readonly<Record<string, string>>;
 	readonly coordinator: ProcessExecutionCoordinator;
 	readonly backend: LinuxProcessReuseBackend;
+	readonly workspaceSandbox: WorkspaceSandboxService;
 	readonly world: SpeculativeAgentExecutionWorld;
 	readonly tool: AgentTool;
 	readonly dispose: () => Promise<void>;
@@ -74,7 +75,9 @@ export async function createLinuxProcessBenchmark(
 				})?.process,
 		}),
 	);
+	const workspaceSandbox = new WorkspaceSandboxService();
 	const world = createLinuxProcessExecutionWorld({
+		workspaceSandbox,
 		coordinator,
 		tools: PI_OPERATION_TOOLS.process,
 		backend,
@@ -97,12 +100,13 @@ export async function createLinuxProcessBenchmark(
 		coordinator,
 		backend,
 		world,
+		workspaceSandbox,
 		tool,
 		dispose: async () => {
 			if (disposed) return;
 			disposed = true;
 			try {
-				await world.dispose?.();
+				try { await world.dispose?.(); } finally { await workspaceSandbox.dispose(); }
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
@@ -125,7 +129,7 @@ export async function prepareLinuxProcessReuse(
 	};
 	const started = performance.now();
 	const workspaceFingerprint = options.includeWorkspaceFingerprint
-		? await workspaceSandboxFingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)
+		? await fixture.workspaceSandbox.fingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)
 		: undefined;
 	await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 	const backendFingerprint = await fixture.backend.fingerprint();

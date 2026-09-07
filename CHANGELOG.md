@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- Removed the global workspace convenience functions (`createWorkspaceSandbox`, `commitSandboxDelta`,
+  `forkSandboxWorkspace`, `withSandboxWorkspace`, `prepareSandboxWorkspace`, `closeWorkspaceSandboxPools`,
+  `workspaceSandboxFingerprint`, `qualifyWorkspaceSandboxDriver`). Own a `WorkspaceSandboxService` and
+  call its equivalent methods; Bash replay now drains its own commit lifetime instead of a global singleton.
 - A rejected `resolveInvocation` now fails that Actor invocation instead of silently selecting another executor.
   `ToolOperation.invocation` remains available without a cache key; explicitly bound profile semantics also
   govern routing, observation, resource contention, and candidate invalidation.

@@ -624,6 +624,7 @@ export interface QualifiedWorkspaceSandboxDriver {
 
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
+	private disposal?: Promise<void>;
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
 		pendingCommits: new Set(),
@@ -678,38 +679,13 @@ export class WorkspaceSandboxService {
 		return closeWorkspaceSandboxPoolsFor(this.state, roots);
 	}
 
-	async dispose(): Promise<void> {
-		if (this.state.disposed) return;
+	dispose(): Promise<void> {
+		if (this.disposal) return this.disposal;
 		this.state.disposed = true;
-		await Promise.allSettled([...this.state.pendingCommits]);
-		try {
-			await closeWorkspaceSandboxPoolsFor(this.state);
-		} finally {
-			this.state.overlayfsCapabilities.dispose();
-		}
+		return this.disposal = Promise.allSettled([...this.state.pendingCommits])
+			.then(() => closeWorkspaceSandboxPoolsFor(this.state))
+			.finally(() => this.state.overlayfsCapabilities.dispose());
 	}
-}
-
-const defaultWorkspaceSandboxService = new WorkspaceSandboxService();
-
-/** Concrete storage identity is part of route compatibility, never an implicit implementation detail. */
-export async function workspaceSandboxFingerprint(
-	options: WorkspaceSandboxOptions = {},
-	sourceRoot?: string,
-): Promise<string> {
-	return defaultWorkspaceSandboxService.fingerprint(options, sourceRoot);
-}
-
-/**
- * Qualify the capability- and cost-selected COW driver for a runtime that traces driver-specific
- * filesystem errors and rejects adoption. Generic host-function branches deliberately do not call
- * this function and retain portable Git semantics.
- */
-export function qualifyWorkspaceSandboxDriver(
-	options: WorkspaceSandboxOptions,
-	sourceRoot: string,
-): Promise<QualifiedWorkspaceSandboxDriver> {
-	return defaultWorkspaceSandboxService.qualify(options, sourceRoot);
 }
 
 async function resolveWorkspaceDriver(
@@ -757,11 +733,6 @@ async function resolveWorkspaceDriver(
 	} finally {
 		if (ownedRepository) releaseSandboxRepository(ownedRepository);
 	}
-}
-
-/** Create a copy-on-write execution world with transactional multi-file commit. */
-export function createWorkspaceSandbox(options: WorkspaceSandboxOptions = {}): SpeculativeAgentExecutionWorld {
-	return defaultWorkspaceSandboxService.createExecutionWorld(options);
 }
 
 function createWorkspaceSandboxFor(
@@ -868,11 +839,6 @@ class GitWorldBranch implements WorldBranch<ToolSettlement> {
 	dispose(): void {
 		// The private worktree is sealed and removed during fork; this branch owns only immutable bytes.
 	}
-}
-
-/** Low-level transactional commit primitive for execution-world implementations. */
-export async function commitSandboxDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
-	return defaultWorkspaceSandboxService.commitDelta(delta);
 }
 
 async function commitSandboxExecution(
@@ -1011,22 +977,6 @@ async function commitSandboxExecution(
 	return tracked;
 }
 
-export async function withSandboxWorkspace<T>(
-	cwd: string,
-	run: (workspace: SandboxWorkspaceContext) => Promise<T>,
-	gitBinary = "git",
-): Promise<T> {
-	return defaultWorkspaceSandboxService.withWorkspace(cwd, run, gitBinary);
-}
-
-/**
- * Fork one generic operation into a private workspace and seal its output together with the
- * complete regular-file delta. Process and host-function worlds share this primitive.
- */
-export async function forkSandboxWorkspace(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
-	return defaultWorkspaceSandboxService.fork(options);
-}
-
 async function forkSandboxWorkspaceFor(
 	state: WorkspaceSandboxState,
 	options: SandboxWorkspaceBranchOptions,
@@ -1070,13 +1020,6 @@ async function forkSandboxWorkspaceFor(
 		parent,
 		options.validate,
 	);
-}
-
-export async function prepareSandboxWorkspace(
-	cwd: string,
-	options: PrepareSandboxWorkspaceOptions = {},
-): Promise<void> {
-	return defaultWorkspaceSandboxService.prepare(cwd, options);
 }
 
 async function prepareSandboxWorkspaceFor(
@@ -1781,10 +1724,6 @@ function quarantineSandboxRepository(repository: PooledGitRepository): void {
 	repository.version = undefined;
 	repository.versions.close();
 	releaseSandboxRepository(repository);
-}
-
-export async function closeWorkspaceSandboxPools(roots?: readonly string[]): Promise<void> {
-	return defaultWorkspaceSandboxService.closePools(roots);
 }
 
 function closeWorkspaceSandboxPoolsFor(
