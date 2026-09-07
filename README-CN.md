@@ -82,7 +82,7 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口继续作为兼容聚合入口。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、原生投机 fallback 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关时会先完成 Actor Bash 路线状态变更，再更新完成提示与 footer。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
+在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、原生投机 fallback 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关或层级策略时，会先完成路由诊断更新，再提示完成并刷新 footer。回合登记只修改内存，支持回合中途启用思程层；显式刷新也会重新检查已经断开的 Runtime。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
 
 配置由 package 自己管理：
 
@@ -188,12 +188,12 @@ tt pi-speculative-action
 
 安装脚本支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 使用预构建包，以及重复的 `--model provider/model` 授权。它固定 Agent POSIX SDK 0.1.0，校验 protocol 2 和契约指纹，安装 schema-4 Profile，并把独立运行时放在 `~/.local/share/pi-speculative-action`。环境需要预先提供 Profile 可访问的 Pi、Node、`fd` 和 `rg`。Profile 配置保存在安装目录的 `config` 下，项目 `.pi/speculative-action.json` 仍可覆盖。
 
-适配器提供两条独立能力：
+Profile 共享已有的执行与观察边界：
 
 - `speculation.execute`：`read`、`grep`、`find`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
-- `observation.capture`：在 Actor 的 `read`、`grep`、`find`、`ls` 执行前创建新快照，封装这一次 Actor 输出，供后续验证复用，不重复执行工具，也不依赖投机 runner。两条路径都由 `EffectTransaction` 统一管理采纳状态。
+- Actor 的 `read`、`grep`、`find`、`ls` 统一使用宿主既有 resource observation，包括完整执行窗口的稳定性证明。思程 snapshot/content 相等不能证明 Actor 没有读到 A→B→A 的中间状态，因此不再维护第二套思程 Actor 结果快照。这条路径不需要 SDK 或投机 runner；两条路径仍由 `EffectTransaction` 管理采纳状态。
 
-Profile 会先尝试思程 world，并把原生 Linux 进程 provider 与 Git 工作区 provider 保留为后续路线。Bash 刻意不进入可移植 runner，而是路由到原生进程 world；因此即使 Pi 本身运行在思程中，Bash 仍保有持久进程证书回放、跨父命令子进程复用、held-exec 接管和可复用命令历史。普通源码加载仍使用未改变的默认 provider，也不会加载可选 SDK。
+Profile 会先尝试思程 world，并保留原生 Linux 进程 provider 与 Git 工作区 provider。Bash 不进入可移植 runner，只有当前环境的探测通过后才使用原生进程 world。注册 fallback 不代表外层思程允许嵌套 tracing、helper 或 handoff；公开思程 Runtime 当前只有 aarch64 包，Actor held-exec 实现却限定 x86-64 Linux。缺失的能力回退 Actor，不能保证思程中的完整能力或性能不低于原生路径。普通源码加载仍使用原来的默认 provider，不加载可选 SDK。
 
 `fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收固定的 stock-tool runner：`grep`、`find` 以禁止写入的方式运行 Pi 原生 `rg`/`fd` 实现并验证目录树依赖；任意进程与 Bash 不在其能力声明中。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
@@ -201,7 +201,7 @@ Profile 会先尝试思程 world，并把原生 Linux 进程 provider 与 Git �
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不再替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表，供自行管理完整生命周期的嵌入方使用。所有 World 都按 effect capability 而不是工具名声明能力；Router 在返回 route 前确认后端可用，所以不可用的首选 Runtime 会自然降级到下一项兼容 provider。每个成功后端——包括进程 provenance、资源快照和 Git worktree——都返回同一种封存 `WorldBranch` 载体；Gateway 再将其包装为唯一的 `EffectTransaction`，由事务独占新鲜度验证、采纳、放弃和提交状态，载体只保留兼容性证据与后端局部清理职责。
+Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表。World 同时声明 effect guarantee 与必要的工具作用域；没有具体 action 的预热也遵守作用域。Router 在返回 route 前确认后端可用，执行前再次检查层级策略；首选 provider 不可用时在执行前降级，已经执行失败的动作不会盲目换环境重跑。每个成功后端返回同一种 `WorldBranch`，Gateway 将其包装为 `EffectTransaction`，统一管理新鲜度验证、采纳、放弃与提交；载体保留兼容性证据与后端局部清理职责。
 
 ```ts
 createSpeculativeActionHost(sessionID, {
