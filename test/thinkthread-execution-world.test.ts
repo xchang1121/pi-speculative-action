@@ -43,7 +43,7 @@ describe("ThinkThread execution world", () => {
 		).resolves.toContain("linux-execution-v10");
 	});
 
-	it("routes every stock tool through unified, native, then Actor capability layers", async () => {
+	it.each([false, true])("routes every stock tool through the same capability layers (warmup=%s)", async (warmup) => {
 		const fixture = fakeClient();
 		const primary = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
 		const nativePrepare = vi.fn(async () => undefined);
@@ -80,7 +80,7 @@ describe("ThinkThread execution world", () => {
 		for (const [tool, args, allLayers, nativeOnly] of cases) {
 			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
 			const action = buildPiActionKey(tool, args, cwd, "schema")!;
-			const request = { effect: definition.effect, requirements: definition.requirements, action };
+			const request = { effect: definition.effect, requirements: definition.requirements, tool, action: warmup ? undefined : action };
 			enabled = () => true;
 			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: allLayers });
 			enabled = (backend) => backend !== "ThinkThread";
@@ -268,12 +268,23 @@ describe("ThinkThread execution world", () => {
 	it("can requalify speculation after the runner becomes available", async () => {
 		const directory = await mkdtemp(path.join(os.tmpdir(), "thinkthread-runner-probe-"));
 		const runnerPath = path.join(directory, "tool-runner.js");
-		const world = createThinkThreadExecutionWorld({ clientFactory: () => fakeClient().client, runnerPath });
+		const fixture = fakeClient();
+		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerPath });
+		let enabled = true;
+		const router = new ExecutionWorldRouter([world], () => enabled);
+		const request = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
 		try {
-			await expect(world.speculation.diagnostics?.({ cwd })).rejects.toThrow();
+			await expect(router.diagnostics({ cwd })).resolves.toMatchObject([{ state: "registered" }]);
+			expect(fixture.selfView).not.toHaveBeenCalled();
+			await expect(router.resolve(request, { cwd })).resolves.toBeUndefined();
 			await writeFile(runnerPath, "// runner\n");
-			await expect(world.speculation.diagnostics?.({ cwd })).resolves.toMatchObject({ state: "ready" });
+			await expect(router.diagnostics({ cwd, refresh: true })).resolves.toMatchObject([{ state: "ready" }]);
+			enabled = false;
+			await expect(router.diagnostics({ cwd })).resolves.toMatchObject([{ state: "unavailable", tools: world.speculation.tools }]);
+			enabled = true;
+			await expect(router.diagnostics({ cwd })).resolves.toMatchObject([{ state: "ready" }]);
+			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: world.id });
 		} finally {
 			await world.dispose?.();
 			await rm(directory, { recursive: true, force: true });

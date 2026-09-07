@@ -21,6 +21,8 @@ export interface ExecutionScope {
 export interface ExecutionWorldRequest {
 	readonly effect: ActionEffect;
 	readonly requirements: EffectRequirements;
+	/** Tool scope is still known during warm-up, before a concrete action key exists. */
+	readonly tool?: string;
 	/** Present for concrete candidates; omitted for best-effort turn warm-up. */
 	readonly action?: ActionKey;
 }
@@ -317,6 +319,7 @@ export class ExecutionWorldRouter<Context, Output> {
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
 		const world = this.world(route);
+		if (!this.speculationEnabled(world.id)) throw new Error(`Execution world ${world.id} is disabled by routing policy`);
 		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
 		return world.speculation.execute(context);
 	}
@@ -352,6 +355,7 @@ export class ExecutionWorldRouter<Context, Output> {
 						? await this.diagnose(world.id, "speculation", world.speculation, input)
 						: {
 								capabilities: world.speculation.capabilities,
+								...(world.speculation.tools ? { tools: world.speculation.tools } : {}),
 								state: "unavailable" as const,
 								detail: "Pre-execution disabled by routing policy",
 							}
@@ -398,7 +402,7 @@ export class ExecutionWorldRouter<Context, Output> {
 				const operation = operationFor(world);
 				if (!operation) continue;
 				try {
-					if (!supportsTool(operation, request.action?.tool)) continue;
+					if (!supportsTool(operation, request.action?.tool ?? request.tool)) continue;
 					if (!effectCapabilitiesCover(operation.capabilities, request.requirements)) continue;
 					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await operation.prepare?.(preparation);
@@ -429,13 +433,20 @@ export class ExecutionWorldRouter<Context, Output> {
 		operation: ExecutionWorldOperation,
 		input: ExecutionWorldDiagnosticsContext,
 	): Promise<ExecutionWorldOperationDiagnostic> {
+		const key = `${id}:${kind}`;
+		if (input.refresh) this.routeObservations.delete(key);
 		let report: ExecutionWorldDiagnosticReport | undefined;
 		try {
 			report = await operation.diagnostics?.(input);
+			if (!report && input.refresh && operation.prepare) {
+				await operation.prepare(input);
+				report = { state: "ready", detail: "Route prepared successfully" };
+			}
 		} catch (error) {
 			report = { state: "unavailable", detail: errorDetail(error) };
 		}
-		const route = this.routeObservations.get(`${id}:${kind}`);
+		if (input.refresh && report) this.routeObservations.set(key, { ...report, cwd: input.cwd });
+		const route = this.routeObservations.get(key);
 		if (route?.cwd === input.cwd && route.state === "unavailable") report = route;
 		return Object.freeze({
 			capabilities: operation.capabilities,

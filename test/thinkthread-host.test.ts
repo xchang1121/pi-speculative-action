@@ -26,9 +26,10 @@ describe("ThinkThread profile with shared Actor observation", () => {
 			getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["read"], patternAware: { enabled: false } }),
 			complete: async () => { throw new Error("No model requests expected"); },
 			preflight: () => true,
+			speculativeExecutionWorldEnabled: () => false,
 			executionWorlds: [world],
 		};
-		const host = withThinkThreadProfileLifecycle(createSpeculativeActionHost("session", options), world, options);
+		const host = withThinkThreadProfileLifecycle(createSpeculativeActionHost("session", options), world);
 		const executor = vi.fn(async () => {
 			const restore = change === "ABA" && executor.mock.calls.length === 1;
 			if (restore) await writeFile(file, "B");

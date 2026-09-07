@@ -134,7 +134,8 @@ export function createThinkThreadExecutionWorld(
 			tools: THINKTHREAD_TOOL_NAMES,
 			fingerprint,
 			prepare: async ({ cwd }) => { await prepare(cwd); },
-			diagnostics: async ({ cwd }) => {
+			diagnostics: async ({ cwd, refresh }) => {
+				if (!prepared && !refresh) return { state: "registered", detail: "ThinkThread is checked on first use or refresh" };
 				await prepare(cwd);
 				await fingerprint();
 				return {

@@ -7,7 +7,7 @@ describe("ThinkThread profile extension lifecycle", () => {
 	it("registers each turn lazily and invalidates BASE only after mutating Actor fallbacks", async () => {
 		const host = hostFixture();
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, hostOptions());
+		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value);
 
 		await wrapped.startTurn(startInput("turn-1"));
 		expect(world.prepare).not.toHaveBeenCalled();
@@ -29,7 +29,7 @@ describe("ThinkThread profile extension lifecycle", () => {
 		const startupError = new Error("host startup failed");
 		const host = hostFixture({ startTurnError: startupError });
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, hostOptions());
+		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value);
 
 		await expect(wrapped.startTurn(startInput("turn-failed"))).rejects.toBe(startupError);
 		expect(world.finishTurn).toHaveBeenCalledWith("turn-failed");
@@ -39,36 +39,18 @@ describe("ThinkThread profile extension lifecycle", () => {
 		const settlementError = new Error("host settlement failed");
 		const host = hostFixture({ finishTurnError: settlementError });
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, hostOptions());
+		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value);
 
 		await wrapped.startTurn(startInput("turn-failed"));
 		await expect(wrapped.finishTurn("turn-failed")).rejects.toBe(settlementError);
 		expect(world.finishTurn).toHaveBeenCalledWith("turn-failed");
 	});
 
-	it("does not initialize ThinkThread when its pre-execution layer is disabled", async () => {
-		const host = hostFixture();
-		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host.value, world.value, {
-			...hostOptions(),
-			speculativeExecutionWorldEnabled: () => false,
-		});
-
-		await wrapped.startTurn(startInput("turn-actor"));
-		await wrapped.actual(actualInput("write"));
-		await wrapped.finishTurn("turn-actor");
-		expect(host.startTurn).toHaveBeenCalledOnce();
-		expect(world.prepare).not.toHaveBeenCalled();
-		expect(world.beginTurn).not.toHaveBeenCalled();
-		expect(world.actorFallbackSettled).not.toHaveBeenCalled();
-		expect(world.finishTurn).not.toHaveBeenCalled();
-	});
-
 	it.each(["write", "edit", "bash"])("invalidates %s before the new host.execute reports Actor settlement", async (tool) => {
 		const options = hostOptions();
 		const host = createSpeculativeActionHost("session", options);
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host, world.value, options);
+		const wrapped = withThinkThreadProfileLifecycle(host, world.value);
 		const actual = vi.spyOn(host.runtime, "actual");
 		const output = { content: [{ type: "text" as const, text: "Actor result" }], details: {} };
 		const executor = vi.fn(async () => output);
@@ -87,7 +69,7 @@ describe("ThinkThread profile extension lifecycle", () => {
 		const options = hostOptions();
 		const host = createSpeculativeActionHost("session", options);
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host, world.value, options);
+		const wrapped = withThinkThreadProfileLifecycle(host, world.value);
 		const result = { content: [], details: {} };
 		const executor = vi.fn(async () => result);
 		try {
@@ -105,7 +87,7 @@ describe("ThinkThread profile extension lifecycle", () => {
 		const options = hostOptions();
 		const host = createSpeculativeActionHost("session", options);
 		const world = worldFixture();
-		const wrapped = withThinkThreadProfileLifecycle(host, world.value, options);
+		const wrapped = withThinkThreadProfileLifecycle(host, world.value);
 		const failure = new Error("Actor failed after writing");
 		world.actorFallbackSettled.mockRejectedValueOnce(new Error("cleanup failed"));
 		try {

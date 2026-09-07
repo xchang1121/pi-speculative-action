@@ -497,9 +497,9 @@ async function installController(
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
 	const speculativeExecutionWorldEnabled = (backend: string): boolean =>
-		primaryExecutionWorldIDs.has(backend)
+		currentSettings.enabled && (primaryExecutionWorldIDs.has(backend)
 			? currentSettings.executionRouting.primary
-			: currentSettings.executionRouting.nativeFallback;
+			: currentSettings.executionRouting.nativeFallback);
 	const configureExecutionStorage = () => {
 		for (const world of executionWorlds)
 			world.storage?.configure({
@@ -509,12 +509,9 @@ async function installController(
 	};
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
-	const executionRoutes = (): ExecutionRoutesSnapshot => {
-		const worlds = executionDiagnostics.map((world) => speculativeExecutionWorldEnabled(world.id)
-			? world
-			: { ...world, state: "unavailable" as const, detail: "Pre-execution disabled by routing policy" });
-		return { worlds, actorProcessReplay: processCoordinator.actorDiagnostics() };
-	};
+	const executionRoutes = (): ExecutionRoutesSnapshot => ({
+		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(),
+	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
 	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
@@ -590,7 +587,7 @@ async function installController(
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
 		const [, diagnostics] = await Promise.all([
-			refresh && actorReplayEnabled() ? processCoordinator.refreshActorRoute() : undefined,
+			refresh ? processCoordinator.refreshActorRoute() : undefined,
 			host.executionWorldDiagnostics(refresh && currentSettings.enabled),
 		]);
 		executionDiagnostics = diagnostics;
@@ -632,17 +629,18 @@ async function installController(
 			return { text: `Reusable command history ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
 		},
 		setSettings: async (value) => {
-			const wasActorReplayEnabled = actorReplayEnabled();
+			const previous = currentSettings;
 			if (value)
 				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 			configureExecutionStorage();
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
-			if (wasActorReplayEnabled !== actorReplayEnabled())
-				await recoverSpeculation(() => processCoordinator.refreshActorRoute());
-			await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
-			renderFooter();
+			await recoverSpeculation(() => refreshExecutionDiagnostics(
+				previous.enabled !== currentSettings.enabled ||
+				previous.executionRouting.primary !== currentSettings.executionRouting.primary ||
+				previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
+			));
 		},
 		attachUI: (nextUI) => {
 			ui = nextUI;

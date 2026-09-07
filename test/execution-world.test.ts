@@ -142,8 +142,10 @@ describe("ExecutionWorldRouter", () => {
 		const router = new ExecutionWorldRouter([split], () => speculationEnabled);
 		const observationRequest = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
 
-		expect(await router.resolve(observationRequest, preparation)).toBeDefined();
+		const route = await router.resolve(observationRequest, preparation);
+		expect(route).toBeDefined();
 		speculationEnabled = false;
+		expect(() => router.fork(route!, { value: "must not execute" })).toThrow("disabled by routing policy");
 		expect(await router.resolve(observationRequest, preparation)).toBeUndefined();
 		expect(
 			await router.resolve({ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, preparation),

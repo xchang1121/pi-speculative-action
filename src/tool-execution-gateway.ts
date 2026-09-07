@@ -75,6 +75,7 @@ export class ToolExecutionGateway<Context, Output> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.resolve(
 			{
+				tool: operation.tool,
 				effect,
 				requirements,
 				...(operation.action ? { action: operation.action } : {}),
@@ -95,6 +96,7 @@ export class ToolExecutionGateway<Context, Output> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.captureAuthoritativeResult(
 			{
+				tool: operation.tool,
 				effect,
 				requirements,
 				...(operation.action ? { action: operation.action } : {}),

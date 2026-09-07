@@ -371,8 +371,6 @@ export function createSpeculativeActionHost(
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
-			if (options.speculativeExecutionWorldEnabled?.(route.backend) === false)
-				return { ok: false, reason: "execution_route_disabled" };
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
@@ -385,8 +383,6 @@ export function createSpeculativeActionHost(
 				: result;
 		},
 		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
-			if (options.speculativeExecutionWorldEnabled?.(route.backend) === false)
-				return { ok: false, reason: "execution_route_disabled" };
 			const tool = stateData.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
 			const args = validateCandidateArguments(tool, toolName, concrete, "spec_authorize");

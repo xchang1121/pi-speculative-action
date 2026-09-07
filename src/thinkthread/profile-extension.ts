@@ -2,7 +2,7 @@ import path from "node:path";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { inferredActionEffect } from "../action-semantics.ts";
 import type { AgentExecutionWorld } from "../agent-execution-world.ts";
-import type { CreateSpeculativeActionHostOptions, SpeculativeActionHost } from "../agent-integration.ts";
+import type { SpeculativeActionHost } from "../agent-integration.ts";
 import { createSpeculativeActionHost } from "../agent-integration.ts";
 import { createSpeculativeActionExtension } from "../extension.ts";
 import { SpeculativeActionSettingsStore } from "../settings-store.ts";
@@ -29,7 +29,7 @@ export function createThinkThreadProfileExtension(options: ThinkThreadProfileExt
 			const world = hostOptions.executionWorlds?.map((candidate) => worlds.get(candidate))
 				.find((candidate) => candidate !== undefined);
 			if (!world) throw new Error("ThinkThread execution world was not created for this Pi session");
-			return withThinkThreadProfileLifecycle(createSpeculativeActionHost(sessionID, hostOptions), world, hostOptions);
+			return withThinkThreadProfileLifecycle(createSpeculativeActionHost(sessionID, hostOptions), world);
 		},
 		createSettingsStore: (cwd) =>
 			new SpeculativeActionSettingsStore(cwd, resolveConfigDirectory(options.configDirectory)),
@@ -39,12 +39,10 @@ export function createThinkThreadProfileExtension(options: ThinkThreadProfileExt
 export function withThinkThreadProfileLifecycle(
 	host: SpeculativeActionHost,
 	world: ThinkThreadExecutionWorld,
-	options: CreateSpeculativeActionHostOptions,
 ): SpeculativeActionHost {
 	const activeTurns = new Set<string>();
-	const enabled = () => options.speculativeExecutionWorldEnabled?.(world.id) !== false;
 	const invalidateAfterActorMutation = async (tool: string): Promise<void> => {
-		if ((activeTurns.size === 0 && !enabled()) || inferredActionEffect(tool) === "observation") return;
+		if (inferredActionEffect(tool) === "observation") return;
 		// Invalidation clears BASE before releasing its owner. Cleanup failure must not replace Actor output.
 		await world.actorFallbackSettled().catch(() => undefined);
 	};
@@ -52,7 +50,7 @@ export function withThinkThreadProfileLifecycle(
 		...host,
 		startTurn: async (...args: Parameters<SpeculativeActionHost["startTurn"]>) => {
 			const [input] = args;
-			if (!enabled()) return host.startTurn(...args);
+			// Turn registration is memory-only, so enabling this layer mid-turn needs no restart.
 			await world.beginTurn(input.turnID).catch(() => undefined);
 			activeTurns.add(input.turnID);
 			try {

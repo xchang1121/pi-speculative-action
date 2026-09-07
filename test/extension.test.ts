@@ -26,7 +26,7 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
-import type { ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
+import { ExecutionWorldRouter, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
 	type SpeculativeSettingsStore,
@@ -202,9 +202,12 @@ describe("zero-modification Pi extension", () => {
 
 	it("applies the primary and native pre-execution layers independently", async () => {
 		const primary = {
-			id: "primary_runtime", scope: "runtime", isolation: "runtime_sandbox", speculation: { capabilities: [] },
+			id: "primary_runtime", scope: "runtime", isolation: "runtime_sandbox",
+			speculation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read"], prepare: vi.fn(async () => {}) },
 		} as unknown as SpeculativeAgentExecutionWorld;
 		const fixture = await createFixture({ executionWorlds: [primary], settings: { enabled: true } });
+		const router = new ExecutionWorldRouter([primary], (backend) => fixture.executionWorldEnabled(backend) === true);
+		vi.mocked(fixture.host.executionWorldDiagnostics).mockImplementation((refresh) => router.diagnostics({ cwd: fixture.cwd, refresh }));
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Apply changes", "Close"],
 			"Tools & execution": ["Execution routes", "Back"],
@@ -221,6 +224,16 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.store.effective()?.executionRouting).toEqual({ primary: false, nativeFallback: false });
 		expect(fixture.executionWorldEnabled("primary_runtime")).toBe(false);
 		expect(fixture.executionWorldEnabled("linux_process_reuse")).toBe(false);
+		await expect(fixture.host.executionWorldDiagnostics()).resolves.toMatchObject([{ state: "unavailable", tools: ["read"] }]);
+		driveSettingsMenus(fixture, {
+			"Speculative action": ["Tools & execution", "Apply changes", "Close"],
+			"Tools & execution": ["Execution routes", "Back"],
+			"Execution routes": ["[ ] Unified execution environment", "Back"],
+		});
+		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+		expect(fixture.executionWorldEnabled("primary_runtime")).toBe(true);
+		expect(fixture.executionWorldEnabled("linux_process_reuse")).toBe(false);
+		await expect(fixture.host.executionWorldDiagnostics()).resolves.toMatchObject([{ state: "ready" }]);
 	});
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
@@ -273,7 +286,6 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
 		);
-		expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(3);
 		expect(JSON.stringify([...menus.values()])).not.toContain("sandbox");
 		expect((await fixture.hostSettings())?.tools).not.toContain("bash");
 		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
@@ -302,8 +314,7 @@ describe("zero-modification Pi extension", () => {
 				fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
 			);
 			await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
-			expect(fixture.host.executionWorldDiagnostics).toHaveBeenCalledTimes(2);
-			expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.every(([refresh]) => refresh === false)).toBe(true);
+			expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.map(([refresh]) => refresh)).toEqual([false, false, true]);
 			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("diagnostics refresh only while the plugin is enabled"), "info");
 			expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
 			release({ state: "unavailable", detail: "test route unavailable" });
