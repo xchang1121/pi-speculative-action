@@ -29,7 +29,7 @@ import { effectCommitFailure } from "../effect-transaction.ts";
 import { relativeFilesystemPath, slash } from "../path-utils.ts";
 import { resourceDependencies } from "../resource-version.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
-import type { ToolInvocation, ToolSettlement } from "../tool-settlement.ts";
+import type { ToolSettlement } from "../tool-settlement.ts";
 import { DurableFsExecutor } from "./durable-fs.ts";
 import { createThinkThreadClient } from "./control-transport.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
@@ -43,7 +43,6 @@ import {
 } from "./tool-runner-protocol.ts";
 
 const WORLD_ID = "ThinkThread";
-const LINUX_EXECUTION_BACKEND_EPOCH = "linux-execution-v11";
 const RUNNER_MAX_OUTPUT_BYTES = 512 * 1024;
 const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DIFF_PAGE_LIMIT = 256;
@@ -100,9 +99,9 @@ export function createThinkThreadExecutionWorld(
 		return [
 			"thinkthread-fs-run",
 			CONTRACT_FINGERPRINT,
-			LINUX_EXECUTION_BACKEND_EPOCH,
 			THINKTHREAD_TOOL_RUNNER_VERSION,
 			await runnerFingerprint,
+			nodePath, autoResizeImages,
 		].join(":");
 	};
 	const execute = async <Result>(
@@ -212,14 +211,12 @@ async function forkThinkThreadWorld(
 			autoResizeImages,
 		});
 		const writes: FsRunWrites = PI_ACTION_SEMANTICS.effect(tool) === "observation" ? "deny" : "snapshot";
-		const environment = invocationEnvironment(context.action.executionContext);
 		const runParams: FsRunKeyParamsV1 = {
 			snapshotId: source.lease.id,
 			writes,
 			invocation: {
 				argv: [nodePath, runnerPath],
 				cwd: ".",
-				...(Object.keys(environment).length > 0 ? { environment } : {}),
 			},
 			limits: {
 				timeoutMs: DEFAULT_RUN_TIMEOUT_MS,
@@ -420,20 +417,6 @@ function toolName(tool: string): ThinkThreadToolName {
 	if (!TOOL_NAMES.includes(tool as ThinkThreadToolName))
 		throw new Error(`ThinkThread tool runner does not support ${tool}`);
 	return tool as ThinkThreadToolName;
-}
-
-function toolInvocation(value: unknown): ToolInvocation | undefined {
-	return value !== null &&
-		typeof value === "object" &&
-		!Array.isArray(value) &&
-		typeof (value as { executor?: unknown }).executor === "string"
-		? (value as ToolInvocation)
-		: undefined;
-}
-
-function invocationEnvironment(value: unknown): Record<string, string> {
-	const environment = toolInvocation(value)?.process?.environment ?? {};
-	return Object.fromEntries(Object.entries(environment).filter(([key]) => !key.startsWith("THINKTHREAD_")));
 }
 
 function assertSuccessfulRun(run: FsRunV1): void {

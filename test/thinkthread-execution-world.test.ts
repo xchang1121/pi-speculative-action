@@ -27,7 +27,7 @@ import { encodeThinkThreadToolRunnerResponse } from "../src/thinkthread/tool-run
 const ownerID = parseThinkThreadId("tt-00000000-0000-4000-8000-000000000001");
 
 describe("ThinkThread execution world", () => {
-	it("advertises runtime-wide routing with the current Linux execution epoch", async () => {
+	it("binds the stock runner and execution options without inventing a Runtime epoch", async () => {
 		const world = createThinkThreadExecutionWorld({
 			clientFactory: () => fakeClient().client,
 			runnerPath: "/opt/pi-speculative-action/tool-runner.js",
@@ -38,9 +38,10 @@ describe("ThinkThread execution world", () => {
 		expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
 		expect(world.speculation.tools).toEqual(["read", "ls", "write", "edit"]);
 		expect(world.observation).toBeUndefined();
-		await expect(
-			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
-		).resolves.toContain("linux-execution-v11");
+		const fingerprint = await world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS });
+		expect(fingerprint).toContain("runner-v1");
+		const resized = createThinkThreadExecutionWorld({ runnerFingerprint: "runner-v1", autoResizeImages: false });
+		expect(await resized.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS })).not.toBe(fingerprint);
 	});
 
 	it.each([false, true])("routes every stock tool through the same capability layers (warmup=%s)", async (warmup) => {

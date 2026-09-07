@@ -250,7 +250,6 @@ await writeFile(manifestPath, `${JSON.stringify({
     agentPosixSource,
     agentPosixTarballSha256,
     contractFingerprint: sdk.CONTRACT_FINGERPRINT,
-    executionBackendEpoch: "linux-execution-v10",
     runnerSha256,
 }, null, 2)}\n`);
 NODE
