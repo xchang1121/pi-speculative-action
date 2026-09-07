@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
@@ -130,7 +131,10 @@ describe("speculative action resource versions", () => {
 		const file = path.join(root, "value.ts");
 		await fs.writeFile(file, "tracked\n");
 		const manager = new ResourceVersionManager(root, { watch });
-		const token = await manager.capture(resourceDependencies(action("read", ["value.ts"]), root));
+		const args = { path: "@value.ts" };
+		const key = PI_ACTION_SEMANTICS.buildKey("read", args, root)!;
+		const token = await manager.capture(resourceDependencies(key, root));
+		expect((await createReadTool(root).execute("actor", args)).content).toMatchObject([{ text: "tracked\n" }]);
 		if (change === "replace") {
 			const replacement = path.join(root, "replacement.ts");
 			await fs.writeFile(replacement, "changed\n");

@@ -5,7 +5,7 @@ import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, r
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { asRecord } from "./action-semantics.ts";
+import { asRecord, normalizeRelativeRoot } from "./action-semantics.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
@@ -1131,12 +1131,12 @@ async function executeMutation(
 	const args = asRecord(context.args);
 	if (!args || typeof args.path !== "string") throw new Error(`${context.toolName}.path must be a string`);
 	const sourceRoot = path.resolve(context.cwd);
-	const target = path.resolve(sourceRoot, args.path);
-	if (!containsFilesystemPath(sourceRoot, target) || target === sourceRoot) {
+	const resource = normalizeRelativeRoot(args.path, sourceRoot);
+	if (resource === undefined || resource === "." || resource !== context.action.resources[0]) {
 		throw new Error(`sandbox mutation path escapes workspace: ${args.path}`);
 	}
+	const target = path.resolve(sourceRoot, resource);
 	await assertNoSymlinkPath(sourceRoot, target);
-	const resource = slash(path.relative(sourceRoot, target));
 	const requestedPath = args.path;
 	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot,

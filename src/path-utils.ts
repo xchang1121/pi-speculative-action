@@ -1,7 +1,7 @@
 import path from "node:path";
 
 export function slash(value: string): string {
-	return value.replaceAll("\\", "/");
+	return value.split(path.sep).join("/");
 }
 
 /** Normalize a logical resource without folding case. */

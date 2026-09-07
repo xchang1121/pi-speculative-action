@@ -1,4 +1,6 @@
 import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import {
 	type EffectRequirements,
@@ -236,7 +238,7 @@ export const BASH_TAIL_LINES_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
-		epoch: "pi.read.v2",
+		epoch: "pi.read.v3",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "content",
@@ -245,7 +247,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "grep",
-		epoch: "pi.grep.v2",
+		epoch: "pi.grep.v3",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_content",
@@ -253,7 +255,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "find",
-		epoch: "pi.find.v2",
+		epoch: "pi.find.v3",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_query",
@@ -261,7 +263,7 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "ls",
-		epoch: "pi.ls.v1",
+		epoch: "pi.ls.v2",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "tree_entries",
@@ -277,14 +279,14 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "write",
-		epoch: "pi.write.v1",
+		epoch: "pi.write.v2",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
-		epoch: "pi.edit.v1",
+		epoch: "pi.edit.v2",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalEdit,
@@ -535,7 +537,7 @@ function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined
 	if (!validOptionalInteger(record.offset, 1) || !validOptionalInteger(record.limit, 0)) {
 		return undefined;
 	}
-	const resource = normalizeWorkspacePath(record.path, cwd);
+	const resource = normalizeWorkspacePath(record.path, cwd, true);
 	if (resource === undefined) return undefined;
 	return {
 		resources: [resource],
@@ -750,10 +752,21 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 	}
 }
 
-function normalizeWorkspacePath(value: string, cwd: string): string | undefined {
+const require = createRequire(import.meta.url);
+let piPaths: { resolveToCwd: (value: string, cwd: string) => string; resolveReadPath: (value: string, cwd: string) => string };
+
+function normalizeWorkspacePath(value: string, cwd: string, reading = false): string | undefined {
+	// Pi does not export its path resolver. Use its installed implementation lazily;
+	// an incompatible package layout makes buildKey decline reuse, never invent an identity.
+	piPaths ??= require(fileURLToPath(new URL("./core/tools/path-utils.js", import.meta.resolve("@earendil-works/pi-coding-agent"))));
 	const root = path.resolve(cwd);
-	const relative = relativeFilesystemPath(root, path.resolve(root, value));
-	return relative === undefined ? undefined : slash(relative || ".");
+	const target = piPaths.resolveToCwd(value, root);
+	// Filename guessing needs a proof of the whole search, not only the chosen file.
+	if (reading && piPaths.resolveReadPath(value, root) !== target) return undefined;
+	const relative = relativeFilesystemPath(root, target);
+	if (relative === undefined) return undefined;
+	const resource = slash(relative || ".");
+	return piPaths.resolveToCwd(resource, root) === target ? resource : `./${resource}`;
 }
 
 function normalizePositiveInteger(value: unknown, fallback: number): number {

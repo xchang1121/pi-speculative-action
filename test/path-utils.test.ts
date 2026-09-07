@@ -22,6 +22,7 @@ describe("filesystem path policy", () => {
 
 	test("preserves physical path case", () => {
 		expect(filesystemPathKey(path.join(root, "Case"))).not.toBe(filesystemPathKey(path.join(root, "case")));
+		expect(filesystemPathKey(path.join(root, "a\\b")) === filesystemPathKey(path.join(root, "a/b"))).toBe(process.platform === "win32");
 	});
 
 	test.runIf(process.platform === "win32")("treats drive, separator, and case aliases conservatively", () => {
@@ -34,7 +35,7 @@ describe("filesystem path policy", () => {
 test.each([
 	["same", "src", "src", true],
 	["child", "src", "src/lib", true],
-	["mixed separators", "src", "src\\lib", true],
+	["mixed separators", "src", "src\\lib", process.platform === "win32"],
 	["dot-dot name", "src", "src/..foo", true],
 	["sibling", "src", "source", false],
 	["escape", "src", "src/../outside", false],

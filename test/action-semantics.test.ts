@@ -54,7 +54,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(implicit?.key).toBe(explicit?.key);
 		expect(implicit).toMatchObject({
 			tool: "ls",
-			semanticsEpoch: "pi.ls.v1",
+			semanticsEpoch: "pi.ls.v2",
 			resources: ["."],
 			input: { path: ".", limit: 500 },
 		});
@@ -62,6 +62,10 @@ describe("ActionSemanticsRegistry", () => {
 		expect(buildPiActionKey("ls", { path: "..cache" }, "/workspace")).toBeDefined();
 		expect(buildPiActionKey("ls", { limit: 0 }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("ls", { limit: 1.5 }, "/workspace")).toBeUndefined();
+		for (const tool of ["grep", "find"] as const) {
+			const args = { pattern: "*" };
+			expect(buildPiActionKey(tool, args, "/workspace")?.key).toBe(buildPiActionKey(tool, { ...args, path: "@.", limit: tool === "grep" ? 100 : 1000 }, "/workspace")?.key);
+		}
 	});
 
 	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
@@ -78,13 +82,13 @@ describe("ActionSemanticsRegistry", () => {
 		expect(relation).toMatchObject({ kind: "projected", projector: "read.range" });
 		expect(implicit).toMatchObject({
 			tool: "read",
-			semanticsEpoch: "pi.read.v2",
+			semanticsEpoch: "pi.read.v3",
 			schemaHash: "schema-v1",
 			resources: ["src/a.ts"],
 		});
 		expect(implicit?.input).not.toHaveProperty("limit");
 		expect(explicit?.input).toHaveProperty("limit", 2000);
-		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v2"');
+		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v3"');
 		expect(Object.isFrozen(implicit)).toBe(true);
 		expect(Object.isFrozen(implicit?.input)).toBe(true);
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);

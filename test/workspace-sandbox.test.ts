@@ -130,7 +130,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("accepts workspace mutations and commits a sealed write exactly once", async () => {
 		const root = await temporaryRoot("write");
 		try {
-			const args = { path: "nested/created.txt", content: "isolated\n" };
+			const args = { path: "@nested/created.txt", content: "isolated\n" };
 			const world = createWorkspaceSandbox({ driver: "git" });
 			expect(world.scope).toBe("fallback");
 			if (world.scope !== "fallback") throw new Error("Expected a fallback world");
@@ -151,7 +151,8 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(branch.commit()).toBe(first);
 			await first;
 			expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
-			expect(await readFile(path.join(root, args.path), "utf8")).toBe("isolated\n");
+			expect(await readFile(path.join(root, "nested/created.txt"), "utf8")).toBe("isolated\n");
+			await expect(stat(path.join(root, args.path))).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

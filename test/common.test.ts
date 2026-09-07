@@ -63,22 +63,6 @@ describe("speculative action common", () => {
 		});
 	});
 
-	it("canonicalizes Pi defaults and rejects paths outside the workspace", () => {
-		const implicitGrep = buildPiActionKey("grep", { pattern: "TODO" }, "/workspace");
-		const explicitGrep = buildPiActionKey(
-			"grep",
-			{ pattern: "TODO", path: ".", ignoreCase: false, literal: false, context: 0, limit: 100 },
-			"/workspace",
-		);
-		const implicitFind = buildPiActionKey("find", { pattern: "**/*.ts" }, "/workspace");
-		const explicitFind = buildPiActionKey("find", { pattern: "**/*.ts", path: ".", limit: 1000 }, "/workspace");
-
-		expect(implicitGrep?.key).toBe(explicitGrep?.key);
-		expect(implicitFind?.key).toBe(explicitFind?.key);
-		expect(buildPiActionKey("read", { path: "../secret" }, "/workspace")).toBeUndefined();
-		expect(buildPiActionKey("find", { pattern: "**/*.ts", path: "/outside" }, "/workspace")).toBeUndefined();
-	});
-
 	it("builds stable, conflict-sensitive keys independently of isolation routing", () => {
 		const bash = buildPiActionKey("bash", { command: "npm test", timeout: 30 }, "/workspace/a");
 		const otherCwd = buildPiActionKey("bash", { command: "npm test", timeout: 30 }, "/workspace/b");
