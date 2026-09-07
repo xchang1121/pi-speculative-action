@@ -79,7 +79,9 @@ export function createResourceSnapshotExecutionWorld(
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		observation: { ...route, capture },
+		observation: { ...route, capture: (context) => capture(context,
+			operations?.tools.includes(context.toolName) && (context.action.executionContext as ToolInvocation | undefined)?.filesystem
+				? operations.maxBytes() : undefined) },
 		...(operations?.tools.length ? { speculation: {
 			...route,
 			tools: operations.tools,
@@ -95,7 +97,8 @@ export function createResourceSnapshotExecutionWorld(
 				context.signal.throwIfAborted();
 				const owned = await capture(context, operations.maxBytes());
 				try {
-					const output = await owned.view!.evaluate((view) => execute(view, context));
+					if (!owned.view) throw new Error("resource_snapshot_budget_exceeded");
+					const output = await owned.view.evaluate((view) => execute(view, context));
 					context.signal.throwIfAborted();
 					return await owned.seal(output);
 				} finally { await owned.dispose(); }

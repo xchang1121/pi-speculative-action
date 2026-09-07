@@ -226,28 +226,35 @@ describe("speculative action host", () => {
 		const base = createSpeculativeActionHost("session", {
 			cwd, getSettings: () => ({ enabled: true, drafterEnabled: false, tools, patternAware: { enabled: false } }),
 			complete: async () => { throw new Error("No model calls expected"); }, preflight: () => true,
-			speculativeExecutionWorldEnabled: () => false, executionWorlds: thinkthread ? [world] : [],
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			speculativeExecutionWorldEnabled: () => false, executionWorlds: [
+				...(thinkthread ? [world] : []),
+				createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 4096 }),
+			],
 		});
 		const host = thinkthread ? withThinkThreadProfileLifecycle(base, world) : base;
 		let unstable = false;
+		let args = { path: "@notes.txt", offset: 1 };
 		const actor = vi.fn(async () => {
-			if (unstable) await writeFile(file, "B");
-			const output = await tool.execute("read", { path: "@notes.txt" });
-			if (unstable) await writeFile(file, "A");
+			if (unstable) await writeFile(file, "B\nsecond");
+			const output = await tool.execute("read", args);
+			if (unstable) await writeFile(file, "A\nsecond");
 			return output;
 		});
 		try {
-			for (const [turnID, input, changing, expected, calls] of [
-				["first", "A", false, "A", 1], ["hit", undefined, false, "A", 1],
-				["stale", "B", false, "B", 2], ["ABA", "A", true, "B", 3], ["after-ABA", undefined, false, "A", 4],
+			for (const [turnID, input, changing, expected, calls, offset] of [
+				["first", "A\nsecond", false, "A\nsecond", 1, 1],
+				["input-hit", undefined, false, "second", 1, 2],
+				["stale", "B\nsecond", false, "B\nsecond", 2, 1], ["ABA", "A\nsecond", true, "B\nsecond", 3, 1],
+				["after-ABA", undefined, false, "A\nsecond", 4, 1],
 			] as const) {
 				if (input !== undefined) await writeFile(file, input);
-				unstable = changing;
+				unstable = changing; args = { ...args, offset };
 				await host.startTurn(startInput(tool, turnID));
-				const call = { turnID, id: turnID, tool: "read", args: { path: "@notes.txt" }, tools: [tool] };
+				const call = { turnID, id: turnID, tool: "read", args, tools: [tool] };
 				await host.previewActorCall(call);
 				expect((await host.execute(call, undefined, actor)).content).toEqual([{ type: "text", text: expected }]);
-				expect(actor).toHaveBeenCalledTimes(calls);
+				expect(actor, turnID).toHaveBeenCalledTimes(calls);
 				await host.finishTurn(turnID);
 			}
 			expect(clientFactory).not.toHaveBeenCalled();

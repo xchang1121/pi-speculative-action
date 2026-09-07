@@ -42,6 +42,7 @@ export type ResourceVersionToken = {
 	readonly exact: ReadonlyArray<string>;
 	readonly stamps: ReadonlyArray<string>;
 	readonly manager: ResourceVersionManager;
+	/** Best-effort retained inputs; absence never weakens the token's exact freshness evidence. */
 	readonly view?: ResourceReadView;
 	readonly release: () => void;
 };
@@ -65,18 +66,24 @@ export class ResourceReadView {
 		this.maxBytes = maxBytes;
 	}
 	get bytes(): number { return this.capturedBytes; }
+	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
 
-	reserve(bytes: number): void {
-		if (this.sealed || this.failure) throw new Error("resource_snapshot_not_capturing");
-		if (!Number.isSafeInteger(bytes) || bytes < 0 || this.bytes + bytes > this.maxBytes) {
-			throw new Error("resource_snapshot_budget_exceeded");
+	reserve(bytes: number): boolean {
+		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
+		if (this.failure) return false;
+		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+		if (this.bytes + bytes > this.maxBytes) {
+			this.failure = new Error("resource_snapshot_budget_exceeded");
+			this.entries.clear();
+			return false;
 		}
 		this.capturedBytes += bytes;
+		return true;
 	}
 	capture(target: string, entry: CapturedResource): void {
-		this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
+		if (!this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0));
+			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined) ||
@@ -84,6 +91,7 @@ export class ResourceReadView {
 		this.entries.set(key, entry);
 	}
 	alias(target: string, source: string): void {
+		if (!this.retained) return;
 		this.entry(source);
 		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
 	}
@@ -209,7 +217,8 @@ export class ResourceVersionManager {
 			});
 			const exact = await fingerprintDependencies(normalized, this.root, view);
 			await watcherTurn();
-			view?.seal();
+			const retained = view?.retained ? view : undefined;
+			retained?.seal();
 			const epoch = this.epoch;
 			return {
 				root: this.root,
@@ -220,7 +229,7 @@ export class ResourceVersionManager {
 				exact: exact.fingerprints,
 				stamps: exact.stamps,
 				manager: this,
-				...(view ? { view } : {}),
+				...(retained ? { view: retained } : {}),
 				release,
 			};
 		} catch (error) {
@@ -562,8 +571,8 @@ async function fingerprintPath(
 	}
 	if (info.isFile()) {
 		// Reserve before yielding: concurrent captures cannot each spend the entire token budget.
-		view?.reserve(Number(info.size));
-		const content = await fingerprintIO(() => captureStableFile(target, view ? Number(info.size) : undefined, view !== undefined));
+		const retain = view?.reserve(Number(info.size)) ?? false;
+		const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain));
 		assertInside(realRoot, content.realPath);
 		view?.capture(target, { type: "file", content: content.content });
 		return {

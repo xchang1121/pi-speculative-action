@@ -18,7 +18,6 @@ import {
 	releaseResourceVersion,
 	resourceDependencies,
 	validateResourceVersion,
-	watchResourceVersion,
 } from "../src/resource-version.ts";
 
 const roots: string[] = [];
@@ -68,7 +67,14 @@ describe("speculative action resource versions", () => {
 		await fs.writeFile(file, payload);
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const dependencies = resourceDependencies(action("read", ["value.txt", "missing"]), root);
-		await expect(manager.capture(dependencies, 0)).rejects.toThrow("resource_snapshot_budget_exceeded");
+		for (const [budget, paths] of [[0, dependencies], [payload.length, dependencies.slice(0, 1)]] as const) {
+			const opened = vi.spyOn(fs, "open");
+			const observed = await manager.capture(paths, budget);
+			expect(opened).toHaveBeenCalledOnce(); opened.mockRestore();
+			expect(observed.view).toBeUndefined(); // No partial input authority after either payload or metadata exhaustion.
+			expect((await manager.seal(observed)).expired).toBe(false);
+			observed.release();
+		}
 		const token = await manager.capture(dependencies, 3 * 1024 * 1024), view = token.view!;
 		await expect(view.evaluate(async (scope) => {
 			try { scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
@@ -146,7 +152,9 @@ describe("speculative action resource versions", () => {
 			const branch = await capture.seal(actorOutput);
 			await capture.dispose(); // A sealed capture no longer owns the token.
 			expect(await branch.commit()).toBe(actorOutput);
-			branch.watch?.(() => {});
+			const invalidated = new Promise<string | undefined>((resolve) => branch.watch?.(resolve));
+			await fs.writeFile(file, "B");
+			expect(await invalidated).toBe(file);
 			await branch.dispose();
 			await branch.dispose();
 			expect((await branch.validate?.())?.status).toBe("stale");
@@ -284,24 +292,6 @@ describe("speculative action resource versions", () => {
 				expect(output.result).toEqual(expected);
 			}
 		} finally { releaseResourceVersion(token); }
-	});
-
-	test("notifies active cache owners when a dependency becomes stale", async () => {
-		const root = await workspace({ "value.ts": "one\n" });
-		const file = path.join(root, "value.ts");
-		const token = await captureResourceVersion(action("read", ["value.ts"]), root);
-		const invalidated = new Promise<string>((resolve, reject) => {
-			const timeout = setTimeout(() => reject(new Error("resource invalidation timed out")), 3000);
-			const release = watchResourceVersion(token, (changedPath) => {
-				clearTimeout(timeout);
-				release();
-				resolve(changedPath);
-			});
-		});
-
-		await fs.writeFile(file, "two\n");
-
-		expect(path.resolve(await invalidated)).toBe(path.resolve(file));
 	});
 
 });
