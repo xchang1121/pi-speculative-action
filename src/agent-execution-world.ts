@@ -54,12 +54,25 @@ export function createResourceSnapshotExecutionWorld(
 	};
 	const capture = async (context: SpeculativeToolExecutionContext): Promise<WorldResultCapture<ToolSettlement>> => {
 		const setupStarted = performance.now();
-		const version = await captureResourceVersion(context.action, context.cwd, actionSemantics);
-		return new ResourceSnapshotCapture(
-			version,
-			context.action.executionFingerprint,
-			Math.max(0, performance.now() - setupStarted),
-		);
+		let version: ResourceVersionToken | undefined = await captureResourceVersion(context.action, context.cwd, actionSemantics);
+		const setupMs = Math.max(0, performance.now() - setupStarted);
+		return {
+			seal: async (output) => {
+				const owned = version;
+				version = undefined;
+				if (!owned) throw new Error("resource snapshot capture is already consumed");
+				try {
+					const validation = await owned.manager.seal(owned);
+					if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
+					owned.view?.assertComplete();
+					return new ResourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs);
+				} catch (error) {
+					releaseResourceVersion(owned);
+					throw error;
+				}
+			},
+			dispose: () => { if (version) releaseResourceVersion(version); version = undefined; },
+		};
 	};
 	return {
 		id: "resource_version",
@@ -69,41 +82,10 @@ export function createResourceSnapshotExecutionWorld(
 	};
 }
 
-class ResourceSnapshotCapture implements WorldResultCapture<ToolSettlement> {
-	private state: "open" | "sealed" | "disposed" = "open";
-	private readonly version: ResourceVersionToken;
-	private readonly executionFingerprint: string;
-	private readonly setupMs: number;
-
-	constructor(version: ResourceVersionToken, executionFingerprint: string, setupMs: number) {
-		this.version = version;
-		this.executionFingerprint = executionFingerprint;
-		this.setupMs = setupMs;
-	}
-
-	async seal(output: ToolSettlement): Promise<WorldBranch<ToolSettlement>> {
-		if (this.state !== "open") throw new Error(`resource snapshot capture is already ${this.state}`);
-		const validation = await this.version.manager.seal(this.version);
-		if (validation.expired) {
-			this.dispose();
-			throw new Error(validation.reason ?? "resource observation window changed");
-		}
-		const branch = new ResourceSnapshotBranch(output, this.version, this.executionFingerprint, this.setupMs);
-		this.state = "sealed";
-		return branch;
-	}
-
-	dispose(): void {
-		if (this.state !== "open") return;
-		this.state = "disposed";
-		releaseResourceVersion(this.version);
-	}
-}
-
 class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 	readonly backend = "resource_version" as const;
 	readonly resources: readonly string[] = Object.freeze([]);
-	readonly capturedBytes = 0;
+	readonly capturedBytes: number;
 	readonly executionMetrics: { readonly setupMs: number };
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly output: ToolSettlement;
@@ -114,6 +96,7 @@ class ResourceSnapshotBranch implements WorldBranch<ToolSettlement> {
 	constructor(output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number) {
 		this.output = output;
 		this.version = version;
+		this.capturedBytes = version.view?.bytes ?? 0;
 		this.executionMetrics = Object.freeze({ setupMs });
 		this.compatibility = Object.freeze({
 			status: "compatible",

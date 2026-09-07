@@ -27,54 +27,53 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
-	test.each([
-		{ name: "watcher available", watch: true },
-		{ name: "watcher unavailable", watch: false },
-	])("seals only stable Actor observation windows with $name", async ({ watch }) => {
-		const scenarios = [
-			{ name: "unchanged", mutate: async (_root: string, _file: string) => {}, sealed: true },
-			{ name: "A to B", mutate: async (_root: string, file: string) => fs.writeFile(file, "B") },
-			{
-				name: "A to B to A",
-				mutate: async (_root: string, file: string) => {
-					await fs.writeFile(file, "B");
-					await fs.writeFile(file, "A");
-					await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
-				},
-			},
-			{
-				name: "same-content replacement",
-				mutate: async (root: string, file: string) => {
-					const replacement = path.join(root, "replacement.txt");
-					await fs.writeFile(replacement, "A");
-					await fs.rename(replacement, file);
-				},
-			},
-			{
-				name: "restored directory entries",
-				mutate: async (root: string) => {
-					const temporary = path.join(root, "temporary.txt");
-					await fs.writeFile(temporary, "temporary");
-					await fs.rm(temporary);
-					await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
-				},
-			},
-		];
-		for (const scenario of scenarios) {
+	test.each([true, false])("seals only stable Actor observation windows (watch=%s)", async (watch) => {
+		for (const change of ["unchanged", "write", "restore", "replace", "entries"] as const) {
 			const root = await workspace();
 			const file = path.join(root, "value.txt");
 			await fs.writeFile(file, "A");
 			const manager = new ResourceVersionManager(root, { watch });
-			const target = scenario.name === "restored directory entries" ? ["."] : ["value.txt"];
+			const target = change === "entries" ? ["."] : ["value.txt"];
 			const token = await manager.capture(resourceDependencies(action("read", target), root));
-			await scenario.mutate(root, file);
+			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
+			if (change === "restore") {
+				await fs.writeFile(file, "A");
+				await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
+			}
+			if (change === "replace" || change === "entries") {
+				const temporary = path.join(root, "temporary.txt");
+				await fs.writeFile(temporary, "A");
+				if (change === "replace") await fs.rename(temporary, file);
+				else {
+					await fs.rm(temporary);
+					await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
+				}
+			}
 			if (watch) await settleWatcher();
-
-			const result = await manager.seal(token);
-			expect(result.expired, scenario.name).toBe(!scenario.sealed);
+			expect((await manager.seal(token)).expired, change).toBe(change !== "unchanged");
 			releaseResourceVersion(token);
 			manager.close();
 		}
+	});
+
+	test("owns bounded immutable inputs and never converts unproven access into absence", async () => {
+		const root = await workspace(), file = path.join(root, "value.txt");
+		await fs.writeFile(file, "A");
+		const manager = new ResourceVersionManager(root, { watch: false });
+		const dependencies = resourceDependencies(action("read", ["value.txt", "missing"]), root);
+		await expect(manager.capture(dependencies, 0)).rejects.toThrow("resource_snapshot_budget_exceeded");
+		const token = await manager.capture(dependencies, 4096), view = token.view!;
+		(await view.readFile(file)).fill(66);
+		await fs.writeFile(file, "B");
+		expect((await view.readFile(file)).toString()).toBe("A");
+		expect(view.exists(path.join(root, "missing"))).toBe(false);
+		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
+		expect(() => view.exists(path.join(root, "unknown"))).toThrow("resource_access_unproven");
+		expect(() => view.assertComplete()).toThrow("resource_access_unproven");
+		expect((await manager.seal(token)).expired).toBe(true);
+		releaseResourceVersion(token);
+		await expect(view.readFile(file)).rejects.toThrow("disposed");
+		manager.close();
 	});
 
 	test("a failed seal discards only the cache capture and releases its manager", async () => {
@@ -99,7 +98,9 @@ describe("speculative action resource versions", () => {
 		await settleWatcher();
 
 		const actorOutput = { result: { content: [{ type: "text" as const, text: "A" }], details: {} }, isError: false };
-		await expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
+		const sealing = expect(capture.seal(actorOutput)).rejects.toThrow("resource_observation_window_changed");
+		await expect(capture.seal(actorOutput)).rejects.toThrow("already consumed");
+		await sealing;
 		expect(actorOutput.result.content[0]?.text).toBe("A");
 		const next = await captureResourceVersion(key, root);
 		expect(next.manager).not.toBe(manager);
@@ -239,15 +240,13 @@ describe("speculative action resource versions", () => {
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
 		const root = await workspace();
 		const grep = { ...PI_ACTION_SEMANTICS.definition("ls")!, resourceScope: "tree_content" as const };
-		const write = PI_ACTION_SEMANTICS.definition("write");
-		if (!grep || !write) throw new Error("Pi resource semantics unavailable");
+		const write = PI_ACTION_SEMANTICS.definition("write")!;
 		const semantics = new ActionSemanticsRegistry([
 			{ ...grep, tool: "custom_query", epoch: "test.custom-query.v1" },
 			{ ...write, tool: "custom_write", epoch: "test.custom-write.v1" },
 		]);
-		const processAction = semantics.buildKey("custom_query", { pattern: "ok", path: "." }, root);
-		const writeAction = semantics.buildKey("custom_write", { path: "out.txt", content: "ok" }, root);
-		if (!processAction || !writeAction) throw new Error("custom action key unavailable");
+		const processAction = semantics.buildKey("custom_query", { pattern: "ok", path: "." }, root)!;
+		const writeAction = semantics.buildKey("custom_write", { path: "out.txt", content: "ok" }, root)!;
 
 		expect(resourceDependencies(processAction, root, semantics)).toEqual([
 			{ path: path.resolve(root), scope: "tree_content" },
