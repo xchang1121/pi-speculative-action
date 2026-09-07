@@ -1,8 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
+import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -195,76 +198,41 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it.each([[], ["bash"], ["read"]].map((tools) => ({ tools })))("observes and replays Actor reads independently of prediction=$tools", async ({ tools }) => {
-		const cwd = await temporaryWorkspace();
-		let executions = 0;
-		const events: SpeculativeActionEvent<string>[] = [];
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, input) => {
-				executions++;
-				const text = await readFile(path.join(cwd, input.path), "utf8");
-				return { content: [{ type: "text", text }], details: {} };
-			},
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({
-				enabled: true,
-				drafterEnabled: false,
-				candidateLimit: 1,
-				maxConcurrentActions: 1,
-				tools,
-				patternAware: { enabled: false },
-				selfSpeculation: { enabled: false },
-			}),
-			complete: async () => assistant([], "stop"),
-			preflight: () => true,
-			onEvent: (event) => {
-				events.push(event);
-			},
+	it.each([[], ["bash"], ["read"]].flatMap((tools) => [false, true].map((thinkthread) => ({ tools, thinkthread }))))(
+	"uses the same authoritative observation journey (prediction=$tools, ThinkThread=$thinkthread)", async ({ tools, thinkthread }) => {
+		const cwd = await temporaryWorkspace(), file = path.join(cwd, "notes.txt");
+		const tool = createReadTool(cwd);
+		const clientFactory = vi.fn(() => { throw new Error("Actor observation must not initialize the SDK"); });
+		const world = createThinkThreadExecutionWorld({ clientFactory, runnerFingerprint: "test" });
+		const base = createSpeculativeActionHost("session", {
+			cwd, getSettings: () => ({ enabled: true, drafterEnabled: false, tools, patternAware: { enabled: false } }),
+			complete: async () => { throw new Error("No model calls expected"); }, preflight: () => true,
+			speculativeExecutionWorldEnabled: () => false, executionWorlds: thinkthread ? [world] : [],
 		});
-
+		const host = thinkthread ? withThinkThreadProfileLifecycle(base, world) : base;
+		let unstable = false;
+		const actor = vi.fn(async () => {
+			if (unstable) await writeFile(file, "B");
+			const output = await tool.execute("read", { path: "@notes.txt" });
+			if (unstable) await writeFile(file, "A");
+			return output;
+		});
 		try {
-			await host.startTurn(startInput(tool, "actor-cache-1"));
-			const firstCall = {
-				turnID: "actor-cache-1",
-				id: "actor-cache-call-1",
-				tool: "read",
-				args: { path: "notes.txt" },
-				tools: [tool],
-			};
-			expect(await host.consume(firstCall)).toBeUndefined();
-			const firstResult = await tool.execute(firstCall.id, firstCall.args, undefined);
-			await host.actual({ ...firstCall, durationMs: 2, output: { result: firstResult, isError: false } });
-			expect(executions).toBe(1);
-			expect(host.runtime.inspect("session").sharedCandidates).toBe(1);
-			await host.finishTurn(firstCall.turnID);
-
-			await host.startTurn(startInput(tool, "actor-cache-2"));
-			const secondCall = { ...firstCall, turnID: "actor-cache-2", id: "actor-cache-call-2" };
-			await host.previewActorCall(secondCall);
-			expect(executions).toBe(1);
-			const cached = await host.consume(secondCall);
-			expect(cached, JSON.stringify(events, undefined, 2)).toBeDefined();
-			expect(cached?.result.content).toEqual([{ type: "text", text: "one\ntwo\nthree\nfour" }]);
-			expect(executions).toBe(1);
-			await host.finishTurn(secondCall.turnID);
-
-			await writeFile(path.join(cwd, "notes.txt"), "changed", "utf8");
-			await host.startTurn(startInput(tool, "actor-cache-3"));
-			const thirdCall = { ...firstCall, turnID: "actor-cache-3", id: "actor-cache-call-3" };
-			expect(await host.consume(thirdCall)).toBeUndefined();
-			const thirdResult = await tool.execute(thirdCall.id, thirdCall.args, undefined);
-			await host.actual({ ...thirdCall, durationMs: 2, output: { result: thirdResult, isError: false } });
-			expect(executions).toBe(2);
-			await host.finishTurn(thirdCall.turnID, true);
-		} finally {
-			await host.dispose();
-		}
+			for (const [turnID, input, changing, expected, calls] of [
+				["first", "A", false, "A", 1], ["hit", undefined, false, "A", 1],
+				["stale", "B", false, "B", 2], ["ABA", "A", true, "B", 3], ["after-ABA", undefined, false, "A", 4],
+			] as const) {
+				if (input !== undefined) await writeFile(file, input);
+				unstable = changing;
+				await host.startTurn(startInput(tool, turnID));
+				const call = { turnID, id: turnID, tool: "read", args: { path: "@notes.txt" }, tools: [tool] };
+				await host.previewActorCall(call);
+				expect((await host.execute(call, undefined, actor)).content).toEqual([{ type: "text", text: expected }]);
+				expect(actor).toHaveBeenCalledTimes(calls);
+				await host.finishTurn(turnID);
+			}
+			expect(clientFactory).not.toHaveBeenCalled();
+		} finally { await host.dispose(); }
 	});
 
 	it("matches Bash intent but leaves the only process execution to the Actor", async () => {
