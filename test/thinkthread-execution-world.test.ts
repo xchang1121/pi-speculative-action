@@ -285,6 +285,9 @@ describe("ThinkThread execution world", () => {
 			enabled = true;
 			await expect(router.diagnostics({ cwd })).resolves.toMatchObject([{ state: "ready" }]);
 			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: world.id });
+			vi.mocked(fixture.client.fs.stat).mockRejectedValueOnce(new Error("Runtime disconnected"));
+			await expect(router.diagnostics({ cwd, refresh: true })).resolves.toMatchObject([{ state: "unavailable", detail: "Runtime disconnected" }]);
+			await expect(router.diagnostics({ cwd, refresh: true })).resolves.toMatchObject([{ state: "ready" }]);
 		} finally {
 			await world.dispose?.();
 			await rm(directory, { recursive: true, force: true });

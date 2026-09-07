@@ -136,7 +136,8 @@ export function createThinkThreadExecutionWorld(
 			prepare: async ({ cwd }) => { await prepare(cwd); },
 			diagnostics: async ({ cwd, refresh }) => {
 				if (!prepared && !refresh) return { state: "registered", detail: "ThinkThread is checked on first use or refresh" };
-				await prepare(cwd);
+				const world = await prepare(cwd);
+				if (refresh) await world.client.fs.stat();
 				await fingerprint();
 				return {
 					state: "ready",
