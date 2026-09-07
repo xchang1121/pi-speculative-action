@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync, fork } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { serialize } from "node:v8";
+import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 
 // Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
 // Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
@@ -35,7 +36,7 @@ try {
 	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
 	const pi = {};
 	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) {
-		const executor = name === "grep" ? worker : await prepareWorker(true);
+		const executor = await prepareWorker();
 		try { pi[name] = await qualifyPiSearch(executor, name); }
 		finally { await executor.dispose(); }
 	}
@@ -45,7 +46,8 @@ try {
 		const late = Promise.withResolvers(), inputCompleted = Promise.withResolvers(), inputWait = mode.startsWith("input");
 		try {
 			const arrived = performance.now(); let entered = false;
-			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(new Error("cancelled running guest")); };
+			const reason = inputWait ? 0 : new Error("cancelled running guest");
+			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(reason); };
 			await assert.rejects(interrupted.request(inputWait ? { kind: "grep", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
 				signal: controller.signal, timeoutMs: mode.endsWith("deadline") ? 200 : 5000,
 				onStarted: () => { if (!inputWait) abort(); },
@@ -54,7 +56,7 @@ try {
 					if (mode.endsWith("abort")) throw new Error("late input failure");
 					return { directory: true, size: 0 };
 				},
-			}), mode.endsWith("abort") ? /cancelled running guest/ : /deadline/);
+			}), mode.endsWith("abort") ? (error) => error === reason : /deadline/);
 			assert.ok(interrupted.closed(), "Actor fallback must not race a still-running worker");
 			assert.ok(entered, "cancellation must exercise an entered guest, not just process startup");
 			late.resolve(); if (inputWait) await inputCompleted.promise;
@@ -70,64 +72,9 @@ try {
 } finally { await worker.dispose(); }
 
 async function prepareWorker(qualification = false) {
-	const started = performance.now(), child = fork(new URL(qualification ? "./portable-worker.mjs" : "../dist/closed-search-kernel.mjs", import.meta.url), [path.resolve(moduleFile)], {
-		execArgv: ["--wasm-max-mem-pages=1024", "--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
-	});
-	let pending, nextID = 0, closed = false, diagnosticBytes = 0;
-	let readyResolve, readyReject, closeResolve;
-	const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
-	const closure = new Promise((resolve) => { closeResolve = resolve; });
-	const terminate = (error) => { if (pending) pending.failure ??= error; readyReject(error); child.kill("SIGKILL"); };
-	const startup = setTimeout(() => terminate(new Error("worker preparation deadline")), 15_000);
-	child.on("error", terminate);
-	child.on("close", () => {
-		closed = true; clearTimeout(startup);
-		const error = pending?.failure ?? new Error("worker closed before completion");
-		pending?.settle(error); readyReject(error); closeResolve();
-	});
-	for (const stream of [child.stdout, child.stderr]) stream.on("data", (bytes) => {
-		if ((diagnosticBytes += bytes.length) > 1024 * 1024) terminate(new Error("worker diagnostic budget"));
-	});
-	child.on("message", (message) => {
-		if (message.type === "ready") { clearTimeout(startup); readyResolve(message); return; }
-		if (!pending || message.id !== pending.id || pending.failure) return;
-		if (message.type === "started") { try { pending.onStarted?.(); } catch (error) { terminate(error); } }
-		else if (message.type === "checkpoint") {
-			const admitted = pending;
-			Promise.resolve().then(() => admitted.onCheckpoint?.()).then(() => {
-				if (pending === admitted && !admitted.failure) child.send({ type: "resume", id: admitted.id }, (error) => { if (error) terminate(error); });
-			}, terminate);
-		} else if (message.type === "input") {
-			const admitted = pending;
-			Promise.resolve().then(() => admitted.onInput(message.operation, message.target)).then((value) => ({ value }),
-				(error) => ({ error: String(error.message ?? error).slice(0, 8192), code: error.code })).then((response) => {
-				if (pending !== admitted || admitted.failure) return;
-				if ((admitted.inputBytes += serialize(response).byteLength) > admitted.inputLimit) response = { error: "input byte budget" };
-				child.send({ type: "input", id: admitted.id, sequence: message.sequence, ...response },
-					(error) => { if (error) terminate(error); });
-			}).catch(terminate);
-		} else if (message.type === "result") pending.settle(message.error ? new Error(message.error) : undefined, message.result);
-	});
-	try {
-		const { profile, engines } = await ready;
-		return { profile, engines, preparationMs: performance.now() - started, closed: () => closed, closure,
-			dispose: async () => { if (!closed) terminate(new Error("worker disposed")); await closure; },
-			request: (input, { signal, timeoutMs = 5000, onStarted, onCheckpoint, onInput } = {}) => new Promise((resolve, reject) => {
-				if (signal?.aborted) { reject(signal.reason); return; }
-				if (closed || pending) { reject(new Error("worker unavailable/busy")); return; }
-				assert.ok(serialize(input).byteLength <= profile.limits.requestBytes, "request frame budget");
-				assert.ok(Object.values(input.image?.files ?? {}).reduce((size, bytes) => size + bytes.length, 0) <= profile.limits.inputBytes, "input byte budget");
-				const id = ++nextID, abort = () => terminate(signal.reason);
-				const timer = setTimeout(() => terminate(new Error("worker execution deadline")), timeoutMs);
-				pending = { id, onStarted, onCheckpoint, onInput, inputBytes: 0, inputLimit: profile.limits.inputBytes, settle: (error, result) => {
-					clearTimeout(timer); signal?.removeEventListener("abort", abort); pending = undefined;
-					if (error) reject(error); else resolve(result);
-				} };
-				signal?.addEventListener("abort", abort, { once: true });
-				child.send({ type: "request", id, input }, (error) => { if (error) terminate(error); });
-			}),
-		};
-	} catch (error) { terminate(error); await closure; throw error; }
+	const worker = launchClosedSearchWorker(moduleFile, qualification ? new URL("./portable-worker.mjs", import.meta.url) : undefined);
+	try { return { ...worker, ...await worker.ready }; }
+	catch (error) { await worker.dispose(); throw error; }
 }
 
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
@@ -146,14 +93,19 @@ async function qualifyPiSearch(worker, name) {
 	let inputRequests = 0, inputBytes = 0;
 	const execute = async (role, source, request, checkpoint) => {
 		counts[role]++;
+		let checkpointReached = false;
 		const inputs = source === fs ? await captureResourceVersion(undefined, root, semantics, profile.limits.inputBytes) : undefined;
 		try {
-			const output = await (role === "producer" ? worker : actorWorker).request({ kind: name, root, args: request.args, pause: !!checkpoint },
-				{ signal: request.signal, onCheckpoint: checkpoint, onInput: async (operation, target) => {
+			const output = await (role === "producer" ? worker : actorWorker).request({ kind: name, root, args: request.args },
+				{ signal: request.signal, onInput: async (operation, target) => {
 					inputRequests++;
 					if (operation === "readFile") reads.add(target);
 					const value = await readInput(inputs?.view ?? source, root, operation, target, profile.limits.inputBytes);
-					inputBytes += serialize(value).byteLength; return value;
+					inputBytes += serialize(value).byteLength;
+					if (checkpoint && !checkpointReached && operation === "readFile" && target === "/workspace/.gitignore") {
+						checkpointReached = true; await checkpoint();
+					}
+					return value;
 				} });
 			counts.contextReads += output.contextReads;
 			return { result: output.result, isError: output.isError };

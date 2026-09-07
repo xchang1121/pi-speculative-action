@@ -31,7 +31,7 @@ describe("speculative action package boundary", () => {
 
 	test.each([
 		["host-neutral core", ["src/core.ts", "src/process-reuse.ts"], ["@earendil-works/pi-"]],
-		["default Pi entry", ["src/index.ts", "src/extension.ts", "src/closed-search-kernel.mjs"], ["@thinkthread/agent-posix", "wasi-sh", "ripgrep", "globby"]],
+		["default Pi entry", ["src/index.ts", "src/extension.ts", "src/closed-search-process.mjs"], ["@thinkthread/agent-posix", "wasi-sh", "ripgrep", "globby"]],
 	] as const)("loads %s without forbidden dependencies", async (_label, entries, blocked) => importWithBlockedDependencies(entries, blocked));
 
 	test("loads ThinkThread only through its opt-in entry when the SDK is installed", async () => {

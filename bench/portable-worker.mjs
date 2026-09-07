@@ -52,7 +52,6 @@ if (readChannel) {
 
 	let active;
 	parentPort.on("message", async (message) => {
-		if (message.type === "resume") { if (active?.id === message.id) active.resume?.(); return; }
 		assert.ok(!active && message.type === "request", "unowned guest invocation");
 		active = { id: message.id };
 		const { id, input } = message;
@@ -68,7 +67,6 @@ if (readChannel) {
 				filesystem.verify();
 			} else {
 				result = await kernel.execute(input.kind, input.root, input.args, (operation, target) => readChannel(id, operation, target));
-				if (input.pause) await new Promise((resolve) => { active.resume = resolve; parentPort.postMessage({ type: "checkpoint", id }); });
 			}
 			assert.ok(serialize(result).byteLength <= limits.resultBytes, "result frame budget");
 			parentPort.postMessage({ type: "result", id, result });

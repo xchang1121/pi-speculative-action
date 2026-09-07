@@ -51,7 +51,7 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"check": "tsc --noEmit -p tsconfig.json",
-		"build": "shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs src/closed-search-kernel.mjs dist/",
+		"build": "shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs src/closed-search-kernel.mjs src/closed-search-process.mjs dist/",
 		"bench:ablation": "tsx ./bench/run.ts",
 		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:tape": "tsx ./bench/tape.ts",
