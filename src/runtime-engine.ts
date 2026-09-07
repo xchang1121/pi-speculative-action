@@ -283,19 +283,21 @@ async function projectOutput<Output, StartInput, StateData>(
 	output: Output,
 	match: ActionKeyMatch,
 	rules: readonly ActionProjectionRule<Output>[],
+	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
 	if (match.kind === "exact") return { ok: true, output, durationMs: 0 };
+	const reconstruct = candidateBranch(candidate)?.reconstruct;
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
 	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule.id);
-	if (!coverage) return { ok: false, cause: cause("projection", "coverage_missing") };
+	if (!reconstruct && !coverage) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		const projected = await rule.projectOutput({
+		const projected = reconstruct ? await reconstruct(request) : await rule.projectOutput({
 			speculative: candidate.key,
 			actor,
 			output,
-			coverage: coverage.value,
+			coverage: coverage!.value,
 			keyMatch: match,
 		});
 		const durationMs = Math.max(0, performance.now() - startedAt);
@@ -2095,17 +2097,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					attempt.rejectCandidate(candidate.id, choice.match, authorization);
 					continue;
 				}
-				const wasRunning =
-					candidate.work.execution.status === "queued" || candidate.work.execution.status === "running";
-				if (!wasRunning) {
-					const before = await validateCandidate(candidate);
-					if (stopCandidate(candidate)) break;
-					if (before.status !== "valid") {
-						attempt.rejectCandidate(candidate.id, choice.match, before.cause);
-						if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
-						continue;
-					}
-				}
 				const waiting = await waitForCandidate(
 					candidate.work.completion,
 					signal,
@@ -2133,14 +2124,12 @@ export function makeStructuralSpeculativeActionRuntime<
 					attempt.rejectCandidate(candidate.id, choice.match, execution.cause);
 					continue;
 				}
-				if (wasRunning) {
-					const after = await validateCandidate(candidate);
-					if (stopCandidate(candidate)) break;
-					if (after.status !== "valid") {
-						attempt.rejectCandidate(candidate.id, choice.match, after.cause);
-						if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
-						continue;
-					}
+				const before = await validateCandidate(candidate);
+				if (stopCandidate(candidate)) break;
+				if (before.status !== "valid") {
+					attempt.rejectCandidate(candidate.id, choice.match, before.cause);
+					if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
+					continue;
 				}
 				const branch = execution.output;
 				const compatibility = state.session.scheduler.assessCompatibility(
@@ -2161,6 +2150,8 @@ export function makeStructuralSpeculativeActionRuntime<
 					branch.output,
 					choice.match,
 					runtimeState.projectionRules,
+					{ action: actualKey, args: actualCall.input, callID: actualCall.id ?? actualKey.hash,
+						signal: signal ?? state.generation.signal },
 				);
 				if (stopCandidate(candidate)) break;
 				if (!projection.ok) {
@@ -2168,6 +2159,15 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 				candidate.projectionMs += projection.durationMs;
+				if (choice.match.kind !== "exact") {
+					const after = await validateCandidate(candidate);
+					if (stopCandidate(candidate)) break;
+					if (after.status !== "valid") {
+						attempt.rejectCandidate(candidate.id, choice.match, after.cause);
+						if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
+						continue;
+					}
+				}
 				let output = projection.output;
 				try {
 					const committed = await branch.commit();

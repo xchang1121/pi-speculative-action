@@ -243,6 +243,14 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 		return this.branch.commitMetrics;
 	}
 
+	get reconstruct(): WorldBranch<Output>["reconstruct"] {
+		if (!this.branch.reconstruct || this.attempt.descriptor.route.reuse !== "shared_result") return undefined;
+		return async (request) => {
+			if (this.validation?.status !== "valid" || !["validated", "committed"].includes(this.state)) return undefined;
+			return this.branch.reconstruct!(request);
+		};
+	}
+
 	watch(onInvalidated: (changedPath?: string) => void): void {
 		this.branch.watch?.(onInvalidated);
 	}

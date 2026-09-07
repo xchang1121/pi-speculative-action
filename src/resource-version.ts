@@ -54,7 +54,8 @@ type CapturedResource =
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
-	private readonly entries = new Map<string, CapturedResource>();
+	private entries = new Map<string, CapturedResource>();
+	private owner?: ResourceReadView;
 	private failure?: Error;
 	private capturedBytes = 0;
 	private sealed = false;
@@ -100,9 +101,21 @@ export class ResourceReadView {
 		const entry = this.entry(target);
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
-	assertComplete(): void { if (this.failure) throw this.failure; }
+	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
+	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>): Promise<T> {
+		this.assertComplete();
+		if (!this.sealed) throw new Error("resource_snapshot_not_sealed");
+		const view = new ResourceReadView(0);
+		view.entries = this.entries; view.owner = this; view.sealed = true;
+		try {
+			const output = await operation(view);
+			view.assertComplete();
+			return output;
+		} finally { view.dispose(); }
+	}
+	assertComplete(): void { this.owner?.assertComplete(); if (this.failure) throw this.failure; }
 	seal(): void { this.assertComplete(); this.sealed = true; }
-	dispose(): void { this.entries.clear(); this.failure = new Error("resource_snapshot_disposed"); }
+	dispose(): void { if (!this.owner) this.entries.clear(); this.failure = new Error("resource_snapshot_disposed"); }
 	private entry(target: string): Exclude<CapturedResource, { type: "alias" }> {
 		this.assertComplete();
 		let current = filesystemPathKey(target);

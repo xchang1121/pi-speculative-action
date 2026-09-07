@@ -834,9 +834,19 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("cannot commit a speculative world when output projection fails", async () => {
+	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted"] as const)(
+	"adopts reconstructed input only after a stable, successful evaluation: %s", async (scenario) => {
 		const commit = vi.fn(async () => "committed");
 		const candidateReady = candidateSucceeded();
+		const entered = barrier(), release = barrier(), controller = new AbortController();
+		let changed = false;
+		const actor = call("turn", { path: "README.md", offset: 10, limit: 10 });
+		const reconstruct: NonNullable<WorldBranch<string>["reconstruct"]> = async (request) => {
+			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
+			entered.arrive(); await release.promise;
+			if (scenario === "rejected") throw new Error("evaluation failed");
+			return scenario === "uncovered" ? undefined : "narrow";
+		};
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
@@ -846,22 +856,27 @@ describe("structural speculative runtime", () => {
 			source,
 			projection: true,
 			execute: () => ({
-				output: "wide",
-				backend: "test",
-				resources: [],
-				capturedBytes: 0,
-				executionMetrics: {},
-				compatibility: { status: "compatible", backend: "test", executionFingerprint: "" },
+				...world("wide", { validate: async () => changed
+					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
+					: { status: "valid", metrics: zeroValidationMetrics() } }),
+				...(scenario === "legacy-miss" ? {} : { reconstruct }),
 				commit,
-				dispose: () => {},
 			}),
 			onEvent: candidateReady.observe,
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
 		await candidateReady.promise;
 
-		expect(await fixture.runtime.consume(call("turn", { path: "README.md", offset: 10, limit: 10 }))).toBeUndefined();
-		expect(commit).not.toHaveBeenCalled();
+		const consumed = fixture.runtime.consume(actor, controller.signal);
+		if (scenario !== "legacy-miss") {
+			await entered.promise;
+			changed = scenario === "changed";
+			if (scenario === "aborted") controller.abort();
+			release.arrive();
+		}
+		expect(await consumed).toBe(scenario === "valid" ? "narrow" : undefined);
+		expect(commit).toHaveBeenCalledTimes(scenario === "valid" ? 1 : 0);
+		await fixture.runtime.finishTurn({ ...actor, terminal: true });
 	});
 
 	it("propagates an indeterminate commit instead of authorizing Actor fallback", async () => {

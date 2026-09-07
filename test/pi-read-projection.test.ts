@@ -89,125 +89,40 @@ describe("Pi read range projection", () => {
 		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20, 0))).toBeUndefined();
 	});
 
-	it("reconstructs a middle subrange and its exact continuation notice", async () => {
-		const lines = Array.from({ length: 10 }, (_, index) => `line-${index + 1}`);
-		const projected = await project(
-			readKey("notes.txt", 1, 10),
-			readKey("notes.txt", 3, 2),
-			coveredSettlement(lines, { totalLines: 20 }),
-		);
-
-		expect(outputText(projected)).toBe("line-3\nline-4\n\n[16 more lines in file. Use offset=5 to continue.]");
-		expect(projected?.result.details).toEqual(
-			expect.objectContaining({
-				[READ_RANGE_COVERAGE_DETAILS_KEY]: expect.objectContaining({
-					startLine: 3,
-					endLineExclusive: 5,
-					payloadTextLength: "line-3\nline-4".length,
-				}),
-			}),
-		);
-	});
-
-	it("preserves default-view semantics by reading through EOF", async () => {
-		const projected = await project(
-			readKey("notes.txt", 1, 2),
-			readKey("notes.txt", 3),
-			coveredSettlement(["one", "two", "three", "four", "five"]),
-		);
-
-		expect(outputText(projected)).toBe("three\nfour\nfive");
+	it.each([
+		{ name: "middle interval", spec: [1, 10], actor: [3, 2], lines: ["one", "two", "three", "four", "five"],
+			options: { totalLines: 20 }, text: "three\nfour\n\n[16 more lines in file. Use offset=5 to continue.]" },
+		{ name: "default through EOF", spec: [1, 2], actor: [3], lines: ["one", "two", "three", "four", "five"], text: "three\nfour\nfive" },
+		{ name: "zero limit", spec: [1, 5], actor: [2, 0], lines: ["one", "two", "three", "four", "five"],
+			text: "\n\n[4 more lines in file. Use offset=2 to continue.]" },
+		{ name: "realized EOF", spec: [1, 10], actor: [2, 20], lines: ["one", "two", "three", "four", "five"], text: "two\nthree\nfour\nfive" },
+		{ name: "uncovered interval", spec: [1, 4], actor: [3, 3], lines: ["one", "two", "three", "four"], options: { totalLines: 10 } },
+		{ name: "CRLF", spec: [1, 3], actor: [2, 2], lines: ["one\r", "two\r", "three"], text: "two\r\nthree" },
+		{ name: "line truncation", spec: [1, 5], actor: [1, 4], lines: ["one", "two", "three", "four", "five"],
+			options: { maxLines: 2 }, text: "one\ntwo\n\n[Showing lines 1-2 of 5. Use offset=3 to continue.]", truncatedBy: "lines" },
+		{ name: "byte truncation", spec: [1, 4], actor: [1, 3], lines: ["aa", "bb", "cc"], options: { maxBytes: 5 },
+			text: "aa\nbb\n\n[Showing lines 1-2 of 3 (5B limit). Use offset=3 to continue.]", truncatedBy: "bytes" },
+		{ name: "oversized first line", spec: [1, 3], actor: [1, 2], lines: ["abcdef", "x", "y"], options: { maxBytes: 5 } },
+	])("preserves output-only fallback: $name", async ({ spec, actor, lines, options, text, truncatedBy }) => {
+		const output = await project(readKey("notes.txt", spec[0], spec[1]), readKey("notes.txt", actor[0], actor[1]),
+			coveredSettlement(lines, options));
+		expect(outputText(output)).toBe(text);
+		if (text === undefined) expect(output).toBeUndefined();
+		else {
+			const evidence = PI_READ_RANGE_PROJECTION_RULE.captureCoverage(readKey("notes.txt", actor[0], actor[1]), output!) as ReadRangeCoverage;
+			expect(evidence.startLine).toBe(actor[0]);
+			expect(evidence.payloadTextLength).toBe(text.split("\n\n[")[0]!.length);
+			if (truncatedBy) expect(output?.result.details).toMatchObject({ truncation: { truncatedBy, outputLines: 2 } });
+		}
 	});
 
 	it("does not treat an explicit bounded read as an in-flight default view", async () => {
-		const implicit = readKey("notes.txt", 1);
-		const explicit = readKey("notes.txt", 1, 2);
+		const implicit = readKey("notes.txt", 1), explicit = readKey("notes.txt", 1, 2);
 		const firstTwo = coveredSettlement(["one", "two"], { totalLines: 5, maxLines: 2 });
-
 		expect(actionKeyCovers(implicit, explicit, [PI_READ_RANGE_PROJECTION_RULE])).toBe(true);
 		expect(actionKeyCovers(explicit, implicit, [PI_READ_RANGE_PROJECTION_RULE])).toBe(false);
-		expect(outputText(await project(implicit, explicit, firstTwo))).toBe(
-			"one\ntwo\n\n[3 more lines in file. Use offset=3 to continue.]",
-		);
+		expect(outputText(await project(implicit, explicit, firstTwo))).toBe("one\ntwo\n\n[3 more lines in file. Use offset=3 to continue.]");
 		expect(await project(explicit, implicit, firstTwo)).toBeUndefined();
-	});
-
-	it("reconstructs the intentionally empty zero-limit view", async () => {
-		const projected = await project(
-			readKey("notes.txt", 1, 5),
-			readKey("notes.txt", 2, 0),
-			coveredSettlement(["one", "two", "three", "four", "five"]),
-		);
-
-		expect(outputText(projected)).toBe("\n\n[4 more lines in file. Use offset=2 to continue.]");
-	});
-
-	it("uses complete realized coverage beyond the speculative view", async () => {
-		const projected = await project(
-			readKey("notes.txt", 1, 10),
-			readKey("notes.txt", 2, 20),
-			coveredSettlement(["one", "two", "three", "four", "five"]),
-		);
-
-		expect(outputText(projected)).toBe("two\nthree\nfour\nfive");
-	});
-
-	it("rejects an actor view outside incomplete realized coverage", async () => {
-		const projected = await project(
-			readKey("notes.txt", 1, 4),
-			readKey("notes.txt", 3, 3),
-			coveredSettlement(["one", "two", "three", "four"], { totalLines: 10 }),
-		);
-
-		expect(projected).toBeUndefined();
-	});
-
-	it("preserves CRLF bytes from the existing output payload", async () => {
-		const projected = await project(
-			readKey("windows.txt", 1, 3),
-			readKey("windows.txt", 2, 2),
-			coveredSettlement(["one\r", "two\r", "three"]),
-		);
-
-		expect(outputText(projected)).toBe("two\r\nthree");
-	});
-
-	it("reapplies line truncation and reports the projected line interval", async () => {
-		const projected = await project(
-			readKey("long.txt", 1, 5),
-			readKey("long.txt", 1, 4),
-			coveredSettlement(["one", "two", "three", "four", "five"], { maxLines: 2 }),
-		);
-
-		expect(outputText(projected)).toBe("one\ntwo\n\n[Showing lines 1-2 of 5. Use offset=3 to continue.]");
-		expect(projected?.result.details).toEqual(
-			expect.objectContaining({
-				truncation: expect.objectContaining({ truncated: true, truncatedBy: "lines", outputLines: 2 }),
-				[READ_RANGE_COVERAGE_DETAILS_KEY]: expect.objectContaining({
-					endLineExclusive: 3,
-					payloadTextLength: "one\ntwo".length,
-				}),
-			}),
-		);
-	});
-
-	it("reapplies byte truncation without splitting a line", async () => {
-		const narrowed = await project(
-			readKey("bytes.txt", 1, 4),
-			readKey("bytes.txt", 1, 3),
-			coveredSettlement(["aa", "bb", "cc"], { maxBytes: 5 }),
-		);
-		expect(outputText(narrowed)).toBe("aa\nbb\n\n[Showing lines 1-2 of 3 (5B limit). Use offset=3 to continue.]");
-	});
-
-	it("fails closed when the selected first line alone exceeds the byte limit", async () => {
-		const projected = await project(
-			readKey("bytes.txt", 1, 3),
-			readKey("bytes.txt", 1, 2),
-			coveredSettlement(["abcdef", "x", "y"], { maxBytes: 5 }),
-		);
-
-		expect(projected).toBeUndefined();
 	});
 
 	it.each([

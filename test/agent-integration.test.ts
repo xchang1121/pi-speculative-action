@@ -13,6 +13,7 @@ import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWor
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
+import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
@@ -154,6 +155,7 @@ describe("speculative action host", () => {
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: args }], "toolUse"),
 					preflight: () => true,
+					projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 					resolveInvocation: () => resourceExecution ? { ...invocation!, filesystem: async (view, request) => {
 						await speculativeExecution();
 						return resourceExecution(view, request);
@@ -197,6 +199,13 @@ describe("speculative action host", () => {
 					expect(events.find((event) => event.type === "candidate" && event.state.status === "succeeded")).toMatchObject({
 						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
 					});
+					if (toolName === "read") {
+						const query = { path: "notes.txt", offset: 2, limit: 1 };
+						const narrowed = await host.execute({ turnID, id: "another-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution);
+						expect(narrowed).toEqual(await createReadTool(cwd).execute("native", query));
+						expect(speculativeExecution).toHaveBeenCalledTimes(2); // Re-evaluation uses the sealed inputs, not the host tool.
+						expect(actorExecution).not.toHaveBeenCalled();
+					}
 					await host.finishTurn(turnID, true);
 				} finally {
 					release();

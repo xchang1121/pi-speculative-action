@@ -148,7 +148,9 @@ export async function qualifyStockTool(
 }
 
 function wire(output: ToolSettlement): ToolSettlement {
-	return decodeThinkThreadToolRunnerResponse(Buffer.from(encodeThinkThreadToolRunnerResponse(output)));
+	const decoded = decodeThinkThreadToolRunnerResponse(Buffer.from(encodeThinkThreadToolRunnerResponse(output)));
+	// Stock Pi may omit details; the extension's in-memory Symbol leaves {} after wire encoding.
+	return { ...decoded, result: { ...decoded.result, details: decoded.result.details ?? {} } };
 }
 
 async function workspaceState(root: string, relative = ""): Promise<unknown[]> {

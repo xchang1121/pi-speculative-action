@@ -95,7 +95,7 @@ export function createResourceSnapshotExecutionWorld(
 				context.signal.throwIfAborted();
 				const owned = await capture(context, operations.maxBytes());
 				try {
-					const output = await execute(owned.view!, context);
+					const output = await owned.view!.evaluate((view) => execute(view, context));
 					context.signal.throwIfAborted();
 					return await owned.seal(output);
 				} finally { await owned.dispose(); }
@@ -123,6 +123,14 @@ function resourceSnapshotBranch(
 		watch: (onInvalidated) => {
 			if (owned && !stopWatcher) stopWatcher = watchResourceVersion(owned, onInvalidated);
 		},
+		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
+			request.signal.throwIfAborted();
+			const execute = (request.action.executionContext as ToolInvocation | undefined)?.filesystem;
+			if (!owned?.view || !execute || request.action.executionFingerprint !== executionFingerprint) return undefined;
+			const result = await owned.view.evaluate((view) => execute(view, request));
+			request.signal.throwIfAborted();
+			return result;
+		} } : {}),
 		commit: async () => {
 			if (!owned) throw new Error("resource snapshot is disposed");
 			return output;

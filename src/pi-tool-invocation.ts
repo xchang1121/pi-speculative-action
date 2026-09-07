@@ -4,7 +4,6 @@ import {
 	getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolInvocation } from "./tool-settlement.ts";
-import { withPiProjectionCoverage } from "./pi-read-projection.ts";
 
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
 export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "process", readonly string[]>> = {
@@ -73,7 +72,7 @@ export function resolvePiToolInvocation(
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				const result = await definitions.get(tool)!.execute(request.callID, request.args as never, request.signal, undefined, context);
-				return { result: withPiProjectionCoverage(tool, request.args, result), isError: false };
+				return { result, isError: false };
 			},
 		};
 	}
