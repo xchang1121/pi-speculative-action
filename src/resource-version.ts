@@ -96,6 +96,7 @@ export class ResourceVersionManager {
 
 	async capture(dependencies: ReadonlyArray<ResourceDependency>): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
+		if (!dependencies.length) throw new Error("resource_dependencies_unproven");
 		const reference = this.acquireReference();
 		let release = reference;
 		try {

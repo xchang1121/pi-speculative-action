@@ -2,7 +2,7 @@
 
 这个独立 package 在不修改 Pi 本体的前提下加入投机工具执行。Drafter 与 PatternAware 预测未来工具调用；只有存在可证明安全的隔离路线时才提前执行；Actor 发出等价动作后可以采纳对应结果。
 
-本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。对 Pi 的依赖仅限于以 peer 形式声明的已发布公共扩展 API；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
+本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。Pi package 以 peer 形式声明；路径身份惰性调用已安装 Pi 的路径解析器（当前并非公共 export），布局不兼容时放弃缓存；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
 
 这是一个独立的 GitHub 仓库。其所有可达历史都只包含 speculative-action 相关改动，不包含 Pi monorepo 父提交或源码树。
 
@@ -20,13 +20,13 @@ Runtime 分为四个相互独立的层次：
 | 优先级 | 路线 | 范围 |
 |---|---|---|
 | 1 | `runtime_sandbox` | 内置 Linux/WSL 进程世界或宿主注入的 Runtime 全局世界；探测通过时优先 |
-| 2 | `resource_snapshot` | `read`、`grep`、`find`、`ls` 的本地后备，通过资源版本证据保证新鲜度 |
+| 2 | `resource_snapshot` | 只观察 Actor 已授权的 `read`、`ls` 结果；不授权提前执行 host function |
 | 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
 在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有工作区原语，再用 Sandlock 的 Landlock/seccomp 策略与虚拟文件系统限制进程。当前实现刻意不创建 user、PID 或 mount namespace，因此命令保留 Actor 的原生身份。任何内核能力、binary 或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
-工具策略不按平台或工具名硬编码。启动诊断会把每个执行世界声明的效果保证与工具要求相交：Windows、macOS、WSL 1 和探测不完整的 Linux 默认可配置 `read`、`grep`、`find`、`ls`、`write`、`edit`；Linux/WSL 2 进程世界就绪后再加入 `bash`；宿主注入覆盖全部效果的世界时则可启用全部工具。设置中已选但当前无安全路线的工具会保留偏好但处于 inactive，不会发送给投机源。
+工具策略不按平台或工具名硬编码。启动诊断会把每个执行世界声明的效果保证与工具要求相交：Windows、macOS、WSL 1 和探测不完整的 Linux 默认可配置 `read`、`ls`、`write`、`edit`；Linux/WSL 2 进程世界就绪后再加入 `bash`；宿主注入覆盖全部效果的世界时则可启用全部工具。设置中已选但当前无安全路线的工具会保留偏好但处于 inactive，不会发送给投机源。
 
 进程拦截是结构式的：统一的异步进程出口保留各 Pi 工具自己的参数校验、流式输出、截断和结果格式；Linux 世界只对精确的 exec syscall 做映射，`PATH`、普通文件打开、metadata、目录内容、写入、cwd 与环境都保持原样。Broker 身份由 executable bytes、argv、逻辑 cwd、完整环境、描述符、credential、limit、平台和策略共同决定，而不是由父 Bash 文本或工具名决定，因此不同 Bash 父命令可以复用同一个已完成子进程。
 
@@ -178,7 +178,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## ThinkThread Profile（Linux）
 
-可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行六个可移植的 Pi stock tools，不修改 Pi 本体，也不替换默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
+可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行 `read`、`ls`、`write`、`edit`，不修改 Pi 本体，也不替换默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -190,12 +190,12 @@ tt pi-speculative-action
 
 Profile 共享已有的执行与观察边界：
 
-- `speculation.execute`：`read`、`grep`、`find`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
-- Actor 的 `read`、`grep`、`find`、`ls` 统一使用宿主既有 resource observation，包括完整执行窗口的稳定性证明。思程 snapshot/content 相等不能证明 Actor 没有读到 A→B→A 的中间状态，因此不再维护第二套思程 Actor 结果快照。这条路径不需要 SDK 或投机 runner；两条路径仍由 `EffectTransaction` 管理采纳状态。
+- `speculation.execute`：`read`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
+- Actor 的 `read`、`ls` 统一使用宿主既有 resource observation，包括完整执行窗口的稳定性证明。思程 snapshot/content 相等不能证明 Actor 没有读到 A→B→A 的中间状态，因此不再维护第二套思程 Actor 结果快照。这条路径不需要 SDK 或投机 runner；两条路径仍由 `EffectTransaction` 管理采纳状态。
 
 Profile 会先尝试思程 world，并保留原生 Linux 进程 provider 与 Git 工作区 provider。Bash 不进入可移植 runner，只有当前环境的探测通过后才使用原生进程 world。注册 fallback 不代表外层思程允许嵌套 tracing、helper 或 handoff；公开思程 Runtime 当前只有 aarch64 包，Actor held-exec 实现却限定 x86-64 Linux。缺失的能力回退 Actor，不能保证思程中的完整能力或性能不低于原生路径。普通源码加载仍使用原来的默认 provider，不加载可选 SDK。
 
-`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收固定的 stock-tool runner：`grep`、`find` 以禁止写入的方式运行 Pi 原生 `rg`/`fd` 实现并验证目录树依赖；任意进程与 Bash 不在其能力声明中。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
+`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收已具备证明的固定 stock-tool runner。原生 `grep/find` 继承外部配置和可执行程序（rg 配置还可指定预处理程序）；工作区快照和当前思程验证均不能证明完整闭包。因此它们声明真实的宿主进程效果，由能力矩阵自动阻止无证据的提前执行和结果复用，Actor 行为保持原样。只有提供实际进程依赖/效果证明的 provider 才能重新启用，不维护配置文件黑名单。Bash 同样需要原生进程证明。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
 固定版本的 Agent POSIX SDK 归档现在既是 lockfile 管理的开发依赖，也是安装器的默认载荷；干净 checkout 只需 `npm ci` 即可检查、测试、构建和打包可选适配器，不依赖兄弟仓，也不再临时改写 manifest。`--agent-posix-package` 仍可显式覆盖为离线包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 

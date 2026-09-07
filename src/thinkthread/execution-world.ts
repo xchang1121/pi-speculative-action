@@ -13,7 +13,9 @@ import {
 	type FsSnapshotId,
 } from "@thinkthread/agent-posix";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "../agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../action-semantics.ts";
 import {
+	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../effect-model.ts";
@@ -45,8 +47,8 @@ const LINUX_EXECUTION_BACKEND_EPOCH = "linux-execution-v11";
 const RUNNER_MAX_OUTPUT_BYTES = 512 * 1024;
 const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DIFF_PAGE_LIMIT = 256;
-const OBSERVATION_TOOLS = ["read", "grep", "find", "ls"] as const;
-const TOOL_NAMES = new Set<string>(THINKTHREAD_TOOL_NAMES);
+const CAPABILITIES = [...new Set([...RESOURCE_OBSERVATION_EFFECTS.capabilities, ...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities])];
+const TOOL_NAMES = THINKTHREAD_TOOL_NAMES.filter((tool) => effectCapabilitiesCover(CAPABILITIES, PI_ACTION_SEMANTICS.requirements(tool)!));
 
 export interface ThinkThreadExecutionWorldOptions {
 	readonly clientFactory?: () => AgentPosixClient;
@@ -126,11 +128,8 @@ export function createThinkThreadExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		speculation: {
-			capabilities: [...new Set([
-				...RESOURCE_OBSERVATION_EFFECTS.capabilities,
-				...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-			])],
-			tools: THINKTHREAD_TOOL_NAMES,
+			capabilities: CAPABILITIES,
+			tools: TOOL_NAMES,
 			fingerprint,
 			prepare: async ({ cwd }) => { await (await prepare(cwd)).client.fs.stat(); },
 			diagnostics: async ({ cwd, refresh }) => {
@@ -140,11 +139,11 @@ export function createThinkThreadExecutionWorld(
 				await fingerprint();
 				return {
 					state: "ready",
-					detail: "ThinkThread fs.run for Pi read, grep, find, ls, write, and edit tools",
+					detail: `ThinkThread fs.run: ${TOOL_NAMES.join(", ")}; ambient process tools require a complete process proof`,
 				};
 			},
 			execute: (context) => execute(context, (world, input) =>
-				forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages)),
+			forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages)),
 		},
 		actorFallbackSettled: async () => {
 			const world = await prepared;
@@ -197,6 +196,7 @@ async function forkThinkThreadWorld(
 	autoResizeImages: boolean,
 ): Promise<WorldBranch<ToolSettlement>> {
 	const setupStarted = performance.now();
+	const tool = toolName(context.toolName);
 	const dependencies = actionDependencies(context);
 	const source = context.parentCheckpoint
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
@@ -204,7 +204,6 @@ async function forkThinkThreadWorld(
 	let target: SnapshotLease | undefined;
 	try {
 		context.signal.throwIfAborted();
-		const tool = toolName(context.toolName);
 		const request = encodeThinkThreadToolRunnerRequest({
 			version: THINKTHREAD_TOOL_RUNNER_VERSION,
 			tool,
@@ -212,7 +211,7 @@ async function forkThinkThreadWorld(
 			args: context.args,
 			autoResizeImages,
 		});
-		const writes: FsRunWrites = OBSERVATION_TOOLS.includes(tool as typeof OBSERVATION_TOOLS[number]) ? "deny" : "snapshot";
+		const writes: FsRunWrites = PI_ACTION_SEMANTICS.effect(tool) === "observation" ? "deny" : "snapshot";
 		const environment = invocationEnvironment(context.action.executionContext);
 		const runParams: FsRunKeyParamsV1 = {
 			snapshotId: source.lease.id,
@@ -418,7 +417,7 @@ function actionDependencies(context: SpeculativeToolExecutionContext): readonly 
 }
 
 function toolName(tool: string): ThinkThreadToolName {
-	if (!TOOL_NAMES.has(tool))
+	if (!TOOL_NAMES.includes(tool as ThinkThreadToolName))
 		throw new Error(`ThinkThread tool runner does not support ${tool}`);
 	return tool as ThinkThreadToolName;
 }

@@ -24,7 +24,6 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
 const roots: string[] = [];
 const readSchema = Type.Object({ path: Type.String() });
-const findSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String() });
 
 afterEach(async () => {
@@ -206,7 +205,7 @@ describe("faux LLM speculative action end to end", () => {
 		const store = patternStore(cwd, patternSettings);
 		const sessionID = "decayed-recurrence";
 		let turnID = 0;
-		const observe = (tool: "read" | "find", input: Record<string, unknown>) => {
+		const observe = (tool: "read" | "ls", input: Record<string, unknown>) => {
 			store.observe({
 				sessionID,
 				turnID: `training-${turnID++}`,
@@ -214,7 +213,7 @@ describe("faux LLM speculative action end to end", () => {
 				input,
 				outcome: "success",
 				durationMs: 80,
-				schemaHash: schemaHash(tool === "read" ? readSchema : findSchema),
+				schemaHash: schemaHash(readSchema),
 			});
 		};
 		for (let index = 0; index < 32; index++) observe("read", { path: "old.txt" });
@@ -222,7 +221,7 @@ describe("faux LLM speculative action end to end", () => {
 			store.observeTurn();
 		}
 		observe("read", { path: "old.txt" });
-		for (let index = 0; index < 3; index++) observe("find", { pattern: "target" });
+		for (let index = 0; index < 3; index++) observe("ls", { path: "." });
 		store.observe({
 			sessionID,
 			turnID: "context-marker",
@@ -236,14 +235,14 @@ describe("faux LLM speculative action end to end", () => {
 		const result = await runAgent({
 			cwd,
 			sessionID,
-			tools: [delayedRead(cwd, 80), delayedStep("find", findSchema, 80)],
-			actorTurns: [turn(fauxToolCall("find", { pattern: "target" }), 40), turn("done")],
+			tools: [delayedRead(cwd, 80), delayedStep("ls", readSchema, 80)],
+			actorTurns: [turn(fauxToolCall("ls", { path: "." }), 40), turn("done")],
 			actorTokensPerSecond: 4_000,
 			draftTurns: [],
 			settings: {
 				...patternAwareSettings(patternSettings),
 				maxConcurrentActions: 1,
-				tools: ["read", "find"],
+				tools: ["read", "ls"],
 			},
 			patternStore: store,
 		});
@@ -528,7 +527,7 @@ function delayedRead(cwd: string, durationMs: number | ((file: string) => number
 	};
 }
 
-function delayedStep(name: "find" | "ls", parameters: AgentTool["parameters"], durationMs: number): AgentTool {
+function delayedStep(name: "ls" | "ls", parameters: AgentTool["parameters"], durationMs: number): AgentTool {
 	return {
 		name,
 		label: name,

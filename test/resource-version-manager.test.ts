@@ -3,8 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, test } from "vitest";
+import { createFindTool, createGrepTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
@@ -106,19 +106,23 @@ describe("speculative action resource versions", () => {
 		releaseResourceVersion(next);
 	});
 
-	test("requires exact evidence even when a watcher reports no change", async () => {
-		const root = await workspace();
-		await fs.mkdir(path.join(root, "src"), { recursive: true });
-		await Promise.all(
-			Array.from({ length: 32 }, (_, index) =>
-				fs.writeFile(path.join(root, "src", `value-${index}.ts`), `export const value${index} = ${index}\n`),
-			),
-		);
-		const token = await captureResourceVersion(action("grep", ["src"]), root);
-		const result = await validateResourceVersion(token);
-
-		expect(result).toMatchObject({ expired: false, mode: "exact", filesRead: 32 });
-		expect(result.bytesRead).toBeGreaterThan(0);
+	test.runIf(process.platform === "linux").each(["grep", "find"] as const)("does not certify %s from workspace-only evidence", async (name) => {
+		const root = await workspace(), config = await workspace();
+		await fs.mkdir(path.join(config, "fd"));
+		const configuration = path.join(config, name === "grep" ? "rg" : "fd/ignore");
+		await fs.writeFile(configuration, "");
+		await fs.writeFile(path.join(root, "value.ts"), "alpha\n");
+		vi.stubEnv("XDG_CONFIG_HOME", config);
+		vi.stubEnv("RIPGREP_CONFIG_PATH", path.join(config, "rg"));
+		try {
+			const args = { path: ".", pattern: name === "grep" ? "alpha" : "*.ts" };
+			const tool = name === "grep" ? createGrepTool(root) : createFindTool(root);
+			const before = await tool.execute("before", args);
+			await expect(captureResourceVersion(PI_ACTION_SEMANTICS.buildKey(name, args, root)!, root))
+				.rejects.toThrow("resource_dependencies_unproven");
+			await fs.writeFile(configuration, name === "grep" ? "--glob\n!value.ts\n" : "value.ts\n");
+			expect((await tool.execute("after", args)).content).not.toEqual(before.content);
+		} finally { vi.unstubAllEnvs(); }
 	});
 
 	test.each([
@@ -196,17 +200,17 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.each([
-		{ tool: "find" as const, change: "content", expired: false },
-		{ tool: "find" as const, change: "entry", expired: true },
-		{ tool: "find" as const, change: "ignore", expired: true },
-		{ tool: "find" as const, change: "fdignore", expired: true },
-		{ tool: "ls" as const, change: "content", expired: false },
-		{ tool: "ls" as const, change: "entry", expired: true },
-		{ tool: "ls" as const, change: "git", expired: true },
-		{ tool: "grep" as const, change: "content", expired: true },
-		{ tool: "grep" as const, change: "ignore", expired: true },
-		{ tool: "grep" as const, change: "staging", expired: false },
-	])("applies $tool tree semantics to $change changes", async ({ tool, change, expired }) => {
+		{ scope: "tree_query" as const, change: "content", expired: false },
+		{ scope: "tree_query" as const, change: "entry", expired: true },
+		{ scope: "tree_query" as const, change: "ignore", expired: true },
+		{ scope: "tree_query" as const, change: "fdignore", expired: true },
+		{ scope: "tree_entries" as const, change: "content", expired: false },
+		{ scope: "tree_entries" as const, change: "entry", expired: true },
+		{ scope: "tree_entries" as const, change: "git", expired: true },
+		{ scope: "tree_content" as const, change: "content", expired: true },
+		{ scope: "tree_content" as const, change: "ignore", expired: true },
+		{ scope: "tree_content" as const, change: "staging", expired: false },
+	])("applies $scope evidence to $change changes", async ({ scope, change, expired }) => {
 		const root = await workspace();
 		const file = path.join(root, "src", "value.ts");
 		await fs.mkdir(path.dirname(file), { recursive: true });
@@ -214,7 +218,8 @@ describe("speculative action resource versions", () => {
 		await fs.writeFile(path.join(root, ".gitignore"), "generated/\n");
 		await fs.writeFile(path.join(root, "src", ".fdignore"), "hidden.ts\n");
 		const manager = new ResourceVersionManager(root, { watch: false });
-		const token = await manager.capture(resourceDependencies(action(tool, [change === "staging" ? "." : "src"]), root));
+		const semantics = new ActionSemanticsRegistry([{ ...PI_ACTION_SEMANTICS.definition("ls")!, tool: "query", resourceScope: scope }]);
+		const token = await manager.capture(resourceDependencies(action("query", [change === "staging" ? "." : "src"]), root, semantics));
 		const changed = change === "git" ? path.join(root, "src", ".git") : change === "content"
 			? file
 			: change === "ignore"
@@ -233,7 +238,7 @@ describe("speculative action resource versions", () => {
 
 	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
 		const root = await workspace();
-		const grep = PI_ACTION_SEMANTICS.definition("grep");
+		const grep = { ...PI_ACTION_SEMANTICS.definition("ls")!, resourceScope: "tree_content" as const };
 		const write = PI_ACTION_SEMANTICS.definition("write");
 		if (!grep || !write) throw new Error("Pi resource semantics unavailable");
 		const semantics = new ActionSemanticsRegistry([
@@ -273,7 +278,7 @@ describe("speculative action resource versions", () => {
 	test("keeps a manager until its final token is released, then retires it", async () => {
 		const root = await workspace();
 		await fs.writeFile(path.join(root, "value.txt"), "one\n");
-		const key = buildActionKey({ tool: "bash", resources: ["."], input: { command: "cat value.txt" } });
+		const key = action("read", ["value.txt"]);
 		const first = await captureResourceVersion(key, root);
 		const second = await captureResourceVersion(key, root);
 		releaseResourceVersion(first);
@@ -287,7 +292,7 @@ describe("speculative action resource versions", () => {
 	});
 });
 
-function action(tool: "read" | "grep" | "find" | "ls", resources: ReadonlyArray<string>) {
+function action(tool: string, resources: ReadonlyArray<string>) {
 	return buildActionKey({
 		tool,
 		resources,

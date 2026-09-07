@@ -36,7 +36,7 @@ describe("ThinkThread execution world", () => {
 
 		expect(world.speculation.capabilities).toEqual(expect.arrayContaining([...RESOURCE_OBSERVATION_EFFECTS.capabilities]));
 		expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
-		expect(world.speculation.tools).toEqual(["read", "grep", "find", "ls", "write", "edit"]);
+		expect(world.speculation.tools).toEqual(["read", "ls", "write", "edit"]);
 		expect(world.observation).toBeUndefined();
 		await expect(
 			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
@@ -69,8 +69,8 @@ describe("ThinkThread execution world", () => {
 		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
 		const cases = [
 			["read", { path: "notes.txt" }, "ThinkThread", undefined],
-			["grep", { pattern: "alpha", path: "." }, "ThinkThread", undefined],
-			["find", { pattern: "*.txt", path: "." }, "ThinkThread", undefined],
+			["grep", { pattern: "alpha", path: "." }, undefined, undefined],
+			["find", { pattern: "*.txt", path: "." }, undefined, undefined],
 			["ls", { path: "." }, "ThinkThread", undefined],
 			["write", { path: "generated.txt", content: "generated\n" }, "ThinkThread", "git_worktree"],
 			["edit", { path: "notes.txt", edits: [{ oldText: "alpha", newText: "beta" }] }, "ThinkThread", "git_worktree"],
@@ -82,13 +82,13 @@ describe("ThinkThread execution world", () => {
 			const action = buildPiActionKey(tool, args, cwd, "schema")!;
 			const request = { effect: definition.effect, requirements: definition.requirements, tool, action: warmup ? undefined : action };
 			enabled = () => true;
-			await expect(router.resolve(request, { cwd })).resolves.toMatchObject({ backend: allLayers });
+			expect((await router.resolve(request, { cwd }))?.backend).toBe(allLayers);
 			enabled = (backend) => backend !== "ThinkThread";
 			const native = await router.resolve(request, { cwd });
 			expect(native?.backend).toBe(nativeOnly);
 			enabled = (backend) => backend === "ThinkThread";
 			const unified = await router.resolve(request, { cwd });
-			expect(unified?.backend).toBe(tool === "bash" ? undefined : "ThinkThread");
+			expect(unified?.backend).toBe(allLayers === "ThinkThread" ? "ThinkThread" : undefined);
 			enabled = () => false;
 			await expect(router.resolve(request, { cwd })).resolves.toBeUndefined();
 		}
@@ -175,8 +175,6 @@ describe("ThinkThread execution world", () => {
 
 	it.each([
 		["read", { path: "notes.txt" }, "deny", { path: "notes.txt", scope: "content" }],
-		["grep", { pattern: "alpha", path: "nested" }, "deny", { path: "nested", scope: "tree_content" }],
-		["find", { pattern: "*.txt", path: "nested" }, "deny", { path: "nested", scope: "tree_content" }],
 		["ls", { path: "." }, "deny", { path: ".", scope: "tree_entries" }],
 		[
 			"write",
@@ -199,9 +197,7 @@ describe("ThinkThread execution world", () => {
 		await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
 		expect(fixture.verify).toHaveBeenCalledWith({
 			snapshotId: expect.any(String),
-			dependencies: [dependency, ...(dependency.scope === "tree_content"
-				? [".gitignore", ".ignore", ".rgignore", ".fdignore", ".git/info/exclude"].map((path) => ({ path, scope: "content" }))
-				: [])],
+			dependencies: [dependency],
 		});
 
 		await branch.dispose();

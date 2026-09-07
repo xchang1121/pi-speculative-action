@@ -228,8 +228,8 @@ describe("ExecutionWorldRouter", () => {
 		const status = toolStatuses(platformWorlds("unavailable", processDetail));
 		expect(status).toEqual({
 			read: "ready",
-			grep: "ready",
-			find: "ready",
+			grep: "unavailable",
+			find: "unavailable",
 			ls: "ready",
 			write: "registered",
 			edit: "registered",
@@ -240,8 +240,8 @@ describe("ExecutionWorldRouter", () => {
 	it.each(["Linux", "WSL 2"])("routes Bash when the Linux process world is ready on %s", () => {
 		expect(toolStatuses(platformWorlds("ready", "process isolation ready"))).toEqual({
 			read: "ready",
-			grep: "ready",
-			find: "ready",
+			grep: "unavailable",
+			find: "unavailable",
 			ls: "ready",
 			write: "registered",
 			edit: "registered",

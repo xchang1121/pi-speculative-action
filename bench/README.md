@@ -34,7 +34,7 @@ npm run bench:thinkthread-tools
 ```
 
 The command requires a live SDK `selfView` and `fs.stat` before writing any fixture; setting
-`THINKTHREAD_FS` alone is not sufficient. Each of the six stock tools compares an Actor baseline,
+`THINKTHREAD_FS` alone is not sufficient. Each qualified stock route compares an Actor baseline,
 its native fallback, and actual ThinkThread `fs.run`/validate/commit through the production gateway.
 It checks exact serialized output at the same cwd/path, all fixture entries/contents/modes, and
 no fixture changes before adoption. Native read/grep/find/ls are explicitly **Actor only**, not

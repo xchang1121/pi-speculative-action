@@ -5,6 +5,7 @@ import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import {
 	type EffectRequirements,
 	normalizeEffectRequirements,
+	effectRequirements,
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
@@ -235,6 +236,10 @@ export const BASH_TAIL_LINES_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 		BASH_TAIL_LINES_ACTION_KEY_PROJECTOR.project(speculative, actor) !== undefined,
 };
 
+// Stock query tools launch ambient executables/configuration (rg can even invoke --pre).
+// A static workspace tree is not their dependency closure or their isolation authority.
+const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities);
+
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
@@ -247,18 +252,16 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "grep",
-		epoch: "pi.grep.v3",
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "tree_content",
+		epoch: "pi.grep.v4",
+		effect: "unbounded",
+		requirements: HOST_PROCESS_EFFECTS,
 		canonicalize: canonicalGrep,
 	},
 	{
 		tool: "find",
-		epoch: "pi.find.v3",
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "tree_query",
+		epoch: "pi.find.v4",
+		effect: "unbounded",
+		requirements: HOST_PROCESS_EFFECTS,
 		canonicalize: canonicalFind,
 	},
 	{

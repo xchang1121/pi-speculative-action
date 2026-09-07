@@ -2,7 +2,7 @@
 
 This standalone package adds speculative tool execution to Pi without modifying Pi core. It predicts future tool calls with Drafter and PatternAware, executes only actions with a proven isolation route, and lets the Actor adopt a matching result.
 
-The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Its only Pi dependencies are the published public extension APIs declared as peers. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
+The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Pi packages are declared as peers. Canonical path identity lazily uses the installed Pi path resolver (not currently a public export); an incompatible layout declines caching. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
 
 This is a standalone GitHub repository. Its reachable history contains only speculative-action changes and no Pi monorepo parent or source tree.
 
@@ -20,13 +20,13 @@ Execution routes use this fixed priority:
 | Priority | Route | Scope |
 |---|---|---|
 | 1 | `runtime_sandbox` | The built-in Linux/WSL process world or an injected runtime-wide world; preferred when its probes pass |
-| 2 | `resource_snapshot` | Local fallback for `read`, `grep`, `find`, and `ls` using versioned resource evidence |
+| 2 | `resource_snapshot` | Actor-only observation for `read` and `ls`; never permission to pre-execute a host function |
 | 2 | `workspace_branch` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
 | 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
 
 On Linux and WSL 2, the default extension includes a lightweight process world. It forks the operation into the same private workspace primitive used by mutation tools, then confines it with Sandlock's Landlock/seccomp policy and virtual filesystem. The current provider deliberately creates no user, PID, or mount namespace, so commands retain the Actor's native identity. Failure of any kernel, binary, or policy probe removes this route; Windows, macOS, WSL 1, and incomplete Linux installations therefore keep Pi's ordinary Actor execution rather than silently weakening isolation.
 
-Tool policy is not hard-coded by platform or tool name. Startup diagnostics intersect each execution world's effect guarantees with each tool's requirements: Windows, macOS, WSL 1, and incompletely qualified Linux hosts configure `read`, `grep`, `find`, `ls`, `write`, and `edit` by default; a ready Linux/WSL 2 process world adds `bash`; and a host-injected all-effect world enables every tool. A selected tool with no safe route keeps its preference but remains inactive and is not sent to prediction sources.
+Tool policy is not hard-coded by platform or tool name. Startup diagnostics intersect each execution world's effect guarantees with each tool's requirements: Windows, macOS, WSL 1, and incompletely qualified Linux hosts configure `read`, `ls`, `write`, and `edit` by default; a ready Linux/WSL 2 process world adds `bash`; and a host-injected all-effect world enables every tool. A selected tool with no safe route keeps its preference but remains inactive and is not sent to prediction sources.
 
 Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, exact exec-only mappings leave `PATH`, file opens, metadata, directory contents, writes, cwd, and environment unchanged while routing executable launches to one broker. On x86-64 Linux, a native Actor boundary also stops real child `execve` events before their first instruction. Both routes use the same executable/argv/cwd/environment/process-context key, dependency certificates, result journal, and planner—not a Bash-text cache. A validated child can therefore be reused under a different parent Bash string, while a miss continues the Actor child exactly once.
 
@@ -190,7 +190,7 @@ The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted on
 
 ## ThinkThread profile (Linux)
 
-The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute the six portable Pi stock tools without changing Pi or replacing the default Linux backends. Install and launch it from Linux (Orb on macOS):
+The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute `read`, `ls`, `write`, and `edit` without changing Pi or replacing the default Linux backends. Install and launch it from Linux (Orb on macOS):
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -202,12 +202,12 @@ The installer accepts `--agent-posix-package /path/to/sdk.tgz` and `--speculativ
 
 The profile shares the existing execution and observation boundaries:
 
-- `speculation.execute`: `read`, `grep`, `find`, `ls`, `write`, and `edit` use Pi's stock implementations against a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
-- Actor `read`, `grep`, `find`, and `ls` results use the host's existing resource observation provider, including its stable execution-window proof. ThinkThread snapshot/content equality alone cannot prove that a live Actor call did not observe an intermediate A→B→A state, so there is no second ThinkThread Actor-result cache. This path needs neither the SDK nor the speculative runner. `EffectTransaction` owns adoption state for both operations.
+- `speculation.execute`: `read`, `ls`, `write`, and `edit` use Pi's stock implementations against a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
+- Actor `read` and `ls` results use the host's existing resource observation provider, including its stable execution-window proof. ThinkThread snapshot/content equality alone cannot prove that a live Actor call did not observe an intermediate A→B→A state, so there is no second ThinkThread Actor-result cache. This path needs neither the SDK nor the speculative runner. `EffectTransaction` owns adoption state for both operations.
 
 The profile's ThinkThread world is tried first; the native Linux process provider and Git workspace provider remain downstream routes. Bash is outside the portable runner and uses the native process world only when its actual environment passes qualification. Registration does not guarantee that an outer ThinkThread sandbox permits nested tracing, helpers, or handoff. In particular, the public ThinkThread Runtime is currently aarch64-only while Actor held-exec supports x86-64 Linux. Unavailable capabilities fall back to the Actor; full feature or performance parity under ThinkThread is not yet qualified. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
 
-`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. Only the fixed stock-tool runner is admitted: `grep` and `find` execute their normal Pi `rg`/`fd` implementations with writes denied and tree dependencies verified, while arbitrary process execution and Bash are not advertised by this world. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
+`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. Only the qualified fixed stock-tool runner is admitted. Stock `grep/find` inherit executable and external configuration inputs (including rg preprocessors); neither workspace-only observation nor current ThinkThread verification proves their closure. Their declared host-process effects therefore block these routes, leaving Actor execution unchanged. A provider must prove the actual process dependencies/effects before re-enabling them; there is no configuration-file blacklist. Bash likewise requires the native process proof. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
 
 The pinned Agent POSIX SDK archive is a locked development dependency and the installer's default payload, so a clean `npm ci` can check, test, build, and pack the optional adapter without a sibling checkout or manifest mutation. `--agent-posix-package` remains available for an explicit offline override. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
 

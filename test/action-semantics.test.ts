@@ -24,9 +24,9 @@ describe("ActionSemanticsRegistry", () => {
 	it("defines K(a), resource evidence, and effects without choosing an execution backend", () => {
 		expect(PI_ACTION_SEMANTICS.toolNames()).toEqual(["read", "grep", "find", "ls", "bash", "write", "edit"]);
 		expect(KEYABLE_TOOLS).toEqual(PI_ACTION_SEMANTICS.toolNames());
-		expect(OBSERVATION_ACTION_TOOLS).toEqual(["read", "grep", "find", "ls"]);
+		expect(OBSERVATION_ACTION_TOOLS).toEqual(["read", "ls"]);
 		expect(WORKSPACE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
-		expect(UNBOUNDED_ACTION_TOOLS).toEqual(["bash"]);
+		expect(UNBOUNDED_ACTION_TOOLS).toEqual(["grep", "find", "bash"]);
 
 		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
 			effect: "observation",

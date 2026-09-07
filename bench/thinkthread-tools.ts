@@ -21,8 +21,14 @@ await access(runnerPath);
 console.log(JSON.stringify({ runtime: "ThinkThread", platform: process.platform, arch: process.arch,
 	contract: CONTRACT_FINGERPRINT, attachment: attachment.kind }));
 for (const [name, args] of STOCK_TOOL_CASES) {
+	const world = createThinkThreadExecutionWorld({ runnerPath });
+	if (!world.speculation.tools?.includes(name)) {
+		console.log(JSON.stringify({ tool: name, evidence: "Not qualified: complete process dependency/effect proof unavailable" }));
+		await world.dispose?.();
+		continue;
+	}
 	console.log(JSON.stringify(await qualifyStockTool(name, args, {
-		cwd, world: createThinkThreadExecutionWorld({ runnerPath }),
+		cwd, world,
 	})));
 }
-console.log("Six stock tools passed real execution/adoption comparison; Bash and failure-recovery qualification are separate gates.");
+console.log("Qualified stock routes passed execution/adoption comparison; ambient queries, Bash and failure recovery remain separate gates.");
