@@ -6,7 +6,9 @@ import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { isMainThread } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { serialize } from "node:v8";
+import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMessageOnPort } from "node:worker_threads";
 
 // A common Actor/producer contract, NOT equivalence with ambient native rg/fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
@@ -22,6 +24,65 @@ export const CLOSED_SEARCH_PROFILE = Object.freeze({
 });
 
 let owned = false;
+
+/** One synchronous input mailbox, relayed outside the guest's blocked JS/WASM stack. */
+export function connectClosedSearchWorker(entry) {
+	if (isMainThread) {
+		assert.ok(process.send && ["--wasm-max-mem-pages=1024", "--max-old-space-size=128"].every((flag) => process.execArgv.includes(flag)), "Search requires a bounded child process");
+		const control = new Int32Array(new SharedArrayBuffer(4)), { port1, port2 } = new MessageChannel();
+		const guest = new Worker(new URL(entry), { argv: process.argv.slice(2), workerData: { control, inputPort: port2 }, transferList: [port2] });
+		let pending;
+		guest.on("message", (message) => {
+			assert.ok(serialize(message).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "worker frame budget");
+			if (message.type === "input") { assert.ok(!pending, "overlapping input requests"); pending = message; }
+			process.send(message, (error) => { if (error) throw error; });
+		});
+		process.on("message", (message) => {
+			assert.ok(serialize(message).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "host frame budget");
+			if (message.type !== "input") { guest.postMessage(message); return; }
+			assert.ok(pending && message.id === pending.id && message.sequence === pending.sequence, "unowned input response");
+			port1.postMessage(message); pending = undefined;
+			Atomics.store(control, 0, 1); Atomics.notify(control, 0);
+		});
+		process.once("disconnect", () => process.exit(1));
+		guest.on("error", (error) => { throw error; });
+		guest.on("exit", (code) => process.exit(code));
+		return;
+	}
+	let sequence = 0;
+	return (id, operation, target) => {
+		const expected = ++sequence;
+		Atomics.store(workerData.control, 0, 0);
+		parentPort.postMessage({ type: "input", id, sequence: expected, operation, target });
+		while (Atomics.load(workerData.control, 0) === 0) Atomics.wait(workerData.control, 0, 0);
+		const response = receiveMessageOnPort(workerData.inputPort)?.message;
+		assert.ok(response?.id === id && response.sequence === expected, "unowned input frame");
+		if (response.error) throw Object.assign(new Error(response.error), { code: response.code });
+		return response.value;
+	};
+}
+
+// Direct IPC entry exposes fixed searches only; importing the kernel never starts workers.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	const readInput = connectClosedSearchWorker(import.meta.url);
+	if (readInput) {
+		const kernel = await createClosedSearchKernel(await readFile(process.argv[2]));
+		let active = false;
+		parentPort.on("message", async ({ type, id, input }) => {
+			assert.ok(!active && type === "request" && Number.isSafeInteger(id) && id > 0, "unowned search invocation");
+			active = true;
+			try {
+				parentPort.postMessage({ type: "started", id });
+				const result = await kernel.execute(input.kind, input.root, input.args, (operation, target) => readInput(id, operation, target));
+				assert.ok(serialize(result).byteLength <= CLOSED_SEARCH_PROFILE.limits.resultBytes, "result frame budget");
+				parentPort.postMessage({ type: "result", id, result });
+			} catch (error) { parentPort.postMessage({ type: "result", id, error: String(error?.message ?? error).slice(0, 8192) }); }
+			finally { active = false; }
+		});
+		parentPort.postMessage({ type: "ready", profile: CLOSED_SEARCH_PROFILE });
+	}
+}
+
 /** Trusted, fixed search engines. The caller owns input evidence and hard process termination. */
 export async function createClosedSearchKernel(moduleBytes) {
 	assert.ok(!isMainThread && !owned, "Search kernels require their own worker lifetime");

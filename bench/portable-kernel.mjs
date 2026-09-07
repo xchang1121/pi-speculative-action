@@ -9,7 +9,7 @@ import { serialize } from "node:v8";
 // Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
 const moduleFile = process.argv[2];
 assert.ok(moduleFile, "Usage: node bench/portable-kernel.mjs <installed closed-search.wasm> [--pi-tools]");
-const started = performance.now(), worker = await prepareWorker();
+const started = performance.now(), worker = await prepareWorker(true);
 try {
 	const seed = { "/workspace/a.txt": Buffer.from("before\nneedle\nafter\n"), "/workspace/sub/b.txt": Buffer.from("needle two\n") };
 	const kernel = (commands, options) => worker.request({ kind: "kernel", image: { files: seed, directories: [] }, commands }, options);
@@ -35,13 +35,13 @@ try {
 	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
 	const pi = {};
 	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) {
-		const executor = name === "grep" ? worker : await prepareWorker();
+		const executor = name === "grep" ? worker : await prepareWorker(true);
 		try { pi[name] = await qualifyPiSearch(executor, name); }
 		finally { await executor.dispose(); }
 	}
 	const cancellation = [];
 	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
-		const interrupted = await prepareWorker(), controller = new AbortController();
+		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
 		const late = Promise.withResolvers(), inputCompleted = Promise.withResolvers(), inputWait = mode.startsWith("input");
 		try {
 			const arrived = performance.now(); let entered = false;
@@ -69,8 +69,8 @@ try {
 		admission: "qualification only: full search IPC and termination, not arbitrary shell mutations, native equivalence, or production enablement" }, null, 2));
 } finally { await worker.dispose(); }
 
-async function prepareWorker() {
-	const started = performance.now(), child = fork(new URL("./portable-worker.mjs", import.meta.url), [path.resolve(moduleFile)], {
+async function prepareWorker(qualification = false) {
+	const started = performance.now(), child = fork(new URL(qualification ? "./portable-worker.mjs" : "../dist/closed-search-kernel.mjs", import.meta.url), [path.resolve(moduleFile)], {
 		execArgv: ["--wasm-max-mem-pages=1024", "--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
 	});
 	let pending, nextID = 0, closed = false, diagnosticBytes = 0;
@@ -207,6 +207,7 @@ async function qualifyPiSearch(worker, name) {
 	try {
 		actorWorker = await prepareWorker();
 		assert.deepEqual(actorWorker.profile, profile, "independent execution capacity must keep the same identity");
+		await assert.rejects(actorWorker.request({ kind: "kernel", commands: [] }), /closed search operation denied/);
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(searchRoot); await fs.mkdir(path.join(searchRoot, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "ignored.*\n");

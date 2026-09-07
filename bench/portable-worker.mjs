@@ -2,30 +2,13 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { serialize } from "node:v8";
-import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMessageOnPort } from "node:worker_threads";
+import { parentPort } from "node:worker_threads";
 
-import { CLOSED_SEARCH_PROFILE, createClosedSearchKernel } from "../dist/closed-search-kernel.mjs";
+import { CLOSED_SEARCH_PROFILE, createClosedSearchKernel, connectClosedSearchWorker } from "../dist/closed-search-kernel.mjs";
 
 // Qualification entry, not a production provider: fixed engines, no guest host ports, one invocation at a time.
-if (isMainThread) {
-	assert.ok(process.send, "Start through portable-kernel.mjs");
-	// Own the single synchronous input mailbox outside the guest's blocked JS/WASM stack.
-	const control = new Int32Array(new SharedArrayBuffer(4)), { port1, port2 } = new MessageChannel();
-	const guest = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2), workerData: { control, inputPort: port2 }, transferList: [port2] });
-	let pending;
-	guest.on("message", (message) => {
-		if (message.type === "input") { assert.ok(!pending); pending = message; }
-		process.send(message);
-	});
-	process.on("message", (message) => {
-		if (message.type !== "input") { guest.postMessage(message); return; }
-		assert.ok(pending && message.id === pending.id && message.sequence === pending.sequence, "unowned input response");
-		port1.postMessage(message); pending = undefined;
-		Atomics.store(control, 0, message.sequence); Atomics.notify(control, 0);
-	});
-	guest.on("error", (error) => { throw error; });
-	guest.on("exit", (code) => process.exit(code));
-} else {
+const readChannel = connectClosedSearchWorker(import.meta.url);
+if (readChannel) {
 	const rg = await readFile(process.argv[2]);
 	await assert.rejects(createClosedSearchKernel(Buffer.from("unqualified")), /Requalify the search module/);
 	const supplied = Buffer.from(rg), preparing = createClosedSearchKernel(supplied);
@@ -44,17 +27,6 @@ if (isMainThread) {
 	// _start announces actual guest entry, then loops without further imports. Import quotas cannot cancel it.
 	const spin = await WebAssembly.compile(Buffer.from("0061736d01000000010401600000020f0103656e7607656e7465726564000003020100070a01065f737461727400010a0b010900100003400c000b0b", "hex"));
 	const mutations = ["createFileSync", "mkdirSync", "writeSync", "touchSync", "unlinkSync", "rmdirSync", "renameSync", "linkSync"];
-	let sequence = 0;
-
-	function readInput(operation, target) {
-		const expected = ++sequence;
-		parentPort.postMessage({ type: "input", id: active.id, sequence: expected, operation, target });
-		Atomics.wait(workerData.control, 0, expected - 1);
-		const response = receiveMessageOnPort(workerData.inputPort)?.message;
-		assert.ok(response?.id === active.id && response.sequence === expected, "unowned input frame");
-		if (response.error) throw Object.assign(new Error(response.error), { code: response.code });
-		return response.value;
-	}
 
 	function imageStore(image) {
 		assert.ok(Object.keys(image.files).length + image.directories.length <= limits.entries, "input entry budget");
@@ -95,7 +67,7 @@ if (isMainThread) {
 				for (const command of input.commands) result.push(await kernel.run(modules[command.name], [command.name, ...command.args], filesystem.store));
 				filesystem.verify();
 			} else {
-				result = await kernel.execute(input.kind, input.root, input.args, readInput);
+				result = await kernel.execute(input.kind, input.root, input.args, (operation, target) => readChannel(id, operation, target));
 				if (input.pause) await new Promise((resolve) => { active.resume = resolve; parentPort.postMessage({ type: "checkpoint", id }); });
 			}
 			assert.ok(serialize(result).byteLength <= limits.resultBytes, "result frame budget");

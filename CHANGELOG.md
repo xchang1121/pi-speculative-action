@@ -34,9 +34,11 @@
 - Consolidated authoritative execution and observation into the gateway's single frozen settlement;
   observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
 - Added explicit, hash-verified `setup:search` module installation without npm CLI links or Actor PATH changes.
+- Added the fixed-search IPC entry and shared synchronous input mailbox. Full-tool qualification uses
+  that entry for Actor searches; importing it is inert, and arbitrary qualification commands are denied.
 - Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
   implementation used by qualification. Native Actor defaults are unchanged; production worker
-  ownership, binary delivery, and TUI profile selection remain pending.
+  pooling and TUI profile selection remain pending.
 - Added task-clustered bootstrap confidence intervals and nearest-rank p95 to
   suite latency reports; pooled acceleration remains a ratio of means, and
   repeats of the same instance stay in one resampled cluster.
