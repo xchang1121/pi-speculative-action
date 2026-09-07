@@ -55,7 +55,7 @@ describe("ThinkThread stock Pi tool runner", () => {
 		["ls", { path: "." }],
 		["write", { path: "generated.txt", content: "generated\n" }],
 		["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
-	] as const)("matches the native fallback for Pi %s output and workspace effects", async (tool, args) => {
+	] as const)("matches stock Pi %s and its applicable fallback (local runner, not Runtime)", async (tool, args) => {
 		const [nativeRoot, thinkThreadRoot] = await Promise.all([
 			mkdtemp(path.join(os.tmpdir(), "pi-native-tool-")),
 			mkdtemp(path.join(os.tmpdir(), "pi-thinkthread-tool-")),
@@ -64,10 +64,12 @@ describe("ThinkThread stock Pi tool runner", () => {
 		await Promise.all([seed(nativeRoot), seed(thinkThreadRoot)]);
 		const request = runnerRequest(tool, args);
 
-		const [fallback, isolated] = await Promise.all([
+		const [fallback, runner] = await Promise.all([
 			runFallbackTool(request, nativeRoot),
 			runThinkThreadTool(request, thinkThreadRoot),
 		]);
+		const isolated = decodeThinkThreadToolRunnerResponse(Buffer.from(encodeThinkThreadToolRunnerResponse(runner)));
+		expect(isolated.isError).toBe(false);
 		expect(normalizeWorkspace(isolated, thinkThreadRoot)).toEqual(normalizeWorkspace(fallback, nativeRoot));
 		expect(await workspaceState(thinkThreadRoot)).toEqual(await workspaceState(nativeRoot));
 	});
