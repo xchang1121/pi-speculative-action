@@ -15,7 +15,7 @@ import type {
 	WorldCompatibilityEvidence,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
-import { assertNoSymlinkPath, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, assertNoSymlinkPath, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import {
@@ -239,9 +239,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 	private lastStructure: WorkspaceStructureSnapshot;
 	private readonly frontier: Map<string, RegularFileState | undefined>;
 	private poisonReason?: string;
-	private clockSequence = 0;
-	private clockDevice?: number;
-	private clockHandle?: FileHandle;
+	private clock?: { readonly handle: FileHandle; readonly identity: import("node:fs").Stats };
 	private disposed = false;
 
 	constructor(
@@ -397,8 +395,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 			) {
 				throw new Error("workspace transaction clock is not private or its backing timestamp domain changed");
 			}
-			this.clockDevice = clock.dev;
-			this.clockHandle = handle;
+			this.clock = { handle, identity: clock };
 			retained = true;
 		} finally {
 			if (!retained) await handle.close();
@@ -409,27 +406,8 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 		let boundary = Number.NEGATIVE_INFINITY;
 		for (const entry of snapshot.entries.values()) boundary = Math.max(boundary, entry.changeTimeMs);
 		if (!Number.isFinite(boundary)) throw new Error("workspace change clock boundary is unavailable");
-		const deadline = Date.now() + WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS;
-		for (;;) {
-			const handle = this.clockHandle;
-			if (!handle) throw new Error("workspace transaction clock is unavailable");
-			let changedAt: number;
-			const identity = await handle.stat();
-			if (
-				!identity.isFile() ||
-				identity.nlink !== this.expectedClockLinks ||
-				this.clockDevice === undefined ||
-				identity.dev !== this.clockDevice
-			) {
-				throw new Error("workspace transaction clock identity changed");
-			}
-			await handle.truncate(0);
-			await handle.write(`${++this.clockSequence}\n`, 0, "utf8");
-			changedAt = (await handle.stat()).ctimeMs;
-			if (changedAt > boundary) return;
-			if (Date.now() >= deadline) throw new Error("filesystem change clock did not advance");
-			await new Promise<void>((resolve) => setTimeout(resolve, 1));
-		}
+		if (!this.clock) throw new Error("workspace transaction clock is unavailable");
+		await advanceFilesystemClock(this.clock.handle, boundary, this.clock.identity);
 	}
 
 	async abort(capture: GitWorkspaceTransactionCapture): Promise<void> {
@@ -447,9 +425,9 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 			this.disposed = true;
 			for (const capture of this.active) capture.contaminated = true;
 			this.active.clear();
-			const clock = this.clockHandle;
-			this.clockHandle = undefined;
-			await clock?.close();
+			const clock = this.clock;
+			this.clock = undefined;
+			await clock?.handle.close();
 		});
 
 	private async synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
@@ -593,7 +571,6 @@ const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
 const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
 const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
-const WORKSPACE_TRANSACTION_CLOCK_TIMEOUT_MS = 100;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
 const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";

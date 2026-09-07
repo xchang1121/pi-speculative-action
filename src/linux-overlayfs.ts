@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
+import { advanceFilesystemClock } from "./filesystem-evidence.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
@@ -320,14 +321,14 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 				throw new Error("OverlayFS backing roots do not share an anonymous transaction-clock filesystem");
 			}
 			const priorBoundary = Math.max(workspace.ctimeMs, ...beforeEntries.map((entry) => entry.ctimeMs));
-			await advanceAnonymousClock(clock, priorBoundary);
+			await advanceFilesystemClock(clock, priorBoundary, anonymous);
 			const orderProbe = path.join(root, "clock-order-probe.txt");
 			await writeFile(orderProbe, "ordered\n", "utf8");
 			const [changedRoot, changedFile] = await Promise.all([lstat(root), lstat(orderProbe)]);
 			if (changedRoot.ctimeMs <= priorBoundary || changedFile.ctimeMs <= priorBoundary) {
 				throw new Error("OverlayFS merged timestamps are not ordered by the private backing clock");
 			}
-			await advanceAnonymousClock(clock, Math.max(changedRoot.ctimeMs, changedFile.ctimeMs));
+			await advanceFilesystemClock(clock, Math.max(changedRoot.ctimeMs, changedFile.ctimeMs), anonymous);
 			await rm(orderProbe);
 		} finally {
 			await clock.close();
@@ -371,19 +372,6 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if (safeToRemove) await rm(probeRoot, { recursive: true, force: true }).catch(() => undefined);
 	}
 	return outcome;
-}
-
-async function advanceAnonymousClock(clock: FileHandle, boundary: number): Promise<number> {
-	const deadline = Date.now() + 100;
-	let sequence = 0;
-	for (;;) {
-		await clock.truncate(0);
-		await clock.write(`${++sequence}\n`, 0, "utf8");
-		const changedAt = (await clock.stat()).ctimeMs;
-		if (changedAt > boundary) return changedAt;
-		if (Date.now() >= deadline) throw new Error("anonymous transaction clock did not advance");
-		await new Promise<void>((resolve) => setTimeout(resolve, 1));
-	}
 }
 
 async function startLinuxOverlayfs(input: {

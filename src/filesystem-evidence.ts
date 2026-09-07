@@ -21,6 +21,31 @@ export function sameFilesystemIdentity(
 	return IDENTITY_FIELDS.every((field) => left[field] === right[field]);
 }
 
+/** Fence workspace timestamps with a private descriptor; elapsed budgets must not use wall time. */
+export async function advanceFilesystemClock(
+	clock: import("node:fs/promises").FileHandle,
+	boundary: number,
+	identity: Pick<import("node:fs").Stats, "dev" | "ino" | "nlink">,
+): Promise<void> {
+	const deadline = performance.now() + 100;
+	const stamp = async () => {
+		const current = await clock.stat();
+		if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino || current.nlink !== identity.nlink) {
+			throw new Error("workspace transaction clock identity changed");
+		}
+		return current.ctimeMs;
+	};
+	for (let sequence = 0; ; sequence++) {
+		await stamp();
+		await clock.truncate(0);
+		await clock.write(`${sequence}\n`, 0, "utf8");
+		const current = await stamp();
+		if (current > boundary) return;
+		if (performance.now() >= deadline) throw new Error(`filesystem change clock did not advance: boundary=${boundary}, clock=${current}`);
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+}
+
 /** Hash one regular file through a single descriptor and prove its path still names that descriptor. */
 export async function captureStableFile(
 	target: string,

@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import {
@@ -15,6 +15,7 @@ import {
 } from "../src/effect-model.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
+import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
@@ -634,24 +635,27 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("poisons reuse if the private change-clock identity is replaced", async ({ skip }) => {
-		if (process.platform === "win32") return skip("hard-link identity semantics differ on Windows");
-		const root = await temporaryRoot("transaction-clock");
+	it("fences clock advance, stalled timestamps and replaced identities independently of wall-clock jumps", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+		let wall = 0;
+		const wallClock = vi.spyOn(Date, "now").mockImplementation(() => wall += 1_000);
 		try {
-			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
-			await withSandboxWorkspace(root, async (workspace) => {
-				const first = await workspace.transactions.begin();
-				await first.abort();
-				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
-				await link(clock, path.join(workspace.processRoot, "workspace-transaction.alias"));
-				const second = await workspace.transactions.begin();
-				const delta = await second.finish();
-				expect(delta.complete).toBe(false);
-				if (delta.complete) throw new Error("replaced workspace clock was unexpectedly accepted");
-				expect(delta.reason).toContain("workspace transaction clock identity changed");
-			});
+			for (const state of ["advance", "stalled", "aliased", "replaced"]) {
+				const identity = { dev: 1, ino: 2, nlink: 1 };
+				let queries = 0;
+				const clock = { truncate: async () => {}, write: async () => {}, stat: async () => ({
+					...identity, isFile: () => true, ctimeMs: state === "advance" && ++queries > 3 ? 11 : 10,
+					...(state === "aliased" ? { nlink: 2 } : state === "replaced" ? { ino: 3 } : {}),
+				}) } as unknown as FileHandle;
+				const pending = advanceFilesystemClock(clock, 10, identity);
+				const assertion = state === "advance" ? expect(pending).resolves.toBeUndefined()
+					: expect(pending).rejects.toThrow(state === "stalled" ? "did not advance" : "identity changed");
+				await vi.runAllTimersAsync();
+				await assertion;
+			}
 		} finally {
-			await rm(root, { recursive: true, force: true });
+			wallClock.mockRestore();
+			vi.useRealTimers();
 		}
 	});
 
