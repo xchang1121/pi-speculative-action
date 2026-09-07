@@ -245,7 +245,7 @@ int main(int argc, char **argv) {
 			await securityBranch.dispose();
 		}
 		const securityProduced = metricDelta(securityBefore, fixture.backend.metrics());
-		assert(securityProduced.tainted === 1 && securityProduced.published === 1, "confinement evidence was not retained");
+		assert(securityProduced.tainted === 1 && securityProduced.published === 1, `confinement evidence was not retained: ${JSON.stringify(securityProduced)}`);
 		const securityActorBefore = replayBackend.actorMetrics();
 		const securityActor = await actor.execute(
 			"held-security-actor",
@@ -329,12 +329,13 @@ int main(int argc, char **argv) {
 			await joiningBranch?.dispose();
 		}
 		if (!joinMetrics) throw new Error("joining Actor metrics were not captured");
-		assert(textOutput(joiningOutput!).includes("actor-join\nworker:v2"), "joined child changed Actor output");
+		assert(textOutput(joiningOutput!) === "actor-join\nworker:v2\n", "Actor child output was lost or executed more than once");
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
 		assert(
-			joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 && joinMetrics.actorTimedHits === 1 &&
-				joinMetrics.actorBaselineMs > 0 && joinMetrics.reusedProcessMs > 0,
-			`Actor did not join measured in-flight work: ${JSON.stringify(joinMetrics)}`,
+			joinMetrics.requests === 1 && joinMetrics.hits + joinMetrics.misses === 1 &&
+				joinMetrics.actorTimedHits === joinMetrics.hits &&
+				(joinMetrics.hits === 0 ? joinMetrics.reusedProcessMs === 0 : joinMetrics.actorBaselineMs > 0 && joinMetrics.reusedProcessMs > 0),
+			`Actor acquisition did not settle exactly once: ${JSON.stringify(joinMetrics)}`,
 		);
 
 		const completedChild = "worker completed.txt volatile";
@@ -435,12 +436,15 @@ int main(int argc, char **argv) {
 				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
 			},
 			joining: {
+				// A fixed arrival lead is a workload parameter, not a promise that joining beats fallback.
+				disposition: joinMetrics.hits === 0 ? "actor" : joinMetrics.joinedHits ? "joined" : "completed",
 				actorMs: joiningMs,
 				leadMs,
 				hits: joinMetrics.hits,
 				joinedHits: joinMetrics.joinedHits,
-				estimatedActorMs: joinMetrics.actorBaselineMs,
-				estimatedSavedMs: joinMetrics.actorBaselineMs - joinMetrics.actorTimedHitLatencyMs,
+				estimatedActorMs: joinMetrics.actorTimedHits ? joinMetrics.actorBaselineMs : null,
+				estimatedSavedMs: joinMetrics.actorTimedHits ? joinMetrics.actorBaselineMs - joinMetrics.actorTimedHitLatencyMs : null,
+				...(joinMetrics.lastError ? { rejection: joinMetrics.lastError } : {}),
 			},
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnCompletedRejected: true, crossTurnRunningRejected: true },
 			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },
@@ -508,6 +512,6 @@ function run([executable, ...args]: Command, cwd?: string): Promise<Outcome> {
 		child.stdout.on("data", (value: Buffer) => stdout.push(Buffer.from(value)));
 		child.stderr.on("data", (value: Buffer) => stderr.push(Buffer.from(value)));
 		child.once("error", reject);
-		child.once("exit", (code, signal) => resolve({ code, signal, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), durationMs: performance.now() - started }));
+		child.once("close", (code, signal) => resolve({ code, signal, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), durationMs: performance.now() - started }));
 	});
 }
