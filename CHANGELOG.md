@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Removed `BASH_TAIL_LINES_ACTION_KEY_PROJECTOR`, `PI_BASH_TAIL_LINES_PROJECTION_RULE`,
+  `BashTailLinesView`, and `bashTailLinesView`: shell text cannot prove the behavior of a resolved
+  `tail` command. Exact Bash adoption and native process-certificate reuse remain available.
 - Removed the unused `ActionReuseKind`, `actionKeyProjects`, and `artifact_seed` planner surfaces;
   process reuse now has one completed-replay path and otherwise executes the Actor action.
 - Removed provider-side self-fork controls from Drafter-model requests. Self-speculation now decorates and forks only the authoritative Actor stream.

@@ -54,7 +54,7 @@ Nested process misses use the same generic workspace-transaction outlet as the o
 - A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
 - Same-name custom tools remain authoritative and are excluded unless the host explicitly supplies matching semantics and execution capability.
 
-`read` supports lossless range projection backed by realized output coverage. `grep`, `find`, and `ls` remain exact-key-only.
+`read` retains lossless range projection backed by realized output coverage. Other queries may be recomputed only from a world's sealed inputs; an input lookup is not output equivalence. Bash reuse requires an exact whole-command match or native process certificates. A textual suffix such as `| tail -n 20` is not a proof: `tail` may be a function or a different executable with different output, effects, or exit status.
 
 ## Install and use
 

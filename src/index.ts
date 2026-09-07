@@ -21,9 +21,6 @@ export {
 	type ActionKeyMismatchReason,
 	actionKeyMismatchReason,
 	actionKeyProjectionPartitions,
-	BASH_TAIL_LINES_ACTION_KEY_PROJECTOR,
-	type BashTailLinesView,
-	bashTailLinesView,
 	buildPiActionKey,
 	FIND_DEFAULT_LIMIT,
 	GREP_DEFAULT_LIMIT,
@@ -109,7 +106,6 @@ export {
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
-export { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "./pi-bash-projection.ts";
 export {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,

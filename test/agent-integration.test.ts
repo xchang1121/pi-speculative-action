@@ -12,7 +12,6 @@ import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
-import { PI_BASH_TAIL_LINES_PROJECTION_RULE } from "../src/pi-bash-projection.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
@@ -293,93 +292,31 @@ describe("speculative action host", () => {
 		} finally { releaseBinding.resolve(); await host.dispose(); }
 	});
 
-	it("adopts an in-flight projected Bash view from a runtime-wide sandbox", async () => {
-		const cwd = await temporaryWorkspace();
-		let actorExecutions = 0;
-		let sandboxExecutions = 0;
-		let releaseSandbox!: () => void;
-		const sandboxGate = new Promise<void>((resolve) => {
-			releaseSandbox = resolve;
-		});
+	it.each(["running", "completed"])("does not adopt a %s Bash command through an unproven suffix relation", async (phase) => {
+		const cwd = await temporaryWorkspace(), started = deferred<void>(), finish = deferred<void>(), completed = deferred<void>();
+		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "tail arguments: -n 2" }], details: {} }));
+		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor };
 		const dispose = vi.fn();
-		const tool: AgentTool<typeof bashSchema> = {
-			name: "bash",
-			label: "bash",
-			description: "bash",
-			parameters: bashSchema,
-			execute: async () => {
-				actorExecutions++;
-				return { content: [{ type: "text", text: "actor" }], details: {} };
-			},
-		};
-		const sandbox = mockRuntimeWorld(
-			async () => {
-				sandboxExecutions++;
-				await sandboxGate;
-				const text = `${Array.from({ length: 60 }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
-				const output = {
-					result: { content: [{ type: "text" as const, text }], details: {} },
-					isError: false,
-				};
-				return output;
-			},
-			dispose,
-		);
-		const events: SpeculativeActionEvent<string>[] = [];
+		const sandbox = mockRuntimeWorld(async () => {
+			started.resolve(); await finish.promise;
+			return { result: { content: [{ type: "text", text: "tail arguments: -n 3" }], details: {} }, isError: false };
+		}, dispose);
 		const host = createSpeculativeActionHost("session", {
-			cwd,
-			getSettings: () => ({ ...settings(), tools: ["bash"] }),
-			draftModel: model("draft"),
-			complete: async () =>
-				assistant(
-					[
-						{
-							type: "toolCall",
-							id: "draft-bash",
-							name: "bash",
-							arguments: { command: "pytest -q 2>&1 | tail -60" },
-						},
-					],
-					"toolUse",
-				),
-			preflight: () => true,
-			resolveInvocation: (toolName, input) =>
-				resolvePiToolInvocation(toolName, input, { cwd, environment: {}, shellPath: process.execPath }),
-			projectionRules: [PI_BASH_TAIL_LINES_PROJECTION_RULE],
-			executionWorlds: [sandbox, sandbox],
-			onEvent: (event) => {
-				events.push(event);
-			},
+			cwd, getSettings: () => ({ ...settings(), tools: ["bash"] }), draftModel: model("draft"),
+			complete: async () => assistant([{ type: "toolCall", id: "draft-bash", name: "bash",
+				arguments: { command: "printf data 2>&1 | tail -n 3" } }], "toolUse"),
+			preflight: () => true, executionWorlds: [sandbox, sandbox],
+			resolveInvocation: (name, args) => resolvePiToolInvocation(name, args, { cwd, environment: {}, shellPath: process.execPath }),
+			onEvent: (event) => { if (event.type === "candidate" && event.state.status === "succeeded") completed.resolve(); },
 		});
-
-		await host.startTurn(startInput(tool));
-		await waitFor(() => sandboxExecutions === 1);
-		let settled = false;
-		const pendingHit = host
-			.consume({
-				turnID: "turn-1",
-				id: "actor-bash",
-				tool: "bash",
-				args: { command: "pytest -q 2>&1 | tail -20" },
-				tools: [tool],
-			})
-			.then((hit) => {
-				settled = true;
-				return hit;
-			});
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(settled).toBe(false);
-		releaseSandbox();
-		const hit = await pendingHit;
-
-		const expected = `${Array.from({ length: 20 }, (_, index) => `line-${index + 41}`).join("\n")}\n`;
-		expect(hit?.result.content).toEqual([{ type: "text", text: expected }]);
-		expect(sandboxExecutions).toBe(1);
-		expect(actorExecutions).toBe(0);
-		expect(events.find((event) => event.type === "candidate")).toMatchObject({
-			candidate: { execution: "runtime_sandbox" },
-		});
-		await host.dispose();
+		try {
+			await host.startTurn(startInput(tool)); await started.promise;
+			if (phase === "completed") { finish.resolve(); await completed.promise; }
+			const output = await host.execute({ turnID: "turn-1", id: "actor-bash", tool: "bash",
+				args: { command: "printf data 2>&1 | tail -n 2" }, tools: [tool] }, undefined, actor);
+			expect(output.content).toEqual([{ type: "text", text: "tail arguments: -n 2" }]);
+			expect(actor).toHaveBeenCalledOnce();
+		} finally { finish.resolve(); await host.dispose(); }
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 

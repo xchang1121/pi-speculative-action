@@ -23,12 +23,6 @@ export interface ReadActionRange {
 	readonly end: number;
 }
 
-export interface BashTailLinesView {
-	/** Exact output-producing command before the final `tail` stage. */
-	readonly core: string;
-	readonly lines: number;
-}
-
 export interface ActionKey {
 	readonly key: string;
 	readonly hash: string;
@@ -234,22 +228,6 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 	canShareInFlight: readRangesShareInFlight,
 };
 
-/** π_bash_tail narrows one complete stdout/stderr suffix to a shorter suffix. */
-export const BASH_TAIL_LINES_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
-	id: "bash.tail_lines",
-	partition: bashTailProjectionPartition,
-	project: (speculative, actor) => {
-		const speculativeView = bashTailLinesView(speculative);
-		const actorView = bashTailLinesView(actor);
-		if (!speculativeView || !actorView) return undefined;
-		if (bashTailProjectionPartition(speculative) !== bashTailProjectionPartition(actor)) return undefined;
-		if (speculativeView.lines < actorView.lines) return undefined;
-		return { action: actor, distance: speculativeView.lines - actorView.lines };
-	},
-	canShareInFlight: (speculative, actor) =>
-		BASH_TAIL_LINES_ACTION_KEY_PROJECTOR.project(speculative, actor) !== undefined,
-};
-
 // Stock query tools launch ambient executables/configuration (rg can even invoke --pre).
 // A static workspace tree is not their dependency closure or their isolation authority.
 const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities);
@@ -292,7 +270,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 		effect: "unbounded",
 		requirements: UNRESTRICTED_PROCESS_EFFECTS,
 		canonicalize: canonicalBash,
-		projectors: [BASH_TAIL_LINES_ACTION_KEY_PROJECTOR],
 	},
 	{
 		tool: "write",
@@ -476,51 +453,6 @@ export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey
 	);
 }
 
-/**
- * Parse the only shell form whose full observable output is a deterministic suffix view.
- *
- * The accepted command is one pipeline whose producer redirects stderr into stdout, optionally
- * preceded by a silent `cd` to an absolute path. Quoted operators are ignored; command lists,
- * substitutions, nested pipelines, and unredirected stderr fail closed.
- */
-export function bashTailLinesView(action: ActionKey): BashTailLinesView | undefined {
-	if (action.tool !== "bash") return undefined;
-	const input = asRecord(action.input);
-	if (!input || typeof input.command !== "string") return undefined;
-	const command = input.command;
-	if (action.executionContext !== undefined) {
-		const invocation = asRecord(action.executionContext);
-		const process = asRecord(invocation?.process);
-		if (process?.command !== command) return undefined;
-	}
-	const operators = shellOperators(command);
-	if (!operators) return undefined;
-	const pipelines = operators.filter((operator) => operator.kind === "pipe");
-	const conjunctions = operators.filter((operator) => operator.kind === "and");
-	if (
-		pipelines.length !== 1 ||
-		conjunctions.length > 1 ||
-		operators.length !== pipelines.length + conjunctions.length
-	) {
-		return undefined;
-	}
-	const pipe = pipelines[0]!.index;
-	const suffix = command.slice(pipe + 1).trim();
-	const tail = /^tail\s+(?:-(\d+)|-n\s+(\d+))$/.exec(suffix);
-	const lines = Number(tail?.[1] ?? tail?.[2]);
-	if (!tail || !Number.isSafeInteger(lines) || lines <= 0) return undefined;
-
-	let producerStart = 0;
-	const conjunction = conjunctions[0];
-	if (conjunction) {
-		if (conjunction.index > pipe || !silentAbsoluteCd(command.slice(0, conjunction.index))) return undefined;
-		producerStart = conjunction.index + 2;
-	}
-	const producer = command.slice(producerStart, pipe).trim();
-	if (!/\s2>&1$/.test(producer)) return undefined;
-	return { core: command.slice(0, pipe).trimEnd(), lines };
-}
-
 export function normalizeRelativeRoot(value: unknown, cwd: string): string | undefined {
 	if (value !== undefined && typeof value !== "string") return undefined;
 	return normalizeWorkspacePath(value ?? ".", cwd);
@@ -625,83 +557,6 @@ function canonicalBash(input: unknown, cwd: string): CanonicalAction | undefined
 			timeout: finiteOrUndefined(record.timeout),
 		},
 	};
-}
-
-function bashTailProjectionPartition(action: ActionKey): string | undefined {
-	const view = bashTailLinesView(action);
-	const input = asRecord(action.input);
-	if (!view || !input) return undefined;
-	return stableStringify({
-		core: view.core,
-		cwd: input.cwd,
-		timeout: input.timeout,
-		resources: action.resources,
-		executionFingerprint: action.executionFingerprint,
-	});
-}
-
-type ShellOperator = { readonly kind: "pipe" | "and" | "other"; readonly index: number };
-
-function shellOperators(command: string): readonly ShellOperator[] | undefined {
-	if (command.includes("\n") || command.includes("\r") || command.includes("\0")) return undefined;
-	const operators: ShellOperator[] = [];
-	let quote: "single" | "double" | undefined;
-	let escaped = false;
-	for (let index = 0; index < command.length; index++) {
-		const character = command[index]!;
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
-		if (quote === "single") {
-			if (character === "'") quote = undefined;
-			continue;
-		}
-		if (quote === "double") {
-			if (character === "\\") escaped = true;
-			else if (character === '"') quote = undefined;
-			continue;
-		}
-		if (character === "\\") {
-			escaped = true;
-			continue;
-		}
-		if (character === "'") {
-			quote = "single";
-			continue;
-		}
-		if (character === '"') {
-			quote = "double";
-			continue;
-		}
-		if (character === "`" || character === "(" || character === ")" || character === "{" || character === "}") {
-			return undefined;
-		}
-		if (character === "$" && (command[index + 1] === "(" || command[index + 1] === "{")) return undefined;
-		if (character === "|") {
-			if (command[index + 1] === "|" || command[index + 1] === "&") {
-				operators.push({ kind: "other", index });
-				index++;
-			} else operators.push({ kind: "pipe", index });
-			continue;
-		}
-		if (character === "&") {
-			if (command[index - 1] === ">") continue;
-			if (command[index + 1] === "&") {
-				operators.push({ kind: "and", index });
-				index++;
-			} else operators.push({ kind: "other", index });
-			continue;
-		}
-		if (character === ";") operators.push({ kind: "other", index });
-	}
-	return quote || escaped ? undefined : operators;
-}
-
-function silentAbsoluteCd(command: string): boolean {
-	const match = /^\s*cd\s+(?:--\s+)?(?:'([^']+)'|"([^"$`\\]+)"|([^\s'"$`\\;&|(){}]+))\s*$/.exec(command);
-	const target = match?.[1] ?? match?.[2] ?? match?.[3];
-	return typeof target === "string" && target.startsWith("/");
 }
 
 function canonicalWrite(input: unknown, cwd: string): CanonicalAction | undefined {
