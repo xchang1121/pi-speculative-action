@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { serialize } from "node:v8";
-import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
+import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 
 // Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
 // Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
@@ -36,8 +36,8 @@ try {
 	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
 	const pi = {};
 	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) {
-		const executor = await prepareWorker();
-		try { pi[name] = await qualifyPiSearch(executor, name); }
+		const executor = new ClosedSearchProcessPool(moduleFile);
+		try { pi[name] = await qualifyPiSearch(executor, name, worker.profile); }
 		finally { await executor.dispose(); }
 	}
 	const cancellation = [];
@@ -78,7 +78,7 @@ async function prepareWorker(qualification = false) {
 }
 
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
-async function qualifyPiSearch(worker, name) {
+async function qualifyPiSearch(pool, name, profile) {
 	const { createGrepToolDefinition, createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
 	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
@@ -86,9 +86,7 @@ async function qualifyPiSearch(worker, name) {
 	const { RESOURCE_OBSERVATION_EFFECTS } = await import("../dist/effect-model.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
 	const { captureResourceVersion } = await import("../dist/resource-version.js");
-	const profile = worker.profile;
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-")), searchRoot = path.join(root, "search");
-	let actorWorker;
 	const counts = { producer: 0, actor: 0, contextReads: 0 }, reads = new Set();
 	let inputRequests = 0, inputBytes = 0;
 	const execute = async (role, source, request, checkpoint) => {
@@ -96,7 +94,7 @@ async function qualifyPiSearch(worker, name) {
 		let checkpointReached = false;
 		const inputs = source === fs ? await captureResourceVersion(undefined, root, semantics, profile.limits.inputBytes) : undefined;
 		try {
-			const output = await (role === "producer" ? worker : actorWorker).request({ kind: name, root, args: request.args },
+			const output = await pool.request(role, { kind: name, root, args: request.args },
 				{ signal: request.signal, onInput: async (operation, target) => {
 					inputRequests++;
 					if (operation === "readFile") reads.add(target);
@@ -157,9 +155,7 @@ async function qualifyPiSearch(worker, name) {
 		};
 	}
 	try {
-		actorWorker = await prepareWorker();
-		assert.deepEqual(actorWorker.profile, profile, "independent execution capacity must keep the same identity");
-		await assert.rejects(actorWorker.request({ kind: "kernel", commands: [] }), /closed search operation denied/);
+		await assert.rejects(pool.request("actor", { kind: "kernel", commands: [] }), /closed search operation denied/);
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(searchRoot); await fs.mkdir(path.join(searchRoot, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "ignored.*\n");
@@ -203,7 +199,7 @@ async function qualifyPiSearch(worker, name) {
 			const fifo = path.join(searchRoot, ".gitignore"); execFileSync("mkfifo", [fifo]);
 			try {
 				for (const role of ["actor", "producer"]) await assert.rejects(execute(role, fs, { args, signal }), /file size is not proven by retained content/);
-				assert.ok(!reads.has("/workspace/search/.gitignore") && !worker.closed() && !actorWorker.closed(), "FIFO must be refused before content access, not by a worker timeout");
+				assert.ok(!reads.has("/workspace/search/.gitignore"), "FIFO must be refused before content access, not by a worker timeout");
 			}
 			finally { await fs.rm(fifo); }
 		}
@@ -217,10 +213,17 @@ async function qualifyPiSearch(worker, name) {
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
 		assert.ok(!reads.has("/workspace/search/ignored.bin") && !reads.has("/workspace/search/ignored.txt"), "the broker transferred ignored content");
 		if (name === "grep") await assert.rejects(execute("actor", fs, { args: { ...args, path: "search/ignored.bin" }, signal }), /input byte budget/);
-		await assert.rejects(actorWorker.request({ kind: name, root, args }, {
+		await assert.rejects(pool.request("actor", { kind: name, root, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
+		const both = Promise.withResolvers(), proceed = Promise.withResolvers(); let entered = 0;
+		const concurrent = [0, 1].map(() => execute("producer", fs, { args, signal }, async () => {
+			if (++entered === 2) both.resolve(); await proceed.promise;
+		}));
+		try { await bounded(Promise.race([both.promise, Promise.all(concurrent)]), "concurrent producer barrier"); }
+		finally { proceed.resolve(); }
+		assert.equal(entered, 2); for (const output of await Promise.all(concurrent)) assert.deepEqual(output.result, expected);
 		const ready = journey(); await ready.start("produce");
 		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
 		await ready.start("recall", false);
@@ -279,24 +282,34 @@ async function qualifyPiSearch(worker, name) {
 			const fallback = await cancelled.actor("independent", different);
 			assert.deepEqual(fallback.output, direct.result); assert.equal(fallback.settlement.provider.kind, "actor");
 			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running");
-			assert.ok(!worker.closed(), "Actor fallback must not depend on producer termination");
 			await cancelled.host.runtime.settingsChanged(disabled);
 		} finally { released.resolve(); }
 		assert.equal((await bounded(cancelled.candidate, "cancelled candidate")).status, "cancelled");
-		await bounded(worker.closure, "cancelled worker retirement"); assert.ok(worker.closed());
 		await cancelled.host.runtime.settingsChanged({ ...disabled, enabled: true });
 		await cancelled.start("recovery", false);
 		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
 		assert.equal(counts.contextReads > 0, name === "grep", "the original Pi context reread was not exercised");
+		const arrivals = { actor: Promise.withResolvers(), producer: Promise.withResolvers() }, drain = Promise.withResolvers();
+		const actor = execute("actor", fs, { args, signal }, async () => { arrivals.actor.resolve(); await drain.promise; });
+		const producer = execute("producer", fs, { args, signal }, async () => { arrivals.producer.resolve(); await drain.promise; });
+		const rejected = assert.rejects(producer, /worker disposed/);
+		try {
+			await bounded(Promise.all(Object.values(arrivals).map((arrival) => arrival.promise)), "retirement barrier");
+			const retiring = pool.dispose(); assert.equal(pool.dispose(), retiring);
+			await rejected;
+			assert.equal(await Promise.race([retiring, Promise.resolve("pending")]), "pending", "retirement must drain admitted Actors");
+			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await retiring;
+			await assert.rejects(pool.request("actor", { kind: name, root, args }), /search pool retired/);
+		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
 		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, behaviors, rejectedEscapingLinks: true,
 			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable", inputTransport, speculativeMs: completed.executionMs,
 			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
-			actorRanWhileProducerPaused: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1, actorWorkerPreparationMs: actorWorker.preparationMs,
+			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorOnly: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
 			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence or production enablement" };
 	} finally {
-		await Promise.all(journeys.map((host) => host.dispose())); await actorWorker?.dispose();
+		await Promise.all(journeys.map((host) => host.dispose())); await pool.dispose();
 		assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
 	}
 }

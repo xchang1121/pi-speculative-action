@@ -4,6 +4,37 @@ import path from "node:path";
 import { serialize } from "node:v8";
 import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 
+/** Reuse execution capacity, never results. Busy producers and Actors own independent reservations. */
+export class ClosedSearchProcessPool {
+	#moduleFile; #workers = new Map(); #idle = new Map(); #retirement;
+	constructor(moduleFile) { this.#moduleFile = moduleFile; }
+	async request(role, input, options = {}) {
+		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
+		options.signal?.throwIfAborted();
+		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(this.#moduleFile);
+		this.#idle.delete(role);
+		if (!this.#workers.has(worker)) void worker.closure.then(() => {
+			this.#workers.delete(worker); if (this.#idle.get(role) === worker) this.#idle.delete(role);
+		});
+		const execution = worker.request(input, options), lease = { role, execution };
+		this.#workers.set(worker, lease);
+		try { return await execution; }
+		finally {
+			lease.execution = undefined;
+			if (this.#retirement || worker.closed() || this.#idle.has(role)) await worker.dispose();
+			else this.#idle.set(role, worker);
+		}
+	}
+	dispose() {
+		if (this.#retirement) return this.#retirement;
+		this.#idle.clear();
+		return this.#retirement = Promise.all([...this.#workers].map(async ([worker, lease]) => {
+			if (lease.role === "actor") await lease.execution?.catch(() => {});
+			await worker.dispose();
+		})).then(() => {});
+	}
+}
+
 /** Owns preparation, one admitted invocation, and hard retirement of a trusted search worker. */
 export function launchClosedSearchWorker(moduleFile, entry = new URL("./closed-search-kernel.mjs", import.meta.url)) {
 	const { limits } = CLOSED_SEARCH_PROFILE, started = performance.now();
