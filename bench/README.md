@@ -23,6 +23,30 @@ five-second child begins, while recording the observable `TracerPid` difference:
 npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
 ```
 
+## ThinkThread real Runtime qualification
+
+From a source checkout with its real Agent POSIX SDK installed and `npm run build` complete,
+start the installed `tt pi-speculative-action` profile. Ask Pi's Bash tool to run, at the
+`THINKTHREAD_FS` root (the checkout):
+
+```sh
+npm run bench:thinkthread-tools
+```
+
+The command requires a live SDK `selfView` and `fs.stat` before writing any fixture; setting
+`THINKTHREAD_FS` alone is not sufficient. Each of the six stock tools compares an Actor baseline,
+its native fallback, and actual ThinkThread `fs.run`/validate/commit through the production gateway.
+It checks exact serialized output at the same cwd/path, all fixture entries/contents/modes, and
+no fixture changes before adoption. Native read/grep/find/ls are explicitly **Actor only**, not
+early host execution. A failed primary selection is a failed qualification, never a native pass.
+Preparation, producer execution, and ready-candidate adoption timings are separate single samples;
+the Actor/adoption ratio is not an end-to-end workload guarantee. Poisoned adoption retains the
+owned fixture without further workspace writes.
+
+The regular unit suite reuses this fixture only with the **local wire runner**, not a Runtime.
+Bash under the real profile must separately pass the native process/in-flight qualifications below;
+conflict, cancellation/recovery, and implicit dependency closure also remain separate release gates.
+
 ## Linux/WSL process reuse qualification
 
 Run the production `createBashTool`, generic process outlet, Linux execution

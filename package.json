@@ -62,6 +62,7 @@
 		"bench:linux-topology": "tsx ./bench/linux-process-topology-reuse.ts",
 		"bench:linux-admission": "tsx ./bench/linux-process-admission.ts",
 		"bench:linux-inflight": "tsx ./bench/linux-process-inflight.ts",
+		"bench:thinkthread-tools": "tsx ./bench/thinkthread-tools.ts",
 		"bench:exec-boundary": "tsx ./bench/linux-exec-boundary.ts",
 		"bench:overlay-probe": "sh ./bench/overlayfs-capability-probe.sh",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
