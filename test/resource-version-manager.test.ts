@@ -200,6 +200,7 @@ describe("speculative action resource versions", () => {
 		{ tool: "find" as const, change: "fdignore", expired: true },
 		{ tool: "ls" as const, change: "content", expired: false },
 		{ tool: "ls" as const, change: "entry", expired: true },
+		{ tool: "ls" as const, change: "git", expired: true },
 		{ tool: "grep" as const, change: "content", expired: true },
 		{ tool: "grep" as const, change: "ignore", expired: true },
 		{ tool: "grep" as const, change: "staging", expired: false },
@@ -212,7 +213,7 @@ describe("speculative action resource versions", () => {
 		await fs.writeFile(path.join(root, "src", ".fdignore"), "hidden.ts\n");
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture(resourceDependencies(action(tool, [change === "staging" ? "." : "src"]), root));
-		const changed = change === "content"
+		const changed = change === "git" ? path.join(root, "src", ".git") : change === "content"
 			? file
 			: change === "ignore"
 				? path.join(root, ".gitignore")

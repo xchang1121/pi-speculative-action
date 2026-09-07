@@ -38,7 +38,6 @@ export type ResourceVersionToken = {
 	readonly dependencies: ReadonlyArray<ResourceDependency>;
 	readonly epoch: number;
 	readonly watching: boolean;
-	readonly versions: ReadonlyArray<number>;
 	readonly preciseContent: ReadonlyArray<string>;
 	readonly exact: ReadonlyArray<string>;
 	readonly stamps: ReadonlyArray<string>;
@@ -60,7 +59,6 @@ type ResourceSubscriber = {
 
 const MAX_EVENT_HISTORY = 4096;
 const FINGERPRINT_CONCURRENCY = 12;
-const IGNORED_DIRECTORIES = new Set([".git"]);
 const QUERY_CONTROL_FILES = new Set([".gitignore", ".ignore", ".rgignore", ".fdignore"]);
 
 export class ResourceVersionManager {
@@ -68,7 +66,6 @@ export class ResourceVersionManager {
 	private readonly events: ResourceEvent[] = [];
 	private readonly subscribers = new Set<ResourceSubscriber>();
 	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
-	private readonly treeVersions = new Map<string, number>();
 	private references = 0;
 	private watcher?: FSWatcher;
 	private reliable = false;
@@ -114,13 +111,11 @@ export class ResourceVersionManager {
 			const exact = await fingerprintDependencies(normalized, this.root);
 			await watcherTurn();
 			const epoch = this.epoch;
-			const versions = this.reliable ? normalized.map((dependency) => this.dependencyVersion(dependency)) : [];
 			return {
 				root: this.root,
 				dependencies: normalized,
 				epoch,
 				watching: this.reliable,
-				versions,
 				preciseContent: precise.paths,
 				exact: exact.fingerprints,
 				stamps: exact.stamps,
@@ -209,7 +204,6 @@ export class ResourceVersionManager {
 		this.preciseWatches.clear();
 		this.subscribers.clear();
 		this.events.length = 0;
-		this.treeVersions.clear();
 	}
 
 	private acquireReference(): () => void {
@@ -220,27 +214,12 @@ export class ResourceVersionManager {
 		});
 	}
 
-	private contentChangedSince(token: ResourceVersionToken) {
-		const dependencies = token.dependencies.filter((dependency) => dependency.scope === "content");
-		if (dependencies.length === 0) return false;
-		if (this.changesSince(token).uncertain) return true;
-		const preciseContent = new Set(token.preciseContent.map(filesystemPathKey));
-		return this.events.some(
-			(event) =>
-				event.epoch > token.epoch && dependencies.some((dependency) => affects(dependency, event, preciseContent)),
-		);
-	}
-
 	private watcherInvalidated(token: ResourceVersionToken): boolean {
-		return (
-			this.reliable &&
-			token.versions.length === token.dependencies.length &&
-			(!sameValues(
-				token.dependencies.map((dependency) => this.dependencyVersion(dependency)),
-				token.versions,
-			) ||
-				this.contentChangedSince(token))
-		);
+		if (!this.reliable || !token.watching) return false;
+		if (this.changesSince(token).uncertain) return true;
+		const precise = new Set(token.preciseContent.map(filesystemPathKey));
+		return this.events.some((event) => event.epoch > token.epoch &&
+			token.dependencies.some((dependency) => affects(dependency, event, precise)));
 	}
 
 	private owns(token: ResourceVersionToken): boolean {
@@ -259,35 +238,10 @@ export class ResourceVersionManager {
 		const event = { epoch: ++this.epoch, path: absolute, type };
 		this.events.push(event);
 		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
-		this.updateTreeVersions(event);
 		for (const subscriber of this.subscribers) {
 			if (subscriber.dependencies.some((dependency) => affects(dependency, event, subscriber.preciseContent))) {
 				subscriber.callback(absolute);
 			}
-		}
-	}
-
-	private dependencyVersion(dependency: ResourceDependency): number {
-		return this.treeVersions.get(`${dependency.scope}:${filesystemPathKey(dependency.path)}`) ?? 0;
-	}
-
-	private updateTreeVersions(event: ResourceEvent): void {
-		if (event.type !== "unknown" && path.basename(event.path).startsWith(".pi-speculative-")) return;
-		const root = path.resolve(this.root);
-		const absolute = path.resolve(event.path);
-		if (!containsFilesystemPath(root, absolute)) return;
-		const gitBoundary = event.type === "unknown" ? undefined : nestedGitBoundary(root, absolute);
-		const entries = event.type === "unknown" || event.type === "rename";
-		const query =
-			event.type === "unknown" ||
-			event.type === "rename" ||
-			(event.type === "change" && QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase()));
-		for (let current = absolute; ; current = path.dirname(current)) {
-			const key = filesystemPathKey(current);
-			this.treeVersions.set(`tree_content:${key}`, event.epoch);
-			if (entries) this.treeVersions.set(`tree_entries:${key}`, event.epoch);
-			if (query) this.treeVersions.set(`tree_query:${key}`, event.epoch);
-			if (current === root || current === gitBoundary) break;
 		}
 	}
 
@@ -400,7 +354,7 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 		typeof token.root === "string" &&
 		typeof token.epoch === "number" &&
 		typeof token.watching === "boolean" &&
-		[token.dependencies, token.versions, token.preciseContent, token.exact, token.stamps].every(Array.isArray) &&
+		[token.dependencies, token.preciseContent, token.exact, token.stamps].every(Array.isArray) &&
 		typeof token.release === "function" &&
 		token.manager instanceof ResourceVersionManager
 	);
@@ -449,9 +403,6 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
 	}
 	if (!containsFilesystemPath(dependencyPath, changed)) return false;
-	if (path.basename(event.path).startsWith(".pi-speculative-")) return false;
-	const relative = path.relative(dependency.path, event.path);
-	if (relative === ".git" || relative.startsWith(`.git${path.sep}`)) return false;
 	if (dependency.scope === "tree_entries") return event.type !== "change";
 	if (dependency.scope === "tree_query") {
 		return event.type !== "change" || QUERY_CONTROL_FILES.has(path.basename(event.path).toLowerCase());
@@ -605,9 +556,7 @@ async function stableFileEntry(
 }
 
 function selectEntries(entries: ReadonlyArray<import("node:fs").Dirent>) {
-	return entries
-		.filter((entry) => !IGNORED_DIRECTORIES.has(entry.name))
-		.sort((left, right) => left.name.localeCompare(right.name));
+	return [...entries].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function entryIdentity(entry: import("node:fs").Dirent): string {
@@ -694,14 +643,6 @@ function validationMetrics(
 
 function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Value>) {
 	return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function nestedGitBoundary(root: string, target: string) {
-	const relative = relativeFilesystemPath(root, target);
-	if (!relative) return undefined;
-	const parts = relative.split(path.sep);
-	const index = parts.indexOf(".git");
-	return index < 0 ? undefined : path.resolve(root, ...parts.slice(0, index + 1));
 }
 
 function watcherTurn() {
