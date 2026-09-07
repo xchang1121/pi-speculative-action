@@ -29,13 +29,10 @@ describe("speculative action package boundary", () => {
 		expect(root.ProcessReusePlanner).toBe(processReuse.ProcessReusePlanner);
 	});
 
-	test("keeps host-neutral entries executable without Pi packages", async () => {
-		await importWithBlockedDependencies(["src/core.ts", "src/process-reuse.ts"], ["@earendil-works/pi-"]);
-	});
-
-	test("loads the default Pi entry without initializing opt-in engines", async () => {
-		await importWithBlockedDependencies(["src/index.ts", "src/extension.ts"], ["@thinkthread/agent-posix", "wasi-sh", "ripgrep", "globby"]);
-	});
+	test.each([
+		["host-neutral core", ["src/core.ts", "src/process-reuse.ts"], ["@earendil-works/pi-"]],
+		["default Pi entry", ["src/index.ts", "src/extension.ts"], ["@thinkthread/agent-posix", "wasi-sh", "ripgrep", "globby"]],
+	] as const)("loads %s without forbidden dependencies", async (_label, entries, blocked) => importWithBlockedDependencies(entries, blocked));
 
 	test("loads ThinkThread only through its opt-in entry when the SDK is installed", async () => {
 		const thinkThread = await import("../src/thinkthread/index.ts");
@@ -74,7 +71,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 		}
 	});
 
-	test("loads from its package manifest through Pi's public extension loader", async () => {
+	test("loads the Pi package and preserves installed engines when explicit setup fails", async () => {
 		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-speculative-package-"));
 		const cwd = path.join(temporaryRoot, "workspace");
 		const agentDir = path.join(temporaryRoot, "agent");
@@ -83,6 +80,18 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 			const loaded = await discoverAndLoadExtensions([packageRoot], cwd, agentDir);
 			expect(loaded.errors).toEqual([]);
 			expect(loaded.extensions).toHaveLength(1);
+			const engine = path.join(agentDir, "closed-search.wasm"), setup = pathToFileURL(path.join(packageRoot, "src/setup-closed-search.mjs")).href;
+			await fs.writeFile(engine, "previous engine");
+			for (const [status, bytes, reason] of [[503, 0, "HTTP 503"], [200, 4, "archive integrity mismatch"], [200, 1048577, "download budget"]] as const) {
+				const script = `process.argv[2] = ${JSON.stringify(engine)};
+					globalThis.fetch = async () => new Response(new Uint8Array(${bytes}), { status: ${status} });
+					await import(${JSON.stringify(setup)});`;
+				const stderr = await execFileAsync(process.execPath, ["--input-type=module", "--eval", script], { cwd: packageRoot, windowsHide: true })
+					.then(() => "", (error) => error.stderr as string);
+				expect(stderr).toContain(reason);
+				expect(await fs.readFile(engine, "utf8")).toBe("previous engine");
+				expect(await fs.readdir(agentDir)).toEqual(["closed-search.wasm"]);
+			}
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
 		}

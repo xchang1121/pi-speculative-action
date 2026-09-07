@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { brotliDecompressSync } from "node:zlib";
 import { serialize } from "node:v8";
 import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMessageOnPort } from "node:worker_threads";
 
@@ -30,10 +26,7 @@ if (isMainThread) {
 	guest.on("error", (error) => { throw error; });
 	guest.on("exit", (code) => process.exit(code));
 } else {
-	// The CLI-bearing npm package stays OUTSIDE this repository and the Actor's PATH.
-	const require = createRequire(path.join(process.argv[2], "package.json"));
-	const { getCompressedBytes } = await import(new URL("./_rg.wasm.mjs", pathToFileURL(require.resolve("ripgrep"))).href);
-	const rg = brotliDecompressSync(getCompressedBytes());
+	const rg = await readFile(process.argv[2]);
 	await assert.rejects(createClosedSearchKernel(Buffer.from("unqualified")), /Requalify the search module/);
 	const supplied = Buffer.from(rg), preparing = createClosedSearchKernel(supplied);
 	supplied.fill(0); // The kernel must own the bytes it hashed across asynchronous initialization.

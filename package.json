@@ -66,6 +66,7 @@
 		"bench:exec-boundary": "tsx ./bench/linux-exec-boundary.ts",
 		"bench:overlay-probe": "sh ./bench/overlayfs-capability-probe.sh",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
+		"setup:search": "node ./src/setup-closed-search.mjs",
 		"test": "vitest --run",
 		"prepack": "npm run build"
 	},

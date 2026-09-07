@@ -6,9 +6,9 @@ import path from "node:path";
 import { serialize } from "node:v8";
 
 // Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
-// CLI-bearing ripgrep stays in an explicit external directory, never the Actor's npm PATH.
-const dependencyRoot = process.argv[2];
-assert.ok(dependencyRoot, "Usage: node bench/portable-kernel.mjs <external ripgrep dependency directory> [--pi-tools]");
+// Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
+const moduleFile = process.argv[2];
+assert.ok(moduleFile, "Usage: node bench/portable-kernel.mjs <installed closed-search.wasm> [--pi-tools]");
 const started = performance.now(), worker = await prepareWorker();
 try {
 	const seed = { "/workspace/a.txt": Buffer.from("before\nneedle\nafter\n"), "/workspace/sub/b.txt": Buffer.from("needle two\n") };
@@ -70,7 +70,7 @@ try {
 } finally { await worker.dispose(); }
 
 async function prepareWorker() {
-	const started = performance.now(), child = fork(new URL("./portable-worker.mjs", import.meta.url), [path.resolve(dependencyRoot)], {
+	const started = performance.now(), child = fork(new URL("./portable-worker.mjs", import.meta.url), [path.resolve(moduleFile)], {
 		execArgv: ["--wasm-max-mem-pages=1024", "--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
 	});
 	let pending, nextID = 0, closed = false, diagnosticBytes = 0;
