@@ -498,13 +498,8 @@ async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDepen
 }
 
 async function fingerprintDependency(dependency: ResourceDependency, realRoot: string, view?: ResourceReadView) {
-	const result = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
-	return {
-		fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value: result.value }),
-		stamp: result.stamp,
-		bytesRead: result.bytesRead,
-		filesRead: result.filesRead,
-	};
+	const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
+	return { fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 }
 
 type FingerprintResult = {

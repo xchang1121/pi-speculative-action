@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,14 +31,14 @@ afterEach(async () => {
 
 describe("speculative action resource versions", () => {
 	test.each([true, false])("seals only stable Actor observation windows (watch=%s)", async (watch) => {
-		for (const change of ["unchanged", "write", "restore", "replace", "entries"] as const) {
-			const root = await workspace();
+		for (const change of ["unchanged", "sibling", "write", "restore", "replace", "entries"] as const) {
+			const root = await workspace({ "value.txt": "A" });
 			const file = path.join(root, "value.txt");
-			await fs.writeFile(file, "A");
 			const manager = new ResourceVersionManager(root, { watch });
 			const target = change === "entries" ? ["."] : ["value.txt"];
 			const token = await manager.capture(resourceDependencies(action(change === "entries" ? "ls" : "read", target), root));
 			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
+			if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
 			if (change === "restore") {
 				await fs.writeFile(file, "A");
 				await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
@@ -52,26 +53,31 @@ describe("speculative action resource versions", () => {
 				}
 			}
 			if (watch) await settleWatcher();
-			expect((await manager.seal(token)).expired, change).toBe(change !== "unchanged");
+			const changed = change !== "unchanged" && change !== "sibling";
+			expect((await manager.validate(token)).expired, change).toBe(watch ? changed : change === "write");
+			expect((await manager.seal(token)).expired, change).toBe(changed);
 			releaseResourceVersion(token);
 			manager.close();
 		}
 	});
 
 	test("owns bounded immutable inputs and never converts unproven access into absence", async () => {
+		expect((await validateResourceVersion(undefined)).expired).toBe(true);
 		const root = await workspace(), file = path.join(root, "value.txt");
-		await fs.writeFile(file, "A");
+		const payload = Buffer.concat([Buffer.alloc(1024 * 1024, 65), Buffer.alloc(1024 * 1024, 66), Buffer.from("end")]);
+		await fs.writeFile(file, payload);
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const dependencies = resourceDependencies(action("read", ["value.txt", "missing"]), root);
 		await expect(manager.capture(dependencies, 0)).rejects.toThrow("resource_snapshot_budget_exceeded");
-		const token = await manager.capture(dependencies, 4096), view = token.view!;
+		const token = await manager.capture(dependencies, 3 * 1024 * 1024), view = token.view!;
 		await expect(view.evaluate(async (scope) => {
 			try { scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
 		})).rejects.toThrow("resource_access_unproven");
-		expect(await view.evaluate(async (scope) => (await scope.readFile(file)).toString())).toBe("A");
+		expect(await view.evaluate((scope) => scope.readFile(file))).toEqual(payload);
+		expect((await captureStableFile(file)).hash).toBe(createHash("sha256").update(payload).digest("hex"));
 		(await view.readFile(file)).fill(66);
 		await fs.writeFile(file, "B");
-		expect((await view.readFile(file)).toString()).toBe("A");
+		expect(await view.readFile(file)).toEqual(payload);
 		expect(view.exists(path.join(root, "missing"))).toBe(false);
 		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
 		expect(() => view.exists(path.join(root, "unknown"))).toThrow("resource_access_unproven");
@@ -121,9 +127,8 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.each([false, true])("capture and branch share one resource lifetime (changed=%s)", async (changed) => {
-		const root = await workspace();
+		const root = await workspace({ "value.txt": "A" });
 		const file = path.join(root, "value.txt");
-		await fs.writeFile(file, "A");
 		const key = action("read", ["value.txt"]);
 		const probe = await captureResourceVersion(key, root);
 		const manager = probe.manager;
@@ -177,35 +182,28 @@ describe("speculative action resource versions", () => {
 		} finally { vi.unstubAllEnvs(); }
 	});
 
-	test.each([
-		{ change: "write", expired: true },
-		{ change: "replace", expired: true },
-		{ change: "sibling", expired: false },
-	].flatMap((scenario) => [true, false].map((watch) => ({ ...scenario, watch }))))(
-	"validates file content after a $change (watch=$watch)", async ({ change, expired, watch }) => {
-		expect((await validateResourceVersion(undefined)).expired).toBe(true);
-		const root = await workspace();
-		const file = path.join(root, "value.ts");
-		await fs.writeFile(file, "tracked\n");
-		const manager = new ResourceVersionManager(root, { watch });
-		const args = { path: "@value.ts" };
-		const key = PI_ACTION_SEMANTICS.buildKey("read", args, root)!;
-		const token = await manager.capture(resourceDependencies(key, root));
-		expect((await createReadTool(root).execute("actor", args)).content).toMatchObject([{ text: "tracked\n" }]);
-		if (change === "replace") {
-			const replacement = path.join(root, "replacement.ts");
-			await fs.writeFile(replacement, "changed\n");
-			await fs.rename(replacement, file);
-		} else {
-			await fs.writeFile(change === "write" ? file : path.join(root, "sibling.ts"), "changed\n");
+	test.for(["empty", "short", "grow", "shrink", "replace"])("owns descriptor reads through %s", async (change, { skip }) => {
+		if (process.platform === "win32" && change === "replace") return skip("Windows denies replacement of the open destination");
+		for (const retain of [false, true]) {
+			const payload = Buffer.from(change === "empty" ? "" : "initial contents");
+			const root = await workspace({ value: payload }), file = path.join(root, "value");
+			const handle = await fs.open(file, "r"), read = handle.read.bind(handle);
+			const open = vi.spyOn(fs, "open").mockResolvedValueOnce(handle);
+			vi.spyOn(handle, "read").mockImplementationOnce((async (buffer: Buffer) => {
+				if (change === "grow") await fs.appendFile(file, "more");
+				if (change === "shrink") await fs.truncate(file, 1);
+				if (change === "replace") { const replacement = path.join(root, "new"); await fs.writeFile(replacement, payload); await fs.rename(replacement, file); }
+				return read(buffer, 0, Math.min(3, buffer.byteLength), null);
+			}) as typeof handle.read);
+			try {
+				const capture = captureStableFile(file, Infinity, retain);
+				if (["empty", "short"].includes(change)) {
+					expect(await capture).toMatchObject({ hash: createHash("sha256").update(payload).digest("hex"), bytesRead: payload.length,
+						...(retain ? { content: payload } : {}) });
+				} else await expect(capture).rejects.toThrow("file_changed_during_capture");
+				expect(handle.fd).toBe(-1);
+			} finally { open.mockRestore(); }
 		}
-		if (watch) await settleWatcher();
-
-		const result = await validateResourceVersion(token);
-		expect(result.expired).toBe(expired);
-		expect(result.mode).toBe(expired && watch ? "watcher" : "exact");
-		releaseResourceVersion(token);
-		manager.close();
 	});
 
 	test.for(["file", "directory"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
@@ -289,9 +287,8 @@ describe("speculative action resource versions", () => {
 	});
 
 	test("notifies active cache owners when a dependency becomes stale", async () => {
-		const root = await workspace();
+		const root = await workspace({ "value.ts": "one\n" });
 		const file = path.join(root, "value.ts");
-		await fs.writeFile(file, "one\n");
 		const token = await captureResourceVersion(action("read", ["value.ts"]), root);
 		const invalidated = new Promise<string>((resolve, reject) => {
 			const timeout = setTimeout(() => reject(new Error("resource invalidation timed out")), 3000);
@@ -317,9 +314,10 @@ function action(tool: string, resources: ReadonlyArray<string>) {
 	});
 }
 
-async function workspace() {
+async function workspace(files: Readonly<Record<string, string | Buffer>> = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-resource-version-"));
 	roots.push(root);
+	await Promise.all(Object.entries(files).map(([name, content]) => fs.writeFile(path.join(root, name), content)));
 	return root;
 }
 

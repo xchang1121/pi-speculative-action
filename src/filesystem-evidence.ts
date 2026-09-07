@@ -64,18 +64,23 @@ export async function captureStableFile(
 		}
 
 		const hash = createHash("sha256");
-		const content: Buffer[] | undefined = retainContent ? [] : undefined;
+		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
+		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
 		let bytesRead = 0;
-		for await (const chunk of handle.createReadStream({ autoClose: false })) {
-			bytesRead += chunk.byteLength;
+		for (;;) {
+			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
+			const { bytesRead: size } = await handle.read(chunk);
+			if (size === 0) break;
+			bytesRead += size;
 			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-			hash.update(chunk);
-			content?.push(chunk);
+			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+			hash.update(chunk.subarray(0, size));
 		}
 
 		const after = await handle.stat({ bigint: true });
 		const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
 		if (
+			bytesRead !== Number(before.size) ||
 			beforePath !== afterPath ||
 			!sameFilesystemIdentity(before, after) ||
 			pathStat.isSymbolicLink() ||
@@ -85,7 +90,7 @@ export async function captureStableFile(
 			throw new Error("file_changed_during_capture");
 		}
 		return { hash: hash.digest("hex"), bytesRead, realPath: afterPath, stat: after,
-			...(content ? { content: Buffer.concat(content, bytesRead) } : {}) };
+			...(content ? { content } : {}) };
 	} finally {
 		await handle.close();
 	}
