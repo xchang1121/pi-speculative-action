@@ -54,18 +54,28 @@ export class DurableFsExecutor {
 		input: Uint8Array,
 		signal?: AbortSignal,
 	): Promise<FsRunV1> {
-		if (signal?.aborted) throw abortError();
+		signal?.throwIfAborted();
 		const requestID = this.requestID();
 		const payload = await this.workflows.uploadBytes(input, requestID);
 		if (signal?.aborted) {
 			await this.client.fs.payloadRemove({ payloadId: payload.payloadId });
-			throw abortError();
+			signal.throwIfAborted();
 		}
 		const request = {
 			...params, requestId: requestID,
 			invocation: { ...params.invocation, stdinPayloadId: payload.payloadId },
 		};
-		return this.execute("fs.run", requestID, () => this.client.fs.run(request), signal);
+		try {
+			return await this.execute("fs.run", requestID, () => this.client.fs.run(request), signal,
+				(params.limits?.timeoutMs ?? 120_000) + 5_000);
+		} catch (error) {
+			// Only a proven non-admission leaves the uploaded payload locally owned.
+			if (error instanceof ThinkThreadDurableError && error.code === "not_sent") {
+				await this.client.fs.payloadRemove({ payloadId: payload.payloadId });
+				signal?.throwIfAborted();
+			}
+			throw error;
+		}
 	}
 
 	async apply(params: Omit<FsApplyParamsV1, "requestId">): Promise<FsApplyV1> {
@@ -96,8 +106,9 @@ export class DurableFsExecutor {
 		requestID: RequestId,
 		invoke: () => Promise<Result>,
 		signal?: AbortSignal,
+		timeoutMs = 5_000,
 	): Promise<Result> {
-		if (signal?.aborted) throw abortError();
+		const deadline = performance.now() + timeoutMs;
 		const cancel = () => {
 			if (method === "fs.run") void this.client.fs.requestCancel({ requestId: requestID }).catch(() => undefined);
 		};
@@ -105,21 +116,23 @@ export class DurableFsExecutor {
 		try {
 			let lastError: unknown;
 			for (let attempt = 0; attempt < MAX_INVOKE_ATTEMPTS; attempt++) {
+				if (signal?.aborted) throw new ThinkThreadDurableError(method, requestID, "not_sent", "Cancelled before admission", signal.reason);
 				try {
 					const result = await invoke();
 					await this.close(requestID);
 					return result;
 				} catch (error) {
 					lastError = error;
-					const transport = transportError(error);
+					const underlying = error instanceof WorkflowError ? error.cause : error;
+					const transport = underlying instanceof TransportError ? underlying : undefined;
 					if (transport?.delivery === "not_sent") continue;
-					if (transport?.delivery === "completion_unknown" || rejection(error)) {
-						const status = await this.status(requestID);
+					if (transport?.delivery === "completion_unknown" || underlying instanceof RejectedError) {
+						const status = await this.status(method, requestID);
 						if (status === undefined) {
 							if (transport) continue;
 							throw error;
 						}
-						return await this.settleStatus<Result>(method, requestID, status, signal);
+						return await this.settleStatus<Result>(method, requestID, status, deadline, signal);
 					}
 					throw error;
 				}
@@ -127,7 +140,7 @@ export class DurableFsExecutor {
 			throw new ThinkThreadDurableError(
 				method,
 				requestID,
-				"delivery_unresolved",
+				"not_sent",
 				`${method} could not be delivered after ${MAX_INVOKE_ATTEMPTS} attempts`,
 				lastError,
 			);
@@ -140,17 +153,13 @@ export class DurableFsExecutor {
 		method: DurableMethod,
 		requestID: RequestId,
 		initial: FsRequestStatusV1,
+		deadline: number,
 		signal?: AbortSignal,
 	): Promise<Result> {
 		let status = initial;
 		for (;;) {
 			if (status.method !== method) {
-				throw new ThinkThreadDurableError(
-					method,
-					requestID,
-					"method_mismatch",
-					`Durable request ${requestID} belongs to ${status.method}, not ${method}`,
-				);
+				throw new ThinkThreadDurableError(method, requestID, "method_mismatch", `Request belongs to ${status.method}, not ${method}`);
 			}
 			switch (status.state) {
 				case "succeeded":
@@ -165,37 +174,30 @@ export class DurableFsExecutor {
 					throw new ThinkThreadDurableError(method, requestID, status.error.code, status.error.message);
 				}
 				case "needs_recovery":
-					throw new ThinkThreadRecoveryRequiredError(
-						method,
-						requestID,
-						status.error?.message ?? `${method} requires Runtime recovery`,
-						status.error,
-					);
+					throw new ThinkThreadRecoveryRequiredError(method, requestID, status.error?.message ?? `${method} requires Runtime recovery`, status.error);
 				case "closing":
-					throw new ThinkThreadDurableError(
-						method,
-						requestID,
-						"response_closing",
-						`${method} response is already closing without a locally retained result`,
-					);
+					throw new ThinkThreadDurableError(method, requestID, "response_closing", "Response is closing without a locally retained result");
 				case "accepted":
 				case "running":
+					if (performance.now() >= deadline) {
+						throw new ThinkThreadRecoveryRequiredError(method, requestID, "Request did not settle before its recovery deadline");
+					}
 					if (signal?.aborted && method === "fs.run") {
 						await this.client.fs.requestCancel({ requestId: requestID }).catch(() => undefined);
 					}
-					await delay(STATUS_POLL_MS);
-					status = (await this.status(requestID)) ?? missingStatus(method, requestID);
+					await new Promise((resolve) => setTimeout(resolve, STATUS_POLL_MS));
+					status = (await this.status(method, requestID)) ?? missingStatus(method, requestID);
 					break;
 			}
 		}
 	}
 
-	private async status(requestID: RequestId): Promise<FsRequestStatusV1 | undefined> {
+	private async status(method: DurableMethod, requestID: RequestId): Promise<FsRequestStatusV1 | undefined> {
 		try {
 			return await this.client.fs.requestStatus({ requestId: requestID });
 		} catch (error) {
 			if (error instanceof RejectedError && error.response.error.code === "RequestNotFound") return undefined;
-			throw error;
+			throw new ThinkThreadRecoveryRequiredError(method, requestID, "Cannot reconcile admitted request", error);
 		}
 	}
 
@@ -213,18 +215,6 @@ export class DurableFsExecutor {
 	}
 }
 
-function transportError(error: unknown): TransportError | undefined {
-	if (error instanceof TransportError) return error;
-	if (error instanceof WorkflowError && error.cause instanceof TransportError) return error.cause;
-	return undefined;
-}
-
-function rejection(error: unknown): RejectedError | undefined {
-	if (error instanceof RejectedError) return error;
-	if (error instanceof WorkflowError && error.cause instanceof RejectedError) return error.cause;
-	return undefined;
-}
-
 function missingStatus(method: DurableMethod, requestID: RequestId): never {
 	throw new ThinkThreadDurableError(
 		method,
@@ -232,14 +222,4 @@ function missingStatus(method: DurableMethod, requestID: RequestId): never {
 		"request_disappeared",
 		`Durable request ${requestID} disappeared before reaching a terminal state`,
 	);
-}
-
-function abortError(): Error {
-	const error = new Error("ThinkThread fs operation aborted");
-	error.name = "AbortError";
-	return error;
-}
-
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

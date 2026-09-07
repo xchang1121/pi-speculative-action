@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	AgentPosixClient,
+	type AgentPosixClient,
 	CONTRACT_FINGERPRINT,
 	type FsDependency,
 	type FsRunKeyParamsV1,
@@ -29,6 +29,7 @@ import { resourceDependencies } from "../resource-version.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "../tool-settlement.ts";
 import { DurableFsExecutor } from "./durable-fs.ts";
+import { createThinkThreadClient } from "./control-transport.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
 import { type SnapshotLease, type ThinkThreadCheckpoint, ThinkThreadSnapshotPool } from "./snapshot-pool.ts";
 import {
@@ -187,7 +188,7 @@ async function prepareWorld(cwd: string, clientFactory: (() => AgentPosixClient)
 	if (configuredFs && path.resolve(configuredFs) !== path.resolve(cwd)) {
 		throw new Error(`Pi cwd ${cwd} does not match THINKTHREAD_FS ${configuredFs}`);
 	}
-	const client = clientFactory?.() ?? AgentPosixClient.fromEnv();
+	const client = clientFactory?.() ?? createThinkThreadClient();
 	const self = await client.selfView();
 	if (!self.capabilities.some((capability) => capability.id === "thinkthread.fs.self" && capability.version === 1)) {
 		throw new Error("ThinkThread profile does not delegate thinkthread.fs.self@1");
