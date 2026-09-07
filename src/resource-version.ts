@@ -96,10 +96,10 @@ export class ResourceReadView {
 		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
 	}
 	exists = (target: string): boolean => this.entry(target).type !== "missing";
-	stat = (target: string): { isDirectory: () => boolean } => {
+	stat = (target: string): { isDirectory: () => boolean; size?: number } => {
 		const entry = this.entry(target);
 		if (entry.type === "missing") return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory" };
+		return { isDirectory: () => entry.type === "directory", size: entry.type === "file" ? entry.content?.length : undefined };
 	};
 	readdir = (target: string): string[] => {
 		const entry = this.entry(target);

@@ -83,7 +83,7 @@ describe("speculative action resource versions", () => {
 		expect((await captureStableFile(file)).hash).toBe(createHash("sha256").update(payload).digest("hex"));
 		(await view.readFile(file)).fill(66);
 		await fs.writeFile(file, "B");
-		expect(await view.readFile(file)).toEqual(payload);
+		expect([await view.readFile(file), view.stat(file).size]).toEqual([payload, payload.length]);
 		expect(view.exists(path.join(root, "missing"))).toBe(false);
 		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
 		expect(() => view.exists(path.join(root, "unknown"))).toThrow("resource_access_unproven");
@@ -103,7 +103,7 @@ describe("speculative action resource versions", () => {
 			for (const capture of reverse ? captures.reverse() : captures) capture();
 			view.seal();
 			expect(view.readdir(root)).toEqual(["value"]);
-			expect((await view.readFile(file)).toString()).toBe("A");
+			expect([(await view.readFile(file)).toString(), view.stat(file).size]).toEqual(["A", 1]);
 			expect(() => view.capture(file, { type: "file" })).toThrow("not_capturing");
 			view.dispose();
 		}

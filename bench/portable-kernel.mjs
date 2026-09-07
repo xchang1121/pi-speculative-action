@@ -35,18 +35,26 @@ try {
 	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
 	const pi = process.argv.includes("--pi-tools") ? await qualifyPiSearch(worker) : undefined;
 	const cancellation = [];
-	for (const mode of ["abort", "deadline"]) {
+	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
 		const interrupted = await prepareWorker(), controller = new AbortController();
+		const late = Promise.withResolvers(), inputCompleted = Promise.withResolvers(), inputWait = mode.startsWith("input");
 		try {
 			const arrived = performance.now(); let entered = false;
-			await assert.rejects(interrupted.request({ kind: "spin", image: { files: {}, directories: [] } }, {
-				signal: controller.signal, timeoutMs: mode === "deadline" ? 200 : 5000,
-				onStarted: () => { entered = true; if (mode === "abort") controller.abort(new Error("cancelled running guest")); },
-			}), mode === "abort" ? /cancelled running guest/ : /deadline/);
+			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(new Error("cancelled running guest")); };
+			await assert.rejects(interrupted.request(inputWait ? { kind: "grep", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
+				signal: controller.signal, timeoutMs: mode.endsWith("deadline") ? 200 : 5000,
+				onStarted: () => { if (!inputWait) abort(); },
+				onInput: async () => {
+					abort(); await late.promise; inputCompleted.resolve();
+					if (mode.endsWith("abort")) throw new Error("late input failure");
+					return { directory: true, size: 0 };
+				},
+			}), mode.endsWith("abort") ? /cancelled running guest/ : /deadline/);
 			assert.ok(interrupted.closed(), "Actor fallback must not race a still-running worker");
 			assert.ok(entered, "cancellation must exercise an entered guest, not just process startup");
+			late.resolve(); if (inputWait) await inputCompleted.promise;
 			cancellation.push({ mode, retirementMs: performance.now() - arrived });
-		} finally { await interrupted.dispose(); }
+		} finally { late.resolve(); await interrupted.dispose(); }
 	}
 	console.log(JSON.stringify({ platform: process.platform, node: process.version, engines: worker.engines, profile: worker.profile,
 		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started,
@@ -84,20 +92,29 @@ async function prepareWorker() {
 			Promise.resolve().then(() => admitted.onCheckpoint?.()).then(() => {
 				if (pending === admitted && !admitted.failure) child.send({ type: "resume", id: admitted.id }, (error) => { if (error) terminate(error); });
 			}, terminate);
+		} else if (message.type === "input") {
+			const admitted = pending;
+			Promise.resolve().then(() => admitted.onInput(message.operation, message.target)).then((value) => ({ value }),
+				(error) => ({ error: String(error.message ?? error).slice(0, 8192), code: error.code })).then((response) => {
+				if (pending !== admitted || admitted.failure) return;
+				if ((admitted.inputBytes += serialize(response).byteLength) > admitted.inputLimit) response = { error: "input byte budget" };
+				child.send({ type: "input", id: admitted.id, sequence: message.sequence, ...response },
+					(error) => { if (error) terminate(error); });
+			}).catch(terminate);
 		} else if (message.type === "result") pending.settle(message.error ? new Error(message.error) : undefined, message.result);
 	});
 	try {
 		const { profile, engines } = await ready;
 		return { profile, engines, preparationMs: performance.now() - started, closed: () => closed, closure,
 			dispose: async () => { if (!closed) terminate(new Error("worker disposed")); await closure; },
-			request: (input, { signal, timeoutMs = 5000, onStarted, onCheckpoint } = {}) => new Promise((resolve, reject) => {
+			request: (input, { signal, timeoutMs = 5000, onStarted, onCheckpoint, onInput } = {}) => new Promise((resolve, reject) => {
 				if (signal?.aborted) { reject(signal.reason); return; }
 				if (closed || pending) { reject(new Error("worker unavailable/busy")); return; }
 				assert.ok(serialize(input).byteLength <= profile.limits.requestBytes, "request frame budget");
-				assert.ok(Object.values(input.image.files).reduce((size, bytes) => size + bytes.length, 0) <= profile.limits.inputBytes, "input byte budget");
+				assert.ok(Object.values(input.image?.files ?? {}).reduce((size, bytes) => size + bytes.length, 0) <= profile.limits.inputBytes, "input byte budget");
 				const id = ++nextID, abort = () => terminate(signal.reason);
 				const timer = setTimeout(() => terminate(new Error("worker execution deadline")), timeoutMs);
-				pending = { id, onStarted, onCheckpoint, settle: (error, result) => {
+				pending = { id, onStarted, onCheckpoint, onInput, inputBytes: 0, inputLimit: profile.limits.inputBytes, settle: (error, result) => {
 					clearTimeout(timer); signal?.removeEventListener("abort", abort); pending = undefined;
 					if (error) reject(error); else resolve(result);
 				} };
@@ -119,19 +136,17 @@ async function qualifyPiSearch(worker) {
 	const profile = worker.profile;
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-"));
 	let actorWorker;
-	const virtual = (target) => path.posix.join("/workspace", path.relative(root, target).split(path.sep).join("/"));
-	const collect = async (source, target = root, image = { files: {}, directories: [] }) => {
-		if ((await source.stat(target)).isDirectory()) {
-			image.directories.push(virtual(target));
-			for (const name of await source.readdir(target)) await collect(source, path.join(target, name), image);
-		} else image.files[virtual(target)] = await source.readFile(target);
-		return image;
-	};
-	const counts = { producer: 0, actor: 0, contextReads: 0 };
-	const execute = async (role, image, request, checkpoint) => {
+	const counts = { producer: 0, actor: 0, contextReads: 0 }, reads = new Set();
+	let inputRequests = 0, inputBytes = 0;
+	const execute = async (role, source, request, checkpoint) => {
 		counts[role]++;
-		const output = await (role === "producer" ? worker : actorWorker).request({ kind: "grep", image, root, args: request.args, pause: !!checkpoint },
-			{ signal: request.signal, onCheckpoint: checkpoint });
+		const output = await (role === "producer" ? worker : actorWorker).request({ kind: "grep", root, args: request.args, pause: !!checkpoint },
+			{ signal: request.signal, onCheckpoint: checkpoint, onInput: async (operation, target) => {
+				inputRequests++;
+				if (operation === "readFile") reads.add(target);
+				const value = await readInput(source, root, operation, target, profile.limits.inputBytes);
+				inputBytes += serialize(value).byteLength; return value;
+			} });
 		counts.contextReads += output.contextReads;
 		return { result: output.result, isError: output.isError };
 	};
@@ -145,7 +160,7 @@ async function qualifyPiSearch(worker) {
 		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
 		const invocation = { executor: profile.id, identity: profile,
-			filesystem: async (view, request) => execute("producer", await collect(view), request, checkpoint) };
+			filesystem: async (view, request) => execute("producer", view, request, checkpoint) };
 		const host = createSpeculativeActionHost("portable-" + journeys.length, {
 			cwd: root, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
 				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? ["grep"] : [],
@@ -171,7 +186,7 @@ async function qualifyPiSearch(worker) {
 				actorWaiting = true; feedback = Promise.withResolvers();
 				const arrived = performance.now();
 				const output = await host.execute({ turnID, id, tool: "grep", args: query, tools: [tool] }, signal, async (operation) => {
-					actorCalls++; return (await execute("actor", await collect(fs), { args: operation.input, signal: operation.signal })).result;
+					actorCalls++; return (await execute("actor", fs, { args: operation.input, signal: operation.signal })).result;
 				});
 				actorWaiting = false;
 				return { output, totalMs: performance.now() - arrived, settlement: await bounded(feedback.promise, "Actor settlement") };
@@ -184,7 +199,7 @@ async function qualifyPiSearch(worker) {
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(path.join(root, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "ignored.txt\n");
-		await fs.writeFile(path.join(root, "ignored.txt"), "needle ignored\n");
+		await fs.writeFile(path.join(root, "ignored.txt"), Buffer.alloc(16 * 1024 * 1024, "x"));
 		await fs.writeFile(path.join(root, "notes.txt"), "before\nneedle\nafter\n");
 		for (let index = 0; index < 16; index++) await fs.writeFile(path.join(root, "data-" + index + ".txt"), "no match\n".repeat(8192) + "needle " + index + "\n");
 		const sample = async (execute) => {
@@ -192,7 +207,15 @@ async function qualifyPiSearch(worker) {
 			for (let index = 0; index < 3; index++) { const started = performance.now(); output = await execute(); times.push(performance.now() - started); }
 			return { output, medianMs: times.sort((a, b) => a - b)[1] };
 		};
-		const baseline = await sample(async () => execute("actor", await collect(fs), { args, signal }));
+		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
+		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
+		assert.ok(!reads.has("/workspace/ignored.txt"), "the broker transferred ignored content");
+		await assert.rejects(execute("actor", fs, { args: { ...args, path: "ignored.txt" }, signal }), /input byte budget/);
+		await assert.rejects(actorWorker.request({ kind: "grep", root, args }, {
+			onInput: () => { throw new Error("resource_access_unproven"); },
+		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
+		// Transport is on demand; ResourceVersionManager still captures static tree_content dependencies.
+		await fs.writeFile(path.join(root, "ignored.txt"), "needle ignored\n");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
 		const ready = journey(); await ready.start("produce");
 		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
@@ -202,7 +225,7 @@ async function qualifyPiSearch(worker) {
 		assert.equal(counts.producer, beforeHit, "completed adoption executed the search again");
 		const queries = [{ ...args, pattern: "after", limit: 1 }, { ...args, pattern: "absent" }, { ...args, glob: "*.txt", context: 0 }];
 		for (const query of queries) {
-			const actor = await execute("actor", await collect(fs), { args: query, signal });
+			const actor = await execute("actor", fs, { args: query, signal });
 			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
 			assert.deepEqual(reconstructed.output, actor.result);
 			assert.equal(reconstructed.settlement.provider.match?.projector, "resource.inputs");
@@ -245,7 +268,7 @@ async function qualifyPiSearch(worker) {
 		try {
 			assert.equal(await bounded(Promise.race([paused.promise, cancelled.candidate]), "independent Actor checkpoint"), undefined);
 			const different = { ...args, pattern: "absent" };
-			const direct = await execute("actor", await collect(fs), { args: different, signal });
+			const direct = await execute("actor", fs, { args: different, signal });
 			const fallback = await cancelled.actor("independent", different);
 			assert.deepEqual(fallback.output, direct.result); assert.equal(fallback.settlement.provider.kind, "actor");
 			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running");
@@ -258,16 +281,41 @@ async function qualifyPiSearch(worker) {
 		await cancelled.start("recovery", false);
 		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
 		assert.ok(counts.contextReads > 0, "the original Pi context reread was not exercised");
-		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, speculativeMs: completed.executionMs,
+		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, inputTransport, speculativeMs: completed.executionMs,
 			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
-			actorRanWhileProducerPaused: true, recoveryActorCalls: 1, actorWorkerPreparationMs: actorWorker.preparationMs,
+			actorRanWhileProducerPaused: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1, actorWorkerPreparationMs: actorWorker.preparationMs,
 			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence or production enablement" };
 	} finally {
 		await Promise.all(journeys.map((host) => host.dispose())); await actorWorker?.dispose();
 		assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
 	}
+}
+
+/** The same closed namespace for live Actor fixture IO and token-owned sealed inputs. */
+async function readInput(source, root, operation, target, maxBytes) {
+	assert.ok(["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
+	const fail = (code) => { throw Object.assign(new Error(`${code}: ${target}`), { code }); };
+	const normalized = path.posix.normalize(target);
+	if (normalized === "/") return operation === "stat" ? { directory: true, size: 0 } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
+	const relative = path.posix.relative("/workspace", normalized);
+	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT"); // Closed virtual namespace, never the host root.
+	let physical = root;
+	for (const segment of relative ? relative.split("/") : []) {
+		if (!(await source.stat(physical)).isDirectory()) return fail("ENOTDIR");
+		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT"); // Negative evidence comes from captured entries.
+		physical = path.join(physical, segment);
+	}
+	const stat = await source.stat(physical), directory = stat.isDirectory();
+	if (operation === "stat") {
+		assert.ok(directory || Number.isSafeInteger(stat.size), "file size is not proven by retained content");
+		return { directory, size: directory ? 0 : stat.size };
+	}
+	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
+	if (directory) return fail("EISDIR");
+	assert.ok(stat.size <= maxBytes, "input byte budget");
+	return source.readFile(physical);
 }
 
 function bounded(promise, label) {
