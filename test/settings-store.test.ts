@@ -57,12 +57,21 @@ describe("extension-owned speculative settings", () => {
 		expect(store.effective()).toMatchObject({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
 	});
 
-	it("treats malformed optional layers as absent", async () => {
+	it("recovers from malformed input and failed publication without poisoning future writes", async () => {
 		const { agent, cwd } = await fixture();
-		await writeFile(path.join(agent, "speculative-action.json"), "{broken", "utf8");
+		const target = path.join(agent, "speculative-action.json");
+		await writeFile(target, "{broken", "utf8");
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await expect(store.load()).resolves.toBeUndefined();
 		expect(store.effective()).toBeUndefined();
+		await rm(target);
+		await mkdir(target);
+		store.setEffective({ enabled: false });
+		await expect(store.flush()).rejects.toThrow();
+		await rm(target, { recursive: true });
+		store.setEffective({ enabled: true });
+		await store.flush();
+		expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ enabled: true });
 	});
 });
 

@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 
@@ -23,7 +24,7 @@ export class SpeculativeActionSettingsStore {
 	private global: SettingsOverlay | undefined;
 	private project: SettingsOverlay | undefined;
 	private scopeValue: SpeculativeSettingsScope = "global";
-	private writeQueue = Promise.resolve();
+	private writeQueue: Promise<PromiseSettledResult<void>> = Promise.resolve({ status: "fulfilled", value: undefined });
 
 	readonly cwd: string;
 	readonly agentDirectory: string;
@@ -70,11 +71,15 @@ export class SpeculativeActionSettingsStore {
 		const value = this.scopeValue === "project" ? this.project : this.global;
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
 		const snapshot = clone(value);
-		this.writeQueue = this.writeQueue.then(() => writeSettings(target, snapshot));
+		this.writeQueue = this.writeQueue.then(() => writeSettings(target, snapshot)).then(
+			(value) => ({ status: "fulfilled", value }),
+			(reason: unknown) => ({ status: "rejected", reason }),
+		);
 	}
 
-	flush(): Promise<void> {
-		return this.writeQueue;
+	async flush(): Promise<void> {
+		const result = await this.writeQueue;
+		if (result.status === "rejected") throw result.reason;
 	}
 
 	private get globalPath(): string {
@@ -102,9 +107,13 @@ async function writeSettings(file: string, value: SettingsOverlay | undefined): 
 		return;
 	}
 	await mkdir(path.dirname(file), { recursive: true });
-	const temporary = `${file}.${process.pid}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-	await rename(temporary, file);
+	const temporary = `${file}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+		await rename(temporary, file);
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
 }
 
 function mergeSettings(
