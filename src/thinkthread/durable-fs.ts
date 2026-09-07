@@ -54,9 +54,18 @@ export class DurableFsExecutor {
 		input: Uint8Array,
 		signal?: AbortSignal,
 	): Promise<FsRunV1> {
+		if (signal?.aborted) throw abortError();
 		const requestID = this.requestID();
-		const request = { ...params, requestId: requestID };
-		return this.execute("fs.run", requestID, () => this.workflows.runWithStdinBytes(request, input), signal);
+		const payload = await this.workflows.uploadBytes(input, requestID);
+		if (signal?.aborted) {
+			await this.client.fs.payloadRemove({ payloadId: payload.payloadId });
+			throw abortError();
+		}
+		const request = {
+			...params, requestId: requestID,
+			invocation: { ...params.invocation, stdinPayloadId: payload.payloadId },
+		};
+		return this.execute("fs.run", requestID, () => this.client.fs.run(request), signal);
 	}
 
 	async apply(params: Omit<FsApplyParamsV1, "requestId">): Promise<FsApplyV1> {
@@ -144,7 +153,9 @@ export class DurableFsExecutor {
 				);
 			}
 			switch (status.state) {
-				case "succeeded": {
+				case "succeeded":
+				case "cancelled": {
+					// A cancelled fs.run can still own a TARGET; its caller must receive and release it.
 					const result = status.result as Result;
 					await this.close(requestID);
 					return result;
@@ -153,9 +164,6 @@ export class DurableFsExecutor {
 					await this.close(requestID);
 					throw new ThinkThreadDurableError(method, requestID, status.error.code, status.error.message);
 				}
-				case "cancelled":
-					await this.close(requestID);
-					throw abortError();
 				case "needs_recovery":
 					throw new ThinkThreadRecoveryRequiredError(
 						method,

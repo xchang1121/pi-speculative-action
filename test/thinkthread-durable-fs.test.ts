@@ -1,7 +1,7 @@
 import {
 	type AgentPosixClient,
+	parseFsPayloadId,
 	parseFsSnapshotId,
-	parseRequestId,
 	parseThinkThreadId,
 	TransportError,
 } from "@thinkthread/agent-posix";
@@ -19,65 +19,59 @@ const snapshot = {
 };
 
 describe("ThinkThread durable fs executor", () => {
-	it("retries not-sent delivery with the same request ID", async () => {
+	it.each(["not_sent", "completion_unknown", "needs_recovery"] as const)("settles %s without changing request identity", async (delivery) => {
 		const requestIDs: string[] = [];
 		const snapshotCreate = vi.fn(async ({ requestId }: { readonly requestId: string }) => {
 			requestIDs.push(requestId);
-			if (requestIDs.length === 1) throw new TransportError("not sent", "not_sent");
-			return snapshot;
+			if (delivery === "not_sent" && requestIDs.length > 1) return snapshot;
+			throw new TransportError("transport failed", delivery === "not_sent" ? "not_sent" : "completion_unknown");
 		});
+		const requestStatus = vi.fn(async () => ({
+			requestId: requestIDs[0], method: "fs.snapshot.create",
+			state: delivery === "needs_recovery" ? "needs_recovery" : "succeeded",
+			acceptedAtUnixMs: 1, finishedAtUnixMs: 2, result: snapshot, error: null,
+		}));
 		const requestClose = vi.fn(async () => ({}));
-		const durable = new DurableFsExecutor(fakeClient({ snapshotCreate, requestClose }));
-
-		await expect(durable.snapshotCreate()).resolves.toEqual(snapshot);
-		expect(requestIDs).toHaveLength(2);
+		const durable = new DurableFsExecutor(fakeClient({ snapshotCreate, requestStatus, requestClose }));
+		if (delivery === "needs_recovery") await expect(durable.snapshotCreate()).rejects.toBeInstanceOf(ThinkThreadRecoveryRequiredError);
+		else await expect(durable.snapshotCreate()).resolves.toEqual(snapshot);
+		expect(requestIDs).toHaveLength(delivery === "not_sent" ? 2 : 1);
 		expect(new Set(requestIDs).size).toBe(1);
-		expect(requestClose).toHaveBeenCalledOnce();
+		expect(requestStatus).toHaveBeenCalledTimes(delivery === "not_sent" ? 0 : 1);
+		expect(requestClose).toHaveBeenCalledTimes(delivery === "needs_recovery" ? 0 : 1);
 	});
 
-	it("settles completion-unknown from durable status and closes the record", async () => {
-		let requestID = parseRequestId("req-00000000-0000-4000-8000-000000000003");
-		const snapshotCreate = vi.fn(async ({ requestId }: { readonly requestId: typeof requestID }) => {
-			requestID = requestId;
-			throw new TransportError("unknown", "completion_unknown");
+	it.each(["staging_abort", "retry", "cancelled"])("owns upload, invocation and terminal artifacts: %s", async (outcome) => {
+		const controller = new AbortController();
+		const payloadId = parseFsPayloadId("fspayload-00000000-0000-4000-8000-000000000005");
+		const payloadCreate = vi.fn(async () => ({ payloadId }));
+		const payloadSeal = vi.fn(async () => {
+			if (outcome === "staging_abort") controller.abort();
+			return { payloadId };
 		});
-		const requestStatus = vi.fn(async () => ({
-			requestId: requestID,
-			method: "fs.snapshot.create" as const,
-			state: "succeeded" as const,
-			acceptedAtUnixMs: 1,
-			finishedAtUnixMs: 2,
-			result: snapshot,
-			error: null,
-		}));
-		const requestClose = vi.fn(async () => ({}));
-		const durable = new DurableFsExecutor(fakeClient({ snapshotCreate, requestStatus, requestClose }));
-
-		await expect(durable.snapshotCreate()).resolves.toEqual(snapshot);
-		expect(requestStatus).toHaveBeenCalledWith({ requestId: requestID });
-		expect(requestClose).toHaveBeenCalledWith({ requestId: requestID });
-	});
-
-	it("fails closed and retains a needs-recovery record", async () => {
-		let requestID = parseRequestId("req-00000000-0000-4000-8000-000000000004");
-		const snapshotCreate = vi.fn(async ({ requestId }: { readonly requestId: typeof requestID }) => {
-			requestID = requestId;
-			throw new TransportError("unknown", "completion_unknown");
+		const result = { targetSnapshotId: snapshotID, exit: { kind: "cancelled" } };
+		const run = vi.fn(async (_request: { requestId: string }) => {
+			if (outcome === "cancelled") throw new TransportError("unknown", "completion_unknown");
+			if (run.mock.calls.length === 1) throw new TransportError("not sent", "not_sent");
+			return result;
 		});
-		const requestStatus = vi.fn(async () => ({
-			requestId: requestID,
-			method: "fs.snapshot.create" as const,
-			state: "needs_recovery" as const,
-			acceptedAtUnixMs: 1,
-			finishedAtUnixMs: 2,
-			result: null,
-			error: null,
+		const requestStatus = vi.fn(async ({ requestId }: { requestId: string }) => ({
+			requestId, method: "fs.run", state: "cancelled", result, error: null,
 		}));
+		const payloadRemove = vi.fn(async () => ({}));
 		const requestClose = vi.fn(async () => ({}));
-		const durable = new DurableFsExecutor(fakeClient({ snapshotCreate, requestStatus, requestClose }));
-
-		await expect(durable.snapshotCreate()).rejects.toBeInstanceOf(ThinkThreadRecoveryRequiredError);
-		expect(requestClose).not.toHaveBeenCalled();
+		const durable = new DurableFsExecutor(fakeClient({
+			payloadCreate, payloadWrite: async () => ({ payloadId }), payloadSeal, payloadRemove,
+			run, requestStatus, requestClose, requestCancel: async () => ({}),
+		}));
+		const pending = durable.runWithInput({ snapshotId: snapshotID, writes: "snapshot", invocation: { argv: ["node"] } }, Buffer.from("input"), controller.signal);
+		if (outcome === "staging_abort") await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		else await expect(pending).resolves.toBe(result);
+		expect(payloadCreate).toHaveBeenCalledOnce();
+		expect(run).toHaveBeenCalledTimes(outcome === "staging_abort" ? 0 : outcome === "retry" ? 2 : 1);
+		expect(payloadRemove).toHaveBeenCalledTimes(outcome === "staging_abort" ? 1 : 0);
+		expect(requestClose).toHaveBeenCalledTimes(outcome === "staging_abort" ? 0 : 1);
+		if (outcome === "retry") expect(run.mock.calls[0]).toEqual(run.mock.calls[1]);
 	});
 
 	it("queues a failed record close and drains it without repeating the operation", async () => {

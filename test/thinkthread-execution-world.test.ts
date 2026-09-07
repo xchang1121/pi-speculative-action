@@ -313,11 +313,11 @@ describe("ThinkThread execution world", () => {
 		await expect(world.speculation.execute(input)).rejects.toThrow();
 	});
 
-	it("reclaims a mutation TARGET even when its response cannot be adopted", async () => {
-		const fixture = fakeClient({ outputTruncated: true });
+	it.each(["truncated", "cancelled"])("reclaims a mutation TARGET after %s", async (exit) => {
+		const fixture = fakeClient({ outputTruncated: exit === "truncated", cancelled: exit === "cancelled" });
 		const { world, cwd } = await startWorld(fixture, "truncated-write");
 		await expect(world.speculation.execute(context("write", { path: "a", content: "b" }, cwd, "write")))
-			.rejects.toThrow("exceeded 512 KiB");
+			.rejects.toThrow(exit === "truncated" ? "exceeded 512 KiB" : "failed (cancelled)");
 		await world.finishTurn("truncated-write");
 		expect(fixture.snapshotRemove).toHaveBeenCalledTimes(2);
 		await world.dispose?.();
@@ -355,6 +355,7 @@ function fakeClient(
 	options: {
 		readonly returnedRunKey?: string;
 		readonly outputTruncated?: boolean;
+		readonly cancelled?: boolean;
 		readonly applyError?: Error;
 		readonly verifyStatus?: "matched" | "stale";
 	} = {},
@@ -394,7 +395,7 @@ function fakeClient(
 		});
 		const target = params.writes === "snapshot" ? snapshotID(++snapshotSequence) : undefined;
 		return {
-			exit: { kind: "code" as const, code: 0 },
+			exit: options.cancelled ? { kind: "cancelled" as const } : { kind: "code" as const, code: 0 },
 			outputChunks: [
 				{
 					sequence: 0,
