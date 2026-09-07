@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import {
 	clampCandidateLimit,
@@ -198,7 +198,8 @@ export function createSpeculativeActionHost(
 	options: CreateSpeculativeActionHostOptions,
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
-	const projectionRules = (options.projectionRules ?? []).filter((rule) => actionSemantics.supportsProjector(rule.id));
+	const projectionRules = [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(options.projectionRules ?? [])]
+		.filter((rule) => actionSemantics.supportsProjector(rule.id));
 	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
 	if (
 		!executionWorlds.some(

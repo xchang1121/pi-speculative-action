@@ -8,7 +8,7 @@ type BashTailLinesCoverage = {
 };
 
 /** Losslessly narrow one completed, untruncated Bash suffix view to a shorter suffix. */
-export const PI_BASH_TAIL_LINES_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
+export const PI_BASH_TAIL_LINES_PROJECTION_RULE = {
 	...BASH_TAIL_LINES_ACTION_KEY_PROJECTOR,
 	captureCoverage: (action, output) => {
 		const view = bashTailLinesView(action);
@@ -17,7 +17,7 @@ export const PI_BASH_TAIL_LINES_PROJECTION_RULE: ActionProjectionRule<ToolSettle
 		if (content?.type !== "text" || outputTruncated(output.result.details)) return undefined;
 		return { kind: "tail_lines", lines: view.lines } satisfies BashTailLinesCoverage;
 	},
-	projectOutput: ({ speculative, actor, output, coverage }) => {
+	projectOutput: ({ speculative, actor, output, coverage }): ToolSettlement | undefined => {
 		const speculativeView = bashTailLinesView(speculative);
 		const actorView = bashTailLinesView(actor);
 		const realized = tailCoverage(coverage);
@@ -43,7 +43,7 @@ export const PI_BASH_TAIL_LINES_PROJECTION_RULE: ActionProjectionRule<ToolSettle
 			isError: false,
 		};
 	},
-};
+} satisfies ActionProjectionRule<ToolSettlement>;
 
 function tailCoverage(value: unknown): BashTailLinesCoverage | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

@@ -7,12 +7,12 @@ export interface ActionProjectionCoverage {
 	readonly value: unknown;
 }
 
-/** One lossless projection owns the key relation, realized coverage proof, and output reconstruction. */
+/** A key relation uses either branch-owned inputs or optional lossless output coverage. */
 export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 	/** Optional covering K(a) to execute; the runtime accepts it only when this rule proves containment. */
 	readonly coveringAction?: (predicted: ActionKey) => ActionKey | undefined;
-	readonly captureCoverage: (action: ActionKey, output: Output) => unknown | undefined;
-	readonly projectOutput: (input: {
+	readonly captureCoverage?: (action: ActionKey, output: Output) => unknown | undefined;
+	readonly projectOutput?: (input: {
 		readonly speculative: ActionKey;
 		readonly actor: ActionKey;
 		readonly output: Output;

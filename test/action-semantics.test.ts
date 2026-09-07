@@ -11,6 +11,7 @@ import {
 	OBSERVATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
+	RESOURCE_INPUT_ACTION_KEY_PROJECTOR,
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
@@ -270,42 +271,23 @@ describe("ActionSemanticsRegistry", () => {
 		);
 	});
 
-	it("rejects conflicting projector implementations with one identifier", () => {
-		const first = projector("same");
-		const second = projector("same");
-		expect(
-			() =>
-				new ActionSemanticsRegistry([
-					{ ...resourceDefinition("one", "one.v1", canonicalEmpty), projectors: [first] },
-					{ ...resourceDefinition("two", "two.v1", canonicalEmpty), projectors: [second] },
-				]),
-		).toThrow("conflicting action projector same");
-	});
-
-	it("allows one projector instance to be shared and exposes only registered projector IDs", () => {
-		const shared = projector("shared");
-		const registry = new ActionSemanticsRegistry([
-			{ ...resourceDefinition("one", "one.v1", canonicalEmpty), projectors: [shared] },
-			{ ...resourceDefinition("two", "two.v1", canonicalEmpty), projectors: [shared] },
-		]);
-
-		expect(registry.projectors()).toEqual([shared]);
-		expect(registry.supportsProjector("shared")).toBe(true);
-		expect(registry.supportsProjector("unknown")).toBe(false);
-	});
-
-	it("defensively snapshots definitions, projector lists, and tool-name results", () => {
+	it("owns immutable definitions and shares registered projectors without duplicate input relations", () => {
 		const projectors = [projector("kept")];
 		const source = { ...resourceDefinition("one", "one.v1", canonicalEmpty), projectors };
-		const registry = new ActionSemanticsRegistry([source]);
+		const registry = new ActionSemanticsRegistry([source, { ...source, tool: "two" }]);
+		expect(() => new ActionSemanticsRegistry([source, { ...source, tool: "conflict", projectors: [projector("kept")] }]))
+			.toThrow("conflicting action projector kept");
 		projectors.push(projector("late"));
 		(source as { epoch: string }).epoch = "mutated";
 		const names = registry.toolNames() as string[];
 		names.push("outside");
 
 		expect(registry.definition("one")?.epoch).toBe("one.v1");
-		expect(registry.projectors().map((item) => item.id)).toEqual(["kept"]);
-		expect(registry.toolNames()).toEqual(["one"]);
+		expect(registry.projectors()).toEqual([projectors[0], RESOURCE_INPUT_ACTION_KEY_PROJECTOR]);
+		expect(registry.supportsProjector("kept")).toBe(true);
+		expect(registry.supportsProjector("late")).toBe(false);
+		expect(registry.toolNames()).toEqual(["one", "two"]);
+		expect(new ActionSemanticsRegistry([registry.definition("one")!]).definition("one")?.projectors).toHaveLength(2);
 		expect(() =>
 			(registry.definition("one")?.projectors as ActionKeyProjector[]).push(projector("blocked")),
 		).toThrow();

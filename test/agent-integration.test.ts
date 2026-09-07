@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createLsTool, createReadTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
@@ -119,12 +119,13 @@ describe("speculative action host", () => {
 	it("reuses running and completed results for every keyable Pi tool", async () => {
 		expect(mockToolCalls.map(([tool]) => tool)).toEqual(KEYABLE_TOOLS);
 		for (const phase of ["running", "completed"] as const) {
-			for (const [toolName, args] of mockToolCalls) {
+			for (const [toolName, proposal] of mockToolCalls) {
 				const cwd = await temporaryWorkspace();
+				const args = toolName === "read" ? { ...proposal, offset: 2 } : proposal;
 				const turnID = `${phase}-${toolName}`;
 				const invocation = resolvePiToolInvocation(toolName, args, { cwd, environment: {} });
 				const resourceExecution = PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? invocation?.filesystem : undefined;
-				const expected = resourceExecution ? toolName === "read" ? "one\ntwo\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
+				const expected = resourceExecution ? toolName === "read" ? "two\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
 				let release!: () => void;
 				const gate = new Promise<void>((resolve) => {
 					release = resolve;
@@ -199,10 +200,11 @@ describe("speculative action host", () => {
 					expect(events.find((event) => event.type === "candidate" && event.state.status === "succeeded")).toMatchObject({
 						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
 					});
-					if (toolName === "read") {
-						const query = { path: "notes.txt", offset: 2, limit: 1 };
+					if (resourceExecution) {
+						const query = toolName === "read" ? { path: "notes.txt", offset: 1, limit: 1 } : { path: ".", limit: 1 };
 						const narrowed = await host.execute({ turnID, id: "another-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution);
-						expect(narrowed).toEqual(await createReadTool(cwd).execute("native", query));
+						const native = toolName === "read" ? createReadTool(cwd) : createLsTool(cwd);
+						expect(narrowed).toEqual(await native.execute("native", query));
 						expect(speculativeExecution).toHaveBeenCalledTimes(2); // Re-evaluation uses the sealed inputs, not the host tool.
 						expect(actorExecution).not.toHaveBeenCalled();
 					}

@@ -21,6 +21,7 @@ export {
 	type CanonicalAction,
 	type ExactActionKeyMatch,
 	PI_ACTION_SEMANTICS,
+	RESOURCE_INPUT_ACTION_KEY_PROJECTOR,
 	type ProjectedActionKey,
 	type ProjectedActionKeyMatch,
 	type ResourceDependencyScope,

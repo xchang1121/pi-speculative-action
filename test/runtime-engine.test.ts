@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
+import { RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "../src/action-semantics.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
@@ -194,7 +195,7 @@ function harness(input: {
 					: {}),
 			});
 		},
-		projectionRules: input.projection
+		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection
 			? [
 					{
 						...READ_RANGE_ACTION_KEY_PROJECTOR,
@@ -203,7 +204,7 @@ function harness(input: {
 						projectOutput: () => undefined,
 					},
 				]
-			: [],
+			: [])],
 		onCandidateMaterialized: input.onCandidateMaterialized,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: async (event) => {
@@ -601,24 +602,26 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
-	it("counts one shared execution once when it serves multiple Actor actions", async () => {
+	it("counts shared Actor work once without substituting a different producer query", async () => {
 		const candidateReady = candidateSucceeded();
+		const secondReady = candidateSucceeded(2);
+		let offset = 1;
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: () => plan("source", "shared-timing", { path: "README.md" }),
+			propose: () => plan("source", `shared-timing:${offset}`, { path: "README.md", offset }),
 		};
 		const fixture = harness({
 			source,
-			execute: () => "shared",
-			onEvent: candidateReady.observe,
+			execute: (_tool, args) => args.offset === 2 ? "different query" : "shared",
+			onEvent: (event) => { candidateReady.observe(event); secondReady.observe(event); },
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
 		await candidateReady.promise;
 
 		expect(await fixture.runtime.consume(call("turn"))).toBe("shared");
 		expect(await fixture.runtime.consume({ ...call("turn"), id: "call:repeat" })).toBe("shared");
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+		await fixture.runtime.finishTurn({ ...call("turn"), terminal: false });
 
 		const actorEvents = fixture.events.filter((event) => event.type === "actor_action");
 		expect(actorEvents).toHaveLength(2);
@@ -627,9 +630,13 @@ describe("structural speculative runtime", () => {
 		);
 		expect(candidateIDs).toHaveLength(2);
 		expect(new Set(candidateIDs).size).toBe(1);
-		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({
-			timing: { authoritativeToolCount: 1 },
-		});
+		offset = 2;
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "second" });
+		await secondReady.promise;
+		expect(await fixture.runtime.consume(call("second", { path: "README.md", offset }))).toBe("different query");
+		expect(fixture.executions()).toBe(2);
+		await fixture.runtime.finishTurn({ ...call("second"), terminal: true });
+		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
 	});
 
 	it("promotes an authoritative observation into the shared cache without a second execution", async () => {

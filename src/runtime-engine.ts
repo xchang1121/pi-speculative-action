@@ -269,7 +269,7 @@ function captureCoverage<Output>(
 ): readonly ActionProjectionCoverage[] {
 	return rules.flatMap((rule) => {
 		try {
-			const value = rule.captureCoverage(action, output);
+			const value = rule.captureCoverage?.(action, output);
 			return value === undefined ? [] : [{ rule: rule.id, value }];
 		} catch {
 			return [];
@@ -290,10 +290,10 @@ async function projectOutput<Output, StartInput, StateData>(
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
 	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule.id);
-	if (!reconstruct && !coverage) return { ok: false, cause: cause("projection", "coverage_missing") };
+	if (!reconstruct && (!coverage || !rule.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		const projected = reconstruct ? await reconstruct(request) : await rule.projectOutput({
+		const projected = reconstruct ? await reconstruct(request) : await rule.projectOutput!({
 			speculative: candidate.key,
 			actor,
 			output,
@@ -2810,7 +2810,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				candidateWorld(candidate) !== parent
 			)
 				continue;
-			if (lookup.match.kind === "projected" && candidate.work.execution.status !== "succeeded") {
+			if (lookup.match.kind === "projected") {
 				if (!canShareInFlight(candidate, key, lookup.match, runtimeState.projectionRules)) continue;
 			}
 			if (candidate.work.execution.status === "succeeded") {

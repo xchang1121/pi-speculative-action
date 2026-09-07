@@ -22,7 +22,7 @@ export function canPreviewIncompletePiCall(tool: string, input: Readonly<Record<
 }
 
 /** Production Pi read projection. Other tools remain exact-only. */
-export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
+export const PI_READ_RANGE_PROJECTION_RULE = {
 	...READ_RANGE_ACTION_KEY_PROJECTOR,
 	coveringAction: (action) => {
 		const range = readActionRange(action);
@@ -45,7 +45,7 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 		if (action.tool !== "read" || output.isError) return undefined;
 		return parseReadCoverage(readCoverageValue(output.result.details));
 	},
-	projectOutput: ({ actor, output, coverage }) => {
+	projectOutput: ({ actor, output, coverage }): ToolSettlement | undefined => {
 		if (output.isError) return undefined;
 		const actorRange = readActionRange(actor);
 		const actorUsesDefaultLimit = actor.input.limit === undefined;
@@ -113,7 +113,7 @@ export const PI_READ_RANGE_PROJECTION_RULE: ActionProjectionRule<ToolSettlement>
 			isError: false,
 		};
 	},
-};
+} satisfies ActionProjectionRule<ToolSettlement>;
 
 function parseReadCoverage(value: unknown): ReadRangeCoverage | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

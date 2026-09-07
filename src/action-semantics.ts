@@ -118,7 +118,7 @@ export class ActionSemanticsRegistry {
 				tool,
 				epoch,
 				requirements: normalizeEffectRequirements(source.requirements),
-				projectors: Object.freeze([...(source.projectors ?? [])]),
+				projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])]),
 			});
 			assertDefinitionCoherence(definition);
 			this.definitionsByTool.set(tool, definition);
@@ -195,6 +195,20 @@ export const READ_DEFAULT_LIMIT = 2000;
 export const GREP_DEFAULT_LIMIT = 100;
 export const FIND_DEFAULT_LIMIT = 1000;
 export const LS_DEFAULT_LIMIT = 500;
+
+/** Lookup hint only: different queries require re-evaluation over the branch's sealed inputs.
+ * No running join is inferred before a branch proves that it owns those inputs. */
+export const RESOURCE_INPUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
+	id: "resource.inputs",
+	partition: (action) => action.resources.length ? JSON.stringify([
+		action.tool, action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
+	]) : undefined,
+	project: (speculative, actor) => {
+		const partition = RESOURCE_INPUT_ACTION_KEY_PROJECTOR.partition(speculative);
+		return partition !== undefined && partition === RESOURCE_INPUT_ACTION_KEY_PROJECTOR.partition(actor)
+			? { action: actor, distance: Number.MAX_SAFE_INTEGER } : undefined;
+	},
+};
 
 /** π_read narrows a cached read action to the actor's requested interval. */
 export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
