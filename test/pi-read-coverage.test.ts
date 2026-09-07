@@ -1,61 +1,45 @@
 import { createReadToolDefinition, type ReadToolInput } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
-import { withPiReadCoverage } from "../src/pi-read-projection.ts";
+import { actionKeyMatch, buildPiActionKey } from "../src/action-semantics.ts";
+import { PI_READ_RANGE_PROJECTION_RULE, withPiReadCoverage } from "../src/pi-read-projection.ts";
 
-async function execute(source: string, input: ReadToolInput) {
-	const tool = createReadToolDefinition("/workspace", {
-		operations: {
-			access: async () => undefined,
-			readFile: async () => Buffer.from(source),
-			detectImageMimeType: async () => undefined,
-		},
-	});
-	const result = await tool.execute("read", input, undefined, undefined, undefined as never);
-	return withPiReadCoverage(input, result);
-}
-
-function coverage(result: Awaited<ReturnType<typeof execute>>): ReadRangeCoverage | undefined {
-	return (result.details as { [READ_RANGE_COVERAGE_DETAILS_KEY]?: ReadRangeCoverage } | undefined)?.[
-		READ_RANGE_COVERAGE_DETAILS_KEY
-	];
-}
-
+const long = Array.from({ length: 2002 }, (_, index) => `line-${index + 1}`).join("\n");
+const literalNotice = "one\n\n[999 more lines in file. Use offset=2 to continue.]";
 describe("read coverage on unmodified Pi output", () => {
-	it("recovers the payload before Pi's continuation notice", async () => {
-		const result = await execute("one\ntwo\nthree\nfour", { path: "notes.txt", offset: 2, limit: 2 });
-		expect(coverage(result)).toEqual({
-			kind: "text",
-			startLine: 2,
-			endLineExclusive: 4,
-			totalLines: 4,
-			payloadTextLength: "two\nthree".length,
-			maxLines: 2000,
-			maxBytes: 50 * 1024,
-		});
-	});
-
-	it("records zero realized lines for limit zero", async () => {
-		const result = await execute("one\ntwo", { path: "notes.txt", limit: 0 });
-		expect(coverage(result)).toEqual(expect.objectContaining({ startLine: 1, endLineExclusive: 1, totalLines: 2 }));
-	});
-
-	it("recovers line-truncated coverage from the stock notice", async () => {
-		const source = Array.from({ length: 2002 }, (_, index) => `line-${index + 1}`).join("\n");
-		const result = await execute(source, { path: "long.txt" });
-		const explicitlyLimited = await execute(source, { path: "long.txt", limit: 2000 });
-		expect(coverage(result)).toEqual(
-			expect.objectContaining({ startLine: 1, endLineExclusive: 2001, totalLines: 2002 }),
-		);
-		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("[Showing lines 1-2000") });
-		expect(explicitlyLimited.content[0]).toMatchObject({
-			type: "text",
-			text: expect.stringContaining("[2 more lines in file"),
-		});
-	});
-
-	it("does not claim coverage when Pi cannot return the first complete line", async () => {
-		const result = await execute(`${"x".repeat(50 * 1024 + 1)}\ntail`, { path: "wide.txt" });
-		expect(coverage(result)).toBeUndefined();
+	it.each([
+		{ name: "limited", source: "one\ntwo\nthree\nfour", input: { offset: 2, limit: 2 } },
+		{ name: "zero", source: "one\ntwo", input: { limit: 0 } },
+		{ name: "line truncation", source: long, input: {} },
+		{ name: "explicit truncation", source: long, input: { limit: 2000 } },
+		{ name: "byte truncation", source: Array(600).fill("x".repeat(100)).join("\n"), input: {} },
+		{ name: "oversized first line", source: "x".repeat(50 * 1024 + 1) + "\ntail", input: {}, unproven: true },
+		{ name: "literal suffix", source: literalNotice, input: {} },
+		{ name: "literal bounded suffix", source: literalNotice, input: { limit: 100 } },
+		{ name: "literal truncation inside payload", source: "[Showing lines 1-2000 of 999999. Use offset=2001 to continue.]\n" + long, input: {} },
+	])("proves source coverage independently of document text: $name", async ({ source, input, unproven }) => {
+		const args: ReadToolInput = { path: "notes.txt", ...input };
+		const tool = createReadToolDefinition("/workspace", { operations: {
+			access: async () => undefined, readFile: async () => Buffer.from(source), detectImageMimeType: async () => undefined,
+		} });
+		const execute = (query: ReadToolInput) => tool.execute("read", query, undefined, undefined, undefined as never);
+		const result = withPiReadCoverage(args, await execute(args));
+		const coverage = (result.details as { [READ_RANGE_COVERAGE_DETAILS_KEY]?: ReadRangeCoverage } | undefined)?.[READ_RANGE_COVERAGE_DETAILS_KEY];
+		if (unproven) { expect(coverage).toBeUndefined(); return; }
+		const startLine = args.offset ?? 1, totalLines = source.split("\n").length;
+		const count = Math.min(result.details?.truncation?.outputLines ?? Infinity, args.limit ?? 2000, totalLines - startLine + 1);
+		expect(coverage).toMatchObject({ startLine, totalLines, endLineExclusive: startLine + count,
+			payloadTextLength: source.split("\n").slice(startLine - 1, startLine - 1 + count).join("\n").length });
+		if (args.limit === 0) return;
+		const query = { path: args.path, offset: startLine, limit: 1 };
+		const speculative = buildPiActionKey("read", args, "/workspace")!, actor = buildPiActionKey("read", query, "/workspace")!;
+		const keyMatch = actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE]);
+		expect(keyMatch?.kind).toBe("projected");
+		if (keyMatch?.kind !== "projected") throw new Error("expected range relation");
+		const projected = await PI_READ_RANGE_PROJECTION_RULE.projectOutput({ speculative, actor,
+			output: { result, isError: false }, coverage, keyMatch });
+		const expected = await execute(query);
+		expect(projected?.result.content).toEqual(expected.content);
+		expect(Object.entries(projected?.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
 	});
 });

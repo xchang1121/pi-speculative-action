@@ -13,7 +13,7 @@ import {
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
-import { buildActionKey, READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
+import { asRecord, buildActionKey, READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** An incomplete Actor stream may start only the existing lossless read-range projection. */
@@ -28,22 +28,18 @@ export const PI_READ_RANGE_PROJECTION_RULE = {
 		const range = readActionRange(action);
 		if (!range || range.limit === 0 || range.limit >= READ_DEFAULT_LIMIT) return undefined;
 		return buildActionKey({
-			tool: action.tool,
-			resources: action.resources,
+			...action,
 			input: {
 				...action.input,
 				offset: Math.max(1, range.end - READ_DEFAULT_LIMIT + 1),
 				limit: READ_DEFAULT_LIMIT,
 			},
-			schemaHash: action.schemaHash,
-			semanticsEpoch: action.semanticsEpoch,
-			executionFingerprint: action.executionFingerprint,
-			...(action.executionContext !== undefined ? { executionContext: action.executionContext } : {}),
 		});
 	},
 	captureCoverage: (action, output) => {
 		if (action.tool !== "read" || output.isError) return undefined;
-		return parseReadCoverage(readCoverageValue(output.result.details));
+		const details = output.result.details as { [READ_RANGE_COVERAGE_DETAILS_KEY]?: unknown } | undefined;
+		return parseReadCoverage(details?.[READ_RANGE_COVERAGE_DETAILS_KEY]);
 	},
 	projectOutput: ({ actor, output, coverage }): ToolSettlement | undefined => {
 		if (output.isError) return undefined;
@@ -93,13 +89,10 @@ export const PI_READ_RANGE_PROJECTION_RULE = {
 
 		const realizedLineCount = truncation.truncated ? truncation.outputLines : selectedLines.length;
 		const projectedCoverage: ReadRangeCoverage = {
-			kind: "text",
+			...snapshot,
 			startLine,
 			endLineExclusive: startLine + realizedLineCount,
-			totalLines: snapshot.totalLines,
 			payloadTextLength: truncation.content.length,
-			maxLines: snapshot.maxLines,
-			maxBytes: snapshot.maxBytes,
 		};
 		return {
 			result: {
@@ -116,46 +109,15 @@ export const PI_READ_RANGE_PROJECTION_RULE = {
 } satisfies ActionProjectionRule<ToolSettlement>;
 
 function parseReadCoverage(value: unknown): ReadRangeCoverage | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const record = value as Record<string, unknown>;
-	if (record.kind !== "text") return undefined;
-	const startLine = finiteInteger(record.startLine);
-	const endLineExclusive = finiteInteger(record.endLineExclusive);
-	const totalLines = finiteInteger(record.totalLines);
-	const payloadTextLength = finiteInteger(record.payloadTextLength);
-	const maxLines = finiteInteger(record.maxLines);
-	const maxBytes = finiteInteger(record.maxBytes);
-	if (
-		startLine === undefined ||
-		endLineExclusive === undefined ||
-		totalLines === undefined ||
-		payloadTextLength === undefined ||
-		maxLines === undefined ||
-		maxBytes === undefined ||
-		startLine < 1 ||
-		totalLines < 1 ||
-		payloadTextLength < 0 ||
-		maxLines < 1 ||
-		maxBytes < 1 ||
-		endLineExclusive < startLine ||
-		endLineExclusive > totalLines + 1
-	) {
-		return undefined;
-	}
-	return {
-		kind: "text",
-		startLine,
-		endLineExclusive,
-		totalLines,
-		payloadTextLength,
-		maxLines,
-		maxBytes,
-	};
-}
-
-function readCoverageValue(details: unknown): unknown {
-	if (!details || typeof details !== "object") return undefined;
-	return (details as { readonly [READ_RANGE_COVERAGE_DETAILS_KEY]?: unknown })[READ_RANGE_COVERAGE_DETAILS_KEY];
+	const record = asRecord(value);
+	if (record?.kind !== "text") return undefined;
+	const fields = ["startLine", "endLineExclusive", "totalLines", "payloadTextLength", "maxLines", "maxBytes"] as const;
+	const snapshot = Object.fromEntries(fields.map((field) => [field, record[field]])) as Record<typeof fields[number], number>;
+	if (!Object.values(snapshot).every(Number.isSafeInteger)) return undefined;
+	const { startLine, endLineExclusive, totalLines, payloadTextLength, maxLines, maxBytes } = snapshot;
+	if (startLine < 1 || totalLines < 1 || payloadTextLength < 0 || maxLines < 1 || maxBytes < 1 ||
+		endLineExclusive < startLine || endLineExclusive > totalLines + 1) return undefined;
+	return { kind: "text", ...snapshot };
 }
 
 function readCoverageLines(output: ToolSettlement, coverage: ReadRangeCoverage): readonly string[] | undefined {
@@ -174,14 +136,11 @@ export function withPiReadCoverage(
 ): AgentToolResult<ReadToolDetails | undefined> {
 	const coverage = inferPiReadCoverage(input, result);
 	if (!coverage) return result;
-	const details: ReadToolDetails & { [READ_RANGE_COVERAGE_DETAILS_KEY]: ReadRangeCoverage } = {
+	const details = {
 		...(result.details ?? {}),
 		[READ_RANGE_COVERAGE_DETAILS_KEY]: coverage,
 	};
-	return {
-		...result,
-		details,
-	};
+	return { ...result, details };
 }
 
 /** Attach Pi-specific realized coverage without changing the underlying tool result. */
@@ -190,8 +149,8 @@ export function withPiProjectionCoverage(
 	input: unknown,
 	result: AgentToolResult<unknown>,
 ): AgentToolResult<unknown> {
-	if (tool !== "read" || !isReadToolInput(input)) return result;
-	return withPiReadCoverage(input, result as AgentToolResult<ReadToolDetails | undefined>);
+	if (tool !== "read" || typeof asRecord(input)?.path !== "string") return result;
+	return withPiReadCoverage(input as ReadToolInput, result as AgentToolResult<ReadToolDetails | undefined>);
 }
 
 function inferPiReadCoverage(
@@ -199,59 +158,36 @@ function inferPiReadCoverage(
 	result: AgentToolResult<ReadToolDetails | undefined>,
 ): ReadRangeCoverage | undefined {
 	if (result.content.length !== 1 || result.content[0]?.type !== "text") return undefined;
-	const text = result.content[0].text;
-	const startLine = Math.max(1, Math.floor(input.offset ?? 1));
+	const text = result.content[0].text, startLine = input.offset ?? 1, limit = input.limit;
+	if (!Number.isSafeInteger(startLine) || startLine < 1 ||
+		(limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0))) return undefined;
 	const truncation = result.details?.truncation;
 	if (truncation?.firstLineExceedsLimit) return undefined;
-
+	let payload = text, remaining = 0;
 	if (truncation?.truncated) {
-		const totalLines = totalLinesFromTruncationNotice(text);
-		if (totalLines === undefined || !text.startsWith(truncation.content)) return undefined;
-		return {
-			kind: "text",
-			startLine,
-			endLineExclusive: startLine + truncation.outputLines,
-			totalLines,
-			payloadTextLength: truncation.content.length,
-			maxLines: truncation.maxLines,
-			maxBytes: truncation.maxBytes,
-		};
+		payload = truncation.content;
+		// Only the suffix outside Pi's structured payload can supply the file's total line count.
+		const suffix = text.slice(payload.length);
+		const total = Number(/^\n\n\[Showing lines \d+-\d+ of (\d+)/.exec(suffix)?.[1]);
+		const end = startLine + truncation.outputLines - 1;
+		const byteLimit = truncation.truncatedBy === "bytes" ?  ` (${formatSize(truncation.maxBytes)} limit)` : "";
+		if (!text.startsWith(payload) ||
+			suffix !== `\n\n[Showing lines ${startLine}-${end} of ${total}${byteLimit}. Use offset=${end + 1} to continue.]`) return undefined;
+		remaining = total - end;
+	} else if (limit !== undefined) {
+		const notice = /\n\n\[(\d+) more lines in file\. Use offset=(\d+) to continue\.\]$/.exec(text);
+		const prefix = notice ? text.slice(0, notice.index) : text;
+		const prefixLines = prefix === "" && limit === 0 ? 0 : prefix.split("\n").length;
+		// A real bounded-read notice follows exactly limit lines. Otherwise it is document text.
+		if (notice && prefixLines === limit && Number(notice[1]) > 0 && Number(notice[2]) === startLine + limit) {
+			payload = prefix; remaining = Number(notice[1]);
+		}
 	}
-
-	const limited = /\n\n\[(\d+) more lines in file\. Use offset=\d+ to continue\.\]$/.exec(text);
-	const remaining = limited ? Number(limited[1]) : 0;
-	const payload = limited ? text.slice(0, limited.index) : text;
-	const requestedLimit = input.limit === undefined ? undefined : Math.max(0, Math.floor(input.limit));
-	const lineCount = payload === "" && requestedLimit === 0 ? 0 : payload.split("\n").length;
-	const totalLines = startLine - 1 + lineCount + remaining;
-	if (totalLines < 1) return undefined;
-	return {
-		kind: "text",
-		startLine,
-		endLineExclusive: startLine + lineCount,
-		totalLines,
-		payloadTextLength: payload.length,
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	};
-}
-
-function totalLinesFromTruncationNotice(text: string): number | undefined {
-	const match = /\[Showing lines \d+-\d+ of (\d+)(?:\.| \()/.exec(text);
-	if (!match) return undefined;
-	const total = Number(match[1]);
-	return Number.isSafeInteger(total) && total > 0 ? total : undefined;
-}
-
-function finiteInteger(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
-}
-
-function isReadToolInput(value: unknown): value is ReadToolInput {
-	return (
-		!!value &&
-		typeof value === "object" &&
-		!Array.isArray(value) &&
-		typeof (value as { path?: unknown }).path === "string"
-	);
+	const lineCount = payload === "" && limit === 0 ? 0 : payload.split("\n").length;
+	if (remaining < 0 || (limit !== undefined && lineCount > limit)) return undefined;
+	return parseReadCoverage({
+		kind: "text", startLine, endLineExclusive: startLine + lineCount,
+		totalLines: startLine - 1 + lineCount + remaining, payloadTextLength: payload.length,
+		maxLines: truncation?.maxLines ?? DEFAULT_MAX_LINES, maxBytes: truncation?.maxBytes ?? DEFAULT_MAX_BYTES,
+	});
 }
