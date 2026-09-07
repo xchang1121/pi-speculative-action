@@ -946,7 +946,7 @@ async function commitSandboxExecution(
 							await rmdir(change.target);
 							applied.push(change);
 						} else if (!change.before) {
-							createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+							await createParentDirectories(change.root, change.target, createdDirectories);
 							await mkdir(change.target, { mode: change.after.mode });
 							applied.push(change);
 							if (process.platform !== "win32") await chmod(change.target, change.after.mode);
@@ -960,7 +960,7 @@ async function commitSandboxExecution(
 					if (change.operation) {
 						// Native writes are authoritative from their first possible effect, including mkdir.
 						applied.push(change);
-						createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+						await createParentDirectories(change.root, change.target, createdDirectories);
 						const descriptor = descriptors.get(change) ?? await open(change.target, "wx", 0o666);
 						descriptors.set(change, descriptor);
 						await descriptor.truncate(0);
@@ -971,7 +971,7 @@ async function commitSandboxExecution(
 					applied.push(change);
 					const temporary = staged.get(change);
 					if (temporary) {
-						createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+						await createParentDirectories(change.root, change.target, createdDirectories);
 						await replaceFile(temporary, change.target, commitModes.get(change));
 						staged.delete(change);
 					} else {
@@ -2525,20 +2525,19 @@ async function stageAtomicWrite(
 	return temporary;
 }
 
-async function createParentDirectories(sourceRoot: string, target: string): Promise<string[]> {
+async function createParentDirectories(sourceRoot: string, target: string, created?: string[]): Promise<void> {
 	const root = path.resolve(sourceRoot);
 	const parent = path.dirname(path.resolve(target));
 	const relative = relativeFilesystemPath(root, parent);
 	if (relative === undefined) {
 		throw new Error(`sandbox commit path escapes workspace: ${target}`);
 	}
-	const created: string[] = [];
 	let current = root;
 	for (const segment of relative.split(path.sep).filter(Boolean)) {
 		current = path.join(current, segment);
 		try {
 			await mkdir(current);
-			created.push(current);
+			created?.push(current);
 		} catch (error) {
 			if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
 			const info = await lstat(current);
@@ -2547,7 +2546,6 @@ async function createParentDirectories(sourceRoot: string, target: string): Prom
 			}
 		}
 	}
-	return created;
 }
 
 async function removeCreatedDirectories(directories: readonly string[]): Promise<void> {
@@ -2556,7 +2554,7 @@ async function removeCreatedDirectories(directories: readonly string[]): Promise
 			await rmdir(directory);
 		} catch (error) {
 			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-			if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+			if (code !== "ENOENT") throw error;
 		}
 	}
 }

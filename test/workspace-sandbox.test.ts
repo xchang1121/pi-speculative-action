@@ -35,6 +35,10 @@ const writeTool = createWriteTool(process.cwd());
 const editTool = createEditTool(process.cwd());
 
 const testRoots = new Set<string>();
+vi.mock("node:fs/promises", async (original) => {
+	const fs = await original<typeof import("node:fs/promises")>();
+	return { ...fs, mkdir: vi.fn(fs.mkdir) };
+});
 
 afterEach(async () => {
 	const roots = [...testRoots];
@@ -352,31 +356,40 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("rolls back files and directories when final topology verification fails", async () => {
-		const root = await temporaryRoot("directory-rollback");
-		const template = await temporaryRoot("directory-template");
-		const directory = path.join(root, "generated");
-		const target = path.join(directory, "value.txt");
-		try {
-			await mkdir(path.join(template, "generated"));
-			const expectedEmpty = await readSandboxDirectoryState(path.join(template, "generated"));
-			if (!expectedEmpty) throw new Error("template directory state missing");
-			await expect(
-				commitSandboxDelta({
-					output: settlement("unused"),
-					changes: [
-						{ kind: "directory", root, target: directory, resource: "generated", after: expectedEmpty },
-						{ root, target, resource: "generated/value.txt", after: Buffer.from("unexpected child\n") },
-					],
-				}),
-			).rejects.toThrow("directory changed while committing: generated");
-			await expect(stat(target)).rejects.toThrow();
-			await expect(stat(directory)).rejects.toThrow();
-		} finally {
-			await Promise.all([
-				rm(root, { recursive: true, force: true }),
-				rm(template, { recursive: true, force: true }),
-			]);
+	it("owns partial directory creation and permits fallback only after complete rollback", async () => {
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		for (const fault of ["topology", "mkdir", "foreign"]) {
+			const root = await temporaryRoot(`directory-${fault}`), template = await temporaryRoot("directory-template");
+			const directory = path.join(root, "generated"), foreign = path.join(directory, "foreign.txt");
+			const file = fileTransition(root, fault === "topology" ? "generated/value.txt" : "generated/nested/value.txt", undefined, "child");
+			const gateway = new ToolExecutionGateway<unknown, ToolSettlement>([]);
+			let nativeCalls = 0;
+			try {
+				const expectedEmpty = await readSandboxDirectoryState(template);
+				if (!expectedEmpty) throw new Error("template directory state missing");
+				vi.mocked(mkdir).mockImplementation((async (target, options) => {
+					if (target === path.join(directory, "nested")) {
+						if (fault === "foreign") await writeFile(foreign, "external");
+						throw new Error("injected mkdir failure");
+					}
+					return fs.mkdir(target, options);
+				}) as typeof mkdir);
+				const error = await gateway.executeAuthoritative({ tool: "operation", input: {} }, async () => {
+					nativeCalls++;
+					await expect(stat(directory)).rejects.toThrow();
+					return settlement("actor");
+				}, { reuse: () => commitSandboxDelta({ output: settlement("reused"), changes: fault === "topology"
+					? [{ kind: "directory", root, target: directory, resource: "generated", after: expectedEmpty }, file] : [file] }) })
+					.then(() => undefined, (failure: unknown) => failure);
+				expect(nativeCalls, fault).toBe(fault === "foreign" ? 0 : 1);
+				expect(fault === "foreign" ? isPoisonedEffectCommit(error) : error === undefined, fault).toBe(true);
+				await expect(stat(file.target)).rejects.toThrow();
+				if (fault === "foreign") expect(await readFile(foreign, "utf8")).toBe("external");
+				else await expect(stat(directory)).rejects.toThrow();
+			} finally {
+				vi.mocked(mkdir).mockReset(); await gateway.dispose();
+				await Promise.all([rm(root, { recursive: true, force: true }), rm(template, { recursive: true, force: true })]);
+			}
 		}
 	});
 
@@ -405,26 +418,6 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(stat(target)).rejects.toThrow();
 			await expect(stat(inner)).rejects.toThrow();
 			await expect(stat(outer)).rejects.toThrow();
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("validates every path before an atomic multi-file commit", async () => {
-		const root = await temporaryRoot("atomic");
-		const first = path.join(root, "a.txt");
-		const stale = path.join(root, "b.txt");
-		try {
-			await writeFile(first, "a0", "utf8");
-			await writeFile(stale, "actor", "utf8");
-			await expect(
-				commitSandboxDelta({
-					output: settlement("unused"),
-					changes: [fileTransition(root, "a.txt", "a0", "a1"), fileTransition(root, "b.txt", "b0", "b1")],
-				}),
-			).rejects.toThrow("resource changed before commit: b.txt");
-			expect(await readFile(first, "utf8")).toBe("a0");
-			expect(await readFile(stale, "utf8")).toBe("actor");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -468,11 +461,18 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("serializes competing commits so only one shared baseline wins", async () => {
+	it("validates every path under the mutation lock before allowing one competing baseline to win", async () => {
 		const root = await temporaryRoot("lock");
 		const target = path.join(root, "value.txt");
 		try {
 			await writeFile(target, "base\n", "utf8");
+			const stale = path.join(root, "z-stale.txt");
+			await writeFile(stale, "actor");
+			await expect(commitSandboxDelta({ output: settlement("unused"), changes: [
+				fileTransition(root, "value.txt", "base\n", "invalid"), fileTransition(root, "z-stale.txt", "base", "invalid"),
+			] })).rejects.toThrow("resource changed before commit: z-stale.txt");
+			expect(await readFile(target, "utf8")).toBe("base\n");
+			expect(await readFile(stale, "utf8")).toBe("actor");
 			const deltas = ["first\n", "second\n"].map((after) => ({
 				output: settlement(after.trim()),
 				changes: [fileTransition(root, "value.txt", "base\n", after)],
