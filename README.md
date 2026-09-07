@@ -200,10 +200,10 @@ tt pi-speculative-action
 
 The installer accepts `--agent-posix-package /path/to/sdk.tgz` and `--speculative-action-package /path/to/spec.tgz` for prebuilt packages, and repeatable `--model provider/model` delegation. It pins Agent POSIX SDK 0.1.0, verifies protocol 2 and the contract fingerprint, and installs a schema-4 profile plus a private runtime under `~/.local/share/pi-speculative-action`. Pi, Node, `fd`, and `rg` must already be available to the profile. Profile settings live under that installation's `config` directory; project `.pi/speculative-action.json` overrides still apply.
 
-The adapter supplies two independent operations:
+The profile shares the existing execution and observation boundaries:
 
 - `speculation.execute`: `read`, `grep`, `find`, `ls`, `write`, and `edit` use Pi's stock implementations against a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
-- `observation.capture`: a fresh snapshot immediately before an Actor `read`, `grep`, `find`, or `ls`; the same Actor output is sealed for later validated reuse, without executing the tool again. This route does not require the speculative runner. `EffectTransaction` owns adoption state for both operations.
+- Actor `read`, `grep`, `find`, and `ls` results use the host's existing resource observation provider, including its stable execution-window proof. ThinkThread snapshot/content equality alone cannot prove that a live Actor call did not observe an intermediate A→B→A state, so there is no second ThinkThread Actor-result cache. This path needs neither the SDK nor the speculative runner. `EffectTransaction` owns adoption state for both operations.
 
 The profile's ThinkThread world is tried first; the native Linux process provider and Git workspace provider remain downstream routes. Bash is intentionally outside the portable runner and is routed to the native process world, so it retains persistent process-certificate replay, cross-parent child reuse, held-exec handoff, and reusable-command storage when Pi itself runs under ThinkThread. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
 

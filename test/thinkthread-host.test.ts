@@ -1,72 +1,64 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { type AgentPosixClient, parseFsSnapshotId, parseThinkThreadId } from "@thinkthread/agent-posix";
+import { type AgentPosixClient } from "@thinkthread/agent-posix";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 
-describe("ThinkThread through the production speculative host", () => {
-	it.each([false, true])("reuses an Actor read across turns only while fresh (stale=%s)", async (stale) => {
-		let snapshotSequence = 0;
-		let changed = false;
-		const snapshotCreate = vi.fn(async () => ({
-			snapshotId: parseFsSnapshotId(`fsnap-00000000-0000-4000-8000-${String(++snapshotSequence).padStart(12, "0")}`),
-			ownerThinkthreadId: parseThinkThreadId("tt-00000000-0000-4000-8000-000000000001"),
-			createdAtUnixMs: snapshotSequence,
-			logicalBytes: 1,
-		}));
-		const snapshotRemove = vi.fn(async () => ({}));
-		const verify = vi.fn(async () => ({
-			status: changed ? "stale" : "matched",
-			durationMs: 0, comparedEntries: 1, comparedBytes: 1,
-		}));
-		const run = vi.fn(async () => { throw new Error("Authoritative capture must not execute another tool"); });
+describe("ThinkThread profile with shared Actor observation", () => {
+	it.each(["stable", "changed", "ABA"])("proves the live Actor window before cross-turn reuse: %s", async (change) => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "thinkthread-observation-"));
+		const file = path.join(cwd, "notes.txt");
+		await writeFile(file, "A");
+		const snapshotCreate = vi.fn(async () => { throw new Error("Actor observation must use the shared resource proof"); });
 		const client = {
 			selfView: async () => ({ capabilities: [{ id: "thinkthread.fs.self", version: 1 }] }),
-			fs: { stat: async () => ({}), snapshotCreate, snapshotRemove, verify, run, requestClose: async () => ({}) },
+			fs: { stat: async () => ({}), snapshotCreate },
 		} as unknown as AgentPosixClient;
 		const world = createThinkThreadExecutionWorld({ clientFactory: () => client, runnerFingerprint: "test" });
-		const events: SpeculativeActionEvent<string>[] = [];
 		const options = {
-			cwd: process.env.THINKTHREAD_FS ?? "/workspace",
+			cwd,
 			getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["read"], patternAware: { enabled: false } }),
 			complete: async () => { throw new Error("No model requests expected"); },
 			preflight: () => true,
 			executionWorlds: [world],
-			onEvent: (event: SpeculativeActionEvent<string>) => { events.push(event); },
 		};
 		const host = withThinkThreadProfileLifecycle(createSpeculativeActionHost("session", options), world, options);
+		const executor = vi.fn(async () => {
+			const restore = change === "ABA" && executor.mock.calls.length === 1;
+			if (restore) await writeFile(file, "B");
+			const text = await readFile(file, "utf8");
+			if (restore) await writeFile(file, "A");
+			return { content: [{ type: "text" as const, text }], details: {} };
+		});
 		const schema = Type.Object({ path: Type.String() });
-		const executor = vi.fn(async () => ({ content: [{ type: "text" as const, text: changed ? "new" : "original" }], details: {} }));
 		const tool: AgentTool<typeof schema> = { name: "read", label: "read", description: "read", parameters: schema, execute: executor };
 		const actorModel: Model<"openai-responses"> = {
 			id: "test", name: "test", api: "openai-responses", provider: "openai", baseUrl: "https://example.invalid",
 			reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024,
 		};
-		const input = (turnID: string) => ({ turnID, actorModel, context: { messages: [], tools: [tool] }, tools: [tool], actorOptions: undefined });
+		const execute = async (turnID: string) => {
+			await host.startTurn({ turnID, actorModel, context: { messages: [], tools: [tool] }, tools: [tool], actorOptions: undefined });
+			const result = await host.execute({ turnID, id: turnID, tool: "read", args: { path: "notes.txt" }, tools: [tool] }, undefined, executor);
+			await host.finishTurn(turnID);
+			return result;
+		};
 		try {
-			await host.startTurn(input("first"));
-			const first = await host.execute({ turnID: "first", id: "first-read", tool: "read", args: { path: "notes.txt" }, tools: [tool] }, undefined, executor);
-			await host.finishTurn("first");
-			changed = stale;
-			await host.startTurn(input("second"));
-			const second = await host.execute({ turnID: "second", id: "second-read", tool: "read", args: { path: "notes.txt" }, tools: [tool] }, undefined, executor);
-			await host.finishTurn("second", true);
-			await vi.waitFor(() => expect(events.filter((event) => event.type === "actor_action")).toHaveLength(2));
-			expect(executor).toHaveBeenCalledTimes(stale ? 2 : 1);
-			expect(snapshotCreate).toHaveBeenCalledTimes(stale ? 2 : 1);
-			expect(verify).toHaveBeenCalled();
-			expect(run).not.toHaveBeenCalled();
-			if (!stale) expect(second).toBe(first);
-			else expect(second.content).toEqual([{ type: "text", text: "new" }]);
-			const last = events.filter((event) => event.type === "actor_action").at(-1);
-			expect(last?.settlement.provider.kind).toBe(stale ? "actor" : "speculative");
+			const first = await execute("first");
+			expect(first.content).toEqual([{ type: "text", text: change === "ABA" ? "B" : "A" }]);
+			if (change === "changed") await writeFile(file, "B");
+			const second = await execute("second");
+			expect(second.content).toEqual([{ type: "text", text: change === "changed" ? "B" : "A" }]);
+			expect(executor).toHaveBeenCalledTimes(change === "stable" ? 1 : 2);
+			expect(snapshotCreate).not.toHaveBeenCalled();
 		} finally {
 			await host.dispose();
+			await rm(cwd, { recursive: true, force: true });
 		}
-		expect(snapshotRemove).toHaveBeenCalledTimes(snapshotSequence);
 	});
 });

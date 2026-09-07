@@ -37,7 +37,7 @@ describe("ThinkThread execution world", () => {
 		expect(world.speculation.capabilities).toEqual(expect.arrayContaining([...RESOURCE_OBSERVATION_EFFECTS.capabilities]));
 		expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
 		expect(world.speculation.tools).toEqual(["read", "grep", "find", "ls", "write", "edit"]);
-		expect(world.observation?.tools).toEqual(["read", "grep", "find", "ls"]);
+		expect(world.observation).toBeUndefined();
 		await expect(
 			world.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }),
 		).resolves.toContain("linux-execution-v10");
@@ -252,85 +252,17 @@ describe("ThinkThread execution world", () => {
 		await world.dispose?.();
 	});
 
-	it("captures a fresh Actor baseline without executing a tool or reusing the turn BASE", async () => {
-		const fixture = fakeClient();
-		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "test" });
-		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		await world.beginTurn("capture-turn");
-		await world.speculation.prepare?.({ cwd });
-		const input = context("read", { path: "notes.txt" }, cwd, "actor-read");
-		const speculative = await world.speculation.execute(input);
-		const capture = await world.observation!.capture(input);
-		const output = { result: { content: [{ type: "text" as const, text: "Actor output" }], details: {} }, isError: false };
-		const branch = await capture.seal(output);
-
-		expect(fixture.snapshotCreate).toHaveBeenCalledTimes(2);
-		expect(fixture.run).toHaveBeenCalledOnce();
-		expect(branch.checkpoint?.id).not.toBe(speculative.checkpoint?.id);
-		await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
-		await expect(branch.commit()).resolves.toBe(output);
-		expect(fixture.apply).not.toHaveBeenCalled();
-		expect(() => capture.seal(output)).toThrow("already sealed");
-		await capture.dispose();
-		expect(fixture.snapshotRemove).not.toHaveBeenCalled();
-		await branch.dispose();
-		await speculative.dispose();
-		await world.finishTurn("capture-turn");
-		expect(fixture.snapshotRemove).toHaveBeenCalledTimes(2);
-		await world.dispose?.();
-	});
-
-	it("rejects stale Actor observations at adoption and releases unsealed captures", async () => {
+	it("rejects stale snapshot executions at adoption", async () => {
 		const fixture = fakeClient({ verifyStatus: "stale" });
-		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client });
-		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		const input = context("read", { path: "notes.txt" }, cwd, "actor-read");
-		const capture = await world.observation!.capture(input);
-		const branch = await capture.seal({ result: { content: [], details: {} }, isError: false });
+		const { world, cwd } = await startWorld(fixture, "stale");
+		const branch = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
 		await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
 		await expect(branch.commit()).rejects.toMatchObject({
 			resolutionCause: { stage: "freshness", code: "thinkthread_dependency_changed" },
 		});
 		await branch.dispose();
-		const unused = await world.observation!.capture(input);
-		await unused.dispose();
-		await unused.dispose();
-		expect(() => unused.seal(branch.output)).toThrow("already disposed");
-		expect(fixture.snapshotRemove).toHaveBeenCalledTimes(2);
-		expect(fixture.run).not.toHaveBeenCalled();
 		await world.dispose?.();
-	});
-
-	it("qualifies Actor observation independently of the speculative runner", async () => {
-		const fixture = fakeClient();
-		const world = createThinkThreadExecutionWorld({
-			clientFactory: () => fixture.client,
-			runnerPath: "/missing-thinkthread-runner/does-not-exist.js",
-		});
-		const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
-		await expect(world.speculation.diagnostics?.({ cwd })).rejects.toThrow();
-		await expect(world.observation!.diagnostics?.({ cwd })).resolves.toMatchObject({ state: "ready" });
-		await expect(world.observation!.capture(context("write", { path: "a", content: "b" }, cwd, "write")))
-			.rejects.toThrow("cannot capture authoritative write");
-		expect(fixture.snapshotCreate).not.toHaveBeenCalled();
-		await world.dispose?.();
-	});
-
-	it("releases a late Actor snapshot when cancelled during capture", async () => {
-		const fixture = fakeClient();
-		let release!: (snapshot: ReturnType<typeof snapshotView>) => void;
-		fixture.snapshotCreate.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
-		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client });
-		const controller = new AbortController();
-		const input = { ...context("read", { path: "notes.txt" }, process.env.THINKTHREAD_FS ?? "/workspace", "read"), signal: controller.signal };
-		const capture = world.observation!.capture(input);
-		const rejected = expect(capture).rejects.toThrow();
-		await vi.waitFor(() => expect(fixture.snapshotCreate).toHaveBeenCalledOnce());
-		controller.abort();
-		release(snapshotView(1));
-		await rejected;
 		expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
-		await world.dispose?.();
 	});
 
 	it("can requalify speculation after the runner becomes available", async () => {
@@ -348,25 +280,26 @@ describe("ThinkThread execution world", () => {
 		}
 	});
 
-	it("drains in-flight capture before world disposal and rejects later execution", async () => {
+	it.each(["abort", "dispose"])("drains a late BASE after %s without starting the runner", async (operation) => {
 		const fixture = fakeClient();
+		let enter!: () => void;
 		let release!: (snapshot: ReturnType<typeof snapshotView>) => void;
-		fixture.snapshotCreate.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
-		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client });
-		const input = context("read", { path: "notes.txt" }, process.env.THINKTHREAD_FS ?? "/workspace", "read");
-		const capture = world.observation!.capture(input);
-		const rejected = expect(capture).rejects.toThrow();
-		await vi.waitFor(() => expect(fixture.snapshotCreate).toHaveBeenCalledOnce());
-		let disposed = false;
-		const disposal = world.dispose!().then(() => { disposed = true; });
-		await Promise.resolve();
-		expect(disposed).toBe(false);
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const snapshot = new Promise<ReturnType<typeof snapshotView>>((resolve) => { release = resolve; });
+		fixture.snapshotCreate.mockImplementationOnce(() => { enter(); return snapshot; });
+		const { world, cwd } = await startWorld(fixture, "late-base");
+		const controller = new AbortController();
+		const input = { ...context("read", { path: "notes.txt" }, cwd, "read"), signal: controller.signal };
+		const rejected = expect(world.speculation.execute(input)).rejects.toThrow();
+		await entered;
+		if (operation === "abort") controller.abort();
+		const disposal = operation === "dispose" ? world.dispose!() : undefined;
 		release(snapshotView(1));
 		await rejected;
-		await disposal;
+		await (disposal ?? world.dispose!());
+		expect(fixture.run).not.toHaveBeenCalled();
 		expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
-		await expect(world.observation!.capture(input)).rejects.toThrow();
-		expect(fixture.snapshotCreate).toHaveBeenCalledOnce();
+		await expect(world.speculation.execute(input)).rejects.toThrow();
 	});
 
 	it("reclaims a mutation TARGET even when its response cannot be adopted", async () => {

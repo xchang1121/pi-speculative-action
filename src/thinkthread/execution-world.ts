@@ -22,7 +22,6 @@ import {
 	type WorldBranch,
 	type WorldCommitMetrics,
 	type WorldCompatibilityEvidence,
-	type WorldResultCapture,
 } from "../execution-world.ts";
 import { effectCommitFailure } from "../effect-transaction.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
@@ -146,22 +145,6 @@ export function createThinkThreadExecutionWorld(
 			execute: (context) => execute(context, (world, input) =>
 				forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages)),
 		},
-		observation: {
-			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-			tools: OBSERVATION_TOOLS,
-			fingerprint: (request) => {
-				if (request.action && !OBSERVATION_TOOLS.includes(request.action.tool as typeof OBSERVATION_TOOLS[number])) {
-					throw new Error(`ThinkThread cannot capture authoritative ${request.action.tool} results`);
-				}
-				return `thinkthread-fs-observation:v1:${CONTRACT_FINGERPRINT}`;
-			},
-			prepare: async ({ cwd }) => { await prepare(cwd); },
-			diagnostics: async ({ cwd }) => {
-				await prepare(cwd);
-				return { state: "ready", detail: "ThinkThread snapshot/verify for Actor read, grep, find, and ls results" };
-			},
-			capture: (context) => execute(context, captureThinkThreadResult),
-		},
 		beginTurn: async (turnID) => {
 			activeTurn = turnID;
 		},
@@ -223,6 +206,7 @@ async function forkThinkThreadWorld(
 		: await world.pool.acquireRoot();
 	let target: SnapshotLease | undefined;
 	try {
+		context.signal.throwIfAborted();
 		const tool = toolName(context.toolName);
 		const request = encodeThinkThreadToolRunnerRequest({
 			version: THINKTHREAD_TOOL_RUNNER_VERSION,
@@ -231,13 +215,7 @@ async function forkThinkThreadWorld(
 			args: context.args,
 			autoResizeImages,
 		});
-		const writes: FsRunWrites =
-			context.action.tool === "read" ||
-			context.action.tool === "grep" ||
-			context.action.tool === "find" ||
-			context.action.tool === "ls"
-				? "deny"
-				: "snapshot";
+		const writes: FsRunWrites = OBSERVATION_TOOLS.includes(tool as typeof OBSERVATION_TOOLS[number]) ? "deny" : "snapshot";
 		const environment = invocationEnvironment(context.action.executionContext);
 		const runParams: FsRunKeyParamsV1 = {
 			snapshotId: source.lease.id,
@@ -292,37 +270,6 @@ async function forkThinkThreadWorld(
 	}
 }
 
-async function captureThinkThreadResult(
-	world: PreparedWorld,
-	context: SpeculativeToolExecutionContext,
-): Promise<WorldResultCapture<ToolSettlement>> {
-	if (!OBSERVATION_TOOLS.includes(context.toolName as typeof OBSERVATION_TOOLS[number])) {
-		throw new Error(`ThinkThread cannot capture authoritative ${context.toolName} results`);
-	}
-	const dependencies = actionDependencies(context);
-	const started = performance.now();
-	// Actor capture must observe the live workspace now, not an earlier speculative turn BASE.
-	const source = world.pool.ownSnapshot(await world.durable.snapshotCreate());
-	try {
-		context.signal.throwIfAborted();
-		return new ThinkThreadResultCapture({
-			source,
-			lineage: `actor:${source.id}`,
-			depth: 0,
-			resources: [...context.action.resources],
-			capturedBytes: 0,
-			setupMs: Math.max(0, performance.now() - started),
-			captureMs: 0,
-			executionFingerprint: context.action.executionFingerprint,
-			...world,
-			dependencies,
-		});
-	} catch (error) {
-		await source.release().catch(() => undefined);
-		throw error;
-	}
-}
-
 interface ThinkThreadBranchInput {
 	readonly output: ToolSettlement;
 	readonly source: SnapshotLease;
@@ -338,28 +285,6 @@ interface ThinkThreadBranchInput {
 	readonly durable: DurableFsExecutor;
 	readonly pool: ThinkThreadSnapshotPool;
 	readonly dependencies: readonly FsDependency[];
-}
-
-class ThinkThreadResultCapture implements WorldResultCapture<ToolSettlement> {
-	private readonly input: Omit<ThinkThreadBranchInput, "output">;
-	private state: "open" | "sealed" | "disposed" = "open";
-
-	constructor(input: Omit<ThinkThreadBranchInput, "output">) {
-		this.input = input;
-	}
-
-	seal(output: ToolSettlement): WorldBranch<ToolSettlement> {
-		if (this.state !== "open") throw new Error(`ThinkThread result capture is already ${this.state}`);
-		const branch = new ThinkThreadWorldBranch({ ...this.input, output });
-		this.state = "sealed";
-		return branch;
-	}
-
-	async dispose(): Promise<void> {
-		if (this.state !== "open") return;
-		this.state = "disposed";
-		await this.input.source.release();
-	}
 }
 
 class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
