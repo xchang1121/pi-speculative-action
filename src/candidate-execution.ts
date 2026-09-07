@@ -43,46 +43,6 @@ export interface CandidateReservationLease {
 	adopt(): boolean;
 }
 
-class CandidateReservationLeaseHandle implements CandidateReservationLease {
-	readonly owner: string;
-	readonly kind: CandidateReservation["kind"];
-	private stateValue: CandidateReservationLeaseState = "active";
-	private readonly releaseReservation: () => boolean;
-	private readonly adoptReservation: () => boolean;
-
-	constructor(
-		owner: string,
-		kind: CandidateReservation["kind"],
-		releaseReservation: () => boolean,
-		adoptReservation: () => boolean,
-	) {
-		this.owner = owner;
-		this.kind = kind;
-		this.releaseReservation = releaseReservation;
-		this.adoptReservation = adoptReservation;
-	}
-
-	get state(): CandidateReservationLeaseState {
-		return this.stateValue;
-	}
-
-	get active(): boolean {
-		return this.stateValue === "active";
-	}
-
-	release(): boolean {
-		if (!this.active || !this.releaseReservation()) return false;
-		this.stateValue = "released";
-		return true;
-	}
-
-	adopt(): boolean {
-		if (!this.active || !this.adoptReservation()) return false;
-		this.stateValue = this.kind === "exclusive" ? "consumed" : "released";
-		return true;
-	}
-}
-
 /** Owns execution and reservation as independent, monotonic facts. */
 export class CandidateExecution<Output> {
 	readonly controller: AbortController;
@@ -158,12 +118,22 @@ export class CandidateExecution<Output> {
 	acquire(owner: string): CandidateReservationLease | undefined {
 		if (!this.reserve(owner)) return undefined;
 		const kind = this.reservationValue.kind;
-		return new CandidateReservationLeaseHandle(
+		let state: CandidateReservationLeaseState = "active";
+		const settle = (adopt: boolean) => {
+			if (state !== "active") return false;
+			const consumed = adopt && kind === "exclusive";
+			if (!(consumed ? this.consume(owner) : this.release(owner))) return false;
+			state = consumed ? "consumed" : "released";
+			return true;
+		};
+		return {
 			owner,
 			kind,
-			() => this.release(owner),
-			() => (kind === "exclusive" ? this.consume(owner) : this.release(owner)),
-		);
+			get state() { return state; },
+			get active() { return state === "active"; },
+			release: () => settle(false),
+			adopt: () => settle(true),
+		};
 	}
 
 	release(turnID: string): boolean {
