@@ -5,7 +5,7 @@ import {
 } from "../src/effect-model.ts";
 import type { ExecutionWorld } from "../src/execution-world.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { ToolExecutionGateway, type ToolOperation } from "../src/tool-execution-gateway.ts";
+import { ToolExecutionGateway, type ToolOperation, type AuthoritativeExecutionSettlement } from "../src/tool-execution-gateway.ts";
 
 type TestContext = { readonly value: string };
 type TestWorld = ExecutionWorld<TestContext, string>;
@@ -61,80 +61,39 @@ describe("ToolExecutionGateway", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it("runs authoritative operations through the same source-neutral boundary", async () => {
+	it("settles each authoritative attempt once without replacing its executor or failure", async () => {
 		const gateway = new ToolExecutionGateway<TestContext, string>([]);
-		const operation = { tool: "third_party_tool", callID: "actor-1", input: { value: 42 } };
-		const executor = vi.fn(async (received: ToolOperation) =>
-			(received.input as { readonly value: number }).value,
-		);
-
-		expect(await gateway.executeAuthoritative(operation, executor)).toBe(42);
-		expect(executor).toHaveBeenCalledOnce();
-		expect(executor).toHaveBeenCalledWith(operation);
-	});
-
-	it("owns reuse, Actor fallback timing, and failure-isolated observation", async () => {
-		const gateway = new ToolExecutionGateway<TestContext, string>([]);
-		const operation = { tool: "read", callID: "actor", input: { path: "file" } };
-		const executor = vi.fn(async () => 42);
-		const settled = vi.fn(async () => {
-			throw new Error("observer failed");
-		});
-
-		expect(
-			await gateway.executeAuthoritative(operation, executor, {
-				reuse: async () => {
-					throw new Error("cache failed");
-				},
-				settled,
-			}),
-		).toBe(42);
-		expect(executor).toHaveBeenCalledOnce();
-		expect(settled).toHaveBeenCalledWith(
-			expect.objectContaining({ status: "succeeded", output: 42, durationMs: expect.any(Number) }),
-		);
-
-		executor.mockClear();
-		settled.mockClear();
-		expect(
-			await gateway.executeAuthoritative(operation, executor, { reuse: async () => 7, settled }),
-		).toBe(7);
-		expect(executor).not.toHaveBeenCalled();
-		expect(settled).not.toHaveBeenCalled();
-	});
-
-	it("reports the original Actor error without letting observation replace it", async () => {
-		const gateway = new ToolExecutionGateway<TestContext, string>([]);
-		const failure = new Error("actor failed");
-		const observer = vi.fn(async () => {
-			throw new Error("observer failed");
-		});
-
-		await expect(
-			gateway.executeAuthoritative(
-				{ tool: "bash", input: "exit 1" },
-				async () => {
-					throw failure;
-				},
-				{ settled: observer },
-			),
-		).rejects.toBe(failure);
-		expect(observer).toHaveBeenCalledWith(
-			expect.objectContaining({ status: "failed", error: failure, durationMs: expect.any(Number) }),
-		);
-	});
-
-	it("never starts the Actor after an indeterminate reuse commit", async () => {
-		const gateway = new ToolExecutionGateway<TestContext, string>([]);
-		const executor = vi.fn(async () => "actor");
-		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
-
-		await expect(
-			gateway.executeAuthoritative({ tool: "write", input: {} }, executor, {
-				reuse: async () => Promise.reject(poisoned),
-			}),
-		).rejects.toBe(poisoned);
-		expect(executor).not.toHaveBeenCalled();
+		const operation = { tool: "third_party_tool", callID: "actor", input: { value: 42 } };
+		const failure = new Error("Actor failure"), poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
+		const succeed = async () => 42, fail = () => { throw failure; };
+		const observerFailure = new Error("Observer failure"), failObservation = () => { throw observerFailure; };
+		const observers = [undefined, failObservation, async () => failObservation(), (value: AuthoritativeExecutionSettlement<number>) => {
+			Object.assign(value, { status: "succeeded", output: -1, error: observerFailure });
+		}];
+		const cases = [
+			{ name: "Actor", actor: succeed, reuse: undefined, output: 42, executions: 1 },
+			{ name: "recoverable reuse", actor: succeed, reuse: async () => fail(), output: 42, executions: 1 },
+			{ name: "falsy reuse hit", actor: succeed, reuse: async () => 0, output: 0, executions: 0 },
+			{ name: "Actor throws", actor: fail, reuse: undefined, error: failure, executions: 1 },
+			{ name: "Actor rejects", actor: async () => fail(), reuse: undefined, error: failure, executions: 1 },
+			{ name: "poisoned commit", actor: succeed, reuse: async () => { throw poisoned; }, error: poisoned, executions: 0 },
+		];
+		for (const row of cases) for (const observe of observers) {
+			const executor = vi.fn((received: ToolOperation) => {
+				expect(received).toBe(operation);
+				return row.actor();
+			});
+			const settled = observe && vi.fn(observe);
+			const execution = gateway.executeAuthoritative(operation, executor, { reuse: row.reuse, settled });
+			if ("error" in row) await expect(execution, row.name).rejects.toBe(row.error);
+			else await expect(execution, row.name).resolves.toBe(row.output);
+			expect(executor, row.name).toHaveBeenCalledTimes(row.executions);
+			if (settled) expect(settled, row.name).toHaveBeenCalledTimes(row.executions);
+			if (settled && row.executions) expect(settled).toHaveBeenCalledWith(expect.objectContaining({
+				status: "error" in row ? "failed" : "succeeded", durationMs: expect.any(Number),
+				...("error" in row ? { error: row.error } : { output: row.output }),
+			}));
+		}
 	});
 });
 

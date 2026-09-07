@@ -31,6 +31,8 @@
 
 ### Added
 
+- Consolidated authoritative execution and observation into the gateway's single frozen settlement;
+  observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
 - Added explicit, hash-verified `setup:search` module installation without npm CLI links or Actor PATH changes.
 - Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
   implementation used by qualification. Native Actor defaults are unchanged; production worker

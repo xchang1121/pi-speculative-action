@@ -119,12 +119,32 @@ export class ToolExecutionGateway<Context, Output> {
 		);
 	}
 
-	executeAuthoritative<AuthoritativeOutput>(
+	async executeAuthoritative<AuthoritativeOutput>(
 		operation: ToolOperation,
 		executor: AuthoritativeToolExecutor<AuthoritativeOutput>,
 		hooks: AuthoritativeExecutionHooks<AuthoritativeOutput> = {},
 	): Promise<AuthoritativeOutput> {
-		return executeAuthoritativeLifecycle(operation, executor, hooks);
+		if (hooks.reuse) {
+			try {
+				const reused = await hooks.reuse();
+				if (reused !== undefined) return reused;
+			} catch (error) {
+				if (isPoisonedEffectCommit(error)) throw error;
+				// Reuse is optional; the supplied Actor executor remains authoritative.
+			}
+		}
+		const startedAt = performance.now();
+		let settlement: AuthoritativeExecutionSettlement<AuthoritativeOutput>;
+		try {
+			settlement = { status: "succeeded", output: await executor(operation), durationMs: Math.max(0, performance.now() - startedAt) };
+		} catch (error) {
+			settlement = { status: "failed", error, durationMs: Math.max(0, performance.now() - startedAt) };
+		}
+		Object.freeze(settlement);
+		try { await hooks.settled?.(settlement); }
+		catch { /* Observation cannot replace the original Actor settlement. */ }
+		if (settlement.status === "failed") throw settlement.error;
+		return settlement.output;
 	}
 
 	executeSpeculative(
@@ -141,49 +161,6 @@ export class ToolExecutionGateway<Context, Output> {
 	}
 }
 
-async function executeAuthoritativeLifecycle<Output>(
-	operation: ToolOperation,
-	executor: AuthoritativeToolExecutor<Output>,
-	hooks: AuthoritativeExecutionHooks<Output>,
-): Promise<Output> {
-	if (hooks.reuse) {
-		try {
-			const reused = await hooks.reuse();
-			if (reused !== undefined) return reused;
-		} catch (error) {
-			if (isPoisonedEffectCommit(error)) throw error;
-			// Reuse is optional; the supplied Actor executor remains authoritative.
-		}
-	}
-	const startedAt = performance.now();
-	try {
-		const output = await executor(operation);
-		await observeAuthoritativeSettlement(hooks, {
-			status: "succeeded",
-			output,
-			durationMs: Math.max(0, performance.now() - startedAt),
-		});
-		return output;
-	} catch (error) {
-		await observeAuthoritativeSettlement(hooks, {
-			status: "failed",
-			error,
-			durationMs: Math.max(0, performance.now() - startedAt),
-		});
-		throw error;
-	}
-}
-
-async function observeAuthoritativeSettlement<Output>(
-	hooks: AuthoritativeExecutionHooks<Output>,
-	settlement: AuthoritativeExecutionSettlement<Output>,
-): Promise<void> {
-	try {
-		await hooks.settled?.(settlement);
-	} catch {
-		// Observation is optional and cannot alter the authoritative execution contract.
-	}
-}
 
 function descriptor(operation: ToolOperation, route: SpeculativeExecutionRoute) {
 	return {
