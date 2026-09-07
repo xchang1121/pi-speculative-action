@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
+import * as filesystem from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -15,7 +16,6 @@ import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts"
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
-import { workspaceSandboxFingerprint } from "../src/workspace-sandbox.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import {
 	createLinuxProcessBenchmark,
@@ -24,6 +24,7 @@ import {
 } from "../bench/linux-process-harness.ts";
 
 vi.mock("node:child_process", { spy: true });
+vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
@@ -88,15 +89,16 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("waits for descriptor publication, keeps producers concurrent and classifies an ineligible sibling", async ({ skip }) => {
+	test("owns output independently of tracer descriptors, preserves concurrency and rejects an internal pipe", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
-		const { spawn: nativeSpawn } = await vi.importActual<typeof childProcess>("node:child_process");
-		const spawning = vi.spyOn(childProcess, "spawn").mockImplementation((...args: Parameters<typeof childProcess.spawn>) => {
-			const child = nativeSpawn(...args), pid = child.pid;
-			Object.defineProperty(child, "pid", { configurable: true, value: process.pid });
-			child.prependOnceListener("spawn", () => Object.defineProperty(child, "pid", { value: pid }));
-			return child;
+		const { readlink } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
+		const spawning = vi.mocked(childProcess.spawn);
+		const allocations = vi.mocked(filesystem.mkdtemp);
+		const sampling = vi.spyOn(filesystem, "readlink").mockImplementation((...args) => {
+			const tracer = spawning.mock.results.some(({ value }) => value?.pid && String(args[0]) === `/proc/${value.pid}/fd/1`);
+			return (tracer ? Promise.resolve("pipe:[0]") : readlink(...args)) as ReturnType<typeof readlink>;
 		});
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		try {
@@ -113,17 +115,38 @@ describe("Linux process ExecutionWorld", () => {
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }",
+				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test.v1",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
+			const text = branch.output.result.content[0];
+			expect(text?.type === "text" && text.text.endsWith(" ".repeat(32768) + ":end")).toBe(true);
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(2);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);
-			expect(spawning).toHaveBeenCalled();
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
+			await branch.dispose();
+			branch = undefined;
+			for (const failure of ["spawn", "abort"] as const) {
+				const controller = new AbortController();
+				const args = { command: "while :; do :; done" };
+				const context = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
+				const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "output-lifetime", { fingerprint: executionFingerprint, context })!;
+				spawning.mockImplementation((...input) => {
+					const top = JSON.stringify(input[1]).includes("top-trace-");
+					const child = spawn(...(top && failure === "spawn" ? [path.join(fixture.root, "missing-executable"), input[1], input[2]] : input) as Parameters<typeof spawn>);
+					if (top && failure === "abort") child.once("spawn", () => controller.abort());
+					return child;
+				});
+				await expect(fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
+					callID: failure, signal: controller.signal })).rejects.toThrow("top-level workspace capture is missing");
+			}
+			for (const root of await Promise.all(allocations.mock.results.map(({ value }) => value))) {
+				if (typeof root === "string" && path.basename(root).startsWith("pi-process-output-")) await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+			}
 		} finally {
 			spawning.mockRestore();
+			sampling.mockRestore();
 			await branch?.dispose();
 			await fixture.dispose();
 		}
@@ -163,53 +186,15 @@ describe("Linux process ExecutionWorld", () => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-driver-semantics-"));
-		const workspace = path.join(root, "workspace");
-		const storeRoot = path.join(root, "store");
-		await mkdir(path.join(workspace, "source"), { recursive: true });
-		await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
-		const shellPath = "/bin/bash";
-		const environment = Object.freeze({
-			PATH: `/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
-			HOME: os.homedir(),
-			LANG: "C.UTF-8",
-		});
-		const operations = createLocalBashOperations({ shellPath });
-		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(operations));
-		const backend = new LinuxProcessReuseBackend({ storeRoot });
-		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot, driver: "overlayfs" });
-		const tool = createBashTool(workspace, {
-			operations: coordinator.operations,
-			shellPath,
-			exposeSessionEnvironment: false,
-			spawnHook: (context) => ({ ...context, env: { ...environment } }),
-		});
-		let branch: Awaited<ReturnType<typeof world.speculation.execute>> | undefined;
+		const fixture = await createLinuxProcessBenchmark("pi-process-driver-semantics-", "overlayfs");
+		const { workspace, backend } = fixture;
+		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		try {
-			const status = await backend.check(true);
-			if (status.state !== "ready") throw new Error(status.detail);
-			await world.speculation.prepare?.({ cwd: workspace });
-			const args = { command: "mv source moved" };
-			const invocation = resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath });
-			if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-			const executionFingerprint = `${await backend.fingerprint()}:${await workspaceSandboxFingerprint(
-				{ driver: "overlayfs" },
-				workspace,
-			)}`;
-			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, workspace, "driver-semantics-test.v1", {
-				fingerprint: executionFingerprint,
-				context: invocation,
-			});
-			if (!action) throw new Error("Pi Bash action could not be keyed");
-			branch = await world.speculation.execute({
-				cwd: workspace,
-				tool,
-				toolName: "bash",
-				args,
-				action,
-				callID: "driver-semantics-test",
-				signal: new AbortController().signal,
-			});
+			await mkdir(path.join(workspace, "source"));
+			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { workspaceDriver: "overlayfs", includeWorkspaceFingerprint: true });
+			branch = await forkReusableBash(fixture, { command: "mv source moved", label: "driver-semantics-test",
+				actionNamespace: "driver-semantics-test.v1", executionFingerprint });
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const validation = await branch.validate?.();
 			expect(validation?.status).toBe("indeterminate");
@@ -223,8 +208,7 @@ describe("Linux process ExecutionWorld", () => {
 			await expect(stat(path.join(workspace, "moved"))).rejects.toThrow();
 		} finally {
 			await branch?.dispose();
-			await world.dispose?.();
-			await rm(root, { recursive: true, force: true });
+			await fixture.dispose();
 		}
 	});
 });

@@ -293,7 +293,7 @@ export async function observeStrace(
 			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") {
 				taints.add("pid_observation");
 			}
-			if (NETWORK_SYSCALLS.has(syscall)) taints.add("network");
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line)) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
@@ -471,6 +471,7 @@ function workspaceDriverSemanticGap(
 }
 
 const NETWORK_SYSCALLS = new Set([
+	"getsockname", "getpeername", "getsockopt", "setsockopt", "listen", "shutdown",
 	"accept",
 	"accept4",
 	"bind",
@@ -492,6 +493,12 @@ const IPC_SYSCALLS = new Set([
 	"shmat",
 	"shmget",
 ]);
+
+/** A failed query of a proven file/pipe reveals no socket state; unknown descriptor types stay tainted. */
+function nonSocketQuery(line: TraceLine): boolean {
+	return /^(?:getsockname|getpeername|getsockopt)$/.test(line.name) && /^-1 ENOTSOCK\b/.test(line.result) &&
+		Boolean(absoluteDescriptorPath(line.args[0]) || /^\d+<pipe:\[\d+\]>$/.test(line.args[0] ?? ""));
+}
 
 const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
 const RANDOM_SYSCALLS = new Set(["getrandom"]);

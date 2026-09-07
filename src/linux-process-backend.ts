@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { once } from "node:events";
 import { constants as fsConstants } from "node:fs";
 import {
 	access,
@@ -11,7 +12,6 @@ import {
 	mkdtemp,
 	readFile,
 	readdir,
-	readlink,
 	realpath,
 	rm,
 	writeFile,
@@ -19,6 +19,7 @@ import {
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
 	createExecPrototype,
@@ -98,7 +99,7 @@ import {
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v16";
+const BACKEND_EPOCH = "pi-linux-process-v17";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v2";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -253,7 +254,7 @@ interface ActiveSession {
 		readonly observedProcessMs: number;
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
-	topLevelOutputEndpoints?: Promise<{ readonly endpoints: readonly [string, string] } | { readonly reason: string }>;
+	topLevelOutputEndpoints?: readonly [string, string];
 	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
 	closed: boolean;
 }
@@ -627,15 +628,7 @@ export class LinuxProcessReuseBackend {
 				{
 					cwd: physicalCwd,
 					environment,
-					onSpawn: (pid) => {
-						session.topLevelOutputEndpoints = Promise.all([
-							readlink(`/proc/${pid}/fd/1`),
-							readlink(`/proc/${pid}/fd/2`),
-						]).then(
-							([stdout, stderr]) => ({ endpoints: [stdout, stderr] as const }),
-							(error) => ({ reason: `output_endpoint_capture_failed:${errorMessage(error)}` }),
-						);
-					},
+					onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
 					...(session.invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
 					...(request.signal ? { signal: request.signal } : {}),
 					...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
@@ -2039,63 +2032,110 @@ async function runSpawn(
 		readonly signal?: AbortSignal;
 		readonly timeoutSeconds?: number;
 		readonly onOutput?: (event: BufferedOutput) => void;
-		readonly onSpawn?: (pid: number) => void;
+		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 	},
 ): Promise<SpawnOutcome> {
 	throwIfAborted(options.signal);
-	const child = spawn(executable, args, {
-		cwd: options.cwd,
-		env: options.environment,
-		detached: true,
-		stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"],
-	});
-	const output: BufferedOutput[] = [];
-	// A PID alone does not publish initialized stdio; capture only after spawn succeeds.
-	child.once("spawn", () => { if (child.pid) options.onSpawn?.(child.pid); });
-	const append = (fd: 1 | 2, value: Buffer) => {
-		const event = { fd, data: Buffer.from(value) } as const;
-		const previous = output.at(-1);
-		if (previous?.fd === fd && previous.data.byteLength + event.data.byteLength <= 1024 * 1024) {
-			(output as BufferedOutput[])[output.length - 1] = { fd, data: Buffer.concat([previous.data, event.data]) };
-		} else output.push(event);
-		options.onOutput?.(event);
-	};
-	child.stdout?.on("data", (value: Buffer) => append(1, value));
-	child.stderr?.on("data", (value: Buffer) => append(2, value));
-	if (options.stdin) child.stdin?.end(options.stdin);
-	const terminate = () => {
-		if (!child.pid) return;
-		try {
-			process.kill(-child.pid, "SIGKILL");
-		} catch {
-			child.kill("SIGKILL");
-		}
-	};
-	const onAbort = () => terminate();
-	options.signal?.addEventListener("abort", onAbort, { once: true });
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	let timedOut = false;
-	if (options.timeoutSeconds !== undefined) {
-		timeout = setTimeout(() => {
-			timedOut = true;
-			terminate();
-		}, Math.max(1, options.timeoutSeconds * 1000));
-	}
+	const channels = options.onOutputEndpoints ? await acquireOutputChannels(options.signal) : undefined;
 	try {
-		const result = await new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
+		throwIfAborted(options.signal);
+		if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
+		const child = spawn(executable, args, {
+			cwd: options.cwd,
+			env: options.environment,
+			detached: true,
+			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const)],
+		});
+		const output: BufferedOutput[] = [];
+		child.once("spawn", () => channels?.releaseWriters());
+		const append = (fd: 1 | 2, value: Buffer) => {
+			const event = { fd, data: Buffer.from(value) } as const;
+			const previous = output.at(-1);
+			if (previous?.fd === fd && previous.data.byteLength + event.data.byteLength <= 1024 * 1024) {
+				(output as BufferedOutput[])[output.length - 1] = { fd, data: Buffer.concat([previous.data, event.data]) };
+			} else output.push(event);
+			options.onOutput?.(event);
+		};
+		const sources = channels?.entries.map((entry) => entry.source) ?? [child.stdout!, child.stderr!];
+		const drained = Promise.all(sources.map((source, index) => {
+			source.on("data", (value: Buffer) => append(index === 0 ? 1 : 2, value));
+			return finished(source, { readable: true, writable: false, cleanup: true });
+		}));
+		void drained.catch(() => undefined);
+		if (options.stdin) child.stdin?.end(options.stdin);
+		const terminate = () => {
+			if (!child.pid) return;
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				child.kill("SIGKILL");
+			}
+		};
+		const onAbort = () => terminate();
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+		if (options.timeoutSeconds !== undefined) {
+			timeout = setTimeout(() => {
+				timedOut = true;
+				terminate();
+			}, Math.max(1, options.timeoutSeconds * 1000));
+		}
+		const completed = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
 			(resolve, reject) => {
 				child.once("error", reject);
-				// `close` follows process exit and complete drainage of every stdio stream.
+				// Owned channels drain separately from the child's Node-managed stdio.
 				child.once("close", (code, signal) => resolve({ code, signal }));
 			},
 		);
-		if (options.signal?.aborted) throw new Error("aborted");
-		if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
-		return { ...result, output };
-	} finally {
-		if (timeout) clearTimeout(timeout);
-		options.signal?.removeEventListener("abort", onAbort);
-	}
+		try {
+			const [result] = await Promise.all([completed, drained]);
+			if (options.signal?.aborted) throw new Error("aborted");
+			if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
+			return { ...result, output };
+		} catch (error) {
+			terminate();
+			await completed.catch(() => undefined);
+			throw error;
+		} finally {
+			if (timeout) clearTimeout(timeout);
+			options.signal?.removeEventListener("abort", onAbort);
+		}
+	} finally { await channels?.dispose(); }
+}
+
+/** Own the write endpoints before inheritance; a running tracer may replace its descriptors. */
+async function acquireOutputChannels(signal?: AbortSignal) {
+	const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-output-"));
+	const entries: { server: net.Server; source: net.Socket; target?: net.Socket; endpoint: string }[] = [];
+	const releaseWriters = () => { for (const entry of entries) entry.target?.destroy(); };
+	const dispose = async () => {
+		releaseWriters();
+		for (const entry of entries) entry.source.destroy();
+		await Promise.all(entries.map(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))));
+		await rm(root, { recursive: true, force: true });
+	};
+	try {
+		for (const fd of [1, 2]) {
+			throwIfAborted(signal);
+			const socketPath = path.join(root, String(fd));
+			const entry = { server: net.createServer({ pauseOnConnect: true }), source: new net.Socket({ signal }), endpoint: "" } as typeof entries[number];
+			entries.push(entry);
+			entry.source.on("error", () => undefined); // Abort may precede the stream-drain observer.
+			entry.server.maxConnections = 1;
+			entry.server.once("connection", (socket) => { entry.target = socket; });
+			await listenUnixSocket(entry.server, socketPath);
+			const accepted = once(entry.server, "connection");
+			await Promise.all([accepted, once(entry.source.connect(socketPath), "connect")]);
+			// One connected server endpoint in our private namespace; no Node private fd API.
+			const peers = (await readFile("/proc/net/unix", "utf8")).split("\n")
+				.map((line) => line.trim().split(/\s+/))
+				.filter((fields) => fields[7] === socketPath && fields[4] === "0001" && fields[5] === "03");
+			if (peers.length !== 1 || !/^\d+$/.test(peers[0]![6]!)) throw new Error("output_endpoint_identity_unproven");
+			entry.endpoint = `socket:[${peers[0]![6]}]`;
+		}
+		return { entries, releaseWriters, dispose };
+	} catch (error) { await dispose(); throw error; }
 }
 
 function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
@@ -2150,10 +2190,8 @@ async function eligibleRequest(
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
 	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };
-	if (!session.topLevelOutputEndpoints) return { reason: "output_endpoint_capture_missing" };
-	const captured = await session.topLevelOutputEndpoints;
-	if ("reason" in captured) return captured;
-	const { endpoints } = captured;
+	const endpoints = session.topLevelOutputEndpoints;
+	if (!endpoints) return { reason: "output_endpoint_capture_missing" };
 	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
 	const routeOf = (endpoint: string): 0 | 1 | 2 => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : 0;
 	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
