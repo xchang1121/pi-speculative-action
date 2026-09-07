@@ -6,6 +6,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import {
 	effectCapabilitiesCover,
@@ -499,7 +500,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("rejects path escape and source symlink traversal before invoking the tool", async () => {
+	it.each(["native", "thinkthread"])("rejects path escape and source symlink traversal before invoking %s tools", async (route) => {
 		const root = await temporaryRoot("paths");
 		const outside = await temporaryRoot("outside");
 		let executions = 0;
@@ -510,14 +511,15 @@ describe("workspace-branch ExecutionWorld", () => {
 				return writeTool.execute(...args);
 			},
 		};
+		const execute = (args: { path: string; content: string }) => route === "native"
+			? createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, args))
+			: runThinkThreadTool({ version: 1, tool: "write", callID: "guard", args, autoResizeImages: true }, root);
 		try {
 			const escapingInput = { path: "../outside.txt", content: "no" };
-			await expect(
-				createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, escapingInput)),
-			).rejects.toThrow("escapes workspace");
+			await expect(execute(escapingInput)).rejects.toThrow();
 			await symlink(outside, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
 			const linked = { path: "linked/out.txt", content: "no" };
-			await expect(createWorkspaceSandbox().speculation.execute(context(root, "write", countingTool, linked))).rejects.toThrow(
+			await expect(execute(linked)).rejects.toThrow(
 				"contains symlink",
 			);
 			expect(executions).toBe(0);

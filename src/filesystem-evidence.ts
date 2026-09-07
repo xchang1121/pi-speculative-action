@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
+import path from "node:path";
+import { containsFilesystemPath, slash } from "./path-utils.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 
@@ -9,6 +11,7 @@ export type StableFileCapture = {
 	readonly bytesRead: number;
 	readonly realPath: string;
 	readonly stat: import("node:fs").BigIntStats;
+	readonly content?: Buffer;
 };
 
 export function sameFilesystemIdentity(
@@ -22,7 +25,9 @@ export function sameFilesystemIdentity(
 export async function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
+	retainContent = false,
 ): Promise<StableFileCapture> {
+	if ((await fs.lstat(target)).isSymbolicLink()) throw new Error("not_regular_file:symlink");
 	const beforePath = await fs.realpath(target);
 	// Descriptor admission must not perform blocking device/FIFO IO before the type proof.
 	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
@@ -34,11 +39,13 @@ export async function captureStableFile(
 		}
 
 		const hash = createHash("sha256");
+		const content: Buffer[] | undefined = retainContent ? [] : undefined;
 		let bytesRead = 0;
 		for await (const chunk of handle.createReadStream({ autoClose: false })) {
 			bytesRead += chunk.byteLength;
 			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
 			hash.update(chunk);
+			content?.push(chunk);
 		}
 
 		const after = await handle.stat({ bigint: true });
@@ -52,8 +59,41 @@ export async function captureStableFile(
 		) {
 			throw new Error("file_changed_during_capture");
 		}
-		return { hash: hash.digest("hex"), bytesRead, realPath: afterPath, stat: after };
+		return { hash: hash.digest("hex"), bytesRead, realPath: afterPath, stat: after,
+			...(content ? { content: Buffer.concat(content, bytesRead) } : {}) };
 	} finally {
 		await handle.close();
+	}
+}
+
+export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
+	const resolvedRoot = path.resolve(root);
+	const resolvedTarget = path.resolve(target);
+	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) {
+		throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
+	}
+	try {
+		const rootInfo = await fs.lstat(resolvedRoot);
+		if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+			throw new Error("sandbox workspace root must be a real directory");
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`, { cause: error });
+		throw error;
+	}
+	const relative = path.relative(resolvedRoot, resolvedTarget);
+	let current = resolvedRoot;
+	for (const segment of relative === "" ? [] : relative.split(path.sep)) {
+		current = path.join(current, segment);
+		try {
+			const stats = await fs.lstat(current);
+			if (stats.isSymbolicLink()) {
+				throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, current))}`);
+			}
+			if (!stats.isFile() && !stats.isDirectory()) throw new Error("sandbox path contains a special file");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+			throw error;
+		}
 	}
 }

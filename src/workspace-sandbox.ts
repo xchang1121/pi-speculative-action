@@ -15,6 +15,7 @@ import type {
 	WorldCompatibilityEvidence,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
+import { assertNoSymlinkPath, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import {
@@ -2267,36 +2268,6 @@ async function readGitTreeRegularState(
 	};
 }
 
-async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
-	const resolvedRoot = path.resolve(root);
-	const resolvedTarget = path.resolve(target);
-	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) {
-		throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
-	}
-	try {
-		const rootInfo = await lstat(resolvedRoot);
-		if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
-			throw new Error("sandbox workspace root must be a real directory");
-		}
-	} catch (error) {
-		if (isMissing(error)) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`, { cause: error });
-		throw error;
-	}
-	const relative = path.relative(resolvedRoot, resolvedTarget);
-	let current = resolvedRoot;
-	for (const segment of relative === "" ? [] : relative.split(path.sep)) {
-		current = path.join(current, segment);
-		try {
-			const stats = await lstat(current);
-			if (stats.isSymbolicLink()) {
-				throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, current))}`);
-			}
-		} catch (error) {
-			if (isMissing(error)) break;
-			throw error;
-		}
-	}
-}
 
 async function assertNoDirectoryLinks(root: string, relative: string): Promise<void> {
 	const normalized = slash(relative).replace(/\/+$/, "");
@@ -2321,40 +2292,20 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 }
 
 async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
-	let handle: FileHandle;
 	try {
-		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-		handle = await open(target, fsConstants.O_RDONLY | noFollow);
+		const captured = await captureStableFile(target, maxBytes, true);
+		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n) };
 	} catch (error) {
 		if (isMissing(error)) return undefined;
-		if (error && typeof error === "object" && "code" in error && error.code === "ELOOP") {
-			throw new Error(`symbolic links are not committable sandbox resources: ${target}`, { cause: error });
-		}
 		throw error;
-	}
-	try {
-		const before = await handle.stat();
-		if (!before.isFile()) throw new Error(`sandbox resource is not a regular file: ${target}`);
-		if (before.size > maxBytes) throw new Error(`sandbox resource exceeds capture limit: ${target}`);
-		const content = await handle.readFile();
-		const after = await handle.stat();
-		if (content.byteLength !== before.size || !sameOpenFileIdentity(before, after)) {
-			throw new Error(`sandbox resource changed while being captured: ${target}`);
-		}
-		return {
-			content,
-			mode: process.platform === "win32" ? 0 : before.mode & 0o777,
-		};
-	} finally {
-		await handle.close();
 	}
 }
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
 export async function readSandboxDirectoryState(target: string): Promise<SandboxDirectoryState | undefined> {
-	let before: Awaited<ReturnType<typeof lstat>>;
+	let before: import("node:fs").BigIntStats;
 	try {
-		before = await lstat(target);
+		before = await lstat(target, { bigint: true });
 	} catch (error) {
 		if (isMissing(error)) return undefined;
 		throw error;
@@ -2363,46 +2314,18 @@ export async function readSandboxDirectoryState(target: string): Promise<Sandbox
 		throw new Error(`sandbox resource is not a real directory: ${target}`);
 	}
 	const entries = await readdir(target, { withFileTypes: true });
-	const after = await lstat(target);
-	if (!after.isDirectory() || after.isSymbolicLink() || !sameDirectoryCaptureIdentity(before, after)) {
+	const after = await lstat(target, { bigint: true });
+	if (!after.isDirectory() || after.isSymbolicLink() || !sameFilesystemIdentity(before, after)) {
 		throw new Error(`sandbox directory changed while being captured: ${target}`);
 	}
 	return {
 		entriesDigest: directoryEntriesDigest(entries),
-		mode: before.mode & 0o777,
-		uid: before.uid,
-		gid: before.gid,
+		mode: Number(before.mode & 0o777n),
+		uid: Number(before.uid),
+		gid: Number(before.gid),
 	};
 }
 
-function sameDirectoryCaptureIdentity(
-	left: Awaited<ReturnType<typeof lstat>>,
-	right: Awaited<ReturnType<typeof lstat>>,
-): boolean {
-	return (
-		left.dev === right.dev &&
-		left.ino === right.ino &&
-		left.mode === right.mode &&
-		left.uid === right.uid &&
-		left.gid === right.gid &&
-		left.nlink === right.nlink &&
-		left.size === right.size &&
-		left.mtimeMs === right.mtimeMs &&
-		left.ctimeMs === right.ctimeMs
-	);
-}
-
-function sameOpenFileIdentity(left: Awaited<ReturnType<FileHandle["stat"]>>, right: Awaited<ReturnType<FileHandle["stat"]>>): boolean {
-	return (
-		left.dev === right.dev &&
-		left.ino === right.ino &&
-		left.mode === right.mode &&
-		left.nlink === right.nlink &&
-		left.size === right.size &&
-		left.mtimeMs === right.mtimeMs &&
-		left.ctimeMs === right.ctimeMs
-	);
-}
 
 function sameBaselineState(current: RegularFileState | undefined, change: SandboxFileChange): boolean {
 	if (current === undefined || change.before === undefined) {

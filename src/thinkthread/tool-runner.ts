@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
 	createEditTool,
@@ -7,6 +8,8 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { withPiProjectionCoverage } from "../pi-read-projection.ts";
+import { buildPiActionKey } from "../action-semantics.ts";
+import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
 import {
 	decodeThinkThreadToolRunnerRequest,
@@ -30,6 +33,9 @@ export async function runThinkThreadTool(
 	request: ThinkThreadToolRunnerRequestV1,
 	cwd = process.cwd(),
 ): Promise<ToolSettlement> {
+	const action = buildPiActionKey(request.tool, request.args, cwd);
+	if (!action) throw new Error("Runner cannot prove the stock tool path identity");
+	for (const resource of action.resources) await assertNoSymlinkPath(cwd, path.resolve(cwd, resource));
 	const tool = createTool(request, cwd);
 	try {
 		const result = withPiProjectionCoverage(
