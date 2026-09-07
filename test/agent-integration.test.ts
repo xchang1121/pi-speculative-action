@@ -195,7 +195,7 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it("reuses the Actor's own read across turns and invalidates it on resource change", async () => {
+	it.each([[], ["bash"], ["read"]].map((tools) => ({ tools })))("observes and replays Actor reads independently of prediction=$tools", async ({ tools }) => {
 		const cwd = await temporaryWorkspace();
 		let executions = 0;
 		const events: SpeculativeActionEvent<string>[] = [];
@@ -217,7 +217,7 @@ describe("speculative action host", () => {
 				drafterEnabled: false,
 				candidateLimit: 1,
 				maxConcurrentActions: 1,
-				tools: ["read"],
+				tools,
 				patternAware: { enabled: false },
 				selfSpeculation: { enabled: false },
 			}),

@@ -985,7 +985,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (signal?.aborted) return;
 		const definitions = adapter.definitions(input);
 		const names = runtimeState.candidateNames(settings);
-		if (!definitions.length || !names.length) return;
+		if (!definitions.length) return;
 		const key = turnKey(input.sessionID, input.turnID);
 		const previous = runtimeState.turns.get(key);
 		if (previous) await finishState(previous, false);
@@ -1136,6 +1136,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const launchSourceRequests = (state: Turn): void => {
+		if (!state.candidateNames.length) return;
 		for (const source of runtimeState.sources) {
 			if (!source.enabled(state.settings)) continue;
 			const count = clampCandidateLimit(source.proposalCount?.(state.settings));
@@ -1807,7 +1808,6 @@ export function makeStructuralSpeculativeActionRuntime<
 	): Promise<void> => {
 		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) return;
-		if (!state.candidateNames.includes(input.tool)) return;
 		state.actorToolHints.add(input.tool);
 		await Promise.all(
 			nearestPredictions(state.session, state.decisionSequence, (node) => node.action.tool === input.tool).map(
@@ -1886,7 +1886,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			}
 			return;
 		}
-		if (!record || !state.candidateNames.includes(actualCall.tool)) return;
+		if (!record) return;
 		const executionSignal = signal ?? state.generation.signal;
 		const concrete = asConcreteInput(action.input);
 		if (!concrete) return;
@@ -2375,8 +2375,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			attempt.releaseAdmission();
 			if (
 				adapter.captureAuthoritativeResult &&
-				runtimeState.semantics.effect(actualKey.tool) === "observation" &&
-				state.candidateNames.includes(actualCall.tool)
+				runtimeState.semantics.effect(actualKey.tool) === "observation"
 			) {
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
 			}
@@ -3086,9 +3085,10 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const reconcileStores = async (state: Turn): Promise<void> => {
-		const enabled = new Set(runtimeState.candidateNames(state.settings));
+		const available = new Set(state.definitions.map((definition) => definition.name));
 		for (const candidate of allCandidates(state.sessionID)) {
-			if (!enabled.has(candidate.key.tool))
+			if (!available.has(candidate.key.tool) ||
+				(candidate.work.execution.status === "queued" && !state.candidateNames.includes(candidate.key.tool)))
 				discardCandidate(state.session, candidate, cause("control", "tool_disabled"));
 		}
 		trimResults(state.session, state.settings);

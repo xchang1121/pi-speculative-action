@@ -962,7 +962,7 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
 
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		expect(await fixture.runtime.consume(call("turn-2"))).toBeUndefined();
+		expect(await fixture.runtime.consume(call("turn-2"))).toBe("speculative");
 
 		configured = { ...settings, enabled: false };
 		await fixture.runtime.settingsChanged(configured);
