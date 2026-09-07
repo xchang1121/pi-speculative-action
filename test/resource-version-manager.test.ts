@@ -5,13 +5,14 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { createFindTool, createGrepTool, createLsTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { ActionSemanticsRegistry, buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
+	ResourceReadView,
 	ResourceVersionManager,
 	releaseResourceVersion,
 	resourceDependencies,
@@ -80,6 +81,20 @@ describe("speculative action resource versions", () => {
 		await expect(view.readFile(file)).rejects.toThrow("disposed");
 		await expect(view.evaluate(async () => "late")).rejects.toThrow("disposed");
 		manager.close();
+	});
+
+	test("retains payloads across both orders of overlapping metadata captures", async () => {
+		for (const reverse of [false, true]) {
+			const view = new ResourceReadView(4096), root = path.resolve("sealed"), file = path.join(root, "value");
+			const captures = [() => { view.capture(root, { type: "directory", entries: ["value"] }); view.capture(file, { type: "file", content: Buffer.from("A") }); },
+				() => { view.capture(root, { type: "directory" }); view.capture(file, { type: "file", content: undefined }); }];
+			for (const capture of reverse ? captures.reverse() : captures) capture();
+			view.seal();
+			expect(view.readdir(root)).toEqual(["value"]);
+			expect((await view.readFile(file)).toString()).toBe("A");
+			expect(() => view.capture(file, { type: "file" })).toThrow("not_capturing");
+			view.dispose();
+		}
 	});
 
 	test("re-evaluates original read arguments over sealed bytes, not parsed output notices", async () => {
@@ -271,23 +286,6 @@ describe("speculative action resource versions", () => {
 				expect(output.result).toEqual(expected);
 			}
 		} finally { releaseResourceVersion(token); }
-	});
-
-	test("derives custom-tool resource evidence from action semantics rather than tool names", async () => {
-		const root = await workspace();
-		const grep = { ...PI_ACTION_SEMANTICS.definition("ls")!, resourceScope: "tree_content" as const };
-		const write = PI_ACTION_SEMANTICS.definition("write")!;
-		const semantics = new ActionSemanticsRegistry([
-			{ ...grep, tool: "custom_query", epoch: "test.custom-query.v1" },
-			{ ...write, tool: "custom_write", epoch: "test.custom-write.v1" },
-		]);
-		const processAction = semantics.buildKey("custom_query", { pattern: "ok", path: "." }, root)!;
-		const writeAction = semantics.buildKey("custom_write", { path: "out.txt", content: "ok" }, root)!;
-
-		expect(resourceDependencies(processAction, root, semantics)).toEqual([
-			{ path: path.resolve(root), scope: "tree_content" },
-		]);
-		expect(resourceDependencies(writeAction, root, semantics)).toEqual([]);
 	});
 
 	test("notifies active cache owners when a dependency becomes stale", async () => {

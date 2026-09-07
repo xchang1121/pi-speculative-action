@@ -1,4 +1,6 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { resourceDependencies } from "../src/resource-version.ts";
 import {
 	type ActionKeyProjector,
 	type ActionSemanticsDefinition,
@@ -187,18 +189,18 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("supports a new host tool with one semantics definition", () => {
 		const registry = new ActionSemanticsRegistry([
-			resourceDefinition("stat", "host.stat.v1", (input) => {
+			{ ...resourceDefinition("stat", "host.stat.v1", (input) => {
 				if (!input || typeof input !== "object" || !("path" in input) || typeof input.path !== "string") {
 					return undefined;
 				}
 				return { input: { path: input.path }, resources: [input.path] };
-			}),
+			}), resourceScope: "tree_entries" },
+			{ ...PI_ACTION_SEMANTICS.definition("write")!, tool: "custom_write" },
 		]);
-
-		expect(registry.toolNames()).toEqual(["stat"]);
-		expect(registry.effect("stat")).toBe("observation");
-		expect(registry.resourceScope("stat")).toBe("content");
-		expect(registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")).toMatchObject({
+		const key = registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")!;
+		expect(resourceDependencies(key, "/workspace", registry)).toEqual([{ path: path.resolve("/workspace/a.ts"), scope: "tree_entries" }]);
+		expect(resourceDependencies({ ...key, tool: "custom_write" }, "/workspace", registry)).toEqual([]);
+		expect(key).toMatchObject({
 			tool: "stat",
 			input: { path: "a.ts" },
 			resources: ["a.ts"],

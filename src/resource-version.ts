@@ -77,7 +77,11 @@ export class ResourceReadView {
 		this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0));
-		this.entries.set(filesystemPathKey(target), entry);
+		const key = filesystemPathKey(target), previous = this.entries.get(key);
+		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
+		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined) ||
+			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined)) return;
+		this.entries.set(key, entry);
 	}
 	alias(target: string, source: string): void {
 		this.entry(source);
@@ -584,7 +588,7 @@ async function fingerprintPath(
 		throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 	}
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
-	const selected = selectEntries(entries);
+	const selected = [...entries].sort((left, right) => left.name.localeCompare(right.name));
 	const descendants = new Set(ancestors).add(identity);
 	const children = await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
 		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view, scope !== "entries");
@@ -631,10 +635,6 @@ async function stableEntry(
 		bytesRead: 0,
 		filesRead: 0,
 	};
-}
-
-function selectEntries(entries: ReadonlyArray<import("node:fs").Dirent>) {
-	return [...entries].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function entryIdentity(entry: import("node:fs").Dirent): string {
