@@ -1,5 +1,6 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
+import type { ToolInvocation } from "./tool-settlement.ts";
 import {
 	EffectTransactionCoordinator,
 	type EffectTransaction,
@@ -30,6 +31,8 @@ export interface ToolOperation {
 	readonly signal?: AbortSignal;
 	/** Present after the caller has resolved the canonical action identity. */
 	readonly action?: ActionKey;
+	/** The Actor owns its selected executor even when no reusable action key can be constructed. */
+	readonly invocation?: ToolInvocation;
 }
 
 /** Dynamic effect requirement used to select an isolation backend. */

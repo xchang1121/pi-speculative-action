@@ -2362,13 +2362,11 @@ export function makeStructuralSpeculativeActionRuntime<
 				executionBlockedAttemptLead(state.session, matchingPredictions, actorArrivedAt),
 			);
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
-			preemptForActor(state.session, actorResourceProfile(actualKey.tool), state.settings);
+			const effect = runtimeState.semantics.effect(actualKey);
+			preemptForActor(state.session, actionResourceProfile(effect), state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			attempt.releaseAdmission();
-			if (
-				adapter.captureAuthoritativeResult &&
-				runtimeState.semantics.effect(actualKey.tool) === "observation"
-			) {
+			if (adapter.captureAuthoritativeResult && effect === "observation") {
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
 			}
 			return undefined;
@@ -2391,8 +2389,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		return earliestAttempt === undefined ? undefined : Math.max(0, actorArrivedAt - earliestAttempt);
 	};
-
-	const actorResourceProfile = (tool: string) => actionResourceProfile(runtimeState.semantics.effect(tool));
 
 	const promoteAuthoritativeResult = async (
 		state: Turn,
@@ -3105,7 +3101,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const authoritativeMutationResources = (action: ActionKey, adopted?: Candidate): readonly string[] => {
-		if (runtimeState.semantics.effect(action.tool) === "observation") return [];
+		if (runtimeState.semantics.effect(action) === "observation") return [];
 		if (adopted?.work.reservation.kind === "shared") return [];
 		return adopted ? (candidateBranch(adopted)?.resources ?? action.resources) : action.resources;
 	};

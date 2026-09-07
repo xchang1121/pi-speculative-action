@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- A rejected `resolveInvocation` now fails that Actor invocation instead of silently selecting another executor.
+  `ToolOperation.invocation` remains available without a cache key; explicitly bound profile semantics also
+  govern routing, observation, resource contention, and candidate invalidation.
 - Removed `BASH_TAIL_LINES_ACTION_KEY_PROJECTOR`, `PI_BASH_TAIL_LINES_PROJECTION_RULE`,
   `BashTailLinesView`, and `bashTailLinesView`: shell text cannot prove the behavior of a resolved
   `tail` command. Exact Bash adoption and native process-certificate reuse remain available.

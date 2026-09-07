@@ -99,7 +99,7 @@ export interface CreateSpeculativeActionHostOptions {
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	/** Provider completion used by the drafter. */
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
-	/** Resolve the concrete executor identity used by both speculative and actor calls. */
+	/** Bind the concrete executor used by both speculative and Actor calls; rejection fails this invocation. */
 	readonly resolveInvocation?: (
 		tool: string,
 		input: unknown,
@@ -214,7 +214,7 @@ export function createSpeculativeActionHost(
 	}
 	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
-		const definition = actionSemantics.definition(tool);
+		const definition = actionSemantics.definition(action ?? tool);
 		return definition
 			? executionGateway.resolve(
 					{
@@ -286,12 +286,11 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
-	const resolveActionKey = async (tool: string, input: unknown, schemaHash: string | undefined) => {
-		try {
-			const invocation = await options.resolveInvocation?.(tool, input);
-			return actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
-				? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation } : undefined);
-		} catch { return undefined; }
+	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string) => {
+		const invocation = await options.resolveInvocation?.(tool, input);
+		const action = schemaHash === undefined ? undefined : actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
+			? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
+		return { ...(invocation ? { invocation } : {}), ...(action ? { action } : {}) };
 	};
 	const runtime = makeSpeculativeActionRuntime<
 		string,
@@ -333,13 +332,13 @@ export function createSpeculativeActionHost(
 			if (!tool) return undefined;
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
-			return resolveActionKey(toolName, validated, schemaHash);
+			return (await resolveBinding(toolName, validated, schemaHash)).action;
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
 		captureAuthoritativeResult: async ({ startInput, data, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) return undefined;
-			const definition = actionSemantics.definition(toolName);
+			const definition = actionSemantics.definition(action);
 			if (!definition) return undefined;
 			const args = validateCandidateArguments(tool, toolName, concrete, callID);
 			if (args === undefined) return undefined;
@@ -469,8 +468,8 @@ export function createSpeculativeActionHost(
 			// One invocation owns its binding; resolve inside consume so Actor arrival includes binding cost.
 			const bind = () => binding ??= (async () => {
 				const tool = input.tools.find((tool) => tool.name === input.tool);
-				const action = tool ? await resolveActionKey(input.tool, input.args, stableValueHash(tool.parameters ?? null)) : undefined;
-				return Object.freeze({ ...operation, ...(action ? { action } : {}) });
+				return Object.freeze({ ...operation, ...await resolveBinding(input.tool, input.args,
+					tool ? stableValueHash(tool.parameters ?? null) : undefined) });
 			})();
 			const actorCall = input.turnID
 				? {

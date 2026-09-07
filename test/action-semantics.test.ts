@@ -106,43 +106,6 @@ describe("ActionSemanticsRegistry", () => {
 		expect(buildPiActionKey("find", { pattern: "*", limit: 1.5 }, "/workspace")).toBeUndefined();
 	});
 
-	it("never equates identical inputs across different tool-semantics epochs", () => {
-		const oldAction = buildActionKey({
-			tool: "read",
-			resources: ["a.ts"],
-			input: { path: "a.ts", offset: 1, limit: 20 },
-			schemaHash: "schema",
-			semanticsEpoch: "read.v1",
-		});
-		const newAction = buildActionKey({
-			tool: "read",
-			resources: ["a.ts"],
-			input: { path: "a.ts", offset: 1, limit: 20 },
-			schemaHash: "schema",
-			semanticsEpoch: "read.v2",
-		});
-
-		expect(actionKeyMatch(oldAction, newAction, [READ_RANGE_ACTION_KEY_PROJECTOR])).toBeUndefined();
-		expect(actionKeyMismatchReason(oldAction, newAction, [READ_RANGE_ACTION_KEY_PROJECTOR])).toBe(
-			"different_semantics",
-		);
-	});
-
-	it("never equates identical actions resolved to different execution backends", () => {
-		const first = PI_ACTION_SEMANTICS.buildKey("bash", { command: "echo $VALUE" }, "/workspace", "schema", {
-			fingerprint: "local:env-a",
-		});
-		const second = PI_ACTION_SEMANTICS.buildKey("bash", { command: "echo $VALUE" }, "/workspace", "schema", {
-			fingerprint: "local:env-b",
-		});
-
-		expect(first).toBeDefined();
-		expect(second).toBeDefined();
-		if (!first || !second) throw new Error("Expected keyed bash actions");
-		expect(actionKeyMatch(first, second)).toBeUndefined();
-		expect(actionKeyMismatchReason(first, second)).toBe("different_executor");
-	});
-
 	it("keeps every projection inside the immutable semantic envelope", () => {
 		const permissive: ActionKeyProjector = {
 			id: "permissive",
@@ -167,23 +130,32 @@ describe("ActionSemanticsRegistry", () => {
 			projector: "permissive",
 		});
 
-		for (const actor of [
-			buildActionKey({ ...base, tool: "grep", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
-			buildActionKey({
-				...base,
-				semanticsEpoch: "read.v2",
-				resources: ["a.ts"],
-				input: { path: "a.ts", offset: 2 },
-			}),
-			buildActionKey({ ...base, schemaHash: "schema.v2", resources: ["a.ts"], input: { path: "a.ts", offset: 2 } }),
-			buildActionKey({
-				...base,
-				executionFingerprint: "executor.v2",
-				resources: ["a.ts"],
-				input: { path: "a.ts", offset: 2 },
-			}),
-		]) {
-			expect(actionKeyMatch(base, actor, [permissive])).toBeUndefined();
+		for (const [field, value, reason] of [["tool", "grep", "different_tool"], ["semanticsEpoch", "read.v2", "different_semantics"],
+			["schemaHash", "schema.v2", "different_schema"], ["executionFingerprint", "executor.v2", "different_executor"]]) {
+			for (const input of [base.input, { path: "a.ts", offset: 2 }]) {
+				const actor = buildActionKey({ ...base, [field!]: value, input });
+				expect(actionKeyMatch(base, actor, [permissive])).toBeUndefined();
+				expect(actionKeyMismatchReason(base, actor, [permissive])).toBe(reason);
+			}
+		}
+	});
+
+	it("binds profile requirements and resource evidence without mutating the native registry", () => {
+		for (const tool of ["grep", "find"]) {
+			const profile: ActionSemanticsDefinition = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed.v1",
+				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
+			const args = { pattern: "needle", path: "." };
+			const native = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace")!;
+			const closed = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", { fingerprint: "profile.v1", semantics: profile })!;
+			expect(PI_ACTION_SEMANTICS.definition(native)?.effect).toBe("unbounded");
+			expect(PI_ACTION_SEMANTICS.definition(closed)?.effect).toBe("observation");
+			expect(resourceDependencies(native, "/workspace")).toEqual([]);
+			expect(resourceDependencies(closed, "/workspace")).toEqual([{ path: path.resolve("/workspace"), scope: "tree_content" }]);
+			expect(actionKeyMatch(native, closed, [RESOURCE_INPUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
+			(profile as { resourceScope: string }).resourceScope = "entries";
+			expect(buildActionKey(closed).semantics?.resourceScope).toBe("tree_content");
+			expect(() => buildActionKey({ ...closed, tool: "unrelated" })).toThrow("contract identity mismatch");
+			expect(Object.isFrozen(closed.semantics?.requirements)).toBe(true);
 		}
 	});
 

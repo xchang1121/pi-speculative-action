@@ -37,6 +37,8 @@ export interface ActionKey {
 	readonly executionFingerprint: string;
 	/** In-memory execution descriptor. It is deliberately excluded from diagnostics and persisted keys. */
 	readonly executionContext?: unknown;
+	/** An explicitly selected executor contract; absent for the host registry's default tools. */
+	readonly semantics?: ActionSemanticsDefinition;
 }
 
 export interface ProjectedActionKey {
@@ -102,19 +104,8 @@ export class ActionSemanticsRegistry {
 
 	constructor(definitions: readonly ActionSemanticsDefinition[]) {
 		for (const source of definitions) {
-			const tool = source.tool.trim();
-			const epoch = source.epoch.trim();
-			if (!tool) throw new Error("action semantics tool must not be empty");
-			if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
+			const definition = normalizeDefinition(source), { tool } = definition;
 			if (this.definitionsByTool.has(tool)) throw new Error(`duplicate action semantics for ${tool}`);
-			const definition: ActionSemanticsDefinition = Object.freeze({
-				...source,
-				tool,
-				epoch,
-				requirements: normalizeEffectRequirements(source.requirements),
-				projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])]),
-			});
-			assertDefinitionCoherence(definition);
 			this.definitionsByTool.set(tool, definition);
 			for (const projector of definition.projectors ?? []) {
 				const existing = this.projectorsByID.get(projector.id);
@@ -126,8 +117,9 @@ export class ActionSemanticsRegistry {
 		}
 	}
 
-	definition(tool: string): ActionSemanticsDefinition | undefined {
-		return this.definitionsByTool.get(tool);
+	definition(action: string | ActionKey): ActionSemanticsDefinition | undefined {
+		if (typeof action !== "string" && action.semantics) return action.semantics;
+		return this.definitionsByTool.get(typeof action === "string" ? action : action.tool);
 	}
 
 	toolNames(effect?: ActionEffect): readonly string[] {
@@ -136,16 +128,16 @@ export class ActionSemanticsRegistry {
 			.map((definition) => definition.tool);
 	}
 
-	effect(tool: string): ActionEffect | undefined {
-		return this.definition(tool)?.effect;
+	effect(action: string | ActionKey): ActionEffect | undefined {
+		return this.definition(action)?.effect;
 	}
 
-	requirements(tool: string): EffectRequirements | undefined {
-		return this.definition(tool)?.requirements;
+	requirements(action: string | ActionKey): EffectRequirements | undefined {
+		return this.definition(action)?.requirements;
 	}
 
-	resourceScope(tool: string): ResourceDependencyScope | undefined {
-		return this.definition(tool)?.resourceScope;
+	resourceScope(action: string | ActionKey): ResourceDependencyScope | undefined {
+		return this.definition(action)?.resourceScope;
 	}
 
 	projectors(): readonly ActionKeyProjector[] {
@@ -161,9 +153,9 @@ export class ActionSemanticsRegistry {
 		input: unknown,
 		cwd: string,
 		schemaHash = "",
-		execution?: { readonly fingerprint: string; readonly context?: unknown },
+		execution?: { readonly fingerprint: string; readonly context?: unknown; readonly semantics?: ActionSemanticsDefinition },
 	): ActionKey | undefined {
-		const definition = this.definition(tool);
+		const definition = execution?.semantics ?? this.definition(tool);
 		if (!definition) return undefined;
 		let canonical: CanonicalAction | undefined;
 		try {
@@ -180,6 +172,7 @@ export class ActionSemanticsRegistry {
 			semanticsEpoch: definition.epoch,
 			executionFingerprint: execution?.fingerprint,
 			executionContext: execution?.context,
+			semantics: execution?.semantics,
 		});
 	}
 }
@@ -300,10 +293,13 @@ export function buildActionKey(input: {
 	readonly semanticsEpoch?: string;
 	readonly executionFingerprint?: string;
 	readonly executionContext?: unknown;
+	readonly semantics?: ActionSemanticsDefinition;
 }): ActionKey {
 	const schemaHash = input.schemaHash ?? "";
 	const semanticsEpoch = input.semanticsEpoch ?? "";
 	const executionFingerprint = input.executionFingerprint ?? "";
+	const semantics = input.semantics ? normalizeDefinition(input.semantics) : undefined;
+	if (semantics && (semantics.tool !== input.tool || semantics.epoch !== semanticsEpoch)) throw new Error("action contract identity mismatch");
 	const canonicalInput = freezeCanonicalValue(structuredClone(input.input));
 	const key = stableStringify({
 		tool: input.tool,
@@ -322,6 +318,7 @@ export function buildActionKey(input: {
 		schemaHash,
 		executionFingerprint,
 		...(input.executionContext !== undefined ? { executionContext: input.executionContext } : {}),
+		...(semantics ? { semantics } : {}),
 	});
 }
 
@@ -593,6 +590,18 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 		action.resources,
 		range.path,
 	]);
+}
+
+function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemanticsDefinition {
+	const tool = source.tool.trim(), epoch = source.epoch.trim();
+	if (!tool) throw new Error("action semantics tool must not be empty");
+	if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
+	const definition = Object.freeze({ ...source, tool, epoch,
+		requirements: normalizeEffectRequirements(source.requirements),
+		projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])]),
+	});
+	assertDefinitionCoherence(definition);
+	return definition;
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {

@@ -259,37 +259,44 @@ describe("speculative action host", () => {
 
 	it("binds one Actor operation through matching, fallback and settlement", async () => {
 		const cwd = await temporaryWorkspace();
-		let profile = "initial", boundKey: unknown;
-		const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
-		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "built" }], details: {} }));
-		const settled = vi.fn();
-		const resolveInvocation = vi.fn(async () => {
-			const invocation = { executor: profile };
-			bindingStarted.resolve(); await releaseBinding.promise;
-			return invocation;
-		});
-		const tool: AgentTool<typeof bashSchema> = {
-			name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor,
-		};
-		const host = createSpeculativeActionHost("session", {
-			cwd, getSettings: () => ({ ...settings(), drafterEnabled: false, tools: ["bash"] }),
-			complete: async () => { throw new Error("prediction disabled"); },
-			resolveInvocation, onActorActionSettled: settled,
-		});
-		try {
-			await host.startTurn(startInput(tool));
-			const call = { turnID: "turn-1", id: "actor-bash", tool: "bash", args: { command: "npm test" }, tools: [tool] };
-			const pending = host.execute(call, undefined, async (operation) => {
-				expect(operation.action?.executionContext).toEqual({ executor: "initial" });
-				boundKey = operation.action;
-				return actor();
+		for (const mode of ["keyed", "unkeyable", "outside-turn", "binding-error"]) {
+			let profile = "initial", boundKey: unknown;
+			const problem = new Error("selected executor unavailable");
+			const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
+			const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "built" }], details: {} }));
+			const settled = vi.fn();
+			const resolveInvocation = vi.fn(async () => {
+				const invocation = { executor: profile };
+				bindingStarted.resolve(); await releaseBinding.promise;
+				if (mode === "binding-error") throw problem;
+				return invocation;
 			});
-			await bindingStarted.promise; profile = "next"; releaseBinding.resolve();
-			expect((await pending).content[0]).toEqual({ type: "text", text: "built" });
-			await host.finishTurn("turn-1", true);
-			expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledOnce();
-			expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey);
-		} finally { releaseBinding.resolve(); await host.dispose(); }
+			const tool: AgentTool<typeof bashSchema> = {
+				name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor,
+			};
+			const host = createSpeculativeActionHost("session", {
+				cwd, getSettings: () => ({ ...settings(), drafterEnabled: false, tools: ["bash"] }),
+				complete: async () => { throw new Error("prediction disabled"); },
+				resolveInvocation, onActorActionSettled: settled,
+			});
+			try {
+				if (mode !== "outside-turn") await host.startTurn(startInput(tool));
+				const call = { ...(mode !== "outside-turn" ? { turnID: "turn-1" } : {}), id: "actor-bash", tool: "bash",
+					args: mode === "unkeyable" ? {} : { command: "npm test" }, tools: mode === "outside-turn" ? [] : [tool] };
+				const pending = host.execute(call, undefined, async (operation) => {
+					expect(operation.invocation).toEqual({ executor: "initial" });
+					expect(operation.action?.executionContext).toEqual(mode === "keyed" ? operation.invocation : undefined);
+					boundKey = operation.action;
+					return actor();
+				});
+				const outcome = mode === "binding-error" ? expect(pending).rejects.toBe(problem) : expect(pending).resolves.toHaveProperty("content.0.text", "built");
+				await bindingStarted.promise; profile = "next"; releaseBinding.resolve();
+				await outcome;
+				await host.finishTurn("turn-1", true);
+				expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledTimes(mode === "binding-error" ? 0 : 1);
+				if (mode === "keyed") { expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey); }
+			} finally { releaseBinding.resolve(); await host.dispose(); }
+		}
 	});
 
 	it.each(["running", "completed"])("does not adopt a %s Bash command through an unproven suffix relation", async (phase) => {

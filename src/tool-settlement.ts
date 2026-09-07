@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { formatThrownValue } from "@earendil-works/pi-ai";
+import type { ActionSemanticsDefinition } from "./action-semantics.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -39,6 +40,8 @@ export interface ToolFilesystemOperations {
 /** Versioned identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
+	/** Explicit common Actor/speculation profile; never inferred from the tool's name. */
+	readonly semantics?: ActionSemanticsDefinition;
 	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */
 	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;

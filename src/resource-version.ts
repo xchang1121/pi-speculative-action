@@ -424,7 +424,7 @@ export function resourceDependencies(
 	root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 ) {
-	const definition = actionSemantics.definition(action.tool);
+	const definition = actionSemantics.definition(action);
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined) return [];
 	return action.resources.map((resource) => ({

@@ -135,7 +135,7 @@ async function qualifyPiSearch(worker, name) {
 	const { createGrepToolDefinition, createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
 	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
-	const { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
+	const { PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
 	const { RESOURCE_OBSERVATION_EFFECTS } = await import("../dist/effect-model.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
 	const { captureResourceVersion } = await import("../dist/resource-version.js");
@@ -161,7 +161,7 @@ async function qualifyPiSearch(worker, name) {
 	};
 	const tool = ({ grep: createGrepToolDefinition, find: createFindToolDefinition })[name](root), definition = { ...PI_ACTION_SEMANTICS.definition(name), epoch: profile.id,
 		effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
-	const semantics = new ActionSemanticsRegistry([definition]);
+	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const signal = new AbortController().signal, journeys = [];
@@ -169,14 +169,14 @@ async function qualifyPiSearch(worker, name) {
 	function journey(checkpoint, capacity = 1) {
 		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
-		const invocation = { executor: profile.id, identity: profile,
+		const invocation = { executor: profile.id, identity: profile, semantics: definition,
 			filesystem: async (view, request) => execute("producer", view, request, checkpoint) };
 		const host = createSpeculativeActionHost("portable-" + journeys.length, {
 			cwd: root, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
 				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? [name] : [],
 				patternAware: { enabled: false }, selfSpeculation: { enabled: false } }),
 			draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
-			actionSemantics: semantics, resolveInvocation: () => invocation,
+				resolveInvocation: () => invocation,
 			preflight: () => { if (actorWaiting) authorized.resolve(); return true; },
 			executionWorlds: [resources],
 			onEvent: (event) => {
@@ -196,7 +196,7 @@ async function qualifyPiSearch(worker, name) {
 				actorWaiting = true; feedback = Promise.withResolvers();
 				const arrived = performance.now();
 				const output = await host.execute({ turnID, id, tool: name, args: query, tools: [tool] }, signal, async (operation) => {
-					assert.deepEqual(operation.action?.executionContext?.identity, profile, "Actor execution must retain the identity used for admission");
+					assert.deepEqual(operation.invocation?.identity, profile, "Actor execution must retain the selected executor independently of K(a)");
 					actorCalls++; return (await execute("actor", fs, { args: operation.input, signal: operation.signal })).result;
 				});
 				actorWaiting = false;
