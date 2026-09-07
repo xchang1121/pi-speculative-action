@@ -28,13 +28,18 @@ export interface ProcessExecutionRoute {
 
 export type ProcessToolOperations = BashOperations;
 
+interface ActorProcessGeneration {
+	readonly preparation: Promise<PreparedProcessExecutionRoute>;
+	readonly executions: Set<Promise<ProcessExecutionResult>>;
+	prepared?: PreparedProcessExecutionRoute;
+}
+
 /** One process outlet; execution worlds replace only its dynamic async scope. */
 export class ProcessExecutionCoordinator {
 	private readonly scope = new AsyncLocalStorage<ProcessExecutor>();
 	private readonly host: ProcessExecutor;
 	private readonly actorRoute?: ProcessExecutionRoute;
-	private actorPreparation?: Promise<PreparedProcessExecutionRoute>;
-	private preparedActor?: PreparedProcessExecutionRoute;
+	private actor?: ActorProcessGeneration | { readonly retirement: Promise<void> };
 	private disposed = false;
 	readonly operations: ProcessToolOperations;
 
@@ -42,15 +47,17 @@ export class ProcessExecutionCoordinator {
 		this.host = host;
 		this.actorRoute = actorRoute;
 		this.operations = Object.freeze({
-			exec: async (command: string, cwd: string, options: Parameters<ProcessToolOperations["exec"]>[2]) =>
-				(this.scope.getStore() ?? (await this.actorExecutor())).execute({
+			exec: async (command: string, cwd: string, options: Parameters<ProcessToolOperations["exec"]>[2]) => {
+				const request = {
 					command,
 					cwd,
 					environment: options.env ?? process.env,
 					onData: options.onData,
 					...(options.signal ? { signal: options.signal } : {}),
 					...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
-				}),
+				};
+				return this.scope.getStore()?.execute(request) ?? this.executeActor(request);
+			},
 		});
 	}
 
@@ -58,19 +65,19 @@ export class ProcessExecutionCoordinator {
 		if (this.disposed) return { state: "unavailable", detail: "Process route disposed" };
 		if (!this.actorRoute) return { state: "unavailable", detail: "Actor process reuse is not configured" };
 		if (!this.actorRoute.enabled()) return { state: "disabled", detail: "Actor process reuse is disabled" };
-		return this.preparedActor ?? (this.actorPreparation
+		if (this.actor && "retirement" in this.actor) return { state: "probing", detail: "Retiring Actor process reuse; new calls use the original executor" };
+		return this.actor?.prepared ?? (this.actor
 			? { state: "probing", detail: "Checking Actor process reuse" }
 			: { state: "idle", detail: "Checked on first Bash execution" });
 	}
 
 	async refreshActorRoute(): Promise<ProcessRouteSnapshot> {
 		await this.resetActorRoute();
-		if (this.actorRoute?.enabled()) await this.prepareActorRoute();
+		if (!this.disposed && this.actorRoute?.enabled()) await this.prepareActorRoute()?.preparation;
 		return this.actorDiagnostics();
 	}
 
 	async dispose(): Promise<void> {
-		if (this.disposed) return;
 		this.disposed = true;
 		await this.resetActorRoute();
 	}
@@ -80,27 +87,43 @@ export class ProcessExecutionCoordinator {
 		return this.scope.run(executor, operation);
 	}
 
-	private async actorExecutor(): Promise<ProcessExecutor> {
-		if (!this.actorRoute?.enabled() || this.disposed) return this.host;
-		const prepared = await this.prepareActorRoute();
-		return this.actorRoute.enabled() && "executor" in prepared ? prepared.executor : this.host;
+	private async executeActor(request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
+		const generation = this.actorRoute?.enabled() && !this.disposed ? this.prepareActorRoute() : undefined;
+		if (!generation) return this.host.execute(request);
+		const prepared = await generation.preparation;
+		if (this.disposed || this.actor !== generation || !this.actorRoute?.enabled() || !("executor" in prepared)) return this.host.execute(request);
+		const execution = Promise.resolve().then(() => prepared.executor.execute(request));
+		generation.executions.add(execution);
+		try { return await execution; } finally { generation.executions.delete(execution); }
 	}
 
-	private prepareActorRoute(): Promise<PreparedProcessExecutionRoute> {
+	private prepareActorRoute(): ActorProcessGeneration | undefined {
 		if (!this.actorRoute) throw new Error("Actor process reuse is not configured");
-		this.actorPreparation ??= this.actorRoute.prepare()
+		if (this.actor) return "retirement" in this.actor ? undefined : this.actor;
+		const generation: ActorProcessGeneration = {
+			executions: new Set(),
+			preparation: Promise.resolve().then(() => this.actorRoute!.prepare())
 			.catch((error): PreparedProcessExecutionRoute => ({
 				state: "unavailable",
 				detail: error instanceof Error ? error.message : String(error),
 			}))
-			.then((prepared) => (this.preparedActor = prepared));
-		return this.actorPreparation;
+			.then((prepared) => (generation.prepared = prepared)),
+		};
+		return this.actor = generation;
 	}
 
-	private async resetActorRoute(): Promise<void> {
-		await this.actorPreparation;
-		this.actorPreparation = this.preparedActor = undefined;
-		await this.actorRoute?.reset?.();
+	private resetActorRoute(): Promise<void> {
+		const generation = this.actor;
+		if (!generation) return Promise.resolve();
+		if ("retirement" in generation) return generation.retirement;
+		// Detach admission before yielding; only this generation's already admitted calls may drain.
+		const retiring = { retirement: (async () => {
+			await generation.preparation;
+			await Promise.allSettled(generation.executions);
+			await this.actorRoute?.reset?.();
+		})().finally(() => { if (this.actor === retiring) this.actor = undefined; }) };
+		this.actor = retiring;
+		return retiring.retirement;
 	}
 }
 
