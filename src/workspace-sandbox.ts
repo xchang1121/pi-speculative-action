@@ -46,6 +46,8 @@ import {
 
 export interface SandboxFileChange {
 	readonly kind?: "file";
+	/** A native content write preserves the existing inode and checks its write permission. */
+	readonly operation?: "write_contents";
 	readonly root: string;
 	readonly target: string;
 	readonly resource: string;
@@ -76,6 +78,7 @@ export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
 interface RegularFileState {
 	readonly content: Uint8Array;
 	readonly mode: number;
+	readonly identity?: import("node:fs").BigIntStats;
 }
 
 export interface SandboxExecutionDelta {
@@ -118,11 +121,11 @@ export interface SandboxWorkspaceBranchOptions {
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement>;
 	/** Optional backend metrics collected during execute/capture and sealed into the branch. */
 	readonly executionMetrics?: () => WorldExecutionMetrics;
-	/** Seal operation-specific evidence after the generic transaction has captured its exact delta. */
+	/** Seal evidence after generic capture; return a complete delta when refining its operation semantics. */
 	readonly afterCapture?: (
 		workspace: SandboxWorkspaceContext,
 		capture: SandboxExecutionDelta,
-	) => Promise<readonly SandboxDirectoryChange[] | void>;
+	) => Promise<readonly SandboxWorkspaceChange[] | void>;
 	/** Optional exact freshness proof captured by the operation-specific execution substrate. */
 	readonly validate?: () => Promise<ResourceValidation>;
 }
@@ -893,6 +896,7 @@ async function commitSandboxExecution(
 		commitLockTargets(changes),
 		async () => {
 			const staged = new Map<SandboxFileChange, string>();
+			const descriptors = new Map<SandboxFileChange, FileHandle>();
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
 			const commitModes = new Map<SandboxFileChange, number | undefined>();
 			const applied: SandboxWorkspaceChange[] = [];
@@ -903,7 +907,7 @@ async function commitSandboxExecution(
 			try {
 				for (const change of changes) await assertCommitTarget(change);
 				for (const change of changes) {
-					if (change.kind !== "directory" && change.after !== undefined) {
+					if (change.kind !== "directory" && !change.operation && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				}
@@ -920,6 +924,18 @@ async function commitSandboxExecution(
 					}
 					if (change.kind !== "directory") {
 						commitModes.set(change, resolveCommitMode(current as RegularFileState | undefined, change));
+						if (change.operation) {
+							if (change.after === undefined) throw new Error("A content write cannot delete a file");
+							const before = current as RegularFileState | undefined;
+							if (before) {
+								const descriptor = await open(change.target, fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+								descriptors.set(change, descriptor);
+								const identity = await descriptor.stat({ bigint: true });
+								if (identity.nlink !== 1n || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
+									throw new Error(`content write identity is not representable: ${change.resource}`);
+								}
+							}
+						}
 					}
 				}
 				validationMs = Math.max(0, performance.now() - validationStarted);
@@ -941,6 +957,17 @@ async function commitSandboxExecution(
 						resourcesCommitted++;
 						continue;
 					}
+					if (change.operation) {
+						// Native writes are authoritative from their first possible effect, including mkdir.
+						applied.push(change);
+						createdDirectories.push(...(await createParentDirectories(change.root, change.target)));
+						const descriptor = descriptors.get(change) ?? await open(change.target, "wx", 0o666);
+						descriptors.set(change, descriptor);
+						await descriptor.truncate(0);
+						await descriptor.writeFile(change.after!);
+						resourcesCommitted++;
+						continue;
+					}
 					applied.push(change);
 					const temporary = staged.get(change);
 					if (temporary) {
@@ -959,6 +986,9 @@ async function commitSandboxExecution(
 					}
 				}
 			} catch (error) {
+				if (applied.some((change) => change.kind !== "directory" && change.operation)) {
+					throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
+				}
 				try {
 					await restoreChanges(applied, baselines);
 					await removeCreatedDirectories(createdDirectories);
@@ -971,9 +1001,12 @@ async function commitSandboxExecution(
 				}
 				throw effectCommitFailure(error, "recoverable");
 			} finally {
+				const closed = await Promise.allSettled([...descriptors.values()].map((descriptor) => descriptor.close()));
 				await Promise.all(
 					[...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)),
 				);
+				const failure = closed.find((result) => result.status === "rejected");
+				if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 			}
 			return {
 				output: execution.output,
@@ -1044,8 +1077,7 @@ async function forkSandboxWorkspaceFor(
 			const output = await options.execute(workspace);
 			const captureStarted = performance.now();
 			const fileChanges = await collectSandboxChanges(workspace);
-			const directoryChanges = (await options.afterCapture?.(workspace, { output, changes: fileChanges })) ?? [];
-			const changes = deduplicateChanges([...fileChanges, ...directoryChanges]);
+			const changes = deduplicateChanges((await options.afterCapture?.(workspace, { output, changes: fileChanges })) ?? fileChanges);
 			return {
 				output,
 				changes,
@@ -1111,15 +1143,17 @@ async function executeMutation(
 	const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 	if (!execute) throw new Error("Workspace execution requires an explicitly bound filesystem operation");
 	const sourceRoot = path.resolve(context.cwd);
+	const writes = new Map<string, SandboxFileChange>();
 	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot,
 		action: context.action,
 		...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 		...options,
+		afterCapture: async () => [...writes.values()],
 		execute: async (workspace) => {
 			const physical = async (logical: string) => {
 				const relative = relativeFilesystemPath(sourceRoot, logical);
-				if (relative === undefined) throw new Error("Filesystem operation escapes workspace");
+				if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
 				const target = path.resolve(workspace.sandboxRoot, relative);
 				await assertNoSymlinkPath(workspace.sandboxRoot, target);
 				return target;
@@ -1127,7 +1161,15 @@ async function executeMutation(
 			return execute({
 				readFile: async (target, limit) => (await readFile(await physical(target))).subarray(0, limit),
 				access: async (target, writable) => access(await physical(target), fsConstants.R_OK | (writable ? fsConstants.W_OK : 0)),
-				writeFile: async (target, content) => writeFile(await physical(target), content, "utf8"),
+				writeFile: async (target, content) => {
+					const file = await physical(target);
+					const previous = writes.get(target);
+					const before = previous ? previous.before : (await readRegularState(file))?.content;
+					await writeFile(file, content, "utf8");
+					// An equal-content write still performs permission checks and changes the original inode.
+					writes.set(target, { root: sourceRoot, target, resource: slash(path.relative(sourceRoot, target)),
+						before, after: Buffer.from(content), operation: "write_contents" });
+				},
 				mkdir: async (target) => { await mkdir(await physical(target), { recursive: true }); },
 			}, context);
 		},
@@ -2268,7 +2310,7 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
 	try {
 		const captured = await captureStableFile(target, maxBytes, true);
-		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n) };
+		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) {
 		if (isMissing(error)) return undefined;
 		throw error;
@@ -2364,6 +2406,7 @@ function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): Sandbox
 		const previousFile = previous as SandboxFileChange;
 		const changeFile = change as SandboxFileChange;
 		if (
+			previousFile.operation !== changeFile.operation ||
 			!sameOptionalBytes(previousFile.before, changeFile.before) ||
 			(previousFile.beforeMode !== undefined &&
 				changeFile.beforeMode !== undefined &&

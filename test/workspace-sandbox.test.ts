@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, type FileHandle, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -16,6 +16,8 @@ import {
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
+import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
+import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import {
 	closeWorkspaceSandboxPools,
 	commitSandboxDelta,
@@ -26,6 +28,7 @@ import {
 	withSandboxWorkspace,
 	WorkspaceSandboxService,
 	workspaceSandboxFingerprint,
+	type SandboxFileChange,
 } from "../src/workspace-sandbox.ts";
 
 const writeTool = createWriteTool(process.cwd());
@@ -107,22 +110,23 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
 			const target = path.join(root, "nested/created.txt"), before = `\uFEFFbefore ${root}\r\n`;
 			const forbidden = { ...writeTool, execute: vi.fn(async () => { throw new Error("host function invoked"); }) };
-			for (const [name, args] of [
-				["write", { path: "@nested/created.txt", content: before }],
-				["edit", { path: target, edits: [{ oldText: "before", newText: "after" }] }],
+			for (const [name, args, initial] of [
+				["write", { path: "@nested/created.txt", content: before }, undefined],
+				["write", { path: "@nested/created.txt", content: before }, before],
+				["edit", { path: target, edits: [{ oldText: "before", newText: "after" }] }, before],
 			] as const) {
 				const native = name === "write" ? createWriteTool(root) : createEditTool(root);
 				const expected = await native.execute("actor", args as never);
 				const expectedBytes = await readFile(target);
-				if (name === "write") await rm(path.dirname(target), { recursive: true, force: true });
-				else await writeFile(target, before);
+				if (initial === undefined) await rm(path.dirname(target), { recursive: true, force: true });
+				else await writeFile(target, initial);
 				const request = context(root, name, forbidden, args);
 				await expect(world.speculation.execute({ ...request, action: { ...request.action, executionContext: undefined } }))
 					.rejects.toThrow("explicitly bound");
 				const branch = await world.speculation.execute(request);
 				expect(branch.output).toEqual({ result: expected, isError: false });
-				if (name === "write") await expect(stat(target)).rejects.toThrow();
-				else expect(await readFile(target, "utf8")).toBe(before);
+				if (initial === undefined) await expect(stat(target)).rejects.toThrow();
+				else expect(await readFile(target, "utf8")).toBe(initial);
 				const first = branch.commit();
 				expect(branch.commit()).toBe(first);
 				await first;
@@ -394,13 +398,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				output: settlement("deleted"),
 				changes: [
 					{ kind: "directory", root, target: outer, resource: "generated", before: outerBefore },
-					{
-						root,
-						target,
-						resource: "generated/nested/value.txt",
-						before: Buffer.from("remove me\n"),
-						beforeMode: fileBefore.mode & 0o777,
-					},
+					{ ...fileTransition(root, "generated/nested/value.txt", "remove me\n", undefined), beforeMode: fileBefore.mode & 0o777 },
 					{ kind: "directory", root, target: inner, resource: "generated/nested", before: innerBefore },
 				],
 			});
@@ -422,22 +420,51 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(
 				commitSandboxDelta({
 					output: settlement("unused"),
-					changes: [
-						{ root, target: first, resource: "a.txt", before: Buffer.from("a0"), after: Buffer.from("a1") },
-						{
-							root,
-							target: stale,
-							resource: "b.txt",
-							before: Buffer.from("b0"),
-							after: Buffer.from("b1"),
-						},
-					],
+					changes: [fileTransition(root, "a.txt", "a0", "a1"), fileTransition(root, "b.txt", "b0", "b1")],
 				}),
 			).rejects.toThrow("resource changed before commit: b.txt");
 			expect(await readFile(first, "utf8")).toBe("a0");
 			expect(await readFile(stale, "utf8")).toBe("actor");
 		} finally {
 			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves native file identity and never retries a possibly applied content write", async () => {
+		for (const fault of ["none", "hardlink", "readonly", "write", "close"]) {
+			const root = await temporaryRoot(`content-${fault}`), target = path.join(root, "value.txt");
+			await writeFile(target, "before");
+			const observer = await open(target, "r"), prototype = Object.getPrototypeOf(observer);
+			const originalWrite = observer.writeFile;
+			const gateway = new ToolExecutionGateway<unknown, ToolSettlement>([]);
+			let nativeCalls = 0;
+			try {
+				if (fault === "hardlink") await link(target, path.join(root, "alias.txt"));
+				if (fault === "readonly") await chmod(target, 0o444);
+				if (fault === "write" || fault === "close") vi.spyOn(prototype, "writeFile").mockImplementationOnce(async function (this: FileHandle) {
+					await originalWrite.call(this, fault === "write" ? "partial" : "after");
+					if (fault === "write") throw new Error("injected partial write");
+					const close = this.close.bind(this);
+					this.close = async () => { await close(); throw new Error("injected close failure"); };
+				});
+				const poisoned = fault === "write" || fault === "close";
+				const native = async () => { nativeCalls++; await writeFile(target, "after"); return settlement("done"); };
+				const error = await gateway.executeAuthoritative({ tool: "write", input: {} }, native, {
+					reuse: () => commitSandboxDelta({ output: settlement("done"), changes: [
+						{ ...fileTransition(root, "value.txt", "before", "after"), operation: "write_contents" },
+					] }),
+				}).then(() => undefined, (failure: unknown) => failure);
+				expect(isPoisonedEffectCommit(error), fault).toBe(poisoned);
+				if (fault !== "readonly") expect(nativeCalls, fault).toBe(fault === "hardlink" ? 1 : 0);
+				else if (error) expect(nativeCalls).toBe(1); // Root may legitimately have permission despite mode 0444.
+				const expected = fault === "write" ? "partial" : error && !poisoned ? "before" : "after";
+				expect((await observer.readFile()).toString(), fault).toBe(expected);
+				expect(await readFile(target, "utf8"), fault).toBe(expected);
+				if (fault === "hardlink") expect(await readFile(path.join(root, "alias.txt"), "utf8")).toBe("after");
+			} finally {
+				vi.restoreAllMocks(); await observer.close(); await gateway.dispose();
+				await chmod(target, 0o644); await rm(root, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -448,9 +475,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(target, "base\n", "utf8");
 			const deltas = ["first\n", "second\n"].map((after) => ({
 				output: settlement(after.trim()),
-				changes: [
-					{ root, target, resource: "value.txt", before: Buffer.from("base\n"), after: Buffer.from(after) },
-				],
+				changes: [fileTransition(root, "value.txt", "base\n", after)],
 			}));
 
 			let enterBlock!: () => void;
@@ -506,21 +531,21 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("does not modify an existing repository's index or branch", async () => {
 		const root = await temporaryRoot("git");
 		try {
-			await runGit(["init"], root);
-			await runGit(["config", "user.email", "test@example.com"], root);
-			await runGit(["config", "user.name", "Test"], root);
+			await runProgram("git", ["init"], root);
+			await runProgram("git", ["config", "user.email", "test@example.com"], root);
+			await runProgram("git", ["config", "user.name", "Test"], root);
 			await writeFile(path.join(root, "tracked.txt"), "base\n", "utf8");
-			await runGit(["add", "tracked.txt"], root);
-			await runGit(["commit", "-m", "base"], root);
+			await runProgram("git", ["add", "tracked.txt"], root);
+			await runProgram("git", ["commit", "-m", "base"], root);
 			await writeFile(path.join(root, "staged.txt"), "user\n", "utf8");
-			await runGit(["add", "staged.txt"], root);
-			const beforeStatus = await runGit(["status", "--short"], root);
-			const beforeBranch = await runGit(["branch", "--show-current"], root);
+			await runProgram("git", ["add", "staged.txt"], root);
+			const beforeStatus = await runProgram("git", ["status", "--short"], root);
+			const beforeBranch = await runProgram("git", ["branch", "--show-current"], root);
 			const args = { path: "created.txt", content: "speculative\n" };
 			await createWorkspaceSandbox().speculation.execute(context(root, "write", writeTool, args));
 
-			expect(await runGit(["status", "--short"], root)).toBe(beforeStatus);
-			expect(await runGit(["branch", "--show-current"], root)).toBe(beforeBranch);
+			expect(await runProgram("git", ["status", "--short"], root)).toBe(beforeStatus);
+			expect(await runProgram("git", ["branch", "--show-current"], root)).toBe(beforeBranch);
 			await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -551,13 +576,18 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("captures exact regular-file deltas through the generic workspace transaction driver", async () => {
+	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
 		const root = await temporaryRoot("transaction");
 		try {
 			await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
 			await writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8");
 			await writeFile(path.join(root, "untouched.txt"), "stable\n", "utf8");
 			await withSandboxWorkspace(root, async (workspace) => {
+				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
+				await expect(stat(clock)).rejects.toThrow();
+				const initial = await workspace.transactions.begin();
+				expect((await stat(clock)).isFile()).toBe(true);
+				await initial.abort();
 				const capture = await workspace.transactions.begin();
 				await writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after!\n", "utf8");
 				await writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8");
@@ -565,16 +595,10 @@ describe("workspace-branch ExecutionWorld", () => {
 				const delta = await capture.finish();
 
 				if (!delta.complete) throw new Error(`workspace transaction was incomplete: ${delta.reason}`);
-				expect(delta.complete).toBe(true);
 				const beforeEntry = delta.before.entries.get("changed.txt");
 				const afterEntry = delta.after.entries.get("changed.txt");
 				if (beforeEntry?.kind !== "file" || afterEntry?.kind !== "file") throw new Error("change clock missing");
 				expect(afterEntry.changeTimeMs).toBeGreaterThan(beforeEntry.changeTimeMs);
-				expect(delta.changes.map((change) => change.relativePath)).toEqual([
-					"changed.txt",
-					"created.txt",
-					"deleted.txt",
-				]);
 				expect(
 					delta.changes.map((change) => ({
 						path: change.relativePath,
@@ -586,22 +610,6 @@ describe("workspace-branch ExecutionWorld", () => {
 					{ path: "created.txt", before: undefined, after: "created\n" },
 					{ path: "deleted.txt", before: "deleted\n", after: undefined },
 				]);
-			});
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("defers transaction observation until the first mutation interval", async () => {
-		const root = await temporaryRoot("transaction-deferred");
-		try {
-			await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
-			await withSandboxWorkspace(root, async (workspace) => {
-				const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
-				await expect(stat(clock)).rejects.toThrow();
-				const capture = await workspace.transactions.begin();
-				expect((await stat(clock)).isFile()).toBe(true);
-				await capture.abort();
 			});
 		} finally {
 			await rm(root, { recursive: true, force: true });
@@ -642,7 +650,6 @@ describe("workspace-branch ExecutionWorld", () => {
 				const linkPath = path.join(workspace.sandboxRoot, "link.txt");
 				await symlink("target.txt", linkPath);
 				const delta = await capture.finish();
-				expect(delta.complete).toBe(false);
 				if (delta.complete) throw new Error("symlink transition was unexpectedly reusable");
 				expect(delta.reason).toContain("unsupported_workspace_transition:link.txt");
 				expect((await stat(linkPath)).isFile()).toBe(true);
@@ -678,7 +685,6 @@ describe("workspace-branch ExecutionWorld", () => {
 				if (!recoveredDelta.complete) {
 					throw new Error(`recovered workspace transaction was incomplete: ${recoveredDelta.reason}`);
 				}
-				expect(recoveredDelta.complete).toBe(true);
 				expect(Buffer.from(recoveredDelta.changes[0]?.before ?? []).toString("utf8")).toBe("overlap\n");
 				expect(Buffer.from(recoveredDelta.changes[0]?.after ?? []).toString("utf8")).toBe("recovered\n");
 			});
@@ -729,24 +735,20 @@ function settlement(text: string): ToolSettlement {
 	return { result: { content: [{ type: "text", text }], details: undefined }, isError: false };
 }
 
+function fileTransition(root: string, resource: string, before: string | undefined, after: string | undefined): SandboxFileChange {
+	return { root, resource, target: path.resolve(root, resource),
+		before: before === undefined ? undefined : Buffer.from(before), after: after === undefined ? undefined : Buffer.from(after) };
+}
+
 async function temporaryRoot(label: string): Promise<string> {
 	const root = await mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
 	testRoots.add(root);
 	return root;
 }
 
-function runGit(args: string[], cwd: string): Promise<string> {
+function runProgram(executable: string, args: readonly string[], cwd?: string): Promise<string> {
 	return new Promise((resolve, reject) => {
-		execFile("git", args, { cwd }, (error, stdout, stderr) => {
-			if (error) reject(new Error(stderr));
-			else resolve(stdout);
-		});
-	});
-}
-
-function runProgram(executable: string, args: readonly string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+		execFile(executable, args, { encoding: "utf8", cwd }, (error, stdout, stderr) => {
 			if (error) reject(new Error(`${executable} failed: ${stderr || error.message}`, { cause: error }));
 			else resolve(stdout);
 		});

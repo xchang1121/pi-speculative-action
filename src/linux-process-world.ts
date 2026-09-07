@@ -120,7 +120,7 @@ export function createLinuxProcessExecutionWorld(
 							},
 				afterCapture: async (_workspace, capture) => {
 					if (!session) throw new Error("process evidence sealer is missing");
-					return session.seal(capture.changes);
+					return [...capture.changes, ...await session.seal(capture.changes)];
 				},
 				execute: async (workspace) => {
 					session = await backend.open({
