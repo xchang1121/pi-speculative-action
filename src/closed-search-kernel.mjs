@@ -8,11 +8,11 @@ import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMe
 
 // Explicit shared Actor/producer semantics, NOT equivalence with ambient native fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
-	id: "pi.captured-find.v1", pi: "0.84.1", platform: process.platform, node: process.version,
-	find: Object.freeze({ glob: "13.0.6", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
-		nocase: false, nodir: false, dot: true, follow: false, matchBase: true, mark: true, absolute: true }),
+	id: "pi.captured-find.v2", pi: "0.84.1", platform: process.platform, node: process.version,
+	find: Object.freeze({ minimatch: "10.2.5", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
+		platform: "linux", nocase: false, dot: true, matchBase: true, nocomment: true, nonegate: true, braceExpandMax: 10_000 }),
 	environment: Object.freeze({ PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" }),
-	filesystem: "readonly captured input; normalized in-root aliases; synthetic type/size; no ambient filesystem fallback",
+	filesystem: "readonly /workspace namespace; exact spelling; normalized in-root aliases; no ambient filesystem fallback",
 	limits: Object.freeze({ inputBytes: 8 * 1024 * 1024, entries: 4096, requestBytes: 9 * 1024 * 1024, resultBytes: 1024 * 1024 }),
 });
 let owned = false;
@@ -78,30 +78,27 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 export async function loadSearchEngines() {
 	const pi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent")), profile = CLOSED_SEARCH_PROFILE;
 	assert.equal(JSON.parse(await readFile(new URL("../package.json", import.meta.resolve("@earendil-works/pi-coding-agent")), "utf8")).version, profile.pi);
-	for (const [name, version] of [["glob", profile.find.glob], ["ignore", profile.find.ignore]])
+	for (const [name, version] of [["minimatch", profile.find.minimatch], ["ignore", profile.find.ignore]])
 		assert.equal(pi(`${name}/package.json`).version, version, `Requalify Pi's installed ${name}`);
-	const { globSync, Ignore } = pi("glob"), ignore = pi("ignore");
-	return { globSync, Ignore, ignore };
+	const { Minimatch } = pi("minimatch"), ignore = pi("ignore");
+	return { Minimatch, ignore };
 }
 
 export async function createClosedSearchKernel() {
 	assert.ok(!isMainThread && !owned, "Search kernels require their own worker lifetime");
 	owned = true;
-	const { globSync, Ignore, ignore } = await loadSearchEngines(), profile = CLOSED_SEARCH_PROFILE;
+	const { Minimatch, ignore } = await loadSearchEngines(), profile = CLOSED_SEARCH_PROFILE, namespace = path.posix;
 	const { createFindToolDefinition } = await import(new URL("./core/tools/find.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 	return { execute: async (kind, root, args, readInput) => {
 		assert.equal(kind, "find", "closed search operation denied");
 		const inputs = new Map(), rules = new Map(), decisions = new Map(); let failure;
 		const read = (operation, target) => {
 			if (failure) throw failure;
-			const relative = path.relative(root, target);
-			if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`))
-				throw Object.assign(new Error("outside captured namespace"), { code: "ENOENT" });
-			const key = JSON.stringify([operation, relative]);
+			const normalized = namespace.normalize(target), key = JSON.stringify([operation, normalized]);
 			if (!inputs.has(key)) {
 				try {
 					assert.ok(inputs.size < profile.limits.entries, "input entry budget");
-					inputs.set(key, { value: readInput(operation, path.posix.join("/workspace", relative.split(path.sep).join("/"))) });
+					inputs.set(key, { value: readInput(operation, normalized) });
 				} catch (error) {
 					if (!["ENOENT", "ENOTDIR", "EISDIR"].includes(error.code)) failure = error;
 					inputs.set(key, { error });
@@ -109,39 +106,22 @@ export async function createClosedSearchKernel() {
 			}
 			const entry = inputs.get(key); if (entry.error) throw entry.error; return entry.value;
 		};
-		const stat = (target) => {
-			const value = read("stat", target);
-			return { name: path.basename(target), parentPath: path.dirname(target), size: value.size,
-				...Object.fromEntries(Object.keys({ isFile: 0, isDirectory: 0, isSymbolicLink: 0, isFIFO: 0, isSocket: 0, isCharacterDevice: 0, isBlockDevice: 0 })
-					.map((name) => [name, () => name === (value.directory ? "isDirectory" : "isFile")])) };
-		};
-		// PathScurry fills omitted methods from host fs. Supply EVERY documented sync/callback/promise port.
-		const operations = { lstat: stat, readdir: (target) => read("readdir", target).map((name) => stat(path.join(target, name))),
-			readlink: () => { throw failure ??= new Error("uncaptured readlink denied"); },
-			realpath: () => { throw failure ??= new Error("uncaptured realpath denied"); } };
-		const filesystem = { promises: Object.fromEntries(Object.entries(operations).map(([name, run]) => [name, async (...args) => run(...args)])),
-			...Object.fromEntries(Object.entries(operations).flatMap(([name, run]) => [[name + "Sync", run], [name, (...args) => {
-				const callback = args.pop(); let value;
-				try { value = run(...args); } catch (error) { callback(error); return; } callback(null, value);
-			}]])) };
 		const layers = (directory) => {
 			if (!rules.has(directory)) {
-				const inherited = directory === root ? [] : layers(path.dirname(directory));
+				const inherited = directory === "/workspace" ? [] : layers(namespace.dirname(directory));
 				let text = "";
-				try { text = Buffer.from(read("readFile", path.join(directory, ".gitignore"))).toString("utf8"); }
+				try { text = Buffer.from(read("readFile", namespace.join(directory, ".gitignore"))).toString("utf8"); }
 				catch (error) { if (error.code !== "ENOENT") throw error; }
 				rules.set(directory, [...inherited, { directory, matcher: ignore({ ignorecase: false }).add(text) }]);
 			}
 			return rules.get(directory);
 		};
 		const ignored = (target, directory) => {
-			if (target === root) return false;
-			const relative = path.relative(root, target);
-			if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) return true;
+			if (target === "/workspace") return false;
 			if (!decisions.has(target)) {
-				const parent = path.dirname(target); let excluded = ignored(parent, true);
+				const parent = namespace.dirname(target); let excluded = ignored(parent, true);
 				if (!excluded) for (const layer of layers(parent)) {
-					const relative = path.relative(layer.directory, target).split(path.sep).join("/") + (directory ? "/" : "");
+					const relative = namespace.relative(layer.directory, target) + (directory ? "/" : "");
 					const match = layer.matcher.test(relative);
 					if (match.ignored || match.unignored) excluded = match.ignored;
 				}
@@ -150,13 +130,22 @@ export async function createClosedSearchKernel() {
 			return decisions.get(target);
 		};
 		const tool = createFindToolDefinition(root, { operations: {
-			exists: (target) => { try { stat(target); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; } },
+			exists: (target) => { try { read("stat", readInput("resolve", target)); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; } },
 			glob: async (pattern, cwd, options) => {
-				const excluded = new Ignore(options.ignore, profile.find);
-				return globSync(pattern, { ...profile.find, cwd, fs: filesystem, ignore: {
-					ignored: (entry) => excluded.ignored(entry) || ignored(entry.fullpath(), entry.isDirectory()),
-					childrenIgnored: (entry) => excluded.childrenIgnored(entry) || ignored(entry.fullpath(), true),
-				} }).sort().slice(0, options.limit);
+				const base = readInput("resolve", cwd), matches = [], matcher = new Minimatch(pattern, profile.find);
+				const excluded = options.ignore.map((pattern) => new Minimatch(pattern, profile.find));
+				const walk = (target) => {
+					const { directory } = read("stat", target), relative = namespace.relative(base, target);
+					if (ignored(target, directory) || excluded.some((rule) => rule.match(target + (directory ? "/" : "")))) return;
+					const spellings = [relative, `./${relative}`, target];
+					if (relative && spellings.some((value) => matcher.match(value + (directory ? "/" : ""))))
+						matches.push(path.resolve(root, namespace.relative("/workspace", target)) + (directory ? path.sep : ""));
+					// The matcher owns grammar and prefix admission; input names never pass through an identity-folding filesystem cache.
+					if (directory && (!relative || matcher.globParts.some((parts) => parts.length === 1) || spellings.some((value) => matcher.match(value, true))))
+						for (const name of read("readdir", target)) walk(namespace.join(target, name));
+				};
+				walk(base);
+				return matches.sort().slice(0, options.limit);
 			},
 		} });
 		return { result: await tool.execute("captured-find", args).finally(() => { if (failure) throw failure; }), isError: false };

@@ -1262,7 +1262,7 @@ async function openExecutionRoutes(
 		actions.set(`Search execution › ${searchExecutionLabel(settings.searchExecution)}`, async () => {
 			const choice = await ctx.ui.select("Search execution", ["Native Pi (default)", "Captured find (Actor + speculation; no installation)", BACK]);
 			if (!choice || choice === BACK) return;
-			if (choice.startsWith("Captured")) ctx.ui.notify("Uses Pi's installed glob/ignore over captured workspace inputs for BOTH Actor find and speculation; not native fd equivalence. grep remains Native Pi or an available unified environment. Unproven inputs and limits fail the selected find call. No extra packages, binaries or downloads.", "warning");
+			if (choice.startsWith("Captured")) ctx.ui.notify("Uses Pi's installed matcher over captured workspace inputs for BOTH Actor find and speculation; not native fd equivalence. grep remains Native Pi or an available unified environment. Unproven inputs and limits fail the selected find call. No extra packages, binaries or downloads.", "warning");
 			await editor.setSettings({ ...settings, searchExecution: choice.startsWith("Captured") ? "captured" : "native" });
 		});
 		actions.set("Actor execution · always available", () =>

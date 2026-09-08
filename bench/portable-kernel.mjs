@@ -141,19 +141,19 @@ async function qualifyPiSearch(name) {
 		await fs.mkdir(path.join(searchRoot, "nested"));
 		for (const [file, content] of Object.entries({ "nested/.gitignore": "*.txt\n!kept.txt\n", "nested/kept.txt": "needle kept\n",
 			"nested/skipped.txt": "needle skipped\n", "UPPER.TXT": "needle case\n", "中文 name.txt": "needle utf8\n",
+			"é.txt": "composed", "e\u0301.txt": "decomposed", "①.txt": "circled", "1.txt": "plain",
 			"utf16.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("needle unicode\r\n", "utf16le")]) })) await fs.writeFile(path.join(searchRoot, file), content);
 		const behaviors = [];
-		for (const pattern of ["empty", "nested/**/*.txt", "*.TXT", "absent", "*.txt"]) {
+		for (const [pattern, text] of [["empty", "empty/"], ["nested/**/*.txt", "nested/kept.txt"], ["*.TXT", "UPPER.TXT"],
+			["absent", "No files found matching pattern"], ["*.txt"], ["é.txt", "é.txt"], ["①.txt", "①.txt"],
+			["./é.txt", "é.txt"], ["e\u0301.txt", "e\u0301.txt"], ["nested/{kept,skipped}.txt", "nested/kept.txt"]]) {
 			const query = { ...args, pattern, limit: 2 };
 			const output = (await execute("actor", fs, { args: query, signal })).result;
 			assert.deepEqual((await execute("producer", fs, { args: query, signal })).result, output);
 			const native = await tool.execute("native-case", query, signal);
 			const equal = JSON.stringify(output) === JSON.stringify(native);
 			behaviors.push({ pattern, nativeOutputEqual: equal, ...(!equal ? { native: native.content, profile: output.content } : {}) });
-			if (pattern === "empty") assert.equal(output.content[0].text, "empty/");
-			if (pattern === "nested/**/*.txt") assert.equal(output.content[0].text, "nested/kept.txt");
-			if (pattern === "*.TXT") assert.equal(output.content[0].text, "UPPER.TXT");
-			if (pattern === "absent") assert.equal(output.content[0].text, "No files found matching pattern");
+			if (text !== undefined) assert.equal(output.content[0].text, text, pattern);
 		}
 		const external = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-external-")), link = path.join(searchRoot, "alias");
 		try {
@@ -190,6 +190,11 @@ async function qualifyPiSearch(name) {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
+		if (process.platform === "win32") for (const cwd of [root.replace(/^[a-z]:/iu, (drive) => drive.toLowerCase()), root.replaceAll("\\", "/")]) {
+			const { pool: aliasPool, invocations } = await createClosedSearchProfile(cwd);
+			try { assert.deepEqual((await invocations.get(name).authoritative({ args, signal, callID: "root-alias" })).result, expected); }
+			finally { await aliasPool.dispose(); }
+		}
 		const both = Promise.withResolvers(), proceed = Promise.withResolvers(); let entered = 0;
 		const concurrent = [0, 1].map(() => execute("producer", fs, { args, signal }, async () => {
 			if (++entered === 2) both.resolve(); await proceed.promise;
@@ -224,7 +229,7 @@ async function qualifyPiSearch(name) {
 			assert.deepEqual(hit.output, expected); assert.equal(hit.settlement.provider.kind, "speculative");
 			assert.equal(running.actorCalls(), 0);
 		} finally { resume.resolve(); await running.host.dispose(); }
-		await fs.appendFile(path.join(root, ".gitignore"), "data-*.txt\nnotes.txt\n中文*\nutf16.txt\nUPPER.TXT\nnested/\n");
+		await fs.appendFile(path.join(root, ".gitignore"), "data-*.txt\nnotes.txt\n中文*\nutf16.txt\nUPPER.TXT\nnested/\n*é*\n*é*\n①*\n1*\n");
 		const stale = await ready.actor("stale");
 		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 2);
 		assert.notDeepEqual(stale.output, expected);

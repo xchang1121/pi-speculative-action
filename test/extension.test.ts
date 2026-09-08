@@ -159,7 +159,7 @@ describe("zero-modification Pi extension", () => {
 	it("selects one search profile for both routes, fails closed, and retires it on refresh or disable", async () => {
 		const fixture = await createFixture({ settings: JSON.parse('{"searchExecution":"closed"}') });
 		vi.stubEnv("PI_CODING_AGENT_DIR", fixture.cwd);
-		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockRejectedValue(new Error("Requalify Pi's installed glob"));
+		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockRejectedValue(new Error("Requalify Pi's installed minimatch"));
 		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
 		try {
 			await fixture.emit("session_start", {}, fixture.context);
@@ -177,7 +177,7 @@ describe("zero-modification Pi extension", () => {
 			expect(fixture.store.effective()).toMatchObject({ enabled: false, searchExecution: "captured" });
 			expect(prepare).not.toHaveBeenCalled();
 			await command("on");
-			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Requalify Pi's installed glob"), "warning");
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Requalify Pi's installed minimatch"), "warning");
 			await expect(fixture.tools.get("find")!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("Requalify");
 			expect(prepare).toHaveBeenCalledOnce();
 			expect((await fixture.resolveInvocation("read", { path: "a" }))?.authoritative).toBeUndefined();

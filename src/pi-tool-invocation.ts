@@ -7,6 +7,7 @@ import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from ".
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion } from "./resource-version.ts";
+import { relativeFilesystemPath, slash } from "./path-utils.ts";
 
 export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["find"];
 
@@ -147,8 +148,12 @@ export async function createClosedSearchProfile(cwd: string) {
 
 /** Translate a closed namespace using only captured positive/negative evidence, never ambient host fs. */
 export async function readClosedSearchInput(source: ToolFilesystemOperations, root: string, operation: string, target: string, maxBytes: number): Promise<unknown> {
-	assert.ok(source.stat && source.readdir && ["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
 	const fail = (code: string): never => { throw Object.assign(new Error(`${code}: ${target}`), { code }); };
+	if (operation === "resolve") {
+		const relative = relativeFilesystemPath(root, target);
+		return relative === undefined ? fail("ENOENT") : path.posix.join("/workspace", slash(relative));
+	}
+	assert.ok(source.stat && source.readdir && ["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
 	const normalized = path.posix.normalize(target);
 	if (normalized === "/") return operation === "stat" ? { directory: true, size: 0 } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
 	const relative = path.posix.relative("/workspace", normalized);
