@@ -60,6 +60,10 @@ interface TraceFile {
 }
 
 type TraceRoot = { readonly file: TraceFile; readonly start: number };
+interface TraceProcess extends TraceRoot {
+	readonly cwd: string | undefined;
+	readonly fs: { shared: boolean; changed: boolean };
+}
 interface TraceLine {
 	readonly name: string;
 	readonly args: readonly string[];
@@ -140,7 +144,6 @@ function reassembleSyscalls(lines: readonly string[], pid: number): readonly Tra
 }
 
 function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot | { readonly reason: string } {
-	const byPID = new Map(files.map((file) => [file.pid, file]));
 	const parent = new Map<number, number>();
 	const children = new Map<number, number[]>();
 	for (const file of files) {
@@ -157,13 +160,9 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 	if (roots.length !== 1) return { reason: `trace_root_ambiguous:${roots.map(({ pid }) => pid).sort().join(",")}` };
 
 	const depth = new Map<number, number>([[roots[0]!.pid, 0]]);
-	const queue = [roots[0]!.pid];
-	while (queue.length) {
-		const pid = queue.shift()!;
+	for (const [pid, level] of depth) {
 		for (const child of children.get(pid) ?? []) {
-			if (!byPID.has(child) || depth.has(child)) continue;
-			depth.set(child, depth.get(pid)! + 1);
-			queue.push(child);
+			if (!depth.has(child)) depth.set(child, level + 1);
 		}
 	}
 	const candidates: Array<TraceRoot & { readonly depth: number }> = [];
@@ -180,7 +179,14 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 	if (!candidates.length) return { reason: "target_exec_not_found" };
 	const shallowest = Math.min(...candidates.map((candidate) => candidate.depth));
 	const matches = candidates.filter((candidate) => candidate.depth === shallowest);
-	return matches.length === 1 ? matches[0]! : { reason: `target_exec_ambiguous:${matches.map(({ file }) => file.pid).sort().join(",")}` };
+	if (matches.length !== 1) return { reason: `target_exec_ambiguous:${matches.map(({ file }) => file.pid).sort().join(",")}` };
+	const match = matches[0]!;
+	// exec does not unshare CLONE_FS. An excluded task must not retain authority over the target cwd.
+	if (files.some((file) => file.lines.some((line, index) => spawnedPID(line) && sharesFilesystem(line) !== false &&
+		(spawnedPID(line) === match.file.pid || (file === match.file && index < match.start))))) {
+		return { reason: "target_filesystem_context_unproven" };
+	}
+	return match;
 }
 
 /**
@@ -216,21 +222,15 @@ export async function observeStrace(
 	}
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
-	const selected = new Map<number, number>([[root.file.pid, root.start]]);
-	const initialCwds = new Map<number, string | undefined>([[root.file.pid, path.posix.resolve(initialCwd)]]);
-	const queue = [root.file.pid];
+	const selected = new Map<number, TraceProcess>([[root.file.pid, {
+		...root, cwd: path.posix.resolve(initialCwd), fs: { shared: false, changed: false },
+	}]]);
 	let complete = true;
 	const incompleteReasons = new Set<string>();
-	while (queue.length) {
-		const pid = queue.shift()!;
-		const file = byPID.get(pid);
-		if (!file) {
-			complete = false;
-			incompleteReasons.add(`trace_file_missing:${pid}`);
-			continue;
-		}
-		let cwd = initialCwds.get(pid);
-		for (const line of file.lines.slice(selected.get(pid) ?? 0)) {
+	for (const [pid, process] of selected) {
+		let cwd = process.cwd;
+		for (const line of process.file.lines.slice(process.start)) {
+			if (process.fs.shared && (line.name === "chdir" || line.name === "fchdir") && syscallSucceeded(line)) process.fs.changed = true;
 			cwd = tracedCwd(line, cwd);
 			const child = spawnedPID(line);
 			if (!child || selected.has(child)) continue;
@@ -240,9 +240,10 @@ export async function observeStrace(
 				incompleteReasons.add(`child_trace_missing:${child}`);
 				continue;
 			}
-			selected.set(child, 0);
-			initialCwds.set(child, cwd);
-			queue.push(child);
+			const shared = sharesFilesystem(line);
+			if (shared === undefined) { complete = false; incompleteReasons.add(`clone_flags_unparsed:${pid}`); }
+			if (shared !== false) process.fs.shared = true;
+			selected.set(child, { file: childFile, start: 0, cwd, fs: shared === false ? { shared: false, changed: false } : process.fs });
 		}
 	}
 
@@ -255,7 +256,7 @@ export async function observeStrace(
 		]),
 	);
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const ignoredSegments = ignoredProcessSegments(selected, byPID, interposedExecutables, initialCwds);
+	const ignoredSegments = ignoredProcessSegments(selected, interposedExecutables);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, digest: Sha256Digest) => {
 		const identity = `metadata:${followSymlinks}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
@@ -269,10 +270,10 @@ export async function observeStrace(
 			digest,
 		});
 	};
-	for (const [pid, start] of selected) {
-		const file = byPID.get(pid);
-		if (!file) continue;
-		let cwd = initialCwds.get(pid);
+	for (const [pid, { file, start, cwd: initial, fs }] of selected) {
+		// -ff files cannot order another task's chdir against this task's pathname lookup.
+		if (fs.changed) { complete = false; incompleteReasons.add("shared_cwd_mutation"); continue; }
+		let cwd = initial;
 		if (!cwd) {
 			complete = false;
 			incompleteReasons.add(`cwd_unknown:${pid}`);
@@ -316,14 +317,6 @@ export async function observeStrace(
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
-				const changed = tracedCwd(line, cwd);
-				if (changed) cwd = changed;
-				else {
-					complete = false;
-					incompleteReasons.add(`${syscall}_unparsed:${pid}`);
-				}
-			}
 			if (MODELED_METADATA_SYSCALLS.has(syscall)) {
 				if (syscallSucceeded(line)) {
 					const metadataPaths = metadataSyscallPaths(line, syscall, cwd);
@@ -350,6 +343,11 @@ export async function observeStrace(
 			for (const observed of syscallPaths(line, syscall, cwd)) {
 				if (paths.get(observed) !== "executable") paths.set(observed, role);
 			}
+			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
+				const changed = tracedCwd(line, cwd);
+				if (changed) cwd = changed;
+				else { complete = false; incompleteReasons.add(`${syscall}_unparsed:${pid}`); }
+			}
 		}
 	}
 	if (!complete) taints.add("trace_incomplete");
@@ -367,8 +365,8 @@ export async function observeStrace(
 				),
 		),
 		taints: Object.freeze([...taints].sort()),
-		tracedProcesses: [...selected].filter(([pid, start]) =>
-			byPID.get(pid)?.lines.slice(start).some((_, offset) =>
+		tracedProcesses: [...selected].filter(([pid, { file, start }]) =>
+			file.lines.slice(start).some((_, offset) =>
 				!ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to),
 			),
 		).length,
@@ -475,19 +473,14 @@ function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
 }
 
 function ignoredProcessSegments(
-	selected: ReadonlyMap<number, number>,
-	byPID: ReadonlyMap<number, TraceFile>,
+	selected: ReadonlyMap<number, TraceProcess>,
 	interposedExecutables: ReadonlyMap<string, string>,
-	initialCwds: ReadonlyMap<number, string | undefined>,
 ): Map<number, Array<readonly [number, number]>> {
 	const ignored = new Map<number, Array<readonly [number, number]>>();
 	if (!interposedExecutables.size) return ignored;
-	const queue: Array<readonly [number, number]> = [];
-	const fullyIgnored = new Set<number>();
-	for (const [pid, start] of selected) {
-		const file = byPID.get(pid);
-		if (!file) continue;
-		let cwd = initialCwds.get(pid);
+	const fullyIgnored = new Map<number, number>();
+	for (const [pid, { file, start, cwd: initial }] of selected) {
+		let cwd = initial;
 		for (let index = start; index < file.lines.length; index++) {
 			const line = file.lines[index]!;
 			cwd = tracedCwd(line, cwd);
@@ -510,21 +503,18 @@ function ignoredProcessSegments(
 				continue;
 			}
 			(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, file.lines.length]);
-			fullyIgnored.add(pid);
-			queue.push([pid, index]);
+			fullyIgnored.set(pid, index);
 			break;
 		}
 	}
-	while (queue.length) {
-		const [pid, start] = queue.shift()!;
-		const file = byPID.get(pid);
+	for (const [pid, start] of fullyIgnored) {
+		const file = selected.get(pid)?.file;
 		if (!file) continue;
 		for (const line of file.lines.slice(start)) {
 			const child = spawnedPID(line);
 			if (!child || fullyIgnored.has(child)) continue;
-			ignored.set(child, [[0, byPID.get(child)?.lines.length ?? Number.POSITIVE_INFINITY]]);
-			fullyIgnored.add(child);
-			queue.push([child, 0]);
+			ignored.set(child, [[0, selected.get(child)?.file.lines.length ?? Number.POSITIVE_INFINITY]]);
+			fullyIgnored.set(child, 0);
 		}
 	}
 	return ignored;
@@ -550,6 +540,21 @@ function spawnedPID(line: TraceLine): number | undefined {
 	if (!["clone", "clone3", "fork", "vfork"].includes(line.name)) return undefined;
 	const pid = Number(line.result);
 	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function sharesFilesystem(line: TraceLine): boolean | undefined {
+	if (line.name === "fork" || line.name === "vfork") return false;
+	const flags = line.name === "clone3" ? /^\{flags=([^,}]+)(?:,|})/.exec(line.args[0] ?? "")?.[1]
+		: line.args.find((argument) => argument.startsWith("flags="))?.slice(6);
+	if (!flags) return undefined;
+	let shared = false;
+	for (const flag of flags.split("|")) {
+		const number = parseInteger(flag);
+		if (number !== undefined) shared ||= (number & 0x200n) !== 0n;
+		else if (flag === "CLONE_FS") shared = true;
+		else if (!/^(?:CLONE_[A-Z0-9_]+|SIG[A-Z0-9]+)$/.test(flag)) return undefined;
+	}
+	return shared;
 }
 
 function syscallSucceeded(line: TraceLine): boolean {
