@@ -51,6 +51,9 @@
 
 ### Added
 
+- Bounded grep cost qualification (`--cost-only`, optionally `--case=repository,unicode`) trains the
+  same Host on original Actor calls before measuring adoption, reports fallback separately, and checks
+  exact-once Actor execution without changing the benefit gate or enabling production grep.
 - Dependency-free grep qualification now includes captured ancestor configurations and Git indirection,
   keeping native repository detection and original Actor fallback. Production grep remains unchanged.
 - Explicit filesystem operations may bind a read-only capture root and inspect captured resolved names.

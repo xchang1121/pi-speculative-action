@@ -24,6 +24,8 @@ const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
 const linksOnly = process.argv.includes("--links-only"), semanticOnly = linksOnly || process.argv.includes("--semantics-only");
+const costOnly = process.argv.includes("--cost-only");
+assert.ok(!costOnly || !semanticOnly, "choose either semantic or cost qualification");
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
 let worker, actorWorker, ownedRg, engine;
@@ -31,12 +33,12 @@ let nativeProcesses = 0, nativeClosed = 0, nativeCancels = 0;
 const configuredAtStart = process.env.RIPGREP_CONFIG_PATH;
 const nativeFlags = ["--no-config", "--sort=path", "--no-ignore-global", "--no-ignore-parent"];
 const rows = semanticOnly ? [] : [
-  { label: "repository", contents: await fs.readFile(new URL("../src/runtime-engine.ts", import.meta.url)), files: 32, patterns: ["authoritativeMutationResources", "\\b(?:[A-Za-z_]\\w*\\.){4,}[A-Za-z_]\\w*\\b", "(?:\\p{L}+\\s+){15}\\p{L}+"] },
-  { label: "unicode", contents: Buffer.from("Αλφα βήτα Ελληνικά κώδικας γράμματα λέξεις μία δύο τρία τέσσερα\n".repeat(50_000)), files: 1, patterns: ["needle", "^\\w{60}$", "(?P<word>Αλφα)", "."] },
+  { label: "repository", contents: await fs.readFile(new URL("../src/runtime-engine.ts", import.meta.url)), files: costOnly ? 8 : 32, patterns: ["authoritativeMutationResources", "\\b(?:[A-Za-z_]\\w*\\.){4,}[A-Za-z_]\\w*\\b", "(?:\\p{L}+\\s+){15}\\p{L}+"] },
+  { label: "unicode", contents: Buffer.from("Αλφα βήτα Ελληνικά κώδικας γράμματα λέξεις μία δύο τρία τέσσερα\n".repeat(costOnly ? 7_000 : 50_000)), files: 1, patterns: ["needle", "^\\w{60}$", "(?P<word>Αλφα)", "."] },
 ];
 const median = async (run) => {
   const times = []; let output;
-  for (let i = 0; i < (semanticOnly ? 1 : 5); i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
+  for (let i = 0; i < (semanticOnly ? 1 : costOnly ? 3 : 5); i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
   return { ms: times.sort((a, b) => a - b)[Math.floor(times.length / 2)], output };
 };
 try {
@@ -54,6 +56,7 @@ try {
     report.push(await (linksOnly ? qualifyNativeLinks() : qualifyNamespace()));
   }
   for (const row of rows) {
+    if (selectedCases.size && !selectedCases.has(row.label)) continue;
     const cwd = path.join(root, row.label); await fs.mkdir(cwd);
     for (let i = 0; i < row.files; i++) await fs.writeFile(path.join(cwd, `${i}.txt`), row.contents);
     const tool = createGrepTool(cwd);
@@ -74,17 +77,19 @@ try {
       console.log(JSON.stringify(report.at(-1)));
     }
   }
+  if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
   const resultLimitCancels = nativeCancels;
-  if (!semanticOnly) assert.ok(resultLimitCancels > 0, "Pi's result-limit stop must reach the native process");
+  if (!semanticOnly && !costOnly) assert.ok(resultLimitCancels > 0, "Pi's result-limit stop must reach the native process");
   const cancellation = {};
-  for (let repeat = 0; repeat < (linksOnly ? 0 : semanticOnly ? 1 : 20); repeat++) {
+  const cancellationRepeats = linksOnly ? 0 : semanticOnly || costOnly ? 1 : 20;
+  for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
-    cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : "unicode"), mode);
+    cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode);
   }
   assert.equal(nativeClosed, nativeProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
-    nativeProcesses, nativeClosed, resultLimitCancels, cancellationRepeats: linksOnly ? 0 : semanticOnly ? 1 : 20,
-    qualification: "Explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Not native-default equivalence or production admission; metadata traversal cost, unsupported filesystem entries and benefit gates remain material." }, null, 2));
+    nativeProcesses, nativeClosed, resultLimitCancels, cancellationRepeats,
+    qualification: "Explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Cost mode primes the same Host with original Actor service before probing measured admission; fallback is a valid outcome, not a hit. Not native-default equivalence or production admission." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
   await worker?.dispose();
@@ -94,7 +99,8 @@ try {
 }
 
 async function qualifyCaptured(cwd, args, expected, changed, rejected = false, stableChange = false) {
-  const ready = Promise.withResolvers(), started = performance.now(), reads = new Set(), enumerated = new Set(); let executions = 0, copies = 0, actorCalls = 0;
+  const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set(), trials = [];
+  let started, executions = 0, copies = 0, actorCalls = 0, drafterEnabled = !costOnly, settled;
   const execute = async (view, request) => {
     executions++;
     const privateRoot = await fs.mkdtemp(path.join(root, "retained-"));
@@ -122,10 +128,11 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
   const host = createSpeculativeActionHost("probe", {
-    cwd, getSettings: () => ({ enabled: true, drafterEnabled: true, drafterGateEnabled: false, drafterMaxDepth: 0,
+    cwd, getSettings: () => ({ enabled: true, drafterEnabled, drafterGateEnabled: false, drafterMaxDepth: 0,
       tools: ["grep"], candidateLimit: 1, maxConcurrentActions: 1, resourceCacheMaxEntries: 32, resourceCacheMaxBytes: 16 * 1024 * 1024, patternAware: { enabled: false } }),
     complete: async () => fauxAssistantMessage(fauxToolCall("grep", args), { stopReason: "toolUse" }),
     resolveInvocation: () => invocation, preflight: () => true, executionWorlds: [world],
+    onActorActionSettled: ({ settlement }) => settled?.resolve(settlement),
     onEvent: (event) => {
       if (event.type === "candidate" && ["succeeded", "failed", "cancelled"].includes(event.state.status)) ready.resolve(event.state);
       if (event.type === "prediction" && event.settlement.observation === "unobserved") ready.reject(new Error(JSON.stringify(event.settlement)));
@@ -133,9 +140,28 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   });
   const turn = { turnID: "probe", actorModel: model, actorOptions: undefined, tools, context: { systemPrompt: "qualification", messages: [], tools } };
   let callID = 0;
-  const actor = () => host.execute({ turnID: turn.turnID, id: `Actor-${++callID}`, tool: "grep", args, tools }, new AbortController().signal,
-    async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
+  const actor = async () => {
+    settled = Promise.withResolvers();
+    const before = actorCalls, started = performance.now();
+    const result = await host.execute({ turnID: turn.turnID, id: `Actor-${++callID}`, tool: "grep", args, tools }, new AbortController().signal,
+      async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
+    if (costOnly) {
+      const ms = performance.now() - started, { provider, rejections } = await settled.promise;
+      assert.equal(actorCalls - before, provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
+      trials.push({ ms, provider, rejections });
+    }
+    return result;
+  };
   try {
+    let hostActorMs;
+    if (costOnly) {
+      turn.turnID = "baseline"; await host.startTurn(turn);
+      hostActorMs = (await median(async () => { const result = await actor(); assert.deepEqual(result, expected); return result; })).ms;
+      assert.equal(executions, 0); assert.equal(actorCalls, 3);
+      await host.finishTurn(turn.turnID);
+      actorCalls = 0; trials.length = 0; drafterEnabled = true; turn.turnID = "probe";
+    }
+    started = performance.now();
     await host.startTurn(turn);
     const completion = await ready.promise;
     assert.equal(completion.status, rejected ? "failed" : "succeeded", JSON.stringify(completion));
@@ -150,9 +176,13 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     const adopted = await median(async () => {
       const result = await actor(); assert.deepEqual(result, expected); return result;
     });
-    assert.equal(executions, 1); assert.equal(copies, materialized); assert.equal(actorCalls, 0);
+    assert.equal(executions, 1); assert.equal(copies, materialized);
+    if (costOnly) for (const trial of trials) {
+      if (trial.provider.kind === "actor") assert.ok(trial.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(trial));
+    } else assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { producerMs, hitMs: adopted.ms, producerCalls: executions, filesMaterialized: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
+    return { producerMs, ...(costOnly ? { hostActorMs, probeMs: adopted.ms, trials } : { hitMs: adopted.ms }),
+      producerCalls: executions, filesMaterialized: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
   } finally { await host.dispose(); }
 }
 
