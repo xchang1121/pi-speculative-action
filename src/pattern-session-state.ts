@@ -36,29 +36,17 @@ export class PatternSessionState<Event> {
 	readonly id: string;
 	readonly history: Event[] = [];
 	private pendingValue: PatternPendingValidation[] = [];
-	private readonly recurrentActionsValue: BoundedRecencyMap<string, PatternRecurrentAction>;
+	readonly recurrentActions: BoundedRecencyMap<string, PatternRecurrentAction>;
 	private readonly pendingLimit: number;
 
 	constructor(id: string, budgets: PatternSessionBudgets) {
 		this.id = id;
 		this.pendingLimit = budgets.pendingValidationsPerSession;
-		this.recurrentActionsValue = new BoundedRecencyMap(budgets.recurrentActionsPerSession);
+		this.recurrentActions = new BoundedRecencyMap(budgets.recurrentActionsPerSession);
 	}
 
 	get pending(): readonly PatternPendingValidation[] {
 		return this.pendingValue;
-	}
-
-	get recurrentActions(): Iterable<PatternRecurrentAction> {
-		return this.recurrentActionsValue.values();
-	}
-
-	recurrentAction(key: string): PatternRecurrentAction | undefined {
-		return this.recurrentActionsValue.get(key);
-	}
-
-	rememberRecurrentAction(key: string, action: PatternRecurrentAction): void {
-		this.recurrentActionsValue.set(key, action);
 	}
 
 	replacePending(next: readonly PatternPendingValidation[]): readonly PatternPendingValidation[] {

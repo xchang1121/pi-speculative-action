@@ -1268,41 +1268,31 @@ describe("PatternAware", () => {
 		);
 	});
 
-	test("retains promoted exact actions beyond bounded context but not beyond the session", () => {
-		const store = new PatternAwareStore(
-			settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
-			undefined,
-			piActionSemantics(),
-		);
-		const sessionID = "long-recurrence";
-		const command = { command: "npm test -- src/slow.test.ts" };
-		store.observe(input({ sessionID, tool: "bash", input: command, outcome: "failure", durationMs: 500 }));
-		for (let index = 0; index < 3; index++) {
-			store.observe(input({ sessionID, tool: "read", input: { path: `src/before-${index}.ts` } }));
+	test("promotes canonical same-session actions beyond context only with authoritative, schema-compatible support", () => {
+		for (const mode of ["command", "path aliases", "stale schema", "non-learning"] as const) {
+			const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }), undefined, piActionSemantics());
+			const tool = mode === "command" || mode === "non-learning" ? "bash" : "read";
+			const first = tool === "bash" ? { command: "npm test" } : { path: "src/a.ts" };
+			const inputs = [first, tool === "read" ? { ...first, offset: 1 } : first];
+			for (const [index, value] of inputs.entries()) {
+				store.observe(input({ sessionID: mode, tool, input: value, schemaHash: "v1", learnTarget: mode !== "non-learning",
+					outcome: index === 0 ? "failure" : "success", durationMs: index === 0 ? 500 : 700 }));
+				for (let noise = 0; noise < 3; noise++)
+					store.observe(input({ sessionID: mode, tool: "read", input: { path: `noise-${index}-${noise}.ts` } }));
+				const recurrent = store.predict(mode, { [tool]: mode === "stale schema" ? "v2" : "v1" })
+					.find((candidate) => candidate.patternID.startsWith("action-backoff:") && !candidate.background);
+				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
+				else {
+					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0, expectedDurationMs: 350 });
+					expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
+					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
+					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
+				}
+			}
+			store.finishSession(mode);
+			store.observe(input({ sessionID: "other", tool: "read", input: { path: "other.ts" } }));
+			expect(store.predict("other").some((item) => item.patternID.startsWith("action-backoff:"))).toBe(false);
 		}
-		expect(store.predict(sessionID).some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(
-			false,
-		);
-
-		store.observe(input({ sessionID, tool: "bash", input: command, durationMs: 700 }));
-		for (let index = 0; index < 3; index++) {
-			store.observe(input({ sessionID, tool: "read", input: { path: `src/after-${index}.ts` } }));
-		}
-		const recurrent = store.predict(sessionID).find((candidate) => candidate.patternID.startsWith("action-backoff:"));
-		expect(recurrent).toMatchObject({
-			tool: "bash",
-			input: command,
-			horizon: 0,
-			latestHorizon: 0,
-			expectedDurationMs: 350,
-		});
-		expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
-		const learnedPatternIDs = new Set(store.snapshot().map((pattern) => pattern.id));
-		expect(recurrent!.supportingPatternIDs.every((patternID) => learnedPatternIDs.has(patternID))).toBe(true);
-
-		store.finishSession(sessionID);
-		store.observe(input({ sessionID: "other", tool: "read", input: { path: "src/other.ts" } }));
-		expect(store.predict("other").some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(false);
 	});
 
 	test("bounds background exact-action samples by the configured per-tool beam", () => {
@@ -1328,44 +1318,6 @@ describe("PatternAware", () => {
 		expect(new Set(sampled.map((candidate) => candidate.tool))).toEqual(new Set(["bash", "read"]));
 	});
 
-	test("uses canonical K(a) identity and rejects stale schemas or non-learning observations", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 2 }), undefined, piActionSemantics());
-		store.observe(
-			input({ sessionID: "canonical", tool: "read", input: { path: "src/a.ts" }, schemaHash: "read-v1" }),
-		);
-		store.observe(input({ sessionID: "canonical", tool: "grep", input: { pattern: "separator" } }));
-		store.observe(
-			input({
-				sessionID: "canonical",
-				tool: "read",
-				input: { path: "src/a.ts", offset: 1 },
-				schemaHash: "read-v1",
-			}),
-		);
-		const canonical = store
-			.predict("canonical", { read: "read-v1" })
-			.find((candidate) => candidate.patternID.startsWith("action-backoff:"));
-		expect(canonical).toMatchObject({ tool: "read", input: { path: "src/a.ts" } });
-		expect(
-			store
-				.predict("canonical", { read: "read-v2" })
-				.some((candidate) => candidate.patternID.startsWith("action-backoff:")),
-		).toBe(false);
-
-		for (let index = 0; index < 2; index++) {
-			store.observe(
-				input({
-					sessionID: "not-learned",
-					tool: "bash",
-					input: { command: "npm test" },
-					learnTarget: false,
-				}),
-			);
-		}
-		expect(store.predict("not-learned").some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(
-			false,
-		);
-	});
 
 	test("merges exact backoff and keeps contradicted patterns from evicting contextual evidence", () => {
 		const store = new PatternAwareStore(
@@ -1629,11 +1581,11 @@ describe("PatternAware", () => {
 		registry.ensure("second");
 		registry.get("first");
 		expect(registry.ensure("third").evicted?.id).toBe("second");
-		first.rememberRecurrentAction("one", recurrentAction("one", 1));
-		first.rememberRecurrentAction("two", recurrentAction("two", 2));
-		first.recurrentAction("one");
-		first.rememberRecurrentAction("three", recurrentAction("three", 3));
-		expect([...first.recurrentActions].map((item) => item.action.key)).toEqual(["one", "three"]);
+		first.recurrentActions.set("one", recurrentAction("one", 1));
+		first.recurrentActions.set("two", recurrentAction("two", 2));
+		first.recurrentActions.get("one");
+		first.recurrentActions.set("three", recurrentAction("three", 3));
+		expect([...first.recurrentActions.values()].map((item) => item.action.key)).toEqual(["one", "three"]);
 		expect(
 			first.replacePending([pendingPattern("oldest", 1), pendingPattern("middle", 2), pendingPattern("newest", 3)]),
 		).toEqual([expect.objectContaining({ patternID: "oldest" })]);

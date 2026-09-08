@@ -865,7 +865,7 @@ export class PatternAwareStore {
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
-		const actions = sessionID ? this.sessions.get(sessionID)?.recurrentActions : undefined;
+		const actions = sessionID ? this.sessions.get(sessionID)?.recurrentActions.values() : undefined;
 		if (!actions) return [];
 		const values = [...actions].filter((item) => {
 			const current = schemaHashes[item.action.tool];
@@ -1006,7 +1006,7 @@ export class PatternAwareStore {
 	private observeRecurrentAction(session: PatternSessionState<PatternAwareEvent>, event: PatternAwareEvent) {
 		const action = this.resolveActionKey(event.tool, event.input, event.schemaHash);
 		if (!action) return;
-		const existing = session.recurrentAction(action.key);
+		const existing = session.recurrentActions.get(action.key);
 		const durationMs =
 			event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
@@ -1014,7 +1014,7 @@ export class PatternAwareStore {
 			existing.totalDurationMs = Math.min(Number.MAX_VALUE / 2, existing.totalDurationMs + durationMs);
 			existing.lastSeenSequence = event.sequence;
 		} else {
-			session.rememberRecurrentAction(action.key, {
+			session.recurrentActions.set(action.key, {
 				action,
 				input: structuredClone(event.input),
 				count: 1,
