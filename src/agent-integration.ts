@@ -1,4 +1,4 @@
-import type { AgentTool, AgentToolCall, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
@@ -51,7 +51,8 @@ import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from ".
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
-type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation> };
+const RAW_ACTOR_CALL = Symbol("raw-actor-call");
+type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation>; readonly [RAW_ACTOR_CALL]?: true };
 
 export interface SpeculativeAgentSettingsInput {
 	readonly enabled?: boolean;
@@ -181,6 +182,7 @@ export interface SpeculativeActionHost {
 		input: { readonly turnID: string; readonly tool: string },
 		signal?: AbortSignal,
 	) => Promise<void>;
+	/** Raw streamed arguments; preparation is provisional and never binds the final Actor call. */
 	readonly previewActorCall: (input: Omit<AgentConsumeInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	readonly consume: (
 		input: Omit<AgentConsumeInput, "sessionID">,
@@ -204,6 +206,7 @@ export interface SpeculativeToolExecutionInput {
 	readonly turnID?: string;
 	readonly id?: string;
 	readonly tool: string;
+	/** Final host-prepared arguments; this outlet must not prepare them a second time. */
 	readonly args: unknown;
 	readonly tools: readonly AgentTool[];
 }
@@ -323,17 +326,15 @@ export function createSpeculativeActionHost(
 			let tool: AgentTool | undefined;
 			let validated: unknown;
 			if (context.type === "consume") {
-				const bind = (context.consumeInput as BoundActorCall)[ACTOR_OPERATION];
+				const call = context.consumeInput as BoundActorCall, bind = call[ACTOR_OPERATION];
 				if (bind) return (await bind()).action;
-				tool = context.consumeInput.tools.find((candidate) => candidate.name === toolName);
-				validated = immutableSnapshot(input);
+				tool = call.tools.find((candidate) => candidate.name === toolName);
+				validated = call[RAW_ACTOR_CALL] ? tool && prepareToolArguments(tool, input) : immutableSnapshot(input);
 			} else {
 				tool = context.data.tools.get(toolName);
-				if (!tool) return undefined;
-				validated = prepareCandidateArguments(tool, toolName, input);
-				if (validated === undefined) return undefined;
+				validated = tool && prepareToolArguments(tool, input);
 			}
-			if (!tool) return undefined;
+			if (!tool || validated === undefined) return undefined;
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
 			return (await resolveBinding(toolName, validated, schemaHash)).action;
@@ -451,7 +452,7 @@ export function createSpeculativeActionHost(
 			executionGateway.diagnostics({ cwd: options.cwd, ...(refresh ? { refresh: true } : {}) }),
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
-		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID }, signal),
+		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
 		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		execute: (input, signal, executor) => {
 			const operation: ToolOperation = {
@@ -521,22 +522,17 @@ export function createSpeculativeActionHost(
 	};
 }
 
-/** Raw predictions cross Pi's preparation boundary once, before canonical identity is sealed. */
-function prepareCandidateArguments(
-	tool: AgentTool,
-	toolName: string,
-	input: unknown,
-): unknown | undefined {
+/** Raw predictions and previews cross Pi's preparation boundary once, before identity is sealed. */
+function prepareToolArguments(tool: AgentTool, input: unknown): unknown | undefined {
 	try {
 		const owned = structuredClone(input);
 		const prepared = tool.prepareArguments ? tool.prepareArguments(owned) : owned;
-		const toolCall: AgentToolCall = {
+		return immutableSnapshot(validateToolArguments(tool, {
 			type: "toolCall",
 			id: "spec_key",
-			name: toolName,
+			name: tool.name,
 			arguments: prepared as Record<string, unknown>,
-		};
-		return immutableSnapshot(validateToolArguments(tool, toolCall));
+		}));
 	} catch {
 		return undefined;
 	}

@@ -115,9 +115,9 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
-	it("prepares each prediction once and adopts its keyed execution for every Pi tool", async () => {
+	it("prepares raw predictions and previews once and adopts their keyed execution for every Pi tool", async () => {
 		expect(mockToolCalls.map(([tool]) => tool)).toEqual(KEYABLE_TOOLS);
-		for (const phase of ["running", "completed"] as const) {
+		for (const [origin, phase] of [["prediction", "running"], ["prediction", "completed"], ["preview", "running"], ["preview", "completed"]] as const) {
 			for (const [toolName, proposal] of mockToolCalls) {
 				const cwd = await temporaryWorkspace();
 				const writer = createWriteTool(cwd);
@@ -149,7 +149,7 @@ describe("speculative action host", () => {
 					: toolRuntimeWorld();
 				const host = createSpeculativeActionHost(`session-${turnID}`, {
 					cwd,
-					getSettings: () => ({ ...settings(), drafterMaxDepth: 0, tools: [toolName] }),
+					getSettings: () => ({ ...settings(), drafterEnabled: origin === "prediction", drafterMaxDepth: 0, tools: [toolName] }),
 					draftModel: model("draft"),
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: proposal }], "toolUse"),
@@ -168,6 +168,9 @@ describe("speculative action host", () => {
 				});
 				try {
 					await host.startTurn({ ...startInput(tool, turnID), tools: resourceExecution ? [tool, writer] : [tool] });
+					if (origin === "preview") for (let repeat = 0; repeat < 2; repeat++) {
+						await host.previewActorCall({ turnID, id: `actor-${toolName}`, tool: toolName, args: proposal, tools: [tool] });
+					}
 					await started.promise;
 					expect(prepareArguments).toHaveBeenCalledOnce();
 					for (const { args, action } of permissions) expect(args).toEqual(action.input);
@@ -193,11 +196,12 @@ describe("speculative action host", () => {
 					await adopted.promise;
 					expect(prepareArguments).toHaveBeenCalledOnce();
 					expect(events.find((event) => event.type === "actor_action"))
-						.toMatchObject({ settlement: { provider: { kind: "speculative", match: { kind: "exact" } } } });
+						.toMatchObject({ settlement: { provider: origin === "prediction"
+							? { kind: "speculative", match: { kind: "exact" } } : { kind: "actor", origin: "preview" } } });
 					expect(events.find((event) => event.type === "candidate" && event.state.status === "succeeded")).toMatchObject({
 						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
 					});
-					if (resourceExecution) {
+					if (resourceExecution && origin === "prediction") {
 						const query = toolName === "read" ? { path: "notes.txt", offset: 1, limit: 1 } : { path: ".", limit: 1 };
 						const narrowed = await host.execute({ turnID, id: "another-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution);
 						const native = toolName === "read" ? createReadTool(cwd) : createLsTool(cwd);
