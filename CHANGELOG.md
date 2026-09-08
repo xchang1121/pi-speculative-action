@@ -62,8 +62,8 @@
   the old relay thread/shared-memory mailbox is removed. Full-tool qualification shares the production
   protocol; imports are inert, and arbitrary qualification commands are denied by the production kernel.
 - Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
-  implementation used by qualification. Native Actor defaults are unchanged; production worker
-  pooling and TUI profile selection remain pending.
+  implementation used by qualification. Native Actor defaults are unchanged; captured find shares
+  worker pooling and TUI profile selection, while grep remains in qualification.
 - Added task-clustered bootstrap confidence intervals and nearest-rank p95 to
   suite latency reports; pooled acceleration remains a ratio of means, and
   repeats of the same instance stay in one resampled cluster.
@@ -155,6 +155,8 @@
 
 ### Changed
 
+- Settings menus share their existing action loop and grouped editors; labels, dynamic submenus,
+  staged updates and destructive-action confirmation retain their behavior without parallel handlers.
 - Resource snapshots are now observation-only authority; speculative execution requires a provider
   with an actual isolation guarantee. Bash whole-command and child reuse share the process coordinator.
 - Bash telemetry now separates eliminated process work from calibrated Actor critical-path savings;

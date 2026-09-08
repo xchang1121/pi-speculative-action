@@ -352,16 +352,17 @@ describe("zero-modification Pi extension", () => {
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
 			"Advanced settings": ["Scheduling and storage", "Actor probe and target verification", "Learned-pattern tuning", "Back"],
-			"Scheduling and storage": ["Prediction wait limit", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Back"],
+			"Scheduling and storage": ["Prediction wait limit", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Clear", "Back"],
 			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
 			"Integration and authentication": ["Integration", "Control service URL", "Back"],
 			"Fork decoding": ["Back"],
 			"Target verification": ["Back"],
 			"Benefit control": ["Back"],
-			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back"],
+			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back", "Back"],
 			"Learning history": ["Early-prediction coverage", "Back"],
 			"Multi-step search": ["Back"],
-			"Prediction sources": ["Model Drafter", "Actor probe", "Back"],
+			"Prediction sources": ["Model Drafter", "Actor probe", "Learned patterns", "Back"],
+			"Learned patterns": ["Enabled", "Predict follow-up tool steps", "Advanced settings", "Back"],
 			"Model Drafter": ["Advanced settings", "Back"],
 			"Model Drafter advanced": ["Maximum output tokens", "Follow-up tool steps", "Back"],
 			"Actor probe": ["Minimum tool-name confidence", "Back"],
@@ -378,7 +379,8 @@ describe("zero-modification Pi extension", () => {
 				"Minimum tool-name confidence": "0.75",
 				"Early-prediction coverage (0-1)": "0.8",
 			} as Readonly<Record<string, string>>)[title];
-		fixture.ui.confirm = async (title) => title === "Clear reusable command history?";
+		let clearConfirmations = 0;
+		fixture.ui.confirm = async (title) => title === "Clear reusable command history?" && ++clearConfirmations === 2;
 
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
@@ -393,8 +395,10 @@ describe("zero-modification Pi extension", () => {
 				forkTransport: "sidecar",
 				forkActionMinConfidence: 0.75,
 			},
-			patternAware: { futureGapCoverage: 0.8 },
+			patternAware: { futureGapCoverage: 0.8, enabled: false, multiStepEnabled: false },
 		});
+		expect(clearConfirmations).toBe(2);
+		expect(menus.get("Learned-pattern advanced")?.some((label) => label.startsWith("Multi-step search"))).toBe(false);
 		expect(fixture.store.effective()).not.toHaveProperty("drafterMaxTokens");
 		expect(menus.get("Model Drafter")).toEqual(expect.arrayContaining([
 			"Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2",

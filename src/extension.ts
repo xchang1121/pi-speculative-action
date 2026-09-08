@@ -982,52 +982,39 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	}
 }
 
-async function openPredictionSources(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
+function openPredictionSources(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Prediction sources", () => {
 		const settings = controller.settings();
-		const choice = await ctx.ui.select("Prediction sources", [
-			`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`,
-			`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`,
-			`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`,
-			BACK,
+		return new Map<string, MenuAction>([
+			[`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`, () => openDrafterSettings(ctx, controller)],
+			[`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`, () => openActorForkSettings(ctx, controller)],
+			[`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`, () => openPatternAwareSettings(ctx, controller)],
 		]);
-		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Model Drafter")) await openDrafterSettings(ctx, controller);
-		if (choice.startsWith("Actor probe")) await openActorForkSettings(ctx, controller);
-		if (choice.startsWith("Learned patterns")) await openPatternAwareSettings(ctx, controller);
-	}
+	});
 }
 
 function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	return runActionMenuLoop(ctx, "Advanced settings", () => {
 		const settings = controller.settings();
 		return new Map<string, MenuAction>([
-			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterAdvancedSettings(ctx, controller)],
+			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterSettings(ctx, controller, true)],
 			[`Actor probe and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
-			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAdvancedSettings(ctx, controller)],
+			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAwareSettings(ctx, controller, "advanced")],
 			[`Scheduling and storage › ${settings.maxConcurrentActions} simultaneous tools`, () => openSchedulingAndCache(ctx, controller)],
 		]);
 	});
 }
 
-function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runActionMenuLoop(ctx, "Model Drafter", () => {
+function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController, advanced = false): Promise<void> {
+	return runActionMenuLoop(ctx, advanced ? "Model Drafter advanced" : "Model Drafter", () => {
 		const settings = controller.settings();
 		const edit = (field: RootInputField) => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
-		return new Map<string, MenuAction>([
+		return new Map<string, MenuAction>(!advanced ? [
 			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
 			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
 			[`Candidate requests per decision: ${settings.candidateLimit}`, () => edit("candidateLimit")],
-			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterAdvancedSettings(ctx, controller)],
-		]);
-	});
-}
-
-function openDrafterAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runActionMenuLoop(ctx, "Model Drafter advanced", () => {
-		const settings = controller.settings();
-		const edit = (field: RootInputField) => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
-		return new Map<string, MenuAction>([
+			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
+		] : [
 			[`Pause when measured cost exceeds benefit: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
 			[`Follow-up tool steps: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
 			[`Maximum output tokens: ${settings.drafterMaxTokens ?? "Provider default"}`, () => edit("drafterMaxTokens")],
@@ -1108,60 +1095,47 @@ function openActorForkSettings(
 	});
 }
 
-function openPatternAwareSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runActionMenuLoop(ctx, "Learned patterns", () => {
-		const settings = controller.settings();
-		const pattern = settings.patternAware;
-		return new Map<string, MenuAction>([
-			[`Enabled: ${pattern.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, enabled: !pattern.enabled } })],
-			[`Predict follow-up tool steps: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
-			[`Advanced settings › history, confidence, search limits`, () => openPatternAdvancedSettings(ctx, controller)],
-		]);
-	});
-}
-
-function openPatternAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	return runActionMenuLoop(ctx, "Learned-pattern advanced", () => {
-		const pattern = controller.settings().patternAware;
-		const actions = new Map<string, MenuAction>([
-			[`Learning history › ${pattern.maxContextLength} previous actions`, () => openPatternAdvancedGroup(ctx, controller, "learning")],
-		]);
-		if (pattern.multiStepEnabled)
-			actions.set(`Multi-step search › ${pattern.beamWidth} alternatives/tool, ${pattern.maxPredictionDepth} steps`, () => openPatternAdvancedGroup(ctx, controller, "multiStep"));
-		return actions;
-	});
-}
-
-async function openPatternAdvancedGroup(
+function openPatternAwareSettings(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
-	group: "learning" | "multiStep",
+	menu: "basic" | "advanced" | "learning" | "multiStep" = "basic",
 ): Promise<void> {
-	return runActionMenuLoop(ctx, group === "learning" ? "Learning history" : "Multi-step search", () => {
+	const title = { basic: "Learned patterns", advanced: "Learned-pattern advanced", learning: "Learning history", multiStep: "Multi-step search" }[menu];
+	return runActionMenuLoop(ctx, title, () => {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
 		const edit = (field: PatternInputField) => editSetting(ctx, pattern, field, PATTERN_SETTING_INPUTS,
 			(patternAware) => controller.setSettings({ ...settings, patternAware }));
-		const actions = group === "learning"
-			? new Map<string, () => Promise<void>>([
-				[`Previous actions used as context: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
-				[`Maximum skipped Actor decisions: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
-				[`Early-prediction coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
-				[`History half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
-				[`Uses before learning a pattern: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
-				[`Stored pattern limit: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
-			])
-			: new Map<string, () => Promise<void>>([
-				[`Alternatives retained per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
-				[`Maximum predicted tool steps: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
-				[`Minimum argument-replay confidence: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
+		if (menu === "basic") return new Map<string, MenuAction>([
+			[`Enabled: ${pattern.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, enabled: !pattern.enabled } })],
+			[`Predict follow-up tool steps: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
+			[`Advanced settings › history, confidence, search limits`, () => openPatternAwareSettings(ctx, controller, "advanced")],
+		]);
+		if (menu === "advanced") {
+			const actions = new Map<string, MenuAction>([
+				[`Learning history › ${pattern.maxContextLength} previous actions`, () => openPatternAwareSettings(ctx, controller, "learning")],
 			]);
-		return actions;
+			if (pattern.multiStepEnabled)
+				actions.set(`Multi-step search › ${pattern.beamWidth} alternatives/tool, ${pattern.maxPredictionDepth} steps`, () => openPatternAwareSettings(ctx, controller, "multiStep"));
+			return actions;
+		}
+		return new Map<string, MenuAction>(menu === "learning" ? [
+			[`Previous actions used as context: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
+			[`Maximum skipped Actor decisions: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
+			[`Early-prediction coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
+			[`History half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
+			[`Uses before learning a pattern: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
+			[`Stored pattern limit: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
+		] : [
+			[`Alternatives retained per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
+			[`Maximum predicted tool steps: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
+			[`Minimum argument-replay confidence: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
+		]);
 	});
 }
 
-async function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
-	while (true) {
+function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Scheduling and storage", () => {
 		const settings = controller.settings();
 		const fields = new Map<string, RootInputField>([
 			[`Simultaneous speculative tools: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
@@ -1171,23 +1145,18 @@ async function openSchedulingAndCache(ctx: ExtensionContext, controller: Specula
 			[`Reusable command history entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
 			[`Reusable command history memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
 		]);
-		const reclaim = "Reclaim reusable command history";
-		const clear = "Clear reusable command history";
-		const choice = await ctx.ui.select("Scheduling and storage", [...fields.keys(), reclaim, clear, BACK]);
-		if (!choice || choice === BACK) return;
-		if (choice === clear && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) continue;
-		const operation = choice === reclaim ? "gc" : choice === clear ? "clear" : undefined;
-		if (operation) {
+		const actions = new Map<string, MenuAction>([...fields].map(([label, field]) =>
+			[label, () => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings)]));
+		for (const [label, operation] of [["Reclaim", "gc"], ["Clear", "clear"]] as const) actions.set(`${label} reusable command history`, async () => {
+			if (operation === "clear" && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) return;
 			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
 			ctx.ui.notify(
 				report?.text ?? "Reusable command history maintenance failed.",
 				report && !report.failed ? "info" : "warning",
 			);
-			continue;
-		}
-		const field = fields.get(choice);
-		if (field) await editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
-	}
+		});
+		return actions;
+	});
 }
 
 type MenuAction = () => void | Promise<void>;
@@ -1205,29 +1174,19 @@ async function runActionMenuLoop(
 	}
 }
 
-async function openToolsAndExecution(
+function openToolsAndExecution(
 	ctx: ExtensionContext,
 	editor: SpeculativeActionController,
 	controller: SpeculativeActionController,
 ): Promise<void> {
-	while (true) {
+	return runActionMenuLoop(ctx, "Tools & execution", () => {
 		const settings = editor.settings();
 		const policy = toolPolicyCounts(settings, controller.registeredTools());
-		const choice = await ctx.ui.select("Tools & execution", [
-			`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`,
-			"Execution routes",
-			BACK,
+		return new Map<string, MenuAction>([
+			[`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`, () => editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts())],
+			["Execution routes", () => openExecutionRoutes(ctx, editor, controller)],
 		]);
-		if (!choice || choice === BACK) return;
-		if (choice.startsWith("Tool policy"))
-			await editToolPolicy(
-				ctx,
-				editor,
-				controller.registeredTools(),
-				controller.toolConflicts(),
-			);
-		if (choice === "Execution routes") await openExecutionRoutes(ctx, editor, controller);
-	}
+	});
 }
 
 async function openExecutionRoutes(
@@ -1276,48 +1235,43 @@ async function openExecutionRoutes(
 	});
 }
 
-async function editToolPolicy(
+function editToolPolicy(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	registered: ReadonlySet<string>,
 	conflicts: ReadonlyMap<string, string>,
 ): Promise<void> {
-	while (true) {
+	return runActionMenuLoop(ctx, "Tool policy · [x] prediction on · [ ] prediction off", () => {
 		const settings = controller.settings();
 		const capabilities = controller.toolCapabilities();
 		const tools = [...new Set([...KEYABLE_TOOLS, ...settings.tools, ...registered])].sort(
 			(left, right) => toolCategory(left) - toolCategory(right) || left.localeCompare(right),
 		);
-		const labels = new Map<string, string>();
-		for (const tool of tools) {
+		return new Map<string, MenuAction>(tools.map((tool) => {
 			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
 			const selected = supported && settings.tools.includes(tool);
 			const capability = capabilities.get(tool);
 			const staged = capability ? { ...capability, predict: selected ? "on" as const : "off" as const } : undefined;
-			labels.set(`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, tool);
-		}
-		const choice = await ctx.ui.select("Tool policy · [x] prediction on · [ ] prediction off", [...labels.keys(), BACK]);
-		if (!choice || choice === BACK) return;
-		const tool = labels.get(choice);
-		if (!tool) continue;
-		if (!(KEYABLE_TOOLS as readonly string[]).includes(tool)) {
-			ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning");
-			continue;
-		}
-		const selected = settings.tools.includes(tool);
-		if (!selected && !registered.has(tool)) {
-			const conflict = conflicts.get(tool);
-			ctx.ui.notify(
-				conflict
-					? `${tool} is provided by ${conflict}. Custom tool overrides remain authoritative and are excluded from speculation.`
-					: `${tool} is not registered in the current Pi session.`,
-				"warning",
-			);
-			continue;
-		}
-		const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
-		await controller.setSettings({ ...settings, tools: next });
-	}
+			return [`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, async () => {
+				if (!supported) {
+					ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning");
+					return;
+				}
+				if (!selected && !registered.has(tool)) {
+					const conflict = conflicts.get(tool);
+					ctx.ui.notify(
+						conflict
+							? `${tool} is provided by ${conflict}. Custom tool overrides remain authoritative and are excluded from speculation.`
+							: `${tool} is not registered in the current Pi session.`,
+						"warning",
+					);
+					return;
+				}
+				const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
+				await controller.setSettings({ ...settings, tools: next });
+			}];
+		}));
+	});
 }
 
 function updateSelfSpeculation(
