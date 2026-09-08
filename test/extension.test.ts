@@ -176,7 +176,7 @@ describe("zero-modification Pi extension", () => {
 			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
 			const dispose = vi.fn(async () => {});
 			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 } },
-				pool: { request: authoritative, dispose }, invocations: new Map(piTools.PI_CLOSED_SEARCH_TOOLS.map((tool) => [tool, {
+				pool: { run: authoritative, dispose }, invocations: new Map(piTools.PI_CLOSED_SEARCH_TOOLS.map((tool) => [tool, {
 					executor: "test-search", authoritative, filesystem: authoritative,
 					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
 				}])) });

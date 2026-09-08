@@ -14,7 +14,7 @@ import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolveHostExecutable } from "../src/executable-path.ts";
 import { relativeFilesystemPath } from "../src/path-utils.ts";
-import { launchClosedSearchWorker } from "../src/closed-search-process.mjs";
+import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../src/closed-search-process.mjs";
 
 // Qualification only: complete stock-Pi grep on private, token-owned inputs.
 // Stock Pi runs in a bounded process; the parent owns rg, its output and completion.
@@ -28,7 +28,7 @@ const costOnly = process.argv.includes("--cost-only");
 assert.ok(!costOnly || !semanticOnly, "choose either semantic or cost qualification");
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
-let worker, actorWorker, ownedRg, engine;
+let pool, ownedRg, engine;
 let nativeProcesses = 0, nativeClosed = 0, nativeCancels = 0;
 const configuredAtStart = process.env.RIPGREP_CONFIG_PATH;
 const nativeFlags = ["--no-config", "--sort=path", "--no-ignore-global", "--no-ignore-parent"];
@@ -46,10 +46,9 @@ try {
   engine = Object.freeze({ sha256: binary.hash, platform: process.platform, arch: process.arch, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
   ownedRg = path.join(root, process.platform === "win32" ? "rg-owned.exe" : "rg-owned");
   await fs.writeFile(ownedRg, binary.content, { flag: "wx", mode: 0o500 });
-  worker = launchClosedSearchWorker(new URL("./grep-process-worker.mjs", import.meta.url));
-  const { preparationMs: workerPreparationMs } = await worker.ready;
-  actorWorker = launchClosedSearchWorker(new URL("./grep-process-worker.mjs", import.meta.url));
-  await actorWorker.ready;
+  pool = new ClosedSearchProcessPool(new URL("./grep-process-worker.mjs", import.meta.url));
+  const { preparationMs: workerPreparationMs } = await pool.run("producer", (worker) => worker.ready);
+  await pool.run("actor", (worker) => worker.ready);
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
   if (semanticOnly) {
     process.env.RIPGREP_CONFIG_PATH = configuration;
@@ -92,8 +91,7 @@ try {
     qualification: "Explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Cost mode primes the same Host with original Actor service before probing measured admission; fallback is a valid outcome, not a hit. Not native-default equivalence or production admission." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
-  await worker?.dispose();
-  await actorWorker?.dispose();
+  await pool?.dispose();
   assert.equal(path.dirname(root), path.resolve(os.tmpdir())); assert.ok(path.basename(root).startsWith("pi-grep-evidence-"));
   await fs.rm(root, { recursive: true, force: true });
 }
@@ -101,29 +99,29 @@ try {
 async function qualifyCaptured(cwd, args, expected, changed, rejected = false, stableChange = false) {
   const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set(), trials = [];
   let started, executions = 0, copies = 0, actorCalls = 0, drafterEnabled = !costOnly, settled;
-  const execute = async (view, request) => {
+  const execute = (view, request) => pool.run("producer", async (worker, signal) => {
     executions++;
     const privateRoot = await fs.mkdtemp(path.join(root, "retained-"));
     try {
       const relative = relativeFilesystemPath(cwd, resolveToCwd(request.args.path || ".", cwd));
       assert.notEqual(relative, undefined, "captured query must remain in its workspace");
       const query = { ...request.args, path: relative || "." };
-      const prepared = await materializeSelected(view, cwd, privateRoot, query, request.signal, reads, enumerated); copies += prepared.files;
-      request.signal.throwIfAborted();
-      return await worker.request({ root: prepared.cwd, args: prepared.args }, { signal: request.signal,
+      const prepared = await materializeSelected(view, cwd, privateRoot, query, signal, reads, enumerated); copies += prepared.files;
+      signal.throwIfAborted();
+      return await worker.request({ root: prepared.cwd, args: prepared.args }, { signal,
         onInput: (operation, invocation, signal, emit) => runNative(operation, { ...invocation, cwd: prepared.cwd }, signal, emit) });
     } finally {
       assert.equal(path.dirname(privateRoot), root); assert.ok(path.basename(privateRoot).startsWith("retained-"));
       await fs.rm(privateRoot, { recursive: true, force: true });
     }
-  };
+  }, request.signal);
   const invocation = { executor: "captured-grep-qualification", filesystemRoot: path.parse(cwd).root, identity: { engine, cwd, filesystemRoot: path.parse(cwd).root },
     semantics: { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: "captured-grep-qualification.v3", effect: "observation",
       requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" },
     filesystem: execute, authoritative: (request) => {
       actorCalls++;
-      return actorWorker.request({ root: cwd, args: request.args }, { signal: request.signal,
-        onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd }, signal, emit) });
+      return pool.run("actor", (worker, signal) => worker.request({ root: cwd, args: request.args }, { signal,
+        onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd }, signal, emit) }), request.signal);
     } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
@@ -484,10 +482,9 @@ async function qualifyNamespace() {
     ["explicit-git-directory", { path: ".git", pattern: "ref:" }],
   ]) {
     if (selectedCases.size && !selectedCases.has(label)) continue;
-    const reference = async () => (await actorWorker.request({ root: workspace, args }, {
-      signal: new AbortController().signal,
+    const reference = async () => (await pool.run("actor", (worker, signal) => worker.request({ root: workspace, args }, { signal,
       onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd: workspace }, signal, emit),
-    })).result;
+    }))).result;
     const expected = await reference().catch((error) => { if (!rejected) throw error; return error; });
     if (label === "limit") assert.equal(expected.details?.matchLimitReached, 1);
     if (label.startsWith("parent-config") || configurationCases.some(([name]) => name === label)) {

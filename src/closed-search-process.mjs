@@ -3,23 +3,29 @@ import { fork } from "node:child_process";
 import { serialize } from "node:v8";
 import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 
-/** Reuse execution capacity, never results. Busy producers and Actors own independent reservations. */
+/** Reuse capacity, never results. Each lease owns preparation, worker inputs and final cleanup. */
 export class ClosedSearchProcessPool {
-	#workers = new Map(); #idle = new Map(); #retirement;
-	async request(role, input, options = {}) {
+	#workers = new Map(); #idle = new Map(); #retirement; #entry;
+	constructor(entry) { this.#entry = entry; }
+	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
-		options.signal?.throwIfAborted();
-		const worker = this.#idle.get(role) ?? launchClosedSearchWorker();
+		signal?.throwIfAborted();
+		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(this.#entry), controller = new AbortController();
+		const executionSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 		this.#idle.delete(role);
 		if (!this.#workers.has(worker)) void worker.closure.then(() => {
-			this.#workers.delete(worker); if (this.#idle.get(role) === worker) this.#idle.delete(role);
+			if (!this.#workers.get(worker)?.execution) this.#workers.delete(worker);
+			if (this.#idle.get(role) === worker) this.#idle.delete(role);
 		});
-		const execution = worker.request(input, options), lease = { role, execution };
+		const execution = Promise.resolve().then(() => { executionSignal.throwIfAborted(); return operation(worker, executionSignal); });
+		const lease = { role, execution, controller };
 		this.#workers.set(worker, lease);
-		try { return await execution; }
+		try { const output = await execution; executionSignal.throwIfAborted(); return output; }
 		finally {
 			lease.execution = undefined;
-			if (this.#retirement || worker.closed() || this.#idle.has(role)) await worker.dispose();
+			if (this.#retirement || executionSignal.aborted || worker.closed() || this.#idle.has(role)) {
+				await worker.dispose(); this.#workers.delete(worker);
+			}
 			else this.#idle.set(role, worker);
 		}
 	}
@@ -27,7 +33,8 @@ export class ClosedSearchProcessPool {
 		if (this.#retirement) return this.#retirement;
 		this.#idle.clear();
 		return this.#retirement = Promise.all([...this.#workers].map(async ([worker, lease]) => {
-			if (lease.role === "actor") await lease.execution?.catch(() => {});
+			if (lease.role === "producer") { lease.controller.abort(new Error("worker disposed")); await worker.dispose(); }
+			await lease.execution?.catch(() => {});
 			await worker.dispose();
 		})).then(() => {});
 	}

@@ -121,21 +121,24 @@ export async function createClosedSearchProfile(cwd: string) {
 	await loadSearchEngines();
 	const { ClosedSearchProcessPool } = await import(new URL("./closed-search-process.mjs", import.meta.url).href);
 	const pool = new ClosedSearchProcessPool() as {
-		request(role: "actor" | "producer", input: unknown, options: { signal?: AbortSignal; onInput: (operation: string, target: string) => Promise<unknown> }): Promise<ToolSettlement>;
+		run(role: "actor" | "producer", operation: (worker: {
+			request(input: unknown, options?: { signal?: AbortSignal; onInput: (operation: string, target: string) => Promise<unknown> }): Promise<ToolSettlement>;
+			dispose(): Promise<void>;
+		}, signal: AbortSignal) => Promise<ToolSettlement>, signal?: AbortSignal): Promise<ToolSettlement>;
 		dispose(): Promise<void>;
 	};
 	const invocations = new Map<string, ToolInvocation>();
 	for (const tool of PI_CLOSED_SEARCH_TOOLS) {
-		const execute = async (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => {
+		const execute = (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => pool.run(view ? "producer" : "actor", async (worker, signal) => {
 			const capture = view ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
 			try {
 				const input = view ?? capture?.view;
 				if (!input) throw new Error("closed search input capture unavailable");
-				return await pool.request(view ? "producer" : "actor", { kind: tool, root: cwd, args: request.args }, {
-					signal: request.signal, onInput: (operation, target) => readClosedSearchInput(input, cwd, operation, target, profile.limits.inputBytes),
+				return await worker.request({ kind: tool, root: cwd, args: request.args }, {
+					signal, onInput: (operation, target) => readClosedSearchInput(input, cwd, operation, target, profile.limits.inputBytes),
 				});
 			} finally { capture?.release(); }
-		};
+		}, request.signal);
 		invocations.set(tool, Object.freeze({
 			executor: profile.id, identity: Object.freeze({ profile, cwd }),
 			semantics: Object.freeze({ ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: profile.id,

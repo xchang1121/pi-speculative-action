@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Search pool `run(role, operation, signal)` replaces request forwarding: the lease now owns input
+  preparation and final cleanup as well as the worker. Retirement cancels producers, drains Actors,
+  and retains outstanding cleanup even after a worker has physically closed.
 - Captured-input profiles declare `resourceScope: "captured_inputs"`, which never certifies an ambient
   Actor execution window. Read the scope from the definition; removed the unused registry forwarding method.
 - Transaction attempts expose only an immutable descriptor and lifecycle view; route and validation

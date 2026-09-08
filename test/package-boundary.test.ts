@@ -82,14 +82,35 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 			expect(loaded.errors).toEqual([]);
 			expect(loaded.extensions).toHaveLength(1);
 			await fs.writeFile(path.join(cwd, "notes.txt"), "captured");
-			const { pool, invocations } = await createClosedSearchProfile(cwd);
-			try {
-				const find = invocations.get("find")!;
-				const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
-				expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
-				expect(invocations.has("grep")).toBe(false);
-				expect(await fs.readdir(agentDir)).toEqual([]);
-			} finally { await pool.dispose(); }
+			for (const phase of ["preparation", "cleanup"]) {
+				const { pool, invocations } = await createClosedSearchProfile(cwd);
+				let reached!: () => void, resume!: () => void;
+				const started = new Promise<void>((resolve) => { reached = resolve; }), paused = new Promise<void>((resolve) => { resume = resolve; });
+				try {
+					const find = invocations.get("find")!;
+					const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
+					expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
+					expect(invocations.has("grep")).toBe(false);
+					expect(await fs.readdir(agentDir)).toEqual([]);
+					let entered = 0, retired = false;
+					const executions = Promise.allSettled((["actor", "producer"] as const).map((role) => pool.run(role, async (worker, signal) => {
+						if (phase === "cleanup") await worker.dispose(); // A closed worker must not erase its still-active cleanup owner.
+						if (++entered === 2) reached();
+						await paused; signal.throwIfAborted();
+						return { result: { content: [], details: undefined }, isError: false };
+					})));
+					await Promise.race([started, executions]); expect(entered).toBe(2);
+					const retirement = pool.dispose(); expect(pool.dispose()).toBe(retirement);
+					void retirement.then(() => { retired = true; });
+					await new Promise<void>((resolve) => setImmediate(resolve)); expect(retired, phase).toBe(false);
+					resume();
+					const results = await executions;
+					expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
+					expect(results[1]).toMatchObject({ reason: new Error("worker disposed") });
+					await retirement;
+					await expect(pool.run("actor", async () => { throw new Error("unexpected admission"); })).rejects.toThrow("search pool retired");
+				} finally { resume(); await pool.dispose(); }
+			}
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
 		}

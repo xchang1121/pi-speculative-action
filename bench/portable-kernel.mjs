@@ -63,7 +63,7 @@ async function qualifyPiSearch(name) {
 	const { pool, profile, invocations } = await createClosedSearchProfile(root), bound = invocations.get(name);
 	const counts = { producer: 0, actor: 0 }, reads = new Set();
 	let inputRequests = 0, inputBytes = 0;
-	const execute = async (role, source, request, checkpoint) => {
+	const execute = (role, source, request, checkpoint) => pool.run(role, async (worker, signal) => {
 		counts[role]++;
 		let checkpointReached = false;
 		const inputs = source === fs ? await captureResourceVersion(undefined, root, semantics, profile.limits.inputBytes) : undefined;
@@ -73,8 +73,8 @@ async function qualifyPiSearch(name) {
 				reads.add(path.posix.join("/workspace", path.relative(root, target).split(path.sep).join("/")));
 				return view.readFile(target, ...options);
 			} };
-			const output = await pool.request(role, { kind: name, root, args: request.args },
-				{ signal: request.signal, onInput: async (operation, target) => {
+			const output = await worker.request({ kind: name, root, args: request.args },
+				{ signal, onInput: async (operation, target) => {
 					inputRequests++;
 					const value = await readClosedSearchInput(observed, root, operation, target, profile.limits.inputBytes);
 					inputBytes += serialize(value).byteLength;
@@ -85,7 +85,7 @@ async function qualifyPiSearch(name) {
 				} });
 			return { result: output.result, isError: output.isError };
 		} finally { inputs?.release(); }
-	};
+	}, request.signal);
 	const tool = createFindToolDefinition(root), write = createWriteTool(root), tools = [tool, write];
 	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
@@ -135,7 +135,7 @@ async function qualifyPiSearch(name) {
 		};
 	}
 	try {
-		await assert.rejects(pool.request("actor", { kind: "kernel", commands: [] }), /closed search operation denied/);
+		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: "kernel", commands: [] })), /closed search operation denied/);
 		await fs.mkdir(path.join(root, ".git")); await fs.mkdir(searchRoot); await fs.mkdir(path.join(searchRoot, "empty"));
 		await fs.writeFile(path.join(root, ".git/HEAD"), "ref: refs/heads/main\n");
 		await fs.writeFile(path.join(root, ".gitignore"), "ignored.*\n");
@@ -192,9 +192,9 @@ async function qualifyPiSearch(name) {
 		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
 		assert.ok(!reads.has("/workspace/search/ignored.bin") && !reads.has("/workspace/search/ignored.txt"), "the broker transferred ignored content");
-		await assert.rejects(pool.request("actor", { kind: name, root, args }, {
+		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
-		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
+		})), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
 		if (process.platform === "win32") for (const cwd of [root.replace(/^[a-z]:/iu, (drive) => drive.toLowerCase()), root.replaceAll("\\", "/")]) {
 			const { pool: aliasPool, invocations } = await createClosedSearchProfile(cwd);
@@ -284,7 +284,7 @@ async function qualifyPiSearch(name) {
 			const retiring = pool.dispose(); assert.equal(pool.dispose(), retiring);
 			assert.equal(await Promise.race([retiring, Promise.resolve("pending")]), "pending", "retirement must drain admitted Actors");
 			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await Promise.all([retiring, rejected]);
-			await assert.rejects(pool.request("actor", { kind: name, root, args }), /search pool retired/);
+			await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, args })), /search pool retired/);
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
 		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, behaviors, rejectedEscapingLinks: true,
 			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable", inputTransport, speculativeMs: completed.executionMs,
