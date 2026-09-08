@@ -5,6 +5,7 @@ import type {
 	SourceRequestSettlement,
 } from "./settlement.ts";
 import { cause } from "./settlement.ts";
+import { waitForCandidate } from "./scheduler.ts";
 
 export interface SourceRequestResult<Value> extends SettledSourceRequest {
 	readonly value?: Value;
@@ -58,56 +59,38 @@ export async function runSourceRequest<Value>(input: {
 	if (!input.generation.active) {
 		return result(input.request, startedAt, {
 			status: "aborted",
-			cause: asSourceCause(input.generation.expiration, "generation_expired"),
+			cause: cause("source", input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail),
 		});
 	}
 
 	const controller = new AbortController();
 	const abortFromGeneration = () => controller.abort(input.generation.expiration);
 	input.generation.signal.addEventListener("abort", abortFromGeneration, { once: true });
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	let cancelFromGeneration: (() => void) | undefined;
 	const producer = Promise.resolve()
 		.then(() => input.produce(controller.signal))
 		.then(
 			(value) => ({ kind: "produced" as const, value }),
 			(error) => ({ kind: "error" as const, error }),
 		);
-	const cancellation = new Promise<
-		{ readonly kind: "timeout" } | { readonly kind: "aborted"; readonly expiration?: ResolutionCause }
-	>((resolve) => {
-		const duration = finiteTimeout(input.timeoutMs);
-		if (duration !== undefined) {
-			timeout = setTimeout(() => {
-				controller.abort(cause("source", "timeout"));
-				resolve({ kind: "timeout" });
-			}, duration);
-		}
-		cancelFromGeneration = () => resolve({ kind: "aborted", expiration: input.generation.expiration });
-		input.generation.signal.addEventListener("abort", cancelFromGeneration, { once: true });
-	});
 
 	try {
-		const outcome = await Promise.race([producer, cancellation]);
-		if (outcome.kind === "timeout") {
-			return result(input.request, startedAt, {
-				status: "timeout",
-				cause: sourceCause("timeout"),
-			});
+		const waited = await waitForCandidate(producer, input.generation.signal, finiteTimeout(input.timeoutMs));
+		if (waited.status === "deadline") {
+			const expiration = cause("source", "timeout");
+			controller.abort(expiration);
+			return result(input.request, startedAt, { status: "timeout", cause: expiration });
 		}
-		if (outcome.kind === "aborted" || !input.generation.active) {
+		if (waited.status === "aborted" || !input.generation.active) {
 			return result(input.request, startedAt, {
 				status: "aborted",
-				cause: asSourceCause(
-					outcome.kind === "aborted" ? outcome.expiration : input.generation.expiration,
-					"generation_expired",
-				),
+				cause: cause("source", input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail),
 			});
 		}
+		const outcome = waited.value;
 		if (outcome.kind === "error") {
 			return result(input.request, startedAt, {
 				status: "error",
-				cause: sourceCause("producer_error", errorDetail(outcome.error)),
+				cause: cause("source", "producer_error", errorDetail(outcome.error)),
 			});
 		}
 		let proposalCount: number;
@@ -116,7 +99,7 @@ export async function runSourceRequest<Value>(input: {
 		} catch (error) {
 			return result(input.request, startedAt, {
 				status: "error",
-				cause: sourceCause("result_error", errorDetail(error)),
+				cause: cause("source", "result_error", errorDetail(error)),
 			});
 		}
 		return {
@@ -128,9 +111,7 @@ export async function runSourceRequest<Value>(input: {
 			value: outcome.value,
 		};
 	} finally {
-		if (timeout) clearTimeout(timeout);
 		input.generation.signal.removeEventListener("abort", abortFromGeneration);
-		if (cancelFromGeneration) input.generation.signal.removeEventListener("abort", cancelFromGeneration);
 	}
 }
 
@@ -145,17 +126,6 @@ function result(
 		durationMs: Math.max(0, performance.now() - startedAt),
 		settlement: Object.freeze(settlement),
 	});
-}
-
-function asSourceCause(
-	value: ResolutionCause | undefined,
-	fallback: string,
-): ResolutionCause & { readonly stage: "source" } {
-	return sourceCause(value?.code ?? fallback, value?.detail);
-}
-
-function sourceCause(code: string, detail?: string): ResolutionCause & { readonly stage: "source" } {
-	return cause("source", code, detail);
 }
 
 function finiteTimeout(value: number | undefined): number | undefined {

@@ -93,7 +93,7 @@ export type CandidateWaitResult<T> =
 	| { readonly status: "aborted" }
 	| { readonly status: "deadline" };
 
-/** One cancellation/deadline boundary shared by every in-flight adoption path. */
+/** Owns cancellation/deadline settlement for producer requests and in-flight adoption. */
 export async function waitForCandidate<T>(
 	promise: Promise<T>,
 	signal?: AbortSignal,
