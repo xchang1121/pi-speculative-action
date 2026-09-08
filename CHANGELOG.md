@@ -41,8 +41,9 @@
 - Consolidated authoritative execution and observation into the gateway's single frozen settlement;
   observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
 - Captured find uses Pi's installed matching/ignore components; the experimental search installer and its dependencies were removed.
-- Added the fixed-search IPC entry and shared synchronous input mailbox. Full-tool qualification uses
-  that entry for Actor searches; importing it is inert, and arbitrary qualification commands are denied.
+- Fixed-search execution uses one bounded process with asynchronous, invocation-owned input requests;
+  the old relay thread/shared-memory mailbox is removed. Full-tool qualification shares the production
+  protocol; imports are inert, and arbitrary qualification commands are denied by the production kernel.
 - Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
   implementation used by qualification. Native Actor defaults are unchanged; production worker
   pooling and TUI profile selection remain pending.

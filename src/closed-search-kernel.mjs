@@ -4,7 +4,6 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serialize } from "node:v8";
-import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMessageOnPort } from "node:worker_threads";
 
 // Explicit shared Actor/producer semantics, NOT equivalence with ambient native fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
@@ -17,61 +16,44 @@ export const CLOSED_SEARCH_PROFILE = Object.freeze({
 });
 let owned = false;
 
-/** Relay synchronous engine reads outside its blocked worker, retaining hard process cancellation. */
-export function connectClosedSearchWorker(entry) {
-	if (isMainThread) {
-		assert.ok(process.send && process.execArgv.includes("--max-old-space-size=128"), "Search requires a bounded child process");
-		const control = new Int32Array(new SharedArrayBuffer(4)), { port1, port2 } = new MessageChannel();
-		const guest = new Worker(new URL(entry), { workerData: { control, inputPort: port2 }, transferList: [port2] });
-		let pending;
-		guest.on("message", (message) => {
-			assert.ok(serialize(message).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "worker frame budget");
-			if (message.type === "input") { assert.ok(!pending, "overlapping input requests"); pending = message; }
-			process.send(message, (error) => { if (error) throw error; });
-		});
-		process.on("message", (message) => {
-			assert.ok(serialize(message).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "host frame budget");
-			if (message.type !== "input") { guest.postMessage(message); return; }
-			assert.ok(pending && message.id === pending.id && message.sequence === pending.sequence, "unowned input response");
-			port1.postMessage(message); pending = undefined;
-			Atomics.store(control, 0, 1); Atomics.notify(control, 0);
-		});
-		process.once("disconnect", () => process.exit(1));
-		guest.on("error", (error) => { throw error; });
-		guest.on("exit", (code) => process.exit(code));
-		return;
-	}
-	let sequence = 0;
-	return (id, operation, target) => {
-		const expected = ++sequence;
-		Atomics.store(workerData.control, 0, 0);
-		parentPort.postMessage({ type: "input", id, sequence: expected, operation, target });
-		while (Atomics.load(workerData.control, 0) === 0) Atomics.wait(workerData.control, 0, 0);
-		const response = receiveMessageOnPort(workerData.inputPort)?.message;
-		assert.ok(response?.id === id && response.sequence === expected, "unowned input frame");
-		if (response.error) throw Object.assign(new Error(response.error), { code: response.code });
-		return response.value;
+/** One bounded process owns invocation and asynchronous input correspondence; no synchronous relay thread. */
+export function serveClosedSearchWorker(execute) {
+	assert.ok(process.send && process.execArgv.includes("--max-old-space-size=128"), "Search requires a bounded child process");
+	let active, pending, sequence = 0;
+	const send = (message) => {
+		assert.ok(serialize(message).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "worker frame budget");
+		process.send(message, (error) => { if (error) throw error; });
 	};
+	process.once("disconnect", () => process.exit(1));
+	process.on("message", async ({ type, id, input, ...response }) => {
+		assert.ok(serialize({ type, id, input, ...response }).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "host frame budget");
+		if (type === "input") {
+			assert.ok(pending && id === active && response.sequence === pending.sequence, "unowned input response");
+			const request = pending; pending = undefined;
+			if (Object.hasOwn(response, "error")) request.reject(Object.assign(new Error(response.error), { code: response.code }));
+			else request.resolve(response.value);
+			return;
+		}
+		assert.ok(active === undefined && type === "request" && Number.isSafeInteger(id) && id > 0, "unowned search invocation");
+		active = id;
+		try {
+			send({ type: "started", id });
+			const result = await execute(input, (operation, target) => new Promise((resolve, reject) => {
+				assert.ok(active === id && !pending, "unowned input request");
+				pending = { sequence: ++sequence, resolve, reject };
+				send({ type: "input", id, sequence, operation, target });
+			}));
+			assert.ok(!pending && serialize(result).byteLength <= CLOSED_SEARCH_PROFILE.limits.resultBytes, "result frame budget or pending input");
+			send({ type: "result", id, result });
+		} catch (error) { send({ type: "result", id, error: String(error?.message ?? error).slice(0, 8192) }); }
+		finally { active = undefined; }
+	});
+	send({ type: "ready", profile: CLOSED_SEARCH_PROFILE });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-	const readInput = connectClosedSearchWorker(import.meta.url);
-	if (readInput) {
-		const kernel = await createClosedSearchKernel();
-		let active = false;
-		parentPort.on("message", async ({ type, id, input }) => {
-			assert.ok(!active && type === "request" && Number.isSafeInteger(id) && id > 0, "unowned search invocation");
-			active = true;
-			try {
-				parentPort.postMessage({ type: "started", id });
-				const result = await kernel.execute(input.kind, input.root, input.args, (operation, target) => readInput(id, operation, target));
-				assert.ok(serialize(result).byteLength <= CLOSED_SEARCH_PROFILE.limits.resultBytes, "result frame budget");
-				parentPort.postMessage({ type: "result", id, result });
-			} catch (error) { parentPort.postMessage({ type: "result", id, error: String(error?.message ?? error).slice(0, 8192) }); }
-			finally { active = false; }
-		});
-		parentPort.postMessage({ type: "ready", profile: CLOSED_SEARCH_PROFILE });
-	}
+	const kernel = await createClosedSearchKernel();
+	serveClosedSearchWorker((input, readInput) => kernel.execute(input.kind, input.root, input.args, readInput));
 }
 
 /** Only Pi's installed dependencies: no CLI discovery, download, native child or regex reimplementation. */
@@ -85,20 +67,20 @@ export async function loadSearchEngines() {
 }
 
 export async function createClosedSearchKernel() {
-	assert.ok(!isMainThread && !owned, "Search kernels require their own worker lifetime");
+	assert.ok(process.send && process.execArgv.includes("--max-old-space-size=128") && !owned, "Search kernels require their own bounded process lifetime");
 	owned = true;
 	const { Minimatch, ignore } = await loadSearchEngines(), profile = CLOSED_SEARCH_PROFILE, namespace = path.posix;
 	const { createFindToolDefinition } = await import(new URL("./core/tools/find.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 	return { execute: async (kind, root, args, readInput) => {
 		assert.equal(kind, "find", "closed search operation denied");
 		const inputs = new Map(), rules = new Map(), decisions = new Map(); let failure;
-		const read = (operation, target) => {
+		const read = async (operation, target) => {
 			if (failure) throw failure;
 			const normalized = namespace.normalize(target), key = JSON.stringify([operation, normalized]);
 			if (!inputs.has(key)) {
 				try {
 					assert.ok(inputs.size < profile.limits.entries, "input entry budget");
-					inputs.set(key, { value: readInput(operation, normalized) });
+					inputs.set(key, { value: await readInput(operation, normalized) });
 				} catch (error) {
 					if (!["ENOENT", "ENOTDIR", "EISDIR"].includes(error.code)) failure = error;
 					inputs.set(key, { error });
@@ -106,21 +88,21 @@ export async function createClosedSearchKernel() {
 			}
 			const entry = inputs.get(key); if (entry.error) throw entry.error; return entry.value;
 		};
-		const layers = (directory) => {
+		const layers = async (directory) => {
 			if (!rules.has(directory)) {
-				const inherited = directory === "/workspace" ? [] : layers(namespace.dirname(directory));
+				const inherited = directory === "/workspace" ? [] : await layers(namespace.dirname(directory));
 				let text = "";
-				try { text = Buffer.from(read("readFile", namespace.join(directory, ".gitignore"))).toString("utf8"); }
+				try { text = Buffer.from(await read("readFile", namespace.join(directory, ".gitignore"))).toString("utf8"); }
 				catch (error) { if (error.code !== "ENOENT") throw error; }
 				rules.set(directory, [...inherited, { directory, matcher: ignore({ ignorecase: false }).add(text) }]);
 			}
 			return rules.get(directory);
 		};
-		const ignored = (target, directory) => {
+		const ignored = async (target, directory) => {
 			if (target === "/workspace") return false;
 			if (!decisions.has(target)) {
-				const parent = namespace.dirname(target); let excluded = ignored(parent, true);
-				if (!excluded) for (const layer of layers(parent)) {
+				const parent = namespace.dirname(target); let excluded = await ignored(parent, true);
+				if (!excluded) for (const layer of await layers(parent)) {
 					const relative = namespace.relative(layer.directory, target) + (directory ? "/" : "");
 					const match = layer.matcher.test(relative);
 					if (match.ignored || match.unignored) excluded = match.ignored;
@@ -130,21 +112,21 @@ export async function createClosedSearchKernel() {
 			return decisions.get(target);
 		};
 		const tool = createFindToolDefinition(root, { operations: {
-			exists: (target) => { try { read("stat", readInput("resolve", target)); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; } },
+			exists: async (target) => { try { await read("stat", await readInput("resolve", target)); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; } },
 			glob: async (pattern, cwd, options) => {
-				const base = readInput("resolve", cwd), matches = [], matcher = new Minimatch(pattern, profile.find);
+				const base = await readInput("resolve", cwd), matches = [], matcher = new Minimatch(pattern, profile.find);
 				const excluded = options.ignore.map((pattern) => new Minimatch(pattern, profile.find));
-				const walk = (target) => {
-					const { directory } = read("stat", target), relative = namespace.relative(base, target);
-					if (ignored(target, directory) || excluded.some((rule) => rule.match(target + (directory ? "/" : "")))) return;
+				const walk = async (target) => {
+					const { directory } = await read("stat", target), relative = namespace.relative(base, target);
+					if (await ignored(target, directory) || excluded.some((rule) => rule.match(target + (directory ? "/" : "")))) return;
 					const spellings = [relative, `./${relative}`, target];
 					if (relative && spellings.some((value) => matcher.match(value + (directory ? "/" : ""))))
 						matches.push(path.resolve(root, namespace.relative("/workspace", target)) + (directory ? path.sep : ""));
 					// The matcher owns grammar and prefix admission; input names never pass through an identity-folding filesystem cache.
 					if (directory && (!relative || matcher.globParts.some((parts) => parts.length === 1) || spellings.some((value) => matcher.match(value, true))))
-						for (const name of read("readdir", target)) walk(namespace.join(target, name));
+						for (const name of await read("readdir", target)) await walk(namespace.join(target, name));
 				};
-				walk(base);
+				await walk(base);
 				return matches.sort().slice(0, options.limit);
 			},
 		} });
