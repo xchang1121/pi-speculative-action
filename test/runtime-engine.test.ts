@@ -752,74 +752,53 @@ describe("structural speculative runtime", () => {
 		expect(fixture.runtime.inspect().pendingPredictions).toBe(0);
 	});
 
-	it("preempts only to start queued Actor work and joins running work at its existing capacity", async () => {
-		for (const mode of ["queued", "running"] as const) {
-			const executed: string[] = [];
-			const aborted: string[] = [];
-			const busyStarted = barrier();
-			const targetStarted = barrier();
-			const targetGate = barrier();
-			const source: Source = {
-				id: "source",
-				enabled: () => true,
-				propose: () => ({
-					id: `promotion-${mode}`,
-					source: "source",
-					revision: 0,
-					actions: [
-						{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" } },
-						{
-							id: "target",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "target.ts" },
-							resourceDemand: mode === "queued" ? 2 : 1,
-						},
-					],
-				}),
-			};
+	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
+		for (const mode of ["producer", "preview", "queued", "running"] as const) {
+			const executed: string[] = [], aborted: string[] = [];
+			const busyStarted = barrier(), stop = barrier(), stopped = barrier(), cleanup = barrier(), released = barrier();
+			const targetStarted = barrier(), targetGate = barrier(), targetQueued = barrier();
+			const original = SpeculationScheduler.prototype.admit;
+			const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
+				const result = original.call(this, job, forecasts, ...rest);
+				if (forecasts[0]?.actionKeyHash === buildPiActionKey("read", { path: "target.ts" }, "/workspace")!.hash) targetQueued.arrive();
+				return result;
+			});
+			const speculative = mode === "producer" || mode === "preview";
 			const fixture = harness({
-				source,
-				settings: () => ({ ...settings, maxConcurrentActions: mode === "queued" ? 1 : 2 }),
+				source: { id: "source", enabled: () => true, propose: () => [
+					{ id: "busy", source: "source", revision: 0, actions: [
+						{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" }, expectedLatencyBenefitMs: speculative ? 0 : 1 }] },
+					...(mode === "preview" ? [] : [{ id: "target", source: "source", revision: 0, actions: [
+						{ id: "target", type: "tool_call" as const, tool: "read", input: { path: "target.ts" }, resourceDemand: mode === "queued" ? 2 : 1 }] }]),
+				] },
+				settings: () => ({ ...settings, maxConcurrentActions: mode === "running" ? 2 : 1 }),
+				actionKey: async (tool, args) => { if ((args as { path: string }).path === "target.ts") await busyStarted.promise; return buildPiActionKey(tool, args, "/workspace"); },
 				execute: async (_tool, input, signal) => {
-					const path = String(input.path);
-					executed.push(path);
-					if (path === "target.ts") {
-						targetStarted.arrive();
-						await targetGate.promise;
-						return "target";
-					}
-					busyStarted.arrive();
-					return new Promise((_, reject) => {
-						signal.addEventListener(
-							"abort",
-							() => {
-								aborted.push(path);
-								reject(signal.reason);
-							},
-							{ once: true },
-						);
-					});
+					const path = String(input.path); executed.push(path);
+					if (path === "target.ts") { targetStarted.arrive(); await targetGate.promise; return "target"; }
+					signal.addEventListener("abort", () => { aborted.push(path); stop.arrive(); }, { once: true }); busyStarted.arrive();
+					await stop.promise; await stopped.promise;
+					return world("busy", { onDispose: async () => { cleanup.arrive(); await released.promise; } });
 				},
 			});
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-			await busyStarted.promise;
-			if (mode === "running") await targetStarted.promise;
-
-			const consumed = fixture.runtime.consume(call("turn", { path: "target.ts" }));
-			await targetStarted.promise;
-			targetGate.arrive();
-			expect(await consumed).toBe("target");
-			expect(executed).toEqual(["busy.ts", "target.ts"]);
-			expect(aborted).toEqual(mode === "queued" ? ["busy.ts"] : []);
-			const preemption = fixture.events.find(
-				(event) =>
-					event.type === "candidate" &&
-					event.state.status === "cancelled" &&
-					event.state.cause.code === "preempted_by_actor",
-			);
-			expect(preemption !== undefined).toBe(mode === "queued");
-			await fixture.runtime.settingsChanged({ ...settings, enabled: false });
+			try {
+				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await busyStarted.promise;
+				if (mode === "preview") await fixture.runtime.previewActorCall(call("turn", { path: "target.ts" }));
+				if (mode === "running") await targetStarted.promise;
+				if (mode === "queued") await targetQueued.promise;
+				if (speculative) {
+					await stop.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
+					stopped.arrive(); await cleanup.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
+					released.arrive(); await targetStarted.promise;
+				}
+				const consumed = fixture.runtime.consume(call("turn", { path: "target.ts" }));
+				await targetStarted.promise; targetGate.arrive();
+				expect(await consumed).toBe("target");
+				expect(executed).toEqual(["busy.ts", "target.ts"]);
+				expect(aborted).toEqual(mode === "running" ? [] : ["busy.ts"]);
+			} finally { stopped.arrive(); released.arrive(); targetGate.arrive(); await fixture.runtime.dispose(); admission.mockRestore(); }
 		}
 	});
 

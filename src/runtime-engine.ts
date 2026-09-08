@@ -1653,7 +1653,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (execution.status === "queued") startQueuedCandidates(session);
 	};
 
-	const startQueuedCandidates = (session: Session, preferred?: Candidate, authoritative = false): void => {
+	const startQueuedCandidates = (session: Session, preferred?: Candidate): void => {
 		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
 		const queued = runtimeState.candidates
 			.pending(session.id)
@@ -1680,12 +1680,14 @@ export function makeStructuralSpeculativeActionRuntime<
 				candidate,
 				forecastsForCandidate(session, candidate),
 				concurrentLimit(session.settings),
+				reservationAvailable(candidate.work.reservation) ? "producer" : "actor",
 			);
 			if (!admission.admitted && !candidate.background) {
 				for (const victim of session.scheduler.preemptFor(
 					admission.work.resource,
 					concurrentLimit(session.settings),
 					(victim) =>
+						victim.work.execution.status === "running" &&
 						reservationAvailable(victim.work.reservation) &&
 						(victim.background ||
 							candidate.expectedDecisionSeq < victim.expectedDecisionSeq ||
@@ -1700,7 +1702,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					concurrentLimit(session.settings),
 				);
 			}
-			if (!admission.admitted && !(authoritative && candidate === preferred)) continue;
+			if (!admission.admitted) continue;
 			const startedAt = performance.now();
 			if (!candidate.work.start(startedAt)) continue;
 			queueCandidateEvent(session, candidate);
@@ -1735,14 +1737,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
 			const completedAt = performance.now();
 			if (!candidate.work.succeed(branch, completedAt, completedAt - startedAt)) {
-				session.lifecycle.release(branch);
+				await session.lifecycle.release(branch);
 				return;
 			}
 			session.scheduler.observeSpeculativeService(
 				actionTimingIdentity(candidate.key),
 				completedAt - startedAt,
 			);
-			session.scheduler.complete(candidate);
 			runtimeState.candidates.settle(session.id, candidate);
 			queueCandidateContinuations(
 				session,
@@ -1756,9 +1757,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 			trimResults(session, candidate.owner.settings);
 			queueCandidateEvent(session, candidate);
-			dispatchReady(session);
 		} catch (error) {
-			if (candidate.work.execution.status !== "succeeded") session.lifecycle.release(branch);
+			if (candidate.work.execution.status !== "succeeded") await session.lifecycle.release(branch);
 			const failure =
 				error instanceof CandidateFailure
 					? error.failure
@@ -1769,9 +1769,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			const settled = candidate.work.controller.signal.aborted
 				? candidate.work.cancel(failure, completedAt, completedAt - startedAt)
 				: candidate.work.fail(failure, completedAt, completedAt - startedAt);
-			session.scheduler.complete(candidate);
 			removeCandidate(session, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
+		} finally {
+			session.scheduler.complete(candidate);
 			dispatchReady(session);
 		}
 	};
@@ -1850,7 +1851,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (preferred) {
 			if (record) record.state = { status: "candidate", candidateID: preferred.id, ownership: "existing" };
 			if (preferred.work.execution.status === "queued") {
-				startQueuedCandidates(state.session, preferred, true);
+				startQueuedCandidates(state.session, preferred);
 			}
 			return;
 		}
@@ -1923,7 +1924,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		};
 		runtimeState.candidates.insertPending(state.sessionID, candidate);
 		record.state = { status: "candidate", candidateID: candidate.id, ownership: "preview" };
-		startQueuedCandidates(state.session, candidate, true);
+		startQueuedCandidates(state.session, candidate);
 	};
 
 	const abandonActorPreview = (
@@ -2055,7 +2056,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						state.settings,
 						matchingCandidates,
 					);
-					startQueuedCandidates(state.session, candidate, true);
+					startQueuedCandidates(state.session, candidate);
 				}
 				attempt.releaseAdmission();
 				const authorization = await authorize(
@@ -2983,7 +2984,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const candidate of session.scheduler.preemptFor(
 			resource,
 			concurrentLimit(settings),
-			(candidate) => !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
+			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
 		)) {
 			cancelCandidate(session, candidate, cause("admission", "preempted_by_actor"));
 		}
@@ -2999,7 +3000,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		const startedAt = state.status === "running" ? state.startedAt : performance.now();
 		const completedAt = performance.now();
 		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
-		session.scheduler.discard(candidate);
 		removeCandidate(session, candidate);
 		if (settled) queueCandidateEvent(session, candidate);
 		if (dispatch) dispatchReady(session);

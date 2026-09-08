@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Scheduler preemption now requests cancellation without releasing capacity. Executors return their
+  slot through `complete`; the redundant `discard` alias and untracked preview admission are removed.
 - Removed `WorldBranch.watch`, `watchResourceVersion` and `ResourceVersionManager.subscribe`.
   Shared results require a backend `validate` proof on reuse; Actor path overlap and filesystem events
   no longer evict a sealed result. Pending work and checkpoint descendants still invalidate conservatively.

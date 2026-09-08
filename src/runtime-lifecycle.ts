@@ -10,7 +10,7 @@ export class RuntimeLifecycleLane {
 	private closeTask?: Promise<void>;
 	private sealedValue = false;
 	private readonly work = new Set<Promise<unknown>>();
-	private readonly released = new WeakSet<object>();
+	private readonly released = new WeakMap<object, Promise<void>>();
 
 	get sealed(): boolean {
 		return this.sealedValue;
@@ -37,11 +37,15 @@ export class RuntimeLifecycleLane {
 		return task;
 	}
 
-	release(resource?: { readonly dispose: () => void | Promise<void> }): void {
-		if (!resource || this.released.has(resource)) return;
-		this.released.add(resource);
-		try { this.track(Promise.resolve(resource.dispose())); }
-		catch { /* Cleanup failure cannot replace the authoritative settlement. */ }
+	release(resource?: { readonly dispose: () => void | Promise<void> }): Promise<void> {
+		if (!resource) return Promise.resolve();
+		const existing = this.released.get(resource);
+		if (existing) return existing;
+		const task = this.track((async () => {
+			try { await resource.dispose(); } catch { /* Cleanup cannot replace authoritative settlement. */ }
+		})());
+		this.released.set(resource, task);
+		return task;
 	}
 
 	async drain(): Promise<void> {

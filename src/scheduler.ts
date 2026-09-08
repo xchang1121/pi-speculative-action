@@ -166,10 +166,11 @@ export class SpeculationScheduler<Job extends object> {
 		job: Job,
 		forecasts: readonly PredictionForecast[],
 		capacity: number | SpeculativeResourceBudget,
+		role: "producer" | "actor" = "producer",
 	): SchedulerAdmission {
 		const work = this.evaluate(forecasts);
 		const budget = normalizeBudget(capacity);
-		if (!fits([...this.entries.values()], work.resource, budget)) {
+		if (role === "producer" && !fits([...this.entries.values()], work.resource, budget)) {
 			return { admitted: false, work, reason: "budget_exhausted" };
 		}
 		this.entries.set(job, { job, work, sequence: this.sequence++ });
@@ -187,10 +188,7 @@ export class SpeculationScheduler<Job extends object> {
 		return this.entries.delete(job);
 	}
 
-	discard(job: Job): boolean {
-		return this.entries.delete(job);
-	}
-
+	/** Choose cancellation victims; only their executor completion returns physical capacity. */
 	preemptFor(
 		resource: SpeculativeResourceProfile,
 		capacity: number | SpeculativeResourceBudget,
@@ -212,7 +210,6 @@ export class SpeculationScheduler<Job extends object> {
 			if (!victim) break;
 			victims.push(victim);
 		}
-		for (const victim of victims) this.entries.delete(victim.job);
 		return victims.map((entry) => entry.job);
 	}
 

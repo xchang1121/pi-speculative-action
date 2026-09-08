@@ -255,27 +255,22 @@ describe("SpeculationScheduler", () => {
 		]);
 	});
 
-	it("preempts the latest and least critical work for an authoritative action", () => {
-		const scheduler = new SpeculationScheduler<object>();
-		const nearCritical = {};
-		const farNoncritical = {};
-		scheduler.admit(nearCritical, [forecast({ decisionBatchesUntilCall: 1, criticalPathMs: 500 })], 2);
-		scheduler.admit(farNoncritical, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
-		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2)).toEqual([farNoncritical]);
-		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([nearCritical]);
-	});
-
-	it("does not preempt a candidate already joined by an Actor", () => {
-		const scheduler = new SpeculationScheduler<object>();
-		const joined = {};
-		const idle = {};
-		scheduler.admit(joined, [forecast({ decisionBatchesUntilCall: 5 })], 2);
-		scheduler.admit(idle, [forecast({ decisionBatchesUntilCall: 1 })], 2);
-
-		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (candidate) => candidate !== joined)).toEqual([
-			idle,
-		]);
-		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([joined]);
+	it("selects unreserved victims but accounts for them until completion, including Actor over-budget work", () => {
+		for (const joined of [false, true]) {
+			const scheduler = new SpeculationScheduler<object>(), near = {}, far = {}, next = {}, actor = {};
+			scheduler.admit(near, [forecast({ decisionBatchesUntilCall: 1, criticalPathMs: 500 })], 2);
+			scheduler.admit(far, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
+			const victim = joined ? near : far;
+			expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => !joined || job !== far)).toEqual([victim]);
+			expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([near, far]);
+			expect(scheduler.admit(next, [forecast()], 2).admitted).toBe(false);
+			scheduler.complete(victim);
+			expect(scheduler.admit(next, [forecast()], 2).admitted).toBe(true);
+			expect(scheduler.admit(actor, [forecast({ resourceDemand: 2 })], 2, "actor").admitted).toBe(true);
+			expect(scheduler.snapshot().map((entry) => entry.job)).toContain(actor);
+			expect(scheduler.admit({}, [forecast()], 2).admitted).toBe(false);
+			scheduler.complete(actor);
+		}
 	});
 
 	it("accepts world effects only when backend evidence matches the Actor execution world", () => {
