@@ -46,9 +46,9 @@ export class RuntimeLifecycleLane {
 		if (!resource) return Promise.resolve();
 		const existing = this.released.get(resource);
 		if (existing) return existing;
-		const task = this.track((async () => {
+		const task = this.track(Promise.resolve().then(async () => {
 			try { await resource.dispose(); } catch { /* Cleanup cannot replace authoritative settlement. */ }
-		})());
+		}));
 		this.released.set(resource, task);
 		return task;
 	}

@@ -249,6 +249,8 @@
 
 ### Fixed
 
+- Register the shared resource-release promise before invoking cleanup. Synchronous callback reentry
+  joins the same release instead of disposing twice; shutdown still waits for successful or failed cleanup.
 - Shared sealing and every borrower now preserve enumerable Symbol-keyed data, including Pi read
   coverage, without dropping metadata or rejecting an otherwise reusable production result.
   Output-only projection results are owned before revalidation and commit, so provider or Actor edits

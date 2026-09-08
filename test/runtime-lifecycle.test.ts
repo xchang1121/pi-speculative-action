@@ -18,7 +18,7 @@ describe("RuntimeLifecycleLane", () => {
 		expect(order).toEqual([1, 2]);
 	});
 
-	it("seals synchronously and coalesces every close caller", async () => {
+	it.each([false, true])("seals synchronously and coalesces close and release callers (dispose fails=%s)", async (fails) => {
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
@@ -28,17 +28,35 @@ describe("RuntimeLifecycleLane", () => {
 		});
 		const late = vi.fn();
 		const lane = new RuntimeLifecycleLane();
+		let finishResource!: () => void, nested: Promise<void> | undefined, reenter = true, closed = false;
+		const resourceGate = new Promise<void>((resolve) => { finishResource = resolve; });
+		const resource = { dispose: vi.fn(async () => {
+			if (reenter) { reenter = false; nested = lane.release(resource); }
+			await resourceGate;
+			if (fails) throw new Error("resource cleanup failed");
+		}) };
+		const firstRelease = lane.release(resource), secondRelease = lane.release(resource);
 
 		const first = lane.close(close);
 		const second = lane.close(close);
 		const afterSeal = lane.run(late);
-		expect(lane.sealed).toBe(true);
-		expect(first).toBe(second);
-		expect(afterSeal).toBe(first);
-		expect(late).not.toHaveBeenCalled();
-
-		release();
-		await first;
+		const completion = first.then(() => { closed = true; });
+		try {
+			expect(lane.sealed).toBe(true);
+			expect(first).toBe(second);
+			expect(afterSeal).toBe(first);
+			expect(late).not.toHaveBeenCalled();
+			release();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(closed).toBe(false);
+			expect(resource.dispose).toHaveBeenCalledOnce();
+			expect(firstRelease).toBe(secondRelease);
+			expect(nested).toBe(firstRelease);
+		} finally {
+			release(); finishResource();
+			await Promise.all([firstRelease, secondRelease, nested, first, second, afterSeal, completion]);
+		}
 		expect(close).toHaveBeenCalledOnce();
+		expect(lane.release(resource)).toBe(firstRelease);
 	});
 });
