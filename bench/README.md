@@ -30,12 +30,15 @@ node --experimental-strip-types bench/grep-captured-qualification.mjs
 ```
 
 Uses only Pi's existing rg, with downloads disabled; missing rg reports a skip. On fixed flat
-UTF-8 fixtures it runs the complete stock tool over privately copied, token-owned inputs, then
-requires five real Runtime adoptions with identical output and no new producer execution. Native
-Pi, fixed-sort host Pi, producer preparation/execution, and ready-hit timings are separate.
+UTF-8 fixtures it runs the complete stock tool over privately copied, token-owned inputs in a bounded
+process. The qualification-only module adapter forwards process operations to the parent, which owns
+the real rg handle and streams its output through the existing input protocol. It requires five Runtime
+adoptions without another producer, exact Pi formatting/context/truncation, result-limit cancellation,
+and actual-rg abort/output-budget barriers that keep request settlement behind native close and borrowed-input cleanup.
+Native Pi, fixed-sort host Pi, one-time worker startup, warm producer and ready-hit timings are separate.
 Sorting can change native limited results; this is **not** a transparent native replacement or
-a production grep route. General namespace/config/ignore/encoding, cancellation and benefit
-admission remain unqualified. Both wins and slower-than-native hits are retained in the output.
+a production grep route. General namespace/config/ignore/encoding, engine identity and benefit admission
+remain unqualified. Both wins and slower-than-native hits are retained in the output.
 
 ## ThinkThread real Runtime qualification
 

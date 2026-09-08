@@ -69,18 +69,23 @@ export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel
 			}
 			assert.ok(pending && message.id === pending.id, "unowned worker response");
 			if (message.type === "started") pending.onStarted?.();
+			else if (message.type === "input_cancel") {
+				assert.ok(Number.isSafeInteger(message.sequence) && message.sequence > 0 && message.sequence <= pending.sequence, "unowned input cancellation");
+				if (message.sequence === pending.sequence) pending.input?.controller.abort();
+			}
 			else if (message.type === "input") {
 				const admitted = pending;
 				assert.ok(!admitted.input && Number.isSafeInteger(message.sequence) && message.sequence > admitted.sequence, "unowned input request");
 				admitted.sequence = message.sequence;
 				const controller = new AbortController();
-				const completion = Promise.resolve().then(() => { controller.signal.throwIfAborted(); return admitted.onInput(message.operation, message.target, controller.signal); }).then((value) => ({ value }),
-					(error) => ({ error: String(error?.message ?? error).slice(0, 8192), code: error?.code })).then((response) => {
-					if (pending !== admitted || failure || closed) return;
-					if ((admitted.inputBytes += serialize(response).byteLength) > limits.inputBytes) response = { error: "input byte budget" };
-					admitted.input = undefined;
+				const publish = (response) => {
+					if (pending !== admitted || failure || closed || admitted.input?.controller !== controller) return;
+					if ((admitted.inputBytes += serialize(response).byteLength) > limits.inputBytes) { stop(new Error("input byte budget")); return; }
+					if (!Object.hasOwn(response, "chunk")) admitted.input = undefined;
 					send({ type: "input", id: admitted.id, sequence: message.sequence, ...response });
-				}).catch(stop);
+				};
+				const completion = Promise.resolve().then(() => { controller.signal.throwIfAborted(); return admitted.onInput(message.operation, message.target, controller.signal, (chunk) => publish({ chunk })); })
+					.then((value) => ({ value }), (error) => ({ error: String(error?.message ?? error).slice(0, 8192), code: error?.code })).then(publish).catch(stop);
 				admitted.input = { controller, completion };
 			} else {
 				assert.ok(message.type === "result" && !pending.input, "unexpected worker response");

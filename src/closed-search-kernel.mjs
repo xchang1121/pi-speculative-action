@@ -29,7 +29,8 @@ export function serveClosedSearchWorker(execute) {
 		assert.ok(serialize({ type, id, input, ...response }).byteLength <= CLOSED_SEARCH_PROFILE.limits.requestBytes, "host frame budget");
 		if (type === "input") {
 			assert.ok(pending && id === active && response.sequence === pending.sequence, "unowned input response");
-			const request = pending; pending = undefined;
+			if (Object.hasOwn(response, "chunk")) { assert.equal(typeof pending.onChunk, "function", "unobserved input chunk"); pending.onChunk(response.chunk); return; }
+			const request = pending; pending = undefined; request.cleanup();
 			if (Object.hasOwn(response, "error")) request.reject(Object.assign(new Error(response.error), { code: response.code }));
 			else request.resolve(response.value);
 			return;
@@ -38,10 +39,13 @@ export function serveClosedSearchWorker(execute) {
 		active = id;
 		try {
 			send({ type: "started", id });
-			const result = await execute(input, (operation, target) => new Promise((resolve, reject) => {
+			const result = await execute(input, (operation, target, { signal, onChunk } = {}) => new Promise((resolve, reject) => {
+				signal?.throwIfAborted();
 				assert.ok(active === id && !pending, "unowned input request");
-				pending = { sequence: ++sequence, resolve, reject };
-				send({ type: "input", id, sequence, operation, target });
+				const inputSequence = ++sequence, abort = () => send({ type: "input_cancel", id, sequence: inputSequence });
+				pending = { sequence: inputSequence, resolve, reject, onChunk, cleanup: () => signal?.removeEventListener("abort", abort) };
+				signal?.addEventListener("abort", abort, { once: true });
+				send({ type: "input", id, sequence: inputSequence, operation, target });
 			}));
 			assert.ok(!pending && serialize(result).byteLength <= CLOSED_SEARCH_PROFILE.limits.resultBytes, "result frame budget or pending input");
 			send({ type: "result", id, result });
