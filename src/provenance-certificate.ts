@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { stableStringify } from "./stable-json.ts";
+import { stableEqual, stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 6 as const;
+export const PROCESS_CERTIFICATE_VERSION = 7 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -218,7 +218,7 @@ export function createExecPrototype(input: ProcessPrototypeInput): ExecPrototype
 				? { name, present: false }
 				: { name, present: true, valueDigest: sha256Digest(Buffer.from(value, "utf8")) },
 		)
-		.sort((left, right) => left.name.localeCompare(right.name));
+		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
 	return deepFreeze({
 		...identity,
 		argvDigest: sha256Digest(argvBytes),
@@ -322,16 +322,14 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 			result: candidate.result,
 			createdAt: candidate.createdAt,
 		});
-		const { id: _id, ...legacyBody } = sealed;
-		const legacyID = digestObject(legacyBody);
 		if (
-			(sealed.id !== candidate.id && legacyID !== candidate.id) ||
+			sealed.id !== candidate.id ||
 			sealed.weakKey !== candidate.weakKey ||
 			sealed.strongKey !== candidate.strongKey
 		) {
 			return undefined;
 		}
-		return sealed.id === candidate.id ? sealed : deepFreeze({ ...sealed, id: candidate.id });
+		return sealed;
 	} catch {
 		return undefined;
 	}
@@ -450,7 +448,7 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 				? { name: entry.name, present: true as const, valueDigest: entry.valueDigest! }
 				: { name: entry.name, present: false as const };
 		})
-		.sort((left, right) => left.name.localeCompare(right.name));
+		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
 	const descriptors = new Set<number>();
 	const inheritedFDs = [...prototype.inheritedFDs]
 		.map((fd) => {
@@ -526,29 +524,22 @@ function normalizeDependencyCertificate(certificate: DynamicDependencyCertificat
 }
 
 function normalizeDependencies(dependencies: readonly DynamicDependency[]): DynamicDependency[] {
-	const normalized = dependencies.map((dependency) => {
-		validateDependency(dependency);
+	const seen = new Map<string, DynamicDependency>();
+	for (const source of dependencies) {
+		validateDependency(source);
+		const dependency = { ...source };
 		if (dependency.kind === "directory" && dependency.excludedEntries) {
-			return { ...dependency, excludedEntries: Object.freeze([...new Set(dependency.excludedEntries)].sort()) };
+			dependency.excludedEntries = Object.freeze([...new Set(dependency.excludedEntries)].sort());
 		}
 		if (dependency.kind === "absence" && dependency.parentExcludedEntries) {
-			return {
-				...dependency,
-				parentExcludedEntries: Object.freeze([...new Set(dependency.parentExcludedEntries)].sort()),
-			};
+			dependency.parentExcludedEntries = Object.freeze([...new Set(dependency.parentExcludedEntries)].sort());
 		}
-		return { ...dependency };
-	});
-	normalized.sort((left, right) => dynamicDependencyIdentity(left).localeCompare(dynamicDependencyIdentity(right)));
-	const seen = new Map<string, string>();
-	for (const dependency of normalized) {
 		const identity = dynamicDependencyIdentity(dependency);
-		const encoded = stableStringify(dependency);
 		const existing = seen.get(identity);
-		if (existing !== undefined && existing !== encoded) throw new Error(`conflicting dependency evidence for ${identity}`);
-		seen.set(identity, encoded);
+		if (existing !== undefined && !stableEqual(existing, dependency)) throw new Error(`conflicting dependency evidence for ${identity}`);
+		seen.set(identity, dependency);
 	}
-	return normalized.filter((dependency, index) => index === 0 || dynamicDependencyIdentity(dependency) !== dynamicDependencyIdentity(normalized[index - 1]!));
+	return [...seen.keys()].sort().map((identity) => seen.get(identity)!);
 }
 
 export function dynamicDependencyIdentity(dependency: DynamicDependency): string {

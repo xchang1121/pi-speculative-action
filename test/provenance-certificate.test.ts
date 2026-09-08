@@ -7,6 +7,7 @@ import {
 	createExecPrototype,
 	dependencyPathsetKey,
 	type DynamicDependency,
+	parseProcessCertificate,
 	processWeakKey,
 	type ProvenanceTaint,
 	sealProcessCertificate,
@@ -150,14 +151,35 @@ describe("process provenance certificates", () => {
 	});
 
 	it("keys complete environment and process context without persisting raw values", () => {
-		const first = prototype({ SECRET: "alpha", MODE: "build" });
-		const second = prototype({ SECRET: "beta", MODE: "build" });
+		const environment = { SECRET: "alpha", MODE: "build", "\u00e9": "two", "e\u0301": "one", _: "underscore", z: undefined, Z: "upper" };
+		const first = prototype(environment);
+		const second = prototype({ ...environment, SECRET: "beta" });
 
 		expect(processWeakKey(first)).not.toBe(processWeakKey(second));
+		expect(processWeakKey(first)).toBe(processWeakKey(prototype(Object.fromEntries(Object.entries(environment).reverse()))));
+		expect(first.environment.map((entry) => entry.name)).toEqual(["MODE", "SECRET", "Z", "_", "e\u0301", "z", "\u00e9"]);
 		expect(JSON.stringify(first)).not.toContain("alpha");
 		expect(JSON.stringify(first)).not.toContain("--compile");
 		expect(first).not.toHaveProperty("argv");
 		expect(Object.isFrozen(first.environment)).toBe(true);
+	});
+
+	it.each([["a", "b"], ["e\u0301", "\u00e9"]])("owns an exact dependency set independently of capture order (%s, %s)", (left, right) => {
+		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries") };
+		const b = { ...a, path: `/workspace/${right}` };
+		const seal = (dependencies: DynamicDependency[]) => sealProcessCertificate({
+			prototype: prototype(), producer: PRODUCER,
+			dependencyCertificate: { complete: true, dependencies, taints: [] },
+			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } }, createdAt: 123,
+		});
+		const first = seal([a, b, a]), second = seal([b, a]);
+		expect(dependencyPathsetKey(first.dependencyCertificate)).toBe(dependencyPathsetKey(second.dependencyCertificate));
+		expect(first).toEqual(second);
+		expect(parseProcessCertificate(first)).toEqual(first);
+		expect(first.dependencyCertificate.dependencies).toEqual([a, b]);
+		expect(first.dependencyCertificate.dependencies[0]).not.toBe(a);
+		expect(Object.isFrozen(first.dependencyCertificate.dependencies[0])).toBe(true);
+		expect(() => seal([a, b, { ...a, parentEntriesDigest: sha256Digest("changed") }])).toThrow("conflicting dependency evidence");
 	});
 
 	it("keeps producer authority out of semantic keys but inside certificate identity", () => {

@@ -10,6 +10,11 @@ describe("stable JSON values", () => {
 		expect(stableEqual(first, second)).toBe(true);
 		expect(stableEqual(first, { ...second, zebra: 2 })).toBe(false);
 		expect(stableStringify(first)).toBe('{"2":"two","10":"ten","01":"named","alpha":{"left":1,"right":2},"zebra":1}');
+		const named = { "\u00e9": 2, "e\u0301": 1, Z: 3, z: 4, _: 5 };
+		const reversed = Object.fromEntries(Object.entries(named).reverse());
+		expect(stableEqual(named, reversed)).toBe(true);
+		expect(stableStringify(named)).toBe(stableStringify(reversed));
+		expect(stableStringify(named)).toBe('{"Z":3,"_":5,"e\u0301":1,"z":4,"\u00e9":2}');
 	});
 
 	test("matches JSON omission and array placeholder semantics", () => {

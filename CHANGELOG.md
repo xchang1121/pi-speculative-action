@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- Canonical JSON named keys, process environments and dependency identities now use exact UTF-16
+  ordering instead of locale collation. Process certificates move to v7: v6 weak keys cold-miss and
+  timing-inclusive legacy IDs are rejected. No store clear is performed; existing GC policy still applies.
+  Exact duplicate dependencies collapse once per normalization; conflicting evidence still fails closed.
 - Projector/rule identifiers and callback slots are captured at registration across semantics, Host,
   Runtime and candidate indexes; later provider edits do not redefine an indexed relation or adoption.
   Output coverage must be shareable plain data and each callback receives a separate copy. Opaque

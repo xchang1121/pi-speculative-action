@@ -1,4 +1,4 @@
-import { mkdtemp, rm, unlink } from "node:fs/promises";
+import { mkdtemp, rm, unlink, utimes } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -33,8 +33,8 @@ describe("persistent provenance store", () => {
 		expect(duplicate.id).toBe(certificate.id);
 		const { id: _id, ...legacyBody } = certificate;
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
-		expect(parseProcessCertificate(legacy)?.id).toBe(legacy.id);
-		expect(parseProcessCertificate({ ...certificate, version: 2 })).toBeUndefined();
+		expect(parseProcessCertificate(legacy)).toBeUndefined();
+		for (const version of [2, 6]) expect(parseProcessCertificate({ ...certificate, version })).toBeUndefined();
 		expect(await initial.put(certificate)).toBe(true);
 		expect(await initial.put(duplicate)).toBe(false);
 
@@ -53,15 +53,26 @@ describe("persistent provenance store", () => {
 			orphanGraceMs: 0,
 		});
 		const secondArtifact = await store.artifacts.put("second");
-		await store.artifacts.put("orphan");
+		const orphan = await store.artifacts.put("orphan");
+		const artifactPaths = [first, orphan].map((reference) => {
+			const hex = reference.digest.slice("sha256:".length);
+			return path.join(root, "cas", "sha256", hex.slice(0, 2), hex.slice(2));
+		});
+		// Explicit ages avoid a zero-grace race between fractional filesystem mtime and integer Date.now().
+		await utimes(artifactPaths[0]!, 1, 1);
+		const future = new Date(Date.now() + 60_000);
+		await utimes(artifactPaths[1]!, future, future);
 		const second = completed(secondArtifact, 789, "second");
 		await store.put(second);
 
 		const collected = await store.gc();
 		expect(collected).toMatchObject({
 			removedCertificates: 1,
-			removedArtifacts: 2,
+			removedArtifacts: 1,
 		});
+		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 2, orphanArtifacts: 1 });
+		await utimes(artifactPaths[1]!, 1, 1);
+		expect(await store.gc()).toMatchObject({ removedCertificates: 0, removedArtifacts: 1 });
 		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false });
 		expect(await store.get(certificate.id)).toBeUndefined();
 		expect(await store.get(second.id)).toEqual(second);

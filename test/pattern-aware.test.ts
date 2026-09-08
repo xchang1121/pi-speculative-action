@@ -475,7 +475,8 @@ describe("PatternAware", () => {
 
 	test.each([17, 18])("restores only valid patterns and feedback from persistence v%s and owns every public snapshot", async (version) => {
 		const file = await patternFile("corrupt-state");
-		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern" });
+		const restoredInput = { path: "README.md", fields: { "\u00e9": 2, "e\u0301": 1 } };
+		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
 		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
 		await fs.writeFile(file, JSON.stringify({ version,
@@ -504,6 +505,9 @@ describe("PatternAware", () => {
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
 		expect(persisted.pools).toEqual([]);
 		expect(persisted.patterns[0].feedback).toEqual({ ...valid.feedback, issued: valid.feedback.issued + 1 });
+		store.observe(input({ sessionID: "restored", tool: "grep", input: {} }));
+		expect(store.predict("restored")).toContainEqual(expect.objectContaining({ patternID: valid.id, input: restoredInput }));
+		await store.flush();
 	});
 
 	test.each([false, true])("shares analyzer state and drains every release caller (flush failure=%s)", async (fails) => {

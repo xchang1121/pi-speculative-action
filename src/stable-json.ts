@@ -1,6 +1,6 @@
 import { types } from "node:util";
 
-/** JSON.stringify with recursively stable object keys and no intermediate object tree. */
+/** JSON.stringify with UTF-16-ordered named keys, numeric indices first, and no intermediate object tree. */
 export function stableStringify(value: unknown): string {
 	return serialize(value) as string;
 }
@@ -90,7 +90,7 @@ function serialize(value: unknown): string | undefined {
 	const keys = Object.keys(record);
 	let firstNamed = 0;
 	while (firstNamed < keys.length && isArrayIndex(keys[firstNamed]!)) firstNamed++;
-	keys.push(...keys.splice(firstNamed).sort((left, right) => left.localeCompare(right)));
+	keys.push(...keys.splice(firstNamed).sort());
 	let result = "{";
 	let first = true;
 	for (const key of keys) {

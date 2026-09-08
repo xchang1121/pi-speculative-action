@@ -115,11 +115,14 @@ describe("ActionSemanticsRegistry", () => {
 		const base = buildActionKey({
 			tool: "read",
 			resources: ["a.ts"],
-			input: { path: "a.ts", offset: 1 },
+			input: { path: "a.ts", offset: 1, fields: { "\u00e9": 2, "e\u0301": 1 } },
 			semanticsEpoch: "read.v1",
 			schemaHash: "schema.v1",
 			executionFingerprint: "executor.v1",
 		});
+		expect(actionKeyMatch(base, buildActionKey({
+			...base, input: { ...base.input, fields: { "e\u0301": 1, "\u00e9": 2 } },
+		}))).toMatchObject({ kind: "exact", distance: 0 });
 		const sameEnvelope = buildActionKey({
 			...base,
 			resources: ["a.ts"],
