@@ -63,6 +63,8 @@
 
 ### Added
 
+- Validation and reconstruction register their borrowed lifetime before entering backend callbacks,
+  including callbacks that synchronously request transaction retirement.
 - Gateway retirement drains transaction sealing-failure cleanup before disposing execution worlds.
 - Runtime candidate indexing now calls its existing pending/result stores directly for local operations;
   removed seven forwarding helpers while retaining atomic cross-store transitions and branch disposal.

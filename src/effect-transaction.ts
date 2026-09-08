@@ -214,7 +214,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
 			if (cleanupPromise || validation?.status !== "valid" || !["validated", "committed"].includes(attempt.stateValue)) return undefined;
-			const task = sealed.reconstruct!(request).then(cloneSharedData);
+			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then(cloneSharedData);
 			reconstructions.add(task);
 			try { return await task; } finally { reconstructions.delete(task); }
 		} : undefined,
@@ -227,13 +227,13 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			if (validationPromise) return validationPromise;
 			const preserveCommitted = attempt.stateValue === "committed";
 			attempt.stateValue = preserveCommitted ? "committed" : "validating";
-			const pending = (async () => {
+			const pending = Promise.resolve().then(async () => {
 				validation = await validateWorldBranch(sealed, attempt.descriptor.route.reuse);
 				if (!preserveCommitted && attempt.stateValue === "validating") {
 					attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";
 				}
 				return validation;
-			})();
+			});
 			validationPromise = pending;
 			try { return await pending; } finally { if (validationPromise === pending) validationPromise = undefined; }
 		},

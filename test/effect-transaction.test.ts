@@ -52,13 +52,16 @@ describe("EffectTransactionCoordinator", () => {
 		}
 	});
 
-	it("retires resources only after admitted validation, reconstruction and commit finish", async () => {
+	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
 		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
 			let release!: () => void, enter!: () => void;
 			const gate = new Promise<void>((resolve) => { release = resolve; });
 			const entered = new Promise<void>((resolve) => { enter = resolve; });
 			const failure = new Error("borrow failed"), dispose = vi.fn();
-			const borrow = async () => { enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure; };
+			const borrow = async () => {
+				if (closing === "callback") void transaction.abort();
+				enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure;
+			};
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
 				validate: async () => { if (phase === "validation") await borrow(); return { status: "valid", metrics: metrics() }; },
@@ -68,8 +71,8 @@ describe("EffectTransactionCoordinator", () => {
 			const request = { action: buildPiActionKey("read", { path: "notes" }, "/workspace")!, args: {}, callID: "actor", signal: new AbortController().signal };
 			if (phase !== "validation") await transaction.validate();
 			if (phase === "committed") await transaction.commit();
-			const operations = Promise.allSettled(phase === "validation" ? [transaction.validate()] : phase === "committing" ? [transaction.commit()]
-				: [transaction.reconstruct!(request), transaction.reconstruct!(request)]);
+			const invoke = () => phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
+			const operations = Promise.allSettled(Array.from({ length: closing === "external" && ["reconstruction", "committed"].includes(phase) ? 2 : 1 }, invoke));
 			await entered;
 			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
 			const late = Promise.allSettled([transaction.validate(), transaction.reconstruct!(request)]);
