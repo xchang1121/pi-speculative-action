@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Semantic parent replacement also renews dependent action identities and bindings, using the existing
+  dependency validation walk and retirement path. Late reuse cannot attach an old parent world to the
+  renewed chain; independent actions, metadata-only updates and normal parent adoption retain reuse.
+  Prediction retirement respects an Actor's candidate lease, with cleanup after adoption or release.
 - Plan updates capture their headers, actions, dependencies, removals and inputs before waiting in
   the existing admission lanes. Application reuses that owned capture and rechecks current revision
   and graph validity; producer edits cannot redirect a queued revision. Proposal and delta share one

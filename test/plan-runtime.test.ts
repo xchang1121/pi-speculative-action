@@ -269,12 +269,27 @@ describe("PlanRuntime", () => {
 			expectedDecisionSeq: 8,
 			latestDecisionSeq: 8,
 		});
+		for (const invalid of [
+			[action("a", { dependsOn: [{ actionID: "missing" }] })],
+			[action("a", { dependsOn: [{ actionID: "a" }] })],
+			[action("a", { dependsOn: [{ actionID: "b" }] }), action("b", { dependsOn: [{ actionID: "a" }] })],
+		]) expect(new PlanRuntime().apply(proposal(invalid), 0)).toEqual({ accepted: false, reason: "invalid_dependency" });
 	});
 
-	it("keeps a claimed opportunity authoritative after its plan node is replaced", () => {
+	it.each(["direct", "ancestor"] as const)("keeps a claimed opportunity authoritative through %s replacement", (mode) => {
 		const plan = new PlanRuntime();
-		plan.apply(proposal([action("target", { input: { path: "old.ts" } })]), 0);
-		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
+		const root = mode === "ancestor" ? "parent" : "target";
+		const actions = [...(mode === "ancestor" ? [
+			action("leaf", { dependsOn: [{ actionID: "target" }] }),
+			action("target", { dependsOn: [{ actionID: "middle" }] }),
+			action("middle", { dependsOn: [{ actionID: "parent" }] }),
+		] : []), action(root, { input: { path: "old.ts" } }), action("independent")];
+		plan.apply(proposal(actions), 0);
+		const independent = plan.get("plan", "independent")!.identity, execution = new CandidateExecution<string>("shared");
+		execution.start(0); execution.succeed("parent-output", 1, 1);
+		for (const id of mode === "ancestor" ? ["parent", "middle", "independent"] : ["independent"])
+			plan.attachExecution("plan", id, `${id}-candidate`, execution);
+		const actor = { id: "actor", sequence: 4, turnID: "turn" } as const;
 		const relation = { kind: "exact", distance: 0 } as const;
 		const original = plan.claimMatch("plan", "target", actor, relation)!;
 		const update = plan.apply(
@@ -282,12 +297,20 @@ describe("PlanRuntime", () => {
 				proposalID: "plan",
 				source: "source",
 				revision: 2,
-				upsert: [action("target", { input: { path: "new.ts" } })],
+				upsert: [action(root, { input: { path: "new.ts" } })],
 			},
 			1,
 		);
 
-		expect(update).toMatchObject({ accepted: true, retired: [{ node: { action: { id: "target" } } }] });
+		const replaced = mode === "ancestor" ? ["parent", "middle", "target", "leaf"] : ["target"];
+		expect(update).toMatchObject({ accepted: true, retired: replaced.map((id) => ({ node: { action: { id } } })) });
+		if (!update.accepted) throw new Error(update.reason);
+		expect(Object.isFrozen(update.upserted)).toBe(true);
+		expect(update.upserted.map((action) => action.id)).toEqual(replaced);
+		expect(update.plan.actions.map((action) => action.id)).toEqual(actions.map((action) => action.id));
+		expect(plan.get("plan", "independent")?.identity).toBe(independent);
+		expect(plan.get("plan", "independent")?.execution).toMatchObject({ status: "succeeded", candidateID: "independent-candidate" });
+		for (const id of replaced) expect(plan.get("plan", id)?.execution).toEqual({ status: "deferred" });
 		expect(original.settlement).toBeUndefined();
 		expect(plan.opportunity("plan", "target")).not.toBe(original);
 		expect(plan.confirm(original, actor, { status: "adopted", candidateID: "old-candidate" })).toMatchObject({
@@ -295,6 +318,11 @@ describe("PlanRuntime", () => {
 			match: { matched: true, adoption: { status: "adopted" } },
 		});
 		expect(plan.opportunity("plan", "target")?.state).toEqual({ status: "pending" });
+		const current = plan.get("plan", "target")!.identity;
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 3,
+			upsert: [action(root, { input: { path: "new.ts" }, horizon: 2, expectedDurationMs: 50 })] }, 1))
+			.toMatchObject({ accepted: true, retired: [] });
+		expect(plan.get("plan", "target")!.identity).toBe(current);
 	});
 
 	it("settles observed misses and unobserved control endings exactly once", () => {

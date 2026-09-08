@@ -2546,6 +2546,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const candidate = runtimeState.candidates.find(session.id, node.execution.candidateID);
 			if (
 				candidate?.work.reservation.kind === "exclusive" &&
+				reservationAvailable(candidate.work.reservation) &&
 				!nodesForCandidate(session, candidate.id).some((item) => item.predictionState.status !== "settled")
 			) {
 				discardCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));

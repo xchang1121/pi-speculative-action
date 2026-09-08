@@ -233,11 +233,12 @@ export class PlanRuntime {
 		const actions = new Map(proposal ? [] : [...current!.nodes].map(([id, node]) => [id, node.action] as const));
 		if (!proposal) for (const id of owned.remove ?? []) actions.delete(id);
 		for (const action of upserted) actions.set(action.id, action);
-		if (!dependenciesAreValid(actions)) return { accepted: false, reason: "invalid_dependency" };
+		const ordered = dependencyOrder(actions);
+		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({
 			id, source: owned.source, revision: owned.revision,
 			draftTokens: (proposal ? 0 : current!.draftTokens) + finiteMetric(owned.draftTokens),
-			actions, upserted, anchorDecisionSeq,
+			actions, upserted, ordered, anchorDecisionSeq,
 		});
 	}
 
@@ -414,16 +415,18 @@ export class PlanRuntime {
 		readonly draftTokens: number;
 		readonly actions: ReadonlyMap<string, PlanAction>;
 		readonly upserted: readonly PlanAction[];
+		readonly ordered: readonly PlanAction[];
 		readonly anchorDecisionSeq: number;
 	}): PlanRuntimeUpdateResult {
 		const current = this.plans.get(input.id);
 		const touched = new Set(input.upserted.map((action) => action.id));
-		const replaced = new Set(
-			input.upserted.flatMap((action) => {
-				const previous = current?.nodes.get(action.id)?.action;
-				return previous && !samePlanActionExecution(previous, action) ? [action.id] : [];
-			}),
-		);
+		const replaced = new Set<string>();
+		// A changed ancestor changes the child's execution context even when its own input is unchanged.
+		for (const action of input.ordered) {
+			const previous = current?.nodes.get(action.id)?.action;
+			if (previous && ((touched.has(action.id) && !samePlanActionExecution(previous, action)) ||
+				action.dependsOn?.some((dependency) => replaced.has(dependency.actionID)))) replaced.add(action.id);
+		}
 		const removed = current ? [...current.nodes.keys()].filter((id) => !input.actions.has(id)) : [];
 		const retiredIDs = new Set([...removed, ...replaced]);
 		const retired: RetiredPlanNode[] = [];
@@ -465,7 +468,7 @@ export class PlanRuntime {
 		return {
 			accepted: true,
 			plan: planSnapshot(next),
-			upserted: input.upserted,
+			upserted: Object.freeze([...input.upserted, ...input.ordered.filter((action) => replaced.has(action.id) && !touched.has(action.id))]),
 			removed,
 			retired: Object.freeze(retired),
 		};
@@ -753,29 +756,22 @@ function validateActions(
 	return { ok: true, actions: Object.freeze(result) };
 }
 
-function dependenciesAreValid(actions: ReadonlyMap<string, PlanAction>): boolean {
-	for (const action of actions.values()) {
-		for (const dependency of action.dependsOn ?? []) {
-			const parent = actions.get(dependency.actionID);
-			if (dependency.actionID === action.id || !parent) {
-				return false;
-			}
-		}
-	}
+function dependencyOrder(actions: ReadonlyMap<string, PlanAction>): readonly PlanAction[] | undefined {
 	const visiting = new Set<string>();
-	const visited = new Set<string>();
+	const ordered = new Map<string, PlanAction>();
 	const visit = (actionID: string): boolean => {
-		if (visiting.has(actionID)) return false;
-		if (visited.has(actionID)) return true;
+		if (ordered.has(actionID)) return true;
+		const action = actions.get(actionID);
+		if (!action || visiting.has(actionID)) return false;
 		visiting.add(actionID);
-		for (const dependency of actions.get(actionID)?.dependsOn ?? []) {
+		for (const dependency of action.dependsOn ?? []) {
 			if (!visit(dependency.actionID)) return false;
 		}
 		visiting.delete(actionID);
-		visited.add(actionID);
+		ordered.set(actionID, action);
 		return true;
 	};
-	return [...actions.keys()].every(visit);
+	return [...actions.keys()].every(visit) ? [...ordered.values()] : undefined;
 }
 
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {

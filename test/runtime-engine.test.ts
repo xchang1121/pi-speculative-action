@@ -1570,57 +1570,51 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("keeps equal child actions isolated by parent world and rebases the adopted lineage", async () => {
-		let enabled = true;
-		let workspaceVersion = 0;
+	it.each(["baseline", "replaced", "adopted", "claimed", "cancelled"] as const)("keeps child reuse on its current parent lineage: %s", async (mode) => {
+		const claimed = mode === "claimed" || mode === "cancelled", actorController = new AbortController();
+		let enabled = true, workspaceVersion = 0, holdReuse = false;
 		const executed: string[] = [];
 		const childParents: string[] = [];
+		const aliasOutputs: string[] = [];
 		const childrenReady = candidateSucceeded(2, '"content":"child"');
+		const parentReady = candidateSucceeded(1, "parent-new"), validationStarted = barrier(), validationGate = barrier();
+		const parentBinding = barrier(), parentGate = barrier(), aliasReady = barrier(), cleanup = vi.fn(), transactions = new EffectTransactionCoordinator<string>();
+		const parentAction = (content: string) => ({ id: "parent", type: "tool_call" as const, tool: "write", input: { path: `${content}.txt`, content } });
+		const childAction = { id: "child", type: "tool_call" as const, tool: "write", input: { path: "child.txt", content: "child" },
+			expectedDurationMs: 1_000, dependsOn: [{ actionID: "parent", condition: "execution_succeeded" as const }] };
 		const source: Source = {
 			id: "source",
 			enabled: () => enabled,
 			proposalCount: () => 2,
 			continueOn: ["execution_succeeded"],
-			propose: ({ proposalIndex }) => ({
+			propose: ({ proposalIndex, startInput }) => startInput.turnID === "parent" ? ({
 				id: `chain:${proposalIndex}`,
 				source: "source",
 				revision: 0,
-				actions: [
-					{
-						id: "parent",
-						type: "tool_call",
-						tool: "write",
-						input: { path: `parent-${proposalIndex}.txt`, content: `parent-${proposalIndex}` },
-					},
-				],
-			}),
-			continue: ({ proposalID, actionID, revision, candidate }) => {
+				actions: [parentAction(`parent-${proposalIndex}`)],
+			}) : undefined,
+			observe: ({ concrete }) => concrete.path === "alias.ts"
+				? { proposalID: "chain:0", source: "source", revision: 2, upsert: [{ ...childAction, id: "alias" }] }
+				: concrete.path === "replace.ts" ? { proposalID: "chain:0", source: "source", revision: 3, upsert: [parentAction("parent-new")] } : undefined,
+			continue: ({ proposalID, actionID, revision, candidate, output }) => {
+				if (actionID === "alias") { aliasOutputs.push(output); aliasReady.arrive(); }
 				if (String(candidate.input.content).startsWith("child")) return undefined;
-				return {
-					proposalID,
-					source: "source",
-					revision,
-					upsert: [
-						{
-							id: "child",
-							type: "tool_call",
-							tool: "write",
-							input: { path: "child.txt", content: "child" },
-							dependsOn: [{ actionID, condition: "execution_succeeded" }],
-						},
-					],
-				};
+				return { proposalID, source: "source", revision, upsert: [childAction] };
 			},
 		};
 		const fixture = harness({
 			source,
-			execute: (_tool, input, _signal, parentWorld) => {
+			actionKey: async (tool, input, context) => {
+				if (context.type === "start" && (input as { content?: string }).content === "parent-new") { parentBinding.arrive(); await parentGate.promise; }
+				return buildPiActionKey(tool, input, "/workspace");
+			},
+			execute: (tool, input, _signal, parentWorld) => {
 				const content = String(input.content);
 				executed.push(content);
 				if (content === "child") childParents.push(String(parentWorld?.output));
 				const output = content === "child" ? `child:${parentWorld?.output}` : content;
 				const parentCheckpoint = parentWorld?.checkpoint;
-				return world(output, {
+				return transactions.execute(transactions.begin({ tool, route: MUTATION_ROUTE }), async () => world(output, {
 					checkpoint: {
 						backend: "test",
 						id: output,
@@ -1629,38 +1623,72 @@ describe("structural speculative runtime", () => {
 					},
 					resources: ["."],
 					onCommit: () => workspaceVersion++,
-				});
+					onDispose: () => cleanup(output),
+					validate: async () => {
+						if (holdReuse && output === "child:parent-0") { validationStarted.arrive(); await validationGate.promise; }
+						return { status: "valid", metrics: zeroValidationMetrics() };
+					},
+				}));
 			},
-			onEvent: childrenReady.observe,
+			onEvent: (event) => { childrenReady.observe(event); parentReady.observe(event); },
 		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent" });
-		await childrenReady.promise;
-		expect(executed.sort()).toEqual(["child", "child", "parent-0", "parent-1"]);
-		expect(childParents.sort()).toEqual(["parent-0", "parent-1"]);
-
-		const parentCall: Call = {
-			sessionID: "session",
-			turnID: "parent",
-			id: "actor-parent",
-			tool: "write",
-			input: { path: "parent-0.txt", content: "parent-0" },
-		};
-		expect(await fixture.runtime.consume(parentCall)).toBe("parent-0");
-		enabled = false;
-		await fixture.runtime.finishTurn({ ...parentCall, terminal: false });
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "child" });
-		const childCall: Call = {
-			sessionID: "session",
-			turnID: "child",
-			id: "actor-child",
-			tool: "write",
-			input: { path: "child.txt", content: "child" },
-		};
-		expect(await fixture.runtime.consume(childCall)).toBe("child:parent-0");
-		expect(workspaceVersion).toBe(2);
-		await fixture.runtime.finishTurn({ ...childCall, terminal: true });
+		const expectedParent = mode === "replaced" ? "parent-new" : "parent-0";
+		const parentCall: Call = { sessionID: "session", turnID: "parent", id: "actor-parent", tool: "write", input: parentAction(expectedParent).input };
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent" }); await childrenReady.promise;
+			expect(executed.sort()).toEqual(["child", "child", "parent-0", "parent-1"]);
+			expect(childParents.sort()).toEqual(["parent-0", "parent-1"]);
+			if (mode !== "baseline") {
+				holdReuse = !claimed;
+				const alias = call("parent", { path: "alias.ts" });
+				expect(await fixture.runtime.consume(alias)).toBeUndefined();
+				await fixture.runtime.actual({ ...alias, durationMs: 1, output: "actor" });
+				await (claimed ? aliasReady : validationStarted).promise;
+				if (mode === "replaced") {
+					const replacement = call("parent", { path: "replace.ts" });
+					expect(await fixture.runtime.consume(replacement)).toBeUndefined();
+					await fixture.runtime.actual({ ...replacement, durationMs: 1, output: "actor" }); await parentBinding.promise;
+				} else if (mode === "adopted") expect(await fixture.runtime.consume(parentCall)).toBe(expectedParent);
+				holdReuse = false; if (!claimed) validationGate.arrive(); await new Promise<void>(setImmediate);
+				expect(aliasOutputs).toEqual(mode === "replaced" ? [] : ["child:parent-0"]);
+				if (mode === "replaced") {
+					parentGate.arrive(); await parentReady.promise; await new Promise<void>(setImmediate);
+					expect(childParents).toEqual(["parent-0", "parent-1", "parent-new"]);
+				} else expect(childParents.filter((parent) => parent === "parent-0")).toEqual(["parent-0"]);
+			}
+			if (mode !== "adopted") expect(await fixture.runtime.consume(parentCall)).toBe(expectedParent);
+			enabled = claimed; await fixture.runtime.finishTurn({ ...parentCall, terminal: false });
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "child" });
+			const childCall: Call = { ...parentCall, turnID: "child", id: "actor-child", input: childAction.input };
+			holdReuse = claimed;
+			const childConsumption = fixture.runtime.consume(childCall, actorController.signal);
+			if (claimed) {
+				await validationStarted.promise;
+				const replacement = call("child", { path: "replace.ts" });
+				expect(await fixture.runtime.consume(replacement)).toBeUndefined();
+				await fixture.runtime.actual({ ...replacement, durationMs: 1, output: "actor" }); await parentBinding.promise;
+				if (mode === "cancelled") actorController.abort();
+				holdReuse = false; validationGate.arrive();
+			}
+			expect(await childConsumption).toBe(mode === "cancelled" ? undefined : `child:${expectedParent}`);
+			expect(workspaceVersion).toBe(mode === "cancelled" ? 1 : 2);
+			await new Promise<void>(setImmediate);
+			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(1);
+			parentGate.arrive();
+			await fixture.runtime.finishTurn({ ...childCall, terminal: true });
+			const predictions = fixture.events.filter((event) => event.type === "prediction").map((event) => event.settlement);
+			expect(new Set(predictions.map((settlement) => settlement.prediction.id)).size).toBe(predictions.length);
+			if (claimed) {
+				const matched = predictions.filter((settlement) => settlement.observation === "observed" &&
+					settlement.actorAction.id === childCall.id && settlement.match.matched);
+				expect(matched).toHaveLength(1);
+				expect(matched[0]).toMatchObject({ match: { adoption: mode === "cancelled"
+					? { status: "rejected", cause: { code: "actor_aborted" } } : { status: "adopted" } } });
+			}
+			expect(fixture.events.filter((event) => event.type === "actor_action" && event.settlement.actorAction.id === childCall.id))
+				.toHaveLength(mode === "cancelled" ? 0 : 1);
+		} finally { validationGate.arrive(); parentGate.arrive(); await fixture.runtime.dispose(); }
+		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 });
 
