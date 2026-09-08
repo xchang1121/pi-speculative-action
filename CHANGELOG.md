@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Queued continuations recheck their parent identity and target decision before claiming a source slot.
+  Session closure retires plan launch authority before draining producers; expired, replaced or terminal
+  work cannot restart prediction. Valid cross-turn continuations and retries remain eligible, and an
+  already-claimed Actor transaction retains its commit and settlement ownership through closure.
 - Session shutdown drains physical prediction and continuation producers even after their admission
   wait times out or is cancelled. Late failures stay contained; terminal shared-result retention remains.
   Cancellation before the producer microtask prevents launch, and Drafter preparation rechecks its

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR, type ActionKey } from "../src/action-semantics.ts";
-import { effectCommitFailure } from "../src/effect-transaction.ts";
+import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	type SpeculativeExecutionRoute,
 	type WorldBranch,
@@ -908,28 +908,49 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("propagates an indeterminate commit instead of authorizing Actor fallback", async () => {
+	it.each(["poisoned", "terminal", "disposed"] as const)("preserves claimed Actor commit ownership through %s", async (phase) => {
 		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
-		const candidateReady = candidateSucceeded();
+		const candidateReady = candidateSucceeded(), entered = barrier(), release = barrier();
+		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
+		const continuation = vi.fn(() => undefined), settlements: PredictionSettlement[] = [];
+		const commit = vi.fn(async () => {
+			entered.arrive(); await release.promise;
+			if (phase === "poisoned") throw poisoned;
+			return "speculative";
+		});
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: () => plan("source", "poisoned", { path: "README.md" }),
+			propose: () => plan("source", "claimed", { path: "README.md" }),
+			continueOn: ["actor_adopted"], continue: continuation,
+			onSettled: ({ settlement }) => { settlements.push(settlement); },
 		};
 		const fixture = harness({
 			source,
-			execute: () => ({
-				...world("speculative", { backend: "resource_version" }),
+			execute: (tool, concrete) => coordinator.execute(coordinator.begin({ tool, callID: "claimed", route: RESOURCE_ROUTE }), async () => ({
+				...world("speculative", { executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint }),
 				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
-				commit: async () => Promise.reject(poisoned),
-			}),
+				commit, dispose: cleanup,
+			})),
 			onEvent: candidateReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await candidateReady.promise;
-
-		await expect(fixture.runtime.consume(call("turn", { path: "README.md" }))).rejects.toBe(poisoned);
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+		let consuming: Promise<string | undefined> | undefined, closing: Promise<void> | undefined;
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await candidateReady.promise;
+			consuming = fixture.runtime.consume(call("turn")); await entered.promise;
+			if (phase !== "poisoned") closing = phase === "disposed" ? fixture.runtime.dispose()
+				: fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			release.arrive();
+			if (phase === "poisoned") await expect(consuming).rejects.toBe(poisoned);
+			else expect(await consuming).toBe("speculative");
+			await closing; await fixture.runtime.dispose();
+			expect(commit).toHaveBeenCalledTimes(1); expect(cleanup).toHaveBeenCalledTimes(1);
+			expect(continuation).not.toHaveBeenCalled();
+			if (phase !== "poisoned") expect(settlements).toEqual([expect.objectContaining({
+				match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }),
+			})]);
+		} finally { release.arrive(); await Promise.allSettled([consuming, closing]); await fixture.runtime.dispose(); }
 	});
 
 	it("settles a K(a) match as incompatible without committing backend effects", async () => {
@@ -1337,11 +1358,14 @@ describe("structural speculative runtime", () => {
 		).toEqual([1, 2]);
 	});
 
-	it("keeps a bounded continuation alive across turns without extending turn completion", async () => {
+	it.each(["retained", "retry", "expired", "replaced", "terminal"] as const)("keeps queued continuation authority %s across plan and turn boundaries", async (phase) => {
 		const gate = barrier();
 		const continuationStarted = barrier();
-		const childReady = candidateSucceeded(1, "child.ts");
+		const retained = phase === "retained" || phase === "retry", nextChild = phase === "retry" ? "late-child" : "child";
+		const childReady = candidateSucceeded(1, `${nextChild}.ts`);
+		const replacementReady = candidateSucceeded(1, "replacement.ts");
 		let proposals = 0;
+		const continuations: string[] = [];
 		const executed: string[] = [];
 		const source: Source = {
 			id: "source",
@@ -1352,11 +1376,19 @@ describe("structural speculative runtime", () => {
 				return plan("source", "cross-turn", { path: "parent.ts" });
 			},
 			continue: async ({ proposalID, actionID, revision, candidate, trigger }) => {
-				if (String(candidate.input.path) !== "parent.ts" || trigger !== "execution_succeeded") return undefined;
-				continuationStarted.arrive();
-				await gate.promise;
-				return childPlanUpdate({ proposalID, actionID, revision }, "child", "child.ts");
+				if (String(candidate.input.path) !== "parent.ts") return undefined;
+				continuations.push(trigger);
+				if (trigger === "execution_succeeded") {
+					continuationStarted.arrive(); await gate.promise;
+					if (phase === "retry") return undefined;
+				}
+				const child = trigger === "execution_succeeded" ? "child" : "late-child";
+				return childPlanUpdate({ proposalID, actionID, revision }, child, `${child}.ts`);
 			},
+			observe: ({ concrete }) => phase === "replaced" && concrete.path === "replace.ts" ? {
+				proposalID: "cross-turn", source: "source", revision: 2,
+				upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }],
+			} : undefined,
 		};
 		const fixture = harness({
 			source,
@@ -1364,21 +1396,40 @@ describe("structural speculative runtime", () => {
 				executed.push(String(input.path));
 				return `${String(input.path)}:output`;
 			},
-			onEvent: childReady.observe,
+			onEvent: (event) => { childReady.observe(event); replacementReady.observe(event); },
 		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent-turn" });
-		await continuationStarted.promise;
-		expect(await fixture.runtime.consume(call("parent-turn", { path: "parent.ts" }))).toBe("parent.ts:output");
-		await fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: false });
-		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 1 });
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "child-turn" });
-		expect(proposals).toBe(1);
-		gate.arrive();
-		await childReady.promise;
-		expect(await fixture.runtime.consume(call("child-turn", { path: "child.ts" }))).toBe("child.ts:output");
-		await fixture.runtime.finishTurn({ ...call("child-turn"), terminal: true });
+		let closing: Promise<void> | undefined;
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent-turn" });
+			await continuationStarted.promise;
+			expect(await fixture.runtime.consume(call("parent-turn", { path: "parent.ts" }))).toBe("parent.ts:output");
+			if (phase === "terminal") closing = fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: true });
+			else if (phase === "replaced") {
+				const replacement = { ...call("parent-turn", { path: "replace.ts" }), id: "replace-parent" };
+				expect(await fixture.runtime.consume(replacement)).toBeUndefined();
+				await fixture.runtime.actual({ ...replacement, durationMs: 1, output: "actor" });
+				await replacementReady.promise;
+				gate.arrive();
+			} else {
+				await fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: false });
+				expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 1 });
+				await fixture.runtime.startTurn({ sessionID: "session", turnID: "child-turn" });
+				expect(proposals).toBe(1);
+				if (retained) { gate.arrive(); await childReady.promise; }
+				else {
+					const unrelated = call("child-turn", { path: "other.ts" });
+					expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
+					await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "actor" });
+				}
+			}
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(continuations).toEqual(["execution_succeeded", ...(phase === "retry" ? ["actor_adopted"] : [])]);
+			expect(executed).toEqual(["parent.ts", ...(retained ? [`${nextChild}.ts`] : phase === "replaced" ? ["replacement.ts"] : [])]);
+			if (retained) {
+				expect(await fixture.runtime.consume(call("child-turn", { path: `${nextChild}.ts` }))).toBe(`${nextChild}.ts:output`);
+				await fixture.runtime.finishTurn({ ...call("child-turn"), terminal: true });
+			}
+		} finally { gate.arrive(); await closing; await fixture.runtime.dispose(); }
 	});
 
 	it("adopts a target-state-valid child after its parent prediction misses", async () => {

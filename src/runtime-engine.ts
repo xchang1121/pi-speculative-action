@@ -2619,14 +2619,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		const requestLimit = clampCandidateLimit(source.proposalCount?.(context.settings));
 		const pending = context.continuationTail
 			.then(async () => {
+				if (session.lifecycle.sealed || targetDecisionSequence <= session.decisionSequence ||
+					session.plan.get(node.proposalID, node.action.id)?.identity.id !== node.identity.id) return;
 				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit, "continuation");
 				if (!slot) return;
 				context.continuationSlots.add(slot);
 				retainSourceRequest(slot);
-				if (session.lifecycle.sealed || !slot.active) {
-					releaseSourceRequest(session, slot);
-					return;
-				}
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) {
 					releaseSourceRequest(session, slot);
@@ -3093,15 +3091,16 @@ export function makeStructuralSpeculativeActionRuntime<
 		});
 
 		releaseAllSourceSlots(session, failure);
+		const planFailure = terminal ? cause("control", "session_terminal") : failure;
+		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
+		clearLaunchTimers(session);
+		session.plan.clear();
 		await waitForSourceTasks(session);
 		await session.effects.flush();
 		for (const closure of closures) await completeTurnClosure(closure);
 		for (const key of session.turns) runtimeState.turns.delete(key);
 		session.turns.clear();
 
-		const planFailure = terminal ? cause("control", "session_terminal") : failure;
-		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
-		clearLaunchTimers(session);
 		for (const candidate of runtimeState.candidates.all(session.id)) {
 			if (!terminal || candidate.work.reservation.kind === "exclusive") {
 				discardCandidate(session, candidate, planFailure);
@@ -3114,7 +3113,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		await session.effects.flush();
 		if (terminal || mode === "disposed") await flushSources();
-		session.plan.clear();
 		pruneActionContexts(session);
 		clearActorActions(session);
 		if (!terminal) await session.lifecycle.drain();
