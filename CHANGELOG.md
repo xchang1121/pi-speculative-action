@@ -161,6 +161,8 @@
 
 ### Changed
 
+- Prediction, Actor preview and observed-result candidates share one initializer for identity sequence,
+  reservation ownership and accounting defaults; origin-specific timing, coverage and routes remain explicit.
 - Settings menus share their existing action loop and grouped editors; labels, dynamic submenus,
   staged updates and destructive-action confirmation retain their behavior without parallel handlers.
 - Resource snapshots are now observation-only authority; speculative execution requires a provider

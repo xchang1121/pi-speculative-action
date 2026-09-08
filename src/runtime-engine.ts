@@ -946,6 +946,35 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const runtimeState = new StructuralRuntimeState(adapter);
 
+	const createCandidate = (
+		session: Session,
+		context: Pick<Candidate["owner"], "startInput" | "data" | "settings">,
+		draft: SpeculativeDraftCandidate,
+		input: Pick<Candidate, "origin" | "key" | "route" | "attemptStartedAt" | "expectedDecisionSeq" |
+			"expectedDurationMs" | "criticalPathMs" | "priorityMs"> & Partial<Pick<Candidate,
+			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "background" | "estimatedBytes" | "projectionCoverage">>,
+	): Candidate => {
+		const sequence = ++session.candidateSequence;
+		return {
+			id: `${input.origin === "prediction" ? "spec" : input.origin === "actor_preview" ? "actor" : input.origin}_${sequence}_${input.key.hash.slice(0, 12)}`,
+			work: new CandidateExecution<WorldBranch<Output>>(input.origin !== "actor_result" && input.route.reuse === "exclusive_branch" ? "exclusive" : "shared"),
+			actorAdopted: input.origin === "actor_result",
+			owner: { startInput: context.startInput, data: context.data, settings: context.settings, draft, index: sequence - 1 },
+			createdAt: Date.now(),
+			predictionLatencyMs: 0,
+			draftTokens: 0,
+			totalDraftTokens: session.tokenTotal,
+			background: false,
+			estimatedBytes: 0,
+			projectionCoverage: [],
+			validationMs: 0,
+			validationBytes: 0,
+			validationFiles: 0,
+			projectionMs: 0,
+			...input,
+		};
+	};
+
 	const clearLaunchTimers = (session: Session): void => {
 		for (const timer of session.launchTimers.values()) clearTimeout(timer);
 		session.launchTimers.clear();
@@ -1573,29 +1602,14 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("admission", "invalid_input"));
 			return;
 		}
-		const sequence = ++session.candidateSequence;
-		const candidateID = `spec_${sequence}_${node.actionKey.hash.slice(0, 12)}`;
-		const reuse = route.reuse === "exclusive_branch" ? "exclusive" : "shared";
-		const work = new CandidateExecution<WorldBranch<Output>>(reuse);
 		const scheduled = session.scheduler.evaluate([
 			forecastFor(node, route, session.decisionSequence, actorPhaseFor(session)),
 		]);
-		const candidate: Candidate = {
-			id: candidateID,
+		const candidate = createCandidate(session, context, context.draft, {
 			origin: "prediction",
 			key: node.actionKey,
 			route,
-			work,
 			...(parent ? { worldParent: parent } : {}),
-			actorAdopted: false,
-			owner: {
-				startInput: context.startInput,
-				data: context.data,
-				settings: context.settings,
-				draft: context.draft,
-				index: sequence - 1,
-			},
-			createdAt: Date.now(),
 			attemptStartedAt: context.attemptStartedAt,
 			predictionLatencyMs: context.predictionLatencyMs,
 			draftTokens: context.draftTokens,
@@ -1605,13 +1619,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			criticalPathMs: scheduled.criticalPathMs,
 			priorityMs: scheduled.priorityMs,
 			background: scheduled.background,
-			estimatedBytes: 0,
-			projectionCoverage: [],
-			validationMs: 0,
-			validationBytes: 0,
-			validationFiles: 0,
-			projectionMs: 0,
-		};
+		});
 		const insertion = runtimeState.candidates.insertOrGetCompatible(
 			session.id,
 			candidate,
@@ -1878,7 +1886,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		});
 		if (!admission.ok || !active()) return;
 		const { route } = admission;
-		const sequence = ++state.session.candidateSequence;
 		const forecast: PredictionForecast = {
 			tool: actualCall.tool,
 			execution: route.isolation,
@@ -1888,40 +1895,16 @@ export function makeStructuralSpeculativeActionRuntime<
 			actorPhase: actorPhaseFor(state.session),
 		};
 		const scheduled = state.session.scheduler.evaluate([forecast]);
-		const work = new CandidateExecution<WorldBranch<Output>>(
-			route.reuse === "exclusive_branch" ? "exclusive" : "shared",
-		);
-		const candidate: Candidate = {
-			id: `actor_${sequence}_${action.hash.slice(0, 12)}`,
+		const candidate = createCandidate(state.session, state, draft, {
 			origin: "actor_preview",
 			key: action,
 			route,
-			work,
-			actorAdopted: false,
-			owner: {
-				startInput: state.startInput,
-				data: state.data,
-				settings: state.settings,
-				draft,
-				index: sequence - 1,
-			},
-			createdAt: Date.now(),
 			attemptStartedAt,
-			predictionLatencyMs: 0,
-			draftTokens: 0,
-			totalDraftTokens: state.session.tokenTotal,
 			expectedDurationMs: scheduled.expectedDurationMs,
 			expectedDecisionSeq: state.decisionSequence,
 			criticalPathMs: scheduled.criticalPathMs,
 			priorityMs: scheduled.priorityMs,
-			background: false,
-			estimatedBytes: 0,
-			projectionCoverage: [],
-			validationMs: 0,
-			validationBytes: 0,
-			validationFiles: 0,
-			projectionMs: 0,
-		};
+		});
 		runtimeState.candidates.insertPending(state.sessionID, candidate);
 		record.state = { status: "candidate", candidateID: candidate.id, ownership: "preview" };
 		startQueuedCandidates(state.session, candidate);
@@ -2389,41 +2372,21 @@ export function makeStructuralSpeculativeActionRuntime<
 		let retained = false;
 		try {
 			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || runtimeState.masterDisabled()) return;
-			const sequence = ++state.session.candidateSequence;
-			const work = new CandidateExecution<WorldBranch<Output>>("shared");
-			work.start(toolExecution.startedAt);
-			if (!work.succeed(branch, toolExecution.completedAt, durationMs)) return;
-			const candidate: Candidate = {
-				id: `actor_result_${sequence}_${action.hash.slice(0, 12)}`,
+			const candidate = createCandidate(state.session, state,
+				{ type: "tool_call", tool: action.tool, input: action.input, source: "actor_result" }, {
 				origin: "actor_result",
 				key: action,
 				route: capture.route,
-				work,
-				actorAdopted: true,
-				owner: {
-					startInput: state.startInput,
-					data: state.data,
-					settings: state.settings,
-					draft: { type: "tool_call", tool: action.tool, input: action.input, source: "actor_result" },
-					index: sequence - 1,
-				},
-				createdAt: Date.now(),
 				attemptStartedAt: toolExecution.startedAt,
-				predictionLatencyMs: 0,
-				draftTokens: 0,
-				totalDraftTokens: state.session.tokenTotal,
 				expectedDurationMs: durationMs,
 				expectedDecisionSeq: state.decisionSequence,
 				criticalPathMs: durationMs,
 				priorityMs: durationMs,
-				background: false,
 				estimatedBytes: estimateValueBytes(output) + branch.capturedBytes,
 				projectionCoverage: captureCoverage(action, output, runtimeState.projectionRules),
-				validationMs: 0,
-				validationBytes: 0,
-				validationFiles: 0,
-				projectionMs: 0,
-			};
+			});
+			candidate.work.start(toolExecution.startedAt);
+			if (!candidate.work.succeed(branch, toolExecution.completedAt, durationMs)) return;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
 			runtimeState.candidates.insertResult(state.sessionID, candidate);
