@@ -38,7 +38,7 @@ input cleanup before settlement; a tiny query may finish before its result-limit
 `--case=<label>` selects one semantic case. The separate 16-process link characterization checks both
 `--files` and actual search: on this Windows rg, a discovered dangling junction is absent from the file
 list but makes search fail. No-follow captured entries therefore cannot alone authorize skipping it.
-The 19 semantic cases per OS cover explicit in-root links, POSIX linked ignore files and skipped FIFO/
+The 22 semantic cases per OS cover explicit in-root links, POSIX linked ignore files and skipped FIFO/
 discovered links. Unproven external or broken targets reject speculation; the original-workspace Actor
 runs once, including its original error. Windows external discovered junctions also conservatively fall
 back because their target metadata is outside the captured namespace. No native-default behavior changes.
@@ -46,6 +46,12 @@ back because their target metadata is outside the captured namespace. No native-
 Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
 The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
 Metadata and ignore-file evidence drive rg's own file selection; only selected raw bytes are copied.
+Directory expansion is lazy: temporary, uniquely named marker files test the next frontier with rg;
+the final marker override matches only these files, never their parent directory names. Ordinary,
+caller-glob and query-local selections retain native directory precedence and explicit-root admission.
+Ignored and negative-glob subtrees must not be enumerated, including `.git`; its named exclude file is
+captured separately. A tiny ignored-subtree mutation retains adoption without extra Actor execution.
+This bounds ignored-tree metadata without a large fixture, but adds selection processes per depth.
 Provider-owned ancestor-directory overrides preserve explicit-root admission without interpreting user
 globs. Native [root admission](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/walk.rs) and
 [override semantics](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/overrides.rs) remain the reference.
@@ -54,7 +60,7 @@ Omit `--semantics-only` only for a performance-stage run: larger flat fixtures, 
 query, and 20 abort/output-budget barriers. Native Pi, fixed-sort host Pi, startup, producer and ready-hit
 timings stay separate; the small-mode timings are not performance claims. The proposed profile explicitly
 cuts off global/above-workspace ignore inputs and sorts output. This is **not** native-default equivalence
-or production admission: Git indirection, private materialization cost, broader namespaces and
+or production admission: Git indirection, private materialization/selection cost, broader namespaces and
 existing benefit gates still need qualification. Nothing is installed or downloaded; missing rg skips.
 
 ## ThinkThread real Runtime qualification
