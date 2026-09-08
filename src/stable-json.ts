@@ -23,6 +23,27 @@ export function immutableSnapshot<Value>(value: Value): Value {
 	return owned;
 }
 
+/** Own shareable data without silently flattening opaque prototypes, accessors or hidden fields. */
+export function cloneSharedData<Value>(value: Value): Value {
+	const seen = new WeakSet<object>();
+	const validate = (item: unknown): void => {
+		if (typeof item === "function" || typeof item === "symbol") throw new Error("shared_output_not_data");
+		if (!isObject(item) || seen.has(item)) return;
+		seen.add(item);
+		const array = Array.isArray(item);
+		if (Object.getPrototypeOf(item) !== (array ? Array.prototype : Object.prototype)) throw new Error("shared_output_not_data");
+		for (const key of Reflect.ownKeys(item)) {
+			const property = Object.getOwnPropertyDescriptor(item, key)!;
+			if (typeof key === "symbol" || !("value" in property) || (!property.enumerable && !(array && key === "length"))) {
+				throw new Error("shared_output_not_data");
+			}
+			validate(property.value);
+		}
+	};
+	validate(value);
+	return structuredClone(value);
+}
+
 function equalObject(left: object, right: object): boolean {
 	const leftArray = Array.isArray(left);
 	const rightArray = Array.isArray(right);

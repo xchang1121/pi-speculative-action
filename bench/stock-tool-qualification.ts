@@ -108,9 +108,9 @@ export async function qualifyStockTool(
 				output = await actor();
 				executionMs = performance.now() - started;
 			} else {
-				const branch = await gateway.executeSpeculative(operation, route, () => ({
+				const branch = await gateway.executeSpeculative(operation, route, {
 					...context, action: { ...action, executionFingerprint: route.fingerprint },
-				}));
+				});
 				executionMs = performance.now() - started;
 				try {
 					assert.deepEqual(await workspaceState(root), initial, `${name}: speculative effects leaked before adoption`);

@@ -25,7 +25,7 @@ describe("ToolExecutionGateway", () => {
 					capture: async () => { await borrow(); return { seal: async (output) => branch("workspace", output), dispose: () => {} }; } },
 			};
 			const gateway = new ToolExecutionGateway([world]), preparation = { cwd: "/workspace" };
-			const operation = { tool: "custom_process", callID: "call", input: { any: "shape" } }, context = () => ({ value: "sealed" });
+			const operation = { tool: "custom_process", callID: "call", input: { any: "shape" } }, context = { value: "sealed" };
 			const requirement = { operation, effect: "workspace_mutation" as const, requirements: WORKSPACE_PATH_MUTATION_EFFECTS };
 			const route = (await gateway.resolve(requirement, preparation))!;
 			expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });

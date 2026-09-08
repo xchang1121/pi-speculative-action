@@ -93,7 +93,6 @@ export {
 	type AuthoritativeExecutionSettlement,
 	type AuthoritativeToolExecutor,
 	ToolExecutionGateway,
-	type ToolExecutionContextFactory,
 	type ToolExecutionRequirement,
 	type ToolOperation,
 } from "./tool-execution-gateway.ts";

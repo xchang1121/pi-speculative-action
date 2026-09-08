@@ -17,36 +17,34 @@ const route: SpeculativeExecutionRoute = {
 
 describe("EffectTransactionCoordinator", () => {
 	it.each([false, true])("owns concurrent commit across pending validation=%s", async (pending) => {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => { release = resolve; });
-		const commit = vi.fn(async () => "committed");
-		const dispose = vi.fn(async () => {});
-		const coordinator = new EffectTransactionCoordinator<string>();
-		const attempt = coordinator.begin({ tool: "arbitrary", callID: "call-1", route });
-		expect(attempt.state).toBe("begun");
-		for (const unowned of [{ ...attempt }, new EffectTransactionCoordinator<string>().begin(attempt.descriptor)])
-			await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
-
-		const transaction = await coordinator.execute(attempt, async () =>
-			branch({
+		for (const disposition of ["success", "recoverable", "poisoned", undefined] as const) {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const failure = disposition === "success" ? undefined : disposition ? effectCommitFailure(new Error("commit failed"), disposition) : new Error("unknown state");
+			const commit = vi.fn(async () => { if (failure) throw failure; return "committed"; }), dispose = vi.fn();
+			const coordinator = new EffectTransactionCoordinator<string>();
+			const attempt = coordinator.begin({ tool: "arbitrary", callID: "call-1", route });
+			expect(attempt.state).toBe("begun");
+			for (const unowned of [{ ...attempt }, new EffectTransactionCoordinator<string>().begin(attempt.descriptor)])
+				await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
+			const transaction = await coordinator.execute(attempt, async () => branch({
 				validate: async () => { await gate; return { status: "valid", metrics: metrics() }; },
-				commit,
-				dispose,
-			}),
-		);
-		expect([transaction.state, attempt.state]).toEqual(["sealed", "sealed"]);
-		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
-		const validation = transaction.validate();
-		if (!pending) { release(); await validation; }
-		const commits = [transaction.commit(), transaction.commit()];
-		release();
-		const [first, second] = await Promise.all(commits);
-		expect([first, second]).toEqual(["committed", "committed"]);
-		expect(commit).toHaveBeenCalledOnce();
-		expect([transaction.state, attempt.state]).toEqual(["committed", "committed"]);
-		await transaction.abort();
-		expect(dispose).toHaveBeenCalledOnce();
-		expect(transaction.state).toBe("committed");
+				commit, dispose,
+			}));
+			expect([transaction.state, attempt.state]).toEqual(["sealed", "sealed"]);
+			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
+			const validation = transaction.validate();
+			if (!pending) { release(); await validation; }
+			const commits = Promise.allSettled([transaction.commit(), transaction.commit()]);
+			release();
+			const [first, second] = await commits;
+			expect(first).toEqual(second);
+			expect(first).toMatchObject(failure ? { status: "rejected", reason: { disposition: disposition ?? "poisoned" } } : { status: "fulfilled", value: "committed" });
+			const state = !failure ? "committed" : disposition === "recoverable" ? "failed" : "poisoned";
+			expect([transaction.state, attempt.state]).toEqual([state, state]); expect(commit).toHaveBeenCalledOnce();
+			await transaction.abort(); expect(dispose).toHaveBeenCalledOnce();
+			expect(transaction.state).toBe(state === "failed" ? "aborted" : state);
+		}
 	});
 
 	it("retires resources only after admitted validation, reconstruction and commit finish", async () => {
@@ -80,7 +78,7 @@ describe("EffectTransactionCoordinator", () => {
 			expect(transaction.state).toBe(phase === "committed" || (phase === "committing" && !fails) ? "committed" : phase === "committing" ? "poisoned" : "aborted");
 			expect(await transaction.validate()).toMatchObject({ status: "indeterminate" });
 			expect(await transaction.reconstruct!(request)).toBeUndefined();
-			if (phase === "committed" || (phase === "committing" && !fails)) await expect(transaction.commit()).resolves.toBe("committed");
+			if (phase === "committed" || (phase === "committing" && !fails)) await expect(transaction.commit()).resolves.toBe("sealed");
 			else await expect(transaction.commit()).rejects.toMatchObject({ disposition: phase === "committing" ? "poisoned" : "recoverable" });
 		}
 	});
@@ -122,30 +120,35 @@ describe("EffectTransactionCoordinator", () => {
 		expect(abandonedAttempt.state).toBe("aborted");
 	});
 
-	it("classifies failures once, including unclassified partial commits", async () => {
-		for (const disposition of ["recoverable", "poisoned", undefined] as const) {
-			const dispose = vi.fn();
-			const failure = disposition ? effectCommitFailure(new Error("commit failed"), disposition) : new Error("unknown state");
-			const coordinator = new EffectTransactionCoordinator<string>();
-			const transaction = await coordinator.execute(
-				coordinator.begin({ tool: "write", route }),
-				async () =>
-					branch({
-						validate: async () => ({ status: "valid", metrics: metrics() }),
-						commit: async () => Promise.reject(failure),
-						dispose,
-					}),
-			);
-			await transaction.validate();
-
-			const commits = await Promise.allSettled([transaction.commit(), transaction.commit()]);
-			expect(commits[0]).toEqual(commits[1]);
-			expect(commits[0]).toMatchObject({ status: "rejected", reason: { disposition: disposition ?? "poisoned" } });
-			expect(transaction.state).toBe(disposition === "recoverable" ? "failed" : "poisoned");
-			await transaction.abort();
-			expect(transaction.state).toBe(disposition === "recoverable" ? "aborted" : "poisoned");
-			expect(dispose).toHaveBeenCalledOnce();
+	it("owns each shared result and retires opaque outputs without changing their Actor owner", async () => {
+		const getter = vi.fn(() => "not data"), opaque = Object.create({ method() {} });
+		for (const captured of [false, true]) for (const details of [{ value: ["sealed"] }, opaque, new Date(), Buffer.from("raw"),
+			{ method() {} }, { [Symbol("hidden")]: 1 }, Object.defineProperty({}, "hidden", { value: 1 }), { get value() { return getter(); } }]) {
+			const output = { content: ["sealed"], details }, expected = { content: ["sealed"], details: { value: ["sealed"] } };
+			const shareable = "value" in details && Array.isArray(Object.getOwnPropertyDescriptor(details, "value")?.value);
+			const coordinator = new EffectTransactionCoordinator<typeof output>();
+			const attempt = coordinator.begin({ tool: "custom", route: { ...route, reuse: "shared_result" } });
+			const commit = vi.fn(async () => output), dispose = vi.fn(), source = { ...branch(), output, commit, dispose, reconstruct: async () => output,
+				validate: async () => ({ status: "valid" as const, metrics: metrics() }) };
+			const pending = captured ? coordinator.capture(attempt, { seal: () => source, dispose: () => {} }).seal(output)
+				: coordinator.execute(attempt, async () => source);
+			if (!shareable) {
+				await expect(pending).rejects.toThrow("shared_output_not_data");
+				expect(attempt.state).toBe("failed"); expect(dispose).toHaveBeenCalledOnce(); expect(commit).not.toHaveBeenCalled();
+				expect(source.output).toBe(output); expect(Object.isFrozen(details)).toBe(false);
+				continue;
+			}
+			const transaction = await pending;
+			output.content.push("provider edit"); (details as { value: string[] }).value.push("provider edit");
+			transaction.output.content.push("reader edit");
+			expect(transaction.output).toEqual(expected);
+			await transaction.validate!();
+			const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
+			first.content.push("Actor edit"); (first.details as { value: string[] }).value.push("Actor edit");
+			expect(second).toEqual(expected); expect(commit).toHaveBeenCalledOnce();
+			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce();
 		}
+		expect(getter).not.toHaveBeenCalled();
 	});
 
 });

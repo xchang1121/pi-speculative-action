@@ -4,6 +4,11 @@
 
 ### Breaking Changes
 
+- Shared transactions now own a sealed plain-data result and give each reader/adoption a separate copy.
+  Opaque prototypes, accessors, symbols and hidden fields are not shareable; failed sealing retires the
+  branch without freezing or rewriting the Actor result. Only exclusive commits may update the settlement.
+- Gateway world calls now take their already-bound execution context directly; removed the unused
+  `ToolExecutionContextFactory` callback boundary and redundant capture/descriptor forwarding.
 - Scheduler preemption now requests cancellation without releasing capacity. Executors return their
   slot through `complete`; the redundant `discard` alias and untracked preview admission are removed.
 - Removed `WorldBranch.watch`, `watchResourceVersion` and `ResourceVersionManager.subscribe`.

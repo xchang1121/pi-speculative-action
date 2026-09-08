@@ -138,7 +138,8 @@ export interface WorldBranch<Output> {
 		readonly callID: string;
 		readonly signal: AbortSignal;
 	}) => Promise<Output | undefined>;
-	/** Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */
+	/** Shared adoption returns the sealed output; only exclusive effects may return an updated settlement.
+	 * Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */
 	readonly commit: () => Promise<Output>;
 	/** Idempotently release every branch-local handle. Must be safe before or after commit. */
 	readonly dispose: () => void | Promise<void>;

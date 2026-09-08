@@ -44,7 +44,6 @@ export interface ToolExecutionRequirement {
 }
 
 export type AuthoritativeToolExecutor<Output> = (operation: ToolOperation) => Promise<Output>;
-export type ToolExecutionContextFactory<Context> = (operation: ToolOperation) => Context;
 
 export type AuthoritativeExecutionSettlement<Output> =
 	| { readonly status: "succeeded"; readonly output: Output; readonly durationMs: number }
@@ -88,19 +87,19 @@ export class ToolExecutionGateway<Context, Output> {
 	captureAuthoritativeResult(
 		requirement: ToolExecutionRequirement,
 		preparation: ExecutionWorldPreparation,
-		context: ToolExecutionContextFactory<Context>,
+		context: Context,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.captureAuthoritativeResult(
 			{ tool: operation.tool, action: operation.action, effect, requirements },
 			preparation,
-			context(operation),
+			context,
 		).then((captured) =>
 			captured
 				? Object.freeze({
 						route: captured.route,
 						capture: this.transactions.capture(
-							this.transactions.begin(descriptor(operation, captured.route)),
+							this.transactions.begin({ tool: operation.tool, callID: operation.callID, route: captured.route }),
 							captured.capture,
 						),
 					})
@@ -141,22 +140,13 @@ export class ToolExecutionGateway<Context, Output> {
 	executeSpeculative(
 		operation: ToolOperation,
 		route: SpeculativeExecutionRoute,
-		context: ToolExecutionContextFactory<Context>,
+		context: Context,
 	): Promise<EffectTransaction<Output>> {
-		const attempt = this.transactions.begin(descriptor(operation, route));
-		return this.transactions.execute(attempt, () => this.router.fork(route, context(operation)));
+		const attempt = this.transactions.begin({ tool: operation.tool, callID: operation.callID, route });
+		return this.transactions.execute(attempt, () => this.router.fork(route, context));
 	}
 
 	dispose(): Promise<void> {
 		return this.router.dispose();
 	}
-}
-
-
-function descriptor(operation: ToolOperation, route: SpeculativeExecutionRoute) {
-	return {
-		tool: operation.tool,
-		...(operation.callID ? { callID: operation.callID } : {}),
-		route,
-	};
 }

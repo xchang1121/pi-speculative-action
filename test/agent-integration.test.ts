@@ -202,6 +202,12 @@ describe("speculative action host", () => {
 						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
 					});
 					if (resourceExecution && origin === "prediction") {
+						const delivered = await result;
+						const pristine = structuredClone(delivered);
+						delivered.content.push({ type: "text", text: "Actor-owned edit" });
+						delivered.details = { actor: true };
+						const retained = await host.execute({ turnID, id: "another-owner", tool: toolName, args, tools: [tool] }, undefined, actorExecution);
+						expect(retained).toEqual(pristine);
 						const query = toolName === "read" ? { path: "notes.txt", offset: 1, limit: 1 } : { path: ".", limit: 1 };
 						const narrowed = await host.execute({ turnID, id: "another-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution);
 						const native = toolName === "read" ? createReadTool(cwd) : createLsTool(cwd);
@@ -264,8 +270,14 @@ describe("speculative action host", () => {
 				await host.startTurn(startInput(tool, turnID));
 				const call = { turnID, id: turnID, tool: "read", args, tools: [tool] };
 				await host.previewActorCall(call);
-				expect((await host.execute(call, undefined, actor)).content).toEqual([{ type: "text", text: expected }]);
-				expect(actor, turnID).toHaveBeenCalledTimes(calls - (process.platform !== "win32" && calls > 1 ? 1 : 0));
+				const delivered = await host.execute(call, undefined, actor);
+				expect(delivered.content).toEqual([{ type: "text", text: expected }]);
+				delivered.content.push({ type: "text", text: "Actor-owned edit" });
+				if (calls === 1) {
+					const repeat = await host.execute({ ...call, id: `${turnID}:repeat` }, undefined, actor);
+					expect(repeat.content).toEqual([{ type: "text", text: expected }]);
+				}
+				expect(actor, turnID).toHaveBeenCalledTimes(calls + (process.platform === "win32" ? 1 : calls > 1 ? -1 : 0));
 				await host.finishTurn(turnID);
 			}
 			expect(clientFactory).not.toHaveBeenCalled();

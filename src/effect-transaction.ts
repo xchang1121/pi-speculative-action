@@ -1,5 +1,6 @@
 import { type SpeculativeExecutionRoute, validateWorldBranch, type WorldBranch, type WorldResultCapture } from "./execution-world.ts";
 import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
+import { cloneSharedData } from "./stable-json.ts";
 
 export type EffectTransactionState =
 	| "begun"
@@ -108,7 +109,7 @@ export class EffectTransactionCoordinator<Output> {
 		try {
 			const branch = await executor();
 			this.transition(owned, "executing", "sealing");
-			return this.seal(owned, branch);
+			return await this.seal(owned, branch);
 		} catch (error) {
 			owned.stateValue = "failed";
 			throw error;
@@ -128,7 +129,7 @@ export class EffectTransactionCoordinator<Output> {
 				consumed = true;
 				this.transition(owned, "begun", "sealing");
 				try {
-					return this.seal(owned, await capture.seal(output));
+					return await this.seal(owned, await capture.seal(output));
 				} catch (error) {
 					owned.stateValue = "failed";
 					await capture.dispose();
@@ -148,12 +149,18 @@ export class EffectTransactionCoordinator<Output> {
 		});
 	}
 
-	private seal(
+	private async seal(
 		attempt: MutableEffectTransactionAttempt,
 		branch: WorldBranch<Output>,
-	): EffectTransaction<Output> {
-		this.transition(attempt, "sealing", "sealed");
-		return new SealedEffectTransaction(attempt, branch);
+	): Promise<EffectTransaction<Output>> {
+		try {
+			const transaction = new SealedEffectTransaction(attempt, branch);
+			this.transition(attempt, "sealing", "sealed");
+			return transaction;
+		} catch (error) {
+			try { await branch.dispose(); } catch { /* Preserve the sealing failure. */ }
+			throw error;
+		}
 	}
 
 	private owned(attempt: EffectTransactionAttempt): MutableEffectTransactionAttempt {
@@ -177,6 +184,7 @@ export class EffectTransactionCoordinator<Output> {
 class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	private readonly attempt: MutableEffectTransactionAttempt;
 	private readonly branch: WorldBranch<Output>;
+	private readonly shared?: { readonly output: Output };
 	private validation?: ResourceValidation;
 	private validationPromise?: Promise<ResourceValidation>;
 	private commitPromise?: Promise<Output>;
@@ -186,6 +194,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	constructor(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>) {
 		this.attempt = attempt;
 		this.branch = branch;
+		if (attempt.descriptor.route.reuse === "shared_result") this.shared = { output: cloneSharedData(branch.output) };
 	}
 
 	get transactionID(): string {
@@ -201,7 +210,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	}
 
 	get output(): Output {
-		return this.branch.output;
+		return this.shared ? structuredClone(this.shared.output) : this.branch.output;
 	}
 
 	get backend(): string {
@@ -236,7 +245,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 		if (!this.branch.reconstruct || this.attempt.descriptor.route.reuse !== "shared_result") return undefined;
 		return async (request) => {
 			if (this.cleanupPromise || this.validation?.status !== "valid" || !["validated", "committed"].includes(this.state)) return undefined;
-			const task = this.branch.reconstruct!(request);
+			const task = this.branch.reconstruct!(request).then(cloneSharedData);
 			this.reconstructions.add(task);
 			try { return await task; } finally { this.reconstructions.delete(task); }
 		};
@@ -271,7 +280,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 
 	async commit(): Promise<Output> {
 		// An admitted effect keeps its original settlement, including during/after retirement.
-		if (this.commitPromise) return this.commitPromise;
+		if (this.commitPromise) return this.shared ? structuredClone(await this.commitPromise) : this.commitPromise;
 		if (this.cleanupPromise) {
 			throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
 		}
@@ -279,7 +288,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 			throw new Error(`effect transaction ${this.transactionID} requires successful validation before commit`);
 		}
 		// Reserve the entire validation → commit operation before yielding, not just its effect.
-		return this.commitPromise = (async () => {
+		this.commitPromise = (async () => {
 			await this.validationPromise;
 			if (this.validation?.status !== "valid" || this.attempt.stateValue !== "validated") {
 				throw new Error(`effect transaction ${this.transactionID} cannot commit from ${this.attempt.stateValue}`);
@@ -288,7 +297,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 			try {
 				const output = await this.branch.commit();
 				this.attempt.stateValue = "committed";
-				return output;
+				return this.shared ? this.shared.output : output;
 			} catch (error) {
 				const failure = effectCommitFailure(
 					error,
@@ -299,6 +308,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 				throw failure;
 			}
 		})();
+		return this.shared ? structuredClone(await this.commitPromise) : this.commitPromise;
 	}
 
 	abort(): Promise<void> {

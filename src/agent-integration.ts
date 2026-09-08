@@ -349,23 +349,12 @@ export function createSpeculativeActionHost(
 			const captured = await executionGateway.captureAuthoritativeResult(
 				{ operation, effect: definition.effect, requirements: definition.requirements },
 				{ cwd: options.cwd, signal },
-				(operation) => ({
-					cwd: options.cwd,
-					tool,
-					toolName: operation.tool,
-					args: operation.input,
-					action: operation.action ?? action,
-					callID: operation.callID ?? callID,
-					signal: operation.signal ?? signal,
+				{
+					cwd: options.cwd, tool, toolName, args: concrete, action, callID, signal,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
-				}),
+				},
 			);
-			if (!captured) return undefined;
-			return {
-				route: captured.route,
-				seal: (output) => captured.capture.seal(output),
-				dispose: () => captured.capture.dispose(),
-			};
+			return captured && { route: captured.route, ...captured.capture };
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, signal }) => {
@@ -397,20 +386,15 @@ export function createSpeculativeActionHost(
 		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
+			const args = structuredClone(concrete);
 			return executionGateway.executeSpeculative(
-				{ tool: toolName, callID, input: structuredClone(concrete), signal, action },
+				{ tool: toolName, callID, input: args, signal, action },
 				route,
-				(operation) => ({
-					cwd: options.cwd,
-					tool,
-					toolName: operation.tool,
-					args: operation.input,
-					action: operation.action ?? action,
-					callID: operation.callID ?? callID,
-					signal: operation.signal ?? signal,
+				{
+					cwd: options.cwd, tool, toolName, args, action, callID, signal,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
-				}),
+				},
 			);
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
