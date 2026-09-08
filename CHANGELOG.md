@@ -51,6 +51,8 @@
 
 ### Added
 
+- Dependency-free grep qualification now includes captured ancestor configurations and Git indirection,
+  keeping native repository detection and original Actor fallback. Production grep remains unchanged.
 - Explicit filesystem operations may bind a read-only capture root and inspect captured resolved names.
   The default remains the workspace; external named inputs share the existing token budget and validation.
 - Consolidated authoritative execution and observation into the gateway's single frozen settlement;

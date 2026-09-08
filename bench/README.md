@@ -35,13 +35,13 @@ mixed raw UTF-8/UTF-16/binary inputs, exact stock-Pi formatting/context/truncati
 and exactly-once native Actor fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
 file must never enter the payload evidence. One actual-rg abort barrier verifies native close and borrowed
 input cleanup before settlement; a tiny query may finish before its result-limit cancellation arrives.
-`--case=<label>` selects one semantic case. The separate 16-process link characterization checks both
+`--case=<label>[,<label>...]` selects semantic cases. The separate 16-process link characterization checks both
 `--files` and actual search: on this Windows rg, a discovered dangling junction is absent from the file
 list but makes search fail. No-follow captured entries therefore cannot alone authorize skipping it.
-The 22 semantic cases per OS cover explicit in-root links, POSIX linked ignore files and skipped FIFO/
-discovered links. Unproven external or broken targets reject speculation; the original-workspace Actor
-runs once, including its original error. Windows external discovered junctions also conservatively fall
-back because their target metadata is outside the captured namespace. No native-default behavior changes.
+The 33 semantic cases per OS cover named same-volume links, POSIX linked ignore files and skipped FIFO/
+discovered links, ancestor configurations, Git indirection and explicit Git-directory/data searches.
+Broken targets, cross-volume inputs and directory aliases combined with globs remain unqualified; the
+original-workspace Actor runs once, including its original error. No native-default behavior changes.
 
 Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
 The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
@@ -49,19 +49,28 @@ Metadata and ignore-file evidence drive rg's own file selection; only selected r
 Directory expansion is lazy: temporary, uniquely named marker files test the next frontier with rg;
 the final marker override matches only these files, never their parent directory names. Ordinary,
 caller-glob and query-local selections retain native directory precedence and explicit-root admission.
-Ignored and negative-glob subtrees must not be enumerated, including `.git`; its named exclude file is
-captured separately. A tiny ignored-subtree mutation retains adoption without extra Actor execution.
+Ignored and negative-glob subtrees must not be enumerated, including `.git` unless explicitly queried.
+Named parent configurations are captured up to the declared read-only volume root, without enumerating
+ancestors or recursively watching that root. Private path geometry preserves anchored rules; Git
+`gitdir`/`commondir` pointers address only owned controls, while selected configuration data retain their
+original bytes. Creating a formerly absent commondir or changing its exclude file invalidates adoption.
+A tiny ignored-subtree mutation retains adoption without extra Actor execution.
 This bounds ignored-tree metadata without a large fixture, but adds selection processes per depth.
 Provider-owned ancestor-directory overrides preserve explicit-root admission without interpreting user
 globs. Native [root admission](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/walk.rs) and
 [override semantics](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/overrides.rs) remain the reference.
+Keep native repository detection: `--no-require-git` also disables `.git` file indirection in the tested
+engine. Windows rg 15.2.0 and WSL rg 14.1.0 differ on `.jj` recognition; the same captured marker is
+compared against each pinned native engine, not a cross-version assumption.
 
 Omit `--semantics-only` only for a performance-stage run: larger flat fixtures, five host adoptions per
 query, and 20 abort/output-budget barriers. Native Pi, fixed-sort host Pi, startup, producer and ready-hit
 timings stay separate; the small-mode timings are not performance claims. The proposed profile explicitly
-cuts off global/above-workspace ignore inputs and sorts output. This is **not** native-default equivalence
-or production admission: Git indirection, private materialization/selection cost, broader namespaces and
-existing benefit gates still need qualification. Nothing is installed or downloaded; missing rg skips.
+disables ambient rg/global ignore configuration and sorts output; ancestor ignore files remain inputs.
+Native parent loading is disabled only on the fully materialized private namespace, preventing access
+to uncaptured host ancestors. This is **not** native-default equivalence or production admission:
+private materialization/selection cost, alias/glob namespaces and existing benefit gates still need
+qualification. Nothing is installed or downloaded; missing rg skips.
 
 ## ThinkThread real Runtime qualification
 
