@@ -5,13 +5,6 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import {
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -21,6 +14,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CreateSpeculativeActionHostOptions, SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -32,19 +26,13 @@ import {
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import * as piTools from "../src/pi-tool-invocation.ts";
+import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
+import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
 
 const roots: string[] = [];
-
-type StockToolDefinition =
-	| ReturnType<typeof createReadToolDefinition>
-	| ReturnType<typeof createBashToolDefinition>
-	| ReturnType<typeof createEditToolDefinition>
-	| ReturnType<typeof createWriteToolDefinition>
-	| ReturnType<typeof createGrepToolDefinition>
-	| ReturnType<typeof createFindToolDefinition>
-	| ReturnType<typeof createLsToolDefinition>;
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -121,7 +109,7 @@ describe("zero-modification Pi extension", () => {
 
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
 		const fixture = await createFixture({ overriddenTools: ["read"] });
-		const customRead = fixture.customTools.get("read") as ReturnType<typeof createReadToolDefinition> | undefined;
+		const customRead = fixture.customTools.get("read") as ToolDefinition | undefined;
 		await fixture.emit("session_start", {}, fixture.context);
 
 		expect(fixture.tools.has("read")).toBe(false);
@@ -148,25 +136,7 @@ describe("zero-modification Pi extension", () => {
 		);
 	});
 
-	it("delegates misses to Pi's public tool factory and records the authoritative result", async () => {
-		const fixture = await createFixture({ consume: async () => undefined });
-		await writeFile(path.join(fixture.cwd, "notes.txt"), "from upstream read", "utf8");
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.emit("context", { messages: [] }, fixture.context);
-		const read = fixture.tools.get("read");
-		const result = await read?.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
-
-		expect(result?.content).toEqual([{ type: "text", text: "from upstream read" }]);
-		expect(fixture.host.actual).toHaveBeenCalledWith(
-			expect.objectContaining({
-				tool: "read",
-				args: { path: "notes.txt" },
-				output: expect.objectContaining({ isError: false }),
-			}),
-		);
-	});
-
-	it("never lets cache or telemetry failures replace the actor's stock tool result", async () => {
+	it("records the stock Actor result without letting cache or telemetry failures replace it", async () => {
 		const fixture = await createFixture();
 		await writeFile(path.join(fixture.cwd, "notes.txt"), "authoritative", "utf8");
 		vi.mocked(fixture.host.consume).mockRejectedValue(new Error("cache failed"));
@@ -181,6 +151,56 @@ describe("zero-modification Pi extension", () => {
 		await expect(fixture.emit("turn_end", {}, fixture.context)).resolves.toBeUndefined();
 
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
+		expect(fixture.host.actual).toHaveBeenCalledWith(expect.objectContaining({
+			tool: "read", args: { path: "notes.txt" }, output: expect.objectContaining({ isError: false }),
+		}));
+	});
+
+	it("selects one search profile for both routes, fails closed, and retires it on refresh or disable", async () => {
+		const fixture = await createFixture();
+		vi.stubEnv("PI_CODING_AGENT_DIR", fixture.cwd);
+		const prepare = vi.spyOn(piTools, "createClosedSearchProfile");
+		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
+		try {
+			await fixture.emit("session_start", {}, fixture.context);
+			driveSettingsMenus(fixture, {
+				"Speculative action": ["Tools & execution", "Apply changes", "Close"],
+				"Tools & execution": ["Execution routes", "Back"],
+				"Execution routes": ["Search execution", "Back"],
+				"Search execution (grep/find)": ["Portable search"],
+			});
+			await command("");
+			expect(fixture.store.effective()).toMatchObject({ enabled: false, searchExecution: "closed" });
+			expect(prepare).not.toHaveBeenCalled();
+			await command("on");
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("npm run setup:search"), "warning");
+			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) {
+				await expect(fixture.tools.get(tool)!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("setup:search");
+			}
+			expect(prepare).toHaveBeenCalledOnce();
+			expect((await fixture.resolveInvocation("read", { path: "a" }))?.authoritative).toBeUndefined();
+			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
+			const dispose = vi.fn(async () => {});
+			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", rg: "unused", limits: { inputBytes: 1024 } },
+				pool: { request: authoritative, dispose }, invocations: new Map(piTools.PI_CLOSED_SEARCH_TOOLS.map((tool) => [tool, {
+					executor: "test-search", authoritative, filesystem: authoritative,
+					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
+				}])) });
+			await command("status"); // Explicit refresh recovers an installed/repaired setup without restarting Pi.
+			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) {
+				expect((await fixture.tools.get(tool)!.execute("bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
+				expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`${tool}\\s+On\\s+Ready\\s+Ready\\s+Ready`, "u")), "info");
+			}
+			expect(authoritative).toHaveBeenCalledTimes(2);
+			await command("status");
+			expect(dispose).toHaveBeenCalledOnce();
+			await command("off");
+			expect(dispose).toHaveBeenCalledTimes(2);
+			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
+		} finally {
+			await fixture.emit("session_shutdown", {}, fixture.context);
+			prepare.mockRestore(); vi.unstubAllEnvs();
+		}
 	});
 
 	it("preserves provider priority and admits only bound process tools before probing", async () => {
@@ -423,19 +443,12 @@ async function createFixture(options: FixtureOptions = {}) {
 	roots.push(cwd);
 	const handlers = new Map<string, Array<(event: never, context: ExtensionContext) => unknown>>();
 	const tools = new Map<string, ToolDefinition>();
-	const baseTools = new Map<string, StockToolDefinition>();
-	baseTools.set("read", createReadToolDefinition(cwd));
-	baseTools.set("bash", createBashToolDefinition(cwd));
-	baseTools.set("edit", createEditToolDefinition(cwd));
-	baseTools.set("write", createWriteToolDefinition(cwd));
-	baseTools.set("grep", createGrepToolDefinition(cwd));
-	baseTools.set("find", createFindToolDefinition(cwd));
-	baseTools.set("ls", createLsToolDefinition(cwd));
-	const actorTools = new Map<string, StockToolDefinition | ToolDefinition>(baseTools);
+	const baseTools = piTools.createPiToolDefinitions(cwd);
+	const actorTools = new Map<string, PiToolDefinition | ToolDefinition>(baseTools);
 	const toolSources = new Map<string, SourceInfo>(
 		[...baseTools.keys()].map((name) => [name, sourceInfo(`<builtin:${name}>`, "builtin")]),
 	);
-	const customTools = new Map<string, StockToolDefinition>();
+	const customTools = new Map<string, PiToolDefinition>();
 	for (const name of options.overriddenTools ?? []) {
 		const base = baseTools.get(name);
 		if (!base) throw new Error(`Unknown fixture tool override: ${name}`);
@@ -443,7 +456,7 @@ async function createFixture(options: FixtureOptions = {}) {
 			...base,
 			label: `custom ${name}`,
 			execute: vi.fn(async () => textResult(`custom ${name}`)),
-		} as StockToolDefinition;
+		} as PiToolDefinition;
 		customTools.set(name, custom);
 		actorTools.set(name, custom);
 		toolSources.set(name, sourceInfo(`custom-${name}.ts`, "cli"));
@@ -452,7 +465,9 @@ async function createFixture(options: FixtureOptions = {}) {
 		string,
 		{ handler: (args: string, context: ExtensionCommandContext) => Promise<void> | void }
 	>();
-	const host = mockHost(options.consume);
+	let hostOptions: CreateSpeculativeActionHostOptions | undefined;
+	const resolveInvocation: NonNullable<CreateSpeculativeActionHostOptions["resolveInvocation"]> = (tool, input) => hostOptions?.resolveInvocation?.(tool, input);
+	const host = mockHost(options.consume, resolveInvocation);
 	const ui = {
 		select: async (_title: string, _options: string[]) => undefined as string | undefined,
 		confirm: async (_title: string, _message?: string) => false,
@@ -477,9 +492,6 @@ async function createFixture(options: FixtureOptions = {}) {
 		thinkingLevel: "off",
 	} as unknown as ExtensionContext;
 	const store = memorySettingsStore(options.settings);
-	let getHostSettings: CreateSpeculativeActionHostOptions["getSettings"];
-	let hostExecutionWorlds: CreateSpeculativeActionHostOptions["executionWorlds"] = [];
-	let executionWorldEnabled: CreateSpeculativeActionHostOptions["speculativeExecutionWorldEnabled"];
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -500,10 +512,8 @@ async function createFixture(options: FixtureOptions = {}) {
 	} as unknown as ExtensionAPI;
 	const createExecutionWorlds = vi.fn(() => options.executionWorlds ?? []);
 	const factory = createSpeculativeActionExtension({
-		createHost: (_sessionID, hostOptions) => {
-			getHostSettings = hostOptions.getSettings;
-			hostExecutionWorlds = hostOptions.executionWorlds;
-			executionWorldEnabled = hostOptions.speculativeExecutionWorldEnabled;
+		createHost: (_sessionID, configured) => {
+			hostOptions = configured;
 			return host;
 		},
 		createSettingsStore: () => store,
@@ -515,9 +525,9 @@ async function createFixture(options: FixtureOptions = {}) {
 	};
 	return {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host,
-		executionWorlds: () => hostExecutionWorlds ?? [],
-		executionWorldEnabled: (backend: string) => executionWorldEnabled?.(backend),
-		hostSettings: async () => getHostSettings?.(), store, tools, ui,
+		executionWorlds: () => hostOptions?.executionWorlds ?? [],
+		executionWorldEnabled: (backend: string) => hostOptions?.speculativeExecutionWorldEnabled?.(backend),
+		hostSettings: async () => hostOptions?.getSettings?.(), resolveInvocation, store, tools, ui,
 	};
 }
 
@@ -539,9 +549,11 @@ function sourceInfo(path: string, source = "test"): SourceInfo {
 	return { path, source, scope: "temporary", origin: "top-level" };
 }
 
-function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefined): SpeculativeActionHost {
+function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefined,
+	resolveInvocation: NonNullable<CreateSpeculativeActionHostOptions["resolveInvocation"]>): SpeculativeActionHost {
 	const consumeMock = vi.fn(consume);
 	const actual = vi.fn();
+	const gateway = new ToolExecutionGateway([]);
 	const host: SpeculativeActionHost = {
 		sessionID: "session",
 		executionWorldDiagnostics: vi.fn(async () => portableDiagnostics()),
@@ -563,54 +575,20 @@ function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefi
 		previewActorCall: vi.fn(),
 		consume: consumeMock,
 		execute: vi.fn(async (input, signal, executor) => {
-			if (input.turnID) {
-				try {
-					const cached = await consumeMock(
-						{ ...input, turnID: input.turnID },
-						signal,
-					);
-					if (cached) return cached.result;
-				} catch {
-					// Match the production gateway's best-effort reuse contract.
-				}
-			}
-			const startedAt = performance.now();
-			try {
-				const result = await executor({
-					tool: input.tool,
-					input: input.args,
-					...(input.id ? { callID: input.id } : {}),
-					...(signal ? { signal } : {}),
-				});
-				if (input.turnID) {
-					try {
-						await actual({
-							...input,
-							turnID: input.turnID,
-							durationMs: performance.now() - startedAt,
-							output: { result, isError: false },
-						});
-					} catch {}
-				}
-				return result;
-			} catch (error) {
-				if (input.turnID) {
-					try {
-						await actual({
-							...input,
-							turnID: input.turnID,
-							durationMs: performance.now() - startedAt,
-							output: toolErrorSettlement(error),
-						});
-					} catch {}
-				}
-				throw error;
-			}
+			const invocation = await resolveInvocation(input.tool, input.args);
+			return gateway.executeAuthoritative({ tool: input.tool, input: input.args,
+				...(input.id ? { callID: input.id } : {}), ...(signal ? { signal } : {}), ...(invocation ? { invocation } : {}),
+			}, executor, input.turnID ? {
+				reuse: async () => (await consumeMock({ ...input, turnID: input.turnID! }, signal))?.result,
+				settled: async (settlement) => actual({ ...input, turnID: input.turnID!, durationMs: settlement.durationMs,
+					output: settlement.status === "succeeded" ? { result: settlement.output, isError: false } : toolErrorSettlement(settlement.error),
+				}),
+			} : {});
 		}),
 		actual,
 		finishTurn: vi.fn(),
 		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),
-		dispose: vi.fn(),
+		dispose: vi.fn(() => gateway.dispose()),
 	};
 	return host;
 }
@@ -631,7 +609,7 @@ function portableDiagnostics(
 		},
 		{
 			id: "resource_version", scope: "fallback", isolation: "resource_snapshot",
-			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read", "ls"], state: "ready", detail: "Sealed file inputs ready",
+			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, tools: ["read", "ls", ...piTools.PI_CLOSED_SEARCH_TOOLS], state: "ready", detail: "Sealed file inputs ready",
 			observation: {
 				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 				state: "ready", detail: "Resource validation ready",

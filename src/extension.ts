@@ -38,7 +38,8 @@ import {
 	PI_READ_RANGE_PROJECTION_RULE,
 	withPiProjectionCoverage,
 } from "./pi-read-projection.ts";
-import { createPiToolDefinitions, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
+import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
+import type { ToolInvocation } from "./tool-settlement.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import {
@@ -178,6 +179,7 @@ type ExecutionRoutesSnapshot = {
 	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly actorProcessReplay?: ProcessRouteSnapshot;
 	readonly primaryIDs: ReadonlySet<string>;
+	readonly searchDetail?: string;
 };
 
 export type SpeculativeSettingsStore = Pick<SpeculativeActionSettingsStore,
@@ -238,6 +240,7 @@ export function normalizeSpeculativeActionSettings(
 ) {
 	return {
 		...normalizeSpeculativeAgentSettings(input),
+		searchExecution: input?.searchExecution === "closed" ? "closed" : "native",
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
@@ -273,6 +276,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
+		`Search execution when enabled: ${settings.searchExecution === "closed" ? "Portable search (Actor and speculation)" : "Native Pi"}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
@@ -375,6 +379,21 @@ async function installController(
 		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
 	});
 	const settings = () => currentSettings;
+	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
+	type SearchRoute = { ready: Promise<SearchProfile>; profile?: SearchProfile; error?: string };
+	let search: SearchRoute | undefined;
+	const closedSearchEnabled = () => currentSettings.enabled && currentSettings.searchExecution === "closed";
+	const prepareSearch = (): Promise<SearchProfile> => {
+		if (search) return search.ready;
+		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd,
+			path.join(getAgentDir(), "speculative-action", "closed-search.wasm")).then(
+				(profile) => (entry.profile = profile), (error) => { entry.error = String(error?.message ?? error); throw error; }) };
+		search = entry; return entry.ready;
+	};
+	const resetSearch = async () => {
+		const previous = search; search = undefined;
+		await previous?.ready.then((profile) => profile.pool.dispose(), () => {});
+	};
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
 			const configured = settings().selfSpeculation;
@@ -432,7 +451,7 @@ async function installController(
 			}),
 			workspaceSandbox.createExecutionWorld(),
 			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
-				tools: PI_OPERATION_TOOLS.resources, maxBytes: () => currentSettings.resourceCacheMaxBytes,
+				tools: [...PI_OPERATION_TOOLS.resources, ...PI_CLOSED_SEARCH_TOOLS], maxBytes: () => currentSettings.resourceCacheMaxBytes,
 			}),
 		]),
 	];
@@ -452,6 +471,7 @@ async function installController(
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
 		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
+		searchDetail: !closedSearchEnabled() ? "Native Pi" : search?.error ?? (search?.profile ? "Portable search; workers start on demand" : "Portable search; not checked"),
 	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -479,6 +499,7 @@ async function installController(
 	);
 	const toolCapabilities = () => resolveToolCapabilities(
 		currentSettings, baseDefinitions.keys(), toolConflicts, executionRoutes(),
+		closedSearchEnabled() ? search?.profile?.invocations : undefined,
 	);
 	const runtimeSettings = () => ({
 		...currentSettings,
@@ -504,15 +525,21 @@ async function installController(
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
-		resolveInvocation: (tool, input) =>
-			resolvePiToolInvocation(tool, input, {
+		resolveInvocation: async (tool, input) => {
+			if (closedSearchEnabled() && PI_CLOSED_SEARCH_TOOLS.includes(tool)) {
+				const invocation = (await prepareSearch()).invocations.get(tool);
+				if (!invocation) throw new Error(`Selected search profile has no ${tool} executor`);
+				return invocation;
+			}
+			return resolvePiToolInvocation(tool, input, {
 				cwd: latestContext.cwd,
 				environment: piShellEnvironment(latestContext),
 				autoResizeImages: piToolSettings.autoResizeImages,
 				modelSupportsImages: latestContext.model?.input.includes("image") ?? true,
 				...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 				...(piToolSettings.shellCommandPrefix ? { shellCommandPrefix: piToolSettings.shellCommandPrefix } : {}),
-			}),
+			});
+		},
 		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		executionWorlds,
 		speculativeExecutionWorldEnabled,
@@ -533,6 +560,8 @@ async function installController(
 		},
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
+		if (refresh) await resetSearch();
+		if (closedSearchEnabled()) await prepareSearch().catch(() => {}); // Diagnostic failure cannot change selected Actor semantics.
 		const [, diagnostics] = await Promise.all([
 			refresh ? processCoordinator.refreshActorRoute() : undefined,
 			host.executionWorldDiagnostics(refresh && currentSettings.enabled),
@@ -581,9 +610,11 @@ async function installController(
 			if (!currentSettings.enabled || !currentSettings.selfSpeculation.enabled) selfSpeculation.reset();
 			await recoverSpeculation(() => refreshExecutionDiagnostics(
 				previous.enabled !== currentSettings.enabled ||
+				previous.searchExecution !== currentSettings.searchExecution ||
 				previous.executionRouting.primary !== currentSettings.executionRouting.primary ||
 				previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
 			));
+			if (closedSearchEnabled() && search?.error) ui?.notify(search.error, "warning");
 		},
 		attachUI: (nextUI) => {
 			ui = nextUI;
@@ -663,13 +694,15 @@ async function installController(
 					withPiProjectionCoverage(
 						operation.tool,
 						operation.input,
-						await definition.execute(
+						(operation.invocation?.authoritative ? (await operation.invocation.authoritative({
+							callID, args: operation.input, signal: operation.signal ?? new AbortController().signal,
+						})).result : await definition.execute(
 							callID,
 							operation.input as never,
 							operation.signal,
 							onUpdate as never,
 							nextContext,
-						),
+						)),
 					),
 			);
 		},
@@ -694,7 +727,7 @@ async function installController(
 				try {
 					await workspaceSandbox.dispose();
 				} finally {
-					await selfSpeculation.dispose();
+					await Promise.all([selfSpeculation.dispose(), resetSearch()]);
 				}
 			}
 		},
@@ -1227,6 +1260,12 @@ async function openExecutionRoutes(
 					: () => ctx.ui.notify("No unified execution environment is installed for this profile.", "info"),
 			);
 		}
+		actions.set(`Search execution › ${settings.searchExecution === "closed" ? "Portable search" : "Native Pi"}`, async () => {
+			const choice = await ctx.ui.select("Search execution (grep/find)", ["Native Pi (default)", "Portable search (Actor + speculation)", BACK]);
+			if (!choice || choice === BACK) return;
+			if (choice.startsWith("Portable")) ctx.ui.notify("Requires npm run setup:search. Uses fixed search engines, workspace inputs and ignore rules for BOTH Actor and speculation; not native rg/fd equivalence. Missing inputs, limits or setup errors fail the call, never silently switch semantics.", "warning");
+			await editor.setSettings({ ...settings, searchExecution: choice.startsWith("Portable") ? "closed" : "native" });
+		});
 		actions.set("Actor execution · always available", () =>
 			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"));
 		actions.set("Refresh and show capabilities", async () => {
@@ -1560,12 +1599,13 @@ function resolveToolCapabilities(
 	registered: Iterable<string>,
 	conflicts: ReadonlyMap<string, string>,
 	routes: ExecutionRoutesSnapshot,
+	bindings?: ReadonlyMap<string, ToolInvocation>,
 ): ReadonlyMap<string, ToolCapabilityRow> {
 	const registeredTools = new Set(registered);
 	const { worlds, actorProcessReplay } = routes;
 	return new Map<string, ToolCapabilityRow>(
 		KEYABLE_TOOLS.map((tool): [string, ToolCapabilityRow] => {
-			const requirements = PI_ACTION_SEMANTICS.requirements(tool);
+			const requirements = bindings?.get(tool)?.semantics?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool);
 			const unavailable = conflicts.get(tool) ?? (!registeredTools.has(tool) ? "not registered" : undefined);
 			if (unavailable || !requirements) {
 				return [tool, { predict: "unavailable", replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
@@ -1692,6 +1732,7 @@ function executionWorldSummary(
 	return [
 		"Execution capabilities:",
 		capabilityTable(tools),
+		...(routes.searchDetail ? [`Search executor: ${routes.searchDetail}`] : []),
 		"Providers:",
 		...(actorProcessReplay
 			? [`- Actor Bash history: ${processRouteLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]

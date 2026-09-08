@@ -7,6 +7,9 @@ import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from ".
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion } from "./resource-version.ts";
+import { captureStableFile } from "./filesystem-evidence.ts";
+
+export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["grep", "find"];
 
 // Pi's read resolver/sniffer are private APIs. Other versions retain observation, not assumed authority.
 export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "process", readonly string[]>> = {
@@ -108,18 +111,21 @@ export function resolvePiToolInvocation(
 	};
 }
 
-/** Explicit common search semantics. Creating the profile does not launch processes or access host input. */
+/** Validate explicit search setup without launching processes or reading workspace inputs. */
 export async function createClosedSearchProfile(cwd: string, moduleFile: string) {
 	const { CLOSED_SEARCH_PROFILE: profile } = await import(new URL("./closed-search-kernel.mjs", import.meta.url).href) as {
-		CLOSED_SEARCH_PROFILE: Readonly<{ id: string; limits: { inputBytes: number } }>;
+		CLOSED_SEARCH_PROFILE: Readonly<{ id: string; pi: string; rg: string; limits: { inputBytes: number } }>;
 	};
+	assert.equal(VERSION, profile.pi, "Closed search requires its qualified Pi version");
+	try { assert.equal((await captureStableFile(moduleFile, 4 * 1024 * 1024)).hash, profile.rg, "module integrity"); }
+	catch (cause) { throw new Error("Closed search module unavailable; run npm run setup:search in this package", { cause }); }
 	const { ClosedSearchProcessPool } = await import(new URL("./closed-search-process.mjs", import.meta.url).href);
 	const pool = new ClosedSearchProcessPool(moduleFile) as {
 		request(role: "actor" | "producer", input: unknown, options: { signal?: AbortSignal; onInput: (operation: string, target: string) => Promise<unknown> }): Promise<ToolSettlement>;
 		dispose(): Promise<void>;
 	};
 	const invocations = new Map<string, ToolInvocation>();
-	for (const tool of ["grep", "find"]) {
+	for (const tool of PI_CLOSED_SEARCH_TOOLS) {
 		const execute = async (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => {
 			const capture = view ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
 			try {

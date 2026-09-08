@@ -48,6 +48,7 @@ try {
 	} finally { assert.equal(path.dirname(rejectedModules), path.resolve(os.tmpdir())); await fs.rm(rejectedModules, { recursive: true, force: true }); }
 	const pi = {};
 	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) pi[name] = await qualifyPiSearch(name);
+	const extension = process.argv.includes("--pi-tools") ? await qualifySearchExtension() : undefined;
 	const cancellation = [];
 	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
 		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
@@ -75,8 +76,8 @@ try {
 		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started,
 		assertions: { sharedFilesystem: true, copyOnWrite: true, noGrantedHostPorts: true, moduleMemoryCapMiB: 64,
 			writeBudget: true, sparseStoreWriteBudget: true, noPartialResultOnQuotaFailure: true, fixedMetadata: true, cancellation },
-		pipeline, search: { ...search, stdout: undefined, matches }, pi,
-		admission: "qualification only: full search IPC and termination, not arbitrary shell mutations, native equivalence, or production enablement" }, null, 2));
+		pipeline, search: { ...search, stdout: undefined, matches }, pi, extension,
+		admission: "explicit portable search and TUI integration; not arbitrary Bash, native search equivalence, macOS or ThinkThread Runtime qualification" }, null, 2));
 } finally { await worker.dispose(); }
 
 async function prepareWorker(qualification = false) {
@@ -318,10 +319,86 @@ async function qualifyPiSearch(name) {
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
 			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorOnly: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
-			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence or production enablement" };
+			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence" };
 	} finally {
 		await Promise.all(journeys.map((host) => host.dispose())); await pool.dispose();
 		assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
+/** Real extension callbacks, persistent settings, workers and Runtime; only model/UI input is scripted. */
+async function qualifySearchExtension() {
+	const { createSpeculativeActionExtension } = await import("../dist/extension.js");
+	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
+	const { createPiToolDefinitions } = await import("../dist/pi-tool-invocation.js");
+	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-extension-")), cwd = path.join(root, "workspace"), agent = path.join(root, "agent");
+	const previousAgent = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agent;
+	const handlers = new Map(), commands = new Map(), registered = createPiToolDefinitions(cwd), notices = [], results = {};
+	let selected, candidate, settlement;
+	const choices = new Map(Object.entries({
+		"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
+		"Tools & execution": ["Execution routes", "Back"], "Execution routes": ["Search execution", "Back"],
+		"Search execution (grep/find)": ["Portable search"],
+	}));
+	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
+	const context = { cwd, mode: "tui", hasUI: true, model, isProjectTrusted: () => true, getSystemPrompt: () => "qualification",
+		sessionManager: { getSessionId: () => "closed-search", getSessionFile: () => undefined }, thinkingLevel: "off",
+		modelRegistry: { getAvailable: () => [model], complete: async () => fauxAssistantMessage(fauxToolCall(...selected), { stopReason: "toolUse" }) },
+		ui: { notify: (text) => notices.push(text), setStatus: () => {}, select: async (title, options) => {
+			const next = choices.get(title)?.shift(); return options.find((option) => next && option.startsWith(next));
+		} },
+	};
+	const emit = async (name, event = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, context); };
+	const command = (args) => commands.get("speculative-action").handler(args, context);
+	const invoke = (name, args) => registered.get(name).execute("actor", args, undefined, undefined, context);
+	try {
+		await fs.mkdir(cwd); await fs.mkdir(path.join(agent, "speculative-action"), { recursive: true });
+		await fs.writeFile(path.join(cwd, "notes.txt"), "before\nneedle\nafter\n");
+		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false,
+			drafterGateEnabled: false, drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
+			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
+		const module = path.join(agent, "speculative-action", "closed-search.wasm"); await fs.copyFile(moduleFile, module);
+		await createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
+			...options, onEvent: (event) => { options.onEvent?.(event);
+				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate?.resolve(event.state);
+			}, onActorActionSettled: (value) => { options.onActorActionSettled?.(value); settlement?.resolve(value.settlement); },
+		}) })({ on: (name, handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
+			registerCommand: (name, value) => commands.set(name, value), registerTool: (tool) => registered.set(tool.name, tool),
+			getActiveTools: () => [...registered.keys()], getAllTools: () => [...registered.values()].map((tool) => ({ ...tool,
+				sourceInfo: { path: `<builtin:${tool.name}>`, source: "builtin", scope: "temporary", origin: "top-level" } })),
+		});
+		await emit("session_start"); await command("");
+		assert.match(notices.join("\n"), /settings applied/);
+		for (const name of ["grep", "find"]) {
+			const args = { pattern: name === "grep" ? "needle" : "notes.txt", path: "." }; selected = [name, args];
+			await invoke(name, args); // Exclude worker startup from the warm Actor baseline.
+			const baselineAt = performance.now(), expected = await invoke(name, args), warmActorMs = performance.now() - baselineAt;
+			candidate = Promise.withResolvers(); settlement = Promise.withResolvers();
+			await emit("context", { messages: [] });
+			const completed = await bounded(candidate.promise, "extension candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
+			const arrived = performance.now(); assert.deepEqual(await invoke(name, args), expected); const hitMs = performance.now() - arrived;
+			const feedback = await bounded(settlement.promise, "extension settlement");
+			assert.equal(feedback.provider.kind, "speculative", JSON.stringify(feedback));
+			results[name] = { warmActorMs, hitMs, actorArrivalSpeedup: warmActorMs / hitMs };
+			await emit("agent_end");
+		}
+		await fs.rename(module, module + ".held"); await command("status");
+		await assert.rejects(invoke(...selected), /setup:search/); // Cannot reuse an old identity or silently switch to native search.
+		await fs.rename(module + ".held", module); await command("status"); await invoke(...selected);
+		await command("off");
+		const stock = createPiToolDefinitions(cwd).get(selected[0]);
+		assert.deepEqual(await invoke(...selected), await stock.execute("native", selected[1], undefined, undefined, context));
+		await emit("session_shutdown"); // The real store drains its publication queue at shutdown.
+		assert.equal(JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json"))).searchExecution, "closed");
+		return { results, appliedThroughTui: true, missingSetupRejected: true, refreshRecovered: true, disabledNativeActor: true };
+	} finally {
+		try { await emit("session_shutdown"); }
+		finally {
+			if (previousAgent === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgent;
+			assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
+		}
 	}
 }
 
