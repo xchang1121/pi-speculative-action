@@ -248,6 +248,10 @@
 
 ### Fixed
 
+- Candidate retirement removes the exact and projection memberships captured at insertion, without
+  recalling partial provider functions. Lookup and reuse predicates reject retired registrations,
+  including delete/reinsert of the same entry; reentrant insertion resolves the current scope.
+  Repeated insertion of one retained result preserves its existing reuse evidence.
 - Bind Actor arguments and executor metadata to owned snapshots before reuse; asynchronous binding
   and later configuration mutation cannot change the command or descriptor behind its K(a).
 - Prepare each prediction's arguments once before K(a); permission checks and execution no longer

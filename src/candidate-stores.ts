@@ -26,11 +26,16 @@ export interface ActionStoreInsertResult<Entry> extends ActionStoreLookup<Entry>
 }
 
 interface IndexedActionStoreLookup<Entry> extends ActionStoreLookup<Entry> {
-	readonly recency: number;
+	readonly indexed: IndexedEntry<Entry>;
+}
+
+interface IndexedEntry<Entry> {
+	readonly memberships: ReadonlyArray<readonly [Map<string, Set<Entry>>, string]>;
+	recency: number;
 }
 
 interface IndexedScope<Entry> {
-	readonly entries: Map<Entry, number>;
+	readonly entries: Map<Entry, IndexedEntry<Entry>>;
 	readonly exact: Map<string, Set<Entry>>;
 	readonly partitions: Map<string, Set<Entry>>;
 }
@@ -48,11 +53,10 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
-		const state = this.ensureScope(scope);
-		const existing = last(state.exact.get(entry.key.key));
+		if (this.has(scope, entry)) return entry;
+		const existing = this.getExact(scope, entry.key);
 		if (existing && !this.allowDuplicateExact) return existing;
-		this.add(state, entry);
-		return undefined;
+		return this.add(scope, entry, actionKeyProjectionPartitions(entry.key, this.projectors));
 	}
 
 	insertOrGetCompatible(
@@ -61,20 +65,23 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
 		canReuseExact: (existing: Entry) => boolean = () => true,
 	): ActionStoreInsertResult<Entry> {
-		const state = this.ensureScope(scope);
-		const exact = [...(state.exact.get(entry.key.key) ?? [])].reverse();
+		const state = this.scopesByID.get(scope);
+		const exact = [...(state?.exact.get(entry.key.key) ?? [])].reverse();
 		for (const existing of exact) {
-			if (!this.allowDuplicateExact || canReuseExact(existing)) {
+			const indexed = state!.entries.get(existing);
+			if (!indexed) continue;
+			if ((!this.allowDuplicateExact || canReuseExact(existing)) && state!.entries.get(existing) === indexed) {
 				return { entry: existing, match: { kind: "exact", distance: 0 }, inserted: false };
 			}
 		}
-		for (const candidate of this.lookupRecords(state, entry.key)) {
-			if (candidate.match.kind === "exact") continue;
-			if (!canReuseProjected(candidate.entry, candidate.match)) continue;
-			return { entry: candidate.entry, match: candidate.match, inserted: false };
+		const partitions = actionKeyProjectionPartitions(entry.key, this.projectors);
+		for (const { entry: existing, match, indexed } of this.lookupRecords(scope, entry.key, partitions)) {
+			if (match.kind === "exact" || this.scopesByID.get(scope)?.entries.get(existing) !== indexed) continue;
+			if (!canReuseProjected(existing, match) || this.scopesByID.get(scope)?.entries.get(existing) !== indexed) continue;
+			return { entry: existing, match, inserted: false };
 		}
-		this.add(state, entry);
-		return { entry, match: { kind: "exact", distance: 0 }, inserted: true };
+		const existing = this.add(scope, entry, partitions);
+		return { entry: existing ?? entry, match: { kind: "exact", distance: 0 }, inserted: !existing };
 	}
 
 	getExact(scope: Scope, action: ActionKey): Entry | undefined {
@@ -86,16 +93,20 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 	}
 
 	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Entry>[] {
-		const state = this.scopesByID.get(scope);
-		return state ? this.lookupRecords(state, action).map(({ entry, match }) => ({ entry, match })) : [];
+		if (!this.scopesByID.has(scope)) return [];
+		return this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors)).map(
+			({ entry, match }) => ({ entry, match }),
+		);
 	}
 
 	touch(scope: Scope, entry: Entry): boolean {
 		const state = this.scopesByID.get(scope);
-		if (!state?.entries.has(entry)) return false;
+		const indexed = state?.entries.get(entry);
+		if (!state || !indexed) return false;
 		state.entries.delete(entry);
-		state.entries.set(entry, this.sequence++);
-		const exact = state.exact.get(entry.key.key)!;
+		indexed.recency = this.sequence++;
+		state.entries.set(entry, indexed);
+		const exact = state.exact.get(indexed.memberships[0]![1])!;
 		exact.delete(entry);
 		exact.add(entry);
 		return true;
@@ -103,11 +114,14 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 
 	delete(scope: Scope, entry: Entry): boolean {
 		const state = this.scopesByID.get(scope);
-		if (!state?.entries.delete(entry)) return false;
-		const exact = state.exact.get(entry.key.key);
-		exact?.delete(entry);
-		if (exact?.size === 0) state.exact.delete(entry.key.key);
-		this.removeFromPartitions(state, entry);
+		const indexed = state?.entries.get(entry);
+		if (!state || !indexed) return false;
+		state.entries.delete(entry);
+		for (const [index, key] of indexed.memberships) {
+			const members = index.get(key)!;
+			members.delete(entry);
+			if (members.size === 0) index.delete(key);
+		}
 		if (state.entries.size === 0) this.scopesByID.delete(scope);
 		return true;
 	}
@@ -120,58 +134,56 @@ export class ActionStore<Scope, Entry extends ActionStoreEntry> {
 		return [...this.scopesByID.values()].flatMap((state) => [...state.entries.keys()]);
 	}
 
-	private lookupRecords(state: IndexedScope<Entry>, action: ActionKey): readonly IndexedActionStoreLookup<Entry>[] {
+	private lookupRecords(
+		scope: Scope,
+		action: ActionKey,
+		partitions: readonly string[],
+	): readonly IndexedActionStoreLookup<Entry>[] {
+		const state = this.scopesByID.get(scope);
+		if (!state) return [];
 		const candidates = new Set<Entry>();
 		for (const exact of state.exact.get(action.key) ?? []) candidates.add(exact);
-		for (const key of actionKeyProjectionPartitions(action, this.projectors)) {
+		for (const key of partitions) {
 			for (const entry of state.partitions.get(key) ?? []) candidates.add(entry);
 		}
 		const ranked: IndexedActionStoreLookup<Entry>[] = [];
 		for (const entry of candidates) {
+			const indexed = state.entries.get(entry);
+			if (!indexed) continue;
 			const match = actionKeyMatch(entry.key, action, this.projectors);
-			if (!match) continue;
-			ranked.push({ entry, match, recency: state.entries.get(entry) ?? 0 });
+			if (match) ranked.push({ entry, match, indexed });
 		}
-		ranked.sort((left, right) => left.match.distance - right.match.distance || right.recency - left.recency);
-		return ranked;
+		// A later provider callback can retire an already-ranked registration, including delete/reinsert of the same entry.
+		return ranked
+			.filter(({ entry, indexed }) => state.entries.get(entry) === indexed)
+			.sort((left, right) =>
+				left.match.distance - right.match.distance || right.indexed.recency - left.indexed.recency,
+			);
 	}
 
-	private ensureScope(scope: Scope): IndexedScope<Entry> {
-		const existing = this.scopesByID.get(scope);
-		if (existing) return existing;
-		const created: IndexedScope<Entry> = {
+	private add(scope: Scope, entry: Entry, partitions: readonly string[]): Entry | undefined {
+		// Resolve the current scope only after provider callbacks; they may have retired or replaced it.
+		const state: IndexedScope<Entry> = this.scopesByID.get(scope) ?? {
 			entries: new Map(),
 			exact: new Map(),
 			partitions: new Map(),
 		};
-		this.scopesByID.set(scope, created);
-		return created;
-	}
-
-	private add(state: IndexedScope<Entry>, entry: Entry): void {
-		if (state.entries.has(entry)) return;
-		state.entries.set(entry, this.sequence++);
-		const exact = state.exact.get(entry.key.key) ?? new Set<Entry>();
-		exact.add(entry);
-		state.exact.set(entry.key.key, exact);
-		this.addToPartitions(state, entry);
-	}
-
-	private addToPartitions(state: IndexedScope<Entry>, entry: Entry): void {
-		for (const key of actionKeyProjectionPartitions(entry.key, this.projectors)) {
-			const partition = state.partitions.get(key) ?? new Set<Entry>();
-			partition.add(entry);
-			state.partitions.set(key, partition);
+		const existing = this.allowDuplicateExact
+			? (state.entries.has(entry) ? entry : undefined)
+			: last(state.exact.get(entry.key.key));
+		if (existing) return existing;
+		const memberships = [
+			[state.exact, entry.key.key] as const,
+			...partitions.map((key) => [state.partitions, key] as const),
+		];
+		state.entries.set(entry, { memberships, recency: this.sequence++ });
+		for (const [index, key] of memberships) {
+			const members = index.get(key) ?? new Set<Entry>();
+			members.add(entry);
+			index.set(key, members);
 		}
-	}
-
-	private removeFromPartitions(state: IndexedScope<Entry>, entry: Entry): void {
-		for (const key of actionKeyProjectionPartitions(entry.key, this.projectors)) {
-			const partition = state.partitions.get(key);
-			if (!partition) continue;
-			partition.delete(entry);
-			if (partition.size === 0) state.partitions.delete(key);
-		}
+		this.scopesByID.set(scope, state);
+		return undefined;
 	}
 }
 
