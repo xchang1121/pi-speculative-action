@@ -5,21 +5,24 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { createGrepTool } from "@earendil-works/pi-coding-agent";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
+import { createClosedSearchSemantics } from "../src/pi-tool-invocation.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolveHostExecutable } from "../src/executable-path.ts";
 import { relativeFilesystemPath } from "../src/path-utils.ts";
+import { CLOSED_SEARCH_PROFILE } from "../src/closed-search-kernel.mjs";
 import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../src/closed-search-process.mjs";
 
 // Qualification only: complete stock-Pi grep on private, token-owned inputs.
 // Stock Pi runs in a bounded process; the parent owns rg, its output and completion.
 const { getToolPath } = await import(new URL("./utils/tools-manager.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
-const { resolveToCwd } = await import(new URL("./core/tools/path-utils.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+const { resolvePath } = await import(new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+const pathRules = Object.freeze({ homeDir: os.homedir(), normalizeUnicodeSpaces: true, stripAtPrefix: true });
 const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
@@ -43,10 +46,10 @@ const median = async (run) => {
 };
 try {
   const binary = await captureStableFile(await resolveHostExecutable(rg, "rg"), 32 * 1024 * 1024, true);
-  engine = Object.freeze({ sha256: binary.hash, platform: process.platform, arch: process.arch, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
+  engine = Object.freeze({ profile: CLOSED_SEARCH_PROFILE, sha256: binary.hash, platform: process.platform, arch: process.arch, pathRules, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
   ownedRg = path.join(root, process.platform === "win32" ? "rg-owned.exe" : "rg-owned");
   await fs.writeFile(ownedRg, binary.content, { flag: "wx", mode: 0o500 });
-  pool = new ClosedSearchProcessPool(new URL("./grep-process-worker.mjs", import.meta.url));
+  pool = new ClosedSearchProcessPool();
   const { preparationMs: workerPreparationMs } = await pool.run("producer", (worker) => worker.ready);
   await pool.run("actor", (worker) => worker.ready);
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
@@ -103,25 +106,22 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     executions++;
     const privateRoot = await fs.mkdtemp(path.join(root, "retained-"));
     try {
-      const relative = relativeFilesystemPath(cwd, resolveToCwd(request.args.path || ".", cwd));
-      assert.notEqual(relative, undefined, "captured query must remain in its workspace");
-      const query = { ...request.args, path: relative || "." };
+      const query = { ...request.args, path: resolvePath(request.args.path || ".", cwd, pathRules) };
       const prepared = await materializeSelected(view, cwd, privateRoot, query, signal, reads, enumerated); copies += prepared.files;
       signal.throwIfAborted();
-      return await worker.request({ root: prepared.cwd, args: prepared.args }, { signal,
-        onInput: (operation, invocation, signal, emit) => runNative(operation, { ...invocation, cwd: prepared.cwd }, signal, emit) });
+      return await worker.request({ kind: "grep", root: prepared.cwd, args: prepared.args, home: pathRules.homeDir }, { signal,
+        onInput: (operation, invocation, signal, emit) => runInput(operation, invocation, signal, emit, { cwd: prepared.cwd, inputRoot: privateRoot }) });
     } finally {
       assert.equal(path.dirname(privateRoot), root); assert.ok(path.basename(privateRoot).startsWith("retained-"));
       await fs.rm(privateRoot, { recursive: true, force: true });
     }
   }, request.signal);
   const invocation = { executor: "captured-grep-qualification", filesystemRoot: path.parse(cwd).root, identity: { engine, cwd, filesystemRoot: path.parse(cwd).root },
-    semantics: { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: "captured-grep-qualification.v3", effect: "observation",
-      requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" },
+    semantics: await createClosedSearchSemantics("grep", cwd, pathRules.homeDir),
     filesystem: execute, authoritative: (request) => {
       actorCalls++;
-      return pool.run("actor", (worker, signal) => worker.request({ root: cwd, args: request.args }, { signal,
-        onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd }, signal, emit) }), request.signal);
+      return pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: request.args, home: pathRules.homeDir }, { signal,
+        onInput: (operation, invocation, signal, emit) => runInput(operation === "process" ? "reference" : operation, invocation, signal, emit, { cwd }) }), request.signal);
     } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
@@ -133,7 +133,7 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     onActorActionSettled: ({ settlement }) => settled?.resolve(settlement),
     onEvent: (event) => {
       if (event.type === "candidate" && ["succeeded", "failed", "cancelled"].includes(event.state.status)) ready.resolve(event.state);
-      if (event.type === "prediction" && event.settlement.observation === "unobserved") ready.reject(new Error(JSON.stringify(event.settlement)));
+      if (event.type === "prediction" && event.settlement.observation === "unobserved") ready.resolve(event.settlement);
     },
   });
   const turn = { turnID: "probe", actorModel: model, actorOptions: undefined, tools, context: { systemPrompt: "qualification", messages: [], tools } };
@@ -162,14 +162,15 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     started = performance.now();
     await host.startTurn(turn);
     const completion = await ready.promise;
-    assert.equal(completion.status, rejected ? "failed" : "succeeded", JSON.stringify(completion));
+    assert.equal(completion.observation === "unobserved" ? completion.cause.code : completion.status,
+      rejected === "unkeyable" ? "action_not_keyable" : rejected ? "failed" : "succeeded", JSON.stringify(completion));
     const producerMs = performance.now() - started, materialized = copies;
     if (stableChange) { assert.deepEqual(await changed(), expected); changed = undefined; }
     if (rejected) {
       if (expected instanceof Error) await assert.rejects(actor, { message: expected.message });
       else assert.deepEqual(await actor(), expected);
-      assert.equal(executions, 1); assert.equal(actorCalls, 1);
-      return { producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected: true, actorError: expected instanceof Error };
+      assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
+      return { producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
     const adopted = await median(async () => {
       const result = await actor(); assert.deepEqual(result, expected); return result;
@@ -284,7 +285,7 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
   };
   const select = async (targets, flags = []) => {
     const output = [], diagnostic = []; let bytes = 0;
-    const { code } = await runNative("selection", { file: rg, cwd: privateCwd, args: ["--files", "--null", "--hidden", ...flags, "--", ...targets],
+    const { code } = await runInput("selection", { file: rg, cwd: privateCwd, args: ["--files", "--null", "--hidden", ...flags, "--", ...targets],
       options: { stdio: ["ignore", "pipe", "pipe"] } }, signal,
       ({ fd, data }) => { assert.ok((bytes += data.length) <= 1024 * 1024, "selected name budget"); (fd === 1 ? output : diagnostic).push(data); });
     assert.ok(code === 0 || code === 1, Buffer.concat(diagnostic).toString());
@@ -345,7 +346,7 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
     if (source !== undefined && selected.has(target)) await load(source, target); // Restore raw config bytes after private-only pointer/ancestor transport.
     else { assert.notEqual(relativeFilesystemPath(privateVolume, target), undefined); await fs.unlink(target); }
   }
-  return { files: loaded.size, cwd: privateCwd, args: { ...query, path: logicalTarget } };
+  return { files: loaded.size, cwd: privateCwd, args: { ...query, path: pathToFileURL(logicalTarget).href } };
 }
 
 async function qualifyNativeLinks() {
@@ -360,7 +361,7 @@ async function qualifyNativeLinks() {
     await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
     for (const explicit of [false, true]) for (const mode of ["files", "search"]) {
       const chunks = [], signal = AbortSignal.timeout(3000);
-      const result = await runNative("reference", { file: rg, cwd, args: [...(mode === "files" ? ["--files", "--null"] : ["--json"]), "--hidden", "--", ...(mode === "search" ? ["needle"] : []), explicit ? link : search],
+      const result = await runInput("reference", { file: rg, cwd, args: [...(mode === "files" ? ["--files", "--null"] : ["--json"]), "--hidden", "--", ...(mode === "search" ? ["needle"] : []), explicit ? link : search],
         options: { stdio: ["ignore", "pipe", "pipe"] } }, signal, ({ fd, data }) => chunks.push({ fd, data: data.toString() }));
       assert.equal(result.code, kind === "dangling" && (explicit || process.platform === "win32" && mode === "search") ? 2 : 0);
       const output = chunks.filter(({ fd }) => fd === 1).map(({ data }) => data).join("");
@@ -385,6 +386,7 @@ async function qualifyNamespace() {
     "search/skip.tmp": "needle excluded by dot ignore\n", "search/skip.log": "needle excluded by gitignore\n",
     "search/excluded.txt": "needle excluded by git info\n", "search/ignored.txt": "needle excluded by root\n",
     "search/中文 name.txt": "n.e and NEEDLE unicode\n", "search/é.txt": "needle composed\n", "search/e\u0301.txt": "needle decomposed\n",
+    "search/encoded\u00a0name.txt": "needle encoded nonbreaking name\n",
     "search/utf16.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("before\r\nneedle unicode\r\nafter\r\n", "utf16le")]),
     "search/binary.txt": Buffer.from("before\0needle binary\0after"), "search/long.txt": "needle " + "x".repeat(4096),
     "rules/shared-ignore": "hidden.txt\n", "search/linked-config/hidden.txt": "needle filtered by linked config\n",
@@ -440,6 +442,12 @@ async function qualifyNamespace() {
   const checks = [];
   for (const [label, args, rejected, workspace = cwd, configurationMutation] of [
     ["directory-ignore", { path: "search", pattern: "needle", limit: 1000 }],
+    ["path-at-prefix", { path: "@search", pattern: "needle" }],
+    ["path-absolute", { path: path.join(cwd, "search"), pattern: "needle" }],
+    ["path-file-url", { path: pathToFileURL(path.join(cwd, "search")).href, pattern: "needle" }],
+    ["path-encoded-name", { path: pathToFileURL(path.join(cwd, "search/encoded\u00a0name.txt")).href, pattern: "needle", context: 1 }],
+    ["path-home", { path: "~/" + path.relative(pathRules.homeDir, path.join(cwd, "search")).split(path.sep).join("/"), pattern: "needle", glob: "search/a.txt" }],
+    ["path-external", { path: outside, pattern: "needle" }, "unkeyable"],
     ["nested-search", { path: "search/nested", pattern: "needle" }],
     ["glob", { path: "search", pattern: "needle", glob: "**/{a,z}.txt" }],
     ["glob-override", { path: "search", pattern: "needle", glob: "*.tmp" }],
@@ -482,8 +490,8 @@ async function qualifyNamespace() {
     ["explicit-git-directory", { path: ".git", pattern: "ref:" }],
   ]) {
     if (selectedCases.size && !selectedCases.has(label)) continue;
-    const reference = async () => (await pool.run("actor", (worker, signal) => worker.request({ root: workspace, args }, { signal,
-      onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd: workspace }, signal, emit),
+    const reference = async () => (await pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: workspace, args, home: pathRules.homeDir }, { signal,
+      onInput: (operation, invocation, signal, emit) => runInput(operation === "process" ? "reference" : operation, invocation, signal, emit, { cwd: workspace }),
     }))).result;
     const expected = await reference().catch((error) => { if (!rejected) throw error; return error; });
     if (label === "limit") assert.equal(expected.details?.matchLimitReached, 1);
@@ -513,14 +521,20 @@ async function qualifyNamespace() {
   return { mode: "small-semantic-fixture", checks, qualification: "Full host key/route/transaction/adoption; content, ignore rules and negative names each invalidate before one Actor fallback. Timings are not performance claims." };
 }
 
-async function runNative(operation, invocation, signal, emit, onSpawn) {
+async function runInput(operation, invocation, signal, emit, { cwd, inputRoot, onSpawn } = {}) {
+  signal.throwIfAborted();
+  if (operation === "stat" || operation === "readFile") {
+    assert.equal(typeof invocation, "string");
+    if (inputRoot) assert.notEqual(relativeFilesystemPath(inputRoot, invocation), undefined, "worker input escaped its owned tree");
+    return operation === "stat" ? { directory: (await fs.stat(invocation)).isDirectory() } : fs.readFile(invocation, { signal });
+  }
   assert.ok(operation === "process" || operation === "selection" || operation === "reference");
   assert.ok(invocation.file === "rg" || invocation.file === rg, "only the previously discovered executable");
   assert.deepEqual(invocation.options, { stdio: ["ignore", "pipe", "pipe"] });
   signal.throwIfAborted();
   const flags = operation === "reference" ? nativeFlags.filter((flag) => flag !== "--no-ignore-parent") : nativeFlags;
   const child = spawn(ownedRg, [...flags, ...(operation === "process" ? ["--no-ignore"] : []), ...invocation.args],
-    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, cwd: invocation.cwd ?? root,
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, cwd: cwd ?? invocation.cwd ?? root,
       env: { HOME: root, LC_ALL: "C", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) } });
   nativeProcesses++;
   return await new Promise((resolve, reject) => {
@@ -542,15 +556,16 @@ async function runNative(operation, invocation, signal, emit, onSpawn) {
 }
 
 async function qualifyCancellation(cwd, mode) {
-  const interrupted = launchClosedSearchWorker(new URL("./grep-process-worker.mjs", import.meta.url));
+  const interrupted = launchClosedSearchWorker();
   const controller = new AbortController(), closed = Promise.withResolvers(), release = Promise.withResolvers();
   const before = nativeClosed; let settled = false;
   try {
     await interrupted.ready;
     const args = mode === "abort" ? { pattern: "^\\w{60}$" } : { pattern: ".", limit: Number.MAX_SAFE_INTEGER };
-    const execution = interrupted.request({ root: cwd, args }, {
-      signal: controller.signal, onInput: async (...args) => {
-        try { return await runNative(...args, mode === "abort" ? () => controller.abort(0) : undefined); }
+    const execution = interrupted.request({ kind: "grep", root: cwd, args, home: pathRules.homeDir }, {
+      signal: controller.signal, onInput: async (operation, invocation, signal, emit) => {
+        if (operation !== "process") return runInput(operation, invocation, signal, emit, { cwd });
+        try { return await runInput(operation, invocation, signal, emit, { cwd, onSpawn: mode === "abort" ? () => controller.abort(0) : undefined }); }
         finally { closed.resolve(); await release.promise; }
       },
     });

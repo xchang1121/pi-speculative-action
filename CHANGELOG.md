@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Closed-search v4 binds HOME in executor identity and keeps prepared arguments unchanged in K(a).
+  Worker requests now take `{ kind, root, home, args }`; bootstrap environment is not invocation identity.
 - Search pool `run(role, operation, signal)` replaces request forwarding: the lease now owns input
   preparation and final cleanup as well as the worker. Retirement cancels producers, drains Actors,
   and retains outstanding cleanup even after a worker has physically closed.
@@ -54,6 +56,9 @@
 
 ### Added
 
+- Find and grep qualification share the existing bounded search worker and its owned process/input
+  protocol. Removed the separate grep worker and secondary tool discovery; no production grep route
+  is enabled. OS input errors retain stock Pi handling, while unproven input authority rejects the call.
 - Bounded grep cost qualification (`--cost-only`, optionally `--case=repository,unicode`) trains the
   same Host on original Actor calls before measuring adoption, reports fallback separately, and checks
   exact-once Actor execution without changing the benefit gate or enabling production grep.

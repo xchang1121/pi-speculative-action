@@ -4,7 +4,7 @@ import {
 	getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { asRecord, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion } from "./resource-version.ts";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -113,6 +113,7 @@ export function resolvePiToolInvocation(
 
 /** Bind captured-input searches without installing anything or reading workspace inputs. */
 export async function createClosedSearchProfile(cwd: string) {
+	const home = os.homedir();
 	const { CLOSED_SEARCH_PROFILE: profile, loadSearchEngines } = await import(new URL("./closed-search-kernel.mjs", import.meta.url).href) as {
 		CLOSED_SEARCH_PROFILE: Readonly<{ id: string; pi: string; limits: { inputBytes: number } }>;
 		loadSearchEngines(): Promise<unknown>;
@@ -134,19 +135,35 @@ export async function createClosedSearchProfile(cwd: string) {
 			try {
 				const input = view ?? capture?.view;
 				if (!input) throw new Error("closed search input capture unavailable");
-				return await worker.request({ kind: tool, root: cwd, args: request.args }, {
+				return await worker.request({ kind: tool, root: cwd, home, args: request.args }, {
 					signal, onInput: (operation, target) => readClosedSearchInput(input, cwd, operation, target, profile.limits.inputBytes),
 				});
 			} finally { capture?.release(); }
 		}, request.signal);
 		invocations.set(tool, Object.freeze({
-			executor: profile.id, identity: Object.freeze({ profile, cwd }),
-			semantics: Object.freeze({ ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: profile.id,
-				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" }),
+			executor: profile.id, identity: Object.freeze({ profile, cwd, home }),
+			semantics: await createClosedSearchSemantics(tool, cwd, home),
 			authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
 		} satisfies ToolInvocation));
 	}
 	return { profile, pool, invocations: invocations as ReadonlyMap<string, ToolInvocation> };
+}
+
+/** Index paths with the bound resolver; replay the exact prepared arguments, never a second normalization. */
+export async function createClosedSearchSemantics(tool: string, cwd: string, homeDir: string): Promise<ActionSemanticsDefinition> {
+	assert.ok(tool === "find" || tool === "grep");
+	const { CLOSED_SEARCH_PROFILE: profile } = await import(new URL("./closed-search-kernel.mjs", import.meta.url).href);
+	const { resolvePath } = await import(new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+	return Object.freeze({ ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: profile.id,
+		effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs",
+		canonicalize: (input: unknown) => {
+			const record = asRecord(input);
+			if (!record || typeof record.pattern !== "string" || (record.path !== undefined && typeof record.path !== "string")) return undefined;
+			const target = resolvePath(record.path || ".", cwd, { homeDir, normalizeUnicodeSpaces: true, stripAtPrefix: true });
+			const relative = relativeFilesystemPath(cwd, target);
+			return relative === undefined ? undefined : { input: record, resources: [slash(relative || ".")] };
+		},
+	});
 }
 
 /** Translate a closed namespace using only captured positive/negative evidence, never ambient host fs. */
@@ -177,3 +194,4 @@ export async function readClosedSearchInput(source: ToolFilesystemOperations, ro
 }
 import assert from "node:assert/strict";
 import path from "node:path";
+import os from "node:os";

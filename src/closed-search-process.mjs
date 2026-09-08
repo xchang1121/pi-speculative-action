@@ -5,12 +5,11 @@ import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 
 /** Reuse capacity, never results. Each lease owns preparation, worker inputs and final cleanup. */
 export class ClosedSearchProcessPool {
-	#workers = new Map(); #idle = new Map(); #retirement; #entry;
-	constructor(entry) { this.#entry = entry; }
+	#workers = new Map(); #idle = new Map(); #retirement;
 	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		signal?.throwIfAborted();
-		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(this.#entry), controller = new AbortController();
+		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(), controller = new AbortController();
 		const executionSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 		this.#idle.delete(role);
 		if (!this.#workers.has(worker)) void worker.closure.then(() => {
@@ -45,7 +44,7 @@ export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel
 	const { limits } = CLOSED_SEARCH_PROFILE, started = performance.now();
 	const child = fork(entry, [], {
 		execArgv: ["--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
-		env: { ...CLOSED_SEARCH_PROFILE.environment, ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+		env: { ...CLOSED_SEARCH_PROFILE.bootstrapEnvironment, ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
 	});
 	const ready = Promise.withResolvers(), closure = Promise.withResolvers();
 	let pending, failure, closed = false, prepared = false, nextID = 0, diagnosticBytes = 0, diagnostic = "";

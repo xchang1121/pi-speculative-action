@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { describe, expect, test } from "vitest";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -83,15 +84,40 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 			expect(loaded.extensions).toHaveLength(1);
 			await fs.writeFile(path.join(cwd, "notes.txt"), "captured");
 			for (const phase of ["preparation", "cleanup"]) {
-				const { pool, invocations } = await createClosedSearchProfile(cwd);
+				const environment = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+				const bound = (async () => {
+					process.env.HOME = process.env.USERPROFILE = cwd;
+					try { return await createClosedSearchProfile(cwd); }
+					finally { for (const [name, value] of Object.entries(environment)) if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+				})();
+				const { pool, invocations } = await bound;
 				let reached!: () => void, resume!: () => void;
 				const started = new Promise<void>((resolve) => { reached = resolve; }), paused = new Promise<void>((resolve) => { resume = resolve; });
 				try {
 					const find = invocations.get("find")!;
+					expect(find.identity).toMatchObject({ home: cwd });
 					const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
 					expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
 					expect(invocations.has("grep")).toBe(false);
 					expect(await fs.readdir(agentDir)).toEqual([]);
+					const homeResult = () => find.authoritative!({ callID: "home", args: { pattern: "*.txt", path: "~" }, signal: new AbortController().signal }).catch((error: Error) => error.message);
+					const homeBefore = await homeResult();
+					for (const target of ["~", "@.", pathToFileURL(cwd).href]) {
+						const args = { pattern: "*.txt", path: target };
+						const key = PI_ACTION_SEMANTICS.buildKey("find", args, cwd, "", { fingerprint: "bound-home", semantics: find.semantics })!;
+						expect(key?.input).toEqual(args); // Indexing must not rewrite already-prepared execution inputs.
+						expect(key.resources).toEqual(["."]);
+						expect(await find.authoritative!({ callID: "key", args: key.input, signal: new AbortController().signal })).toEqual(result);
+					}
+					expect(homeBefore).toEqual(result); // Parent HOME changed back after binding; both key and worker retain it.
+					for (const code of [undefined, "EACCES", "EIO"]) {
+						const requested: string[] = [];
+						await expect(pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: { pattern: "captured" }, home: agentDir }, {
+							signal, onInput: async (operation) => { requested.push(operation); throw Object.assign(new Error("ungranted input"), { code }); },
+						}))).rejects.toThrow(code ? `Path not found: ${cwd}` : "ungranted input");
+						expect(requested).toEqual(["stat"]); // No process or ambient file access before the caller grants it.
+					}
+					expect(await homeResult()).toEqual(homeBefore); // A grep home binding cannot drift a later find invocation.
 					let entered = 0, retired = false;
 					const executions = Promise.allSettled((["actor", "producer"] as const).map((role) => pool.run(role, async (worker, signal) => {
 						if (phase === "cleanup") await worker.dispose(); // A closed worker must not erase its still-active cleanup owner.

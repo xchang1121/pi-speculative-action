@@ -19,7 +19,7 @@ try {
 			const arrived = performance.now(); let entered = false;
 			const reason = inputWait ? 0 : new Error("cancelled running guest");
 			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(reason); };
-			await assert.rejects(interrupted.request(inputWait ? { kind: "find", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
+			await assert.rejects(interrupted.request(inputWait ? { kind: "find", root: process.cwd(), home: os.homedir(), args: { pattern: "needle" } } : { kind: "spin" }, {
 				signal: controller.signal, timeoutMs: mode.endsWith("deadline") ? 200 : 5000,
 				onStarted: () => { if (!inputWait) abort(); },
 				onInput: async (_operation, _target, signal) => {
@@ -73,7 +73,7 @@ async function qualifyPiSearch(name) {
 				reads.add(path.posix.join("/workspace", path.relative(root, target).split(path.sep).join("/")));
 				return view.readFile(target, ...options);
 			} };
-			const output = await worker.request({ kind: name, root, args: request.args },
+			const output = await worker.request({ kind: name, root, home: bound.identity.home, args: request.args },
 				{ signal, onInput: async (operation, target) => {
 					inputRequests++;
 					const value = await readClosedSearchInput(observed, root, operation, target, profile.limits.inputBytes);
@@ -192,7 +192,7 @@ async function qualifyPiSearch(name) {
 		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
 		assert.ok(!reads.has("/workspace/search/ignored.bin") && !reads.has("/workspace/search/ignored.txt"), "the broker transferred ignored content");
-		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, args }, {
+		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, home: bound.identity.home, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		})), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
 		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;

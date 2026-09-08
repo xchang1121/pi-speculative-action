@@ -13,5 +13,5 @@ const kernel = await createClosedSearchKernel();
 await assert.rejects(createClosedSearchKernel(), /own bounded process lifetime/);
 serveClosedSearchWorker((input, readInput) => {
 	if (input.kind === "spin") for (;;) {}
-	return kernel.execute(input.kind, input.root, input.args, readInput);
+	return kernel.execute(input, readInput);
 });
