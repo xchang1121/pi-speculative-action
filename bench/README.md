@@ -27,13 +27,21 @@ npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
 
 ```sh
 node --experimental-strip-types bench/grep-captured-qualification.mjs --semantics-only
+node --experimental-strip-types bench/grep-captured-qualification.mjs --links-only
 ```
 
 The low-load mode checks small nested fixtures, native glob/ignore precedence, explicit ignored roots,
 mixed raw UTF-8/UTF-16/binary inputs, exact stock-Pi formatting/context/truncation, complete host adoption,
-and exactly-once fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
+and exactly-once native Actor fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
 file must never enter the payload evidence. One actual-rg abort barrier verifies native close and borrowed
 input cleanup before settlement; a tiny query may finish before its result-limit cancellation arrives.
+`--case=<label>` selects one semantic case. The separate 16-process link characterization checks both
+`--files` and actual search: on this Windows rg, a discovered dangling junction is absent from the file
+list but makes search fail. No-follow captured entries therefore cannot alone authorize skipping it.
+The 19 semantic cases per OS cover explicit in-root links, POSIX linked ignore files and skipped FIFO/
+discovered links. Unproven external or broken targets reject speculation; the original-workspace Actor
+runs once, including its original error. Windows external discovered junctions also conservatively fall
+back because their target metadata is outside the captured namespace. No native-default behavior changes.
 
 Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
 The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
@@ -46,7 +54,7 @@ Omit `--semantics-only` only for a performance-stage run: larger flat fixtures, 
 query, and 20 abort/output-budget barriers. Native Pi, fixed-sort host Pi, startup, producer and ready-hit
 timings stay separate; the small-mode timings are not performance claims. The proposed profile explicitly
 cuts off global/above-workspace ignore inputs and sorts output. This is **not** native-default equivalence
-or production admission: link/special-entry closure, private materialization cost, broader namespaces and
+or production admission: Git indirection, private materialization cost, broader namespaces and
 existing benefit gates still need qualification. Nothing is installed or downloaded; missing rg skips.
 
 ## ThinkThread real Runtime qualification

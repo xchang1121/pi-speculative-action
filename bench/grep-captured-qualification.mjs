@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createGrepTool } from "@earendil-works/pi-coding-agent";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
-import { captureResourceVersion } from "../src/resource-version.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolveHostExecutable } from "../src/executable-path.ts";
 import { relativeFilesystemPath } from "../src/path-utils.ts";
@@ -22,7 +22,7 @@ const { resolveToCwd } = await import(new URL("./core/tools/path-utils.js", impo
 const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
-const semanticOnly = process.argv.includes("--semantics-only");
+const linksOnly = process.argv.includes("--links-only"), semanticOnly = linksOnly || process.argv.includes("--semantics-only");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
 let worker, actorWorker, ownedRg, engine;
 let nativeProcesses = 0, nativeClosed = 0, nativeCancels = 0;
@@ -49,7 +49,7 @@ try {
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
   if (semanticOnly) {
     process.env.RIPGREP_CONFIG_PATH = configuration;
-    report.push(await qualifyNamespace());
+    report.push(await (linksOnly ? qualifyNativeLinks() : qualifyNamespace()));
   }
   for (const row of rows) {
     const cwd = path.join(root, row.label); await fs.mkdir(cwd);
@@ -75,13 +75,13 @@ try {
   const resultLimitCancels = nativeCancels;
   if (!semanticOnly) assert.ok(resultLimitCancels > 0, "Pi's result-limit stop must reach the native process");
   const cancellation = {};
-  for (let repeat = 0; repeat < (semanticOnly ? 1 : 20); repeat++) {
+  for (let repeat = 0; repeat < (linksOnly ? 0 : semanticOnly ? 1 : 20); repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
     cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : "unicode"), mode);
   }
   assert.equal(nativeClosed, nativeProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
-    nativeProcesses, nativeClosed, resultLimitCancels, cancellationRepeats: semanticOnly ? 1 : 20,
+    nativeProcesses, nativeClosed, resultLimitCancels, cancellationRepeats: linksOnly ? 0 : semanticOnly ? 1 : 20,
     qualification: "Explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Not native-default equivalence or production admission; metadata traversal cost, unsupported filesystem entries and benefit gates remain material." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
@@ -91,23 +91,20 @@ try {
   await fs.rm(root, { recursive: true, force: true });
 }
 
-async function qualifyCaptured(cwd, args, expected, changed) {
+async function qualifyCaptured(cwd, args, expected, changed, rejected = false) {
   const ready = Promise.withResolvers(), started = performance.now(), reads = new Set(); let executions = 0, copies = 0, actorCalls = 0;
   const execute = async (view, request) => {
-    if (view) executions++; else actorCalls++;
-    const capture = view ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, 8 * 1024 * 1024);
+    executions++;
     const privateRoot = await fs.mkdtemp(path.join(root, "retained-"));
     try {
-      const source = view ?? capture.view;
       const relative = relativeFilesystemPath(cwd, resolveToCwd(request.args.path || ".", cwd));
       assert.notEqual(relative, undefined, "captured query must remain in its workspace");
       const query = { ...request.args, path: relative || "." };
-      copies += await materializeSelected(source, cwd, privateRoot, query, request.signal, reads);
+      copies += await materializeSelected(view, cwd, privateRoot, query, request.signal, reads);
       request.signal.throwIfAborted();
-      return await (view ? worker : actorWorker).request({ root: privateRoot, args: query }, { signal: request.signal,
+      return await worker.request({ root: privateRoot, args: query }, { signal: request.signal,
         onInput: (operation, invocation, signal, emit) => runNative(operation, { ...invocation, cwd: privateRoot }, signal, emit) });
     } finally {
-      capture?.release();
       assert.equal(path.dirname(privateRoot), root); assert.ok(path.basename(privateRoot).startsWith("retained-"));
       await fs.rm(privateRoot, { recursive: true, force: true });
     }
@@ -115,7 +112,11 @@ async function qualifyCaptured(cwd, args, expected, changed) {
   const invocation = { executor: "captured-grep-qualification", identity: { engine, cwd },
     semantics: { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: "captured-grep-qualification.v2", effect: "observation",
       requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" },
-    filesystem: (view, request) => execute(view, request), authoritative: (request) => execute(undefined, request) };
+    filesystem: execute, authoritative: (request) => {
+      actorCalls++;
+      return actorWorker.request({ root: cwd, args: request.args }, { signal: request.signal,
+        onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd }, signal, emit) });
+    } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
   const host = createSpeculativeActionHost("probe", {
@@ -134,8 +135,15 @@ async function qualifyCaptured(cwd, args, expected, changed) {
     async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
   try {
     await host.startTurn(turn);
-    const completion = await ready.promise; assert.equal(completion.status, "succeeded", JSON.stringify(completion));
+    const completion = await ready.promise;
+    assert.equal(completion.status, rejected ? "failed" : "succeeded", JSON.stringify(completion));
     const producerMs = performance.now() - started, materialized = copies;
+    if (rejected) {
+      if (expected instanceof Error) await assert.rejects(actor, { message: expected.message });
+      else assert.deepEqual(await actor(), expected);
+      assert.equal(executions, 1); assert.equal(actorCalls, 1);
+      return { producerMs, producerCalls: executions, actorCalls, reads: [...reads], rejected: true, actorError: expected instanceof Error };
+    }
     const adopted = await median(async () => {
       const result = await actor(); assert.deepEqual(result, expected); return result;
     });
@@ -147,23 +155,32 @@ async function qualifyCaptured(cwd, args, expected, changed) {
 
 /** Metadata/config selects files with rg itself; ignored payloads never enter the captured view. */
 async function materializeSelected(view, cwd, destination, query, signal, reads) {
-  const files = new Map(), loaded = new Set(); let entries = 0;
+  const files = new Map(), loaded = new Set(), sourceTarget = path.resolve(cwd, query.path); let entries = 0;
   const load = async (source, target) => {
     signal.throwIfAborted(); reads.add(path.relative(cwd, source));
     await fs.writeFile(target, await view.readFile(source)); loaded.add(target);
   };
   const walk = async (source, target) => {
     signal.throwIfAborted(); assert.ok(entries++ < 4096, "metadata entry budget");
-    if ((await view.stat(source, "type")).isDirectory()) {
+    const entry = await view.stat(source, "entry"), configuration = [".gitignore", ".ignore", ".rgignore"].includes(path.basename(source)) ||
+      path.relative(cwd, source).split(path.sep).join("/").endsWith(".git/info/exclude");
+    if (entry.type === "symlink" && !configuration && relativeFilesystemPath(source, sourceTarget) === undefined) {
+      // Windows search opens discovered link metadata even when --files skips it. Unproven targets
+      // must reach the original Actor, never silently turn an rg traversal error into a successful hit.
+      if (process.platform === "win32" && relativeFilesystemPath(sourceTarget, source) !== undefined) await view.stat(source, "type");
+      return;
+    }
+    if (entry.type === "special") { assert.ok(!configuration && source !== sourceTarget, "special search input"); return; }
+    if ((entry.type === "symlink" ? await view.stat(source, "type") : entry).isDirectory()) {
       if (target !== destination) await fs.mkdir(target);
       for (const name of await view.readdir(source)) {
         assert.equal(path.basename(name), name); assert.ok(name !== "." && name !== "..");
         await walk(path.join(source, name), path.join(target, name));
       }
     } else {
+      assert.notEqual(path.basename(source), ".git", "git indirection is not qualified");
       files.set(target, source); await fs.writeFile(target, "", { flag: "wx" });
-      if ([".gitignore", ".ignore", ".rgignore"].includes(path.basename(source)) || path.relative(cwd, source).split(path.sep).join("/").endsWith(".git/info/exclude"))
-        await load(source, target);
+      if (configuration) await load(source, target);
     }
   };
   await walk(cwd, destination);
@@ -206,9 +223,33 @@ async function materializeSelected(view, cwd, destination, query, signal, reads)
   return loaded.size;
 }
 
+async function qualifyNativeLinks() {
+  const checks = [];
+  for (const kind of ["internal", "external", "dangling", "cycle"]) {
+    const cwd = path.join(root, `link-${kind}`), search = path.join(cwd, "search"), payload = path.join(cwd, "payload");
+    await fs.mkdir(cwd); await fs.mkdir(search); await fs.mkdir(payload);
+    await fs.writeFile(path.join(payload, "value.txt"), "needle\n");
+    await fs.writeFile(path.join(search, "value.txt"), "needle\n");
+    const external = path.join(root, `outside-${kind}`); await fs.mkdir(external); await fs.writeFile(path.join(external, "value.txt"), "needle\n");
+    const link = path.join(search, "link"), target = { internal: payload, external, dangling: path.join(cwd, "missing"), cycle: search }[kind];
+    await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+    for (const explicit of [false, true]) for (const mode of ["files", "search"]) {
+      const chunks = [], signal = AbortSignal.timeout(3000);
+      const result = await runNative("reference", { file: rg, cwd, args: [...(mode === "files" ? ["--files", "--null"] : ["--json"]), "--hidden", "--", ...(mode === "search" ? ["needle"] : []), explicit ? link : search],
+        options: { stdio: ["ignore", "pipe", "pipe"] } }, signal, ({ fd, data }) => chunks.push({ fd, data: data.toString() }));
+      assert.equal(result.code, kind === "dangling" && (explicit || process.platform === "win32" && mode === "search") ? 2 : 0);
+      const output = chunks.filter(({ fd }) => fd === 1).map(({ data }) => data).join("");
+      const paths = mode === "files" ? output.split("\0").filter(Boolean) : output.split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((event) => event.type === "match").map((event) => event.data.path.text);
+      assert.deepEqual(paths, kind === "dangling" && explicit ? [] : [path.join(explicit ? link : search, "value.txt")]);
+      checks.push({ kind, explicit, mode, ...result, paths });
+    }
+  }
+  return { mode: "native-link-characterization", checks };
+}
+
 async function qualifyNamespace() {
   const cwd = path.join(root, "namespace"); await fs.mkdir(cwd);
-  for (const directory of [".git", ".git/info", "search", "search/nested", "search/empty", "search/blocked"]) await fs.mkdir(path.join(cwd, directory));
+  for (const directory of [".git", ".git/info", "search", "search/nested", "search/empty", "search/blocked", "search/linked-config", "rules"]) await fs.mkdir(path.join(cwd, directory));
   const fixtures = {
     ".git/HEAD": "ref: refs/heads/main\n", ".git/info/exclude": "excluded.txt\n",
     ".gitignore": "ignored.*\nsearch/blocked/\n", ".ignore": "*.tmp\n", "search/.gitignore": "*.log\n",
@@ -221,12 +262,27 @@ async function qualifyNamespace() {
     "search/中文 name.txt": "n.e and NEEDLE unicode\n", "search/é.txt": "needle composed\n", "search/e\u0301.txt": "needle decomposed\n",
     "search/utf16.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("before\r\nneedle unicode\r\nafter\r\n", "utf16le")]),
     "search/binary.txt": Buffer.from("before\0needle binary\0after"), "search/long.txt": "needle " + "x".repeat(4096),
+    "rules/shared-ignore": "hidden.txt\n", "search/linked-config/hidden.txt": "needle filtered by linked config\n",
+    "search/linked-config/visible.txt": "needle visible beside linked config\n",
   };
   for (const [name, contents] of Object.entries(fixtures)) await fs.writeFile(path.join(cwd, name), contents);
+  const outside = path.join(root, "outside-namespace"); await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "external.txt"), "needle outside captured namespace\n");
+  const directoryLink = process.platform === "win32" ? "junction" : "dir";
+  for (const [name, target] of [["internal-link", path.join(cwd, "search/nested")], ["external-link", outside],
+    ["dangling-link", path.join(cwd, "missing")], ["cycle-link", path.join(cwd, "search")]]) {
+    const parent = process.platform === "win32" && ["external-link", "dangling-link"].includes(name) ? path.join(cwd, `edge-${name}`) : path.join(cwd, "search");
+    await fs.mkdir(parent, { recursive: true }); await fs.symlink(target, path.join(parent, name), directoryLink);
+  }
+  if (process.platform !== "win32") {
+    await fs.symlink(path.join(cwd, "search/a.txt"), path.join(cwd, "search/file-link"));
+    await fs.symlink(path.join(cwd, "rules/shared-ignore"), path.join(cwd, "search/linked-config/.ignore"));
+  } else await fs.writeFile(path.join(cwd, "search/linked-config/.ignore"), fixtures["rules/shared-ignore"]);
+  if (process.platform === "linux") await promisify(execFile)("mkfifo", [path.join(cwd, "search/input.pipe")]);
   const large = await fs.open(path.join(cwd, "search/ignored.bin"), "wx");
   try { await large.truncate(16 * 1024 * 1024); } finally { await large.close(); }
   const checks = [];
-  for (const [label, args] of [
+  for (const [label, args, rejected] of [
     ["directory-ignore", { path: "search", pattern: "needle", limit: 1000 }],
     ["nested-search", { path: "search/nested", pattern: "needle" }],
     ["glob", { path: "search", pattern: "needle", glob: "**/{a,z}.txt" }],
@@ -241,22 +297,36 @@ async function qualifyNamespace() {
     ["limit", { path: "search", pattern: "needle", limit: 1 }],
     ["file", { path: "search/utf16.txt", pattern: "needle", context: 1 }],
     ["explicit-ignored-directory", { path: "search/blocked", pattern: "needle" }],
+    ["explicit-directory-link", { path: "search/internal-link", pattern: "needle" }],
+    ["explicit-external-link", { path: process.platform === "win32" ? "edge-external-link/external-link" : "search/external-link", pattern: "needle" }, true],
+    ["explicit-dangling-link", { path: process.platform === "win32" ? "edge-dangling-link/dangling-link" : "search/dangling-link", pattern: "needle" }, true],
+    ...(process.platform === "win32" ? [
+      ["discovered-external-link", { path: "edge-external-link", pattern: "needle" }, true],
+      ["discovered-dangling-link", { path: "edge-dangling-link", pattern: "needle" }, true],
+    ] : []),
+    ...(process.platform === "win32" ? [] : [
+      ["explicit-file-link", { path: "search/file-link", pattern: "needle" }],
+      ["linked-ignore-file", { path: "search/linked-config", pattern: "needle" }],
+    ]),
   ]) {
+    const only = process.argv.find((arg) => arg.startsWith("--case="))?.slice(7);
+    if (only && label !== only) continue;
     const reference = async () => (await actorWorker.request({ root: cwd, args }, {
       signal: new AbortController().signal,
       onInput: (_operation, invocation, signal, emit) => runNative("reference", { ...invocation, cwd }, signal, emit),
     })).result;
-    const expected = await reference();
+    const expected = await reference().catch((error) => { if (!rejected) throw error; return error; });
     if (label === "limit") assert.equal(expected.details?.matchLimitReached, 1);
     const mutation = {
       "directory-ignore": ["search/z.txt", "needle changed after sealing\n"],
       "nested-search": ["search/nested/.gitignore", "*.txt\n!drop.txt\n"],
       "negative-query": ["search/arrived.txt", "not-present-anywhere\n"],
+      "linked-ignore-file": ["rules/shared-ignore", "visible.txt\n"],
     }[label];
     const changed = mutation ? async () => { await fs.writeFile(path.join(cwd, mutation[0]), mutation[1]); return reference(); } : undefined;
-    const captured = await qualifyCaptured(cwd, args, expected, changed);
+    const captured = await qualifyCaptured(cwd, args, expected, changed, rejected);
     assert.ok(!captured.reads.some((file) => file.endsWith("ignored.bin")), "ignored payload must not consume the input budget");
-    checks.push({ label, outputBytes: Buffer.byteLength(JSON.stringify(expected)), ...captured });
+    checks.push({ label, outputBytes: expected instanceof Error ? 0 : Buffer.byteLength(JSON.stringify(expected)), ...captured });
     console.log(JSON.stringify({ semanticCase: checks.at(-1) }));
   }
   return { mode: "small-semantic-fixture", checks, qualification: "Full host key/route/transaction/adoption; content, ignore rules and negative names each invalidate before one Actor fallback. Timings are not performance claims." };
