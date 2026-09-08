@@ -118,7 +118,13 @@ describe("speculative action resource versions", () => {
 		const text = "first\r\n\n[999 more lines in file. Use offset=3 to continue.]\n" + "x".repeat(60_000) + "\nlast";
 		const root = await workspace({ "value.txt": text }), file = path.join(root, "value.txt");
 		const args = { path: "value.txt", offset: 1, limit: 1 }, native = createReadTool(root);
-		const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
+		const stock = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
+		const configuration = path.join(await workspace({ rule: "A" }), "rule");
+		const invocation = { ...stock, ...(capturedOnly ? { filesystemRoot: path.parse(root).root,
+			filesystem: async (...request: Parameters<NonNullable<typeof stock.filesystem>>) => {
+				await request[0].readFile(configuration); return stock.filesystem!(...request);
+			},
+		} : {}) };
 		const binding = { fingerprint: "original", context: invocation, ...(capturedOnly ? {
 			semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, resourceScope: "captured_inputs" as const },
 		} : {}) };
@@ -126,6 +132,10 @@ describe("speculative action resource versions", () => {
 		if (capturedOnly) await expect(captureResourceVersion(key, root, PI_ACTION_SEMANTICS, 100_000)).rejects.toThrow("resource_dependencies_unproven");
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 100_000 });
 		const signal = new AbortController().signal;
+		if (capturedOnly) {
+			const unbound = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { ...binding, context: { ...invocation, filesystemRoot: undefined } })!;
+			await expect(world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: unbound, callID: "denied", signal })).rejects.toThrow("escapes workspace");
+		}
 		const branch = await world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
 		try {
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
@@ -137,6 +147,8 @@ describe("speculative action resource versions", () => {
 			await expect(branch.reconstruct!({ action: key, args: { path: "unproven" }, callID: "bad", signal })).rejects.toThrow("unproven");
 			expect((await branch.validate!()).status).toBe("valid");
 			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.result).toEqual(await native.execute("native", args));
+			await fs.writeFile(configuration, "B");
+			expect((await branch.validate!()).status).toBe(capturedOnly ? "stale" : "valid");
 		} finally { await branch.dispose(); }
 	});
 
@@ -237,7 +249,7 @@ describe("speculative action resource versions", () => {
 				{ args, callID: "spec", signal: new AbortController().signal });
 			token.view!.assertComplete();
 			expect(await token.view!.stat(alias, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(alias) });
-			expect((await token.view!.stat(directory ? path.join(alias, "value.txt") : target, "entry")).type).toBe("file");
+			expect(await token.view!.stat(directory ? path.join(alias, "value.txt") : target, "entry")).toMatchObject({ type: "file", realPath: await fs.realpath(content) });
 			const expected = await native.execute("actor", args);
 			expect(actual.result.content).toEqual(expected.content);
 			expect(Object.entries(actual.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
@@ -262,7 +274,8 @@ describe("speculative action resource versions", () => {
 				await fs.rm(escape); await fs.symlink(destination, escape, type);
 				const metadata = await manager.capture(undefined, 8192), opened = vi.spyOn(fs, "open");
 				try {
-					expect(await metadata.view!.stat(escape, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(escape), size: undefined });
+					expect(await metadata.view!.stat(escape, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(escape), size: undefined,
+						realPath: path.join(await fs.realpath(root), path.basename(escape)) });
 					metadata.view!.seal();
 					expect(await manager.validate(metadata)).toMatchObject({ expired: false, filesRead: 0, bytesRead: 0 });
 					await expect(metadata.view!.evaluate((view) => view.readFile(escape))).rejects.toThrow("resource_access_unproven");

@@ -55,7 +55,8 @@ export function createResourceSnapshotExecutionWorld(
 	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
 		if (!onDemand && !canObserve) throw new Error("Windows path binding stamps cannot certify host execution windows");
 		const setupStarted = performance.now();
-		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, context.cwd, actionSemantics, retainBytes);
+		const root = onDemand ? (context.action.executionContext as ToolInvocation | undefined)?.filesystemRoot ?? context.cwd : context.cwd;
+		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, root, actionSemantics, retainBytes);
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
 			view: version.view,

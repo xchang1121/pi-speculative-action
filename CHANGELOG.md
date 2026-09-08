@@ -51,6 +51,8 @@
 
 ### Added
 
+- Explicit filesystem operations may bind a read-only capture root and inspect captured resolved names.
+  The default remains the workspace; external named inputs share the existing token budget and validation.
 - Consolidated authoritative execution and observation into the gateway's single frozen settlement;
   observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
 - Captured find uses Pi's installed matching/ignore components; the experimental search installer and its dependencies were removed.

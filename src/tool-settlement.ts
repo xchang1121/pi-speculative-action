@@ -26,7 +26,7 @@ export interface ToolProcessInvocation {
 	readonly timeout?: number;
 }
 
-export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string };
+export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string; realPath?: string };
 
 /** Filesystem capabilities supplied by an execution world, never ambient host defaults. */
 export interface ToolFilesystemOperations {
@@ -48,6 +48,8 @@ export interface ToolInvocation {
 	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */
 	readonly identity?: unknown;
 	readonly process?: ToolProcessInvocation;
+	/** Explicit read-only input boundary; omitted operations remain confined to the host workspace. */
+	readonly filesystemRoot?: string;
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */

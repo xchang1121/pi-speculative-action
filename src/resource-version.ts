@@ -47,12 +47,12 @@ export type ResourceVersionToken = {
 	readonly release: () => void;
 };
 
-type CapturedResource =
+type CapturedResource = (
 	| { readonly type: "file"; readonly content?: Buffer; readonly size?: number }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
 	| { readonly type: "alias"; readonly target: string; readonly link: string }
 	| { readonly type: "special" }
-	| { readonly type: "missing" };
+	| { readonly type: "missing" }) & { readonly realPath?: string };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
@@ -86,7 +86,7 @@ export class ResourceReadView {
 		return true;
 	}
 	capture(target: string, entry: CapturedResource): void {
-		if (!this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
+		if (!this.reserve(Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 			: entry.type === "alias" ? Buffer.byteLength(entry.target) + Buffer.byteLength(entry.link) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
@@ -99,7 +99,7 @@ export class ResourceReadView {
 	stat = async (target: string, fields?: "type" | "entry"): Promise<ToolFilesystemStat> => {
 		const entry = await this.get(target, fields ?? "stat");
 		if (entry.type === "missing" || (!fields && entry.type === "file" && entry.content === undefined && entry.size === undefined)) return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory", size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined,
+		return { isDirectory: () => entry.type === "directory", realPath: entry.realPath, size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined,
 			...(fields === "entry" ? { type: entry.type === "alias" ? "symlink" : entry.type, ...(entry.type === "alias" ? { link: entry.link } : {}) } : {}) };
 	};
 	readdir = async (target: string): Promise<string[]> => {
@@ -549,7 +549,7 @@ async function fingerprintPath(
 		}
 		const source = path.resolve(path.dirname(target), link);
 		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, ancestors, view, descend);
-		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link });
+		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link, realPath: realTarget });
 		return {
 			value: {
 				type: "symlink",
@@ -564,7 +564,7 @@ async function fingerprintPath(
 		};
 	}
 	if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special",
+		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget,
 			...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 		return stableEntry(target, info, identity, scope);
 	}
@@ -573,7 +573,7 @@ async function fingerprintPath(
 		const retain = view?.reserve(Number(info.size)) ?? false;
 		const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain));
 		assertInside(realRoot, content.realPath);
-		view?.capture(target, { type: "file", content: content.content });
+		view?.capture(target, { type: "file", content: content.content, realPath: content.realPath });
 		return {
 			value: {
 				type: "file",
@@ -608,7 +608,7 @@ async function fingerprintPath(
 	) {
 		throw new Error(`resource_directory_changed:${target}`);
 	}
-	view?.capture(target, { type: "directory", entries: entries.map((entry) => entry.name) });
+	view?.capture(target, { type: "directory", entries: entries.map((entry) => entry.name), realPath: realTarget });
 	return {
 		value: {
 			type: "directory",
