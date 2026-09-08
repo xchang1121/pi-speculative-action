@@ -13,7 +13,7 @@ import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
-	readonly scope: ResourceDependencyScope | "stat" | "names" | "binding";
+	readonly scope: ResourceDependencyScope | "stat" | "type" | "names" | "binding";
 };
 
 export type ResourceValidationMetrics = {
@@ -99,11 +99,11 @@ export class ResourceReadView {
 		this.entry(source);
 		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
 	}
-	exists = async (target: string): Promise<boolean> => (await this.get(target, "stat")).type !== "missing";
-	stat = async (target: string): Promise<{ isDirectory: () => boolean; size?: number }> => {
-		const entry = await this.get(target, "stat");
-		if (entry.type === "missing") return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory", size: entry.type === "file" ? entry.content?.length ?? entry.size : undefined };
+	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
+	stat = async (target: string, fields?: "type"): Promise<{ isDirectory: () => boolean; size?: number }> => {
+		const entry = await this.get(target, fields ?? "stat");
+		if (entry.type === "missing" || (!fields && entry.type === "file" && entry.content === undefined && entry.size === undefined)) return this.unproven(target);
+		return { isDirectory: () => entry.type === "directory", size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined };
 	};
 	readdir = async (target: string): Promise<string[]> => {
 		const entry = await this.get(target, "names");
@@ -511,9 +511,10 @@ const dependencyKey = (dependency: ResourceDependency) => `${dependency.scope}:$
 function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>, sealing = false) {
 	if (dependency.scope === "binding") return sealing && event.type === "rename" && filesystemPathKey(dependency.path) === filesystemPathKey(event.path);
 	if (event.type === "unknown") return true;
+	if (dependency.scope === "type" && !sealing && event.type === "change") return false;
 	const dependencyPath = filesystemPathKey(dependency.path);
 	const changed = filesystemPathKey(event.path);
-	if (dependency.scope === "content" || dependency.scope === "stat") {
+	if (dependency.scope === "content" || dependency.scope === "stat" || dependency.scope === "type") {
 		if (dependencyPath === changed) return true;
 		// Some recursive watchers report only the containing directory for a file write.
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
@@ -601,7 +602,7 @@ async function fingerprintPath(
 			filesRead: followed.filesRead,
 		};
 	}
-	if (scope === "stat" || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
+	if (scope === "stat" || scope === "type" || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
 		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special",
 			...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 		return stableEntry(target, info, identity, scope);

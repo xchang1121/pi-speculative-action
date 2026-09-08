@@ -8,7 +8,7 @@ import { isMainThread, Worker, parentPort, workerData, MessageChannel, receiveMe
 
 // Explicit shared Actor/producer semantics, NOT equivalence with ambient native fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
-	id: "pi.captured-find.v2", pi: "0.84.1", platform: process.platform, node: process.version,
+	id: "pi.captured-find.v3", pi: "0.84.1", platform: process.platform, node: process.version,
 	find: Object.freeze({ minimatch: "10.2.5", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
 		platform: "linux", nocase: false, dot: true, matchBase: true, nocomment: true, nonegate: true, braceExpandMax: 10_000 }),
 	environment: Object.freeze({ PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" }),

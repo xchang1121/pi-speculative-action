@@ -210,6 +210,7 @@ async function qualifyPiSearch(name) {
 		assert.equal(entered, 2); for (const output of await Promise.all(concurrent)) assert.deepEqual(output.result, expected);
 		const ready = journey(); await ready.start("produce");
 		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
+		await fs.truncate(path.join(searchRoot, "notes.txt"), profile.limits.inputBytes * 2); // Names-only evidence survives growth beyond the content budget.
 		await ready.start("recall", false);
 		const beforeHit = counts.producer, adopted = await ready.actor("ready");
 		assert.deepEqual(adopted.output, expected); assert.equal(adopted.settlement.provider.kind, "speculative");

@@ -300,7 +300,7 @@ node bench/portable-kernel.mjs
 只使用 Pi 已安装的 minimatch/ignore 和 Node，不需要额外包、模块文件或安装步骤。
 实际完整 Pi find、输入代理、Actor/producer 独立进程、现有 Runtime 和 TUI 均参与验收；
 仅模型和界面输入使用脚本。覆盖完成/跨轮次采纳、封存输入重算、运行中 join、双 producer
-并发、输入变化与逃逸链接拒绝、Actor 单次回退及关闭时排空 Actor/取消 producer。
+并发、文件增长到内容预算之外仍可复用名字查询、ignore 变化与逃逸链接拒绝、Actor 单次回退及关闭时排空 Actor/取消 producer。
 deadline/abort 还测试已进入的不合作循环及拥有独立进程的输入操作；guest 与输入均完成回收后
 才允许回退，晚到成功/失败均被消费。V8 堆限额不是整个进程的 RSS 保证，不声称任意脚本沙箱。
 

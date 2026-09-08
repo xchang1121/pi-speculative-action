@@ -71,7 +71,7 @@ export function resolvePiToolInvocation(
 							return mime.detectSupportedImageMimeType(await view.readFile(target, 4100));
 						},
 					} },
-					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ?? denied, readdir: view.readdir ?? denied } },
+					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ? (target) => view.stat!(target, "type") : denied, readdir: view.readdir ?? denied } },
 					write: { operations: { writeFile, mkdir: view.mkdir ?? denied } },
 					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile } },
 				});
@@ -155,23 +155,21 @@ export async function readClosedSearchInput(source: ToolFilesystemOperations, ro
 	}
 	assert.ok(source.stat && source.readdir && ["stat", "readdir", "readFile"].includes(operation) && path.posix.isAbsolute(target), "input operation denied");
 	const normalized = path.posix.normalize(target);
-	if (normalized === "/") return operation === "stat" ? { directory: true, size: 0 } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
+	if (normalized === "/") return operation === "stat" ? { directory: true } : operation === "readdir" ? ["workspace"] : fail("EISDIR");
 	const relative = path.posix.relative("/workspace", normalized);
 	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT");
 	let physical = root;
 	for (const segment of relative ? relative.split("/") : []) {
-		if (!(await source.stat(physical)).isDirectory()) return fail("ENOTDIR");
+		if (!(await source.stat(physical, "type")).isDirectory()) return fail("ENOTDIR");
 		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT");
 		physical = path.join(physical, segment);
 	}
-	const stat = await source.stat(physical), directory = stat.isDirectory();
-	if (operation === "stat") {
-		assert.ok(directory || Number.isSafeInteger(stat.size), "file size is not proven by retained content");
-		return { directory, size: directory ? 0 : stat.size };
-	}
+	const stat = await source.stat(physical, operation === "readFile" ? undefined : "type"), directory = stat.isDirectory();
+	if (operation === "stat") return { directory };
 	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
 	if (directory) return fail("EISDIR");
-	assert.ok(typeof stat.size === "number" && stat.size <= maxBytes, "input byte budget");
+	assert.ok(Number.isSafeInteger(stat.size) && stat.size! >= 0, "file size is not proven by retained content");
+	assert.ok(stat.size! <= maxBytes, "input byte budget");
 	return source.readFile(physical);
 }
 import assert from "node:assert/strict";

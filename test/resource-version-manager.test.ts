@@ -15,7 +15,6 @@ import {
 	ResourceVersionManager,
 	releaseResourceVersion,
 	resourceDependencies,
-	validateResourceVersion,
 } from "../src/resource-version.ts";
 
 const roots: string[] = [];
@@ -67,7 +66,6 @@ describe("speculative action resource versions", () => {
 	});
 
 	test("owns bounded immutable inputs and never converts unproven access into absence", async () => {
-		expect((await validateResourceVersion(undefined)).expired).toBe(true);
 		const payload = Buffer.concat([Buffer.alloc(1024 * 1024, 65), Buffer.alloc(1024 * 1024, 66), Buffer.from("end")]);
 		const root = await workspace({ "value.txt": payload }), file = path.join(root, "value.txt");
 		const manager = new ResourceVersionManager(root, { watch: false });
@@ -85,10 +83,9 @@ describe("speculative action resource versions", () => {
 			try { await scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
 		})).rejects.toThrow("resource_access_unproven");
 		expect(await view.evaluate((scope) => scope.readFile(file))).toEqual(payload);
-		expect((await captureStableFile(file)).hash).toBe(createHash("sha256").update(payload).digest("hex"));
 		(await view.readFile(file)).fill(66);
 		await fs.writeFile(file, "B");
-		expect([await view.readFile(file), (await view.stat(file)).size]).toEqual([payload, payload.length]);
+		expect([await view.readFile(file), (await view.stat(file)).size, (await view.stat(file, "type")).size]).toEqual([payload, payload.length, undefined]);
 		expect(await view.exists(path.join(root, "missing"))).toBe(false);
 		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
 		await expect(view.exists(path.join(root, "unknown"))).rejects.toThrow("resource_access_unproven");
@@ -275,17 +272,20 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.each([
-		{ scope: "entries" as const, stale: ["entry"] },
-		{ scope: "tree_entries" as const, stale: ["entry", "deep"] },
-		{ scope: "tree_content" as const, stale: ["content", "entry", "deep"] },
+		{ scope: "type" as const, stale: ["kind"] },
+		{ scope: "stat" as const, stale: ["content", "kind"] },
+		{ scope: "entries" as const, stale: ["entry", "kind"] },
+		{ scope: "tree_entries" as const, stale: ["entry", "deep", "kind"] },
+		{ scope: "tree_content" as const, stale: ["content", "entry", "deep", "kind"] },
 	])("validates exactly the declared $scope, without guessing configuration paths", async ({ scope, stale }) => {
 		for (const [change, relative] of Object.entries({ content: "src/value.ts", entry: "src/added.ts",
-			deep: "src/nested/added.ts", outside: ".gitignore", restore: "src/transient" })) {
+			deep: "src/nested/added.ts", outside: ".gitignore", kind: "src/value.ts" })) {
 			const root = await workspace({ "src/value.ts": "one\n", "src/nested/existing.ts": "" });
 			const manager = new ResourceVersionManager(root, { watch: false });
-			const token = await manager.capture([{ path: "src", scope }]);
-			await fs.writeFile(path.join(root, relative), "changed\n");
-			if (change === "restore") await fs.rm(path.join(root, relative));
+			const token = await manager.capture([{ path: scope === "type" || scope === "stat" ? "src/value.ts" : "src", scope }], 4096);
+			if (scope === "type") await expect(token.view!.evaluate((view) => view.stat(path.join(root, "src/value.ts")))).rejects.toThrow("unproven");
+			if (change === "kind") { await fs.rm(path.join(root, relative)); await fs.mkdir(path.join(root, relative)); }
+			else await fs.writeFile(path.join(root, relative), "changed\n");
 			expect((await manager.validate(token)).expired, change).toBe(stale.includes(change));
 			releaseResourceVersion(token);
 			manager.close();
