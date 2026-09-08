@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +14,7 @@ try {
 	const cancellation = [];
 	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
 		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
-		const late = Promise.withResolvers(), inputCompleted = Promise.withResolvers(), inputWait = mode.startsWith("input");
+		const inputClosed = Promise.withResolvers(), inputWait = mode.startsWith("input"); let inputChild, inputCompleted = false;
 		try {
 			const arrived = performance.now(); let entered = false;
 			const reason = inputWait ? 0 : new Error("cancelled running guest");
@@ -22,17 +22,23 @@ try {
 			await assert.rejects(interrupted.request(inputWait ? { kind: "find", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
 				signal: controller.signal, timeoutMs: mode.endsWith("deadline") ? 200 : 5000,
 				onStarted: () => { if (!inputWait) abort(); },
-				onInput: async () => {
-					abort(); await late.promise; inputCompleted.resolve();
-					if (mode.endsWith("abort")) throw new Error("late input failure");
-					return { directory: true, size: 0 };
+				onInput: async (_operation, _target, signal) => {
+					// A real owned input operation: termination of the guest alone cannot retire this process.
+					inputChild = spawn(process.execPath, ["-e", "process.stdin.resume()"], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+					const stop = () => inputChild.kill("SIGKILL");
+					signal?.addEventListener("abort", stop, { once: true });
+					inputChild.once("spawn", abort);
+					inputChild.once("error", inputClosed.reject);
+					inputChild.once("close", () => { inputCompleted = true; inputClosed.resolve(); });
+					try { await inputClosed.promise; if (mode.endsWith("abort")) throw new Error("late input failure"); return { directory: true, size: 0 }; }
+					finally { signal?.removeEventListener("abort", stop); }
 				},
 			}), mode.endsWith("abort") ? (error) => error === reason : /deadline/);
 			assert.ok(interrupted.closed(), "Actor fallback must not race a still-running worker");
 			assert.ok(entered, "cancellation must exercise an entered guest, not just process startup");
-			late.resolve(); if (inputWait) await inputCompleted.promise;
+			assert.ok(!inputWait || inputCompleted, "input ownership must retire before Actor fallback, not just the guest process");
 			cancellation.push({ mode, retirementMs: performance.now() - arrived });
-		} finally { late.resolve(); await interrupted.dispose(); }
+		} finally { if (inputChild) { inputChild.kill("SIGKILL"); await inputClosed.promise; } await interrupted.dispose(); }
 	}
 	console.log(JSON.stringify({ platform: process.platform, node: process.version, profile: worker.profile,
 		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started, cancellation, pi, extension,
@@ -273,9 +279,8 @@ async function qualifyPiSearch(name) {
 		try {
 			await bounded(Promise.all(Object.values(arrivals).map((arrival) => arrival.promise)), "retirement barrier");
 			const retiring = pool.dispose(); assert.equal(pool.dispose(), retiring);
-			await rejected;
 			assert.equal(await Promise.race([retiring, Promise.resolve("pending")]), "pending", "retirement must drain admitted Actors");
-			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await retiring;
+			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await Promise.all([retiring, rejected]);
 			await assert.rejects(pool.request("actor", { kind: name, root, args }), /search pool retired/);
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
 		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, behaviors, rejectedEscapingLinks: true,
@@ -283,7 +288,7 @@ async function qualifyPiSearch(name) {
 			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
-			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorOnly: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
+			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorAndInputs: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
 			scope: "Runtime-owned explicit common-profile full-tool IPC; not native equivalence" };
 	} finally {
 		await Promise.all(journeys.map((host) => host.dispose())); await pool.dispose();

@@ -297,12 +297,12 @@ Use `--output-root` to choose the artifact directory.
 node bench/portable-kernel.mjs
 ```
 
-只使用 Pi 已安装的 glob/ignore 和 Node，不需要额外包、模块文件或安装步骤。
+只使用 Pi 已安装的 minimatch/ignore 和 Node，不需要额外包、模块文件或安装步骤。
 实际完整 Pi find、输入代理、Actor/producer 独立进程、现有 Runtime 和 TUI 均参与验收；
 仅模型和界面输入使用脚本。覆盖完成/跨轮次采纳、封存输入重算、运行中 join、双 producer
 并发、输入变化与逃逸链接拒绝、Actor 单次回退及关闭时排空 Actor/取消 producer。
-deadline/abort 还测试已经进入的不合作循环和阻塞输入；等进程及 stdio close 后才允许回退，
-晚到输入成功/失败均被消费。V8 堆限额不是整个进程的 RSS 保证，不声称任意脚本沙箱。
+deadline/abort 还测试已进入的不合作循环及拥有独立进程的输入操作；guest 与输入均完成回收后
+才允许回退，晚到成功/失败均被消费。V8 堆限额不是整个进程的 RSS 保证，不声称任意脚本沙箱。
 
 原生 fd 与共同配置 Actor 分别采样，报告中列出两者的语义差异，不用投机端偷偷替换原生语义。
 结果复用时间只与同配置 Actor 到达后的基线比较，不冒充整体任务加速；未校准时如实记录。

@@ -33,7 +33,7 @@ export class ClosedSearchProcessPool {
 	}
 }
 
-/** Owns preparation, one admitted invocation, and hard retirement of a trusted search worker. */
+/** Owns the worker AND its borrowed input operations; callbacks must settle after their signal's cleanup. */
 export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel.mjs", import.meta.url)) {
 	const { limits } = CLOSED_SEARCH_PROFILE, started = performance.now();
 	const child = fork(entry, [], {
@@ -42,15 +42,18 @@ export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel
 	});
 	const ready = Promise.withResolvers(), closure = Promise.withResolvers();
 	let pending, failure, closed = false, prepared = false, nextID = 0, diagnosticBytes = 0, diagnostic = "";
-	const stop = (reason) => { failure ??= { reason }; if (!closed) child.kill("SIGKILL"); };
+	const stop = (reason) => { failure ??= { reason }; pending?.input?.controller.abort(reason); if (!closed) child.kill("SIGKILL"); };
 	const send = (message) => { try { child.send(message, (error) => { if (error) stop(error); }); } catch (error) { stop(error); } };
 	const startup = setTimeout(() => stop(new Error("worker preparation deadline")), 15_000);
 	void ready.promise.catch(() => {}); // An idle/preparing worker still owns its failure before a caller awaits it.
 	child.once("error", stop);
-	child.once("close", () => {
+	child.once("close", async () => {
 		closed = true; clearTimeout(startup);
 		const error = failure ? failure.reason : new Error(`worker closed before completion: ${diagnostic}`);
-		pending?.settle({ error }); ready.reject(error); closure.resolve();
+		const admitted = pending;
+		admitted?.input?.controller.abort(error);
+		await admitted?.input?.completion;
+		admitted?.settle({ error }); ready.reject(error); closure.resolve();
 	});
 	for (const stream of [child.stdout, child.stderr]) stream.on("data", (bytes) => {
 		diagnostic = (diagnostic + bytes.toString()).slice(-4096);
@@ -68,17 +71,19 @@ export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel
 			if (message.type === "started") pending.onStarted?.();
 			else if (message.type === "input") {
 				const admitted = pending;
-				assert.ok(!admitted.inputPending && Number.isSafeInteger(message.sequence) && message.sequence > admitted.sequence, "unowned input request");
-				admitted.inputPending = true; admitted.sequence = message.sequence;
-				Promise.resolve().then(() => admitted.onInput(message.operation, message.target)).then((value) => ({ value }),
+				assert.ok(!admitted.input && Number.isSafeInteger(message.sequence) && message.sequence > admitted.sequence, "unowned input request");
+				admitted.sequence = message.sequence;
+				const controller = new AbortController();
+				const completion = Promise.resolve().then(() => { controller.signal.throwIfAborted(); return admitted.onInput(message.operation, message.target, controller.signal); }).then((value) => ({ value }),
 					(error) => ({ error: String(error?.message ?? error).slice(0, 8192), code: error?.code })).then((response) => {
 					if (pending !== admitted || failure || closed) return;
 					if ((admitted.inputBytes += serialize(response).byteLength) > limits.inputBytes) response = { error: "input byte budget" };
-					admitted.inputPending = false;
+					admitted.input = undefined;
 					send({ type: "input", id: admitted.id, sequence: message.sequence, ...response });
 				}).catch(stop);
+				admitted.input = { controller, completion };
 			} else {
-				assert.ok(message.type === "result" && !pending.inputPending, "unexpected worker response");
+				assert.ok(message.type === "result" && !pending.input, "unexpected worker response");
 				assert.ok(serialize(message.result).byteLength <= limits.resultBytes, "result frame budget");
 				pending.settle(Object.hasOwn(message, "error") ? { error: new Error(message.error) } : message);
 			}
@@ -94,7 +99,7 @@ export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel
 			assert.ok(serialize(input).byteLength <= limits.requestBytes, "request frame budget");
 			const id = ++nextID, abort = () => stop(signal.reason);
 			const timer = setTimeout(() => stop(new Error("worker execution deadline")), timeoutMs);
-			const admitted = pending = { id, onStarted, onInput, inputBytes: 0, inputPending: false, sequence: 0, settle: (settlement) => {
+			const admitted = pending = { id, onStarted, onInput, inputBytes: 0, input: undefined, sequence: 0, settle: (settlement) => {
 				clearTimeout(timer); signal?.removeEventListener("abort", abort); pending = undefined;
 				if (Object.hasOwn(settlement, "error")) reject(settlement.error); else resolve(settlement.result);
 			} };
