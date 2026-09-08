@@ -228,27 +228,21 @@ describe("PlanRuntime", () => {
 		expect(plan.drainBlocked().map((node) => node.action.id)).toEqual(["confirmed"]);
 	});
 
-	it("derives source-neutral deadlines and critical paths from the dependency graph", () => {
+	it.each(["forward", "reverse"] as const)("derives deadlines and critical paths independently of %s graph order", (order) => {
 		const plan = new PlanRuntime();
-		plan.apply(
-			proposal([
-				action("short", { expectedDurationMs: 10 }),
-				action("critical", { expectedDurationMs: 20 }),
-				action("child", {
-					expectedDurationMs: 80,
-					dependsOn: [{ actionID: "short" }, { actionID: "critical", condition: "execution_succeeded" }],
-				}),
-			]),
-			4,
-		);
+		const short = action("short", { expectedDurationMs: 10, latestHorizon: 3 });
+		const child = action("child", { expectedDurationMs: 80,
+			dependsOn: [{ actionID: "short" }, { actionID: "critical", condition: "execution_succeeded" }] });
+		const actions = [short, action("critical", { expectedDurationMs: 20, latestHorizon: 4 }), child,
+			action("leaf", { expectedDurationMs: -1, horizon: 4, latestHorizon: 7, dependsOn: [{ actionID: "child" }] })];
+		if (order === "reverse") actions.reverse();
+		plan.apply(proposal(actions), 4);
 
-		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 90 });
-		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 100 });
-		expect(plan.get("plan", "child")).toMatchObject({
-			earliestDecisionSeq: 6,
-			expectedDecisionSeq: 6,
-			criticalPathMs: 80,
-		});
+		expect(plan.plan("plan")!.actions.map((action) => action.id)).toEqual(actions.map((action) => action.id));
+		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 8, criticalPathMs: 91 });
+		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 9, criticalPathMs: 101 });
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 6, expectedDecisionSeq: 6, latestDecisionSeq: 10, criticalPathMs: 81 });
+		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
 		const identity = plan.get("plan", "child")!.identity;
 		expect(plan.apply({
 			proposalID: "plan", source: "source", revision: 2,
@@ -267,8 +261,28 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "child")).toMatchObject({
 			earliestDecisionSeq: 8,
 			expectedDecisionSeq: 8,
-			latestDecisionSeq: 8,
+			latestDecisionSeq: 9,
 		});
+		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
+		const revisedChild = { ...child, horizon: 2, latestHorizon: 4, expectedDurationMs: 3.5 };
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 3, upsert: [revisedChild] }, 4))
+			.toMatchObject({ accepted: true, retired: [] });
+		expect(plan.get("plan", "child")!.identity).toBe(identity);
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 8, expectedDecisionSeq: 8, latestDecisionSeq: 9, criticalPathMs: 4.5 });
+		expect(plan.get("plan", "short")!.criticalPathMs).toBe(14.5);
+		expect(plan.get("plan", "critical")!.criticalPathMs).toBe(24.5);
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 4, remove: ["leaf"] }, 4).accepted).toBe(true);
+		expect(plan.get("plan", "child")!.criticalPathMs).toBe(3.5);
+		expect(plan.get("plan", "short")!.criticalPathMs).toBe(13.5);
+		expect(plan.get("plan", "critical")!.criticalPathMs).toBe(23.5);
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 5, upsert: [
+			{ ...short, dependsOn: [{ actionID: "child" }] },
+			{ ...revisedChild, dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }] },
+		] }, 8).accepted).toBe(true);
+		expect(plan.get("plan", "short")).toMatchObject({ earliestDecisionSeq: 10, expectedDecisionSeq: 12, latestDecisionSeq: 14, criticalPathMs: 10 });
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 11, latestDecisionSeq: 13, criticalPathMs: 13.5 });
+		expect(plan.get("plan", "critical")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 7, latestDecisionSeq: 7, criticalPathMs: 33.5 });
+		expect(plan.plan("plan")!.actions.map((action) => action.id)).toEqual(actions.filter((action) => action.id !== "leaf").map((action) => action.id));
 		for (const invalid of [
 			[action("a", { dependsOn: [{ actionID: "missing" }] })],
 			[action("a", { dependsOn: [{ actionID: "a" }] })],

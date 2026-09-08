@@ -249,6 +249,9 @@
 
 ### Fixed
 
+- Plan scheduling reuses the graph's validated topological order for deadlines and critical paths,
+  removing repeated recursive traversals and temporary graph indexes. Prediction confirmation locates
+  its current node directly while preserving retired opportunities' independent settlement authority.
 - Semantic parent replacement also renews dependent action identities and bindings, using the existing
   dependency validation walk and retirement path. Late reuse cannot attach an old parent world to the
   renewed chain; independent actions, metadata-only updates and normal parent adoption retain reuse.

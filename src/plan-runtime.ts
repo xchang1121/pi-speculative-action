@@ -163,6 +163,7 @@ type MutablePlan = {
 	nextRevision: number;
 	draftTokens: number;
 	nodes: Map<string, MutableNode>;
+	ordered: readonly MutableNode[];
 };
 
 interface PlanExecutionOwner {
@@ -351,8 +352,8 @@ export class PlanRuntime {
 	): PredictionSettlement | undefined {
 		const finalized = opportunity.confirm(actorAction, adoption);
 		if (!finalized) return undefined;
-		const current = this.mutableValues().find(({ node }) => node.opportunity === opportunity);
-		if (current) this.recompute(current.plan);
+		const current = this.mutable(opportunity.identity.proposalID, opportunity.identity.actionID);
+		if (current?.node.opportunity === opportunity) this.recompute(current.plan);
 		return finalized;
 	}
 
@@ -462,6 +463,7 @@ export class PlanRuntime {
 			nextRevision: Math.max(current?.nextRevision ?? 0, input.revision + 1),
 			draftTokens: input.draftTokens,
 			nodes,
+			ordered: Object.freeze(input.ordered.map((action) => nodes.get(action.id)!)),
 		};
 		this.plans.set(next.id, next);
 		this.recompute(next);
@@ -539,54 +541,28 @@ export class PlanRuntime {
 	}
 
 	private recompute(plan: MutablePlan): void {
-		const actionSequence = (relativeHorizon: (action: PlanAction) => number) => {
-			const memo = new Map<string, number>();
-			const visiting = new Set<string>();
-			const calculate = (node: MutableNode): number => {
-				const cached = memo.get(node.action.id);
-				if (cached !== undefined) return cached;
-				if (visiting.has(node.action.id)) return node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
-				visiting.add(node.action.id);
-				const settlement = node.opportunity.settlement;
-				let value = predictionMatched(settlement)
-					? actorDecisionSequence(settlement.actorAction)
-					: node.anchorDecisionSeq + relativeHorizon(node.action) + 1;
-				for (const dependency of node.action.dependsOn ?? []) {
-					const parent = plan.nodes.get(dependency.actionID);
-					if (parent) value = Math.max(value, calculate(parent) + 1);
-				}
-				visiting.delete(node.action.id);
-				memo.set(node.action.id, value);
-				return value;
-			};
-			return calculate;
-		};
-		const earliest = actionSequence(() => 0);
-		const expected = actionSequence(horizon);
-		const latest = actionSequence(latestHorizon);
-		const dependents = new Map<string, MutableNode[]>();
-		for (const node of plan.nodes.values()) {
+		// The accepted graph is immutable between revisions; reuse its validated topological order.
+		for (const node of plan.ordered) {
+			const settlement = node.opportunity.settlement;
+			const matched = predictionMatched(settlement) ? actorDecisionSequence(settlement.actorAction) : undefined;
+			node.earliestDecisionSeq = matched ?? node.anchorDecisionSeq + 1;
+			node.expectedDecisionSeq = matched ?? node.anchorDecisionSeq + horizon(node.action) + 1;
+			node.latestDecisionSeq = matched ?? node.anchorDecisionSeq + latestHorizon(node.action) + 1;
+			node.criticalPathMs = 0;
 			for (const dependency of node.action.dependsOn ?? []) {
-				const values = dependents.get(dependency.actionID) ?? [];
-				values.push(node);
-				dependents.set(dependency.actionID, values);
+				const parent = plan.nodes.get(dependency.actionID)!;
+				node.earliestDecisionSeq = Math.max(node.earliestDecisionSeq, parent.earliestDecisionSeq + 1);
+				node.expectedDecisionSeq = Math.max(node.expectedDecisionSeq, parent.expectedDecisionSeq + 1);
+				node.latestDecisionSeq = Math.max(node.latestDecisionSeq, parent.latestDecisionSeq + 1);
 			}
 		}
-		const criticalMemo = new Map<string, number>();
-		const criticalPath = (node: MutableNode): number => {
-			const cached = criticalMemo.get(node.action.id);
-			if (cached !== undefined) return cached;
-			const own = Math.max(1, finiteMetric(node.action.expectedDurationMs));
-			const descendants = dependents.get(node.action.id) ?? [];
-			const value = own + descendants.reduce((longest, child) => Math.max(longest, criticalPath(child)), 0);
-			criticalMemo.set(node.action.id, value);
-			return value;
-		};
-		for (const node of plan.nodes.values()) {
-			node.earliestDecisionSeq = earliest(node);
-			node.expectedDecisionSeq = expected(node);
-			node.latestDecisionSeq = latest(node);
-			node.criticalPathMs = criticalPath(node);
+		for (let index = plan.ordered.length - 1; index >= 0; index--) {
+			const node = plan.ordered[index]!;
+			node.criticalPathMs += Math.max(1, finiteMetric(node.action.expectedDurationMs));
+			for (const dependency of node.action.dependsOn ?? []) {
+				const parent = plan.nodes.get(dependency.actionID)!;
+				parent.criticalPathMs = Math.max(parent.criticalPathMs, node.criticalPathMs);
+			}
 		}
 	}
 }
