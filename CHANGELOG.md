@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Plan updates capture their headers, actions, dependencies, removals and inputs before waiting in
+  the existing admission lanes. Application reuses that owned capture and rechecks current revision
+  and graph validity; producer edits cannot redirect a queued revision. Proposal and delta share one
+  apply path, with next-step-only filtering captured at handoff under the same turn settings.
 - Prediction matching retains its computed key relation instead of invoking projection again for each
   selected opportunity. One pass selects the nearest prediction per plan, preserving latest-due or
   nearest-future priority, stable ties and plan order; tool hints still do not claim a prediction.

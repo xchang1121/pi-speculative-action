@@ -107,22 +107,6 @@ function reservationAvailable(reservation: CandidateReservation): boolean {
 	return reservation.kind === "shared" ? reservation.owners.length === 0 : reservation.status === "available";
 }
 
-function planUpdateID(update: PlanUpdate): string {
-	return "actions" in update ? update.id : update.proposalID;
-}
-
-function immediateOnly(update: PlanUpdate): PlanUpdate {
-	if ("actions" in update) {
-		return {
-			...update,
-			actions: update.actions.filter(
-				(action) => finiteMetric(action.horizon) === 0 && (action.dependsOn?.length ?? 0) === 0,
-			),
-		};
-	}
-	return { ...update, upsert: [], remove: update.remove };
-}
-
 function concurrentLimit(settings: SpeculativeActionSettings): number {
 	const value = settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions;
 	return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
@@ -1215,8 +1199,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
+		if (session.lifecycle.sealed || scope.signal.aborted) return;
 		await Promise.allSettled(asUpdates(updates).map(async (update) => {
-			const key = planUpdateID(update);
+			const captured = PlanRuntime.capture(update, source.multiStepEnabled?.(scope.settings) !== false);
+			if (!("update" in captured)) return;
+			update = captured.update;
+			const key = "actions" in update ? update.id : update.proposalID;
 			const previous = session.planAdmissionTails.get(key) ?? Promise.resolve();
 			session.pendingAdmissions++;
 			let admission!: Promise<void>;
@@ -1243,9 +1231,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		const { session } = scope;
 		if (session.lifecycle.sealed || scope.signal.aborted) return;
 		if (update.source !== source.id) return;
-		const acceptedUpdate = source.multiStepEnabled?.(scope.settings) === false ? immediateOnly(update) : update;
-		const draftTokens = finiteMetric(acceptedUpdate.draftTokens);
-		const applied = session.plan.apply(acceptedUpdate, session.decisionSequence);
+		const draftTokens = finiteMetric(update.draftTokens);
+		const applied = session.plan.apply(update, session.decisionSequence);
 		if (!applied.accepted) return;
 		for (const retired of applied.retired) retirePlanAction(session, retired, cause("plan", "superseded"));
 		session.tokenTotal += draftTokens;

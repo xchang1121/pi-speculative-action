@@ -7,8 +7,6 @@ import type {
 	PlanAction,
 	PlanActionDependency,
 	PlanActionDependencyCondition,
-	PlanDelta,
-	PlanProposal,
 	PlanUpdate,
 } from "./plan-proposal.ts";
 import type {
@@ -194,15 +192,53 @@ type MutableNode = {
 	opportunity: PredictionOpportunity;
 };
 
+const capturedUpdates = new WeakSet<PlanUpdate>();
+
 /** Owns plan materialization and prediction opportunities; execution is attached, never embedded. */
 export class PlanRuntime {
 	private readonly plans = new Map<string, MutablePlan>();
 
-	apply(update: PlanUpdate, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
+	/** Capture once at handoff, before an update waits behind an earlier revision. */
+	static capture(update: PlanUpdate, multiStep = true): { readonly update: PlanUpdate } | Extract<PlanRuntimeUpdateResult, { accepted: false }> {
+		const captured = capturedUpdates.has(update);
+		if (captured && multiStep) return { update };
 		update = { ...update };
-		return "actions" in update
-			? this.applyProposal(update, anchorDecisionSeq)
-			: this.applyDelta(update, anchorDecisionSeq);
+		const id = "actions" in update ? update.id : update.proposalID;
+		if (!validIdentity(id, update.source)) return { accepted: false, reason: "invalid_identity" };
+		if (!validRevision(update.revision)) return { accepted: false, reason: "invalid_revision" };
+		const remove = "actions" in update ? [] : [...(update.remove ?? [])];
+		const offered = "actions" in update
+			? multiStep ? update.actions : update.actions.filter((action) => finiteMetric(action.horizon) === 0 && (action.dependsOn?.length ?? 0) === 0)
+			: multiStep ? update.upsert ?? [] : [];
+		const validated = captured ? { ok: true as const, actions: Object.freeze(offered) } : validateActions(offered);
+		if (!validated.ok) return { accepted: false, reason: validated.reason };
+		if (remove.some((id) => !validToken(id))) return { accepted: false, reason: "invalid_action" };
+		update = Object.freeze("actions" in update
+			? { ...update, actions: validated.actions }
+			: { ...update, upsert: validated.actions, remove: Object.freeze(remove) });
+		capturedUpdates.add(update);
+		return { update };
+	}
+
+	apply(update: PlanUpdate, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
+		const captured = PlanRuntime.capture(update);
+		if (!("update" in captured)) return captured;
+		const owned = captured.update, proposal = "actions" in owned;
+		const id = proposal ? owned.id : owned.proposalID;
+		const current = this.plans.get(id);
+		if (!proposal && !current) return { accepted: false, reason: "proposal_missing" };
+		if (current && current.source !== owned.source) return { accepted: false, reason: "source_mismatch" };
+		if (current && owned.revision <= current.revision) return { accepted: false, reason: "stale_revision" };
+		const upserted = proposal ? owned.actions : owned.upsert ?? [];
+		const actions = new Map(proposal ? [] : [...current!.nodes].map(([id, node]) => [id, node.action] as const));
+		if (!proposal) for (const id of owned.remove ?? []) actions.delete(id);
+		for (const action of upserted) actions.set(action.id, action);
+		if (!dependenciesAreValid(actions)) return { accepted: false, reason: "invalid_dependency" };
+		return this.commit({
+			id, source: owned.source, revision: owned.revision,
+			draftTokens: (proposal ? 0 : current!.draftTokens) + finiteMetric(owned.draftTokens),
+			actions, upserted, anchorDecisionSeq,
+		});
 	}
 
 	plan(proposalID: string): MaterializedPlan | undefined {
@@ -369,53 +405,6 @@ export class PlanRuntime {
 
 	clear(): void {
 		this.plans.clear();
-	}
-
-	private applyProposal(proposal: PlanProposal, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
-		if (!validIdentity(proposal.id, proposal.source)) return { accepted: false, reason: "invalid_identity" };
-		if (!validRevision(proposal.revision)) return { accepted: false, reason: "invalid_revision" };
-		const current = this.plans.get(proposal.id);
-		if (current && current.source !== proposal.source) return { accepted: false, reason: "source_mismatch" };
-		if (current && proposal.revision <= current.revision) return { accepted: false, reason: "stale_revision" };
-		const validated = validateActions(proposal.actions);
-		if (!validated.ok) return { accepted: false, reason: validated.reason };
-		const actions = new Map(validated.actions.map((action) => [action.id, action]));
-		if (!dependenciesAreValid(actions)) return { accepted: false, reason: "invalid_dependency" };
-		return this.commit({
-			id: proposal.id,
-			source: proposal.source,
-			revision: proposal.revision,
-			draftTokens: finiteMetric(proposal.draftTokens),
-			actions,
-			upserted: validated.actions,
-			anchorDecisionSeq,
-		});
-	}
-
-	private applyDelta(delta: PlanDelta, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
-		if (!validIdentity(delta.proposalID, delta.source)) return { accepted: false, reason: "invalid_identity" };
-		if (!validRevision(delta.revision)) return { accepted: false, reason: "invalid_revision" };
-		const current = this.plans.get(delta.proposalID);
-		if (!current) return { accepted: false, reason: "proposal_missing" };
-		if (current.source !== delta.source) return { accepted: false, reason: "source_mismatch" };
-		if (delta.revision <= current.revision) return { accepted: false, reason: "stale_revision" };
-		const removals = new Set(delta.remove ?? []);
-		const validated = validateActions(delta.upsert ?? []);
-		if (!validated.ok) return { accepted: false, reason: validated.reason };
-		if ([...removals].some((id) => !validToken(id))) return { accepted: false, reason: "invalid_action" };
-		const actions = new Map([...current.nodes].map(([id, node]) => [id, node.action]));
-		for (const id of removals) actions.delete(id);
-		for (const action of validated.actions) actions.set(action.id, action);
-		if (!dependenciesAreValid(actions)) return { accepted: false, reason: "invalid_dependency" };
-		return this.commit({
-			id: current.id,
-			source: current.source,
-			revision: delta.revision,
-			draftTokens: current.draftTokens + finiteMetric(delta.draftTokens),
-			actions,
-			upserted: validated.actions,
-			anchorDecisionSeq,
-		});
 	}
 
 	private commit(input: {

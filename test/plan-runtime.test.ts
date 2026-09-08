@@ -105,10 +105,20 @@ describe("PlanRuntime", () => {
 				return path;
 			},
 		};
-		expect(plan.apply(update, 0)).toMatchObject({
+		const captured = PlanRuntime.capture(update);
+		if (!("update" in captured)) throw new Error(captured.reason);
+		expect(PlanRuntime.capture(captured.update)).toEqual({ update: captured.update });
+		expect(PlanRuntime.capture(update)).toEqual({ accepted: false, reason: "invalid_revision" });
+		expect(Object.isFrozen(captured.update)).toBe(true);
+		expect(plan.apply(captured.update, 0)).toMatchObject({
 			accepted: true,
 			plan: { id: "plan", source: "source", revision: kind === "proposal" ? 1 : 2, draftTokens: 3 },
 		});
+		const capturedAction = "actions" in captured.update ? captured.update.actions[0] : captured.update.upsert![0];
+		expect(plan.get("plan", "keyed")?.action).toBe(capturedAction);
+		const narrowed = PlanRuntime.capture(captured.update, false);
+		if (!("update" in narrowed)) throw new Error(narrowed.reason);
+		expect("actions" in narrowed.update ? narrowed.update.actions : narrowed.update.upsert).toEqual(kind === "proposal" ? [capturedAction] : []);
 		path = "mutated.ts";
 		expect(reads).toBe(1);
 		expect(plan.get("plan", "keyed")?.action).toMatchObject({ id: "keyed", tool: "read", background: true });
@@ -132,9 +142,15 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "keyed")?.action.input).toEqual({ path: "keyed.ts" });
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
 		const invalid = new PlanRuntime();
-		expect(invalid.apply(proposal([action("uncloneable", { input: { callback: () => undefined } })]), 0)).toEqual({
-			accepted: false,
-			reason: "invalid_action",
+		if (kind === "delta") invalid.apply(proposal([action("retained")]), 0);
+		const uncloneable = action("uncloneable", { horizon: 1, input: { callback: () => undefined } });
+		const future = kind === "proposal" ? proposal([action("now"), uncloneable])
+			: { proposalID: "plan", source: "source", revision: 2, upsert: [uncloneable], remove: ["retained"] };
+		expect(invalid.apply(future, 0)).toEqual({ accepted: false, reason: "invalid_action" });
+		const immediate = PlanRuntime.capture(future, false);
+		if (!("update" in immediate)) throw new Error(immediate.reason);
+		expect(invalid.apply(immediate.update, 0)).toMatchObject({
+			accepted: true, plan: { actions: kind === "proposal" ? [{ id: "now" }] : [] },
 		});
 	});
 

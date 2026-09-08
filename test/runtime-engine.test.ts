@@ -217,6 +217,7 @@ describe("structural speculative runtime", () => {
 		const slow = barrier(), slowStarted = barrier(), executed: string[] = [];
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
 		const keyed: string[] = [];
+		const replacements: MaterializedSpeculativeCandidate<string>[] = [];
 		const proposals = [
 			{ id: "proposal:0", source: "source", revision: 0, actions: [
 				{ id: "slow", type: "tool_call" as const, tool: "read", input: { path: "slow.ts" } },
@@ -245,6 +246,7 @@ describe("structural speculative runtime", () => {
 				return buildPiActionKey(tool, args, "/workspace");
 			},
 			execute: (_tool, concrete) => { executed.push(String(concrete.path)); return "speculative"; },
+			onCandidateMaterialized: (candidate) => { if (String(candidate.input.path).includes("replacement.ts")) replacements.push(candidate); },
 			onEvent: replacementReady.observe,
 		});
 		let turnID = "parallel-admission";
@@ -258,11 +260,24 @@ describe("structural speculative runtime", () => {
 			await slowStarted.promise; await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), "same-plan.ts"]);
 			expect(keyed).not.toContain("replacement.ts");
-			if (revised) { slow.arrive(); await replacementReady.promise; }
+			if (revised) {
+				const revision = mode === "revisions" ? revisions[1]! : observed[1]!;
+				Object.assign(revision, { [mode === "revisions" ? "id" : "proposalID"]: "proposal:1", revision: 2 });
+				const replacement = "actions" in revision ? revision.actions![0]! : revision.upsert![0]!;
+				replacement.id = "drifted";
+				replacement.input.path = "drifted-replacement.ts";
+				slow.arrive(); await replacementReady.promise;
+				expect(keyed).toContain("replacement.ts");
+				expect(keyed).not.toContain("drifted-replacement.ts");
+			}
 			if (mode === "observed") {
 				slow.arrive(); await fixture.runtime.finishTurn({ ...call(turnID), terminal: false });
 				turnID = "next-decision"; await fixture.runtime.startTurn({ sessionID: "session", turnID });
 			}
+			if (revised) expect(replacements).toMatchObject([{
+				source: "source", proposalID: "proposal:0", actionID: mode === "revisions" ? "next" : "same-plan",
+				input: { path: "replacement.ts" },
+			}]);
 			expect(await fixture.runtime.consume(call(turnID, { path: revised ? "replacement.ts" : "same-plan.ts" }))).toBe("speculative");
 		} finally {
 			slow.arrive();
