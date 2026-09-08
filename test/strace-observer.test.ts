@@ -42,51 +42,48 @@ describe("strace provenance decoder", () => {
 		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
 		expect(failed).toMatchObject({ complete: true, taints: [], incompleteReasons: [] });
 		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
-		await expect(observe({ 100: [EXEC, 'openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3'] })).rejects.toThrow();
+		for (const line of ['openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3', 'openat(8, "unresolved", O_RDONLY) = 3'])
+			await expect(observe({ 100: [EXEC, line] })).rejects.toThrow();
 	});
 
 	test("follows target descendants and descriptor-relative metadata without confusing data with flags", async () => {
+		const calls = new Map([
+			['renameat(5</work/a>, "source", 6</work/b>, "renamed") = 0', ["/work/a/source", "/work/b/renamed"]],
+			['renameat2(AT_FDCWD, "/work/absolute", -1, "/work/replaced", RENAME_NOREPLACE) = 0', ["/work/absolute", "/work/replaced"]],
+			['linkat(7</work/c>, "original", 8</work/d>, "linked", 0) = 0', ["/work/c/original", "/work/d/linked"]],
+			['symlinkat("literal-not-an-input", 9</work/e>, "alias") = 0', ["/work/e/alias"]],
+			['openat(AT_FDCWD</work/recorded>, "anchor", O_RDONLY) = 3', ["/work/recorded/anchor"]],
+		]);
 		const observation = await observe({
-			100: [EXEC, 'openat(AT_FDCWD, "/work/input.txt", O_RDONLY) = 3</work/input.txt>',
-				"fstat(3</work/input.txt>, " + STAT + ") = 0", 'chdir("/work/sub") = 0',
-				'openat(AT_FDCWD, "/work/final", O_RDONLY|O_DIRECTORY) = 4</work/final>',
+			100: [EXEC, 'chdir("/work/sub") = 0',
 				"fchdir(4</work/final>) = 0", "clone(child_stack=NULL, flags=SIGCHLD) = 101", "+++ exited with 0 +++"],
 			101: ['execve("/usr/bin/child", ["child"], 0x0) = 0',
 				'newfstatat(AT_FDCWD, "relative.dat", ' + STAT + ", 0) = 0",
-				'newfstatat(5</work/other>, "link", ' + STAT + ", AT_SYMLINK_NOFOLLOW) = 0", "+++ exited with 0 +++"],
+				'newfstatat(5</work/other>, "link", ' + STAT + ", AT_SYMLINK_NOFOLLOW) = 0", ...calls.keys(), "+++ exited with 0 +++"],
 		});
 		expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, taints: [] });
 		expect(observation.paths).toEqual(expect.arrayContaining([
 			{ path: "/usr/bin/example", role: "executable" }, { path: "/usr/bin/child", role: "executable" },
-			{ path: "/work/input.txt", role: "input" }, { path: "/work/final", role: "input" },
-			{ path: "/work/input.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
+			...[...calls.values()].flat().map((path) => ({ path, role: "input" })), { path: "/work/final", role: "input" },
 			{ path: "/work/final/relative.dat", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
 			{ path: "/work/other/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST },
 		]));
+		expect(observation.paths.some(({ path }) => path.includes("literal-not-an-input"))).toBe(false);
 	});
 
-	test("reassembles completed syscalls before extracting dependencies and children", async () => {
+	test("reassembles syscalls and identifies the root before an identical descendant exec", async () => {
 		const observation = await observe({
-			150: [EXEC, 'openat(AT_FDCWD, "/work/input.txt", O_RDONLY <unfinished ...>',
+			700: [EXEC, 'openat(AT_FDCWD, "/work/input.txt", O_RDONLY <unfinished ...>',
 				"<... openat resumed>) = 3</work/input.txt>", "clone(child_stack=NULL, flags=SIGCHLD <unfinished ...>",
-				"<... clone resumed>) = 151", "socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>",
+				"<... clone resumed>) = 600", "socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>",
 				"<... socket resumed>) = 4"],
-			151: ['openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'],
+			600: [EXEC, 'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'],
 		});
 		expect(observation).toMatchObject({ complete: true, tracedProcesses: 2, incompleteReasons: [] });
 		expect(observation.taints).toContain("network");
 		expect(observation.paths).toEqual(expect.arrayContaining([
 			{ path: "/work/input.txt", role: "input" }, { path: "/work/child.txt", role: "input" },
 		]));
-	});
-
-	test("selects the shallowest matching exec from process topology", async () => {
-		const observation = await observe({
-			700: [EXEC, 'openat(AT_FDCWD, "/work/root.txt", O_RDONLY) = 3', "clone(child_stack=NULL, flags=SIGCHLD) = 600"],
-			600: [EXEC, 'openat(AT_FDCWD, "/work/child.txt", O_RDONLY) = 3'],
-		});
-		expect(observation.complete).toBe(true);
-		expect(observation.paths).toContainEqual({ path: "/work/root.txt", role: "input" });
 	});
 
 	test("fails closed on missing process evidence or malformed syntax", async () => {
@@ -141,7 +138,7 @@ describe("strace provenance decoder", () => {
 			['clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)', ["confinement_observation"]],
 			['setxattr("/work/output", "user.pi", "x", 1, 0) = 0', ["unsupported_syscall"]],
 			['getxattr("/work/input", "user.pi", NULL, 0) = -1 ENODATA (No data available)', ["unsupported_syscall"]],
-			['utimensat(AT_FDCWD, "/work/output", NULL, 0) = 0', ["unsupported_syscall"]],
+			['utimensat(3</work/output>, NULL, NULL, 0) = 0', ["unsupported_syscall"]],
 			['fallocate(3</work/output>, 0, 0, 4096) = 0', ["unsupported_syscall"]],
 			['ioctl(3</work/output>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0', ["unsupported_syscall"]],
 			['ioctl(1</dev/null<char 1:3>>, TCGETS, 0x7fff0000) = -1 ENOTTY (Inappropriate ioctl for device)', []],

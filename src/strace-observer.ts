@@ -345,7 +345,7 @@ export async function observeStrace(
 				}
 				continue;
 			}
-			if (!FILE_SYSCALLS.has(syscall)) continue;
+			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			for (const observed of syscallPaths(line, syscall, cwd)) {
 				if (paths.get(observed) !== "executable") paths.set(observed, role);
@@ -376,52 +376,18 @@ export async function observeStrace(
 	};
 }
 
-const FILE_SYSCALLS = new Set([
-	"access",
-	"chdir",
-	"chmod",
-	"chown",
-	"creat",
-	"execve",
-	"execveat",
-	"fchdir",
-	"faccessat",
-	"faccessat2",
-	"fchmodat",
-	"fchownat",
-	"getxattr",
-	"lgetxattr",
-	"listxattr",
-	"llistxattr",
-	"link",
-	"linkat",
-	"mkdir",
-	"mkdirat",
-	"mknod",
-	"mknodat",
-	"mount",
-	"open",
-	"openat",
-	"openat2",
-	"readlink",
-	"readlinkat",
-	"removexattr",
-	"lremovexattr",
-	"rename",
-	"renameat",
-	"renameat2",
-	"rmdir",
-	"setxattr",
-	"lsetxattr",
-	"symlink",
-	"symlinkat",
-	"truncate",
-	"unlink",
-	"unlinkat",
-	"utime",
-	"utimensat",
-	"utimes",
-]);
+/** Kernel argument positions own pathname identity; each *at operand has its own directory binding. */
+const PATH_ARGUMENTS: Readonly<Record<string, readonly (readonly [pathname: number | undefined, dirfd?: number, descriptorPath?: "NULL" | '""'])[]>> = Object.fromEntries(([
+	["access chdir chmod chown creat execve getxattr lgetxattr listxattr llistxattr mkdir mknod open readlink removexattr lremovexattr rmdir setxattr lsetxattr truncate unlink utime utimes stat lstat statfs", [[0]]],
+	["rename link mount", [[0], [1]]],
+	["symlink", [[1]]],
+	["execveat faccessat faccessat2 fchmodat fchownat mkdirat mknodat openat openat2 readlinkat unlinkat statx", [[1, 0]]],
+	["newfstatat", [[1, 0, '""']]],
+	["utimensat", [[1, 0, "NULL"]]],
+	["renameat renameat2 linkat", [[1, 0], [3, 2]]],
+	["symlinkat", [[2, 1]]],
+	["fchdir fstat fstatfs", [[undefined, 0]]],
+] as const).flatMap(([names, positions]) => names.split(" ").map((name) => [name, positions])));
 
 const MODELED_METADATA_SYSCALLS = new Set(["stat", "lstat", "fstat", "newfstatat"]);
 const UNMODELED_METADATA_SYSCALLS = new Set(["statx", "statfs", "fstatfs", "getdents", "getdents64"]);
@@ -603,25 +569,21 @@ function processLimitDenied(line: TraceLine, syscall: string): boolean {
 }
 
 function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] {
-	if (syscall === "fchdir") {
-		const target = absoluteDescriptorPath(line.args[0]);
-		return target ? [target] : [];
-	}
-	const quoted = quotedStrings(line);
-	if (!quoted.length) return [];
-	let values: readonly string[];
-	if (syscall === "symlink" || syscall === "symlinkat") values = quoted.slice(-1);
-	else if (["rename", "renameat", "renameat2", "link", "linkat"].includes(syscall)) values = quoted.slice(0, 2);
-	else values = quoted.slice(0, 1);
-	const dirfd = /^(?:openat2?|newfstatat|statx|faccessat2?|readlinkat|mkdirat|unlinkat|execveat)$/.test(syscall) ? line.args[0] : undefined;
-	const base = absoluteDescriptorPath(dirfd) ?? cwd;
-	return values
-		.filter((value) => value.length > 0)
-		.map((value) => resolveObservedPath(value, base));
+	return (PATH_ARGUMENTS[syscall] ?? []).flatMap(([pathname, dirfd, descriptorPath]) => {
+		const descriptor = dirfd === undefined ? undefined : line.args[dirfd];
+		if (pathname === undefined || (descriptorPath !== undefined && line.args[pathname] === descriptorPath)) {
+			const target = absoluteDescriptorPath(descriptor); return target ? [target] : [];
+		}
+		const value = quotedArgument(line.args[pathname]);
+		if (value?.startsWith("/")) return [path.posix.normalize(value)]; // Absolute names ignore dirfd, even an invalid one.
+		const base = dirfd === undefined || descriptor === "AT_FDCWD" || descriptor === "-100" ? cwd : absoluteDescriptorPath(descriptor);
+		if (!value || !base) throw new Error(`unresolved_pathname:${syscall}:${pathname}`);
+		return [path.posix.resolve(base, value)];
+	});
 }
 
 function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {
-	const target = /^\d+<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
+	const target = /^(?:\d+|AT_FDCWD)<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
 	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(decodeCString(target)) : undefined;
 }
 
@@ -631,11 +593,7 @@ function metadataSyscallPaths(
 	cwd: string,
 ): readonly { readonly path: string; readonly followSymlinks: boolean }[] {
 	const followSymlinks = syscall !== "lstat" && !(syscall === "newfstatat" && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[3] ?? ""));
-	const paths = syscall === "fstat" ? [] : syscallPaths(line, syscall, cwd);
-	if (paths.length) return paths.map((observedPath) => ({ path: observedPath, followSymlinks }));
-	if (syscall !== "fstat" && syscall !== "newfstatat") return [];
-	const descriptorPath = absoluteDescriptorPath(line.args[0]);
-	return descriptorPath ? [{ path: descriptorPath, followSymlinks }] : [];
+	return syscallPaths(line, syscall, cwd).map((observedPath) => ({ path: observedPath, followSymlinks }));
 }
 
 /** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
@@ -719,16 +677,15 @@ function linuxDevice(major: bigint, minor: bigint): bigint {
 		((major & ~0xfffn) << 32n);
 }
 
-function resolveObservedPath(value: string, cwd: string): string {
-	if (value.startsWith("/")) return path.posix.normalize(value);
-	return path.posix.resolve(cwd, value);
-}
-
 function quotedStrings(line: TraceLine): string[] {
 	return line.args.flatMap((argument) => {
-		const match = /^"((?:\\.|[^"\\])*)"$/.exec(argument);
-		return match ? [decodeCString(match[1]!)] : [];
+		const value = quotedArgument(argument); return value === undefined ? [] : [value];
 	});
+}
+
+function quotedArgument(argument: string | undefined): string | undefined {
+	const match = /^"((?:\\.|[^"\\])*)"$/.exec(argument ?? "");
+	return match ? decodeCString(match[1]!) : undefined;
 }
 
 function decodeCString(value: string): string {
