@@ -5,6 +5,7 @@ import {
 	EffectTransactionCoordinator,
 } from "../src/effect-transaction.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "../src/execution-world.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 
 const route: SpeculativeExecutionRoute = {
 	isolation: "runtime_sandbox",
@@ -48,34 +49,40 @@ describe("EffectTransactionCoordinator", () => {
 		expect(transaction.state).toBe("committed");
 	});
 
-	it("coordinates validation and abort through one lifecycle", async () => {
-		let releaseValidation: (() => void) | undefined;
-		const validationGate = new Promise<void>((resolve) => {
-			releaseValidation = resolve;
-		});
-		const dispose = vi.fn();
-		const coordinator = new EffectTransactionCoordinator<string>();
-		const attempt = coordinator.begin({ tool: "write", route });
-		const transaction = await coordinator.execute(attempt, async () =>
-			branch({
-				validate: async () => {
-					await validationGate;
-					return { status: "valid", metrics: metrics() };
-				},
-				dispose,
-			}),
-		);
-
-		const validation = transaction.validate();
-		expect([transaction.state, attempt.state]).toEqual(["validating", "validating"]);
-		const aborted = transaction.abort();
-		expect(transaction.state).toBe("aborting");
-		releaseValidation?.();
-		await validation;
-		await aborted;
-
-		expect([transaction.state, attempt.state]).toEqual(["aborted", "aborted"]);
-		expect(dispose).toHaveBeenCalledOnce();
+	it("retires resources only after admitted validation, reconstruction and commit finish", async () => {
+		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
+			let release!: () => void, enter!: () => void;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const entered = new Promise<void>((resolve) => { enter = resolve; });
+			const failure = new Error("borrow failed"), dispose = vi.fn();
+			const borrow = async () => { enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure; };
+			const coordinator = new EffectTransactionCoordinator<string>();
+			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
+				validate: async () => { if (phase === "validation") await borrow(); return { status: "valid", metrics: metrics() }; },
+				reconstruct: async () => { await borrow(); return "rebuilt"; },
+				commit: async () => { if (phase === "committing") await borrow(); return "committed"; }, dispose,
+			}));
+			const request = { action: buildPiActionKey("read", { path: "notes" }, "/workspace")!, args: {}, callID: "actor", signal: new AbortController().signal };
+			if (phase !== "validation") await transaction.validate();
+			if (phase === "committed") await transaction.commit();
+			const operations = Promise.allSettled(phase === "validation" ? [transaction.validate()] : phase === "committing" ? [transaction.commit()]
+				: [transaction.reconstruct!(request), transaction.reconstruct!(request)]);
+			await entered;
+			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
+			const late = Promise.allSettled([transaction.validate(), transaction.reconstruct!(request)]);
+			try {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(dispose).not.toHaveBeenCalled();
+			} finally { release(); await operations; await aborts; }
+			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" ? "rejected" : "fulfilled");
+			expect(await late).toMatchObject([{ status: "fulfilled", value: { status: "indeterminate" } }, { status: "fulfilled", value: undefined }]);
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(transaction.state).toBe(phase === "committed" || (phase === "committing" && !fails) ? "committed" : phase === "committing" ? "poisoned" : "aborted");
+			expect(await transaction.validate()).toMatchObject({ status: "indeterminate" });
+			expect(await transaction.reconstruct!(request)).toBeUndefined();
+			if (phase === "committed" || (phase === "committing" && !fails)) await expect(transaction.commit()).resolves.toBe("committed");
+			else await expect(transaction.commit()).rejects.toMatchObject({ disposition: phase === "committing" ? "poisoned" : "recoverable" });
+		}
 	});
 
 	it.each(["stale", "missing", "throws"])("requires a backend proof for shared results (%s)", async (proof) => {

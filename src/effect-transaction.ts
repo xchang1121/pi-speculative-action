@@ -181,6 +181,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	private validationPromise?: Promise<ResourceValidation>;
 	private commitPromise?: Promise<Output>;
 	private cleanupPromise?: Promise<void>;
+	private readonly reconstructions = new Set<Promise<Output | undefined>>();
 
 	constructor(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>) {
 		this.attempt = attempt;
@@ -234,20 +235,22 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	get reconstruct(): WorldBranch<Output>["reconstruct"] {
 		if (!this.branch.reconstruct || this.attempt.descriptor.route.reuse !== "shared_result") return undefined;
 		return async (request) => {
-			if (this.validation?.status !== "valid" || !["validated", "committed"].includes(this.state)) return undefined;
-			return this.branch.reconstruct!(request);
+			if (this.cleanupPromise || this.validation?.status !== "valid" || !["validated", "committed"].includes(this.state)) return undefined;
+			const task = this.branch.reconstruct!(request);
+			this.reconstructions.add(task);
+			try { return await task; } finally { this.reconstructions.delete(task); }
 		};
 	}
 
 	async validate(): Promise<ResourceValidation> {
-		if (this.validationPromise) return this.validationPromise;
-		if (["aborted", "aborting", "poisoned", "failed"].includes(this.attempt.stateValue)) {
+		if (this.cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(this.attempt.stateValue)) {
 			return {
 				status: "indeterminate",
 				cause: cause("freshness", "transaction_unavailable"),
 				metrics: zeroValidationMetrics(),
 			};
 		}
+		if (this.validationPromise) return this.validationPromise;
 		const preserveCommitted = this.attempt.stateValue === "committed";
 		this.attempt.stateValue = preserveCommitted ? "committed" : "validating";
 		const pending = (async () => {
@@ -267,8 +270,11 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 	}
 
 	async commit(): Promise<Output> {
+		// An admitted effect keeps its original settlement, including during/after retirement.
 		if (this.commitPromise) return this.commitPromise;
-		if (this.attempt.stateValue === "committed") return this.branch.output;
+		if (this.cleanupPromise) {
+			throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
+		}
 		if (!this.validationPromise && this.validation?.status !== "valid") {
 			throw new Error(`effect transaction ${this.transactionID} requires successful validation before commit`);
 		}
@@ -297,15 +303,10 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 
 	abort(): Promise<void> {
 		if (this.cleanupPromise) return this.cleanupPromise;
-		const committed = this.attempt.stateValue === "committed";
-		const poisoned = this.attempt.stateValue === "poisoned";
-		const committing = this.commitPromise;
-		const validating = this.validationPromise;
-		if (!committed && !poisoned && !committing) this.attempt.stateValue = "aborting";
+		if (!["committed", "poisoned"].includes(this.state) && !this.commitPromise) this.attempt.stateValue = "aborting";
 		const pending = (async () => {
 			try {
-				await validating?.catch(() => undefined);
-				await committing?.catch(() => undefined);
+				await Promise.allSettled([this.validationPromise, this.commitPromise, ...this.reconstructions]);
 				await this.branch.dispose();
 			} finally {
 				if (!["committed", "poisoned"].includes(this.attempt.stateValue)) this.attempt.stateValue = "aborted";
