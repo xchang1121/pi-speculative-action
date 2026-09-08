@@ -53,6 +53,7 @@ Nested process misses use the same generic workspace-transaction outlet as the o
 - Actor adoption still requires action equivalence, permission, fresh resource evidence, compatible world evidence, successful projection, and successful commit.
 - A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
 - Same-name custom tools remain authoritative and are excluded unless the host explicitly supplies matching semantics and execution capability.
+- Input evidence protects the bound file operations' content/path semantics, not zero host metadata effects: sampling can update access times. Known non-regular inputs are rejected before opening, but this JavaScript capture is not kernel protection against concurrent hostile replacement with a device. Workloads requiring metadata/event-level noninterference need a separately qualified snapshot or isolation provider; the resource route does not provide that guarantee.
 
 `read` retains lossless range projection backed by realized output coverage. Other queries may be recomputed only from a world's sealed inputs; an input lookup is not output equivalence. Bash reuse requires an exact whole-command match or native process certificates. A textual suffix such as `| tail -n 20` is not a proof: `tail` may be a function or a different executable with different output, effects, or exit status.
 

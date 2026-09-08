@@ -46,19 +46,19 @@ export async function advanceFilesystemClock(
 	}
 }
 
-/** Hash one regular file through a single descriptor and prove its path still names that descriptor. */
+/** One regular-file identity owns admission, descriptor reads, and the final path proof. */
 export async function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
 ): Promise<StableFileCapture> {
-	if ((await fs.lstat(target)).isSymbolicLink()) throw new Error("not_regular_file:symlink");
+	const before = await fs.lstat(target, { bigint: true });
+	if (!before.isFile()) throw new Error("not_regular_file");
 	const beforePath = await fs.realpath(target);
-	// Descriptor admission must not perform blocking device/FIFO IO before the type proof.
+	// Known special files never reach open; NONBLOCK limits FIFO races, not device-open side effects.
 	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 	try {
-		const before = await handle.stat({ bigint: true });
-		if (!before.isFile()) throw new Error("not_regular_file");
+		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
 			throw new Error(`file_too_large:${before.size}`);
 		}
@@ -83,9 +83,7 @@ export async function captureStableFile(
 			bytesRead !== Number(before.size) ||
 			beforePath !== afterPath ||
 			!sameFilesystemIdentity(before, after) ||
-			pathStat.isSymbolicLink() ||
-			pathStat.dev !== after.dev ||
-			pathStat.ino !== after.ino
+			!sameFilesystemIdentity(after, pathStat)
 		) {
 			throw new Error("file_changed_during_capture");
 		}

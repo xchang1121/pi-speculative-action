@@ -50,7 +50,7 @@ export function createResourceSnapshotExecutionWorld(
 		fingerprint: () => "resource-version:v3",
 		diagnostics: () => ({
 			state: "ready" as const,
-			detail: "Resource-version snapshots are available",
+			detail: "Sealed file inputs; host reads may update access times (not an OS snapshot)",
 		}),
 	};
 	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {

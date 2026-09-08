@@ -187,13 +187,21 @@ describe("speculative action resource versions", () => {
 		} finally { vi.unstubAllEnvs(); }
 	});
 
-	test.for(["empty", "short", "grow", "shrink", "replace"])("owns descriptor reads through %s", async (change, { skip }) => {
-		if (process.platform === "win32" && change === "replace") return skip("Windows denies replacement of the open destination");
-		for (const retain of [false, true]) {
+	test.for([["empty", "short"], ["admission"], ["grow", "shrink"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
+		const lstat = fs.lstat.bind(fs);
+		if (process.platform === "win32" && changes.includes("replace")) return skip("Windows denies replacement of the open destination");
+		for (const change of changes) for (const retain of [false, true]) {
 			const payload = Buffer.from(change === "empty" ? "" : "initial contents");
 			const root = await workspace({ value: payload }), file = path.join(root, "value");
 			const handle = await fs.open(file, "r"), read = handle.read.bind(handle);
-			const open = vi.spyOn(fs, "open").mockResolvedValueOnce(handle);
+			const open = vi.spyOn(fs, "open").mockImplementationOnce(async () => {
+				if (change === "admission") await fs.appendFile(file, "more");
+				return handle;
+			});
+			const inspect = vi.spyOn(fs, "lstat").mockImplementationOnce(lstat).mockImplementationOnce((async (...args: Parameters<typeof fs.lstat>) => {
+				if (change === "seal") await fs.appendFile(file, "more"); // After the final fstat, before the path proof.
+				return lstat(...args);
+			}) as typeof fs.lstat);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (buffer: Buffer) => {
 				if (change === "grow") await fs.appendFile(file, "more");
 				if (change === "shrink") await fs.truncate(file, 1);
@@ -206,8 +214,9 @@ describe("speculative action resource versions", () => {
 					expect(await capture).toMatchObject({ hash: createHash("sha256").update(payload).digest("hex"), bytesRead: payload.length,
 						...(retain ? { content: payload } : {}) });
 				} else await expect(capture).rejects.toThrow("file_changed_during_capture");
+				if (change === "admission") expect(handle.read).not.toHaveBeenCalled();
 				expect(handle.fd).toBe(-1);
-			} finally { open.mockRestore(); }
+			} finally { open.mockRestore(); inspect.mockRestore(); }
 		}
 	});
 
@@ -250,17 +259,19 @@ describe("speculative action resource versions", () => {
 		} finally { token.release(); manager.close(); }
 	});
 
-	test.runIf(process.platform === "linux")("rejects special files without opening them", async () => {
-		const root = await workspace();
-		const fifo = path.join(root, "input.pipe");
-		await execFileAsync("mkfifo", [fifo]);
-		await expect(captureStableFile(fifo)).rejects.toThrow("not_regular_file");
-		const manager = new ResourceVersionManager(root, { watch: false });
-
-		await expect(manager.capture(resourceDependencies(action("read", ["input.pipe"]), root))).rejects.toThrow(
-			"unsupported_resource_type:fifo",
-		);
-		manager.close();
+	test("rejects known non-regular paths before opening a data descriptor", async () => {
+		const root = await workspace(), manager = new ResourceVersionManager(root, { watch: false }), paths = [root];
+		if (process.platform === "linux") {
+			const fifo = path.join(root, "input.pipe"); await execFileAsync("mkfifo", [fifo]); paths.push(fifo);
+		}
+		const open = vi.spyOn(fs, "open");
+		try {
+			for (const target of paths) {
+				await expect(captureStableFile(target)).rejects.toThrow("not_regular_file");
+				await expect(manager.capture([{ path: target, scope: "content" }])).rejects.toThrow("unsupported_resource_type:");
+			}
+			expect(open).not.toHaveBeenCalled();
+		} finally { open.mockRestore(); manager.close(); }
 	});
 
 	test.each([
