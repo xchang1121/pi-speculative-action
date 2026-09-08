@@ -84,7 +84,7 @@ npm run setup:linux
 
 跨平台的受控输入 `find` 只使用 Pi 已安装的 minimatch/ignore 组件和 Node，不增加安装包、二进制、下载或 setup 步骤。在 **Tools & execution → Execution routes → Search execution** 选择 **Captured find**，再 Apply，即可让 Actor 与投机共享这一执行器（`searchExecution: "captured"`）；默认仍为 **Native Pi**。它处理工作区内分层 .gitignore，保留文件名原文（含 Unicode），使用确定的大小写敏感 glob 匹配和排序，不等价于原生 fd。`grep` 保留原生执行或使用可用的统一执行环境，目前没有获准的本地跨平台 grep 提前执行路线。
 
-结果采纳和封存输入重算仍由已有 resource/candidate store 负责。无法证明的输入或超限（输入 8 MiB、结果 1 MiB、包含启动的执行期限 5 秒）会拒绝所选 find 调用；取消还须等待已委托的输入操作完成清理。工作进程按需启动；关闭插件会排空 Actor、取消 producer 并恢复原生 Pi。旧搜索设置直接回到默认值，没有安装报错或迁移提示。Windows 与 WSL 已验收，macOS 仍缺真机验证；这是固定可信执行器，不是任意 Bash 或恶意 JavaScript 沙箱。
+结果采纳和封存输入重算仍由已有 resource/candidate store 负责。可选搜索组件不存在或版本未经验证时，不安装、不弹错，直接绑定原生 Pi；显式刷新可重新检查。一旦已绑定受控执行器，无法证明的输入或超限（输入 8 MiB、结果 1 MiB、包含启动的执行期限 5 秒）仍拒绝该调用，不中途换语义。取消还须等待已委托的输入操作完成清理。工作进程按需启动；关闭插件会排空 Actor、取消 producer 并恢复原生 Pi。旧搜索设置直接回到默认值，没有迁移提示。Windows 与 WSL 已验收，macOS 仍缺真机验证；这是固定可信执行器，不是任意 Bash 或恶意 JavaScript 沙箱。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 

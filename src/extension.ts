@@ -380,18 +380,18 @@ async function installController(
 	});
 	const settings = () => currentSettings;
 	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
-	type SearchRoute = { ready: Promise<SearchProfile>; profile?: SearchProfile; error?: string };
+	type SearchRoute = { ready: Promise<SearchProfile | undefined>; profile?: SearchProfile };
 	let search: SearchRoute | undefined;
 	const closedSearchEnabled = () => currentSettings.enabled && currentSettings.searchExecution !== "native";
-	const prepareSearch = (): Promise<SearchProfile> => {
+	const prepareSearch = (): Promise<SearchProfile | undefined> => {
 		if (search) return search.ready;
 		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd).then(
-				(profile) => (entry.profile = profile), (error) => { entry.error = String(error?.message ?? error); throw error; }) };
+				(profile) => (entry.profile = profile), () => undefined) };
 		search = entry; return entry.ready;
 	};
 	const resetSearch = async () => {
 		const previous = search; search = undefined;
-		await previous?.ready.then((profile) => profile.pool.dispose(), () => {});
+		await previous?.ready.then((profile) => profile?.pool.dispose());
 	};
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
@@ -470,7 +470,7 @@ async function installController(
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
 		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
-		searchDetail: !closedSearchEnabled() ? "Native Pi" : search?.error ?? `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? "workers start on demand" : "not checked"}`,
+		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? "workers start on demand" : "not checked"}`,
 	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -526,9 +526,8 @@ async function installController(
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
 		resolveInvocation: async (tool, input) => {
 			if (closedSearchEnabled() && PI_CLOSED_SEARCH_TOOLS.includes(tool)) {
-				const invocation = (await prepareSearch()).invocations.get(tool);
-				if (!invocation) throw new Error(`Selected search profile has no ${tool} executor`);
-				return invocation;
+				const invocation = (await prepareSearch())?.invocations.get(tool);
+				if (invocation) return invocation; // Qualification precedes identity binding; never switch an admitted call.
 			}
 			return resolvePiToolInvocation(tool, input, {
 				cwd: latestContext.cwd,
@@ -560,7 +559,7 @@ async function installController(
 	});
 	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
 		if (refresh) await resetSearch();
-		if (closedSearchEnabled()) await prepareSearch().catch(() => {}); // Diagnostic failure cannot change selected Actor semantics.
+		if (closedSearchEnabled()) await prepareSearch();
 		const [, diagnostics] = await Promise.all([
 			refresh ? processCoordinator.refreshActorRoute() : undefined,
 			host.executionWorldDiagnostics(refresh && currentSettings.enabled),
@@ -613,7 +612,6 @@ async function installController(
 				previous.executionRouting.primary !== currentSettings.executionRouting.primary ||
 				previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
 			));
-			if (closedSearchEnabled() && search?.error) ui?.notify(search.error, "warning");
 		},
 		attachUI: (nextUI) => {
 			ui = nextUI;

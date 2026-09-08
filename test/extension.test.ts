@@ -156,31 +156,23 @@ describe("zero-modification Pi extension", () => {
 		}));
 	});
 
-	it("selects one search profile for both routes, fails closed, and retires it on refresh or disable", async () => {
-		const fixture = await createFixture({ settings: JSON.parse('{"searchExecution":"closed"}') });
+	it("binds only prepared searches, quietly retains native Actor otherwise, and retires on refresh or disable", async () => {
+		const fixture = await createFixture({ settings: { searchExecution: "captured" } });
 		vi.stubEnv("PI_CODING_AGENT_DIR", fixture.cwd);
 		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockRejectedValue(new Error("Requalify Pi's installed minimatch"));
+		const native = vi.fn(async () => ({ content: [{ type: "text" as const, text: "native find" }], details: {} })); fixture.baseTools.get("find")!.execute = native;
+		const definitions = vi.spyOn(piTools, "createPiToolDefinitions").mockReturnValue(fixture.baseTools);
 		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
 		try {
 			await fixture.emit("session_start", {}, fixture.context);
-			await command("on");
 			for (const tool of ["grep", "find"]) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
 			expect(prepare).not.toHaveBeenCalled();
-			await command("off");
-			driveSettingsMenus(fixture, {
-				"Speculative action": ["Tools & execution", "Apply changes", "Close"],
-				"Tools & execution": ["Execution routes", "Back"],
-				"Execution routes": ["Search execution", "Back"],
-				"Search execution": ["Captured find"],
-			});
-			await command("");
-			expect(fixture.store.effective()).toMatchObject({ enabled: false, searchExecution: "captured" });
-			expect(prepare).not.toHaveBeenCalled();
 			await command("on");
-			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Requalify Pi's installed minimatch"), "warning");
-			await expect(fixture.tools.get("find")!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("Requalify");
+			expect(fixture.ui.notify.mock.calls.flat().join(" ")).not.toMatch(/Requalify|setup:search/u);
+			expect(await fixture.resolveInvocation("find", {})).toBeUndefined();
+			expect(await fixture.tools.get("find")!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).toEqual(textResult("native find"));
+			expect(native).toHaveBeenCalledOnce();
 			expect(prepare).toHaveBeenCalledOnce();
-			expect((await fixture.resolveInvocation("read", { path: "a" }))?.authoritative).toBeUndefined();
 			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
 			const dispose = vi.fn(async () => {});
 			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 } },
@@ -193,6 +185,9 @@ describe("zero-modification Pi extension", () => {
 			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/find\s+On\s+Ready\s+Ready\s+Ready/u), "info");
 			expect(authoritative).toHaveBeenCalledOnce();
 			expect(await fixture.resolveInvocation("grep", { pattern: "x" })).toBeUndefined();
+			authoritative.mockRejectedValueOnce(new Error("unproven selected input"));
+			await expect(fixture.tools.get("find")!.execute("bound-error", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("unproven selected input");
+			expect(native).toHaveBeenCalledOnce(); // Binding is immutable: an admitted profile failure must not silently change semantics.
 			await command("status");
 			expect(dispose).toHaveBeenCalledOnce();
 			await command("off");
@@ -200,7 +195,7 @@ describe("zero-modification Pi extension", () => {
 			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
 		} finally {
 			await fixture.emit("session_shutdown", {}, fixture.context);
-			prepare.mockRestore(); vi.unstubAllEnvs();
+			prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs();
 		}
 	});
 
