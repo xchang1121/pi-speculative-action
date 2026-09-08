@@ -26,19 +26,28 @@ npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
 ## Dependency-free grep feasibility probe
 
 ```sh
-node --experimental-strip-types bench/grep-captured-qualification.mjs
+node --experimental-strip-types bench/grep-captured-qualification.mjs --semantics-only
 ```
 
-Uses only Pi's existing rg, with downloads disabled; missing rg reports a skip. On fixed flat
-UTF-8 fixtures it runs the complete stock tool over privately copied, token-owned inputs in a bounded
-process. The qualification-only module adapter forwards process operations to the parent, which owns
-the real rg handle and streams its output through the existing input protocol. It requires five Runtime
-adoptions without another producer, exact Pi formatting/context/truncation, result-limit cancellation,
-and actual-rg abort/output-budget barriers that keep request settlement behind native close and borrowed-input cleanup.
-Native Pi, fixed-sort host Pi, one-time worker startup, warm producer and ready-hit timings are separate.
-Sorting can change native limited results; this is **not** a transparent native replacement or
-a production grep route. General namespace/config/ignore/encoding, engine identity and benefit admission
-remain unqualified. Both wins and slower-than-native hits are retained in the output.
+The low-load mode checks small nested fixtures, native glob/ignore precedence, explicit ignored roots,
+mixed raw UTF-8/UTF-16/binary inputs, exact stock-Pi formatting/context/truncation, complete host adoption,
+and exactly-once fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
+file must never enter the payload evidence. One actual-rg abort barrier verifies native close and borrowed
+input cleanup before settlement; a tiny query may finish before its result-limit cancellation arrives.
+
+Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
+The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
+Metadata and ignore-file evidence drive rg's own file selection; only selected raw bytes are copied.
+Provider-owned ancestor-directory overrides preserve explicit-root admission without interpreting user
+globs. Native [root admission](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/walk.rs) and
+[override semantics](https://github.com/BurntSushi/ripgrep/blob/15.1.0/crates/ignore/src/overrides.rs) remain the reference.
+
+Omit `--semantics-only` only for a performance-stage run: larger flat fixtures, five host adoptions per
+query, and 20 abort/output-budget barriers. Native Pi, fixed-sort host Pi, startup, producer and ready-hit
+timings stay separate; the small-mode timings are not performance claims. The proposed profile explicitly
+cuts off global/above-workspace ignore inputs and sorts output. This is **not** native-default equivalence
+or production admission: link/special-entry closure, private materialization cost, broader namespaces and
+existing benefit gates still need qualification. Nothing is installed or downloaded; missing rg skips.
 
 ## ThinkThread real Runtime qualification
 
