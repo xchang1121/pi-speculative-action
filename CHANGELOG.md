@@ -63,6 +63,9 @@
 
 ### Added
 
+- K(a) captures the selected profile metadata, canonicalizer and execution binding before calling
+  provider canonicalization. Already-issued definitions retain identity without repeated normalization;
+  mutable provider records are freshly captured for each call, not cached as results or configurations.
 - PatternAware lease retirement shares one settlement across all release callers, including flush
   failures; the lease remains registered before entering persistence callbacks and decrements only once.
 - PatternAware shares feedback counter definitions across types, initialization and persistence

@@ -140,22 +140,38 @@ describe("ActionSemanticsRegistry", () => {
 		}
 	});
 
-	it("binds profile requirements and resource evidence without mutating the native registry", () => {
+	it("binds the selected profile before canonicalization without mutating the native registry", () => {
 		for (const tool of ["grep", "find"]) for (const scope of ["tree_content", "captured_inputs"] as const) {
-			const profile: ActionSemanticsDefinition = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed.v1",
-				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: scope };
+			const profile = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed.v1",
+				effect: "observation", requirements: { capabilities: [...RESOURCE_OBSERVATION_EFFECTS.capabilities] }, resourceScope: scope } satisfies ActionSemanticsDefinition;
+			const context = {}, execution = { fingerprint: "profile.v1", context, semantics: profile as ActionSemanticsDefinition };
+			const canonicalize = profile.canonicalize;
+			profile.canonicalize = function (input, cwd) {
+				profile.epoch = "closed.v2";
+				profile.requirements.capabilities.push("filesystem.write");
+				(profile as { resourceScope: string }).resourceScope = "entries";
+				execution.fingerprint = "profile.v2"; execution.context = { changed: true };
+				execution.semantics = { ...profile, canonicalize: () => undefined };
+				return canonicalize(input, cwd);
+			};
 			const args = { pattern: "needle", path: "." };
 			const native = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace")!;
-			const closed = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", { fingerprint: "profile.v1", semantics: profile })!;
+			const closed = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", execution)!;
+			expect(closed).toMatchObject({ semanticsEpoch: "closed.v1", executionFingerprint: "profile.v1", semantics: { resourceScope: scope } });
+			expect(closed.executionContext).toBe(context);
+			expect(closed.semantics?.requirements).toEqual(RESOURCE_OBSERVATION_EFFECTS);
 			expect(PI_ACTION_SEMANTICS.definition(native)?.effect).toBe("unbounded");
 			expect(PI_ACTION_SEMANTICS.definition(closed)?.effect).toBe("observation");
 			expect(resourceDependencies(native, "/workspace")).toEqual([]);
 			expect(resourceDependencies(closed, "/workspace")).toEqual(scope === "captured_inputs" ? [] : [{ path: path.resolve("/workspace"), scope }]);
 			expect(actionKeyMatch(native, closed, [RESOURCE_INPUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
-			(profile as { resourceScope: string }).resourceScope = "entries";
-			expect(buildActionKey(closed).semantics?.resourceScope).toBe(scope);
+			expect(buildActionKey(closed).semantics).toBe(closed.semantics);
+			expect(closed.semantics?.canonicalize).toBe(profile.canonicalize);
 			expect(() => buildActionKey({ ...closed, tool: "unrelated" })).toThrow("contract identity mismatch");
 			expect(Object.isFrozen(closed.semantics?.requirements)).toBe(true);
+			expect(PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", execution)).toBeUndefined();
+			expect(PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", { ...execution, semantics: profile }))
+				.toMatchObject({ semanticsEpoch: "closed.v2", executionFingerprint: "profile.v2", semantics: { resourceScope: "entries" } });
 		}
 	});
 
@@ -205,44 +221,18 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("rejects duplicate tools and incoherent effect evidence", () => {
 		const definition = resourceDefinition("read", "read.v1", () => ({ input: {}, resources: ["."] }));
-		expect(() => new ActionSemanticsRegistry([definition, definition])).toThrow(
-			"duplicate action semantics for read",
-		);
-		expect(
-			() =>
-				new ActionSemanticsRegistry([
-					{
-						...definition,
-						tool: "write",
-						effect: "workspace_mutation",
-					},
-				]),
-		).toThrow("non-observation action write cannot declare resource evidence");
-		expect(
-			() =>
-				new ActionSemanticsRegistry([
-					{
-						...definition,
-						tool: "missing_scope",
-						resourceScope: undefined,
-					},
-				]),
-		).toThrow("observation action missing_scope requires resource evidence");
-		expect(
-			() =>
-				new ActionSemanticsRegistry([
-					{
-						...definition,
-						tool: "bad_observer",
-						effect: "unbounded",
-						requirements: UNRESTRICTED_PROCESS_EFFECTS,
-						resourceScope: undefined,
-					},
-				]),
-		).not.toThrow();
-		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "bad_none", effect: "unbounded" }])).toThrow(
-			"non-observation action bad_none cannot declare resource evidence",
-		);
+		expect(() => new ActionSemanticsRegistry([definition, definition])).toThrow("duplicate action semantics for read");
+		for (const [override, message] of [
+			[{ tool: "write", effect: "workspace_mutation" }, "non-observation action write cannot declare resource evidence"],
+			[{ tool: "missing_scope", resourceScope: undefined }, "observation action missing_scope requires resource evidence"],
+			[{ tool: "bad_none", effect: "unbounded" }, "non-observation action bad_none cannot declare resource evidence"],
+			[{ tool: "  " }, "action semantics tool must not be empty"],
+			[{ epoch: "  " }, "action semantics epoch must not be empty for read"],
+		] as const) {
+			expect(() => new ActionSemanticsRegistry([Object.freeze({ ...definition, ...override })])).toThrow(message);
+		}
+		expect(() => new ActionSemanticsRegistry([{ ...definition, tool: "observer", effect: "unbounded",
+			requirements: UNRESTRICTED_PROCESS_EFFECTS, resourceScope: undefined }])).not.toThrow();
 	});
 
 	it("owns immutable definitions and shares registered projectors without duplicate input relations", () => {
@@ -261,7 +251,8 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.supportsProjector("kept")).toBe(true);
 		expect(registry.supportsProjector("late")).toBe(false);
 		expect(registry.toolNames()).toEqual(["one", "two"]);
-		expect(new ActionSemanticsRegistry([registry.definition("one")!]).definition("one")?.projectors).toHaveLength(2);
+		expect(registry.definition("one")?.projectors).toHaveLength(2);
+		expect(new ActionSemanticsRegistry([registry.definition("one")!]).definition("one")).toBe(registry.definition("one"));
 		expect(() =>
 			(registry.definition("one")?.projectors as ActionKeyProjector[]).push(projector("blocked")),
 		).toThrow();

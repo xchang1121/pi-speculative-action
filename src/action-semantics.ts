@@ -97,6 +97,9 @@ export interface ActionSemanticsDefinition {
 	readonly projectors?: readonly ActionKeyProjector[];
 }
 
+// Only issued definitions may skip normalization; mutable provider records are never memoized.
+const normalizedDefinitions = new WeakSet<ActionSemanticsDefinition>();
+
 /** Immutable source of truth for K(a), projection, resource evidence, and safe local fallback capability. */
 export class ActionSemanticsRegistry {
 	private readonly definitionsByTool = new Map<string, ActionSemanticsDefinition>();
@@ -151,7 +154,8 @@ export class ActionSemanticsRegistry {
 		schemaHash = "",
 		execution?: { readonly fingerprint: string; readonly context?: unknown; readonly semantics?: ActionSemanticsDefinition },
 	): ActionKey | undefined {
-		const definition = execution?.semantics ?? this.definition(tool);
+		const { fingerprint, context, semantics } = execution ?? {};
+		const definition = semantics ? normalizeDefinition(semantics) : this.definition(tool);
 		if (!definition) return undefined;
 		let canonical: CanonicalAction | undefined;
 		try {
@@ -166,9 +170,9 @@ export class ActionSemanticsRegistry {
 			input: canonical.input,
 			schemaHash,
 			semanticsEpoch: definition.epoch,
-			executionFingerprint: execution?.fingerprint,
-			executionContext: execution?.context,
-			semantics: execution?.semantics,
+			executionFingerprint: fingerprint,
+			executionContext: context,
+			semantics: semantics ? definition : undefined,
 		});
 	}
 }
@@ -582,6 +586,7 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 }
 
 function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemanticsDefinition {
+	if (normalizedDefinitions.has(source)) return source;
 	const tool = source.tool.trim(), epoch = source.epoch.trim();
 	if (!tool) throw new Error("action semantics tool must not be empty");
 	if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
@@ -590,6 +595,7 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 		projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])]),
 	});
 	assertDefinitionCoherence(definition);
+	normalizedDefinitions.add(definition);
 	return definition;
 }
 
