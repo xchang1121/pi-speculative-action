@@ -1,3 +1,20 @@
+/** Stored values never coerce text; interactive parsers below separately enforce strict input. */
+export function positiveInteger<F extends number | undefined>(value: unknown, fallback: F): number | F {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+export function nonNegativeInteger(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+export function nonNegativeNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+export function probability<F extends number | undefined>(value: unknown, fallback: F): number | F {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
+}
+
 export type SettingInputResult<T> =
 	| { readonly ok: true; readonly value: T }
 	| { readonly ok: false; readonly error: string };

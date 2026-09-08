@@ -15,6 +15,7 @@ import {
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { stableEqual as sameValue, stableStringify } from "./stable-json.ts";
+import { nonNegativeInteger, positiveInteger, probability as probabilitySetting } from "./setting-input.ts";
 
 export type PatternAwareSettings = {
 	readonly enabled: boolean;
@@ -3148,18 +3149,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function isObject(value: unknown): value is object {
 	return value !== null && typeof value === "object";
-}
-
-function positiveInteger(value: unknown, fallback: number) {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function nonNegativeInteger(value: unknown, fallback: number) {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
-}
-
-function probabilitySetting(value: unknown, fallback: number) {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
 }
 
 function probability(pattern: Pick<MutablePattern, "historicalMatches" | "historicalOpportunities">) {

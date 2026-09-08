@@ -4,6 +4,7 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
+import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 
 export interface LegacySpeculativeToolGroups {
 	readonly resourceCached?: readonly string[];
@@ -74,7 +75,7 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
 	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
-	const maxTokens = optionalPositiveInteger(input.drafterMaxTokens);
+	const maxTokens = positiveInteger(input.drafterMaxTokens, undefined);
 	return {
 		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
 		...(maxTokens ? { drafterMaxTokens: maxTokens } : {}),
@@ -104,18 +105,6 @@ export function drafterRequestTemperature(
 		((settings.drafterTemperatureMax - settings.drafterTemperatureMin) * (index - deterministic)) /
 			(stochasticCount - 1)
 	);
-}
-
-function optionalPositiveInteger(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
-}
-
-function nonNegativeInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
-}
-
-function nonNegativeNumber(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function stringArrayOr(value: unknown, fallback: readonly string[]): readonly string[] {

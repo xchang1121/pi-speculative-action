@@ -12,6 +12,7 @@ import {
 	type Sha256Digest,
 } from "./provenance-certificate.ts";
 import { stableStringify } from "./stable-json.ts";
+import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 
 export interface ProvenanceStoreLimits {
 	readonly maxCertificates: number;
@@ -446,12 +447,4 @@ function alreadyExists(error: unknown): boolean {
 
 function hasCode(error: unknown, code: string): boolean {
 	return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
-}
-
-function positiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function nonNegativeNumber(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }

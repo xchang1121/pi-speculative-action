@@ -64,6 +64,7 @@ import {
 	optionalPositiveIntegerInput,
 	optionalTextInput,
 	positiveIntegerInput,
+	positiveInteger,
 	probabilityInput,
 	settingInput,
 	type SettingInputDescriptor,
@@ -1537,10 +1538,6 @@ function findExactModelReferenceMatch(reference: string, models: readonly Model<
 	if (canonical.length > 1 || normalized.includes("/")) return undefined;
 	const byID = models.filter((model) => model.id.toLowerCase() === normalized);
 	return byID.length === 1 ? byID[0] : undefined;
-}
-
-function positiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
 function mebibyteInput(title: string): SettingInputDescriptor<number> {

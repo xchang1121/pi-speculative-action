@@ -46,6 +46,7 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
+import { nonNegativeInteger, positiveInteger } from "./setting-input.ts";
 import { immutableSnapshot } from "./stable-json.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
@@ -88,9 +89,9 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		drafterGateEnabled: typeof input.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
 		candidateLimit: clampCandidateLimit(input.candidateLimit ?? DEFAULTS.candidateLimit),
 		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
-		resourceCacheMaxEntries: normalizePositiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
-		resourceCacheMaxBytes: normalizePositiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
-		predictionTimeoutMs: normalizeTimeout(input.predictionTimeoutMs),
+		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
+		resourceCacheMaxBytes: positiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
+		predictionTimeoutMs: nonNegativeInteger(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
 		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
 		tools: normalizeSpeculativeToolSelection(input.tools, allowed),
@@ -520,14 +521,4 @@ function prepareToolArguments(tool: AgentTool, input: unknown): unknown | undefi
 	} catch {
 		return undefined;
 	}
-}
-
-function normalizeTimeout(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0
-		? Math.floor(value)
-		: DEFAULTS.predictionTimeoutMs;
-}
-
-function normalizePositiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }

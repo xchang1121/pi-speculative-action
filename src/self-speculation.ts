@@ -18,6 +18,7 @@ import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { stableStringify } from "./stable-json.ts";
+import { nonNegativeNumber, positiveInteger, probability } from "./setting-input.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
@@ -885,7 +886,7 @@ export class SelfSpeculationCoordinator {
 			const logprobs = record(forkObservation?.logprobs);
 			const logprobTokens = nonNegativeInteger(logprobs?.token_count);
 			const meanLogprob = finiteNumber(logprobs?.mean);
-			const confidence = probabilityOrUndefined(record(logprobs?.tool_name)?.minimum_probability);
+			const confidence = probability(record(logprobs?.tool_name)?.minimum_probability, undefined);
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
 				this.totalForkLogprobTokens += logprobTokens;
@@ -1347,22 +1348,6 @@ function metric(value: number | undefined, fallback: number): number {
 function httpPath(value: unknown, fallback: string): string {
 	const selected = nonEmptyString(value);
 	return selected?.startsWith("/") ? selected : fallback;
-}
-
-function positiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function nonNegativeNumber(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-function probability(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
-}
-
-function probabilityOrUndefined(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
 }
 
 function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
