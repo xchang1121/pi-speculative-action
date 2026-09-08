@@ -175,11 +175,12 @@ describe("zero-modification Pi extension", () => {
 			expect(prepare).toHaveBeenCalledOnce();
 			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
 			const dispose = vi.fn(async () => {});
-			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 } },
-				pool: { run: authoritative, dispose }, invocations: new Map(piTools.PI_CLOSED_SEARCH_TOOLS.map((tool) => [tool, {
+			const profile = { profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 }, grep: { versions: {}, flags: [] } },
+				pool: { run: authoritative, dispose }, invocations: new Map(["find"].map((tool) => [tool, {
 					executor: "test-search", authoritative, filesystem: authoritative,
-					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
-				}])) });
+					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" as const },
+				}])) };
+			prepare.mockResolvedValue(profile);
 			await command("status"); // Refresh retires the old executor generation, not its captured inputs.
 			expect((await fixture.tools.get("find")!.execute("bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
 			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/find\s+On\s+Ready\s+Ready\s+Ready/u), "info");
@@ -188,8 +189,10 @@ describe("zero-modification Pi extension", () => {
 			authoritative.mockRejectedValueOnce(new Error("unproven selected input"));
 			await expect(fixture.tools.get("find")!.execute("bound-error", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("unproven selected input");
 			expect(native).toHaveBeenCalledOnce(); // Binding is immutable: an admitted profile failure must not silently change semantics.
+			profile.invocations.set("grep", { ...profile.invocations.get("find")!, semantics: { ...profile.invocations.get("find")!.semantics, tool: "grep" } });
 			await command("status");
 			expect(dispose).toHaveBeenCalledOnce();
+			expect((await fixture.tools.get("grep")!.execute("grep-bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
 			await command("off");
 			expect(dispose).toHaveBeenCalledTimes(2);
 			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();

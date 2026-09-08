@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { createGrepTool } from "@earendil-works/pi-coding-agent";
@@ -11,7 +10,7 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-wo
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { createClosedSearchSemantics } from "../src/pi-tool-invocation.ts";
+import { createClosedSearchProfile, runCapturedSearchProcess } from "../src/pi-tool-invocation.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolveHostExecutable } from "../src/executable-path.ts";
 import { relativeFilesystemPath } from "../src/path-utils.ts";
@@ -21,8 +20,8 @@ import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../src/closed
 // Qualification only: complete stock-Pi grep on private, token-owned inputs.
 // Stock Pi runs in a bounded process; the parent owns rg, its output and completion.
 const { getToolPath } = await import(new URL("./utils/tools-manager.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
-const { resolvePath } = await import(new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 const pathRules = Object.freeze({ homeDir: os.homedir(), normalizeUnicodeSpaces: true, stripAtPrefix: true });
+const nativeEnvironment = Object.freeze({ HOME: pathRules.homeDir, LC_ALL: "C", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) });
 const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
@@ -32,7 +31,7 @@ assert.ok(!costOnly || !semanticOnly, "choose either semantic or cost qualificat
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
 let pool, ownedRg, engine;
-let nativeProcesses = 0, nativeClosed = 0, nativeCancels = 0;
+let referenceProcesses = 0, referenceClosed = 0, referenceCancels = 0;
 const configuredAtStart = process.env.RIPGREP_CONFIG_PATH;
 const nativeFlags = ["--no-config", "--sort=path", "--no-ignore-global", "--no-ignore-parent"];
 const rows = semanticOnly ? [] : [
@@ -46,12 +45,11 @@ const median = async (run) => {
 };
 try {
   const binary = await captureStableFile(await resolveHostExecutable(rg, "rg"), 32 * 1024 * 1024, true);
-  engine = Object.freeze({ profile: CLOSED_SEARCH_PROFILE, sha256: binary.hash, platform: process.platform, arch: process.arch, pathRules, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
+  engine = Object.freeze({ profile: CLOSED_SEARCH_PROFILE, sha256: binary.hash, platform: process.platform, arch: process.arch, pathRules, environment: nativeEnvironment, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
   ownedRg = path.join(root, process.platform === "win32" ? "rg-owned.exe" : "rg-owned");
   await fs.writeFile(ownedRg, binary.content, { flag: "wx", mode: 0o500 });
   pool = new ClosedSearchProcessPool();
-  const { preparationMs: workerPreparationMs } = await pool.run("producer", (worker) => worker.ready);
-  await pool.run("actor", (worker) => worker.ready);
+  const { preparationMs: workerPreparationMs } = await pool.run("actor", (worker) => worker.ready);
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
   if (semanticOnly) {
     process.env.RIPGREP_CONFIG_PATH = configuration;
@@ -80,18 +78,17 @@ try {
     }
   }
   if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
-  const resultLimitCancels = nativeCancels;
-  if (!semanticOnly && !costOnly) assert.ok(resultLimitCancels > 0, "Pi's result-limit stop must reach the native process");
   const cancellation = {};
+  if (!linksOnly) cancellation.limit = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit");
   const cancellationRepeats = linksOnly ? 0 : semanticOnly || costOnly ? 1 : 20;
   for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
     cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode);
   }
-  assert.equal(nativeClosed, nativeProcesses);
+  assert.equal(referenceClosed, referenceProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
-    nativeProcesses, nativeClosed, resultLimitCancels, cancellationRepeats,
-    qualification: "Explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Cost mode primes the same Host with original Actor service before probing measured admission; fallback is a valid outcome, not a hit. Not native-default equivalence or production admission." }, null, 2));
+    referenceProcesses, referenceClosed, referenceCancels, cancellationRepeats,
+    qualification: "Production captured-search profile through Host admission, with explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Counters cover instrumented reference workers and cancellation probes only; ordinary native Pi baselines and production-profile processes are not counted. Cost mode primes the same Host with original Actor service before measured admission; fallback is a valid outcome, not a hit. Not native-default equivalence." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
   await pool?.dispose();
@@ -101,28 +98,17 @@ try {
 
 async function qualifyCaptured(cwd, args, expected, changed, rejected = false, stableChange = false) {
   const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set(), trials = [];
-  let started, executions = 0, copies = 0, actorCalls = 0, drafterEnabled = !costOnly, settled;
-  const execute = (view, request) => pool.run("producer", async (worker, signal) => {
+  let started, executions = 0, actorCalls = 0, drafterEnabled = !costOnly, settled;
+  const preparation = performance.now(), profile = await createClosedSearchProfile(cwd), profilePreparationMs = performance.now() - preparation;
+  const bound = profile.invocations.get("grep");
+  if (!bound) { await profile.pool.dispose(); throw new Error("existing rg is not qualified by the production profile"); }
+  const invocation = { ...bound, filesystem: (view, request) => {
     executions++;
-    const privateRoot = await fs.mkdtemp(path.join(root, "retained-"));
-    try {
-      const query = { ...request.args, path: resolvePath(request.args.path || ".", cwd, pathRules) };
-      const prepared = await materializeSelected(view, cwd, privateRoot, query, signal, reads, enumerated); copies += prepared.files;
-      signal.throwIfAborted();
-      return await worker.request({ kind: "grep", root: prepared.cwd, args: prepared.args, home: pathRules.homeDir }, { signal,
-        onInput: (operation, invocation, signal, emit) => runInput(operation, invocation, signal, emit, { cwd: prepared.cwd, inputRoot: privateRoot }) });
-    } finally {
-      assert.equal(path.dirname(privateRoot), root); assert.ok(path.basename(privateRoot).startsWith("retained-"));
-      await fs.rm(privateRoot, { recursive: true, force: true });
-    }
-  }, request.signal);
-  const invocation = { executor: "captured-grep-qualification", filesystemRoot: path.parse(cwd).root, identity: { engine, cwd, filesystemRoot: path.parse(cwd).root },
-    semantics: await createClosedSearchSemantics("grep", cwd, pathRules.homeDir),
-    filesystem: execute, authoritative: (request) => {
-      actorCalls++;
-      return pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: request.args, home: pathRules.homeDir }, { signal,
-        onInput: (operation, invocation, signal, emit) => runInput(operation === "process" ? "reference" : operation, invocation, signal, emit, { cwd }) }), request.signal);
-    } };
+    return bound.filesystem({ ...view,
+      readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
+      readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
+    }, request);
+  }, authoritative: (request) => { actorCalls++; return bound.authoritative(request); } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
   const host = createSpeculativeActionHost("probe", {
@@ -164,189 +150,25 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     const completion = await ready.promise;
     assert.equal(completion.observation === "unobserved" ? completion.cause.code : completion.status,
       rejected === "unkeyable" ? "action_not_keyable" : rejected ? "failed" : "succeeded", JSON.stringify(completion));
-    const producerMs = performance.now() - started, materialized = copies;
+    const producerMs = performance.now() - started, materialized = reads.size;
     if (stableChange) { assert.deepEqual(await changed(), expected); changed = undefined; }
     if (rejected) {
       if (expected instanceof Error) await assert.rejects(actor, { message: expected.message });
       else assert.deepEqual(await actor(), expected);
       assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
-      return { producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
+      return { profilePreparationMs, producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
     const adopted = await median(async () => {
       const result = await actor(); assert.deepEqual(result, expected); return result;
     });
-    assert.equal(executions, 1); assert.equal(copies, materialized);
+    assert.equal(executions, 1); assert.equal(reads.size, materialized);
     if (costOnly) for (const trial of trials) {
       if (trial.provider.kind === "actor") assert.ok(trial.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(trial));
     } else assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { producerMs, ...(costOnly ? { hostActorMs, probeMs: adopted.ms, trials } : { hitMs: adopted.ms }),
-      producerCalls: executions, filesMaterialized: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
-  } finally { await host.dispose(); }
-}
-
-/** Metadata/config selects files with rg itself; every native input stays in the private tree. */
-async function materializeSelected(view, cwd, destination, query, signal, reads, enumerated) {
-  const originalCwd = cwd, originalTarget = path.resolve(cwd, query.path), rootStat = await view.stat(originalTarget, "type");
-  const directory = rootStat.isDirectory(), volume = path.parse(cwd).root, privateVolume = path.join(destination, "volume");
-  cwd = (await view.stat(cwd, "type")).realPath;
-  assert.ok(cwd && rootStat.realPath, "resolved input names require captured evidence");
-  // A changed spelling can change caller-glob matching even when directory contents are equal.
-  if (directory && query.glob) assert.ok(cwd === originalCwd, "glob cwd alias namespace is not qualified");
-  const sourceTarget = directory ? rootStat.realPath : originalTarget;
-  const map = (source) => {
-    const relative = relativeFilesystemPath(volume, source);
-    assert.notEqual(relative, undefined, "input crossed its declared filesystem root");
-    return path.join(privateVolume, relative);
-  };
-  const target = map(sourceTarget), logicalTarget = map(originalTarget), privateCwd = map(cwd), marker = "pi-directory-" + randomUUID();
-  const files = new Map(), loaded = new Set(), pending = new Map(), linkedConfigurations = new Set(); let entries = 0;
-  const load = async (source, target) => {
-    signal.throwIfAborted(); reads.add(path.relative(originalCwd, source));
-    await fs.writeFile(target, await view.readFile(source)); loaded.add(target);
-  };
-  const file = async (source, target, configuration) => {
-    if (!files.has(target)) {
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, "", { flag: "wx" }); files.set(target, source);
-    }
-    if (configuration) {
-      if ((await view.stat(source, "entry")).type === "symlink") linkedConfigurations.add(target);
-      if (!loaded.has(target)) await load(source, target);
-    }
-  };
-  const line = async (source) => {
-    const bytes = await view.readFile(source);
-    if (!bytes.length) return undefined;
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytes.indexOf(10) < 0 ? bytes.length : bytes.indexOf(10))).replace(/\r$/, "");
-  };
-  const admitDirectory = async (parent, pattern) => {
-    const control = path.join(parent, ".rgignore");
-    if (!files.has(control)) files.set(control, undefined);
-    await fs.appendFile(control, `\n!/${pattern}/\n`);
-  };
-  const rules = async (source, target) => {
-    await fs.mkdir(target, { recursive: true });
-    for (const name of [".gitignore", ".ignore", ".rgignore"]) {
-      if (await view.exists(path.join(source, name))) await file(path.join(source, name), path.join(target, name), true);
-    }
-    const jj = path.join(source, ".jj"), privateJj = path.join(target, ".jj");
-    if (await view.exists(jj)) {
-      if ((await view.stat(jj, "type")).isDirectory()) await fs.mkdir(privateJj, { recursive: true });
-      else await file(jj, privateJj, false);
-      if ((await view.stat(jj, "entry")).type === "symlink") linkedConfigurations.add(privateJj);
-    }
-    const git = path.join(source, ".git"), privateGit = path.join(target, ".git");
-    if (!await view.exists(git)) return;
-    const entry = await view.stat(git, "entry"), gitDirectory = (await view.stat(git, "type")).isDirectory();
-    if (gitDirectory) {
-      await fs.mkdir(privateGit, { recursive: true });
-      if (await view.exists(path.join(git, "info/exclude"))) await file(path.join(git, "info/exclude"), path.join(privateGit, "info/exclude"), true);
-      return;
-    }
-    assert.equal(entry.type, "file", "git pointer entry is not qualified");
-    await file(git, privateGit, true);
-    const pointer = await line(git);
-    if (!pointer?.startsWith("gitdir: ")) return;
-    // Match the pinned ignore engine's documented pointer resolution, not Git's broader config grammar.
-    const gitdir = path.resolve(cwd, pointer.slice(8)), common = path.join(gitdir, "commondir");
-    const control = path.join(destination, "git-" + randomUUID()); await fs.mkdir(control);
-    await fs.writeFile(privateGit, "gitdir: " + control + "\n");
-    if (!await view.exists(common)) return;
-    await file(common, map(common), true);
-    const commonLine = await line(common);
-    if (commonLine === undefined) return;
-    const commonDirectory = path.resolve(commonLine.startsWith(".") ? gitdir : cwd, commonLine);
-    await fs.mkdir(map(commonDirectory), { recursive: true });
-    await fs.writeFile(path.join(control, "commondir"), map(commonDirectory) + "\n");
-    const exclude = path.join(commonDirectory, "info/exclude");
-    if (await view.exists(exclude)) await file(exclude, map(exclude), true);
-  };
-  const walk = async (source, target) => {
-    signal.throwIfAborted(); assert.ok(entries++ < 4096, "metadata entry budget");
-    if (path.basename(source) === ".git" && source !== sourceTarget) return; // Already captured by the directory's named rules.
-    const entry = await view.stat(source, "entry"), configuration = [".gitignore", ".ignore", ".rgignore"].includes(path.basename(source));
-    if (entry.type === "symlink" && !configuration && source !== sourceTarget) {
-      if (process.platform === "win32") await view.stat(source, "type"); // Native search opens discovered junction metadata.
-      return;
-    }
-    if (entry.type === "special") { assert.ok(!configuration && source !== sourceTarget, "special search input"); return; }
-    if ((entry.type === "symlink" ? await view.stat(source, "type") : entry).isDirectory()) {
-      await rules(source, target); pending.set(target, source);
-    } else await file(source, target, configuration);
-  };
-  const expand = async (target) => {
-    const source = pending.get(target); pending.delete(target);
-    enumerated.add(path.relative(originalCwd, source).split(path.sep).join("/"));
-    for (const name of await view.readdir(source)) {
-      assert.equal(path.basename(name), name); assert.ok(name !== "." && name !== ".." && name !== marker);
-      await walk(path.join(source, name), path.join(target, name));
-    }
-  };
-  const select = async (targets, flags = []) => {
-    const output = [], diagnostic = []; let bytes = 0;
-    const { code } = await runInput("selection", { file: rg, cwd: privateCwd, args: ["--files", "--null", "--hidden", ...flags, "--", ...targets],
-      options: { stdio: ["ignore", "pipe", "pipe"] } }, signal,
-      ({ fd, data }) => { assert.ok((bytes += data.length) <= 1024 * 1024, "selected name budget"); (fd === 1 ? output : diagnostic).push(data); });
-    assert.ok(code === 0 || code === 1, Buffer.concat(diagnostic).toString());
-    const raw = Buffer.concat(output), decoded = raw.toString("utf8");
-    assert.ok(Buffer.from(decoded).equals(raw), "filename encoding must round-trip without replacement");
-    return new Set(decoded.split("\0").filter(Boolean).map((selected) => {
-      const resolved = path.resolve(selected);
-      assert.notEqual(relativeFilesystemPath(privateVolume, resolved), undefined, "rg selected an unowned input"); return resolved;
-    }));
-  };
-  if (directory) for (let source = sourceTarget;; source = path.dirname(source)) {
-    if (source !== sourceTarget) { await rules(source, map(source)); await admitDirectory(map(source), "*"); }
-    if (source === volume) break;
-  }
-  await fs.mkdir(privateCwd, { recursive: true });
-  const parents = new Set([target]), deny = path.join(destination, "glob-deny");
-  if (query.glob) await fs.writeFile(deny, "*\n", { flag: "wx" });
-  const selectedFiles = async (flags = []) => {
-    const ordinary = await select([privateVolume], flags);
-    let selected = ordinary;
-    if (query.glob) {
-      const classify = async (extra) => new Set([...await select([...parents].map((parent) => path.join(logicalTarget, path.relative(target, parent))),
-        ["--no-ignore", "--max-depth=2", "--glob", query.glob, ...extra, ...flags])].map((file) => {
-        const relative = relativeFilesystemPath(logicalTarget, file); assert.notEqual(relative, undefined, "glob classification escaped its query");
-        return path.join(target, relative);
-      }));
-      // Native decisions under neutral/denied defaults distinguish explicit overrides without parsing a glob.
-      const allowed = await classify([]); selected = await classify(["--ignore-file", deny]);
-      for (const file of ordinary) if (allowed.has(file)) selected.add(file);
-    }
-    return new Set([...selected].filter((file) => relativeFilesystemPath(target, file) !== undefined && !linkedConfigurations.has(file) && (!files.has(file) || files.get(file) !== undefined)));
-  };
-  await walk(sourceTarget, target);
-  if (directory) {
-    await expand(target);
-    if (logicalTarget !== target) {
-      await fs.mkdir(path.dirname(logicalTarget), { recursive: true });
-      await fs.symlink(target, logicalTarget, process.platform === "win32" ? "junction" : "dir");
-    }
-  }
-  while (pending.size) {
-    const frontier = [...pending.keys()];
-    for (const parent of frontier) await fs.writeFile(path.join(parent, marker), "", { flag: "wx" });
-    const admitted = await selectedFiles(["--glob", "**/" + marker]);
-    for (const parent of frontier) {
-      await fs.unlink(path.join(parent, marker));
-      if (admitted.has(path.join(parent, marker))) {
-        if (query.glob) {
-          const name = path.basename(parent); assert.ok(!/[\r\n]/.test(name), "directory rule name cannot contain a line ending");
-          await admitDirectory(path.dirname(parent), name.replace(/[\\*?\[\] ]/g, "\\$&"));
-        }
-        parents.add(parent); await expand(parent);
-      } else pending.delete(parent);
-    }
-  }
-  const selected = directory ? await selectedFiles() : new Set([target]);
-  for (const [target, source] of files) {
-    if (source !== undefined && selected.has(target)) await load(source, target); // Restore raw config bytes after private-only pointer/ancestor transport.
-    else { assert.notEqual(relativeFilesystemPath(privateVolume, target), undefined); await fs.unlink(target); }
-  }
-  return { files: loaded.size, cwd: privateCwd, args: { ...query, path: pathToFileURL(logicalTarget).href } };
+    return { profilePreparationMs, producerMs, ...(costOnly ? { hostActorMs, probeMs: adopted.ms, trials } : { hitMs: adopted.ms }),
+      producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
+  } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
 }
 
 async function qualifyNativeLinks() {
@@ -533,47 +355,38 @@ async function runInput(operation, invocation, signal, emit, { cwd, inputRoot, o
   assert.deepEqual(invocation.options, { stdio: ["ignore", "pipe", "pipe"] });
   signal.throwIfAborted();
   const flags = operation === "reference" ? nativeFlags.filter((flag) => flag !== "--no-ignore-parent") : nativeFlags;
-  const child = spawn(ownedRg, [...flags, ...(operation === "process" ? ["--no-ignore"] : []), ...invocation.args],
-    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, cwd: cwd ?? invocation.cwd ?? root,
-      env: { HOME: root, LC_ALL: "C", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) } });
-  nativeProcesses++;
-  return await new Promise((resolve, reject) => {
-    let failure;
-    const stop = () => { nativeCancels++; child.kill("SIGKILL"); };
-    signal.addEventListener("abort", stop, { once: true });
-    if (signal.aborted) stop();
-    if (onSpawn) child.once("spawn", onSpawn);
-    for (const [fd, output] of [[1, child.stdout], [2, child.stderr]]) output.on("data", (data) => {
-      if (!failure) try { emit({ fd, data }); } catch (error) { failure = error; stop(); }
-    });
-    child.once("error", (error) => { failure = error; });
-    child.once("close", (code, exitSignal) => {
-      nativeClosed++;
-      signal.removeEventListener("abort", stop);
-      if (failure) reject(failure); else resolve({ code, signal: exitSignal });
-    });
-  });
+  referenceProcesses++;
+  const stopped = () => { referenceCancels++; }; signal.addEventListener("abort", stopped, { once: true });
+  try { return await runCapturedSearchProcess(ownedRg, [...flags, ...(operation === "process" ? ["--no-ignore"] : []), ...invocation.args],
+    cwd ?? invocation.cwd ?? root, nativeEnvironment, signal, emit, onSpawn); }
+  finally { referenceClosed++; signal.removeEventListener("abort", stopped); }
 }
 
 async function qualifyCancellation(cwd, mode) {
   const interrupted = launchClosedSearchWorker();
   const controller = new AbortController(), closed = Promise.withResolvers(), release = Promise.withResolvers();
-  const before = nativeClosed; let settled = false;
+  const before = referenceClosed, limitCancellation = Promise.withResolvers(); let settled = false;
   try {
     await interrupted.ready;
-    const args = mode === "abort" ? { pattern: "^\\w{60}$" } : { pattern: ".", limit: Number.MAX_SAFE_INTEGER };
+    const args = mode === "abort" ? { pattern: "^\\w{60}$" } : { pattern: ".", limit: mode === "limit" ? 1 : Number.MAX_SAFE_INTEGER };
     const execution = interrupted.request({ kind: "grep", root: cwd, args, home: pathRules.homeDir }, {
       signal: controller.signal, onInput: async (operation, invocation, signal, emit) => {
         if (operation !== "process") return runInput(operation, invocation, signal, emit, { cwd });
-        try { return await runInput(operation, invocation, signal, emit, { cwd, onSpawn: mode === "abort" ? () => controller.abort(0) : undefined }); }
+        if (mode === "limit") signal.addEventListener("abort", () => limitCancellation.resolve(), { once: true });
+        try {
+          const result = await runInput(operation, invocation, signal, emit, { cwd, onSpawn: mode === "abort" ? () => controller.abort(0) : undefined });
+          if (mode === "limit") await limitCancellation.promise; // Keep the borrowed operation alive even if this tiny rg already closed.
+          return result;
+        }
         finally { closed.resolve(); await release.promise; }
       },
     });
     void execution.then(() => { settled = true; }, () => { settled = true; });
     await Promise.race([closed.promise, execution]);
-    assert.equal(nativeClosed, before + 1); assert.equal(settled, false, "request settlement must wait for owned input cleanup");
-    release.resolve(); await assert.rejects(execution, mode === "abort" ? (reason) => reason === 0 : /input byte budget/);
-    assert.ok(interrupted.closed());
-    return { nativeCloseBeforeSettlement: true, borrowedCleanupBeforeSettlement: true };
-  } finally { release.resolve(); await interrupted.dispose(); }
+    assert.equal(referenceClosed, before + 1); assert.equal(settled, false, "request settlement must wait for owned input cleanup");
+    release.resolve();
+    if (mode === "limit") assert.equal((await execution).result.details.matchLimitReached, 1);
+    else { await assert.rejects(execution, mode === "abort" ? (reason) => reason === 0 : /input byte budget/); assert.ok(interrupted.closed()); }
+    return { nativeCloseBeforeSettlement: true, borrowedCleanupBeforeSettlement: true, ...(mode === "limit" ? { resultLimitCancellationReceived: true } : {}) };
+  } finally { limitCancellation.resolve(); release.resolve(); await interrupted.dispose(); }
 }

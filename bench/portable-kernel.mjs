@@ -7,7 +7,7 @@ import { serialize } from "node:v8";
 import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 import { createClosedSearchProfile, readClosedSearchInput } from "../dist/pi-tool-invocation.js";
 
-// No extra engines or installation: qualify the captured-input Pi find and its existing process outlet.
+// No extra engines or installation: qualify captured find, the process outlet, and both production TUI routes.
 const started = performance.now(), worker = await prepareWorker(true);
 try {
 	const pi = { find: await qualifyPiSearch("find") }, extension = await qualifySearchExtension();
@@ -42,7 +42,7 @@ try {
 	}
 	console.log(JSON.stringify({ platform: process.platform, node: process.version, profile: worker.profile,
 		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started, cancellation, pi, extension,
-		admission: "Pi-owned find; no extra dependency/download; not native fd equivalence, grep, macOS or ThinkThread Runtime qualification" }, null, 2));
+		admission: "Captured find plus available qualified grep through the production TUI route; no extra dependency/download. Not native-default equivalence, macOS or ThinkThread Runtime qualification." }, null, 2));
 } finally { await worker.dispose(); }
 
 async function prepareWorker(qualification = false) {
@@ -246,11 +246,8 @@ async function qualifyPiSearch(name) {
 		await ready.start("observed", false);
 		const observed = await ready.actor("observed");
 		assert.deepEqual(observed.output, stale.output);
-		if (!resources.observation.capabilities.length) assert.equal(observed.settlement.provider.kind, "actor", "unproven host observations cannot be promoted");
-		else if (observed.settlement.provider.kind === "actor") {
-			const gate = observed.settlement.rejections.find((rejection) => rejection.cause.code === "candidate_join_not_profitable");
-			assert.ok(gate, JSON.stringify(observed.settlement)); assert.ok(JSON.parse(gate.cause.detail).expectedNetBenefitMs < 0);
-		}
+		assert.equal(bound.semantics.resourceScope, "captured_inputs");
+		assert.equal(observed.settlement.provider.kind, "actor", "ambient observation cannot certify a captured-only profile");
 		assert.equal(counts.producer, beforeReplay, "completed result adoption must not execute guest code");
 		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 3 : 2);
 		const changed = journey(() => fs.appendFile(path.join(root, ".gitignore"), "# changed during search\n"));
@@ -269,7 +266,9 @@ async function qualifyPiSearch(name) {
 			const fallback = await cancelled.actor("independent", different);
 			assert.deepEqual(fallback.output, direct.result); assert.equal(fallback.settlement.provider.kind, "actor");
 			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running");
-			await cancelled.host.runtime.settingsChanged(disabled);
+			const disabling = cancelled.host.runtime.settingsChanged(disabled);
+			assert.equal(await Promise.race([disabling, Promise.resolve("pending")]), "pending", "disable must retain the paused input owner");
+			released.resolve(); await bounded(disabling, "disable cleanup");
 		} finally { released.resolve(); }
 		assert.equal((await bounded(cancelled.candidate, "cancelled candidate")).status, "cancelled");
 		await cancelled.host.runtime.settingsChanged({ ...disabled, enabled: true });
@@ -288,7 +287,7 @@ async function qualifyPiSearch(name) {
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
 		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, behaviors, rejectedEscapingLinks: true,
 			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable", inputTransport, speculativeMs: completed.executionMs,
-			readyAdoptionMs: adopted.totalMs, calibratedReplay: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
+			readyAdoptionMs: adopted.totalMs, unpromotedObservation: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
 			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorAndInputs: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
@@ -313,7 +312,7 @@ async function qualifySearchExtension() {
 	const choices = new Map(Object.entries({
 		"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
 		"Tools & execution": ["Execution routes", "Back"], "Execution routes": ["Search execution", "Back"],
-		"Search execution": ["Captured find"],
+		"Search execution": ["Captured search"],
 	}));
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const context = { cwd, mode: "tui", hasUI: true, model, isProjectTrusted: () => true, getSystemPrompt: () => "qualification",
@@ -347,8 +346,8 @@ async function qualifySearchExtension() {
 		assert.ok(!notices.some((message) => /WASM|setup:search|reselect/.test(message)));
 		await command("off"); await command("");
 		assert.match(notices.join("\n"), /settings applied/);
-		for (const name of ["find"]) {
-			const args = { pattern: "notes.txt", path: "." }; selected = [name, args];
+		for (const name of ["find", "grep"]) {
+			const args = { pattern: name === "find" ? "notes.txt" : "needle", path: "." }; selected = [name, args];
 			await invoke(name, args); // Exclude worker startup from the warm Actor baseline.
 			const baselineAt = performance.now(), expected = await invoke(name, args), warmActorMs = performance.now() - baselineAt;
 			candidate = Promise.withResolvers(); settlement = Promise.withResolvers();
@@ -356,8 +355,9 @@ async function qualifySearchExtension() {
 			const completed = await bounded(candidate.promise, "extension candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
 			const arrived = performance.now(); assert.deepEqual(await invoke(name, args), expected); const hitMs = performance.now() - arrived;
 			const feedback = await bounded(settlement.promise, "extension settlement");
-			assert.equal(feedback.provider.kind, "speculative", JSON.stringify(feedback));
-			results[name] = { warmActorMs, hitMs, actorArrivalSpeedup: warmActorMs / hitMs };
+			if (feedback.provider.kind !== "speculative") assert.ok(feedback.provider.kind === "actor" &&
+				feedback.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(feedback));
+			results[name] = { warmActorMs, arrivalMs: hitMs, provider: feedback.provider, rejections: feedback.rejections };
 			await emit("agent_end");
 		}
 		await command("status"); await invoke(...selected);

@@ -472,7 +472,7 @@ async function installController(
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
 		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
-		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? "workers start on demand" : "not checked"}`,
+		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? [...search.profile.invocations.keys()].join(", ") + " prepared; workers start on demand" : "not checked"}`,
 	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -1220,9 +1220,9 @@ async function openExecutionRoutes(
 			);
 		}
 		actions.set(`Search execution › ${searchExecutionLabel(settings.searchExecution)}`, async () => {
-			const choice = await ctx.ui.select("Search execution", ["Native Pi (default)", "Captured find (Actor + speculation; no installation)", BACK]);
+			const choice = await ctx.ui.select("Search execution", ["Native Pi (default)", "Captured search (find + available rg; no installation)", BACK]);
 			if (!choice || choice === BACK) return;
-			if (choice.startsWith("Captured")) ctx.ui.notify("Uses Pi's installed matcher over captured workspace inputs for BOTH Actor find and speculation; not native fd equivalence. grep remains Native Pi or an available unified environment. Unproven inputs and limits fail the selected find call. No extra packages, binaries or downloads.", "warning");
+			if (choice.startsWith("Captured")) ctx.ui.notify("Actor and speculation share Pi's installed find matcher and, when qualified, pinned rg (Windows x64 15.2.0; Linux x64 14.1.0). grep sorts paths and ignores RIPGREP_CONFIG_PATH/global Git ignores; parent ignore rules remain. Not Native Pi defaults. No installation. An admitted profile call never switches executor on failure.", "warning");
 			await editor.setSettings({ ...settings, searchExecution: choice.startsWith("Captured") ? "captured" : "native" });
 		});
 		actions.set("Actor execution · always available", () =>
@@ -1611,7 +1611,7 @@ function processRouteCapability(state: ProcessRouteSnapshot["state"]): Execution
 }
 
 function searchExecutionLabel(mode: string): string {
-	return mode === "captured" ? "Captured find; grep unchanged" : "Native Pi";
+	return mode === "captured" ? "Captured search" : "Native Pi";
 }
 
 function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {

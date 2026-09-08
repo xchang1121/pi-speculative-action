@@ -4,6 +4,11 @@
 
 ### Breaking Changes
 
+- Closed-search v5 optionally binds captured grep through the existing TUI search choice. Qualified
+  existing engines are Windows x64 rg 15.2.0 and Linux x64 rg 14.1.0; unavailable rg leaves find independent.
+  The explicit profile sorts paths and disables ambient rg/global ignore configuration, not parent rules.
+  Native Pi remains the default; a bound call never switches executor on failure. Pool retirement owns
+  native close, prepared-input cleanup and the pinned executable; no dependency or installation was added.
 - Closed-search v4 binds HOME in executor identity and keeps prepared arguments unchanged in K(a).
   Worker requests now take `{ kind, root, home, args }`; bootstrap environment is not invocation identity.
 - Search pool `run(role, operation, signal)` replaces request forwarding: the lease now owns input

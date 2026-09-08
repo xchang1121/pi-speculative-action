@@ -23,28 +23,33 @@ five-second child begins, while recording the observable `TracerPid` difference:
 npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
 ```
 
-## Dependency-free grep feasibility probe
+## Captured-search production qualification
 
 ```sh
 node --experimental-strip-types bench/grep-captured-qualification.mjs --semantics-only
 node --experimental-strip-types bench/grep-captured-qualification.mjs --links-only
+node --experimental-strip-types bench/grep-captured-qualification.mjs --cost-only --case=repository
 ```
 
 The low-load mode checks small nested fixtures, native glob/ignore precedence, explicit ignored roots,
 mixed raw UTF-8/UTF-16/binary inputs, exact stock-Pi formatting/context/truncation, complete host adoption,
-and exactly-once native Actor fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
-file must never enter the payload evidence. One actual-rg abort barrier verifies native close and borrowed
-input cleanup before settlement; a tiny query may finish before its result-limit cancellation arrives.
+and exactly-once same-profile Actor fallback after content, ignore-rule or negative-name changes. An ignored 16 MiB sparse
+file must never enter the payload evidence. Actual-rg abort and result-limit barriers verify native close and borrowed
+input cleanup before settlement. The limit probe retains its borrowed operation until cancellation arrives;
+it does not require killing a tiny process that has already closed.
 `--case=<label>[,<label>...]` selects semantic cases. The separate 16-process link characterization checks both
 `--files` and actual search: on this Windows rg, a discovered dangling junction is absent from the file
 list but makes search fail. No-follow captured entries therefore cannot alone authorize skipping it.
-The 40 semantic cases per OS cover named same-volume links, POSIX linked ignore files and skipped FIFO/
+The 46 semantic cases per OS cover named same-volume links, POSIX linked ignore files and skipped FIFO/
 discovered links, ancestor configurations, Git indirection and explicit Git-directory/data searches.
+Bound HOME, `@`, absolute/file-URL paths and encoded filename whitespace retain the original Pi resolver behavior.
 Directory-alias glob matching preserves logical names, including explicit directory overrides and
 negative-glob pruning. Broken targets, cross-volume inputs and cwd aliases combined with globs remain unqualified; the
 original-workspace Actor runs once, including its original error. No native-default behavior changes.
 
-Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
+The actual production `createClosedSearchProfile` supplies the producer and original-workspace Actor;
+the benchmark no longer owns a parallel materializer. The profile qualifies existing Windows x64 rg 15.2.0
+or Linux x64 rg 14.1.0: a stable capture pins its SHA-256 and a task-owned executable copy.
 The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
 Metadata and ignore-file evidence drive rg's own file selection; only selected raw bytes are copied.
 Directory expansion is lazy: temporary, uniquely named marker files test the next frontier with rg;
@@ -67,14 +72,19 @@ Keep native repository detection: `--no-require-git` also disables `.git` file i
 engine. Windows rg 15.2.0 and WSL rg 14.1.0 differ on `.jj` recognition; the same captured marker is
 compared against each pinned native engine, not a cross-version assumption.
 
-Omit `--semantics-only` only for a performance-stage run: larger flat fixtures, five host adoptions per
-query, and 20 abort/output-budget barriers. Native Pi, fixed-sort host Pi, startup, producer and ready-hit
-timings stay separate; the small-mode timings are not performance claims. The proposed profile explicitly
+Use `--cost-only --case=repository` for about 1 MB of input and three queries, each with three measured
+admission attempts. The same Host first measures its original Actor with prediction disabled. Every fallback
+must call Actor exactly once and report `candidate_join_not_profitable`; no gate or hit count is forced.
+The unfiltered default is reserved for a performance-stage run: larger fixtures, five adoptions per query
+and 20 abort/output-budget barriers. Native Pi, fixed-sort Pi, profile preparation, producer and arrival
+timings stay separate; small semantic/TUI timings are not speedup claims. The production profile explicitly
 disables ambient rg/global ignore configuration and sorts output; ancestor ignore files remain inputs.
 Native parent loading is disabled only on the fully materialized private namespace, preventing access
-to uncaptured host ancestors. This is **not** native-default equivalence or production admission:
-private materialization/selection cost, cwd-alias namespaces and existing benefit gates still need
-qualification. Nothing is installed or downloaded; missing rg skips.
+to uncaptured host ancestors. This is **not** native-default equivalence or general profitability:
+materialization and worker startup can dominate; cwd-alias/glob combinations remain unqualified.
+Reported process counts cover only instrumented reference workers and cancellation probes, excluding ordinary
+native Pi baselines and production-profile processes. Nothing is installed or downloaded; missing rg skips,
+while an unsupported engine fails this qualification rather than being counted as production success.
 
 ## ThinkThread real Runtime qualification
 
@@ -350,8 +360,8 @@ Use `--output-root` to choose the artifact directory.
 node bench/portable-kernel.mjs
 ```
 
-只使用 Pi 已安装的 minimatch/ignore 和 Node，不需要额外包、模块文件或安装步骤。
-实际完整 Pi find、输入代理、Actor/producer 独立进程、现有 Runtime 和 TUI 均参与验收；
+find 只使用 Pi 已安装的 minimatch/ignore 和 Node；grep 使用上面列出的合格现有 rg，不增加安装步骤。
+实际完整 Pi find、输入代理、Actor/producer 独立进程、现有 Runtime，以及 find/grep 生产 TUI 路线均参与验收；
 仅模型和界面输入使用脚本。覆盖完成/跨轮次采纳、封存输入重算、运行中 join、双 producer
 并发、超预算的内容增长及 Actor 无关写入仍保留名字查询、ignore 变化与逃逸链接拒绝、Actor 单次回退及关闭时排空 Actor/取消 producer。
 deadline/abort 还测试已进入的不合作循环及拥有独立进程的输入操作；guest 与输入均完成回收后
@@ -359,4 +369,5 @@ deadline/abort 还测试已进入的不合作循环及拥有独立进程的输�
 
 原生 fd 与共同配置 Actor 分别采样，报告中列出两者的语义差异，不用投机端偷偷替换原生语义。
 结果复用时间只与同配置 Actor 到达后的基线比较，不冒充整体任务加速；未校准时如实记录。
-此资格不包括 grep、macOS 或 ARM64 ThinkThread Runtime；已有 Linux Bash benchmark 保持独立。
+grep 的完整语义/成本矩阵由上面的独立命令验收；TUI 允许现有收益门拒绝不划算的采纳，不强迫命中。
+此资格不包括 macOS/ARM64 或真实 ThinkThread Runtime；已有 Linux Bash benchmark 保持独立。

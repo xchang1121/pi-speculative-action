@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
-import { createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
+import { createClosedSearchProfile, runCapturedSearchProcess } from "../src/pi-tool-invocation.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { describe, expect, test } from "vitest";
 
@@ -98,7 +98,6 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					expect(find.identity).toMatchObject({ home: cwd });
 					const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
 					expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
-					expect(invocations.has("grep")).toBe(false);
 					expect(await fs.readdir(agentDir)).toEqual([]);
 					const homeResult = () => find.authoritative!({ callID: "home", args: { pattern: "*.txt", path: "~" }, signal: new AbortController().signal }).catch((error: Error) => error.message);
 					const homeBefore = await homeResult();
@@ -118,6 +117,9 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 						expect(requested).toEqual(["stat"]); // No process or ambient file access before the caller grants it.
 					}
 					expect(await homeResult()).toEqual(homeBefore); // A grep home binding cannot drift a later find invocation.
+					if (phase === "cleanup") await expect(runCapturedSearchProcess(process.execPath,
+						["-e", "setInterval(() => {}, 1000); process.stdout.write('owned');"], cwd,
+						process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}, AbortSignal.timeout(3000), () => { throw 0; })).rejects.toBe(0);
 					let entered = 0, retired = false;
 					const executions = Promise.allSettled((["actor", "producer"] as const).map((role) => pool.run(role, async (worker, signal) => {
 						if (phase === "cleanup") await worker.dispose(); // A closed worker must not erase its still-active cleanup owner.
@@ -145,6 +147,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 
 async function importWithBlockedDependencies(entries: readonly string[], blockedPrefixes: readonly string[]) {
 	const urls = entries.map((entry) => pathToFileURL(path.join(packageRoot, entry)).href);
+	const emptyTools = entries.includes("src/closed-search-process.mjs") ? await fs.mkdtemp(path.join(os.tmpdir(), "pi-no-search-tools-")) : undefined;
 	const script = `
 		import { registerHooks } from "node:module";
 		const blocked = ${JSON.stringify(blockedPrefixes)};
@@ -156,11 +159,20 @@ async function importWithBlockedDependencies(entries: readonly string[], blocked
 				return nextResolve(specifier, context);
 			},
 		});
+		globalThis.fetch = () => { throw new Error("installation denied"); };
 		await Promise.all(${JSON.stringify(urls)}.map((entry) => import(entry)));
+		if (${!!emptyTools}) {
+			const { createClosedSearchProfile } = await import(${JSON.stringify(pathToFileURL(path.join(packageRoot, "src/pi-tool-invocation.ts")).href)});
+			const search = await createClosedSearchProfile(process.cwd());
+			try { if ([...search.invocations.keys()].join() !== "find") throw new Error("missing rg must not disable find or enable grep"); }
+			finally { await search.pool.dispose(); }
+		}
 	`;
-	const result = await execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
-		cwd: packageRoot,
-		windowsHide: true,
-	});
-	expect(result.stderr).toBe("");
+	try {
+		const result = await execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+			cwd: packageRoot, windowsHide: true,
+			...(emptyTools ? { env: { ...process.env, PATH: "", PI_CODING_AGENT_DIR: emptyTools } } : {}),
+		});
+		expect(result.stderr).toBe("");
+	} finally { if (emptyTools) await fs.rm(emptyTools, { recursive: true, force: true }); }
 }

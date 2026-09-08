@@ -5,7 +5,8 @@ import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 
 /** Reuse capacity, never results. Each lease owns preparation, worker inputs and final cleanup. */
 export class ClosedSearchProcessPool {
-	#workers = new Map(); #idle = new Map(); #retirement;
+	#workers = new Map(); #idle = new Map(); #retirement; #release;
+	constructor(release = () => {}) { this.#release = release; }
 	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		signal?.throwIfAborted();
@@ -35,7 +36,7 @@ export class ClosedSearchProcessPool {
 			if (lease.role === "producer") { lease.controller.abort(new Error("worker disposed")); await worker.dispose(); }
 			await lease.execution?.catch(() => {});
 			await worker.dispose();
-		})).then(() => {});
+		})).then(() => this.#release());
 	}
 }
 

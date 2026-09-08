@@ -10,10 +10,11 @@ import { serialize } from "node:v8";
 
 // Explicit shared Actor/producer semantics, NOT equivalence with ambient native fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
-	id: "pi.captured-search.v4", pi: "0.84.1", platform: process.platform, node: process.version,
+	id: "pi.captured-search.v5", pi: "0.84.1", platform: process.platform, node: process.version,
 	find: Object.freeze({ minimatch: "10.2.5", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
 		platform: "linux", nocase: false, dot: true, matchBase: true, nocomment: true, nonegate: true, braceExpandMax: 10_000 }),
-	grep: Object.freeze({ process: "caller-owned pinned rg", filesystem: "caller-granted stat and readFile; no ambient fallback" }),
+	grep: Object.freeze({ versions: Object.freeze({ "win32:x64": "15.2.0", "linux:x64": "14.1.0" }), flags: Object.freeze(["--no-config", "--sort=path", "--no-ignore-global"]),
+		process: "caller-owned pinned rg", filesystem: "caller-granted stat and readFile; no ambient fallback" }),
 	bootstrapEnvironment: Object.freeze({ PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" }),
 	filesystem: "readonly /workspace namespace; exact spelling; normalized in-root aliases; no ambient filesystem fallback",
 	limits: Object.freeze({ inputBytes: 8 * 1024 * 1024, entries: 4096, requestBytes: 9 * 1024 * 1024, resultBytes: 1024 * 1024 }),
