@@ -1,4 +1,4 @@
-import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
+import { type SpeculativeExecutionRoute, validateWorldBranch, type WorldBranch, type WorldResultCapture } from "./execution-world.ts";
 import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 
 export type EffectTransactionState =
@@ -239,10 +239,6 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 		};
 	}
 
-	watch(onInvalidated: (changedPath?: string) => void): void {
-		this.branch.watch?.(onInvalidated);
-	}
-
 	async validate(): Promise<ResourceValidation> {
 		if (this.validationPromise) return this.validationPromise;
 		if (["aborted", "aborting", "poisoned", "failed"].includes(this.attempt.stateValue)) {
@@ -255,22 +251,7 @@ class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
 		const preserveCommitted = this.attempt.stateValue === "committed";
 		this.attempt.stateValue = preserveCommitted ? "committed" : "validating";
 		const pending = (async () => {
-			let validation: ResourceValidation;
-			try {
-				validation = this.branch.validate
-					? await this.branch.validate()
-					: { status: "valid", metrics: zeroValidationMetrics() };
-			} catch (error) {
-				validation = {
-					status: "indeterminate",
-					cause: cause(
-						"freshness",
-						"validation_failed",
-						error instanceof Error ? error.message : String(error),
-					),
-					metrics: zeroValidationMetrics(),
-				};
-			}
+			const validation = await validateWorldBranch(this.branch, this.attempt.descriptor.route.reuse);
 			this.validation = validation;
 			if (!preserveCommitted && this.attempt.stateValue === "validating") {
 				this.attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";

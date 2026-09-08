@@ -4,7 +4,7 @@ import {
 	type EffectCapabilities,
 	type EffectRequirements,
 } from "./effect-model.ts";
-import type { ResourceValidation } from "./settlement.ts";
+import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
@@ -128,10 +128,8 @@ export interface WorldBranch<Output> {
 	readonly executionMetrics: WorldExecutionMetrics;
 	readonly compatibility: WorldCompatibilityEvidence;
 	readonly commitMetrics?: WorldCommitMetrics;
-	/** Optional freshness proof owned by the backend that captured the branch. */
+	/** Required for shared results; exclusive branches may instead prove conflicts atomically at commit. */
 	readonly validate?: () => Promise<ResourceValidation>;
-	/** Subscribe to invalidation; the branch owns and releases the subscription. */
-	readonly watch?: (onInvalidated: (changedPath?: string) => void) => void;
 	/** Re-evaluate a compatible query using only this branch's sealed inputs, without host effects. */
 	readonly reconstruct?: (request: {
 		readonly action: ActionKey;
@@ -143,6 +141,18 @@ export interface WorldBranch<Output> {
 	readonly commit: () => Promise<Output>;
 	/** Idempotently release every branch-local handle. Must be safe before or after commit. */
 	readonly dispose: () => void | Promise<void>;
+}
+
+/** Only an actual backend proof can authorize a sealed result; path/event hints cannot replace it. */
+export async function validateWorldBranch<Output>(branch: WorldBranch<Output> | undefined, reuse: WorldReuseStrategy): Promise<ResourceValidation> {
+	try {
+		if (branch?.validate) return await branch.validate();
+		return branch && reuse === "exclusive_branch"
+			? { status: "valid", metrics: zeroValidationMetrics() }
+			: { status: "indeterminate", cause: cause("freshness", "validation_unavailable"), metrics: zeroValidationMetrics() };
+	} catch (error) {
+		return { status: "indeterminate", cause: cause("freshness", "validation_failed", error instanceof Error ? error.message : String(error)), metrics: zeroValidationMetrics() };
+	}
 }
 
 /** Pre-execution evidence that can seal one externally executed authoritative result. */

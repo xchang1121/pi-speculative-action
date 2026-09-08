@@ -176,19 +176,12 @@ type ResourceEvent = {
 	readonly type: "change" | "rename" | "unknown";
 };
 
-type ResourceSubscriber = {
-	readonly dependencies: ReadonlyArray<ResourceDependency>;
-	readonly preciseContent: ReadonlySet<string>;
-	readonly callback: (path: string) => void;
-};
-
 const MAX_EVENT_HISTORY = 4096;
 const FINGERPRINT_CONCURRENCY = 12;
 
 export class ResourceVersionManager {
 	private epoch = 0;
 	private readonly events: ResourceEvent[] = [];
-	private readonly subscribers = new Set<ResourceSubscriber>();
 	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
 	private references = 0;
 	private watcher?: FSWatcher;
@@ -307,7 +300,7 @@ export class ResourceVersionManager {
 		if (!this.reliable || this.changesSince(token).uncertain) return "resource_observation_window_unprovable";
 		const precise = new Set(token.preciseContent.map(filesystemPathKey));
 		const changed = this.events.some((event) => event.epoch > token.epoch &&
-			[...token.observations.values()].some((dependency) => affects(dependency, event, precise, sealing)));
+			[...token.observations.values()].some((dependency) => affects(dependency, event, precise)));
 		return changed ? "resource_observation_window_changed" : undefined;
 	}
 
@@ -326,20 +319,6 @@ export class ResourceVersionManager {
 		};
 	}
 
-	subscribe(token: ResourceVersionToken, callback: (path: string) => void) {
-		const subscriber: ResourceSubscriber = {
-			dependencies: [...token.observations.values()],
-			preciseContent: new Set(token.preciseContent.map(filesystemPathKey)),
-			callback,
-		};
-		this.subscribers.add(subscriber);
-		return releaseOnce(() => {
-			this.subscribers.delete(subscriber);
-			token.release();
-			this.checkIdle();
-		});
-	}
-
 	close() {
 		this.open = false;
 		this.watcher?.close();
@@ -347,7 +326,6 @@ export class ResourceVersionManager {
 		this.reliable = false;
 		for (const precise of this.preciseWatches.values()) precise.watcher.close();
 		this.preciseWatches.clear();
-		this.subscribers.clear();
 		this.events.length = 0;
 	}
 
@@ -364,11 +342,6 @@ export class ResourceVersionManager {
 		const event = { epoch: ++this.epoch, path: absolute, type };
 		this.events.push(event);
 		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
-		for (const subscriber of this.subscribers) {
-			if (subscriber.dependencies.some((dependency) => affects(dependency, event, subscriber.preciseContent))) {
-				subscriber.callback(absolute);
-			}
-		}
 	}
 
 	private acquirePreciseWatches(dependencies: ReadonlyArray<ResourceDependency>) {
@@ -412,7 +385,7 @@ export class ResourceVersionManager {
 	}
 
 	private checkIdle() {
-		if (this.references || this.subscribers.size || this.preciseWatches.size) return;
+		if (this.references || this.preciseWatches.size) return;
 		this.options.onIdle?.();
 	}
 }
@@ -446,11 +419,6 @@ export function validateResourceVersion(token: unknown): Promise<ResourceVersion
 	return isResourceVersionToken(token)
 		? token.manager.validate(token)
 		: Promise.resolve(validation(performance.now(), true, "resource_version_missing", "exact"));
-}
-
-export function watchResourceVersion(token: unknown, callback: (path: string) => void) {
-	if (!isResourceVersionToken(token)) return () => {};
-	return token.manager.subscribe(token, callback);
 }
 
 export function releaseResourceVersion(token: unknown): void {
@@ -508,10 +476,9 @@ function normalizeDependencies(root: string, dependencies: ReadonlyArray<Resourc
 
 const dependencyKey = (dependency: ResourceDependency) => `${dependency.scope}:${filesystemPathKey(dependency.path)}`;
 
-function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>, sealing = false) {
-	if (dependency.scope === "binding") return sealing && event.type === "rename" && filesystemPathKey(dependency.path) === filesystemPathKey(event.path);
+function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
+	if (dependency.scope === "binding") return event.type === "rename" && filesystemPathKey(dependency.path) === filesystemPathKey(event.path);
 	if (event.type === "unknown") return true;
-	if (dependency.scope === "type" && !sealing && event.type === "change") return false;
 	const dependencyPath = filesystemPathKey(dependency.path);
 	const changed = filesystemPathKey(event.path);
 	if (dependency.scope === "content" || dependency.scope === "stat" || dependency.scope === "type") {

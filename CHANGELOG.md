@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Removed `WorldBranch.watch`, `watchResourceVersion` and `ResourceVersionManager.subscribe`.
+  Shared results require a backend `validate` proof on reuse; Actor path overlap and filesystem events
+  no longer evict a sealed result. Pending work and checkpoint descendants still invalidate conservatively.
 - Removed the global workspace convenience functions (`createWorkspaceSandbox`, `commitSandboxDelta`,
   `forkSandboxWorkspace`, `withSandboxWorkspace`, `prepareSandboxWorkspace`, `closeWorkspaceSandboxPools`,
   `workspaceSandboxFingerprint`, `qualifyWorkspaceSandboxDriver`). Own a `WorkspaceSandboxService` and
@@ -37,7 +40,7 @@
 
 - Consolidated authoritative execution and observation into the gateway's single frozen settlement;
   observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
-- Added explicit, hash-verified `setup:search` module installation without npm CLI links or Actor PATH changes.
+- Captured find uses Pi's installed matching/ignore components; the experimental search installer and its dependencies were removed.
 - Added the fixed-search IPC entry and shared synchronous input mailbox. Full-tool qualification uses
   that entry for Actor searches; importing it is inert, and arbitrary qualification commands are denied.
 - Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged

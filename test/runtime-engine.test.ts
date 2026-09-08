@@ -915,6 +915,7 @@ describe("structural speculative runtime", () => {
 			source,
 			execute: () => ({
 				...world("speculative", { backend: "resource_version" }),
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
 				commit: async () => Promise.reject(poisoned),
 			}),
 			onEvent: candidateReady.observe,
@@ -942,6 +943,7 @@ describe("structural speculative runtime", () => {
 			source,
 			execute: () => ({
 				...world("sealed"),
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
 				compatibility: { status: "indeterminate", backend: "test", code: "attestation_missing" },
 				commit,
 			}),
@@ -997,87 +999,43 @@ describe("structural speculative runtime", () => {
 		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0 });
 	});
 
-	it("rearms invalidated work while retaining a prediction until its latest horizon", async () => {
-		let executions = 0;
+	it.each(["running", "sealed valid", "sealed stale", "sealed unproven", "observation"])("reconciles Actor effects with $0 ownership", async (phase) => {
+		let version = 0, executions = 0;
+		const started = barrier(), gate = barrier(), ready = candidateSucceeded(), commits = vi.fn();
 		const settlements: PredictionSettlement[] = [];
-		const executionReady = [barrier(), barrier()];
-		const source: Source = {
-			...futureReadSource({ latestHorizon: 1, expectedDurationMs: 10, subsequent: "placeholder" }),
-			onSettled: ({ settlement }) => {
-				settlements.push(settlement);
-			},
-		};
 		const fixture = harness({
-			source,
-			execute: () => {
-				executionReady[executions]!.arrive();
-				return `future:${++executions}`;
+			source: { ...futureReadSource({ latestHorizon: 1, expectedDurationMs: 10, subsequent: "placeholder" }),
+				onSettled: ({ settlement }) => { settlements.push(settlement); } },
+			onEvent: ready.observe,
+			execute: async () => {
+				const captured = version, output = `future:${++executions}`;
+				started.arrive(); if (phase === "running" && executions === 1) await gate.promise;
+				return world(output, { onCommit: commits, validate: phase === "sealed unproven" ? undefined : async () => captured === version
+					? { status: "valid", metrics: zeroValidationMetrics() }
+					: { status: "stale", cause: cause("freshness", "changed"), metrics: zeroValidationMetrics() } });
 			},
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await executionReady[0]!.promise;
-
-		const mutation: Call = {
-			sessionID: "session",
-			turnID: "turn-1",
-			id: "mutation",
-			tool: "write",
-			input: { path: "future.ts", content: "new" },
-		};
-		expect(await fixture.runtime.consume(mutation)).toBeUndefined();
-		await fixture.runtime.actual({ ...mutation, durationMs: 1, output: "written" });
-		await executionReady[1]!.promise;
-		expect(settlements).toEqual([]);
-		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		expect(
-			await fixture.runtime.consume({
-				sessionID: "session",
-				turnID: "turn-2",
-				id: "future-call",
-				tool: "read",
-				input: { path: "future.ts" },
-			}),
-		).toBe("future:2");
-		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
-		expect(settlements).toContainEqual(
-			expect.objectContaining({
-				match: {
-					matched: true,
-					adoption: { status: "adopted", candidateID: expect.any(String) },
-					relation: expect.any(Object),
-				},
-			}),
-		);
-	});
-
-	it("retains an overlapping result after an authoritative observation", async () => {
-		const cachedInput = { path: "future.ts", offset: 1, limit: 10 };
-		const candidateReady = candidateSucceeded();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: ({ startInput }) =>
-				startInput.turnID === "turn-1"
-					? plan("source", "future", cachedInput)
-					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
-		};
-		const fixture = harness({
-			source,
-			execute: () => "future",
-			onEvent: candidateReady.observe,
-		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await candidateReady.promise;
-		const observation = call("turn-1", { path: "future.ts", offset: 100, limit: 1 });
-		expect(await fixture.runtime.consume(observation)).toBeUndefined();
-		await fixture.runtime.actual({ ...observation, durationMs: 1, output: "other range" });
-		await fixture.runtime.finishTurn({ ...observation, terminal: false });
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		expect(await fixture.runtime.consume(call("turn-2", cachedInput))).toBe("future");
-		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+			await (phase === "running" ? started.promise : ready.promise);
+			const mutation: Call = { ...call("turn-1"), id: "mutation", tool: phase === "observation" ? "read" : "write",
+				input: { path: "future.ts", ...(phase === "observation" ? { offset: 100, limit: 1 } : { content: "new" }) } };
+			expect(await fixture.runtime.consume(mutation)).toBeUndefined();
+			if (phase === "sealed stale" || phase === "running") version++;
+			await fixture.runtime.actual({ ...mutation, durationMs: 1, output: "Actor" });
+			gate.arrive(); if (phase === "running") await ready.promise;
+			expect(executions).toBe(phase === "running" ? 2 : 1);
+			expect(settlements).toHaveLength(phase === "observation" ? 1 : 0);
+			await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+			const actor = call("turn-2", { path: "future.ts" }), hit = !["sealed stale", "sealed unproven"].includes(phase);
+			expect(await fixture.runtime.consume(actor)).toBe(hit ? `future:${phase === "running" ? 2 : 1}` : undefined);
+			if (!hit) await fixture.runtime.actual({ ...actor, durationMs: 1, output: "Actor" });
+			expect(commits).toHaveBeenCalledTimes(hit ? 1 : 0);
+			await fixture.runtime.finishTurn({ ...actor, terminal: true });
+			expect(settlements).toHaveLength(1);
+			expect(settlements[0]).toMatchObject({ observation: "observed", match: { matched: true, adoption: { status: hit && phase !== "observation" ? "adopted" : "rejected" } } });
+		} finally { gate.arrive(); await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true }); }
 	});
 
 	it("binds the actual executor independently from pending or completed preview identity", async () => {

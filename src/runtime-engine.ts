@@ -21,7 +21,7 @@ import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./com
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
-import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, type WorldBranch } from "./execution-world.ts";
+import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
@@ -57,7 +57,7 @@ import type {
 	SettledSourceRequest,
 	SourceRequestKind,
 } from "./settlement.ts";
-import { cause, zeroValidationMetrics } from "./settlement.ts";
+import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
 import { measureSpeculativeTask, type TimelineInterval } from "./task-timing.ts";
 
@@ -1763,7 +1763,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 			session.scheduler.complete(candidate);
 			runtimeState.candidates.settle(session.id, candidate);
-			installWatcher(session, candidate);
 			queueCandidateContinuations(
 				session,
 				nodesForCandidate(session, candidate.id).filter((node) => {
@@ -2446,7 +2445,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (rejected) return;
 			runtimeState.candidates.insertResult(state.sessionID, candidate);
 			retained = true;
-			installWatcher(state.session, candidate);
 			trimResults(state.session, state.settings);
 		} catch {
 			// Optional cache promotion cannot alter an already completed Actor result.
@@ -2883,32 +2881,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		];
 	};
 
-	const installWatcher = (session: Session, candidate: Candidate): void => {
-		const branch = candidateBranch(candidate);
-		if (!branch?.watch) return;
-		try {
-			branch.watch((changedPath) => {
-				invalidateCandidates(session, [candidate], cause("freshness", "resource_changed", changedPath));
-			});
-		} catch {
-			// Exact validation remains authoritative when a backend cannot install a watcher.
-		}
-	};
-
 	const validateCandidate = async (candidate: Candidate): Promise<ResourceValidation> => {
-		const branch = candidateBranch(candidate);
-		if (!branch?.validate) return { status: "valid", metrics: zeroValidationMetrics() };
-		try {
-			const validation = await branch.validate();
-			recordValidation(candidate, validation);
-			return validation;
-		} catch (error) {
-			return {
-				status: "indeterminate",
-				cause: cause("freshness", "validation_failed", errorDetail(error)),
-				metrics: zeroValidationMetrics(),
-			};
-		}
+		const validation = await validateWorldBranch(candidateBranch(candidate), candidate.route.reuse);
+		recordValidation(candidate, validation);
+		return validation;
 	};
 
 	const authorize = async (
@@ -3118,6 +3094,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!reservationAvailable(candidate.work.reservation)) continue;
 			if (candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))) {
 				for (const descendant of candidates) {
+					// Completed shared outputs are checked against their sealed evidence at every adoption.
+					// Pending work and checkpoint descendants still retain conservative conflict invalidation.
+					if (descendant === candidate && candidate.work.execution.status === "succeeded" && candidate.work.reservation.kind === "shared") continue;
 					if (descendant === candidate || descendsFrom(descendant, candidate)) invalid.add(descendant);
 				}
 			}

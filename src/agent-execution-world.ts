@@ -15,7 +15,6 @@ import {
 	type ResourceVersionToken,
 	releaseResourceVersion,
 	validateResourceVersion,
-	watchResourceVersion,
 } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
@@ -115,7 +114,6 @@ function resourceSnapshotBranch(
 	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number,
 ): WorldBranch<ToolSettlement> {
 	let owned: ResourceVersionToken | undefined = version;
-	let stopWatcher: (() => void) | undefined;
 	return {
 		backend: "resource_version", output, resources: Object.freeze([]),
 		capturedBytes: version.view?.bytes ?? 0,
@@ -126,9 +124,6 @@ function resourceSnapshotBranch(
 			return expired
 				? { status: "stale", cause: cause("freshness", reason ?? "resource_changed"), metrics }
 				: { status: "valid", metrics };
-		},
-		watch: (onInvalidated) => {
-			if (owned && !stopWatcher) stopWatcher = watchResourceVersion(owned, onInvalidated);
 		},
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			request.signal.throwIfAborted();
@@ -145,8 +140,6 @@ function resourceSnapshotBranch(
 		dispose: () => {
 			const released = owned;
 			owned = undefined;
-			stopWatcher?.();
-			stopWatcher = undefined;
 			releaseResourceVersion(released);
 		},
 	};

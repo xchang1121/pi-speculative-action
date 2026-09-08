@@ -78,27 +78,27 @@ describe("EffectTransactionCoordinator", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it("fails closed on stale validation and aborts captured authoritative state", async () => {
+	it.each(["stale", "missing", "throws"])("requires a backend proof for shared results (%s)", async (proof) => {
 		const disposeBranch = vi.fn();
 		const disposeCapture = vi.fn();
 		const coordinator = new EffectTransactionCoordinator<string>();
-		const capturedAttempt = coordinator.begin({ tool: "custom", route });
+		const capturedAttempt = coordinator.begin({ tool: "custom", route: { ...route, reuse: "shared_result" } });
 		const capture = coordinator.capture(capturedAttempt, {
 			seal: async (output) =>
 				branch({
 					output,
-					validate: async () => ({
-						status: "stale",
-						cause: { stage: "freshness", code: "changed" },
-						metrics: metrics(),
-					}),
+					validate: proof === "missing" ? undefined : async () => {
+						if (proof === "throws") throw new Error("no evidence");
+						return { status: "stale", cause: { stage: "freshness", code: "changed" }, metrics: metrics() };
+					},
 					dispose: disposeBranch,
 				}),
 			dispose: disposeCapture,
 		});
 		const transaction = (await capture.seal("actor-output")) as EffectTransaction<string>;
 
-		expect(await transaction.validate()).toMatchObject({ status: "stale" });
+		expect(await transaction.validate()).toMatchObject({ status: proof === "stale" ? "stale" : "indeterminate",
+			cause: { code: proof === "stale" ? "changed" : proof === "missing" ? "validation_unavailable" : "validation_failed" } });
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 		await transaction.abort();
 		expect(disposeBranch).toHaveBeenCalledOnce();

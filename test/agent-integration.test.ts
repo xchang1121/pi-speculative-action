@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
-import { createLsTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
@@ -120,6 +120,7 @@ describe("speculative action host", () => {
 		for (const phase of ["running", "completed"] as const) {
 			for (const [toolName, proposal] of mockToolCalls) {
 				const cwd = await temporaryWorkspace();
+				const writer = createWriteTool(cwd);
 				const args = toolName === "read" ? { ...proposal, offset: 2 } : proposal;
 				const turnID = `${phase}-${toolName}`;
 				const invocation = resolvePiToolInvocation(toolName, args, { cwd, environment: {} });
@@ -163,7 +164,7 @@ describe("speculative action host", () => {
 					},
 				});
 				try {
-					await host.startTurn(startInput(tool, turnID));
+					await host.startTurn({ ...startInput(tool, turnID), tools: resourceExecution ? [tool, writer] : [tool] });
 					await waitFor(() => speculativeExecution.mock.calls.length === 1);
 					if (phase === "completed") {
 						release();
@@ -203,6 +204,16 @@ describe("speculative action host", () => {
 						expect(narrowed).toEqual(await native.execute("native", query));
 						expect(speculativeExecution).toHaveBeenCalledTimes(2); // Re-evaluation uses the sealed inputs, not the host tool.
 						expect(actorExecution).not.toHaveBeenCalled();
+						for (const changed of [false, true]) {
+							const mutation = { path: changed && toolName === "ls" ? "added.txt" : "notes.txt", content: changed || toolName === "ls" ? "first\nchanged" : "one\ntwo\nthree\nfour" };
+							await host.execute({ turnID, id: `write:${changed}`, tool: "write", args: mutation, tools: [tool, writer] }, undefined,
+								() => writer.execute("native-write", mutation));
+							const fallback = vi.fn(() => native.execute("native-read", args as never));
+							const repeated = await host.execute({ turnID, id: `after-write:${changed}`, tool: toolName, args, tools: [tool, writer] }, undefined, fallback);
+							expect(repeated).toEqual(await native.execute("control", args as never));
+							expect(fallback).toHaveBeenCalledTimes(changed ? 1 : 0);
+							if (!changed) expect(speculativeExecution).toHaveBeenCalledTimes(2);
+						}
 					}
 					await host.finishTurn(turnID, true);
 				} finally {
@@ -701,8 +712,9 @@ function mockRuntimeWorld(
 					compatibility: {
 						status: "compatible",
 						backend: "runtime",
-						executionFingerprint: context.action.executionFingerprint,
+						 executionFingerprint: context.action.executionFingerprint,
 					},
+					validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }), // Fixed fixture inputs.
 					commit: async () => output,
 					dispose: () => {},
 				};

@@ -151,9 +151,9 @@ describe("speculative action resource versions", () => {
 		const branch = await capture.seal(actorOutput);
 		await capture.dispose(); // A sealed capture no longer owns the token.
 		expect(await branch.commit()).toBe(actorOutput);
-		const invalidated = new Promise<string | undefined>((resolve) => branch.watch?.(resolve));
 		await fs.writeFile(file, "B");
-		expect(await invalidated).toBe(file);
+		expect((await branch.validate!()).status).toBe("stale");
+		await fs.writeFile(file, "A"); expect((await branch.validate!()).status).toBe("valid");
 		await branch.dispose(); await branch.dispose();
 		expect((await branch.validate?.())?.status).toBe("stale");
 		await expect(branch.commit()).rejects.toThrow("disposed");

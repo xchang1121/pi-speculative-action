@@ -118,7 +118,6 @@ export {
 	releaseResourceVersion,
 	resourceDependencies,
 	validateResourceVersion,
-	watchResourceVersion,
 } from "./resource-version.ts";
 export {
 	type AuthoritativeResultCapture,

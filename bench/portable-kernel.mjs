@@ -53,7 +53,7 @@ async function prepareWorker(qualification = false) {
 
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
 async function qualifyPiSearch(name) {
-	const { createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
+	const { createFindToolDefinition, createWriteTool } = await import("@earendil-works/pi-coding-agent");
 	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
@@ -86,7 +86,7 @@ async function qualifyPiSearch(name) {
 			return { result: output.result, isError: output.isError };
 		} finally { inputs?.release(); }
 	};
-	const tool = createFindToolDefinition(root);
+	const tool = createFindToolDefinition(root), write = createWriteTool(root), tools = [tool, write];
 	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
@@ -105,7 +105,7 @@ async function qualifyPiSearch(name) {
 				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? [name] : [],
 				patternAware: { enabled: false }, selfSpeculation: { enabled: false } }),
 			draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
-				resolveInvocation: () => invocation,
+			resolveInvocation: (tool) => tool === name ? invocation : undefined,
 			preflight: () => { if (actorWaiting) authorized.resolve(); return true; },
 			executionWorlds: [resources],
 			onEvent: (event) => {
@@ -118,8 +118,8 @@ async function qualifyPiSearch(name) {
 			start: async (id, predict = true) => {
 				if (turnID) await host.finishTurn(turnID);
 				turnID = id; prediction = predict;
-				await host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools: [tool],
-					context: { systemPrompt: "qualification", messages: [], tools: [tool] } });
+				await host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools,
+					context: { systemPrompt: "qualification", messages: [], tools } });
 			},
 			actor: async (id, query = args) => {
 				actorWaiting = true; feedback = Promise.withResolvers();
@@ -211,6 +211,8 @@ async function qualifyPiSearch(name) {
 		const ready = journey(); await ready.start("produce");
 		const completed = await bounded(ready.candidate, "completed candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
 		await fs.truncate(path.join(searchRoot, "notes.txt"), profile.limits.inputBytes * 2); // Names-only evidence survives growth beyond the content budget.
+		const mutation = { turnID: "produce", id: "write", tool: "write", args: { path: "search/data-0.txt", content: "changed without renaming" }, tools };
+		await ready.host.execute(mutation, signal, () => write.execute(mutation.id, mutation.args, signal));
 		await ready.start("recall", false);
 		const beforeHit = counts.producer, adopted = await ready.actor("ready");
 		assert.deepEqual(adopted.output, expected); assert.equal(adopted.settlement.provider.kind, "speculative");
