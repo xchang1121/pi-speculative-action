@@ -26,7 +26,7 @@ afterEach(async () => {
 });
 
 describe("persistent provenance store", () => {
-	it.each([false, true])("drains admitted publication and deduplicates persistent certificates (maintenance failure=%s)", async (fails) => {
+	it.each(["held", "scan_failure", "delete_failure"] as const)("drains admitted publication and every maintenance sibling (%s)", async (phase) => {
 		const root = await temporaryRoot();
 		const initial = new ProvenanceCertificateStore(root);
 		const first = await initial.artifacts.put("output bytes");
@@ -68,15 +68,27 @@ describe("persistent provenance store", () => {
 		const future = new Date(Date.now() + 60_000);
 		await utimes(artifactPaths[1]!, future, future);
 		const second = completed(secondArtifact, 789, "second");
-		const { readdir } = await vi.importActual<typeof filesystem>("node:fs/promises");
-		let enter!: () => void, resume!: () => void;
-		let intercepted = false;
+		const { readdir, rm: remove } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		let enter!: () => void, resume!: () => void, rejectEntered!: () => void;
+		let armed = true, suspended: Promise<unknown> | undefined;
 		const failure = new Error("maintenance IO failure");
 		const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { resume = resolve; });
+		const failureStarted = new Promise<void>((resolve) => { rejectEntered = resolve; });
+		const fail = async () => { await entered; rejectEntered(); throw failure; };
+		const hold = <Value,>(operation: () => Promise<Value>): Promise<Value> => {
+			armed = false; enter(); const task = gate.then(operation); suspended = task; return task;
+		};
+		const certificateRoot = path.join(root, "certificates"), certificateHex = certificate.id.slice("sha256:".length);
 		const enumeration = vi.spyOn(filesystem, "readdir").mockImplementation((...args) => {
-			const entries = readdir(...args);
-			if (intercepted || String(args[0]) !== path.join(root, "certificates")) return entries;
-			intercepted = true; enter(); return entries.then(async (value) => { await gate; if (fails) throw failure; return value; });
+			const target = String(args[0]);
+			if (armed && phase === "scan_failure" && target === certificateRoot) return readdir(...args).then(fail);
+			const blocked = phase === "held" ? certificateRoot : phase === "scan_failure" ? path.join(root, "cas", "sha256") : undefined;
+			return armed && target === blocked ? hold(() => readdir(...args)) : readdir(...args);
+		});
+		const removal = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
+			const target = String(args[0]);
+			if (armed && phase === "delete_failure" && target === path.join(certificateRoot, certificateHex.slice(0, 2), `${certificateHex.slice(2)}.json`)) return fail();
+			return armed && phase === "delete_failure" && target === artifactPaths[0] ? hold(() => remove(...args)) : remove(...args);
 		});
 		const collect = vi.spyOn(store, "gc"), publish = vi.fn(() => store.put(second)), closed = vi.fn();
 		const gateway = new ToolExecutionGateway<never, boolean>([]);
@@ -85,21 +97,22 @@ describe("persistent provenance store", () => {
 		try {
 			await entered; collection = collect.mock.results[0]!.value;
 			retirement = Promise.all([gateway.dispose(), gateway.dispose()]).then(() => { closed(); });
+			if (phase !== "held") await failureStarted;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(await store.get(second.id)).toEqual(second);
 			expect(publish).toHaveBeenCalledOnce(); expect(collect).toHaveBeenCalledOnce();
 			expect(closed).not.toHaveBeenCalled();
 		} finally {
-			resume(); await Promise.allSettled([publication, retirement ?? gateway.dispose()]);
-			await store.stats().finally(() => { enumeration.mockRestore(); collect.mockRestore(); });
+			resume(); await Promise.allSettled([publication, retirement ?? gateway.dispose(), suspended]);
+			await store.stats().finally(() => { enumeration.mockRestore(); removal.mockRestore(); collect.mockRestore(); });
 		}
 		expect(await publication).toBe(true); expect(closed).toHaveBeenCalledOnce(); expect(publish).toHaveBeenCalledOnce();
 
-		if (fails) await expect(collection).rejects.toBe(failure);
-		const collected = fails ? await store.gc() : await collection;
+		if (phase !== "held") await expect(collection).rejects.toBe(failure);
+		const collected = phase !== "held" ? await store.gc() : await collection;
 		expect(collected).toMatchObject({
 			removedCertificates: 1,
-			removedArtifacts: 1,
+			removedArtifacts: phase === "delete_failure" ? 0 : 1,
 		});
 		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 2, orphanArtifacts: 1 });
 		await utimes(artifactPaths[1]!, 1, 1);

@@ -296,7 +296,7 @@ export class ProvenanceCertificateStore {
 		const orphans = [...inventory.artifacts].flatMap(([digest, artifact]) =>
 			!retainedArtifacts.has(digest) && now - artifact.modifiedAt >= this.orphanGraceMs ? [artifact] : [],
 		);
-		await Promise.all([
+		const removals = [
 			...removed.map((record) => rm(record.path, { force: true })),
 			...removed.flatMap((record) =>
 				record.certificate
@@ -304,7 +304,11 @@ export class ProvenanceCertificateStore {
 					: [],
 			),
 			...orphans.map((artifact) => rm(artifact.path, { force: true })),
-		]);
+		];
+		await Promise.all(removals).catch(async (error) => {
+			await Promise.allSettled(removals);
+			throw error;
+		});
 		return {
 			removedCertificates: removed.length,
 			removedArtifacts: orphans.length,
@@ -315,10 +319,14 @@ export class ProvenanceCertificateStore {
 	}
 
 	private async inventory(): Promise<StoreInventory> {
-		const [certificatePaths, artifactPaths] = await Promise.all([
+		const scans = [
 			filesUnder(this.managedPath("certificates")),
 			filesUnder(path.join(this.artifacts.root, "sha256")),
-		]);
+		] as const;
+		const [certificatePaths, artifactPaths] = await Promise.all(scans).catch(async (error) => {
+			await Promise.allSettled(scans);
+			throw error;
+		});
 		const certificates = (await Promise.all(certificatePaths.filter((target) => target.endsWith(".json")).map(async (target) => {
 			const bytes = await readFile(target).catch(() => undefined);
 			if (!bytes) return undefined;

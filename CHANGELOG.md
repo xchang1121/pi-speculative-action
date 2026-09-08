@@ -253,6 +253,8 @@
 
 ### Fixed
 
+- Failed store scans and GC removals drain every already-started sibling before propagating the
+  original error. Successful operations keep their parallel path; no new queue or error wrapper is added.
 - Certificate publication waits for any due store maintenance it starts, so the existing admitted
   execution lifetime drains GC before shutdown. Maintenance failures still preserve the publication
   result; collection frequency, store serialization and memory-before-persistence handoffs are unchanged.
