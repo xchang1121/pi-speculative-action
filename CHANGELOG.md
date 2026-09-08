@@ -16,8 +16,10 @@
   and retains outstanding cleanup even after a worker has physically closed.
 - Captured-input profiles declare `resourceScope: "captured_inputs"`, which never certifies an ambient
   Actor execution window. Read the scope from the definition; removed the unused registry forwarding method.
-- Transaction attempts expose only an immutable descriptor and lifecycle view; route and validation
-  evidence are now owned snapshots, so external mutations cannot change reuse authority after issuance.
+- Transaction attempts and sealed views own immutable route, resource, validation, execution and compatibility
+  evidence. Backend operation slots are bound at sealing; later provider changes cannot replace proof,
+  adoption or cleanup. Opaque checkpoint handles and method receivers stay with their backend owner.
+  Revalidation waits an already-reserved commit; commit telemetry remains available after settlement.
 - Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused
   `alias` forwarding method was removed. Link metadata grants no authority to read the target.
 - Shared transactions now own a sealed plain-data result and give each reader/adoption a separate copy.

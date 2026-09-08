@@ -152,7 +152,7 @@ export class EffectTransactionCoordinator<Output> {
 		branch: WorldBranch<Output>,
 	): Promise<EffectTransaction<Output>> {
 		try {
-			const transaction = new SealedEffectTransaction(attempt, branch);
+			const transaction = sealEffectTransaction(attempt, branch);
 			this.transition(attempt, "sealing", "sealed");
 			return transaction;
 		} catch (error) {
@@ -179,152 +179,90 @@ export class EffectTransactionCoordinator<Output> {
 	}
 }
 
-class SealedEffectTransaction<Output> implements EffectTransaction<Output> {
-	private readonly attempt: MutableEffectTransactionAttempt;
-	private readonly branch: WorldBranch<Output>;
-	private readonly shared?: { readonly output: Output };
-	private validation?: ResourceValidation;
-	private validationPromise?: Promise<ResourceValidation>;
-	private commitPromise?: Promise<Output>;
-	private cleanupPromise?: Promise<void>;
-	private readonly reconstructions = new Set<Promise<Output | undefined>>();
-
-	constructor(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>) {
-		this.attempt = attempt;
-		this.branch = branch;
-		if (attempt.descriptor.route.reuse === "shared_result") this.shared = { output: cloneSharedData(branch.output) };
-	}
-
-	get transactionID(): string {
-		return this.attempt.id;
-	}
-
-	get state(): EffectTransactionState {
-		return this.attempt.stateValue;
-	}
-
-	get latestValidation(): ResourceValidation | undefined {
-		return this.validation;
-	}
-
-	get output(): Output {
-		return this.shared ? structuredClone(this.shared.output) : this.branch.output;
-	}
-
-	get backend(): string {
-		return this.branch.backend;
-	}
-
-	get checkpoint() {
-		return this.branch.checkpoint;
-	}
-
-	get resources(): readonly string[] {
-		return this.branch.resources;
-	}
-
-	get capturedBytes(): number {
-		return this.branch.capturedBytes;
-	}
-
-	get executionMetrics() {
-		return this.branch.executionMetrics;
-	}
-
-	get compatibility() {
-		return this.branch.compatibility;
-	}
-
-	get commitMetrics() {
-		return this.branch.commitMetrics;
-	}
-
-	get reconstruct(): WorldBranch<Output>["reconstruct"] {
-		if (!this.branch.reconstruct || this.attempt.descriptor.route.reuse !== "shared_result") return undefined;
-		return async (request) => {
-			if (this.cleanupPromise || this.validation?.status !== "valid" || !["validated", "committed"].includes(this.state)) return undefined;
-			const task = this.branch.reconstruct!(request).then(cloneSharedData);
-			this.reconstructions.add(task);
-			try { return await task; } finally { this.reconstructions.delete(task); }
-		};
-	}
-
-	async validate(): Promise<ResourceValidation> {
-		if (this.cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(this.attempt.stateValue)) {
-			return {
-				status: "indeterminate",
-				cause: cause("freshness", "transaction_unavailable"),
-				metrics: zeroValidationMetrics(),
-			};
-		}
-		if (this.validationPromise) return this.validationPromise;
-		const preserveCommitted = this.attempt.stateValue === "committed";
-		this.attempt.stateValue = preserveCommitted ? "committed" : "validating";
-		const pending = (async () => {
-			const validation = await validateWorldBranch(this.branch, this.attempt.descriptor.route.reuse);
-			this.validation = validation;
-			if (!preserveCommitted && this.attempt.stateValue === "validating") {
-				this.attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";
-			}
-			return validation;
-		})();
-		this.validationPromise = pending;
-		try {
-			return await pending;
-		} finally {
-			if (this.validationPromise === pending) this.validationPromise = undefined;
-		}
-	}
-
-	async commit(): Promise<Output> {
-		// An admitted effect keeps its original settlement, including during/after retirement.
-		if (this.commitPromise) return this.shared ? structuredClone(await this.commitPromise) : this.commitPromise;
-		if (this.cleanupPromise) {
-			throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
-		}
-		if (!this.validationPromise && this.validation?.status !== "valid") {
-			throw new Error(`effect transaction ${this.transactionID} requires successful validation before commit`);
-		}
-		// Reserve the entire validation → commit operation before yielding, not just its effect.
-		this.commitPromise = (async () => {
-			await this.validationPromise;
-			if (this.validation?.status !== "valid" || this.attempt.stateValue !== "validated") {
-				throw new Error(`effect transaction ${this.transactionID} cannot commit from ${this.attempt.stateValue}`);
-			}
-			this.attempt.stateValue = "committing";
+function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>): EffectTransaction<Output> {
+	const shared = attempt.descriptor.route.reuse === "shared_result";
+	const sealed: WorldBranch<Output> = Object.freeze({
+		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, capturedBytes: branch.capturedBytes,
+			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
+		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
+		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
+		validate: branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
+		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
+	});
+	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
+	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
+	const reconstructions = new Set<Promise<Output | undefined>>();
+	const abort = (): Promise<void> => {
+		if (cleanupPromise) return cleanupPromise;
+		if (!["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
+		cleanupPromise = (async () => {
 			try {
-				const output = await this.branch.commit();
-				this.attempt.stateValue = "committed";
-				return this.shared ? this.shared.output : output;
-			} catch (error) {
-				const failure = effectCommitFailure(
-					error,
-					"poisoned",
-					"effect commit failed without proof that its side effects were restored",
-				);
-				this.attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "failed";
-				throw failure;
-			}
-		})();
-		return this.shared ? structuredClone(await this.commitPromise) : this.commitPromise;
-	}
-
-	abort(): Promise<void> {
-		if (this.cleanupPromise) return this.cleanupPromise;
-		if (!["committed", "poisoned"].includes(this.state) && !this.commitPromise) this.attempt.stateValue = "aborting";
-		const pending = (async () => {
-			try {
-				await Promise.allSettled([this.validationPromise, this.commitPromise, ...this.reconstructions]);
-				await this.branch.dispose();
+				await Promise.allSettled([validationPromise, commitPromise, ...reconstructions]);
+				await sealed.dispose();
 			} finally {
-				if (!["committed", "poisoned"].includes(this.attempt.stateValue)) this.attempt.stateValue = "aborted";
+				if (!["committed", "poisoned"].includes(attempt.stateValue)) attempt.stateValue = "aborted";
 			}
 		})();
-		this.cleanupPromise = pending;
-		return pending;
-	}
-
-	dispose(): Promise<void> {
-		return this.abort();
-	}
+		return cleanupPromise;
+	};
+	return Object.freeze<EffectTransaction<Output>>({
+		...sealed, transactionID: attempt.id,
+		get state() { return attempt.stateValue; },
+		get latestValidation() { return validation; },
+		get output() { return shared ? structuredClone(sealed.output) : sealed.output; },
+		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
+		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
+		reconstruct: shared && sealed.reconstruct ? async (request) => {
+			if (cleanupPromise || validation?.status !== "valid" || !["validated", "committed"].includes(attempt.stateValue)) return undefined;
+			const task = sealed.reconstruct!(request).then(cloneSharedData);
+			reconstructions.add(task);
+			try { return await task; } finally { reconstructions.delete(task); }
+		} : undefined,
+		validate: async () => {
+			// A reserved commit owns its proof window; a later validation must not reset that state.
+			if (!cleanupPromise && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
+			if (cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
+				return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
+			}
+			if (validationPromise) return validationPromise;
+			const preserveCommitted = attempt.stateValue === "committed";
+			attempt.stateValue = preserveCommitted ? "committed" : "validating";
+			const pending = (async () => {
+				validation = await validateWorldBranch(sealed, attempt.descriptor.route.reuse);
+				if (!preserveCommitted && attempt.stateValue === "validating") {
+					attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";
+				}
+				return validation;
+			})();
+			validationPromise = pending;
+			try { return await pending; } finally { if (validationPromise === pending) validationPromise = undefined; }
+		},
+		commit: async () => {
+			// An admitted effect keeps its original settlement, including during/after retirement.
+			if (commitPromise) return shared ? structuredClone(await commitPromise) : commitPromise;
+			if (cleanupPromise) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
+			if (!validationPromise && validation?.status !== "valid") {
+				throw new Error(`effect transaction ${attempt.id} requires successful validation before commit`);
+			}
+			// Reserve the entire validation → commit operation before yielding, not just its effect.
+			commitPromise = (async () => {
+				await validationPromise;
+				if (validation?.status !== "valid" || attempt.stateValue !== "validated") {
+					throw new Error(`effect transaction ${attempt.id} cannot commit from ${attempt.stateValue}`);
+				}
+				attempt.stateValue = "committing";
+				try {
+					const output = await sealed.commit();
+					attempt.stateValue = "committed";
+					return shared ? sealed.output : output;
+				} catch (error) {
+					const failure = effectCommitFailure(error, "poisoned", "effect commit failed without proof that its side effects were restored");
+					attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "failed";
+					throw failure;
+				}
+			})();
+			return shared ? structuredClone(await commitPromise) : commitPromise;
+		},
+		abort, dispose: abort,
+	});
 }

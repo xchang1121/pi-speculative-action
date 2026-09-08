@@ -16,7 +16,7 @@ const route: SpeculativeExecutionRoute = {
 };
 
 describe("EffectTransactionCoordinator", () => {
-	it.each([false, true])("owns concurrent commit across pending validation=%s", async (pending) => {
+	it.each(["settled", "pending", "revalidate"])("owns concurrent commit across validation=%s", async (phase) => {
 		for (const disposition of ["success", "recoverable", "poisoned", undefined] as const) {
 			let release!: () => void;
 			const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -28,15 +28,19 @@ describe("EffectTransactionCoordinator", () => {
 			expect("stateValue" in attempt).toBe(false); expect(Reflect.set(attempt, "state", "validated")).toBe(false);
 			for (const unowned of [{ ...attempt }, new EffectTransactionCoordinator<string>().begin(attempt.descriptor)])
 				await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
-			const transaction = await coordinator.execute(attempt, async () => branch({
+			const source = branch({
 				validate: async () => { await gate; return { status: "valid", metrics: metrics() }; },
 				commit, dispose,
-			}));
+			});
+			const transaction = await coordinator.execute(attempt, async () => source);
+			Object.assign(source, { output: "replaced after sealing", commit: vi.fn(), dispose: vi.fn() });
+			expect(transaction.output).toBe("sealed");
 			expect([transaction.state, attempt.state]).toEqual(["sealed", "sealed"]);
 			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 			const validation = transaction.validate();
-			if (!pending) { release(); await validation; }
+			if (phase !== "pending") { release(); await validation; }
 			const commits = Promise.allSettled([transaction.commit(), transaction.commit()]);
+			if (phase === "revalidate") expect((await transaction.validate()).status).toBe(failure ? "indeterminate" : "valid");
 			release();
 			const [first, second] = await commits;
 			expect(first).toEqual(second);
@@ -92,19 +96,18 @@ describe("EffectTransactionCoordinator", () => {
 		const capturedAttempt = coordinator.begin({ tool: "custom", route: offeredRoute });
 		offeredRoute.reuse = "exclusive_branch"; offeredRoute.fingerprint = "changed after begin";
 		const offeredProof = { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: metrics() };
+		const offeredBranch = branch({
+			validate: proof === "missing" ? undefined : async () => {
+				if (proof === "throws") throw new Error("no evidence");
+				return offeredProof;
+			}, dispose: disposeBranch,
+		});
 		const capture = coordinator.capture(capturedAttempt, {
-			seal: async (output) =>
-				branch({
-					output,
-					validate: proof === "missing" ? undefined : async () => {
-						if (proof === "throws") throw new Error("no evidence");
-						return offeredProof;
-					},
-					dispose: disposeBranch,
-				}),
+			seal: async (output) => Object.assign(offeredBranch, { output }),
 			dispose: disposeCapture,
 		});
 		const transaction = (await capture.seal("actor-output")) as EffectTransaction<string>;
+		Object.assign(offeredBranch, { validate: async () => ({ status: "valid", metrics: metrics() }) });
 
 		const validation = await transaction.validate();
 		Object.assign(offeredProof, { status: "valid" }); offeredProof.metrics.durationMs = 99;
@@ -127,7 +130,7 @@ describe("EffectTransactionCoordinator", () => {
 		expect(abandonedAttempt.state).toBe("aborted");
 	});
 
-	it("owns each shared result and retires opaque outputs without changing their Actor owner", async () => {
+	it("owns sealed data and operation slots without changing opaque backend or Actor owners", async () => {
 		const getter = vi.fn(() => "not data"), opaque = Object.create({ method() {} });
 		for (const captured of [false, true]) for (const details of [{ value: ["sealed"] }, opaque, new Date(), Buffer.from("raw"),
 			{ method() {} }, { [Symbol("hidden")]: 1 }, Object.defineProperty({}, "hidden", { value: 1 }), { get value() { return getter(); } }]) {
@@ -135,8 +138,14 @@ describe("EffectTransactionCoordinator", () => {
 			const shareable = "value" in details && Array.isArray(Object.getOwnPropertyDescriptor(details, "value")?.value);
 			const coordinator = new EffectTransactionCoordinator<typeof output>();
 			const attempt = coordinator.begin({ tool: "custom", route: { ...route, reuse: "shared_result" } });
-			const commit = vi.fn(async () => output), dispose = vi.fn(), source = { ...branch(), output, commit, dispose, reconstruct: async () => output,
-				validate: async () => ({ status: "valid" as const, metrics: metrics() }) };
+			const checkpoint = { backend: "test", id: "sealed", lineage: "root", depth: 1, handle() {} };
+			const metadata = { backend: "test", resources: ["sealed.txt"], capturedBytes: 1, executionMetrics: { setupMs: 1 },
+				compatibility: { status: "incompatible" as const, backend: "test", code: "sealed_incompatible" } };
+			const commit = vi.fn(async function (this: WorldBranch<typeof output>) { expect(this).toBe(source); return output; });
+			const dispose = vi.fn(function (this: WorldBranch<typeof output>) { expect(this).toBe(source); });
+			const source: WorldBranch<typeof output> = { ...metadata, checkpoint, output, commit, dispose,
+				reconstruct: async function () { expect(this).toBe(source); return expected; },
+				validate: async function () { expect(this).toBe(source); return { status: "valid", metrics: metrics() }; } };
 			const pending = captured ? coordinator.capture(attempt, { seal: () => source, dispose: () => {} }).seal(output)
 				: coordinator.execute(attempt, async () => source);
 			if (!shareable) {
@@ -146,14 +155,28 @@ describe("EffectTransactionCoordinator", () => {
 				continue;
 			}
 			const transaction = await pending;
+			const sealedMetadata = structuredClone(metadata), replaced = vi.fn();
+			metadata.resources.push("late.txt"); metadata.executionMetrics.setupMs = 99;
+			Object.assign(metadata.compatibility, { status: "compatible", executionFingerprint: "late" });
+			Object.assign(source, { backend: "late", checkpoint: undefined, capturedBytes: 99, resources: [], executionMetrics: {},
+				compatibility: { status: "compatible", backend: "late", executionFingerprint: "late" },
+				validate: replaced, reconstruct: replaced, commit: replaced, dispose: replaced });
+			expect(transaction).toMatchObject(sealedMetadata); expect(transaction.checkpoint).toBe(checkpoint);
+			expect(Object.isFrozen(checkpoint)).toBe(false);
+			for (const [owner, key] of [[transaction, "commit"], [transaction.resources, "0"], [transaction.executionMetrics, "setupMs"],
+				[transaction.compatibility, "status"]] as const) expect(Reflect.set(owner, key, "changed")).toBe(false);
 			output.content.push("provider edit"); (details as { value: string[] }).value.push("provider edit");
 			transaction.output.content.push("reader edit");
 			expect(transaction.output).toEqual(expected);
 			await transaction.validate!();
+			expect(await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,
+				args: {}, callID: "actor", signal: new AbortController().signal })).toEqual(expected);
 			const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
+			Object.assign(source, { commitMetrics: { durationMs: 2, validationMs: 1, bytesValidated: 1, resourcesValidated: 1, resourcesCommitted: 1 } });
+			expect(transaction.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
 			first.content.push("Actor edit"); (first.details as { value: string[] }).value.push("Actor edit");
 			expect(second).toEqual(expected); expect(commit).toHaveBeenCalledOnce();
-			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce();
+			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce(); expect(replaced).not.toHaveBeenCalled();
 		}
 		expect(getter).not.toHaveBeenCalled();
 	});
