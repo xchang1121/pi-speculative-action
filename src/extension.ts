@@ -124,6 +124,7 @@ const SELF_SPECULATION_INPUTS = {
 	forkGateFailureThreshold: positiveIntegerInput("Consecutive-failure limit"),
 	maxCandidates: positiveIntegerInput("Candidates sent per Actor decision"),
 	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
+	actorProfile: nonEmptyTextInput("Actor tool-call Profile ('auto' to derive)"),
 	draftFormat: nonEmptyTextInput("Target tool-call format"),
 	draftBoundary: nonEmptyTextInput("Target tool-call boundary override ('auto' to derive)"),
 	forkMaxTokens: positiveIntegerInput("Actor probe output-token limit"),
@@ -273,7 +274,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, replay confidence≥${formatPercent(settings.patternAware.minBindingReplayProbability)}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
+		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
@@ -1089,7 +1090,8 @@ function openActorForkSettings(
 			actions.set(`Verify predicted calls during Actor decoding: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled }));
 			actions.set(`Candidates sent per decision: ${self.maxCandidates}`, () => edit("maxCandidates"));
 			actions.set(`Draft-token limit per candidate: ${self.maxDraftTokens}`, () => edit("maxDraftTokens"));
-			actions.set(`Tool-call format: ${self.draftFormat}`, () => edit("draftFormat"));
+			actions.set(`Actor Profile: ${self.actorProfile}`, () => edit("actorProfile"));
+			actions.set(`Legacy tool-call format: ${self.draftFormat}`, () => edit("draftFormat"));
 			actions.set(`Tool-call boundary: ${syntaxSettingLabel(self.draftBoundary)}`, () => edit("draftBoundary"));
 		} else {
 			actions.set(`Pause forks that stop saving time: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled }));
@@ -1577,6 +1579,11 @@ function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnaps
 function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
 	return [
 		`Self-speculation: ${bridge.bufferedCandidates} buffered`,
+		...(bridge.resolvedActorProfile
+			? [
+					`Resolved Actor Profile: ${bridge.resolvedActorProfile}${bridge.profileResolutionSource ? ` (${bridge.profileResolutionSource})` : ""}`,
+				]
+			: []),
 		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
 		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries), ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
 		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,

@@ -134,7 +134,8 @@ npm run setup:linux
     "forkGateFailureThreshold": 2,
     "maxCandidates": 8,
     "maxDraftTokens": 28,
-    "draftFormat": "tagged_json",
+    "actorProfile": "auto",
+    "draftFormat": "auto",
     "draftBoundary": "auto",
     "forkMaxTokens": 128,
     "forkTemperature": 0,
@@ -174,13 +175,20 @@ fork 有两种传输方式：
 
 D3 默认上限为 28 个 draft token。严格 DeepSeek tokenizer tape 回放中，相比旧上限 20，28 多提交的 12 个 token 全部被接受、没有增加拒绝 token，并额外减少 10 个 target-step 代理；升到 32 不再增加收益。该值仍可配置，并会再次受推理引擎硬上限约束。
 
-JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、tool-call 格式、decoder、温度和专家级语法覆盖。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
+JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、Actor 模型 Profile、tool-call 格式、decoder、温度和专家级语法覆盖。`actorProfile` 决定最终按什么协议为 Actor 格式化和编码 D3 candidate，默认是 `auto`。支持 Profile 的 provider payload 使用协议 v2；仅显式配置旧 `draftFormat` 时仍发送 v1 结构以保持兼容，显式 Profile 则使用 v2 且优先级更高。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
 
 对于 Qwen3.5 系列（包括 Qwen3.8 部署别名），如果 Actor provider 使用模型原生的
-`tools=` chat template，应把 `draftFormat` 设为 `qwen_xml`。只有 Actor 请求本身也通过配套
-`self-speculation` 包按论文 JSON 协议渲染时，才使用 `tagged_json`。只把 sidecar fork 改成
+`tools=` chat template，应把 `actorProfile` 设为 `qwen35_xml`。只有 Actor 请求本身也通过配套
+`self-speculation` 包按论文 JSON 协议渲染时，才使用 `qwen35_tagged_json`。Qwen3 的
+SPORK/Hermes JSON 路径使用 `qwen3_tagged_json`。只把 sidecar fork 改成
 JSON 会导致其 token 前缀与 Actor 不同，无法精确复用 KV cache。Pi 不内置 Qwen 边界 token
 ID；推理集成始终使用目标 tokenizer 派生边界。
+
+DeepSeek V4 原生 DSML 路径使用 `actorProfile: "deepseek_v4_dsml"`。Pi 只透传 Profile
+和记录服务端返回的实际解析结果；DSML parser、formatter、boundary 以及 D3 能力校验由
+`self-speculation` 实现。Pi 提交的是 provider-neutral 的结构化 tool call，因此无论 Drafter
+最初使用什么文本协议，都由 Actor Profile 重新格式化并使用 Actor tokenizer 编码，不能直接
+注入 Drafter token。
 
 PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor 采纳的 Drafter 结果——都会连同真实输出一起做一次不修改学习状态的同轮重基准；正式学习仍在权威 batch 边界进行。若跨轮的 `K(a)` 与 horizon 集合完全不变，则沿用提前签发的机会而不重复创建，避免共享命中被采纳后又启动同组落选候选。
 

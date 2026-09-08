@@ -142,7 +142,8 @@ Example:
     "forkGateFailureThreshold": 2,
     "maxCandidates": 8,
     "maxDraftTokens": 28,
-    "draftFormat": "tagged_json",
+    "actorProfile": "auto",
+    "draftFormat": "auto",
     "draftBoundary": "auto",
     "forkMaxTokens": 128,
     "forkTemperature": 0,
@@ -182,16 +183,25 @@ For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact
 
 The default D3 cap is 28 draft tokens. In the strict DeepSeek-tokenizer tape replay, raising the former cap of 20 to 28 added 12 accepted tokens, no rejected tokens, and 10 saved target-step proxies; 32 added nothing further. This remains configurable and is bounded again by the inference engine.
 
-The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, tool-call format, decoder, temperature, and expert syntax overrides. Boundary and forced-prefix overrides default to `auto`, so the inference adapter derives CoT closure, the name-aligned probe prefix, parser framing, and D3 boundary from one model format. An explicit override must describe that same format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
+The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, Actor model Profile, tool-call format, decoder, temperature, and expert syntax overrides. `actorProfile` selects the protocol used to format and encode final Actor D3 candidates and defaults to `auto`. Profile-aware provider payloads use protocol version 2. For compatibility, setting only a legacy `draftFormat` keeps the version-1 provider shape; an explicit Profile uses version 2 and takes precedence. Boundary and forced-prefix overrides default to `auto`, so the inference adapter derives CoT closure, the name-aligned probe prefix, parser framing, and D3 boundary from one model format. An explicit override must describe that same format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
 
 For Qwen3.5-family checkpoints, including Qwen3.8 deployment aliases, set
-`draftFormat` to `qwen_xml` when the Actor provider uses the model's native
-`tools=` chat template. Keep `tagged_json` only when the Actor request itself is
+`actorProfile` to `qwen35_xml` when the Actor provider uses the model's native
+`tools=` chat template. Use `qwen35_tagged_json` only when the Actor request itself is
 rendered with the paper-aligned JSON protocol provided by the companion
-`self-speculation` package. Changing only the sidecar fork to JSON would make its
+`self-speculation` package; Qwen3's SPORK/Hermes JSON path uses
+`qwen3_tagged_json`. Changing only the sidecar fork to JSON would make its
 prefix differ from the Actor and prevent exact KV-cache reuse. Pi never embeds a
 Qwen boundary token ID; the inference integration derives it with the target
 tokenizer.
+
+Use `actorProfile: "deepseek_v4_dsml"` for a DeepSeek V4 Actor following its
+native DSML protocol. Pi only transports the Profile and records the resolved
+server result; the companion package owns DSML parsing, formatting, boundaries,
+and D3 capability checks. Pi submits provider-neutral structured tool calls, so
+the Actor Profile remains authoritative for re-serialization and tokenization
+regardless of the Drafter's original text protocol; Drafter tokens are never
+injected directly.
 
 When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
 
