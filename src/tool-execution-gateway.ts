@@ -1,6 +1,7 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import {
 	EffectTransactionCoordinator,
 	type EffectTransaction,
@@ -66,9 +67,10 @@ export interface AuthoritativeExecutionHooks<Output> {
 export class ToolExecutionGateway<Context, Output> {
 	private readonly router: ExecutionWorldRouter<Context, Output>;
 	private readonly transactions = new EffectTransactionCoordinator<Output>();
+	private readonly lifecycle = new RuntimeLifecycleLane();
 
 	constructor(worlds: readonly ExecutionWorld<Context, Output>[], speculationEnabled?: (backend: string) => boolean) {
-		this.router = new ExecutionWorldRouter(worlds, speculationEnabled);
+		this.router = new ExecutionWorldRouter(worlds, speculationEnabled, this.lifecycle);
 	}
 
 	resolve(
@@ -76,15 +78,7 @@ export class ToolExecutionGateway<Context, Output> {
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
 		const { operation, effect, requirements } = requirement;
-		return this.router.resolve(
-			{
-				tool: operation.tool,
-				effect,
-				requirements,
-				...(operation.action ? { action: operation.action } : {}),
-			},
-			preparation,
-		);
+		return this.router.resolve({ tool: operation.tool, action: operation.action, effect, requirements }, preparation);
 	}
 
 	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
@@ -98,12 +92,7 @@ export class ToolExecutionGateway<Context, Output> {
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		const { operation, effect, requirements } = requirement;
 		return this.router.captureAuthoritativeResult(
-			{
-				tool: operation.tool,
-				effect,
-				requirements,
-				...(operation.action ? { action: operation.action } : {}),
-			},
+			{ tool: operation.tool, action: operation.action, effect, requirements },
 			preparation,
 			context(operation),
 		).then((captured) =>
@@ -124,27 +113,29 @@ export class ToolExecutionGateway<Context, Output> {
 		executor: AuthoritativeToolExecutor<AuthoritativeOutput>,
 		hooks: AuthoritativeExecutionHooks<AuthoritativeOutput> = {},
 	): Promise<AuthoritativeOutput> {
-		if (hooks.reuse) {
-			try {
-				const reused = await hooks.reuse();
-				if (reused !== undefined) return reused;
-			} catch (error) {
-				if (isPoisonedEffectCommit(error)) throw error;
-				// Reuse is optional; the supplied Actor executor remains authoritative.
+		return this.lifecycle.admit(async () => {
+			if (hooks.reuse) {
+				try {
+					const reused = await hooks.reuse();
+					if (reused !== undefined) return reused;
+				} catch (error) {
+					if (isPoisonedEffectCommit(error)) throw error;
+					// Reuse is optional; the supplied Actor executor remains authoritative.
+				}
 			}
-		}
-		const startedAt = performance.now();
-		let settlement: AuthoritativeExecutionSettlement<AuthoritativeOutput>;
-		try {
-			settlement = { status: "succeeded", output: await executor(operation), durationMs: Math.max(0, performance.now() - startedAt) };
-		} catch (error) {
-			settlement = { status: "failed", error, durationMs: Math.max(0, performance.now() - startedAt) };
-		}
-		Object.freeze(settlement);
-		try { await hooks.settled?.(settlement); }
-		catch { /* Observation cannot replace the original Actor settlement. */ }
-		if (settlement.status === "failed") throw settlement.error;
-		return settlement.output;
+			const startedAt = performance.now();
+			let settlement: AuthoritativeExecutionSettlement<AuthoritativeOutput>;
+			try {
+				settlement = { status: "succeeded", output: await executor(operation), durationMs: Math.max(0, performance.now() - startedAt) };
+			} catch (error) {
+				settlement = { status: "failed", error, durationMs: Math.max(0, performance.now() - startedAt) };
+			}
+			Object.freeze(settlement);
+			try { await hooks.settled?.(settlement); }
+			catch { /* Observation cannot replace the original Actor settlement. */ }
+			if (settlement.status === "failed") throw settlement.error;
+			return settlement.output;
+		});
 	}
 
 	executeSpeculative(

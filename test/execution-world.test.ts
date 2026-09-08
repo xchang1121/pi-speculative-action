@@ -83,6 +83,7 @@ describe("ExecutionWorldRouter", () => {
 				}),
 			]),
 		);
+		vi.mocked(unavailable.dispose!).mockImplementation(() => { throw new Error("cleanup failed"); });
 		await router.dispose();
 		expect(unavailable.dispose).toHaveBeenCalledOnce();
 		expect(resource.dispose).toHaveBeenCalledOnce();

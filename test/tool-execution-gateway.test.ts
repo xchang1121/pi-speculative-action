@@ -11,54 +11,44 @@ type TestContext = { readonly value: string };
 type TestWorld = ExecutionWorld<TestContext, string>;
 
 describe("ToolExecutionGateway", () => {
-	it("owns speculative routing, capture, execution, and world lifecycle", async () => {
-		const dispose = vi.fn(async () => {});
-		const world: TestWorld = {
-			id: "workspace",
-			scope: "fallback",
-			isolation: "workspace_branch",
-			speculation: {
-				capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-				execute: async ({ value }) => branch("workspace", value),
-			},
-			observation: {
-				capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-				capture: async ({ value }) => ({
-					seal: async (output) => branch("workspace", `${value}:${output}`),
-					dispose: () => {},
-				}),
-			},
-			dispose,
-		};
-		const gateway = new ToolExecutionGateway([world]);
-		const operation = { tool: "custom_process", callID: "spec-1", input: { any: "shape" } };
-		const requirement = {
-			operation,
-			effect: "workspace_mutation" as const,
-			requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-		};
-		const route = await gateway.resolve(requirement, { cwd: "/workspace" });
-
-		expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });
-		const transaction = route
-			? await gateway.executeSpeculative(operation, route, () => ({ value: "sealed" }))
-			: undefined;
-		expect(transaction?.output).toBe("sealed");
-		expect(transaction?.state).toBe("sealed");
-		const capture = await gateway.captureAuthoritativeResult(
-			requirement,
-			{ cwd: "/workspace" },
-			() => ({ value: "baseline" }),
-		);
-		expect((await capture?.capture.seal("actor"))?.output).toBe("baseline:actor");
-		expect(
-			await gateway.resolve(
-				{ operation, effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
-				{ cwd: "/workspace" },
-			),
-		).toBeUndefined();
-		await gateway.dispose();
-		expect(dispose).toHaveBeenCalledOnce();
+	it("seals one admission lifetime and drains Actor, preparation and world work before disposal", async () => {
+		for (const phase of ["actor", "actor_failed", "prepare", "fork", "fork_failed", "capture", "diagnostics"]) {
+			let enter!: () => void, release!: () => void, probing = false;
+			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			const dispose = vi.fn(), failure = new Error("admitted execution failed");
+			const borrow = async () => { enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (phase.endsWith("failed")) throw failure; };
+			const world: TestWorld = { id: "workspace", scope: "fallback", isolation: "workspace_branch", dispose,
+				speculation: { tools: ["custom_process"], capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+					prepare: async () => { if (probing && ["prepare", "diagnostics"].includes(phase)) await borrow(); },
+					execute: async ({ value }) => { await borrow(); return branch("workspace", value); } },
+				observation: { capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+					capture: async () => { await borrow(); return { seal: async (output) => branch("workspace", output), dispose: () => {} }; } },
+			};
+			const gateway = new ToolExecutionGateway([world]), preparation = { cwd: "/workspace" };
+			const operation = { tool: "custom_process", callID: "call", input: { any: "shape" } }, context = () => ({ value: "sealed" });
+			const requirement = { operation, effect: "workspace_mutation" as const, requirements: WORKSPACE_PATH_MUTATION_EFFECTS };
+			const route = (await gateway.resolve(requirement, preparation))!;
+			expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });
+			expect(await gateway.resolve({ operation, effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, preparation)).toBeUndefined();
+			probing = true;
+			const pending = phase.startsWith("actor") ? gateway.executeAuthoritative(operation, async () => { await borrow(); return "actor"; })
+				: phase.startsWith("fork") ? gateway.executeSpeculative(operation, route, context)
+				: phase === "capture" ? gateway.captureAuthoritativeResult(requirement, preparation, context)
+				: phase === "diagnostics" ? gateway.diagnostics({ ...preparation, refresh: true }) : gateway.resolve(requirement, preparation);
+			const outcome = Promise.allSettled([pending]); await entered;
+			const retirement = Promise.all([gateway.dispose(), gateway.dispose()]);
+			try {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(dispose, phase).not.toHaveBeenCalled();
+				await expect(gateway.executeAuthoritative(operation, async () => "late Actor")).rejects.toThrow("closed");
+				await expect(gateway.resolve(requirement, preparation)).rejects.toThrow("closed");
+				await expect(gateway.executeSpeculative(operation, route, context)).rejects.toThrow("closed");
+				await expect(gateway.captureAuthoritativeResult(requirement, preparation, context)).rejects.toThrow("closed");
+				await expect(gateway.diagnostics({ ...preparation, refresh: true })).rejects.toThrow("closed");
+			} finally { release(); await outcome; await retirement; }
+			expect((await outcome)[0]?.status).toBe(phase.endsWith("failed") ? "rejected" : "fulfilled");
+			expect(dispose).toHaveBeenCalledOnce();
+		}
 	});
 
 	it("settles each authoritative attempt once without replacing its executor or failure", async () => {

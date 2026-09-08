@@ -30,7 +30,12 @@ export class RuntimeLifecycleLane {
 		return this.closeTask;
 	}
 
-	/** Logical cancellation does not release the executor or resources still owned by its session. */
+	/** New borrowers require an open owner; tracked continuations may still drain after sealing. */
+	admit<Value>(operation: () => Promise<Value>): Promise<Value> {
+		if (this.sealedValue) return Promise.reject(new Error("execution lifetime is closed"));
+		return this.track(Promise.resolve().then(operation));
+	}
+
 	track<Value>(task: Promise<Value>): Promise<Value> {
 		this.work.add(task);
 		void task.finally(() => this.work.delete(task)).catch(() => {});
