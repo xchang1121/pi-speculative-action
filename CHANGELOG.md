@@ -253,6 +253,9 @@
 
 ### Fixed
 
+- Immutable publication takes cleanup ownership only after exclusive temporary-file creation. Partial
+  writes close their native handle and reclaim their temporary; creation collisions preserve the other
+  publisher's file, and existing-target deduplication is unchanged.
 - Failed store scans and GC removals drain every already-started sibling before propagating the
   original error. Successful operations keep their parallel path; no new queue or error wrapper is added.
 - Certificate publication waits for any due store maintenance it starts, so the existing admitted

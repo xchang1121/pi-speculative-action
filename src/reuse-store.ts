@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
 	type ArtifactReference,
@@ -427,17 +427,20 @@ async function filesUnder(root: string): Promise<readonly string[]> {
 async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
 	await mkdir(path.dirname(target), { recursive: true });
 	const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${randomUUID()}.tmp`);
-	await writeFile(temporary, bytes, { flag: "wx" });
-	let published = true;
+	// Exclusive creation grants cleanup ownership; an existing temporary belongs to another publisher.
+	const file = await open(temporary, "wx");
 	try {
-		await link(temporary, target);
-	} catch (error) {
-		if (!alreadyExists(error)) throw error;
-		published = false;
+		try { await writeFile(file, bytes); } finally { await file.close(); }
+		try {
+			await link(temporary, target);
+			return true;
+		} catch (error) {
+			if (!alreadyExists(error)) throw error;
+			return false;
+		}
 	} finally {
 		await rm(temporary, { force: true });
 	}
-	return published;
 }
 
 function digestHex(digest: Sha256Digest): string {

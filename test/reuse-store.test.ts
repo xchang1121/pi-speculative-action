@@ -152,9 +152,54 @@ describe("persistent provenance store", () => {
 		await expect(store.put(certificate)).rejects.toThrow("missing artifact");
 	});
 
-	it("independently leases a verified CAS closure and survives backing-file removal", async () => {
+	it.each(["partial_write", "temporary_collision", "link_failure"] as const)("owns failed publication cleanup and independently leases a retried CAS closure (%s)", async (phase) => {
 		const root = await temporaryRoot();
 		const cas = new ArtifactCAS(root);
+		const native = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const hex = sha256Digest("leased bytes").slice("sha256:".length);
+		const target = path.join(root, "sha256", hex.slice(0, 2), hex.slice(2));
+		const failure = Object.assign(new Error("publication IO failure"), { code: "EIO" });
+		let temporary: string | undefined, handle: filesystem.FileHandle | undefined;
+		const observeTemporary = async (value: unknown) => {
+			if (temporary || typeof value !== "string" || !value.endsWith(".tmp") || path.dirname(value) !== path.dirname(target)) return;
+			temporary = value;
+			if (phase === "temporary_collision") await native.writeFile(value, "other publisher", { flag: "wx" });
+		};
+		const opening = vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
+			await observeTemporary(args[0]);
+			const opened = await native.open(...args);
+			if (args[0] === temporary) { handle = opened; vi.spyOn(opened, "close"); }
+			return opened;
+		});
+		const writing = vi.spyOn(filesystem, "writeFile").mockImplementation(async (...args) => {
+			await observeTemporary(args[0]);
+			if (phase === "partial_write" && (args[0] === temporary || args[0] === handle)) {
+				await native.writeFile(args[0], "lea", args[2]);
+				expect(await native.readFile(temporary!, "utf8")).toBe("lea");
+				throw failure;
+			}
+			return native.writeFile(...args);
+		});
+		const linking = vi.spyOn(filesystem, "link").mockImplementation(async (...args) => {
+			if (phase === "link_failure" && args[0] === temporary) throw failure;
+			return native.link(...args);
+		});
+		const removal = vi.spyOn(filesystem, "rm").mockClear();
+		try {
+			const publication = cas.put("leased bytes");
+			if (phase === "temporary_collision") await expect(publication).rejects.toMatchObject({ code: "EEXIST" });
+			else await expect(publication).rejects.toBe(failure);
+			expect(temporary).toBeDefined();
+			if (handle) { expect(handle.close).toHaveBeenCalledOnce(); expect(handle.fd).toBe(-1); }
+			if (phase === "temporary_collision") {
+				expect(await native.readFile(temporary!, "utf8")).toBe("other publisher");
+				expect(removal.mock.calls.some(([value]) => value === temporary)).toBe(false);
+			} else await expect(native.stat(temporary!)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(native.stat(target)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			opening.mockRestore(); writing.mockRestore(); linking.mockRestore(); removal.mockRestore();
+			if (handle) { if (handle.fd !== -1) await handle.close(); vi.mocked(handle.close).mockRestore(); }
+		}
 		const reference = await cas.put("leased bytes");
 		expect(await cas.has(reference)).toBe(true);
 		expect((await cas.get(reference))?.toString("utf8")).toBe("leased bytes");
@@ -163,8 +208,7 @@ describe("persistent provenance store", () => {
 		expect(closure).toMatchObject({ artifacts: 1, bytes: reference.size });
 
 		expect(closure.read(reference).toString("utf8")).toBe("leased bytes");
-		const hex = reference.digest.slice("sha256:".length);
-		await unlink(path.join(root, "sha256", hex.slice(0, 2), hex.slice(2)));
+		await unlink(target);
 		expect(closure.read(reference).toString("utf8")).toBe("leased bytes");
 		expect(await cas.load([reference])).toBeUndefined();
 	});
