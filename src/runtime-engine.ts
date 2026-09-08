@@ -1530,8 +1530,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		startQueuedCandidates(session);
 	};
 
-	const launchNode = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
-		if (!node.actionKey || node.predictionState.status === "settled") {
+	const launchNode = (session: Session, node: PlanRuntimeNode): Promise<void> => session.lifecycle.track(Promise.resolve().then(async () => {
+		let current = session.plan.get(node.proposalID, node.action.id);
+		if (session.lifecycle.sealed || current?.identity.id !== node.identity.id || current.predictionState.status === "settled") return;
+		if (!node.actionKey) {
 			session.plan.defer(node.proposalID, node.action.id);
 			return;
 		}
@@ -1560,13 +1562,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			return;
 		}
 		const reusable = await reusableForPrediction(session, node.actionKey, route, parent);
+		current = session.plan.get(node.proposalID, node.action.id);
+		if (session.lifecycle.sealed || current?.identity.id !== node.identity.id || current.predictionState.status === "settled") return;
 		if (reusable) {
 			attachNode(session, node, reusable);
-			return;
-		}
-		const concrete = asConcreteInput(node.action.input);
-		if (!concrete) {
-			failUnlaunchable(session, node, cause("admission", "invalid_input"));
 			return;
 		}
 		const scheduled = session.scheduler.evaluate([
@@ -1607,7 +1606,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work);
 		startQueuedCandidates(session);
-	};
+	}));
 
 	const attachNode = (session: Session, node: PlanRuntimeNode, candidate: Candidate): void => {
 		if (!session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work)) return;
@@ -2710,7 +2709,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				}
 				if (validation.status === "indeterminate") continue;
 			}
-			return candidate;
+			if (runtimeState.candidates.find(session.id, candidate.id) === candidate) return candidate;
 		}
 		return undefined;
 	};

@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Prediction launch work is registered before lookup and validation callbacks. It rechecks current
+  plan identity before and after asynchronous reuse validation, and only attaches a result still owned
+  by the candidate registry. Shutdown, supersession and cache retirement cannot revive stale launches
+  or attach an old execution to a replacement node; full disposal drains outstanding launch work.
 - Independent proposal batches share the existing per-plan admission lanes without a serial batch
   barrier; revisions of one plan remain ordered. Ready actions can execute while a sibling's binding
   or permission check is pending. Batch and materialization joins retain all admitted promises through

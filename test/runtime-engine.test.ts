@@ -403,43 +403,81 @@ describe("structural speculative runtime", () => {
 		});
 	});
 
-	it("keeps a fresh exact generation reachable when an older version is indeterminate", async () => {
-		let captures = 0;
-		let runs = 0;
-		const generationStarted = [barrier(), barrier()];
+	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
+		const ready = candidateSucceeded(), refreshed = candidateSucceeded(2);
+		const validating = barrier(), validationGate = barrier(), binding = barrier(), bindingGate = barrier();
+		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
+		const executed: string[] = [];
+		let configured = settings;
+		const refreshes = mode === "refresh" || mode === "replaced" || mode === "evicted";
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: ({ startInput }) => plan("source", startInput.turnID, { path: "README.md" }),
+			propose: ({ startInput }) => startInput.turnID === "turn-3" ? undefined : plan("source", startInput.turnID, { path: "README.md" }),
+			observe: ({ concrete }) => mode === "replaced" && concrete.path === "replace.ts"
+				? { proposalID: "turn-2", source: "source", revision: 1,
+					upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }] } : undefined,
 		};
 		const fixture = harness({
 			source,
-			capture: () => ({ version: ++captures }),
-			validate: (version) =>
-				(version as { version: number }).version === 1
-					? {
-							status: "indeterminate",
-							cause: cause("freshness", "validation_failed"),
-							metrics: zeroValidationMetrics(),
-						}
-					: { status: "valid", metrics: zeroValidationMetrics() },
-			execute: () => {
-				generationStarted[runs]!.arrive();
-				return `generation:${++runs}`;
+			settings: () => configured,
+			actionKey: async (tool, args, context) => {
+				if (context.type === "start" && (args as { path: string }).path === "replacement.ts") { binding.arrive(); await bindingGate.promise; }
+				return buildPiActionKey(tool, args, "/workspace");
 			},
+			execute: (tool, concrete) => {
+				const generation = executed.push(String(concrete.path));
+				const branch = world(`generation:${generation}`, {
+					executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint,
+					validate: async () => {
+						if (generation === 1) { validating.arrive(); await validationGate.promise; }
+						return generation === 1 && mode !== "replaced" && mode !== "evicted"
+							? { status: "indeterminate", cause: cause("freshness", "validation_failed"), metrics: zeroValidationMetrics() }
+							: { status: "valid", metrics: zeroValidationMetrics() };
+					}, onDispose: cleanup,
+				});
+				return mode === "unwrapped" ? branch : coordinator.execute(coordinator.begin({ tool, route: RESOURCE_ROUTE }), async () => branch);
+			},
+			onEvent: (event) => { ready.observe(event); refreshed.observe(event); },
 		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
-		await generationStarted[0]!.promise;
-		const unrelated = call("turn-1", { path: "other.ts" });
-		expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
-		await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "actor" });
-		await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
-		await generationStarted[1]!.promise;
-		expect(await fixture.runtime.consume(call("turn-2"))).toBe("generation:2");
-		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
+		let closing: Promise<void> | undefined, closed = false;
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" }); await ready.promise;
+			const unrelated = call("turn-1", { path: "other.ts" });
+			expect(await fixture.runtime.consume(unrelated)).toBeUndefined();
+			await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "actor" });
+			await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" }); await validating.promise;
+			if (mode === "replaced") {
+				const replacement = call("turn-2", { path: "replace.ts" });
+				expect(await fixture.runtime.consume(replacement)).toBeUndefined();
+				await fixture.runtime.actual({ ...replacement, durationMs: 1, output: "actor" }); await binding.promise;
+			} else if (mode === "evicted") {
+				await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: false });
+				configured = { ...settings, resourceCacheMaxBytes: 1 };
+				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
+				expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
+			} else if (mode !== "refresh") {
+				closing = (mode === "disposed" || mode === "unwrapped" ? fixture.runtime.dispose() : mode === "disabled"
+					? fixture.runtime.settingsChanged({ ...settings, enabled: false })
+					: fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true })).then(() => { closed = true; });
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				if (mode !== "terminal") expect(closed).toBe(false);
+			}
+			validationGate.arrive(); await new Promise<void>((resolve) => setImmediate(resolve));
+			bindingGate.arrive(); await closing; await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(executed).toEqual(["README.md", ...(refreshes ? [mode === "replaced" ? "replacement.ts" : "README.md"] : [])]);
+			if (refreshes) {
+				await refreshed.promise;
+				if (mode === "replaced") {
+					await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: false });
+					await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
+				}
+				expect(await fixture.runtime.consume(call(mode === "refresh" ? "turn-2" : "turn-3",
+					{ path: mode === "replaced" ? "replacement.ts" : "README.md" }))).toBe("generation:2");
+			}
+		} finally { validationGate.arrive(); bindingGate.arrive(); await closing; await fixture.runtime.dispose(); }
+		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 
 	it.each(["prediction", "continuation", "running", "sealed", "capture", "promotion", "sealing"] as const)("drains %s work before retiring its session", async (phase) => {
