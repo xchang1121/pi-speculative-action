@@ -287,13 +287,13 @@ async function projectOutput<Output, StartInput, StateData>(
 	if (!reconstruct && (!coverage || !rule.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		const projected = reconstruct ? await reconstruct(request) : await rule.projectOutput!({
+		const projected = reconstruct ? await reconstruct(request) : cloneSharedData(await rule.projectOutput!({
 			speculative: candidate.key,
 			actor,
 			output,
 			coverage: cloneSharedData(coverage!.value),
 			keyMatch: match,
-		});
+		}));
 		const durationMs = Math.max(0, performance.now() - startedAt);
 		return projected === undefined
 			? { ok: false, cause: cause("projection", "view_not_covered") }

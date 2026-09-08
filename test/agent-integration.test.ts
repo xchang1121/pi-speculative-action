@@ -12,7 +12,7 @@ import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
-import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
+import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
@@ -234,6 +234,75 @@ describe("speculative action host", () => {
 		}
 	});
 
+	it.each(["validation", "reader", "opaque", "closing"])("owns an output-only projection through %s and Actor settlement", async (phase) => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		const args = { path: "notes.txt", offset: 2, limit: 1 };
+		const expected = await tool.execute("control", args);
+		const ready = deferred<void>(), entered = deferred<void>(), release = deferred<void>();
+		const worldDisposed = vi.fn(), committed = vi.fn();
+		const actor = vi.fn(() => tool.execute("actor", args));
+		const events: SpeculativeActionEvent<string>[] = [];
+		let offered: ToolSettlement | undefined;
+		const rule = { ...PI_READ_RANGE_PROJECTION_RULE, projectOutput: async (input: Parameters<typeof PI_READ_RANGE_PROJECTION_RULE.projectOutput>[0]) => {
+			offered ??= PI_READ_RANGE_PROJECTION_RULE.projectOutput(input);
+			if (phase === "opaque" && offered) Object.setPrototypeOf(offered, { opaque: true });
+			entered.resolve();
+			if (phase === "closing") await release.promise;
+			return offered;
+		} };
+		const base = mockRuntimeWorld(async (context) => {
+			await new Promise<void>((resolve) => setTimeout(resolve, 5)); // Measured reusable work, not forced admission.
+			return { result: withPiProjectionCoverage("read", context.args,
+				await tool.execute(context.callID, context.args as never, context.signal)), isError: false };
+		}, worldDisposed);
+		const world = { ...base, speculation: { ...base.speculation, execute: async (context: Parameters<typeof base.speculation.execute>[0]) => {
+			const branch = await base.speculation.execute(context);
+			return { ...branch, validate: async () => {
+				if (phase === "validation" && offered) offered.result.content.push({ type: "text", text: "provider edit after projection" });
+				return branch.validate!();
+			}, commit: async () => { committed(); return branch.commit(); } };
+		} } };
+		const host = createSpeculativeActionHost("session", {
+			cwd, getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), draftModel: model("draft"),
+			complete: async () => drafterCall({ path: "notes.txt" }), preflight: () => true,
+			projectionRules: [rule], executionWorlds: [world],
+			onEvent: (event) => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+		});
+		try {
+			await host.startTurn(startInput(tool));
+			await ready.promise;
+			const call = { turnID: "turn-1", id: "projected", tool: "read", args, tools: [tool] };
+			const delivered = host.execute(call, undefined, actor);
+			if (phase === "closing") {
+				await entered.promise;
+				const closed = host.dispose();
+				try {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					expect(worldDisposed).not.toHaveBeenCalled();
+				} finally { release.resolve(); await closed; }
+			}
+			const first = await delivered;
+			expect(first.content).toEqual(expected.content);
+			if (phase === "reader") {
+				first.content.push({ type: "text", text: "Actor edit" });
+				const second = await host.execute({ ...call, id: "another-reader" }, undefined, actor);
+				expect(second.content).toEqual(expected.content);
+			}
+			const fallback = phase === "opaque" || phase === "closing";
+			expect(actor).toHaveBeenCalledTimes(fallback ? 1 : 0);
+			expect(committed).toHaveBeenCalledTimes(fallback ? 0 : 1);
+			if (!fallback) {
+				expect(rule.captureCoverage(PI_ACTION_SEMANTICS.buildKey("read", args, cwd)!, { result: first, isError: false }))
+					.toMatchObject({ startLine: 2, endLineExclusive: 3, totalLines: 4 });
+				await waitFor(() => events.some((event) => event.type === "actor_action"));
+				expect(events.find((event) => event.type === "actor_action")).toMatchObject({ settlement: {
+					provider: { kind: "speculative", match: { kind: "projected", projector: "read.range" } },
+				} });
+			}
+		} finally { release.resolve(); await host.dispose(); }
+		expect(worldDisposed).toHaveBeenCalledOnce();
+	});
+
 	it.each([false, true])("only promotes proven host observations, independently of prediction (ThinkThread=%s)", async (thinkthread) => {
 		const cwd = await temporaryWorkspace(path.join(process.cwd(), "bench")), file = path.join(cwd, "notes.txt");
 		let tools: string[] = [];
@@ -254,7 +323,7 @@ describe("speculative action host", () => {
 		let args = { path: "@notes.txt", offset: 1 };
 		const actor = vi.fn(async () => {
 			if (unstable) await writeFile(file, "B\nsecond");
-			const output = await tool.execute("read", args);
+			const output = withPiProjectionCoverage("read", args, await tool.execute("read", args));
 			if (unstable) await writeFile(file, "A\nsecond");
 			return output;
 		});

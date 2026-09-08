@@ -26,9 +26,10 @@
   Revalidation waits an already-reserved commit; commit telemetry remains available after settlement.
 - Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused
   `alias` forwarding method was removed. Link metadata grants no authority to read the target.
-- Shared transactions now own a sealed plain-data result and give each reader/adoption a separate copy.
-  Opaque prototypes, accessors, symbols and hidden fields are not shareable; failed sealing retires the
-  branch without freezing or rewriting the Actor result. Only exclusive commits may update the settlement.
+- Shared transactions now own a sealed data result and give each reader/adoption a separate copy.
+  Enumerable Symbol data keys survive copying. Opaque prototypes, proxies, accessors, Symbol values
+  and hidden fields are not shareable; failed sealing retires the branch without freezing or rewriting
+  the Actor result. Only exclusive commits may update the settlement.
 - Gateway world calls now take their already-bound execution context directly; removed the unused
   `ToolExecutionContextFactory` callback boundary and redundant capture/descriptor forwarding.
 - Scheduler preemption now requests cancellation without releasing capacity. Executors return their
@@ -248,6 +249,10 @@
 
 ### Fixed
 
+- Shared sealing and every borrower now preserve enumerable Symbol-keyed data, including Pi read
+  coverage, without dropping metadata or rejecting an otherwise reusable production result.
+  Output-only projection results are owned before revalidation and commit, so provider or Actor edits
+  cannot rewrite another adoption. Opaque projected views decline reuse and retain exactly-once fallback.
 - Candidate retirement removes the exact and projection memberships captured at insertion, without
   recalling partial provider functions. Lookup and reuse predicates reject retired registrations,
   including delete/reinsert of the same entry; reentrant insertion resolves the current scope.

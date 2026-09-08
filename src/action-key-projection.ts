@@ -14,6 +14,7 @@ export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 	readonly coveringAction?: (predicted: ActionKey) => ActionKey | undefined;
 	/** Opaque or otherwise unshareable proof declines output projection, not sealed-input reconstruction. */
 	readonly captureCoverage?: (action: ActionKey, output: Output) => unknown | undefined;
+	/** The returned data view is owned before revalidation/commit, separately for every Actor. */
 	readonly projectOutput?: (input: {
 		readonly speculative: ActionKey;
 		readonly actor: ActionKey;

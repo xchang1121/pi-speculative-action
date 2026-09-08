@@ -209,7 +209,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		...sealed, transactionID: attempt.id,
 		get state() { return attempt.stateValue; },
 		get latestValidation() { return validation; },
-		get output() { return shared ? structuredClone(sealed.output) : sealed.output; },
+		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
 		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
 		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
@@ -239,7 +239,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		},
 		commit: async () => {
 			// An admitted effect keeps its original settlement, including during/after retirement.
-			if (commitPromise) return shared ? structuredClone(await commitPromise) : commitPromise;
+			if (commitPromise) return shared ? cloneSharedData(await commitPromise) : commitPromise;
 			if (cleanupPromise) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
 			if (!validationPromise && validation?.status !== "valid") {
 				throw new Error(`effect transaction ${attempt.id} requires successful validation before commit`);
@@ -261,7 +261,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 					throw failure;
 				}
 			})();
-			return shared ? structuredClone(await commitPromise) : commitPromise;
+			return shared ? cloneSharedData(await commitPromise) : commitPromise;
 		},
 		abort, dispose: abort,
 	});

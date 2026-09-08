@@ -135,9 +135,18 @@ describe("EffectTransactionCoordinator", () => {
 
 	it("owns sealed data and operation slots without changing opaque backend or Actor owners", async () => {
 		const getter = vi.fn(() => "not data"), opaque = Object.create({ method() {} });
-		for (const captured of [false, true]) for (const details of [{ value: ["sealed"] }, opaque, new Date(), Buffer.from("raw"),
-			{ method() {} }, { [Symbol("hidden")]: 1 }, Object.defineProperty({}, "hidden", { value: 1 }), { get value() { return getter(); } }]) {
-			const output = { content: ["sealed"], details }, expected = { content: ["sealed"], details: { value: ["sealed"] } };
+		const metadataKey = Symbol("evidence");
+		const data = () => {
+			const value = ["sealed"], sparse = new Array<unknown>(3);
+			const details = { value, [metadataKey]: value, sparse, ["__proto__"]: { literal: true } };
+			sparse[1] = details;
+			return details;
+		};
+		for (const captured of [false, true]) for (const details of [data(), opaque, new Date(), Buffer.from("raw"), new Proxy({ payload: 1 }, {}),
+			{ method() {} }, { value: Symbol("opaque") }, { [metadataKey]: opaque },
+			Object.defineProperty({}, metadataKey, { value: 1 }), Object.defineProperty({}, metadataKey, { get: getter, enumerable: true }),
+			Object.defineProperty({}, "hidden", { value: 1 }), { get value() { return getter(); } }]) {
+			const output = { content: ["sealed"], details }, expected = { content: ["sealed"], details: data() };
 			const shareable = "value" in details && Array.isArray(Object.getOwnPropertyDescriptor(details, "value")?.value);
 			const coordinator = new EffectTransactionCoordinator<typeof output>();
 			const attempt = coordinator.begin({ tool: "custom", route: { ...route, reuse: "shared_result" } });
@@ -169,7 +178,12 @@ describe("EffectTransactionCoordinator", () => {
 			for (const [owner, key] of [[transaction, "commit"], [transaction.resources, "0"], [transaction.executionMetrics, "setupMs"],
 				[transaction.compatibility, "status"]] as const) expect(Reflect.set(owner, key, "changed")).toBe(false);
 			output.content.push("provider edit"); (details as { value: string[] }).value.push("provider edit");
-			transaction.output.content.push("reader edit");
+			const borrowed = transaction.output;
+			expect(borrowed.details[metadataKey]).toBe(borrowed.details.value);
+			expect(borrowed.details.sparse[1]).toBe(borrowed.details);
+			expect(0 in borrowed.details.sparse).toBe(false);
+			expect(Object.getPrototypeOf(borrowed.details)).toBe(Object.prototype);
+			borrowed.content.push("reader edit"); borrowed.details[metadataKey].push("reader edit");
 			expect(transaction.output).toEqual(expected);
 			await transaction.validate!();
 			expect(await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,

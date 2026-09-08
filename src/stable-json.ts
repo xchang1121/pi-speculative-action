@@ -1,3 +1,5 @@
+import { types } from "node:util";
+
 /** JSON.stringify with recursively stable object keys and no intermediate object tree. */
 export function stableStringify(value: unknown): string {
 	return serialize(value) as string;
@@ -23,25 +25,29 @@ export function immutableSnapshot<Value>(value: Value): Value {
 	return owned;
 }
 
-/** Own shareable data without silently flattening opaque prototypes, accessors or hidden fields. */
+/** Own every enumerable data key, including symbols, without flattening opaque objects or invoking accessors. */
 export function cloneSharedData<Value>(value: Value): Value {
-	const seen = new WeakSet<object>();
-	const validate = (item: unknown): void => {
+	const seen = new WeakMap<object, object>();
+	const copy = (item: unknown): unknown => {
 		if (typeof item === "function" || typeof item === "symbol") throw new Error("shared_output_not_data");
-		if (!isObject(item) || seen.has(item)) return;
-		seen.add(item);
+		if (!isObject(item)) return item;
+		if (types.isProxy(item)) throw new Error("shared_output_not_data");
+		if (seen.has(item)) return seen.get(item);
 		const array = Array.isArray(item);
 		if (Object.getPrototypeOf(item) !== (array ? Array.prototype : Object.prototype)) throw new Error("shared_output_not_data");
+		const owned = array ? new Array(item.length) : {};
+		seen.set(item, owned);
 		for (const key of Reflect.ownKeys(item)) {
 			const property = Object.getOwnPropertyDescriptor(item, key)!;
-			if (typeof key === "symbol" || !("value" in property) || (!property.enumerable && !(array && key === "length"))) {
+			if (!("value" in property) || (!property.enumerable && !(array && key === "length"))) {
 				throw new Error("shared_output_not_data");
 			}
-			validate(property.value);
+			if (array && key === "length") continue;
+			Object.defineProperty(owned, key, { value: copy(property.value), enumerable: true, writable: true, configurable: true });
 		}
+		return owned;
 	};
-	validate(value);
-	return structuredClone(value);
+	return copy(value) as Value;
 }
 
 function equalObject(left: object, right: object): boolean {
