@@ -253,6 +253,9 @@
 
 ### Fixed
 
+- Certificate sealing hashes its captured, validated records directly, avoiding a second prototype
+  and dependency normalization. Raw key APIs and persisted parsing still validate evidence; the v7
+  hash format and replay eligibility rules are unchanged.
 - Immutable publication takes cleanup ownership only after exclusive temporary-file creation. Partial
   writes close their native handle and reclaim their temporary; creation collisions preserve the other
   publisher's file, and existing-target deduplication is unchanged.

@@ -1,13 +1,14 @@
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import {
 	createExecPrototype,
 	dependencyPathsetKey,
 	type DynamicDependency,
 	parseProcessCertificate,
+	processStrongKey,
 	processWeakKey,
 	type ProvenanceTaint,
 	sealProcessCertificate,
@@ -162,24 +163,59 @@ describe("process provenance certificates", () => {
 		expect(JSON.stringify(first)).not.toContain("--compile");
 		expect(first).not.toHaveProperty("argv");
 		expect(Object.isFrozen(first.environment)).toBe(true);
+		for (const patch of [
+			{ environmentComplete: false }, { fileDescriptorTableComplete: false }, { umask: -1 },
+			{ executableDigest: "invalid" }, { environment: [...first.environment, first.environment[0]] },
+			{ stdin: undefined }, { stdin: { type: "bytes", digest: "invalid", eof: true } },
+			{ inheritedFDs: [{ fd: 3, type: "regular", flagsDigest: "invalid" }] },
+		]) {
+			const malformed = Object.freeze({ ...first, ...patch }) as never;
+			expect(() => processWeakKey(malformed)).toThrow();
+			expect(() => sealProcessCertificate({ prototype: malformed, producer: PRODUCER,
+				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+				result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
+			})).toThrow();
+		}
 	});
 
-	it.each([["a", "b"], ["e\u0301", "\u00e9"]])("owns an exact dependency set independently of capture order (%s, %s)", (left, right) => {
-		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries") };
+	it.each([
+		["a", "b", "sha256:f89e6e11beed7ddb8bc4c8a7a0bb8e5fe192215f54c0e85a6d2073a9245d8e1b"],
+		["e\u0301", "\u00e9", "sha256:d0cb9f31cc7f472b0fc83c7e892a03a0685dae8cb85bfd8d35ec5f72d5f83f1e"],
+	] as const)("owns an exact dependency set independently of capture order (%s, %s)", (left, right, id) => {
+		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };
+		const semantic = prototype({ [right]: "second", [left]: "first", MODE: "build" });
 		const seal = (dependencies: DynamicDependency[]) => sealProcessCertificate({
-			prototype: prototype(), producer: PRODUCER,
+			prototype: semantic, producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies, taints: [] },
 			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } }, createdAt: 123,
 		});
-		const first = seal([a, b, a]), second = seal([b, a]);
+		let first!: ReturnType<typeof seal>, frozenValues: unknown[] = [];
+		const freezing = vi.spyOn(Object, "freeze");
+		try { first = seal([a, b, a]); frozenValues = freezing.mock.calls.map(([value]) => value); } finally { freezing.mockRestore(); }
+		expect({
+			prototypeCopies: frozenValues.filter((value) => value && typeof value === "object" && "argvDigest" in value).length,
+			exclusionCopies: frozenValues.filter((value) => Array.isArray(value) && value[0] === ".git" && value[1] === ".pi").length,
+		}).toEqual({ prototypeCopies: 1, exclusionCopies: 3 });
+		const second = seal([b, a]);
+		expect(first.id).toBe(id); // Golden v7 identities from the pre-refactor implementation.
 		expect(dependencyPathsetKey(first.dependencyCertificate)).toBe(dependencyPathsetKey(second.dependencyCertificate));
 		expect(first).toEqual(second);
+		expect(first.weakKey).toBe(processWeakKey(semantic));
+		expect(first.strongKey).toBe(processStrongKey(first.weakKey, { complete: true, dependencies: [b, a], taints: [] }));
 		expect(parseProcessCertificate(first)).toEqual(first);
-		expect(first.dependencyCertificate.dependencies).toEqual([a, b]);
+		expect(first.dependencyCertificate.dependencies).toEqual([a, b].map((dependency) => ({ ...dependency, parentExcludedEntries: [".git", ".pi"] })));
+		expect(a.parentExcludedEntries).toEqual([".pi", ".git", ".pi"]);
 		expect(first.dependencyCertificate.dependencies[0]).not.toBe(a);
 		expect(Object.isFrozen(first.dependencyCertificate.dependencies[0])).toBe(true);
 		expect(() => seal([a, b, { ...a, parentEntriesDigest: sha256Digest("changed") }])).toThrow("conflicting dependency evidence");
+		for (const parentExcludedEntries of [".git", [".git", ".."], [".git", undefined]]) {
+			const dependencies = [{ ...a, parentExcludedEntries }] as DynamicDependency[];
+			const invalid = { complete: true, dependencies, taints: [] };
+			expect(() => seal(dependencies)).toThrow("invalid negative dependency");
+			expect(() => processStrongKey(first.weakKey, invalid)).toThrow("invalid negative dependency");
+			expect(() => dependencyPathsetKey(invalid)).toThrow("invalid negative dependency");
+		}
 	});
 
 	it("keeps producer authority out of semantic keys but inside certificate identity", () => {

@@ -283,10 +283,16 @@ export function sealProcessCertificate(input: {
 }): ProcessProvenanceCertificate {
 	const prototype = normalizePrototype(input.prototype);
 	const producer = normalizeProducerProof(input.producer);
-	const dependencyCertificate = normalizeDependencyCertificate(input.dependencyCertificate);
+	const evidence = input.dependencyCertificate;
+	const dependencyCertificate: DynamicDependencyCertificate = deepFreeze({
+		complete: evidence.complete === true,
+		dependencies: normalizeDependencies(evidence.dependencies),
+		taints: [...new Set(evidence.taints)].sort(),
+	});
 	const result = normalizeResult(input.result);
-	const weakKey = processWeakKey(prototype);
-	const strongKey = processStrongKey(weakKey, dependencyCertificate);
+	// These records are already captured and validated; public key functions still normalize raw callers.
+	const weakKey = digestObject({ version: PROCESS_CERTIFICATE_VERSION, prototype });
+	const strongKey = digestObject({ weakKey, dependencies: dependencyCertificate.dependencies });
 	const createdAt = finiteTimestamp(input.createdAt ?? Date.now());
 	const body = {
 		version: PROCESS_CERTIFICATE_VERSION,
@@ -416,42 +422,40 @@ export function isSha256Digest(value: unknown): value is Sha256Digest {
 	return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
 }
 
-function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
-	if (!prototype.environmentComplete) throw new Error("process prototype requires a complete environment");
-	if (!prototype.fileDescriptorTableComplete) throw new Error("process prototype requires a complete descriptor table");
-	if (
-		!validLogicalPath(prototype.executablePath) ||
-		!validLogicalPath(prototype.logicalCwd) ||
-		!prototype.platformFingerprint
-	) {
+function normalizePrototype(input: ExecPrototype): ExecPrototype {
+	const {
+		executablePath, executableDigest, argvDigest, logicalCwd, platformFingerprint, umask, processContextDigest,
+		environmentComplete, fileDescriptorTableComplete, environment: rawEnvironment, inheritedFDs: rawDescriptors, stdin: rawStdin,
+	} = input;
+	const stdin = { ...rawStdin };
+	if (!environmentComplete) throw new Error("process prototype requires a complete environment");
+	if (!fileDescriptorTableComplete) throw new Error("process prototype requires a complete descriptor table");
+	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || !platformFingerprint) {
 		throw new Error("process prototype identity is incomplete");
 	}
-	if (!Number.isSafeInteger(prototype.umask) || prototype.umask < 0 || prototype.umask > 0o777) {
+	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) {
 		throw new Error("process prototype umask is invalid");
 	}
-	for (const digest of [
-		prototype.executableDigest,
-		prototype.argvDigest,
-		prototype.processContextDigest,
-	]) {
+	for (const digest of [executableDigest, argvDigest, processContextDigest]) {
 		if (!isSha256Digest(digest)) throw new Error("process prototype contains an invalid digest");
 	}
 	const environmentNames = new Set<string>();
-	const environment = [...prototype.environment]
+	const environment = [...rawEnvironment]
 		.map((entry) => {
-			if (!entry.name || entry.name.includes("=") || entry.name.includes("\0") || (entry.present && !isSha256Digest(entry.valueDigest))) {
+			const { name, present } = entry;
+			const valueDigest = present ? entry.valueDigest : undefined;
+			if (!name || name.includes("=") || name.includes("\0") || (present && !isSha256Digest(valueDigest))) {
 				throw new Error("process prototype environment is incomplete");
 			}
-			if (environmentNames.has(entry.name)) throw new Error(`duplicate semantic environment entry ${entry.name}`);
-			environmentNames.add(entry.name);
-			return entry.present
-				? { name: entry.name, present: true as const, valueDigest: entry.valueDigest! }
-				: { name: entry.name, present: false as const };
+			if (environmentNames.has(name)) throw new Error(`duplicate semantic environment entry ${name}`);
+			environmentNames.add(name);
+			return present ? { name, present: true as const, valueDigest: valueDigest! } : { name, present: false as const };
 		})
 		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
 	const descriptors = new Set<number>();
-	const inheritedFDs = [...prototype.inheritedFDs]
-		.map((fd) => {
+	const inheritedFDs = [...rawDescriptors]
+		.map((source) => {
+			const fd = { ...source };
 			if (!Number.isSafeInteger(fd.fd) || fd.fd < 0 || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
 				throw new Error("process prototype descriptor table is invalid");
 			}
@@ -459,28 +463,29 @@ function normalizePrototype(prototype: ExecPrototype): ExecPrototype {
 			for (const digest of [fd.endpointDigest, fd.contentDigest]) {
 				if (digest !== undefined && !isSha256Digest(digest)) throw new Error("process descriptor digest is invalid");
 			}
-			return { ...fd };
+			return fd;
 		})
 		.sort((left, right) => left.fd - right.fd);
 	if (
-		(prototype.stdin.type === "bytes" && !isSha256Digest(prototype.stdin.digest)) ||
-		(prototype.stdin.digest !== undefined && !isSha256Digest(prototype.stdin.digest))
+		!rawStdin ||
+		(stdin.type === "bytes" && !isSha256Digest(stdin.digest)) ||
+		(stdin.digest !== undefined && !isSha256Digest(stdin.digest))
 	) {
 		throw new Error("process stdin identity is invalid");
 	}
 	return deepFreeze({
-		executablePath: prototype.executablePath,
-		executableDigest: prototype.executableDigest,
-		argvDigest: prototype.argvDigest,
-		logicalCwd: prototype.logicalCwd,
+		executablePath,
+		executableDigest,
+		argvDigest,
+		logicalCwd,
 		environment,
 		environmentComplete: true,
-		umask: prototype.umask,
-		processContextDigest: prototype.processContextDigest,
-		stdin: { ...prototype.stdin },
+		umask,
+		processContextDigest,
+		stdin,
 		fileDescriptorTableComplete: true,
 		inheritedFDs,
-		platformFingerprint: prototype.platformFingerprint,
+		platformFingerprint,
 	});
 }
 
@@ -515,25 +520,17 @@ function validProvider(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && !value.includes("\0");
 }
 
-function normalizeDependencyCertificate(certificate: DynamicDependencyCertificate): DynamicDependencyCertificate {
-	return deepFreeze({
-		complete: certificate.complete === true,
-		dependencies: normalizeDependencies(certificate.dependencies),
-		taints: [...new Set(certificate.taints)].sort(),
-	});
-}
-
 function normalizeDependencies(dependencies: readonly DynamicDependency[]): DynamicDependency[] {
 	const seen = new Map<string, DynamicDependency>();
 	for (const source of dependencies) {
-		validateDependency(source);
 		const dependency = { ...source };
-		if (dependency.kind === "directory" && dependency.excludedEntries) {
+		if (dependency.kind === "directory" && Array.isArray(dependency.excludedEntries)) {
 			dependency.excludedEntries = Object.freeze([...new Set(dependency.excludedEntries)].sort());
 		}
-		if (dependency.kind === "absence" && dependency.parentExcludedEntries) {
+		if (dependency.kind === "absence" && Array.isArray(dependency.parentExcludedEntries)) {
 			dependency.parentExcludedEntries = Object.freeze([...new Set(dependency.parentExcludedEntries)].sort());
 		}
+		validateDependency(dependency);
 		const identity = dynamicDependencyIdentity(dependency);
 		const existing = seen.get(identity);
 		if (existing !== undefined && !stableEqual(existing, dependency)) throw new Error(`conflicting dependency evidence for ${identity}`);
