@@ -33,6 +33,8 @@ export interface SelfSpeculationSettingsInput {
 	readonly timeoutMs?: number;
 	readonly maxCandidates?: number;
 	readonly maxDraftTokens?: number;
+	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
+	readonly actorProfile?: string;
 	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
 	readonly draftFormat?: string;
 	/** Exact target-model boundary preceding a boundary-relative action draft. */
@@ -69,6 +71,7 @@ export interface SelfSpeculationSettings {
 	readonly timeoutMs: number;
 	readonly maxCandidates: number;
 	readonly maxDraftTokens: number;
+	readonly actorProfile: string;
 	readonly draftFormat: string;
 	readonly draftBoundary: string;
 	readonly apiKeyEnv?: string;
@@ -99,7 +102,8 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	timeoutMs: 2_000,
 	maxCandidates: 8,
 	maxDraftTokens: 28,
-	draftFormat: "tagged_json",
+	actorProfile: "auto",
+	draftFormat: "auto",
 	draftBoundary: "auto",
 	forkEnabled: true,
 	forkActionEnabled: true,
@@ -140,6 +144,7 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 		timeoutMs: positiveInteger(input.timeoutMs, SELF_SPECULATION_DEFAULTS.timeoutMs),
 		maxCandidates: positiveInteger(input.maxCandidates, SELF_SPECULATION_DEFAULTS.maxCandidates),
 		maxDraftTokens: positiveInteger(input.maxDraftTokens, SELF_SPECULATION_DEFAULTS.maxDraftTokens),
+		actorProfile: nonEmptyString(input.actorProfile) ?? SELF_SPECULATION_DEFAULTS.actorProfile,
 		draftFormat: nonEmptyString(input.draftFormat) ?? SELF_SPECULATION_DEFAULTS.draftFormat,
 		draftBoundary: nonEmptyString(input.draftBoundary) ?? SELF_SPECULATION_DEFAULTS.draftBoundary,
 		...(apiKeyEnv ? { apiKeyEnv } : {}),
@@ -175,6 +180,8 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 
 export interface SelfSpeculationCoordinatorSnapshot {
 	readonly actorRequestID?: string;
+	readonly resolvedActorProfile?: string;
+	readonly profileResolutionSource?: string;
 	readonly bufferedCandidates: number;
 	readonly candidateSubmissions: number;
 	readonly forkRequests: number;
@@ -355,6 +362,8 @@ export class SelfSpeculationCoordinator {
 	private latestGateKey?: string;
 	private failureCount = 0;
 	private lastFailure?: string;
+	private lastResolvedActorProfile?: string;
+	private lastProfileResolutionSource?: string;
 
 	constructor(options: SelfSpeculationCoordinatorOptions) {
 		this.settings = options.settings;
@@ -669,6 +678,12 @@ export class SelfSpeculationCoordinator {
 		const actionEvidence = this.actionEvidence.snapshot();
 		return {
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
+			...(this.lastResolvedActorProfile
+				? { resolvedActorProfile: this.lastResolvedActorProfile }
+				: {}),
+			...(this.lastProfileResolutionSource
+				? { profileResolutionSource: this.lastProfileResolutionSource }
+				: {}),
 			bufferedCandidates:
 				(this.active?.candidates.size ?? 0) +
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
@@ -798,7 +813,8 @@ export class SelfSpeculationCoordinator {
 					request_id: state.requestID,
 					model: modelPayload(state.model),
 					max_draft_tokens: settings.maxDraftTokens,
-					format: settings.draftFormat,
+					actor_profile: settings.actorProfile,
+					...(settings.draftFormat === "auto" ? {} : { format: settings.draftFormat }),
 					...(settings.draftBoundary === "auto" ? {} : { boundary: settings.draftBoundary }),
 					candidates: candidates.map((candidate) =>
 						candidatePayload(candidate, this.candidateCalibration(state, candidate)),
@@ -842,6 +858,12 @@ export class SelfSpeculationCoordinator {
 		for (const rawCandidate of array(bundle?.candidates)) {
 			const candidate = record(rawCandidate);
 			if (!candidate) continue;
+			const profileResolution = record(candidate.profile);
+			const resolvedProfile = record(profileResolution?.profile);
+			const resolvedProfileID = nonEmptyString(resolvedProfile?.id);
+			const resolutionSource = nonEmptyString(profileResolution?.source);
+			if (resolvedProfileID) this.lastResolvedActorProfile = resolvedProfileID;
+			if (resolutionSource) this.lastProfileResolutionSource = resolutionSource;
 			const sources = uniqueStrings(candidate.sources);
 			const candidateIDs = uniqueStrings(candidate.candidate_ids);
 			const rawCalls = array(candidate.tool_calls);
@@ -985,14 +1007,16 @@ function providerPayload(
 		[settings.requestIDField]: requestID,
 	};
 	if (settings.forkTransport === "sidecar") return identified;
+	const legacyFormatOnly = settings.actorProfile === "auto" && settings.draftFormat !== "auto";
 	return {
 		...identified,
 		self_speculation: {
-			version: 1,
+			version: legacyFormatOnly ? 1 : 2,
 			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
+			...(legacyFormatOnly ? {} : { actor_profile: settings.actorProfile }),
 			max_draft_tokens: settings.maxDraftTokens,
-			draft_format: settings.draftFormat,
+			...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
 			...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 			fork_max_tokens: settings.forkMaxTokens,
 			fork_temperature: settings.forkTemperature,
@@ -1014,13 +1038,14 @@ function providerPayload(
 
 function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
 	return {
+		actor_profile: settings.actorProfile,
 		max_tokens: settings.forkMaxTokens,
 		temperature: settings.forkTemperature,
 		decoder: settings.forkDecoder,
 		...(settings.forkForcedPrefix === "auto" ? {} : { forced_prefix: settings.forkForcedPrefix }),
 		require_logprobs: requiresForkLogprobs(settings),
 		max_draft_tokens: settings.maxDraftTokens,
-		draft_format: settings.draftFormat,
+		...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
 		...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 		fork_gate: forkGatePayload(settings),
 	};
@@ -1186,6 +1211,7 @@ function decoderEvidenceContext(state: TurnState, tool: string, source: string) 
 	return {
 		model: state.gateKey,
 		endpoint: state.settings.endpoint,
+		actorProfile: state.settings.actorProfile,
 		format: state.settings.draftFormat,
 		boundary: state.settings.draftBoundary,
 		tool,
