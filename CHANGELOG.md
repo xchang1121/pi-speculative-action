@@ -249,6 +249,9 @@
 
 ### Fixed
 
+- Dependency equality counts already-captured records without locale-sensitive sorting. Reordering
+  distinct Unicode action IDs preserves bindings and descendant identities; changes to dependency
+  conditions or multiplicity still renew execution, and the producer's visible edge order is retained.
 - Plan scheduling reuses the graph's validated topological order for deadlines and critical paths,
   removing repeated recursive traversals and temporary graph indexes. Prediction confirmation locates
   its current node directly while preserving retired opportunities' independent settlement authority.

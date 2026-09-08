@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import { CandidateExecution } from "../src/candidate-execution.ts";
 import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import { PlanRuntime } from "../src/plan-runtime.ts";
@@ -244,15 +245,6 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 6, expectedDecisionSeq: 6, latestDecisionSeq: 10, criticalPathMs: 81 });
 		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
 		const identity = plan.get("plan", "child")!.identity;
-		expect(plan.apply({
-			proposalID: "plan", source: "source", revision: 2,
-			upsert: [action("child", {
-				expectedDurationMs: 80,
-				dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }, { actionID: "short", condition: "execution_settled" }],
-			})],
-		}, 4)).toMatchObject({ accepted: true, retired: [] });
-		expect(plan.get("plan", "child")!.identity).toBe(identity);
-		expect(plan.get("plan", "child")!.action.dependsOn!.map((dependency) => dependency.actionID)).toEqual(["critical", "short"]);
 		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
 
 		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
@@ -288,6 +280,31 @@ describe("PlanRuntime", () => {
 			[action("a", { dependsOn: [{ actionID: "a" }] })],
 			[action("a", { dependsOn: [{ actionID: "b" }] }), action("b", { dependsOn: [{ actionID: "a" }] })],
 		]) expect(new PlanRuntime().apply(proposal(invalid), 0)).toEqual({ accepted: false, reason: "invalid_dependency" });
+	});
+
+	it.each([["left", "right"], ["e\u0301", "\u00e9"]])("compares owned dependency records independently of collation: %s / %s", (first, second) => {
+		const plan = new PlanRuntime(), dependency = { actionID: first };
+		const child = action("child", { dependsOn: [dependency, dependency, { actionID: second }] });
+		plan.apply(proposal([action(first), action(second), child, action("leaf", { dependsOn: [{ actionID: "child" }] })]), 0);
+		const key = buildPiActionKey("read", child.input, "/workspace")!, execution = new CandidateExecution<string>("shared");
+		plan.bindActionKey("plan", "child", key); execution.start(0); execution.succeed("output", 1, 1);
+		for (const id of [first, second, "child"]) plan.attachExecution("plan", id, id, execution);
+		const original = plan.get("plan", "child")!, leaf = plan.get("plan", "leaf")!.identity;
+		expect(original.action.dependsOn![0]).not.toBe(original.action.dependsOn![1]);
+		const reordered = [{ actionID: second, condition: "execution_settled" as const }, dependency, dependency];
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 2, upsert: [{ ...child, dependsOn: reordered }] }, 0))
+			.toMatchObject({ accepted: true, retired: [] });
+		expect(plan.get("plan", "child")!.identity).toBe(original.identity);
+		expect(plan.get("plan", "child")!.actionKey).toBe(key);
+		expect(plan.get("plan", "child")!.execution).toEqual(original.execution);
+		expect(plan.get("plan", "leaf")!.identity).toBe(leaf);
+		expect(plan.get("plan", "child")!.action.dependsOn!.map((edge) => edge.actionID)).toEqual([second, first, first]);
+		const changed = { actionID: second, condition: "execution_succeeded" as const };
+		for (const [index, dependsOn] of [[changed, dependency, dependency], [changed, changed, dependency]].entries()) {
+			expect(plan.apply({ proposalID: "plan", source: "source", revision: 3 + index, upsert: [{ ...child, dependsOn }] }, 0))
+				.toMatchObject({ accepted: true, retired: [{ node: { action: { id: "child" } } }, { node: { action: { id: "leaf" } } }] });
+			expect(plan.get("plan", "child")!.actionKey).toBeUndefined();
+		}
 	});
 
 	it.each(["direct", "ancestor"] as const)("keeps a claimed opportunity authoritative through %s replacement", (mode) => {

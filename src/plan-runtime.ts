@@ -5,7 +5,6 @@ import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type {
 	MaterializedPlan,
 	PlanAction,
-	PlanActionDependency,
 	PlanActionDependencyCondition,
 	PlanUpdate,
 } from "./plan-proposal.ts";
@@ -751,18 +750,17 @@ function dependencyOrder(actions: ReadonlyMap<string, PlanAction>): readonly Pla
 }
 
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
-	return (
-		left.tool === right.tool &&
-		isDeepStrictEqual(left.input, right.input) &&
-		isDeepStrictEqual(orderedDependencies(left), orderedDependencies(right))
-	);
-}
-
-function orderedDependencies(action: PlanAction): readonly PlanActionDependency[] {
-	// Both actions already own canonical records; compare order without rebuilding or mutating them.
-	return [...(action.dependsOn ?? [])].sort(
-		(left, right) => left.actionID.localeCompare(right.actionID) || left.condition!.localeCompare(right.condition!),
-	);
+	if (left.tool !== right.tool || !isDeepStrictEqual(left.input, right.input)) return false;
+	// Owned dependency records have canonical fields; opaque IDs must not use locale ordering.
+	const counts = new Map<string, number>();
+	for (const [dependencies, delta] of [[left.dependsOn, 1], [right.dependsOn, -1]] as const) {
+		for (const dependency of dependencies ?? []) {
+			const key = JSON.stringify(dependency), count = (counts.get(key) ?? 0) + delta;
+			if (count) counts.set(key, count);
+			else counts.delete(key);
+		}
+	}
+	return counts.size === 0;
 }
 
 function planNodeID(source: string, proposalID: string, actionID: string, revision: number): string {
