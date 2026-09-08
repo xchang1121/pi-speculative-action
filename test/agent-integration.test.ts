@@ -333,7 +333,8 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it.each(["running", "completed"])("does not adopt a %s Bash command through an unproven suffix relation", async (phase) => {
+	it.each(["running", "completed"].flatMap((phase) => ["suffix", "preflight", "missing", "recheck"].map((mode) => [phase, mode])))
+	("keeps %s Bash on exactly one Actor fallback when %s rejects reuse", async (phase, mode) => {
 		const cwd = await temporaryWorkspace(), started = deferred<void>(), finish = deferred<void>(), completed = deferred<void>();
 		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "tail arguments: -n 2" }], details: {} }));
 		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor };
@@ -342,21 +343,40 @@ describe("speculative action host", () => {
 			started.resolve(); await finish.promise;
 			return { result: { content: [{ type: "text", text: "tail arguments: -n 3" }], details: {} }, isError: false };
 		}, dispose);
+		let allowed = mode !== "preflight";
+		const preflight = vi.fn(({ signal }: { signal: AbortSignal }) => {
+			expect(signal).toBeInstanceOf(AbortSignal);
+			return phase === "running" ? allowed : allowed ? { ok: true as const } : { ok: false as const, reason: "host_denied", detail: "restricted" };
+		});
+		const events: SpeculativeActionEvent<string>[] = [];
 		const host = createSpeculativeActionHost("session", {
-			cwd, getSettings: () => ({ ...settings(), tools: ["bash"] }), draftModel: model("draft"),
-			complete: async () => assistant([{ type: "toolCall", id: "draft-bash", name: "bash",
-				arguments: { command: "printf data 2>&1 | tail -n 3" } }], "toolUse"),
-			preflight: () => true, executionWorlds: [sandbox, sandbox],
+			cwd, getSettings: () => ({ ...settings(), tools: ["bash"], drafterMaxDepth: 0 }), draftModel: model("draft"),
+			complete: vi.fn().mockResolvedValueOnce(assistant([{ type: "toolCall", id: "draft-bash", name: "bash",
+				arguments: { command: "printf data 2>&1 | tail -n 3" } }], "toolUse")).mockResolvedValue(assistant([], "stop")),
+			preflight: mode === "missing" ? undefined : preflight, executionWorlds: [sandbox, sandbox],
 			resolveInvocation: (name, args) => resolvePiToolInvocation(name, args, { cwd, environment: {}, shellPath: process.execPath }),
-			onEvent: (event) => { if (event.type === "candidate" && event.state.status === "succeeded") completed.resolve(); },
+			onEvent: (event) => {
+				events.push(event);
+				if (event.type === "candidate" && event.state.status === "succeeded" || event.type === "prediction" && event.settlement.observation === "unobserved") completed.resolve();
+			},
 		});
 		try {
-			await host.startTurn(startInput(tool)); await started.promise;
-			if (phase === "completed") { finish.resolve(); await completed.promise; }
+			await host.startTurn(startInput(tool));
+			if (["preflight", "missing"].includes(mode!)) await completed.promise;
+			else { await started.promise; if (phase === "completed") { finish.resolve(); await completed.promise; } }
+			if (mode === "recheck") allowed = false;
 			const output = await host.execute({ turnID: "turn-1", id: "actor-bash", tool: "bash",
-				args: { command: "printf data 2>&1 | tail -n 2" }, tools: [tool] }, undefined, actor);
+				args: { command: `printf data 2>&1 | tail -n ${mode === "suffix" ? 2 : 3}` }, tools: [tool] }, undefined, actor);
 			expect(output.content).toEqual([{ type: "text", text: "tail arguments: -n 2" }]);
 			expect(actor).toHaveBeenCalledOnce();
+			await waitFor(() => events.some((event) => event.type === "actor_action"));
+			expect(preflight).toHaveBeenCalledTimes(mode === "missing" ? 0 : mode === "preflight" || mode === "suffix" && phase === "running" ? 1 : 2);
+			if (mode === "recheck") expect(events.find((event) => event.type === "actor_action")).toMatchObject({ settlement: {
+				rejections: [{ cause: { stage: "authorization", code: "permission_or_policy_changed", ...(phase === "completed" ? { detail: "restricted" } : {}) } }],
+			} });
+			if (mode === "preflight") expect(events.find((event) => event.type === "prediction")).toMatchObject({ settlement: {
+				cause: { stage: "admission", code: phase === "running" ? "permission_or_policy" : "host_denied" },
+			} });
 		} finally { finish.resolve(); await host.dispose(); }
 		expect(dispose).toHaveBeenCalledOnce();
 	});

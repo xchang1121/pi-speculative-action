@@ -300,6 +300,12 @@ export function createSpeculativeActionHost(
 			? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
 		return { ...(invocation ? { invocation } : {}), ...(action ? { action } : {}) };
 	};
+	const checkPermission = async (tool: AgentTool | undefined, context: Omit<SpeculativeAgentPreflightContext, "tool">, recheck = false): Promise<CandidatePreflight> => {
+		const reason = recheck ? "permission_or_policy_changed" : "permission_or_policy";
+		const result = tool && options.preflight ? await options.preflight({ ...context, tool }) : false;
+		if (typeof result === "boolean") return result ? { ok: true } : { ok: false, reason };
+		return recheck && !result.ok ? { ...result, reason } : result;
+	};
 	const runtime = makeSpeculativeActionRuntime<
 		string,
 		ToolSettlement,
@@ -358,32 +364,10 @@ export function createSpeculativeActionHost(
 			return captured && { route: captured.route, ...captured.capture };
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, signal }) => {
-			const tool = data.tools.get(toolName);
-			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
-			const result = await options.preflight({ tool, toolName, args: concrete, action, route, signal });
-			return typeof result === "boolean"
-				? result
-					? { ok: true }
-					: { ok: false, reason: "permission_or_policy" }
-				: result;
-		},
-		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
-			const tool = stateData.tools.get(toolName);
-			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
-			const result = await options.preflight({
-				tool,
-				toolName,
-				args: concrete,
-				action,
-				route,
-				signal: signal ?? new AbortController().signal,
-			});
-			if (typeof result === "boolean") {
-				return result ? { ok: true } : { ok: false, reason: "permission_or_policy_changed" };
-			}
-			return result.ok ? result : { ...result, reason: "permission_or_policy_changed" };
-		},
+		preflightCandidate: ({ data, tool: toolName, concrete, action, route, signal }) =>
+			checkPermission(data.tools.get(toolName), { toolName, args: concrete, action, route, signal }),
+		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
+			checkPermission(stateData.tools.get(toolName), { toolName, args: concrete, action, route, signal: signal ?? new AbortController().signal }, true),
 		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
