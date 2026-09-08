@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- Projector/rule identifiers and callback slots are captured at registration across semantics, Host,
+  Runtime and candidate indexes; later provider edits do not redefine an indexed relation or adoption.
+  Output coverage must be shareable plain data and each callback receives a separate copy. Opaque
+  evidence declines output projection without disabling independently sealed-input reconstruction.
 - Closed-search v5 optionally binds captured grep through the existing TUI search choice. Qualified
   existing engines are Windows x64 rg 15.2.0 and Linux x64 rg 14.1.0; unavailable rg leaves find independent.
   The explicit profile sorts paths and disables ambient rg/global ignore configuration, not parent rules.

@@ -10,13 +10,15 @@ interface Entry {
 }
 
 describe("ActionStore", () => {
-	it("keeps one exact owner and directionally reuses the tightest compatible projection", () => {
-		const store = new ActionStore<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+	it.each(["id", "partition", "project"] as const)("owns %s while directionally reusing the tightest compatible projection", (field) => {
+		const projector = { ...READ_RANGE_ACTION_KEY_PROJECTOR };
+		const store = new ActionStore<string, Entry>([projector]);
 		const broad = entry("broad", "a.ts", 1, 200);
 		const tight = entry("tight", "a.ts", 80, 60);
 		const requested = entry("requested", "a.ts", 100, 10);
 		store.insertOrGetCompatible("one", broad);
 		store.insertOrGetCompatible("one", tight);
+		Object.assign(projector, { [field]: field === "id" ? "changed" : () => undefined });
 
 		const compatible = store.insertOrGetCompatible("one", requested, (existing) =>
 			actionKeyCovers(existing.key, requested.key, [READ_RANGE_ACTION_KEY_PROJECTOR]),
@@ -33,6 +35,8 @@ describe("ActionStore", () => {
 		});
 		expect(store.lookup("one", requested.key).map((item) => item.entry.id)).toEqual(["tight", "broad"]);
 		expect(store.lookup("two", requested.key)).toEqual([]);
+		expect(store.delete("one", tight)).toBe(true);
+		expect(store.lookup("one", requested.key).map((item) => item.entry.id)).toEqual(["broad"]);
 	});
 
 	it("keeps distinct exact owners when their execution contexts cannot be reused", () => {

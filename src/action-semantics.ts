@@ -99,6 +99,7 @@ export interface ActionSemanticsDefinition {
 
 // Only issued definitions may skip normalization; mutable provider records are never memoized.
 const normalizedDefinitions = new WeakSet<ActionSemanticsDefinition>();
+const projectorSources = new WeakMap<ActionKeyProjector, ActionKeyProjector>();
 
 /** Immutable source of truth for K(a), projection, resource evidence, and safe local fallback capability. */
 export class ActionSemanticsRegistry {
@@ -112,7 +113,7 @@ export class ActionSemanticsRegistry {
 			this.definitionsByTool.set(tool, definition);
 			for (const projector of definition.projectors ?? []) {
 				const existing = this.projectorsByID.get(projector.id);
-				if (existing && existing !== projector) {
+				if (existing && projectorSources.get(existing) !== projectorSources.get(projector)) {
 					throw new Error(`conflicting action projector ${projector.id}`);
 				}
 				this.projectorsByID.set(projector.id, projector);
@@ -185,7 +186,7 @@ export const LS_DEFAULT_LIMIT = 500;
 
 /** Lookup hint only: different queries require re-evaluation over the branch's sealed inputs.
  * No running join is inferred before a branch proves that it owns those inputs. */
-export const RESOURCE_INPUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
+export const RESOURCE_INPUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
 	id: "resource.inputs",
 	partition: (action) => action.resources.length ? JSON.stringify([
 		action.tool, action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
@@ -195,10 +196,10 @@ export const RESOURCE_INPUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 		return partition !== undefined && partition === RESOURCE_INPUT_ACTION_KEY_PROJECTOR.partition(actor)
 			? { action: actor, distance: Number.MAX_SAFE_INTEGER } : undefined;
 	},
-};
+});
 
 /** π_read narrows a cached read action to the actor's requested interval. */
-export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
+export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
 	id: "read.range",
 	partition: readProjectionPartition,
 	project: (speculative, actor) => {
@@ -219,7 +220,7 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = {
 		};
 	},
 	canShareInFlight: readRangesShareInFlight,
-};
+});
 
 // Stock query tools launch ambient executables/configuration (rg can even invoke --pre).
 // A static workspace tree is not their dependency closure or their isolation authority.
@@ -585,6 +586,14 @@ function readProjectionPartition(action: ActionKey): string | undefined {
 	]);
 }
 
+/** Capture rule slots once; retain source identity only for conflicting-registration checks. */
+export function ownActionKeyProjector<Projector extends ActionKeyProjector>(source: Projector): Projector {
+	if (projectorSources.has(source)) return source;
+	const owned = Object.freeze({ ...source });
+	projectorSources.set(owned, source);
+	return owned;
+}
+
 function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemanticsDefinition {
 	if (normalizedDefinitions.has(source)) return source;
 	const tool = source.tool.trim(), epoch = source.epoch.trim();
@@ -592,7 +601,7 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 	if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
 	const definition = Object.freeze({ ...source, tool, epoch,
 		requirements: normalizeEffectRequirements(source.requirements),
-		projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])]),
+		projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])].map(ownActionKeyProjector)),
 	});
 	assertDefinitionCoherence(definition);
 	normalizedDefinitions.add(definition);

@@ -128,8 +128,7 @@ function harness(input: {
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly preflight?: (signal: AbortSignal) => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly authorize?: () => CandidatePreflight;
-	readonly projection?: boolean;
-	readonly coveringAction?: ActionProjectionRule<string>["coveringAction"];
+	readonly projection?: ActionProjectionRule<string>;
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
 	readonly onTurnFinished?: (input: { readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
@@ -197,16 +196,7 @@ function harness(input: {
 					: {}),
 			});
 		},
-		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection
-			? [
-					{
-						...READ_RANGE_ACTION_KEY_PROJECTOR,
-						...(input.coveringAction ? { coveringAction: input.coveringAction } : {}),
-						captureCoverage: () => ({ complete: true }),
-						projectOutput: () => undefined,
-					},
-				]
-			: [])],
+		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection ? [input.projection] : [])],
 		onCandidateMaterialized: input.onCandidateMaterialized,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: async (event) => {
@@ -802,17 +792,29 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-covered"] as const)(
-	"adopts reconstructed input only after a stable, successful evaluation: %s", async (scenario) => {
+	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered",
+		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-borrowed"] as const)(
+	"adopts reconstructed input or owned output coverage only after stable evaluation: %s", async (scenario) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed");
 		const candidateReady = candidateSucceeded();
 		const entered = barrier(), release = barrier(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
-		const succeeds = scenario === "valid" || scenario === "running-covered";
+		const outputOnly = scenario.startsWith("output-");
+		const succeeds = ["valid", "running-covered", "output-valid", "output-borrowed"].includes(scenario);
 		let changed = false;
-		const actor = call("turn", { path: "README.md", offset: scenario === "running-unproven" ? 200 : 10, limit: 10 });
+		const actor = call("turn", { path: "README.md", offset: scenario === "running-outside" ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
+		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
+		const projection = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
+			captureCoverage: () => scenario === "output-opaque" ? Object.assign(Object.create({}), evidence) : evidence,
+			projectOutput: ({ coverage }: { coverage: unknown }): string | undefined => {
+				if (!outputOnly) return undefined;
+				if (scenario === "output-rejected") throw new Error("projection failed");
+				const borrowed = coverage as typeof evidence, output = borrowed.complete ? borrowed.view.text : undefined;
+				borrowed.complete = false; borrowed.view.text = "changed by borrower";
+				return output;
+			} };
 		const reconstruct: NonNullable<WorldBranch<string>["reconstruct"]> = async (request) => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
 			entered.arrive(); await release.promise;
@@ -822,31 +824,40 @@ describe("structural speculative runtime", () => {
 		const fixture = harness({
 			source: { id: "source", enabled: () => true,
 				propose: () => plan("source", "projection", { path: "README.md", offset: 1, limit: 100 }) },
-			projection: true,
+			projection,
 			authorize: () => { authorized.arrive(); return { ok: true }; },
-			execute: async () => { started.arrive(); if (running) await completion.promise; return {
+			execute: async () => { started.arrive(); if (running) await completion.promise;
+				if (scenario === "output-borrowed") await new Promise<void>((resolve) => setTimeout(resolve, 5));
+				return {
 				...world("wide", { validate: async () => changed
 					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
 					: { status: "valid", metrics: zeroValidationMetrics() } }),
-				...(scenario === "legacy-miss" ? {} : { reconstruct }),
+				...(scenario === "legacy-miss" || outputOnly ? {} : { reconstruct }),
 				commit,
 			}; },
 			onEvent: candidateReady.observe,
 		});
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
 		await (running ? started.promise : candidateReady.promise);
+		projection.canShareInFlight = () => true;
+		if (!outputOnly) projection.projectOutput = () => "changed callback";
+		else if (scenario !== "output-borrowed") { evidence.complete = true; evidence.view.text = "changed by producer"; }
 		const consumed = fixture.runtime.consume(actor, controller.signal);
 		try {
 			if (running) {
 				expect(await Promise.race([consumed, authorized.promise.then(() => "joined")])).toBe(succeeds ? "joined" : undefined);
 				completion.arrive(); release.arrive();
-			} else if (scenario !== "legacy-miss") {
+			} else if (scenario !== "legacy-miss" && !outputOnly) {
 				await entered.promise; changed = scenario === "changed";
 				if (scenario === "aborted") controller.abort();
 				release.arrive();
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+			if (scenario === "output-borrowed") {
+				expect(await fixture.runtime.consume({ ...actor, id: "second-reader" })).toBe("narrow");
+				expect(commit).toHaveBeenCalledTimes(2);
+			}
 			if (succeeds) {
 				const request = admission.mock.lastCall![0], actorHash = buildPiActionKey(actor.tool, actor.input, "/workspace")!.hash;
 				expect(request.actorIdentity?.actionKeyHash).toBe(actorHash);

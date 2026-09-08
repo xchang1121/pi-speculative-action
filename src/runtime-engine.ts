@@ -6,7 +6,7 @@ import type {
 	ActionSemanticsRegistry,
 	ProjectedActionKeyMatch,
 } from "./action-semantics.ts";
-import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, ownActionKeyProjector, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorCallAttempt } from "./actor-call-attempt.ts";
 import { ActorAction } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation } from "./candidate-execution.ts";
@@ -26,6 +26,7 @@ import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type Ret
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { cloneSharedData } from "./stable-json.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import type {
 	AdoptedAction,
@@ -81,7 +82,7 @@ function uniqueProjectionRules<Output>(
 ): readonly ActionProjectionRule<Output>[] {
 	const unique = new Map<string, ActionProjectionRule<Output>>();
 	for (const rule of rules) {
-		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, rule);
+		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, ownActionKeyProjector(rule));
 	}
 	return [...unique.values()];
 }
@@ -104,10 +105,6 @@ function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): reado
 
 function reservationAvailable(reservation: CandidateReservation): boolean {
 	return reservation.kind === "shared" ? reservation.owners.length === 0 : reservation.status === "available";
-}
-
-function updateSource(update: PlanUpdate): string {
-	return "actions" in update ? update.source : update.source;
 }
 
 function planUpdateID(update: PlanUpdate): string {
@@ -267,7 +264,7 @@ function captureCoverage<Output>(
 	return rules.flatMap((rule) => {
 		try {
 			const value = rule.captureCoverage?.(action, output);
-			return value === undefined ? [] : [{ rule: rule.id, value }];
+			return value === undefined ? [] : [{ rule: rule.id, value: cloneSharedData(value) }];
 		} catch {
 			return [];
 		}
@@ -294,7 +291,7 @@ async function projectOutput<Output, StartInput, StateData>(
 			speculative: candidate.key,
 			actor,
 			output,
-			coverage: coverage!.value,
+			coverage: cloneSharedData(coverage!.value),
 			keyMatch: match,
 		});
 		const durationMs = Math.max(0, performance.now() - startedAt);
@@ -1245,7 +1242,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	): Promise<void> => {
 		const { session } = scope;
 		if (session.lifecycle.sealed || scope.signal.aborted) return;
-		if (updateSource(update) !== source.id) return;
+		if (update.source !== source.id) return;
 		const acceptedUpdate = source.multiStepEnabled?.(scope.settings) === false ? immediateOnly(update) : update;
 		const applied = session.plan.apply(acceptedUpdate, session.decisionSequence);
 		if (!applied.accepted) return;

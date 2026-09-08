@@ -239,15 +239,22 @@ describe("ActionSemanticsRegistry", () => {
 		const projectors = [projector("kept")];
 		const source = { ...resourceDefinition("one", "one.v1", canonicalEmpty), projectors };
 		const registry = new ActionSemanticsRegistry([source, { ...source, tool: "two" }]);
+		const registered = registry.projectors()[0]!;
 		expect(() => new ActionSemanticsRegistry([source, { ...source, tool: "conflict", projectors: [projector("kept")] }]))
 			.toThrow("conflicting action projector kept");
 		projectors.push(projector("late"));
+		Object.assign(projectors[0]!, { id: "changed", partition: () => "changed", project: () => { throw new Error("changed"); } });
 		(source as { epoch: string }).epoch = "mutated";
 		const names = registry.toolNames() as string[];
 		names.push("outside");
 
 		expect(registry.definition("one")?.epoch).toBe("one.v1");
-		expect(registry.projectors()).toEqual([projectors[0], RESOURCE_INPUT_ACTION_KEY_PROJECTOR]);
+		expect(registry.projectors()).toEqual([registered, RESOURCE_INPUT_ACTION_KEY_PROJECTOR]);
+		expect(registered.id).toBe("kept");
+		expect(Object.isFrozen(registered)).toBe(true);
+		expect(Object.isFrozen(projectors[0])).toBe(false);
+		expect(new ActionSemanticsRegistry([source]).projectors()[0]?.id).toBe("changed");
+		expect(registered.partition(buildPiActionKey("read", { path: "a.ts" }, "/workspace")!)).toBeUndefined();
 		expect(registry.supportsProjector("kept")).toBe(true);
 		expect(registry.supportsProjector("late")).toBe(false);
 		expect(registry.toolNames()).toEqual(["one", "two"]);

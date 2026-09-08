@@ -4,6 +4,7 @@ export { READ_RANGE_ACTION_KEY_PROJECTOR, readRangesShareInFlight } from "./acti
 
 export interface ActionProjectionCoverage {
 	readonly rule: string;
+	/** Runtime-owned plain data; each projection callback receives a separate copy. */
 	readonly value: unknown;
 }
 
@@ -11,6 +12,7 @@ export interface ActionProjectionCoverage {
 export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 	/** Optional covering K(a) to execute; the runtime accepts it only when this rule proves containment. */
 	readonly coveringAction?: (predicted: ActionKey) => ActionKey | undefined;
+	/** Opaque or otherwise unshareable proof declines output projection, not sealed-input reconstruction. */
 	readonly captureCoverage?: (action: ActionKey, output: Output) => unknown | undefined;
 	readonly projectOutput?: (input: {
 		readonly speculative: ActionKey;
