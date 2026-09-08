@@ -249,6 +249,9 @@
 
 ### Fixed
 
+- Prediction matching retains its computed key relation instead of invoking projection again for each
+  selected opportunity. One pass selects the nearest prediction per plan, preserving latest-due or
+  nearest-future priority, stable ties and plan order; tool hints still do not claim a prediction.
 - Prediction launch work is registered before lookup and validation callbacks. It rechecks current
   plan identity before and after asynchronous reuse validation, and only attaches a result still owned
   by the candidate registry. Shutdown, supersession and cache retirement cannot revive stale launches

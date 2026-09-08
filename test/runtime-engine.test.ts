@@ -1275,53 +1275,77 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...slowCall, terminal: true });
 	});
 
-	it("records an exact match when isolation is unavailable without starting speculative execution", async () => {
+	it.each(["exact", "future", "due"] as const)("selects one captured prediction relation per plan without isolation: %s", async (mode) => {
 		const settlements: PredictionSettlement[] = [];
-		const routeChecked = barrier();
+		const projected = mode !== "exact", tool = projected ? "read" : "bash";
+		const horizons = mode === "due" ? [4, 0, 2, 2, 1, 3] : projected ? [4, 3, 1, 1, 2, 5] : [0];
+		const proposalIDs = projected ? ["second", "first"] : ["bash"];
+		const predictedInput = projected ? { path: "README.md", offset: 1, limit: 100 } : { command: "build" };
+		const actionCount = horizons.length * proposalIDs.length, routeChecked = barrier(actionCount);
+		const project = vi.fn(READ_RANGE_ACTION_KEY_PROJECTOR.project);
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: () => ({
-				id: "bash",
-				source: "source",
-				revision: 0,
-				actions: [{ id: "next", type: "tool_call", tool: "bash", input: { command: "build" } }],
-			}),
-			onSettled: ({ settlement }) => {
-				settlements.push(settlement);
-			},
+			propose: ({ startInput }) => startInput.turnID !== "turn-1" ? undefined : proposalIDs.map((id) => ({
+				id, source: "source", revision: 0,
+				actions: horizons.map((horizon, index) => ({
+					id: String(index), type: "tool_call", tool, input: predictedInput, horizon, latestHorizon: 8,
+				})),
+			})),
+			onSettled: ({ settlement }) => { settlements.push(settlement); },
 		};
 		const fixture = harness({
 			source,
-			resolveExecution: (tool) => {
-				if (tool === "bash") routeChecked.arrive();
-				return tool === "read" ? RESOURCE_ROUTE : tool === "write" ? MUTATION_ROUTE : undefined;
-			},
+			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, project },
+			resolveExecution: () => { routeChecked.arrive(); return undefined; },
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel" });
-		await routeChecked.promise;
-		expect(fixture.runtime.inspect()).toMatchObject({ exclusiveCandidates: 0, sharedCandidates: 0 });
-		expect(fixture.executions()).toBe(0);
-		const firstCall: Call = {
-			sessionID: "session",
-			turnID: "parallel",
-			id: "first",
-			tool: "bash",
-			input: { command: "build" },
-		};
-		expect(await fixture.runtime.consume(firstCall)).toBeUndefined();
-		expect(fixture.executions()).toBe(0);
-		await fixture.runtime.actual({ ...firstCall, durationMs: 2, output: "actor-built" });
-		await fixture.runtime.finishTurn({ ...firstCall, terminal: true });
-		expect(settlements).toHaveLength(1);
-		expect(settlements[0]).toMatchObject({
-			actorAction: { id: "first" },
-			match: {
-				matched: true,
-				adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
-			},
-		});
-		expect(fixture.events.some((event) => event.type === "candidate" && event.candidate.tool === "bash")).toBe(false);
+		let turnID = "turn-1";
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			await routeChecked.promise;
+			await new Promise<void>(setImmediate);
+			expect(fixture.runtime.inspect()).toMatchObject({
+				exclusiveCandidates: 0, sharedCandidates: 0, executionBlockedPlanActions: actionCount,
+			});
+			for (let previous = 1; mode === "due" && previous <= 2; previous++) {
+				const earlier = call(turnID, { path: "unrelated.ts" });
+				expect(await fixture.runtime.consume(earlier)).toBeUndefined();
+				await fixture.runtime.actual({ ...earlier, durationMs: 1, output: "actor" });
+				await fixture.runtime.finishTurn({ ...earlier, terminal: false });
+				turnID = `turn-${previous + 1}`;
+				await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			}
+			const firstCall: Call = {
+				sessionID: "session", turnID, id: "first", tool,
+				input: projected ? { path: "README.md", offset: 10, limit: 10 } : predictedInput,
+			};
+			project.mockClear();
+			await fixture.runtime.previewActorTool(firstCall);
+			expect(project).not.toHaveBeenCalled();
+			await fixture.runtime.previewActorCall(firstCall);
+			expect.soft(project).toHaveBeenCalledTimes(projected ? actionCount : 0);
+			expect(settlements).toEqual([]);
+			project.mockClear();
+			expect(await fixture.runtime.consume(firstCall)).toBeUndefined();
+			expect.soft(project).toHaveBeenCalledTimes(projected ? actionCount : 0);
+			await fixture.runtime.actual({ ...firstCall, durationMs: 2, output: "actor-built" });
+			await fixture.runtime.finishTurn({ ...firstCall, terminal: true });
+			const matched = settlements.filter((settlement) => settlement.observation === "observed" && settlement.match.matched);
+			expect(matched).toMatchObject(proposalIDs.map((proposalID) => ({
+				prediction: { proposalID, actionID: projected ? "2" : "0" }, actorAction: { id: "first" },
+				match: {
+					matched: true,
+					relation: projected ? { kind: "projected", projector: "read.range", distance: 90 } : { kind: "exact", distance: 0 },
+					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
+				},
+			})));
+			expect(settlements).toHaveLength(actionCount);
+			expect(new Set(settlements.map((settlement) => settlement.prediction.id)).size).toBe(actionCount);
+			expect(fixture.events.filter((event) => event.type === "actor_action" && event.settlement.actorAction.id === "first"))
+				.toMatchObject([{ settlement: { provider: { kind: "actor", origin: "fallback" } } }]);
+			expect(fixture.executions()).toBe(0);
+			expect(fixture.events.some((event) => event.type === "candidate")).toBe(false);
+		} finally { await fixture.runtime.dispose(); }
 	});
 
 	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {

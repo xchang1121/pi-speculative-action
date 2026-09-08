@@ -1759,8 +1759,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) return;
 		state.actorToolHints.add(input.tool);
 		await Promise.all(
-			nearestPredictions(state.session, state.decisionSequence, (node) => node.action.tool === input.tool).map(
-				(node) => promoteForActor(state.session, node),
+			nearestPredictions(state.session, state.decisionSequence, (node) => node.action.tool === input.tool ? { node } : undefined).map(
+				({ node }) => promoteForActor(state.session, node),
 			),
 		);
 		if (signal?.aborted || state.lifecycle !== "active" || runtimeState.turns.get(state.key) !== state) return;
@@ -2848,28 +2848,24 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 	};
 
-	const nearestPredictions = (
+	const nearestPredictions = <Selection extends { readonly node: PlanRuntimeNode }>(
 		session: Session,
 		decisionSequence: number,
-		matches: (node: PlanRuntimeNode) => boolean,
-	): readonly PlanRuntimeNode[] => {
-		const groups = new Map<string, PlanRuntimeNode[]>();
+		select: (node: PlanRuntimeNode) => Selection | undefined,
+	): readonly Selection[] => {
+		const selected = new Map<string, Selection>();
 		for (const node of session.plan.matchable(decisionSequence)) {
 			if (!node.actionKey) continue;
-			if (!matches(node)) continue;
-			const group = groups.get(node.proposalID) ?? [];
-			group.push(node);
-			groups.set(node.proposalID, group);
+			const selection = select(node);
+			if (!selection) continue;
+			const previous = selected.get(node.proposalID)?.node.expectedDecisionSeq;
+			const expected = node.expectedDecisionSeq;
+			// Prefer the latest due action, otherwise the nearest future action; retain insertion-order ties.
+			if (previous === undefined || (expected <= decisionSequence
+				? previous > decisionSequence || expected > previous
+				: expected < previous)) selected.set(node.proposalID, selection);
 		}
-		return [...groups.values()].flatMap((group) => {
-			const due = group.filter((node) => node.expectedDecisionSeq <= decisionSequence);
-			const ranked = (due.length ? due : group).sort((left, right) =>
-				due.length
-					? right.expectedDecisionSeq - left.expectedDecisionSeq
-					: left.expectedDecisionSeq - right.expectedDecisionSeq,
-			);
-			return ranked[0] ? [ranked[0]] : [];
-		});
+		return [...selected.values()];
 	};
 
 	const predictionMatches = (
@@ -2877,13 +2873,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		action: ActionKey,
 		decisionSequence: number,
 	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] =>
-		nearestPredictions(
-			session,
-			decisionSequence,
-			(node) => actionKeyMatch(node.actionKey!, action, runtimeState.projectionRules) !== undefined,
-		).flatMap((node) => {
+		nearestPredictions(session, decisionSequence, (node) => {
 			const relation = actionKeyMatch(node.actionKey!, action, runtimeState.projectionRules);
-			return relation ? [{ node, relation }] : [];
+			return relation ? { node, relation } : undefined;
 		});
 
 	const promoteForActor = async (session: Session, node: PlanRuntimeNode): Promise<void> => {
