@@ -435,37 +435,45 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
-	it("disposes a sealed backend branch that arrives after its candidate was cancelled", async () => {
-		const gate = barrier();
-		const executionStarted = barrier();
-		const disposed = barrier();
-		const dispose = vi.fn();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "late-branch", { path: "README.md" }),
-		};
-		const fixture = harness({
-			source,
-			execute: async () => {
-				executionStarted.arrive();
-				await gate.promise;
-				return world("late", {
-					onDispose: () => {
-						dispose();
-						disposed.arrive();
-					},
-				});
-			},
-		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await executionStarted.promise;
-		const disabling = fixture.runtime.settingsChanged({ ...settings, enabled: false });
-		gate.arrive();
-		await disabling;
-		await disposed.promise;
-		expect(dispose).toHaveBeenCalledOnce();
+	it("drains executions, sealed branches and Actor captures before retiring their session", async () => {
+		for (const phase of ["running", "sealed", "capture", "promotion", "sealing"] as const) for (const dispose of [false, true]) {
+			const started = barrier(), finish = barrier(), cancelled = barrier(), releasing = barrier(), release = barrier();
+			const ready = candidateSucceeded(); let released = false, observed = Promise.resolve();
+			const cleanup = vi.fn(async () => { releasing.arrive(); await release.promise; released = true; });
+			const observing = phase !== "running" && phase !== "sealed";
+			const fixture = harness({
+				source: { id: "source", enabled: () => !observing, propose: () => plan("source", "late", { path: "README.md" }) },
+				execute: async (_tool, _input, signal) => {
+					signal.addEventListener("abort", () => cancelled.arrive(), { once: true }); started.arrive();
+					if (phase === "running") await finish.promise;
+					return world("late", { onDispose: cleanup });
+				},
+				onEvent: ready.observe,
+				captureAuthoritativeResult: () => ({ route: RESOURCE_ROUTE, dispose: cleanup,
+					seal: async (output) => { started.arrive(); if (phase === "sealing") await finish.promise; return world(output, { onDispose: cleanup }); } }),
+				...(phase === "promotion" ? { rejectCandidateOutput: () => { throw new Error("optional cache policy failed"); } } : {}),
+			});
+			try {
+				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+				if (observing) {
+					expect(await fixture.runtime.consume(call("turn"))).toBeUndefined();
+					if (phase !== "capture") {
+						observed = fixture.runtime.actual({ ...call("turn"), durationMs: 1, output: "actor" });
+						if (phase === "promotion") await observed; else await started.promise;
+					}
+				} else await (phase === "running" ? started.promise : ready.promise);
+				const closing = (dispose ? fixture.runtime.dispose() : fixture.runtime.settingsChanged({ ...settings, enabled: false }))
+					.then(() => { expect(released, `${phase}: lifecycle returned before cleanup`).toBe(true); });
+				const outcome = Promise.allSettled([closing]);
+				if (phase === "running") await cancelled.promise;
+				if (phase === "sealing") await new Promise<void>((resolve) => setImmediate(resolve));
+				finish.arrive(); await releasing.promise;
+				await new Promise<void>((resolve) => setImmediate(resolve)); // Let the close continuation run; no elapsed-time race.
+				release.arrive();
+				expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]); await observed;
+				expect(cleanup).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
+			} finally { finish.arrive(); release.arrive(); await fixture.runtime.dispose(); }
+		}
 	});
 
 	it("runs eight independent producers concurrently and deduplicates only by K(a)", async () => {
@@ -694,34 +702,6 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.actual({ ...third, durationMs: 2, output: "actor:2" });
 		expect(seals).toBe(2);
 		await fixture.runtime.finishTurn({ ...third, terminal: true });
-	});
-
-	it("keeps Actor settlement authoritative when optional result promotion fails", async () => {
-		let disposed = 0;
-		const fixture = harness({
-			source: { id: "disabled", enabled: () => false, propose: () => undefined },
-			captureAuthoritativeResult: (action) => ({
-				route: RESOURCE_ROUTE,
-				seal: (output) =>
-					world(output, {
-						executionFingerprint: action.executionFingerprint,
-						onDispose: () => disposed++,
-					}),
-				dispose: () => {
-					disposed++;
-				},
-			}),
-			rejectCandidateOutput: () => {
-				throw new Error("optional cache policy failed");
-			},
-		});
-		const actorCall = call("promotion-failure");
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: actorCall.turnID });
-		expect(await fixture.runtime.consume(actorCall)).toBeUndefined();
-		await expect(fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" })).resolves.toBeUndefined();
-		expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
-		expect(disposed).toBe(1);
-		await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
 	});
 
 	it("expires both pending and admitting next-action requests when the Actor intent arrives", async () => {

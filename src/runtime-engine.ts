@@ -353,7 +353,7 @@ function clearActorActions<SessionID, Output, StartInput, StateData>(
 	turnID?: string,
 ): void {
 	if (turnID === undefined) {
-		for (const capture of session.authoritativeResultCaptures.values()) disposeAuthoritativeResultCapture(capture);
+		for (const capture of session.authoritativeResultCaptures.values()) session.lifecycle.release(capture);
 		session.authoritativeResultCaptures.clear();
 		session.actorCalls.clear();
 		session.anonymousActorCalls.length = 0;
@@ -379,15 +379,7 @@ function disposeActorCapture<SessionID, Output, StartInput, StateData>(
 	const capture = session.authoritativeResultCaptures.get(action);
 	if (!capture) return;
 	session.authoritativeResultCaptures.delete(action);
-	disposeAuthoritativeResultCapture(capture);
-}
-
-function disposeAuthoritativeResultCapture<Output>(capture: AuthoritativeResultCapture<Output>): void {
-	try {
-		void Promise.resolve(capture.dispose()).catch(() => undefined);
-	} catch {
-		// Capture cleanup cannot alter Actor execution or settlement.
-	}
+	session.lifecycle.release(capture);
 }
 
 function callKey(turnID: string, callID: string): string {
@@ -845,7 +837,6 @@ class StructuralRuntimeState<
 	readonly turns = new Map<string, TurnState<SessionID, Output, StartInput, StateData>>();
 	masterEnabled: boolean | undefined;
 
-	private readonly disposedBranches = new WeakSet<WorldBranch<Output>>();
 	private readonly emitEvent: (event: SpeculativeActionEvent<SessionID>) => Promise<void>;
 
 	constructor(adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>) {
@@ -860,7 +851,7 @@ class StructuralRuntimeState<
 		this.candidates = new RuntimeCandidateRegistry(
 			this.projectionRules,
 			candidateCacheValue,
-			(candidate) => this.disposeBranch(candidateBranch(candidate)),
+			(candidate) => this.sessions.get(candidate.owner.startInput.sessionID)?.lifecycle.release(candidateBranch(candidate)),
 		);
 		this.emitEvent = async (event) => {
 			try {
@@ -917,16 +908,6 @@ class StructuralRuntimeState<
 		};
 		this.sessions.set(sessionID, created);
 		return created;
-	}
-
-	disposeBranch(branch: WorldBranch<Output> | undefined): void {
-		if (!branch || this.disposedBranches.has(branch)) return;
-		this.disposedBranches.add(branch);
-		try {
-			void Promise.resolve(branch.dispose()).catch(() => undefined);
-		} catch {
-			// Cleanup cannot change authoritative settlement.
-		}
 	}
 }
 
@@ -1723,7 +1704,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const startedAt = performance.now();
 			if (!candidate.work.start(startedAt)) continue;
 			queueCandidateEvent(session, candidate);
-			void executeCandidate(session, candidate, startedAt);
+			void session.lifecycle.track(executeCandidate(session, candidate, startedAt));
 		}
 	};
 
@@ -1754,7 +1735,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
 			const completedAt = performance.now();
 			if (!candidate.work.succeed(branch, completedAt, completedAt - startedAt)) {
-				runtimeState.disposeBranch(branch);
+				session.lifecycle.release(branch);
 				return;
 			}
 			session.scheduler.observeSpeculativeService(
@@ -1777,7 +1758,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			queueCandidateEvent(session, candidate);
 			dispatchReady(session);
 		} catch (error) {
-			if (candidate.work.execution.status !== "succeeded") runtimeState.disposeBranch(branch);
+			if (candidate.work.execution.status !== "succeeded") session.lifecycle.release(branch);
 			const failure =
 				error instanceof CandidateFailure
 					? error.failure
@@ -1825,7 +1806,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			return Promise.resolve();
 		}
 		const actualCall = adapter.actual(input) as ActualToolCall;
-		if (!actualCall.id) return promoteActorCall(state, input, actualCall, undefined, signal);
+		if (!actualCall.id) return state.session.lifecycle.track(promoteActorCall(state, input, actualCall, undefined, signal));
 		const existing = state.actorPreviews.get(actualCall.id);
 		if (existing) return existing.task;
 		const record: ActorPreviewRecord = {
@@ -1834,7 +1815,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			state: { status: "pending" },
 		};
 		state.actorPreviews.set(actualCall.id, record);
-		record.task = promoteActorCall(state, input, actualCall, record, signal);
+		record.task = state.session.lifecycle.track(promoteActorCall(state, input, actualCall, record, signal));
 		return record.task;
 	};
 
@@ -1996,7 +1977,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			runtimeState.turns.get(state.key) !== state ||
 			runtimeState.masterEnabled === false
 		) {
-			disposeAuthoritativeResultCapture(capture);
+			state.session.lifecycle.release(capture);
 			return;
 		}
 		disposeActorCapture(state.session, actorAction);
@@ -2401,11 +2382,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		try {
 			branch = await capture.seal(output);
 		} catch {
-			disposeAuthoritativeResultCapture(capture);
+			state.session.lifecycle.release(capture);
 			return;
 		}
 		let retained = false;
 		try {
+			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || runtimeState.masterDisabled()) return;
 			const sequence = ++state.session.candidateSequence;
 			const work = new CandidateExecution<WorldBranch<Output>>("shared");
 			work.start(toolExecution.startedAt);
@@ -2449,7 +2431,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		} catch {
 			// Optional cache promotion cannot alter an already completed Actor result.
 		} finally {
-			if (!retained) runtimeState.disposeBranch(branch);
+			if (!retained) state.session.lifecycle.release(branch);
 		}
 	};
 
@@ -2465,7 +2447,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		state.session.authoritativeResultCaptures.delete(actorAction);
 		const durationMs = finiteMetric(input.durationMs);
 		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) {
-			if (capture) disposeAuthoritativeResultCapture(capture);
+			state.session.lifecycle.release(capture);
 			return;
 		}
 		const key = actorAction.actionKey;
@@ -2478,10 +2460,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (provider?.kind === "actor") {
 				await promoteAuthoritativeResult(state, key, input.output, durationMs, provider.toolExecution, capture);
 			} else {
-				disposeAuthoritativeResultCapture(capture);
+				state.session.lifecycle.release(capture);
 			}
 		} else if (capture) {
-			disposeAuthoritativeResultCapture(capture);
+			state.session.lifecycle.release(capture);
 		}
 	};
 
@@ -3208,6 +3190,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.plan.clear();
 		pruneActionContexts(session);
 		clearActorActions(session);
+		if (!terminal) await session.lifecycle.drain();
 	};
 
 	const finishState = (state: Turn, terminal: boolean): Promise<void> =>
@@ -3393,8 +3376,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		startTurn,
 		previewActorTool,
 		previewActorCall,
-		consume,
-		actual,
+		consume: (input, signal) => {
+			const task = consume(input, signal);
+			return runtimeState.sessions.get(input.sessionID)?.lifecycle.track(task) ?? task;
+		},
+		actual: (input) => {
+			const task = actual(input);
+			return runtimeState.sessions.get(input.sessionID)?.lifecycle.track(task) ?? task;
+		},
 		finishTurn,
 		settingsChanged,
 		releaseSession,
