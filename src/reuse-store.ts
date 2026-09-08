@@ -197,7 +197,7 @@ export class ProvenanceCertificateStore {
 		});
 		if (Date.now() >= this.gcDueAt) {
 			this.gcDueAt = Date.now() + this.gcIntervalMs;
-			void this.gc().catch(() => undefined);
+			await this.gc().catch(() => undefined);
 		}
 		return published;
 	}

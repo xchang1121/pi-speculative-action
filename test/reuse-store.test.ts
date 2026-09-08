@@ -1,7 +1,8 @@
 import { mkdtemp, rm, unlink, utimes } from "node:fs/promises";
+import * as filesystem from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createExecPrototype,
 	digestObject,
@@ -10,6 +11,9 @@ import {
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
 import { ArtifactCAS, ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
+
+vi.mock("node:fs/promises", { spy: true });
 
 const roots: string[] = [];
 const PRODUCER = {
@@ -22,7 +26,7 @@ afterEach(async () => {
 });
 
 describe("persistent provenance store", () => {
-	it("deduplicates CAS artifacts and indexes immutable certificates across store instances", async () => {
+	it.each([false, true])("drains admitted publication and deduplicates persistent certificates (maintenance failure=%s)", async (fails) => {
 		const root = await temporaryRoot();
 		const initial = new ProvenanceCertificateStore(root);
 		const first = await initial.artifacts.put("output bytes");
@@ -50,6 +54,7 @@ describe("persistent provenance store", () => {
 		const store = new ProvenanceCertificateStore(root, {
 			maxCertificates: 1,
 			maxBytes: 1024 * 1024,
+			gcIntervalMs: 0,
 			orphanGraceMs: 0,
 		});
 		const secondArtifact = await store.artifacts.put("second");
@@ -63,9 +68,35 @@ describe("persistent provenance store", () => {
 		const future = new Date(Date.now() + 60_000);
 		await utimes(artifactPaths[1]!, future, future);
 		const second = completed(secondArtifact, 789, "second");
-		await store.put(second);
+		const { readdir } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		let enter!: () => void, resume!: () => void;
+		let intercepted = false;
+		const failure = new Error("maintenance IO failure");
+		const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { resume = resolve; });
+		const enumeration = vi.spyOn(filesystem, "readdir").mockImplementation((...args) => {
+			const entries = readdir(...args);
+			if (intercepted || String(args[0]) !== path.join(root, "certificates")) return entries;
+			intercepted = true; enter(); return entries.then(async (value) => { await gate; if (fails) throw failure; return value; });
+		});
+		const collect = vi.spyOn(store, "gc"), publish = vi.fn(() => store.put(second)), closed = vi.fn();
+		const gateway = new ToolExecutionGateway<never, boolean>([]);
+		const publication = gateway.executeAuthoritative({ tool: "certificate", input: {} }, publish);
+		let retirement: Promise<void> | undefined, collection: ReturnType<typeof store.gc> | undefined;
+		try {
+			await entered; collection = collect.mock.results[0]!.value;
+			retirement = Promise.all([gateway.dispose(), gateway.dispose()]).then(() => { closed(); });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(await store.get(second.id)).toEqual(second);
+			expect(publish).toHaveBeenCalledOnce(); expect(collect).toHaveBeenCalledOnce();
+			expect(closed).not.toHaveBeenCalled();
+		} finally {
+			resume(); await Promise.allSettled([publication, retirement ?? gateway.dispose()]);
+			await store.stats().finally(() => { enumeration.mockRestore(); collect.mockRestore(); });
+		}
+		expect(await publication).toBe(true); expect(closed).toHaveBeenCalledOnce(); expect(publish).toHaveBeenCalledOnce();
 
-		const collected = await store.gc();
+		if (fails) await expect(collection).rejects.toBe(failure);
+		const collected = fails ? await store.gc() : await collection;
 		expect(collected).toMatchObject({
 			removedCertificates: 1,
 			removedArtifacts: 1,
@@ -108,19 +139,12 @@ describe("persistent provenance store", () => {
 		await expect(store.put(certificate)).rejects.toThrow("missing artifact");
 	});
 
-	it("keeps the artifact CAS usable independently from certificate indexing", async () => {
-		const root = await temporaryRoot();
-		const cas = new ArtifactCAS(root);
-		const reference = await cas.put("standalone");
-
-		expect(await cas.has(reference)).toBe(true);
-		expect((await cas.get(reference))?.toString("utf8")).toBe("standalone");
-	});
-
-	it("leases a verified artifact closure before replay and survives backing-file removal", async () => {
+	it("independently leases a verified CAS closure and survives backing-file removal", async () => {
 		const root = await temporaryRoot();
 		const cas = new ArtifactCAS(root);
 		const reference = await cas.put("leased bytes");
+		expect(await cas.has(reference)).toBe(true);
+		expect((await cas.get(reference))?.toString("utf8")).toBe("leased bytes");
 		const closure = await cas.load([reference, reference]);
 		if (!closure) throw new Error("expected verified closure");
 		expect(closure).toMatchObject({ artifacts: 1, bytes: reference.size });

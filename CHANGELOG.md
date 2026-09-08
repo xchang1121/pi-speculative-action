@@ -253,6 +253,9 @@
 
 ### Fixed
 
+- Certificate publication waits for any due store maintenance it starts, so the existing admitted
+  execution lifetime drains GC before shutdown. Maintenance failures still preserve the publication
+  result; collection frequency, store serialization and memory-before-persistence handoffs are unchanged.
 - Dependency equality counts already-captured records without locale-sensitive sorting. Reordering
   distinct Unicode action IDs preserves bindings and descendant identities; changes to dependency
   conditions or multiplicity still renew execution, and the producer's visible edge order is retained.
