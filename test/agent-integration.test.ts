@@ -772,32 +772,42 @@ describe("speculative action host", () => {
 		await coordinator.dispose();
 	}, 5_000);
 
-	it("skips a shorter-context Drafter without truncating or compressing Actor history", async () => {
+	it.each(["context", "model", "options"] as const)("skips an ineligible Drafter after %s preparation without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
+		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
 		const complete = vi.fn(async () => drafterCall({ path: "notes.txt" }));
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async () => ({ content: [{ type: "text" as const, text: "unused" }], details: {} }),
-		};
+		const tool = createReadTool(cwd);
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
-			draftModel: { ...model("short"), contextWindow: 32, maxTokens: 16 },
+			draftModel: async () => {
+				if (phase === "model") { entered.resolve(); await release.promise; }
+				return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
+			},
+			getDraftOptions: async () => {
+				if (phase === "options") { entered.resolve(); await release.promise; }
+				return {};
+			},
 			complete,
 			preflight: () => true,
+			onEvent: (event) => { if (event.type === "source_request") settled.resolve(); },
 		});
-
-		await host.startTurn({
-			...startInput(tool),
-			context: { systemPrompt: "x".repeat(128), messages: [], tools: [tool] },
-		});
-		await waitFor(() => !host.runtime.inspect("session").pendingPredictions);
-
-		expect(complete).not.toHaveBeenCalled();
-		await host.dispose();
+		let closing: Promise<void> | undefined, closed = false;
+		try {
+			await host.startTurn({
+				...startInput(tool),
+				context: { systemPrompt: "x".repeat(128), messages: [], tools: [tool] },
+			});
+			if (phase === "context") await settled.promise;
+			else {
+				await entered.promise;
+				closing = host.dispose().then(() => { closed = true; });
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(closed).toBe(false);
+				release.resolve(); await closing;
+			}
+			expect(complete).not.toHaveBeenCalled();
+		} finally { release.resolve(); await closing; await host.dispose(); }
 	});
 
 });

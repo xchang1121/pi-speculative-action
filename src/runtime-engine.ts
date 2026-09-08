@@ -640,7 +640,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly actionContexts: Map<string, PlanActionContext<StartInput, StateData>>;
 	readonly launchTimers: Map<string, ReturnType<typeof setTimeout>>;
 	readonly sourceSlots: Set<SourceRequestSlot>;
-	readonly sourceTasks: Set<Promise<void>>;
+	readonly sourceTasks: Set<Promise<unknown>>;
 	readonly actorCalls: Map<string, ActorAction>;
 	readonly anonymousActorCalls: ActorAction[];
 	readonly authoritativeResultCaptures: Map<ActorAction, AuthoritativeResultCapture<Output>>;
@@ -1091,13 +1091,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const slot of [...session.sourceSlots]) releaseSourceSlot(session, slot, failure);
 	};
 
-	const trackSourceTask = (session: Session, task: Promise<void>): void => {
+	const trackSourceTask = <Value>(session: Session, task: Promise<Value>): Promise<Value> => {
 		session.sourceTasks.add(task);
 		void task
 			.finally(() => session.sourceTasks.delete(task))
 			.catch(() => {
 				// Request failure is already represented by its source settlement.
 			});
+		return task;
 	};
 
 	const waitForSourceTasks = async (session: Session): Promise<void> => {
@@ -1137,7 +1138,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					generation,
 					timeoutMs: source.timeoutMs?.(state.settings),
 					produce: (requestSignal) =>
-						source.propose({
+						trackSourceTask(state.session, Promise.resolve(source.propose({
 							startInput: state.startInput,
 							data: state.data,
 							settings: state.settings,
@@ -1146,7 +1147,7 @@ export function makeStructuralSpeculativeActionRuntime<
 							proposalIndex: index,
 							proposalCount: count,
 							signal: requestSignal,
-						}),
+						}))),
 					count: (value) => asUpdates(value).length,
 				}).then((request) =>
 					sourceRequestFinished(
@@ -2645,7 +2646,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					generation,
 					timeoutMs: source.timeoutMs?.(context.settings),
 					produce: (requestSignal) =>
-						source.continue!({
+						trackSourceTask(session, Promise.resolve(source.continue!({
 							startInput: context.startInput,
 							data: context.data,
 							settings: context.settings,
@@ -2658,7 +2659,7 @@ export function makeStructuralSpeculativeActionRuntime<
 							output,
 							trigger,
 							signal: requestSignal,
-						}),
+						}))),
 					count: (value) => asUpdates(value).length,
 				});
 				await sourceRequestFinished(

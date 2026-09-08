@@ -25,7 +25,7 @@ describe("source request ownership", () => {
 	it("owns expiration and deadlines without admitting late success or leaking late rejection", async () => {
 		vi.useFakeTimers();
 		try {
-			for (const mode of ["expired", "abort", "timeout"] as const) for (const late of ["resolve", "reject"] as const) {
+			for (const mode of ["expired", "queued", "abort", "timeout"] as const) for (const late of ["resolve", "reject"] as const) {
 				const parent = new AbortController(), generation = new SourceGeneration(parent.signal);
 				let release!: (value: string[]) => void, reject!: (error: unknown) => void, enter!: () => void;
 				const producer = new Promise<string[]>((resolve, fail) => { release = resolve; reject = fail; });
@@ -35,18 +35,19 @@ describe("source request ownership", () => {
 				const pending = runSourceRequest({ request, generation, timeoutMs: 10, count,
 					produce: (input) => { signal = input; enter(); return producer; },
 				});
-				if (mode !== "expired") {
+				if (mode === "queued") parent.abort();
+				else if (mode !== "expired") {
 					await entered;
 					if (mode === "abort") parent.abort(); else await vi.advanceTimersByTimeAsync(10);
 				}
 				const settled = await pending;
-				expect(settled.settlement).toMatchObject({ status: mode === "timeout" ? "timeout" : "aborted",
-					cause: { stage: "source", code: { expired: "turn_finished", abort: "turn_aborted", timeout: "timeout" }[mode] },
-				});
-				expect(signal?.aborted).toBe(mode === "expired" ? undefined : true);
-				expect(settled.value).toBeUndefined();
-				if (late === "reject" && mode !== "expired") reject(new Error("late failure")); else release(["late"]);
+				if (late === "reject" && signal) reject(new Error("late failure")); else release(["late"]);
 				await vi.runAllTimersAsync();
+				expect(settled.settlement).toMatchObject({ status: mode === "timeout" ? "timeout" : "aborted",
+					cause: { stage: "source", code: { expired: "turn_finished", queued: "turn_aborted", abort: "turn_aborted", timeout: "timeout" }[mode] },
+				});
+				expect(signal?.aborted).toBe(mode === "expired" || mode === "queued" ? undefined : true);
+				expect(settled.value).toBeUndefined();
 				expect(count).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
 			}
 		} finally { vi.useRealTimers(); }

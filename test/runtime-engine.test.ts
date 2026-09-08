@@ -436,20 +436,38 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true });
 	});
 
-	it("drains executions, sealed branches and Actor captures before retiring their session", async () => {
-		for (const phase of ["running", "sealed", "capture", "promotion", "sealing"] as const) for (const dispose of [false, true]) {
-			const started = barrier(), finish = barrier(), cancelled = barrier(), releasing = barrier(), release = barrier();
+	it.each(["prediction", "continuation", "running", "sealed", "capture", "promotion", "sealing"] as const)("drains %s work before retiring its session", async (phase) => {
+		const sourceWork = phase === "prediction" || phase === "continuation";
+		for (const mode of sourceWork ? ["disabled", "disposed", "terminal"] as const : ["disabled", "disposed"] as const) {
+			const started = barrier(), producerStarted = barrier(), expired = barrier(), finish = barrier(), cancelled = barrier(), releasing = barrier(), release = barrier();
 			const ready = candidateSucceeded(); let released = false, observed = Promise.resolve();
 			const cleanup = vi.fn(async () => { releasing.arrive(); await release.promise; released = true; });
-			const observing = phase !== "running" && phase !== "sealed";
+			const observing = !sourceWork && phase !== "running" && phase !== "sealed";
+			let production: Promise<ReturnType<typeof plan>> | undefined;
+			const produce = (signal: AbortSignal) => production = (async () => {
+				signal.addEventListener("abort", () => cancelled.arrive(), { once: true }); producerStarted.arrive();
+				try {
+					await finish.promise;
+					if (mode === "disposed") throw new Error("late producer failure");
+					return plan("source", "late", { path: "late.ts" });
+				}
+				finally { await cleanup(); }
+			})();
 			const fixture = harness({
-				source: { id: "source", enabled: () => !observing, propose: () => plan("source", "late", { path: "README.md" }) },
+				source: { id: "source", enabled: () => !observing,
+					timeoutMs: () => mode === "terminal" ? 0 : undefined,
+					propose: ({ signal }) => phase === "prediction" ? produce(signal) : plan("source", "late", { path: "README.md" }),
+					...(phase === "continuation" ? { continue: ({ signal }: { signal: AbortSignal }) => produce(signal) } : {}),
+				},
 				execute: async (_tool, _input, signal) => {
 					signal.addEventListener("abort", () => cancelled.arrive(), { once: true }); started.arrive();
 					if (phase === "running") await finish.promise;
-					return world("late", { onDispose: cleanup });
+					return world("late", { onDispose: sourceWork ? undefined : cleanup });
 				},
-				onEvent: ready.observe,
+				onEvent: (event) => {
+					ready.observe(event);
+					if (event.type === "source_request" && event.request.settlement.status === "timeout") expired.arrive();
+				},
 				captureAuthoritativeResult: () => ({ route: RESOURCE_ROUTE, dispose: cleanup,
 					seal: async (output) => { started.arrive(); if (phase === "sealing") await finish.promise; return world(output, { onDispose: cleanup }); } }),
 				...(phase === "promotion" ? { rejectCandidateOutput: () => { throw new Error("optional cache policy failed"); } } : {}),
@@ -462,18 +480,24 @@ describe("structural speculative runtime", () => {
 						observed = fixture.runtime.actual({ ...call("turn"), durationMs: 1, output: "actor" });
 						if (phase === "promotion") await observed; else await started.promise;
 					}
-				} else await (phase === "running" ? started.promise : ready.promise);
-				const closing = (dispose ? fixture.runtime.dispose() : fixture.runtime.settingsChanged({ ...settings, enabled: false }))
+				} else if (sourceWork) await producerStarted.promise;
+				else await (phase === "running" ? started.promise : ready.promise);
+				if (mode === "terminal") await expired.promise;
+				const executions = fixture.executions();
+				const closing = (mode === "disposed" ? fixture.runtime.dispose() : mode === "terminal"
+					? fixture.runtime.finishTurn({ ...call("turn"), terminal: true })
+					: fixture.runtime.settingsChanged({ ...settings, enabled: false }))
 					.then(() => { expect(released, `${phase}: lifecycle returned before cleanup`).toBe(true); });
 				const outcome = Promise.allSettled([closing]);
-				if (phase === "running") await cancelled.promise;
+				if (phase === "running" || sourceWork) await cancelled.promise;
 				if (phase === "sealing") await new Promise<void>((resolve) => setImmediate(resolve));
 				finish.arrive(); await releasing.promise;
 				await new Promise<void>((resolve) => setImmediate(resolve)); // Let the close continuation run; no elapsed-time race.
 				release.arrive();
 				expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]); await observed;
-				expect(cleanup).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
-			} finally { finish.arrive(); release.arrive(); await fixture.runtime.dispose(); }
+				expect(cleanup).toHaveBeenCalledOnce(); expect(fixture.executions()).toBe(executions);
+				expect(fixture.runtime.inspect().sharedCandidates).toBe(mode === "terminal" && phase === "continuation" ? 1 : 0);
+			} finally { finish.arrive(); release.arrive(); await production?.catch(() => {}); await fixture.runtime.dispose(); }
 		}
 	});
 

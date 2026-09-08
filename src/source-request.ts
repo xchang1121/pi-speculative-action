@@ -47,7 +47,7 @@ export class SourceGeneration {
 	}
 }
 
-/** Producer-only timing and cancellation; downstream admission is deliberately outside this function. */
+/** Producer timing/cancellation; the caller retains physical production until close, separately from admission. */
 export async function runSourceRequest<Value>(input: {
 	readonly request: SourceRequestIdentity;
 	readonly generation: SourceGeneration;
@@ -67,7 +67,10 @@ export async function runSourceRequest<Value>(input: {
 	const abortFromGeneration = () => controller.abort(input.generation.expiration);
 	input.generation.signal.addEventListener("abort", abortFromGeneration, { once: true });
 	const producer = Promise.resolve()
-		.then(() => input.produce(controller.signal))
+		.then(() => {
+			controller.signal.throwIfAborted();
+			return input.produce(controller.signal);
+		})
 		.then(
 			(value) => ({ kind: "produced" as const, value }),
 			(error) => ({ kind: "error" as const, error }),

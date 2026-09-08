@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Session shutdown drains physical prediction and continuation producers even after their admission
+  wait times out or is cancelled. Late failures stay contained; terminal shared-result retention remains.
+  Cancellation before the producer microtask prevents launch, and Drafter preparation rechecks its
+  request signal before starting a model call after asynchronous model/options resolution.
 - Capture plan headers, action identities and dependency records before input cloning. Producer or
   preflight callbacks cannot rewrite an accepted revision, scheduling edge or draft-token accounting.
   Dependencies are canonicalized and frozen once; revision comparison reuses those records and

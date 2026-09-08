@@ -126,7 +126,7 @@ export function createDrafterPlanSource(input: {
 				batches.set(batchKey, batch);
 			}
 			const prepared = await batch;
-			if (!prepared.utility.allowed) return undefined;
+			if (!prepared.utility.allowed || signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 			const reasoning = clampThinkingLevel(prepared.model, "off");
 			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
