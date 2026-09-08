@@ -110,14 +110,10 @@ export interface SandboxWorkspaceContext {
 	readonly transactions: WorkspaceTransactionDriver;
 }
 
-export interface SandboxWorkspaceBranchOptions {
+export interface SandboxWorkspaceBranchOptions extends WorkspaceSandboxOptions {
 	readonly cwd: string;
 	readonly action: SpeculativeToolExecutionContext["action"];
 	readonly parentCheckpoint?: WorldCheckpoint;
-	readonly gitBinary?: string;
-	readonly driver?: WorkspaceSandboxDriver;
-	readonly overlayfsBinary?: string;
-	readonly fusermountBinary?: string;
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement>;
 	/** Optional backend metrics collected during execute/capture and sealed into the branch. */
 	readonly executionMetrics?: () => WorldExecutionMetrics;
@@ -130,20 +126,15 @@ export interface SandboxWorkspaceBranchOptions {
 	readonly validate?: () => Promise<ResourceValidation>;
 }
 
-export interface PrepareSandboxWorkspaceOptions extends LinuxOverlayfsOptions {
-	readonly gitBinary?: string;
-	readonly driver?: WorkspaceSandboxDriver;
+export interface PrepareSandboxWorkspaceOptions extends WorkspaceSandboxOptions {
 	readonly signal?: AbortSignal;
 }
 
 interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
-	readonly repository: string;
-	readonly gitDirectory: string;
-	readonly baselineRoot: string;
-	readonly gitBinary: string;
+	readonly baselineGit: ReturnType<typeof bindGit>;
+	readonly indexGit: ReturnType<typeof bindGit>;
 	readonly pool: PooledGitRepository;
 	readonly commit: string;
-	readonly driver: Exclude<WorkspaceSandboxDriver, "auto">;
 	readonly baselineFrontier: Map<string, RegularFileState | undefined>;
 	readonly openTransactionClock: () => Promise<FileHandle>;
 	readonly transactionClockLinks: 0 | 1;
@@ -166,8 +157,9 @@ interface PooledGitRepository {
 	readonly owner: WorkspaceSandboxState;
 	readonly sourceRoot: string;
 	readonly parent: string;
-	readonly repository: string;
 	readonly gitBinary: string;
+	readonly git: ReturnType<typeof bindGit>;
+	readonly index: ReturnType<typeof bindGit>;
 	readonly versions: ResourceVersionManager;
 	commit?: string;
 	version?: ResourceVersionToken;
@@ -230,8 +222,7 @@ class GitWorkspaceTransactionCapture implements WorkspaceTransactionCapture {
 class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 	private readonly active = new Set<GitWorkspaceTransactionCapture>();
 	private lock: Promise<void> = Promise.resolve();
-	private readonly gitBinary: string;
-	private readonly gitRoot: string;
+	private readonly git: ReturnType<typeof bindGit>;
 	private readonly sandboxRoot: string;
 	private readonly baselineTree: string;
 	private readonly captureStructure: () => Promise<WorkspaceStructureSnapshot>;
@@ -245,8 +236,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 	private disposed = false;
 
 	constructor(
-		gitBinary: string,
-		gitRoot: string,
+		git: ReturnType<typeof bindGit>,
 		sandboxRoot: string,
 		baselineTree: string,
 		captureStructure: () => Promise<WorkspaceStructureSnapshot>,
@@ -256,8 +246,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 		initialStructure: WorkspaceStructureSnapshot,
 		initialFrontier: ReadonlyMap<string, RegularFileState | undefined>,
 	) {
-		this.gitBinary = gitBinary;
-		this.gitRoot = gitRoot;
+		this.git = git;
 		this.sandboxRoot = sandboxRoot;
 		this.baselineTree = baselineTree;
 		this.captureStructure = captureStructure;
@@ -468,8 +457,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 			const previous = beforeFrontier.has(relativePath)
 				? beforeFrontier.get(relativePath)
 				: await readGitTreeRegularState(
-						this.gitBinary,
-						this.gitRoot,
+						this.git,
 						this.baselineTree,
 						relativePath,
 						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
@@ -1177,13 +1165,10 @@ async function createPrivateSandboxWorkspace(
 			observationExcludes,
 			structure,
 			transactions,
-			repository: pool.repository,
-			gitDirectory,
-			baselineRoot,
-			gitBinary,
+			baselineGit: bindGit(gitBinary, baselineRoot, ["-C", baselineRoot]),
+			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
 			pool,
 			commit,
-			driver,
 			baselineFrontier,
 			openTransactionClock,
 			transactionClockLinks,
@@ -1221,20 +1206,11 @@ async function createPrivateSandboxWorkspace(
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWorkspace): Promise<WorkspaceTransactionDriver> {
-	const baselineTree = (
-		await git(
-			workspace.gitBinary,
-			["--git-dir", workspace.repository, "rev-parse", `${workspace.commit}^{tree}`],
-			workspace.processRoot,
-		)
-	)
-		.toString("utf8")
-		.trim();
+	const baselineTree = (await workspace.pool.git(["rev-parse", `${workspace.commit}^{tree}`], { cwd: workspace.processRoot })).toString("utf8").trim();
 	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
 	const initialStructure = await workspace.structure.capture();
 	const driver = new GitWorkspaceTransactionDriver(
-		workspace.gitBinary,
-		workspace.baselineRoot,
+		workspace.baselineGit,
 		workspace.sandboxRoot,
 		baselineTree,
 		workspace.structure.capture,
@@ -1284,16 +1260,18 @@ async function createSandboxRepository(
 ): Promise<PooledGitRepository> {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-pool-"));
 	const repository = path.join(parent, "snapshot.git");
+	const git = bindGit(gitBinary, parent, ["--git-dir", repository]);
 	try {
-		await git(gitBinary, ["init", "--bare", repository], parent);
-		await git(gitBinary, ["--git-dir", repository, "config", "core.autocrlf", "false"], parent);
-		await git(gitBinary, ["--git-dir", repository, "config", "core.longpaths", "true"], parent);
+		await bindGit(gitBinary, parent)(["init", "--bare", repository]);
+		await git(["config", "core.autocrlf", "false"]);
+		await git(["config", "core.longpaths", "true"]);
 		return {
 			owner,
 			sourceRoot,
 			parent,
-			repository,
 			gitBinary,
+			git,
+			index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
 			versions: new ResourceVersionManager(sourceRoot),
 			active: 0,
 			idleWaiters: new Set(),
@@ -1331,62 +1309,17 @@ async function acquireSandboxBaseline(
 						? incrementalPathspecs(repository.sourceRoot, changedPaths)
 						: undefined;
 				if (repository.commit && changedPathspecs) {
-					await git(
-						repository.gitBinary,
-						[
-							"--git-dir",
-							repository.repository,
-							"--work-tree",
-							repository.sourceRoot,
-							"read-tree",
-							repository.commit,
-						],
-						repository.sourceRoot,
-					);
+					await repository.index(["read-tree", repository.commit]);
 					if (changedPathspecs.length) {
 						await stageSandboxPaths(repository, changedPathspecs);
 					}
 				} else {
-					await git(
-						repository.gitBinary,
-						["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "read-tree", "--empty"],
-						repository.sourceRoot,
-					);
-					await git(
-						repository.gitBinary,
-						[
-							"--git-dir",
-							repository.repository,
-							"--work-tree",
-							repository.sourceRoot,
-							"add",
-							"-f",
-							"-A",
-							"--",
-							...snapshotPathspecs(),
-						],
-						repository.sourceRoot,
-					);
+					await repository.index(["read-tree", "--empty"]);
+					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				}
-				const tree = (
-					await git(
-						repository.gitBinary,
-						["--git-dir", repository.repository, "--work-tree", repository.sourceRoot, "write-tree"],
-						repository.sourceRoot,
-					)
-				)
-					.toString("utf8")
-					.trim();
+				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				if (repository.commit) {
-					const previousTree = (
-						await git(
-							repository.gitBinary,
-							["--git-dir", repository.repository, "show", "-s", "--format=%T", repository.commit],
-							repository.parent,
-						)
-					)
-						.toString("utf8")
-						.trim();
+					const previousTree = (await repository.git(["show", "-s", "--format=%T", repository.commit])).toString("utf8").trim();
 					if (tree === previousTree) {
 						if ((await repository.versions.validate(version)).expired) continue;
 						replaceSandboxVersion(repository, version);
@@ -1394,30 +1327,12 @@ async function acquireSandboxBaseline(
 						return repository.commit;
 					}
 				}
-				const commit = (
-					await git(
-						repository.gitBinary,
-						[
-							"--git-dir",
-							repository.repository,
-							"commit-tree",
-							tree,
-							...(repository.commit ? ["-p", repository.commit] : []),
-							"-m",
-							"speculative baseline",
-						],
-						repository.parent,
-						authorEnvironment,
-					)
-				)
-					.toString("utf8")
-					.trim();
+				const commit = (await repository.git(
+					["commit-tree", tree, ...(repository.commit ? ["-p", repository.commit] : []), "-m", "speculative baseline"],
+					{ environment: authorEnvironment },
+				)).toString("utf8").trim();
 				if ((await repository.versions.validate(version)).expired) continue;
-				await git(
-					repository.gitBinary,
-					["--git-dir", repository.repository, "update-ref", "refs/heads/baseline", commit],
-					repository.parent,
-				);
+				await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				repository.commit = commit;
 				replaceSandboxVersion(repository, version);
 				retained = true;
@@ -1431,11 +1346,7 @@ async function acquireSandboxBaseline(
 }
 
 async function countGitBaselineEntries(repository: PooledGitRepository, commit: string): Promise<number> {
-	const tree = await git(
-		repository.gitBinary,
-		["--git-dir", repository.repository, "ls-tree", "-r", "-z", "--name-only", commit],
-		repository.parent,
-	);
+	const tree = await repository.git(["ls-tree", "-r", "-z", "--name-only", commit]);
 	return parseNullList(tree).length;
 }
 
@@ -1443,15 +1354,7 @@ async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: rea
 	for (const batch of batchPathspecs(pathspecs)) {
 		let pending = batch;
 		for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
-			const tracked = new Set(
-				parseNullList(
-					await git(
-						repository.gitBinary,
-						["--git-dir", repository.repository, "ls-files", "-z", "--"],
-						repository.sourceRoot,
-					),
-				),
-			);
+			const tracked = new Set(parseNullList(await repository.git(["ls-files", "-z", "--"], { cwd: repository.sourceRoot })));
 			pending = (
 				await Promise.all(
 					pending.map(async (pathspec) =>
@@ -1463,21 +1366,7 @@ async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: rea
 			).filter((pathspec): pathspec is string => pathspec !== undefined);
 			if (!pending.length) break;
 			try {
-				await git(
-					repository.gitBinary,
-					[
-						"--git-dir",
-						repository.repository,
-						"--work-tree",
-						repository.sourceRoot,
-						"add",
-						"-f",
-						"-A",
-						"--",
-						...pending,
-					],
-					repository.sourceRoot,
-				);
+				await repository.index(["add", "-f", "-A", "--", ...pending]);
 				break;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.includes("did not match any files") || attempt === 2) {
@@ -1555,24 +1444,16 @@ async function attachSandboxWorkspace(
 	const sandboxRoot = path.join(processRoot, "workspace");
 	try {
 		if (ownedProcessRoot) await mkdir(processRoot, { recursive: true });
-		await git(
-			repository.gitBinary,
-			["--git-dir", repository.repository, "worktree", "add", "--detach", sandboxRoot, commit],
-			processRoot,
-		);
+		await repository.git(["worktree", "add", "--detach", sandboxRoot, commit], { cwd: processRoot });
 		const gitDirectory = (
-			await git(repository.gitBinary, ["-C", sandboxRoot, "rev-parse", "--absolute-git-dir"], sandboxRoot)
+			await bindGit(repository.gitBinary, sandboxRoot, ["-C", sandboxRoot])(["rev-parse", "--absolute-git-dir"])
 		)
 			.toString("utf8")
 			.trim();
 		if (!path.isAbsolute(gitDirectory)) throw new Error("private Git directory is unavailable");
 		return { sandboxRoot, processRoot, commit, gitDirectory };
 	} catch (error) {
-		await git(
-			repository.gitBinary,
-			["--git-dir", repository.repository, "worktree", "remove", "--force", sandboxRoot],
-			repository.parent,
-		).catch(() => undefined);
+		await repository.git(["worktree", "remove", "--force", sandboxRoot]).catch(() => undefined);
 		if (!ownedProcessRoot) await rm(processRoot, { recursive: true, force: true }).catch(() => undefined);
 		throw error;
 	}
@@ -1636,32 +1517,19 @@ async function discardOverlayBaseline(
 	baseline: SharedOverlayBaseline,
 ): Promise<void> {
 	if (baseline.active > 0) throw new Error("cannot discard an active OverlayFS lower directory");
-	await git(
-		repository.gitBinary,
-		["--git-dir", repository.repository, "worktree", "remove", "--force", baseline.root],
-		repository.parent,
-	).catch(() => undefined);
+	await repository.git(["worktree", "remove", "--force", baseline.root]).catch(() => undefined);
 	await rm(baseline.privateRoot, { recursive: true, force: true });
 }
 
 async function discardPreparedSandbox(repository: PooledGitRepository, workspace: PreparedGitWorkspace): Promise<void> {
-	await git(
-		repository.gitBinary,
-		["--git-dir", repository.repository, "worktree", "remove", "--force", workspace.sandboxRoot],
-		repository.parent,
-	).catch(() => undefined);
+	await repository.git(["worktree", "remove", "--force", workspace.sandboxRoot]).catch(() => undefined);
 	await rm(workspace.processRoot, { recursive: true, force: true });
 }
 
 async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
-	const prefix = ["--git-dir", repository.repository, "--work-tree", repository.sourceRoot];
 	const [tracked, untracked] = await Promise.all([
-		git(
-			repository.gitBinary,
-			[...prefix, "diff-files", "--name-only", "--no-renames", "-z", "--"],
-			repository.sourceRoot,
-		),
-		git(repository.gitBinary, [...prefix, "ls-files", "--others", "-z", "--"], repository.sourceRoot),
+		repository.index(["diff-files", "--name-only", "--no-renames", "-z", "--"]),
+		repository.index(["ls-files", "--others", "-z", "--"]),
 	]);
 	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
 		.filter((file) => !isSnapshotExcluded(slash(file)))
@@ -1890,11 +1758,7 @@ async function cleanupPrivateSandboxWorkspace(workspace: PrivateSandboxWorkspace
 			failures.push(error);
 		}
 	} else {
-		await git(
-			workspace.gitBinary,
-			["--git-dir", workspace.repository, "worktree", "remove", "--force", workspace.sandboxRoot],
-			workspace.processRoot,
-		).catch(() => undefined);
+		await workspace.pool.git(["worktree", "remove", "--force", workspace.sandboxRoot], { cwd: workspace.processRoot }).catch(() => undefined);
 	}
 	if (safeToRelease) {
 		await rm(workspace.processRoot, { recursive: true, force: true }).catch((error) => failures.push(error));
@@ -1948,27 +1812,11 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promis
 }
 
 async function collectGitChangeResources(workspace: PrivateSandboxWorkspace): Promise<readonly string[]> {
-	const prefix = ["--git-dir", workspace.gitDirectory, "--work-tree", workspace.sandboxRoot];
-	const readOnlyGitEnvironment = { GIT_OPTIONAL_LOCKS: "0" };
-	const tracked = await git(
-		workspace.gitBinary,
-		[...prefix, "diff", "--name-only", "--no-renames", "-z", workspace.commit, "--"],
-		workspace.sandboxRoot,
-		readOnlyGitEnvironment,
-	);
-	const untracked = await git(
-		workspace.gitBinary,
-		[...prefix, "ls-files", "--others", "-z", "--"],
-		workspace.sandboxRoot,
-		readOnlyGitEnvironment,
-	);
+	const options = { environment: { GIT_OPTIONAL_LOCKS: "0" } };
+	const tracked = await workspace.indexGit(["diff", "--name-only", "--no-renames", "-z", workspace.commit, "--"], options);
+	const untracked = await workspace.indexGit(["ls-files", "--others", "-z", "--"], options);
 	if (process.platform === "win32") {
-		const untrackedRoots = await git(
-			workspace.gitBinary,
-			[...prefix, "ls-files", "--others", "--directory", "-z", "--"],
-			workspace.sandboxRoot,
-			readOnlyGitEnvironment,
-		);
+		const untrackedRoots = await workspace.indexGit(["ls-files", "--others", "--directory", "-z", "--"], options);
 		for (const resource of parseNullList(untrackedRoots)) {
 			if (slash(resource).endsWith("/")) await assertNoDirectoryLinks(workspace.sandboxRoot, resource);
 		}
@@ -2111,11 +1959,9 @@ async function collectOverlayChangeResources(
 	const resources = new Set<string>();
 	const addBaselineSubtree = async (resource: string) => {
 		const prefix = resource || ".";
-		const tree = await git(
-			workspace.gitBinary,
-			["-C", workspace.baselineRoot, "ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix],
-			workspace.baselineRoot,
-			{ GIT_OPTIONAL_LOCKS: "0" },
+		const tree = await workspace.baselineGit(
+			["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix],
+			{ environment: { GIT_OPTIONAL_LOCKS: "0" } },
 		);
 		for (const record of parseNullList(tree)) {
 			const separator = record.indexOf("\t");
@@ -2142,36 +1988,16 @@ async function readBaselineState(
 	resource: string,
 ): Promise<RegularFileState | undefined> {
 	if (workspace.baselineFrontier.has(resource)) return workspace.baselineFrontier.get(resource);
-	const entry = await git(
-		workspace.gitBinary,
-		["-C", workspace.baselineRoot, "ls-tree", "-z", workspace.commit, "--", resource],
-		workspace.baselineRoot,
-	);
-	if (entry.length === 0) return undefined;
-	const metadata = entry.subarray(0, entry.indexOf(0)).toString("utf8").split("\t", 1)[0];
-	const [mode, kind, hash] = metadata.split(" ");
-	if ((mode !== "100644" && mode !== "100755") || kind !== "blob") {
-		throw new Error(`sandbox baseline resource is not a regular file: ${resource}`);
-	}
-	if (!hash) throw new Error(`invalid Git baseline entry: ${resource}`);
-	return {
-		content: await git(
-			workspace.gitBinary,
-			["-C", workspace.baselineRoot, "cat-file", "blob", hash],
-			workspace.baselineRoot,
-		),
-		mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644,
-	};
+	return readGitTreeRegularState(workspace.baselineGit, workspace.commit, resource, 64 * 1024 * 1024);
 }
 
 async function readGitTreeRegularState(
-	gitBinary: string,
-	gitRoot: string,
+	git: ReturnType<typeof bindGit>,
 	tree: string,
 	resource: string,
 	maxBytes = WORKSPACE_TRANSACTION_MAX_BYTES,
 ): Promise<RegularFileState | undefined> {
-	const entry = await git(gitBinary, ["-C", gitRoot, "ls-tree", "-z", tree, "--", resource], gitRoot);
+	const entry = await git(["ls-tree", "-z", tree, "--", resource]);
 	if (entry.length === 0) return undefined;
 	const terminator = entry.indexOf(0);
 	if (terminator === -1) throw new Error(`invalid Git transaction entry: ${resource}`);
@@ -2181,13 +2007,7 @@ async function readGitTreeRegularState(
 		throw new Error(`workspace transaction resource is not a regular file: ${resource}`);
 	}
 	if (!hash) throw new Error(`invalid Git transaction blob: ${resource}`);
-	const content = await git(
-			gitBinary,
-			["-C", gitRoot, "cat-file", "blob", hash],
-			gitRoot,
-			{},
-			Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1),
-		);
+	const content = await git(["cat-file", "blob", hash], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1) });
 	if (content.byteLength > maxBytes) throw new Error(`Git transaction blob exceeds capture limit: ${resource}`);
 	return {
 		content,
@@ -2527,22 +2347,23 @@ function parseNullList(value: Uint8Array): string[] {
 		.map((item) => slash(item));
 }
 
-function git(
+/** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
+function bindGit(
 	command: string,
-	args: readonly string[],
 	cwd: string,
-	environment: Readonly<Record<string, string>> = {},
-	maxBuffer = 64 * 1024 * 1024,
-): Promise<Buffer> {
-	return new Promise((resolve, reject) => {
+	prefix: readonly string[] = [],
+) {
+	const bound = [...prefix];
+	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
+		const args = [...bound, ...input];
 		execFile(
 			command,
 			[...args],
 			{
-				cwd,
-				env: { ...process.env, ...environment },
+				cwd: options.cwd ?? cwd,
+				env: { ...process.env, ...options.environment },
 				encoding: "buffer",
-				maxBuffer,
+				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
 			},
 			(error, stdout, stderr) => {
 				if (error) {

@@ -168,6 +168,9 @@
 
 ### Changed
 
+- The existing Git process owner now binds private repository/index arguments once. Workspace and
+  transaction capture share regular-blob decoding while retaining their separate byte limits;
+  removed redundant sandbox fields and repeated option declarations without another forwarding layer.
 - Prediction, Actor preview and observed-result candidates share one initializer for identity sequence,
   reservation ownership and accounting defaults; origin-specific timing, coverage and routes remain explicit.
 - Settings menus share their existing action loop and grouped editors; labels, dynamic submenus,
