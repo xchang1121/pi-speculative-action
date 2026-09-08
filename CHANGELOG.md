@@ -61,6 +61,7 @@
 
 ### Added
 
+- Gateway retirement drains transaction sealing-failure cleanup before disposing execution worlds.
 - Runtime candidate indexing now calls its existing pending/result stores directly for local operations;
   removed seven forwarding helpers while retaining atomic cross-store transitions and branch disposal.
 - Find and grep qualification share the existing bounded search worker and its owned process/input

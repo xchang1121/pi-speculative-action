@@ -143,7 +143,7 @@ export class ToolExecutionGateway<Context, Output> {
 		context: Context,
 	): Promise<EffectTransaction<Output>> {
 		const attempt = this.transactions.begin({ tool: operation.tool, callID: operation.callID, route });
-		return this.transactions.execute(attempt, () => this.router.fork(route, context));
+		return this.lifecycle.track(this.transactions.execute(attempt, () => this.router.fork(route, context)));
 	}
 
 	dispose(): Promise<void> {

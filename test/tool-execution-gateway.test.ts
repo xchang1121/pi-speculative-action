@@ -12,7 +12,7 @@ type TestWorld = ExecutionWorld<TestContext, string>;
 
 describe("ToolExecutionGateway", () => {
 	it("seals one admission lifetime and drains Actor, preparation and world work before disposal", async () => {
-		for (const phase of ["actor", "actor_failed", "prepare", "fork", "fork_failed", "capture", "diagnostics"]) {
+		for (const phase of ["actor", "actor_failed", "prepare", "fork", "fork_failed", "seal_failed", "capture", "diagnostics"]) {
 			let enter!: () => void, release!: () => void, probing = false;
 			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
 			const dispose = vi.fn(), failure = new Error("admitted execution failed");
@@ -20,19 +20,23 @@ describe("ToolExecutionGateway", () => {
 			const world: TestWorld = { id: "workspace", scope: "fallback", isolation: "workspace_branch", dispose,
 				speculation: { tools: ["custom_process"], capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
 					prepare: async () => { if (probing && ["prepare", "diagnostics"].includes(phase)) await borrow(); },
-					execute: async ({ value }) => { await borrow(); return branch("workspace", value); } },
+					execute: async ({ value }) => {
+						if (phase !== "seal_failed") await borrow();
+						return { ...branch("workspace", value), ...(phase === "seal_failed" ? { output: Object.create({ opaque: true }) as string, dispose: borrow } : {}) };
+					} },
 				observation: { capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
 					capture: async () => { await borrow(); return { seal: async (output) => branch("workspace", output), dispose: () => {} }; } },
 			};
 			const gateway = new ToolExecutionGateway([world]), preparation = { cwd: "/workspace" };
 			const operation = { tool: "custom_process", callID: "call", input: { any: "shape" } }, context = { value: "sealed" };
-			const requirement = { operation, effect: "workspace_mutation" as const, requirements: WORKSPACE_PATH_MUTATION_EFFECTS };
+			const effect = phase === "seal_failed" ? "observation" as const : "workspace_mutation" as const;
+			const requirement = { operation, effect, requirements: WORKSPACE_PATH_MUTATION_EFFECTS };
 			const route = (await gateway.resolve(requirement, preparation))!;
-			expect(route).toMatchObject({ backend: "workspace", reuse: "exclusive_branch" });
+			expect(route).toMatchObject({ backend: "workspace", reuse: phase === "seal_failed" ? "shared_result" : "exclusive_branch" });
 			expect(await gateway.resolve({ operation, effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS }, preparation)).toBeUndefined();
 			probing = true;
 			const pending = phase.startsWith("actor") ? gateway.executeAuthoritative(operation, async () => { await borrow(); return "actor"; })
-				: phase.startsWith("fork") ? gateway.executeSpeculative(operation, route, context)
+				: phase.startsWith("fork") || phase === "seal_failed" ? gateway.executeSpeculative(operation, route, context)
 				: phase === "capture" ? gateway.captureAuthoritativeResult(requirement, preparation, context)
 				: phase === "diagnostics" ? gateway.diagnostics({ ...preparation, refresh: true }) : gateway.resolve(requirement, preparation);
 			const outcome = Promise.allSettled([pending]); await entered;
