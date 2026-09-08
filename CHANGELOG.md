@@ -63,6 +63,8 @@
 
 ### Added
 
+- PatternAware shares feedback counter definitions across types, initialization and persistence
+  validation, and deep-copies each public snapshot once. Persistence fields and versions are unchanged.
 - Validation and reconstruction register their borrowed lifetime before entering backend callbacks,
   including callbacks that synchronously request transaction retirement.
 - Gateway retirement drains transaction sealing-failure cleanup before disposing execution worlds.

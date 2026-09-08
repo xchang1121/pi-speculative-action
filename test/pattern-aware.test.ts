@@ -473,59 +473,37 @@ describe("PatternAware", () => {
 		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
-	test("skips malformed persisted contexts, binding paths, and binding nodes", async () => {
+	test.each([17, 18])("restores only valid patterns and feedback from persistence v%s and owns every public snapshot", async (version) => {
 		const file = await patternFile("corrupt-state");
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern" });
-		await fs.writeFile(
-			file,
-			JSON.stringify({
-				version: 17,
-				patterns: [
-					valid,
-					{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
-					{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
-					{
-						...valid,
-						id: "bad-binding",
-						bindings: {
-							'["filePath"]': { type: "event", relativeEvent: -1, field: "output", path: "not-an-array" },
-						},
-					},
-				],
-				pools: [],
-				sequenceCounts: [],
-			}),
-		);
-
-		const store = new PatternAwareStore(settings(), file);
-		await expect(store.load()).resolves.toBeUndefined();
-
-		expect(store.snapshot().map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
-	});
-
-	test("rejects indexed pools that reference a missing or malformed event", async () => {
-		const file = await patternFile("corrupt-index");
-		await fs.writeFile(
-			file,
-			JSON.stringify({
-				version: 17,
-				patterns: [],
-				events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }],
-				pools: [
-					{
-						key: "bad-reference",
-						context: [{ tool: "grep", outcome: "success" }],
-						targetTool: "read",
-						samples: [{ context: [0], target: 1, gap: 0 }],
-					},
-				],
-				sequenceCounts: [],
-			}),
-		);
-
+		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
+		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
+		await fs.writeFile(file, JSON.stringify({ version,
+			patterns: [valid,
+				{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
+				{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
+				{ ...valid, id: "bad-binding", bindings: { '["filePath"]': { type: "event", relativeEvent: -1, field: "output", path: "not-an-array" } } },
+				...counters.flatMap((key) => [undefined, null, -1, "0", Number.NaN, Number.POSITIVE_INFINITY].map((value, index) =>
+					({ ...valid, id: `bad-feedback-${key}-${index}`, feedback: { ...valid.feedback, [key]: value } }))),
+				...(["rejectedAfterMatch", "unobserved"] as const).map((key) => ({ ...valid, id: `bad-feedback-${key}`, feedback: { ...valid.feedback, [key]: { invalid: -1 } } })),
+			],
+			events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }],
+			pools: [1, 99].map((target) => ({ key: `bad-reference-${target}`, context: [{ tool: "grep", outcome: "success" }],
+				targetTool: "read", samples: [{ context: [0], target, gap: 0 }] })), sequenceCounts: [],
+		}));
 		const store = new PatternAwareStore(settings({ minOccurrences: 1 }), file);
 		await expect(store.load()).resolves.toBeUndefined();
-		expect(store.snapshot()).toEqual([]);
+		const expected = store.snapshot(), exposed = store.snapshot()[0]!;
+		expect(expected.map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
+		expect(exposed.feedback).toEqual(valid.feedback);
+		for (const value of [exposed, exposed.context[0]!, exposed.bindings['["path"]']!, exposed.feedback,
+			exposed.feedback.rejectedAfterMatch, exposed.feedback.unobserved, exposed.gapCounts, exposed.gapLastSeen!]) Object.assign(value, { external: 99 });
+		(exposed.dependencies as unknown[]).push({});
+		expect(store.snapshot()).toEqual(expected);
+		store.issued(valid.id); await store.flush();
+		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+		expect(persisted.pools).toEqual([]);
+		expect(persisted.patterns[0].feedback).toEqual({ ...valid.feedback, issued: valid.feedback.issued + 1 });
 	});
 
 	test("shares analyzer state across predictor-only settings and isolates analyzer configurations", async () => {

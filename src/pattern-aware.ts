@@ -134,38 +134,20 @@ export type PatternAwareBinding = (
 	readonly variantCounts?: Readonly<Record<string, number>>;
 };
 
-export type PatternAwarePattern = {
-	readonly id: string;
+export type PatternAwarePattern = Readonly<Omit<MutablePattern, "context" | "bindings" | "dependencies" | "gapCounts" | "gapLastSeen" | "feedback">> & {
 	readonly context: ReadonlyArray<PatternAwareEventSignature>;
-	readonly targetTool: string;
 	readonly bindings: Readonly<Record<string, PatternAwareBinding>>;
 	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
-	readonly targetSchemaHash?: string;
 	readonly gapCounts: Readonly<Record<string, number>>;
 	readonly gapLastSeen?: Readonly<Record<string, number>>;
-	readonly occurrences: number;
-	readonly replayMatches: number;
-	readonly historicalOpportunities: number;
-	readonly historicalMatches: number;
 	readonly empiricalProbability: number;
 	readonly adoptionProbability: number;
 	readonly feedback: PatternAwareFeedback;
-	readonly averageDurationMs: number;
-	readonly lastSeenSequence: number;
 };
 
-export type PatternAwareFeedback = {
-	readonly issued: number;
-	readonly observed: number;
-	readonly matched: number;
-	readonly adopted: number;
+export type PatternAwareFeedback = Readonly<PatternFeedbackCounters> & {
 	readonly rejectedAfterMatch: Readonly<Partial<Record<ResolutionStage, number>>>;
 	readonly unobserved: Readonly<Record<string, number>>;
-	readonly recentMatchedWeight: number;
-	readonly recentMismatchedWeight: number;
-	readonly recentAdoptedWeight: number;
-	readonly recentRejectedWeight: number;
-	readonly sequence: number;
 };
 
 export type PatternAwareCandidate = {
@@ -225,18 +207,12 @@ type MutablePattern = {
 	lastSeenSequence: number;
 };
 
-type MutablePatternFeedback = {
-	issued: number;
-	observed: number;
-	matched: number;
-	adopted: number;
+const PATTERN_FEEDBACK_COUNTERS = ["issued", "observed", "matched", "adopted", "recentMatchedWeight",
+	"recentMismatchedWeight", "recentAdoptedWeight", "recentRejectedWeight", "sequence"] as const;
+type PatternFeedbackCounters = Record<typeof PATTERN_FEEDBACK_COUNTERS[number], number>;
+type MutablePatternFeedback = PatternFeedbackCounters & {
 	rejectedAfterMatch: Partial<Record<ResolutionStage, number>>;
 	unobserved: Record<string, number>;
-	recentMatchedWeight: number;
-	recentMismatchedWeight: number;
-	recentAdoptedWeight: number;
-	recentRejectedWeight: number;
-	sequence: number;
 };
 
 type PersistedPatternSample = {
@@ -2763,15 +2739,9 @@ function perToolBeam<Value>(values: readonly Value[], width: number, tool: (valu
 
 function readonlyPattern(pattern: MutablePattern, clock: number, halfLife: number): PatternAwarePattern {
 	return {
-		...pattern,
+		...structuredClone(pattern),
 		empiricalProbability: backoffProbability([pattern], clock, halfLife),
 		adoptionProbability: patternAdoptionProbability([pattern], clock, halfLife),
-		feedback: structuredClone(pattern.feedback),
-		context: pattern.context.map((item) => ({ ...item })),
-		bindings: structuredClone(pattern.bindings),
-		dependencies: structuredClone(pattern.dependencies),
-		gapCounts: { ...pattern.gapCounts },
-		gapLastSeen: { ...pattern.gapLastSeen },
 	};
 }
 
@@ -2829,17 +2799,11 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 }
 
 function emptyPatternFeedback(sequence: number): MutablePatternFeedback {
+	const counters = Object.fromEntries(PATTERN_FEEDBACK_COUNTERS.map((key) => [key, 0])) as PatternFeedbackCounters;
 	return {
-		issued: 0,
-		observed: 0,
-		matched: 0,
-		adopted: 0,
+		...counters,
 		rejectedAfterMatch: {},
 		unobserved: {},
-		recentMatchedWeight: 0,
-		recentMismatchedWeight: 0,
-		recentAdoptedWeight: 0,
-		recentRejectedWeight: 0,
 		sequence: Math.max(0, sequence),
 	};
 }
@@ -2848,35 +2812,12 @@ function mutablePatternFeedback(value: unknown): MutablePatternFeedback | undefi
 	const feedback = asRecord(value);
 	const rejectedAfterMatch = numericRecord(feedback?.rejectedAfterMatch);
 	const unobserved = numericRecord(feedback?.unobserved);
-	if (
-		!feedback ||
-		!rejectedAfterMatch ||
-		!unobserved ||
-		![
-			feedback.issued,
-			feedback.observed,
-			feedback.matched,
-			feedback.adopted,
-			feedback.recentMatchedWeight,
-			feedback.recentMismatchedWeight,
-			feedback.recentAdoptedWeight,
-			feedback.recentRejectedWeight,
-			feedback.sequence,
-		].every((metric) => isFiniteNumber(metric) && metric >= 0)
-	)
-		return;
+	const counters = numericRecord(Object.fromEntries(PATTERN_FEEDBACK_COUNTERS.map((key) => [key, feedback?.[key]]))) as PatternFeedbackCounters | undefined;
+	if (!rejectedAfterMatch || !unobserved || !counters) return;
 	return {
-		issued: feedback.issued as number,
-		observed: feedback.observed as number,
-		matched: feedback.matched as number,
-		adopted: feedback.adopted as number,
+		...counters,
 		rejectedAfterMatch: rejectedAfterMatch as Partial<Record<ResolutionStage, number>>,
 		unobserved,
-		recentMatchedWeight: feedback.recentMatchedWeight as number,
-		recentMismatchedWeight: feedback.recentMismatchedWeight as number,
-		recentAdoptedWeight: feedback.recentAdoptedWeight as number,
-		recentRejectedWeight: feedback.recentRejectedWeight as number,
-		sequence: feedback.sequence as number,
 	};
 }
 
