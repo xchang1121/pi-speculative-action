@@ -115,7 +115,7 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
-	it("reuses running and completed results for every keyable Pi tool", async () => {
+	it("prepares each prediction once and adopts its keyed execution for every Pi tool", async () => {
 		expect(mockToolCalls.map(([tool]) => tool)).toEqual(KEYABLE_TOOLS);
 		for (const phase of ["running", "completed"] as const) {
 			for (const [toolName, proposal] of mockToolCalls) {
@@ -127,32 +127,33 @@ describe("speculative action host", () => {
 				const resourceExecution = PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? invocation?.filesystem : undefined;
 				const expected = resourceExecution ? toolName === "read" ? "two\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
 				const { promise: gate, resolve: release } = deferred<void>();
+				const started = deferred<void>(), completed = deferred<void>(), adopted = deferred<void>();
 				const speculativeExecution = vi.fn(async () => {
+					started.resolve();
 					await gate;
 					return { content: [{ type: "text" as const, text: expected }], details: {} };
 				});
 				const actorExecution = vi.fn(async () => speculativeExecution());
+				const permissions: Array<{ args: unknown; action: { input: unknown } }> = [];
+				const prepareArguments = vi.fn((input: unknown) => {
+					const value = structuredClone(input) as Record<string, unknown>;
+					return toolName === "read" ? { ...value, offset: Number(value.offset ?? 1) + 1 } : value;
+				});
 				const tool: AgentTool<typeof mockToolSchema> = {
-					name: toolName,
-					label: toolName,
-					description: toolName,
-					parameters: mockToolSchema,
+					name: toolName, label: toolName, description: toolName, parameters: mockToolSchema, prepareArguments,
 					execute: resourceExecution ? async () => { throw new Error("Host tool must not execute speculatively"); } : speculativeExecution,
 				};
 				const events: SpeculativeActionEvent<string>[] = [];
 				const sandbox = resourceExecution
 					? createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [toolName], maxBytes: () => 1024 * 1024 })
-					: mockRuntimeWorld(async (context) => ({
-					result: await context.tool.execute(context.callID, context.args as never, context.signal),
-					isError: false,
-				}));
+					: toolRuntimeWorld();
 				const host = createSpeculativeActionHost(`session-${turnID}`, {
 					cwd,
-					getSettings: () => ({ ...settings(), tools: [toolName] }),
+					getSettings: () => ({ ...settings(), drafterMaxDepth: 0, tools: [toolName] }),
 					draftModel: model("draft"),
 					complete: async () =>
-						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: args }], "toolUse"),
-					preflight: () => true,
+						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: proposal }], "toolUse"),
+					preflight: (request) => { permissions.push(request); return true; },
 					projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 					resolveInvocation: () => resourceExecution ? { ...invocation!, filesystem: async (view, request) => {
 						await speculativeExecution();
@@ -161,15 +162,16 @@ describe("speculative action host", () => {
 					executionWorlds: [sandbox],
 					onEvent: (event) => {
 						events.push(event);
+						if (event.type === "candidate" && event.state.status === "succeeded") completed.resolve();
+						if (event.type === "actor_action") adopted.resolve();
 					},
 				});
 				try {
 					await host.startTurn({ ...startInput(tool, turnID), tools: resourceExecution ? [tool, writer] : [tool] });
-					await waitFor(() => speculativeExecution.mock.calls.length === 1);
-					if (phase === "completed") {
-						release();
-						await waitFor(() => events.some((event) => event.type === "candidate" && event.state.status === "succeeded"));
-					}
+					await started.promise;
+					expect(prepareArguments).toHaveBeenCalledOnce();
+					for (const { args, action } of permissions) expect(args).toEqual(action.input);
+					if (phase === "completed") { release(); await completed.promise; }
 					let settled = false;
 					const result = host.execute(
 						{ turnID, id: `actor-${toolName}`, tool: toolName, args, tools: [tool] },
@@ -188,12 +190,10 @@ describe("speculative action host", () => {
 					expect((await result).content).toEqual([{ type: "text", text: expected }]);
 					expect(speculativeExecution).toHaveBeenCalledOnce();
 					expect(actorExecution).not.toHaveBeenCalled();
-					await waitFor(() =>
-						events.some((event) => event.type === "actor_action" && event.settlement.provider.kind === "speculative"),
-					);
-					expect(events.find((event) => event.type === "actor_action")).toMatchObject({
-						settlement: { provider: { kind: "speculative", match: { kind: "exact" } } },
-					});
+					await adopted.promise;
+					expect(prepareArguments).toHaveBeenCalledOnce();
+					expect(events.find((event) => event.type === "actor_action"))
+						.toMatchObject({ settlement: { provider: { kind: "speculative", match: { kind: "exact" } } } });
 					expect(events.find((event) => event.type === "candidate" && event.state.status === "succeeded")).toMatchObject({
 						candidate: { route: { reuse: PI_ACTION_SEMANTICS.effect(toolName) === "observation" ? "shared_result" : "exclusive_branch" } },
 					});

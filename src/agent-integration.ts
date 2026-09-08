@@ -275,7 +275,6 @@ export function createSpeculativeActionHost(
 		draftModel: options.draftModel,
 		getDraftOptions: options.getDraftOptions,
 		complete: options.complete,
-		validateArguments: validateCandidateArguments,
 	});
 	const patternPlans = createPatternPlanSource({
 		sessionID,
@@ -326,7 +325,7 @@ export function createSpeculativeActionHost(
 			} else {
 				tool = context.data.tools.get(toolName);
 				if (!tool) return undefined;
-				validated = validateCandidateArguments(tool, toolName, input, "spec_key");
+				validated = prepareCandidateArguments(tool, toolName, input);
 				if (validated === undefined) return undefined;
 			}
 			if (!tool) return undefined;
@@ -340,9 +339,7 @@ export function createSpeculativeActionHost(
 			if (!tool) return undefined;
 			const definition = actionSemantics.definition(action);
 			if (!definition) return undefined;
-			const args = validateCandidateArguments(tool, toolName, concrete, callID);
-			if (args === undefined) return undefined;
-			const operation: ToolOperation = { tool: toolName, callID, input: args, signal, action };
+			const operation: ToolOperation = { tool: toolName, callID, input: concrete, signal, action };
 			const captured = await executionGateway.captureAuthoritativeResult(
 				{ operation, effect: definition.effect, requirements: definition.requirements },
 				{ cwd: options.cwd, signal },
@@ -365,12 +362,10 @@ export function createSpeculativeActionHost(
 			};
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, callID, signal }) => {
+		preflightCandidate: async ({ data, tool: toolName, concrete, action, route, signal }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy" };
-			const args = validateCandidateArguments(tool, toolName, concrete, callID);
-			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
-			const result = await options.preflight({ tool, toolName, args, action, route, signal });
+			const result = await options.preflight({ tool, toolName, args: concrete, action, route, signal });
 			return typeof result === "boolean"
 				? result
 					? { ok: true }
@@ -380,12 +375,10 @@ export function createSpeculativeActionHost(
 		authorizeCandidate: async ({ stateData, tool: toolName, concrete, action, route, signal }) => {
 			const tool = stateData.tools.get(toolName);
 			if (!tool || !options.preflight) return { ok: false, reason: "permission_or_policy_changed" };
-			const args = validateCandidateArguments(tool, toolName, concrete, "spec_authorize");
-			if (args === undefined) return { ok: false, reason: "invalid_tool_call_input" };
 			const result = await options.preflight({
 				tool,
 				toolName,
-				args,
+				args: concrete,
 				action,
 				route,
 				signal: signal ?? new AbortController().signal,
@@ -398,10 +391,8 @@ export function createSpeculativeActionHost(
 		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
-			const args = validateCandidateArguments(tool, toolName, concrete, callID);
-			if (args === undefined) throw new Error(`Invalid arguments for tool ${toolName}`);
 			return executionGateway.executeSpeculative(
-				{ tool: toolName, callID, input: args, signal, action },
+				{ tool: toolName, callID, input: structuredClone(concrete), signal, action },
 				route,
 				(operation) => ({
 					cwd: options.cwd,
@@ -525,17 +516,18 @@ export function createSpeculativeActionHost(
 	};
 }
 
-function validateCandidateArguments(
+/** Raw predictions cross Pi's preparation boundary once, before canonical identity is sealed. */
+function prepareCandidateArguments(
 	tool: AgentTool,
 	toolName: string,
 	input: unknown,
-	callID: string,
 ): unknown | undefined {
 	try {
-		const prepared = tool.prepareArguments ? tool.prepareArguments(input) : input;
+		const owned = structuredClone(input);
+		const prepared = tool.prepareArguments ? tool.prepareArguments(owned) : owned;
 		const toolCall: AgentToolCall = {
 			type: "toolCall",
-			id: callID,
+			id: "spec_key",
 			name: toolName,
 			arguments: prepared as Record<string, unknown>,
 		};

@@ -190,6 +190,8 @@
 
 ### Fixed
 
+- Prepare each prediction's arguments once before K(a); permission checks and execution no longer
+  rerun non-idempotent Pi preparation or mutate the source's proposed arguments.
 - File evidence now captures stable descriptor identities, follows and seals symlink chains, rejects
   special files, and treats watchers only as early invalidation hints.
 - Strace evidence now reconstructs unfinished/resumed syscalls, selects the root from process

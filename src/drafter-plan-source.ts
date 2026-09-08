@@ -1,7 +1,6 @@
 import {
 	calculateContextTokens,
 	estimateContextTokens,
-	type AgentTool,
 	type AgentToolCall,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -63,12 +62,6 @@ export function createDrafterPlanSource(input: {
 	readonly draftModel?: DraftModelSelection;
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
-	readonly validateArguments: (
-		tool: AgentTool,
-		toolName: string,
-		input: unknown,
-		callID: string,
-	) => unknown | undefined;
 }): DrafterPlanSourceController {
 	const batches = new Map<string, Promise<DrafterBatch>>();
 	const gate = new DrafterUtilityGate();
@@ -165,13 +158,7 @@ export function createDrafterPlanSource(input: {
 			}
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
-			const tool = data.tools.get(call.name);
-			if (
-				!tool ||
-				!candidateNames.includes(call.name) ||
-				input.validateArguments(tool, call.name, call.arguments, call.id) === undefined
-			)
-				return undefined;
+			if (!data.tools.has(call.name) || !candidateNames.includes(call.name)) return undefined;
 			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
 			return {
 				id: proposalID,
