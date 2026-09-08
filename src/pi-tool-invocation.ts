@@ -139,7 +139,7 @@ export async function createClosedSearchProfile(cwd: string) {
 		invocations.set(tool, Object.freeze({
 			executor: profile.id, identity: Object.freeze({ profile, cwd }),
 			semantics: Object.freeze({ ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: profile.id,
-				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" }),
+				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" }),
 			authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
 		} satisfies ToolInvocation));
 	}

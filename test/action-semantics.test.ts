@@ -47,7 +47,7 @@ describe("ActionSemanticsRegistry", () => {
 			effect: "workspace_mutation",
 			requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		});
-		expect(PI_ACTION_SEMANTICS.resourceScope("write")).toBeUndefined();
+		expect(PI_ACTION_SEMANTICS.definition("write")?.resourceScope).toBeUndefined();
 	});
 
 	it("canonicalizes equivalent ls defaults and rejects unstable views", () => {
@@ -141,19 +141,19 @@ describe("ActionSemanticsRegistry", () => {
 	});
 
 	it("binds profile requirements and resource evidence without mutating the native registry", () => {
-		for (const tool of ["grep", "find"]) {
+		for (const tool of ["grep", "find"]) for (const scope of ["tree_content", "captured_inputs"] as const) {
 			const profile: ActionSemanticsDefinition = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed.v1",
-				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" };
+				effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: scope };
 			const args = { pattern: "needle", path: "." };
 			const native = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace")!;
 			const closed = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", { fingerprint: "profile.v1", semantics: profile })!;
 			expect(PI_ACTION_SEMANTICS.definition(native)?.effect).toBe("unbounded");
 			expect(PI_ACTION_SEMANTICS.definition(closed)?.effect).toBe("observation");
 			expect(resourceDependencies(native, "/workspace")).toEqual([]);
-			expect(resourceDependencies(closed, "/workspace")).toEqual([{ path: path.resolve("/workspace"), scope: "tree_content" }]);
+			expect(resourceDependencies(closed, "/workspace")).toEqual(scope === "captured_inputs" ? [] : [{ path: path.resolve("/workspace"), scope }]);
 			expect(actionKeyMatch(native, closed, [RESOURCE_INPUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
 			(profile as { resourceScope: string }).resourceScope = "entries";
-			expect(buildActionKey(closed).semantics?.resourceScope).toBe("tree_content");
+			expect(buildActionKey(closed).semantics?.resourceScope).toBe(scope);
 			expect(() => buildActionKey({ ...closed, tool: "unrelated" })).toThrow("contract identity mismatch");
 			expect(Object.isFrozen(closed.semantics?.requirements)).toBe(true);
 		}

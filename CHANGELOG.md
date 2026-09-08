@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Captured-input profiles declare `resourceScope: "captured_inputs"`, which never certifies an ambient
+  Actor execution window. Read the scope from the definition; removed the unused registry forwarding method.
 - Transaction attempts expose only an immutable descriptor and lifecycle view; route and validation
   evidence are now owned snapshots, so external mutations cannot change reuse authority after issuance.
 - Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused

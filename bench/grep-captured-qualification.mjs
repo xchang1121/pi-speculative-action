@@ -112,7 +112,7 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   };
   const invocation = { executor: "captured-grep-qualification", identity: { engine, cwd },
     semantics: { ...PI_ACTION_SEMANTICS.definition("grep"), epoch: "captured-grep-qualification.v2", effect: "observation",
-      requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "tree_content" },
+      requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" },
     filesystem: execute, authoritative: (request) => {
       actorCalls++;
       return actorWorker.request({ root: cwd, args: request.args }, { signal: request.signal,

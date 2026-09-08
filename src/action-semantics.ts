@@ -91,8 +91,8 @@ export interface ActionSemanticsDefinition {
 	readonly effect: ActionEffect;
 	/** Atomic execution guarantees required independently of any concrete backend. */
 	readonly requirements: EffectRequirements;
-	/** Filesystem evidence required to prove that a completed action is still current. */
-	readonly resourceScope?: ResourceDependencyScope;
+	/** Eager filesystem scope, or supplied inputs only (never proof of an ambient Actor window). */
+	readonly resourceScope?: ResourceDependencyScope | "captured_inputs";
 	readonly canonicalize: (input: unknown, cwd: string) => CanonicalAction | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
 }
@@ -134,10 +134,6 @@ export class ActionSemanticsRegistry {
 
 	requirements(action: string | ActionKey): EffectRequirements | undefined {
 		return this.definition(action)?.requirements;
-	}
-
-	resourceScope(action: string | ActionKey): ResourceDependencyScope | undefined {
-		return this.definition(action)?.resourceScope;
 	}
 
 	projectors(): readonly ActionKeyProjector[] {

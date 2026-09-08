@@ -396,20 +396,31 @@ export function resourceDependencies(
 ) {
 	const definition = actionSemantics.definition(action);
 	const scope = definition ? definition.resourceScope : "content";
-	if (scope === undefined) return [];
+	if (scope === undefined || scope === "captured_inputs") return [];
 	return action.resources.map((resource) => ({
 		path: path.resolve(root, resource),
 		scope,
 	}));
 }
 
-export function captureResourceVersion(
+export async function captureResourceVersion(
 	action: ActionKey | undefined,
 	root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 	retainBytes?: number,
 ) {
-	return resourceVersionManager(root).capture(action ? resourceDependencies(action, root, actionSemantics) : undefined, retainBytes);
+	const dependencies = action ? resourceDependencies(action, root, actionSemantics) : undefined;
+	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
+	const normalized = path.resolve(root);
+	let manager = managers.get(normalized);
+	if (!manager) {
+		manager = new ResourceVersionManager(normalized, {
+			watch: path.dirname(normalized) !== normalized,
+			onIdle: () => { if (managers.get(normalized) === manager) { manager!.close(); managers.delete(normalized); } },
+		});
+		managers.set(normalized, manager);
+	}
+	return manager.capture(dependencies, retainBytes);
 }
 
 export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
@@ -440,22 +451,6 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 export function closeResourceVersionManagers() {
 	for (const manager of managers.values()) manager.close();
 	managers.clear();
-}
-
-function resourceVersionManager(root: string) {
-	const normalized = path.resolve(root);
-	const existing = managers.get(normalized);
-	if (existing) return existing;
-	let manager: ResourceVersionManager;
-	manager = new ResourceVersionManager(normalized, {
-		onIdle: () => {
-			if (managers.get(normalized) !== manager) return;
-			manager.close();
-			managers.delete(normalized);
-		},
-	});
-	managers.set(normalized, manager);
-	return manager;
 }
 
 function normalizeDependencies(root: string, dependencies: ReadonlyArray<ResourceDependency>) {

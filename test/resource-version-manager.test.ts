@@ -114,19 +114,23 @@ describe("speculative action resource versions", () => {
 		} finally { resume(); await pending; token.release(); open.mockRestore(); manager.close(); }
 	});
 
-	test("re-evaluates original read arguments over sealed bytes, not parsed output notices", async () => {
+	test.each([false, true])("re-evaluates sealed bytes without expanding Actor observation authority (captured-only=%s)", async (capturedOnly) => {
 		const text = "first\r\n\n[999 more lines in file. Use offset=3 to continue.]\n" + "x".repeat(60_000) + "\nlast";
 		const root = await workspace({ "value.txt": text }), file = path.join(root, "value.txt");
 		const args = { path: "value.txt", offset: 1, limit: 1 }, native = createReadTool(root);
 		const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
-		const key = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { fingerprint: "original", context: invocation })!;
+		const binding = { fingerprint: "original", context: invocation, ...(capturedOnly ? {
+			semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, resourceScope: "captured_inputs" as const },
+		} : {}) };
+		const key = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", binding)!;
+		if (capturedOnly) await expect(captureResourceVersion(key, root, PI_ACTION_SEMANTICS, 100_000)).rejects.toThrow("resource_dependencies_unproven");
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 100_000 });
 		const signal = new AbortController().signal;
 		const branch = await world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
 		try {
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
 				{ path: "@value.txt", offset: 4, limit: 1 }, { path: file, offset: 5 }]) {
-				const action = PI_ACTION_SEMANTICS.buildKey("read", query, root, "", { fingerprint: "original", context: invocation })!;
+				const action = PI_ACTION_SEMANTICS.buildKey("read", query, root, "", binding)!;
 				expect((await branch.reconstruct!({ action, args: query, callID: "actor", signal }))?.result)
 					.toEqual(await native.execute("native", query));
 			}
