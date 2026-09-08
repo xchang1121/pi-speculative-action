@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import { BoundedRecencyMap } from "../src/bounded-recency-map.ts";
@@ -506,7 +506,7 @@ describe("PatternAware", () => {
 		expect(persisted.patterns[0].feedback).toEqual({ ...valid.feedback, issued: valid.feedback.issued + 1 });
 	});
 
-	test("shares analyzer state across predictor-only settings and isolates analyzer configurations", async () => {
+	test.each([false, true])("shares analyzer state and drains every release caller (flush failure=%s)", async (fails) => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-lease-"));
 		temporary.push(workspace);
 		const first = await acquirePatternAwareStore(workspace, settings());
@@ -520,20 +520,30 @@ describe("PatternAware", () => {
 			settings({ maxContextLength: PATTERN_AWARE_DEFAULTS.maxContextLength + 1 }),
 		);
 
-		expect(second.store).toBe(first.store);
-		expect(predictorOnly.store).toBe(first.store);
-		expect(differentAnalyzer.store).not.toBe(first.store);
-		await first.release();
-		const third = await acquirePatternAwareStore(workspace, settings());
-		expect(third.store).toBe(second.store);
+		try {
+			expect(second.store).toBe(first.store);
+			expect(predictorOnly.store).toBe(first.store);
+			expect(differentAnalyzer.store).not.toBe(first.store);
+			let resume!: () => void;
+			const gate = new Promise<void>((resolve) => { resume = resolve; }), failure = new Error("flush failed"), completed = vi.fn();
+			const flush = vi.spyOn(first.store, "flush").mockImplementationOnce(async () => { await gate; if (fails) throw failure; });
+			const released = Promise.allSettled([first.release().finally(completed), first.release().finally(completed)]);
+			try {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(completed).not.toHaveBeenCalled(); expect(flush).toHaveBeenCalledOnce();
+			} finally { resume(); await released; flush.mockRestore(); }
+			expect(await released).toEqual(Array(2).fill(fails ? { status: "rejected", reason: failure } : { status: "fulfilled", value: undefined }));
+			await second.release();
+			const third = await acquirePatternAwareStore(workspace, settings());
+			try { expect(third.store).toBe(second.store); }
+			finally { await third.release(); }
 
-		await second.release();
-		await predictorOnly.release();
-		await differentAnalyzer.release();
-		await third.release();
-		const next = await acquirePatternAwareStore(workspace, settings());
-		expect(next.store).not.toBe(first.store);
-		await next.release();
+			await predictorOnly.release();
+			await differentAnalyzer.release();
+			const next = await acquirePatternAwareStore(workspace, settings());
+			try { expect(next.store).not.toBe(first.store); }
+			finally { await next.release(); }
+		} finally { await Promise.allSettled([first.release(), second.release(), predictorOnly.release(), differentAnalyzer.release()]); }
 	});
 
 	test("discards persisted patterns from a different schema version", async () => {

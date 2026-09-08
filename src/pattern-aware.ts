@@ -1494,19 +1494,17 @@ export async function acquirePatternAwareStore(
 		if (pooled.references === 0 && stores.get(poolKey) === pooled) stores.delete(poolKey);
 		throw error;
 	}
-	let released = false;
+	let released: Promise<void> | undefined;
 	return {
 		store,
-		release: async () => {
-			if (released) return;
-			released = true;
+		release: () => released ??= Promise.resolve().then(async () => {
 			pooled.references = Math.max(0, pooled.references - 1);
 			try {
 				await store.flush();
 			} finally {
 				if (pooled.references === 0 && stores.get(poolKey) === pooled) stores.delete(poolKey);
 			}
-		},
+		}),
 	};
 }
 

@@ -63,6 +63,8 @@
 
 ### Added
 
+- PatternAware lease retirement shares one settlement across all release callers, including flush
+  failures; the lease remains registered before entering persistence callbacks and decrements only once.
 - PatternAware shares feedback counter definitions across types, initialization and persistence
   validation, and deep-copies each public snapshot once. Persistence fields and versions are unchanged.
 - Validation and reconstruction register their borrowed lifetime before entering backend callbacks,
