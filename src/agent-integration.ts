@@ -46,6 +46,7 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
+import { immutableSnapshot } from "./stable-json.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
@@ -286,7 +287,11 @@ export function createSpeculativeActionHost(
 		store: options.patternStore,
 	});
 	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string) => {
-		const invocation = await options.resolveInvocation?.(tool, input);
+		const resolved = await options.resolveInvocation?.(tool, input);
+		const invocation = resolved && Object.freeze({ ...resolved,
+			...(resolved.identity !== undefined ? { identity: immutableSnapshot(resolved.identity) } : {}),
+			...(resolved.process ? { process: immutableSnapshot(resolved.process) } : {}),
+		});
 		const action = schemaHash === undefined ? undefined : actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
 			? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
 		return { ...(invocation ? { invocation } : {}), ...(action ? { action } : {}) };
@@ -321,7 +326,7 @@ export function createSpeculativeActionHost(
 				const bind = (context.consumeInput as BoundActorCall)[ACTOR_OPERATION];
 				if (bind) return (await bind()).action;
 				tool = context.consumeInput.tools.find((candidate) => candidate.name === toolName);
-				validated = input;
+				validated = immutableSnapshot(input);
 			} else {
 				tool = context.data.tools.get(toolName);
 				if (!tool) return undefined;
@@ -451,7 +456,7 @@ export function createSpeculativeActionHost(
 		execute: (input, signal, executor) => {
 			const operation: ToolOperation = {
 				tool: input.tool,
-				input: input.args,
+				input: immutableSnapshot(input.args),
 				...(input.id ? { callID: input.id } : {}),
 				...(signal ? { signal } : {}),
 			};
@@ -459,7 +464,7 @@ export function createSpeculativeActionHost(
 			// One invocation owns its binding; resolve inside consume so Actor arrival includes binding cost.
 			const bind = () => binding ??= (async () => {
 				const tool = input.tools.find((tool) => tool.name === input.tool);
-				return Object.freeze({ ...operation, ...await resolveBinding(input.tool, input.args,
+				return Object.freeze({ ...operation, ...await resolveBinding(operation.tool, operation.input,
 					tool ? stableValueHash(tool.parameters ?? null) : undefined) });
 			})();
 			const actorCall = input.turnID
@@ -468,7 +473,7 @@ export function createSpeculativeActionHost(
 						turnID: input.turnID,
 						id: input.id,
 						tool: input.tool,
-						args: input.args,
+						args: operation.input,
 						tools: input.tools,
 					}
 				: undefined;
@@ -531,7 +536,7 @@ function prepareCandidateArguments(
 			name: toolName,
 			arguments: prepared as Record<string, unknown>,
 		};
-		return validateToolArguments(tool, toolCall);
+		return immutableSnapshot(validateToolArguments(tool, toolCall));
 	} catch {
 		return undefined;
 	}

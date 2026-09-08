@@ -190,6 +190,8 @@
 
 ### Fixed
 
+- Bind Actor arguments and executor metadata to owned snapshots before reuse; asynchronous binding
+  and later configuration mutation cannot change the command or descriptor behind its K(a).
 - Prepare each prediction's arguments once before K(a); permission checks and execution no longer
   rerun non-idempotent Pi preparation or mutate the source's proposed arguments.
 - File evidence now captures stable descriptor identities, follows and seals symlink chains, rejects

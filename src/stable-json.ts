@@ -10,6 +10,19 @@ export function stableEqual(left: unknown, right: unknown): boolean {
 	return equalObject(left, right);
 }
 
+/** Own a structured value before exposing its immutable identity to another lifecycle. */
+export function immutableSnapshot<Value>(value: Value): Value {
+	const owned = structuredClone(value), seen = new WeakSet<object>();
+	const freeze = (item: unknown): void => {
+		if (!isObject(item) || seen.has(item)) return;
+		seen.add(item);
+		for (const child of Object.values(item)) freeze(child);
+		Object.freeze(item);
+	};
+	freeze(owned);
+	return owned;
+}
+
 function equalObject(left: object, right: object): boolean {
 	const leftArray = Array.isArray(left);
 	const rightArray = Array.isArray(right);

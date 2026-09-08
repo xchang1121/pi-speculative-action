@@ -10,7 +10,7 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
-import { stableStringify } from "./stable-json.ts";
+import { immutableSnapshot, stableStringify } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
@@ -300,7 +300,7 @@ export function buildActionKey(input: {
 	const executionFingerprint = input.executionFingerprint ?? "";
 	const semantics = input.semantics ? normalizeDefinition(input.semantics) : undefined;
 	if (semantics && (semantics.tool !== input.tool || semantics.epoch !== semanticsEpoch)) throw new Error("action contract identity mismatch");
-	const canonicalInput = freezeCanonicalValue(structuredClone(input.input));
+	const canonicalInput = immutableSnapshot(input.input);
 	const key = stableStringify({
 		tool: input.tool,
 		semanticsEpoch,
@@ -320,13 +320,6 @@ export function buildActionKey(input: {
 		...(input.executionContext !== undefined ? { executionContext: input.executionContext } : {}),
 		...(semantics ? { semantics } : {}),
 	});
-}
-
-function freezeCanonicalValue<Value>(value: Value, seen = new WeakSet<object>()): Value {
-	if (!value || typeof value !== "object" || Object.isFrozen(value) || seen.has(value)) return value;
-	seen.add(value);
-	for (const child of Object.values(value)) freezeCanonicalValue(child, seen);
-	return Object.freeze(value);
 }
 
 /** Build K(a) from the default Pi action semantics registry. */

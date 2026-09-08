@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { immutableSnapshot } from "./stable-json.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type {
@@ -752,7 +753,7 @@ function validateActions(
 		}
 		let input: unknown;
 		try {
-			input = freezePlanValue(structuredClone(source.input));
+			input = immutableSnapshot(source.input);
 		} catch {
 			return { ok: false, reason: "invalid_action" };
 		}
@@ -847,11 +848,4 @@ function finiteMetric(value: number | undefined): number {
 
 function sequence(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-}
-
-function freezePlanValue<Value>(value: Value, seen = new WeakSet<object>()): Value {
-	if (!value || typeof value !== "object" || Object.isFrozen(value) || seen.has(value)) return value;
-	seen.add(value);
-	for (const child of Object.values(value)) freezePlanValue(child, seen);
-	return Object.freeze(value);
 }

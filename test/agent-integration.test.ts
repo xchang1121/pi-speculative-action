@@ -272,12 +272,15 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace();
 		for (const mode of ["keyed", "unkeyable", "outside-turn", "binding-error"]) {
 			let profile = "initial", boundKey: unknown;
+			const metadata = { command: "npm test", cwd, shell: process.execPath, commandTransport: "argv" as const,
+				environment: { PROFILE: "initial" }, shellArgs: ["--initial"] };
+			const descriptor = structuredClone(metadata);
 			const problem = new Error("selected executor unavailable");
 			const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
 			const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "built" }], details: {} }));
 			const settled = vi.fn();
 			const resolveInvocation = vi.fn(async () => {
-				const invocation = { executor: profile };
+				const invocation = { executor: profile, identity: metadata, process: metadata };
 				bindingStarted.resolve(); await releaseBinding.promise;
 				if (mode === "binding-error") throw problem;
 				return invocation;
@@ -294,14 +297,18 @@ describe("speculative action host", () => {
 				if (mode !== "outside-turn") await host.startTurn(startInput(tool));
 				const call = { ...(mode !== "outside-turn" ? { turnID: "turn-1" } : {}), id: "actor-bash", tool: "bash",
 					args: mode === "unkeyable" ? {} : { command: "npm test" }, tools: mode === "outside-turn" ? [] : [tool] };
+				const admitted = structuredClone(call.args);
 				const pending = host.execute(call, undefined, async (operation) => {
-					expect(operation.invocation).toEqual({ executor: "initial" });
+					metadata.environment.PROFILE = "reconfigured"; metadata.shellArgs.push("--later"); metadata.command = "later";
+					expect(operation.input).toEqual(admitted);
+					expect(operation.invocation).toEqual({ executor: "initial", identity: descriptor, process: descriptor });
 					expect(operation.action?.executionContext).toEqual(mode === "keyed" ? operation.invocation : undefined);
+					expect(operation.action?.input.command).toBe(mode === "keyed" ? "npm test" : undefined);
 					boundKey = operation.action;
 					return actor();
 				});
 				const outcome = mode === "binding-error" ? expect(pending).rejects.toBe(problem) : expect(pending).resolves.toHaveProperty("content.0.text", "built");
-				await bindingStarted.promise; profile = "next"; releaseBinding.resolve();
+				await bindingStarted.promise; profile = "next"; call.args.command = "changed during binding"; releaseBinding.resolve();
 				await outcome;
 				await host.finishTurn("turn-1", true);
 				expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledTimes(mode === "binding-error" ? 0 : 1);
