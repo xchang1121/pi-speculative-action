@@ -56,6 +56,8 @@
 
 ### Added
 
+- Runtime candidate indexing now calls its existing pending/result stores directly for local operations;
+  removed seven forwarding helpers while retaining atomic cross-store transitions and branch disposal.
 - Find and grep qualification share the existing bounded search worker and its owned process/input
   protocol. Removed the separate grep worker and secondary tool discovery; no production grep route
   is enabled. OS input errors retain stock Pi handling, while unproven input authority rejects the call.

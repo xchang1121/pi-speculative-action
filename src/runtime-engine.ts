@@ -14,7 +14,6 @@ import {
 	ActionStore,
 	ResultCache,
 	type ResultCacheEvidence,
-	type ResultCacheLimits,
 	speculativeCacheValue,
 } from "./candidate-stores.ts";
 import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
@@ -715,8 +714,8 @@ interface RuntimeCandidateEntry {
 }
 
 class RuntimeCandidateRegistry<SessionID, Candidate extends RuntimeCandidateEntry> {
-	private readonly jobs: ActionStore<SessionID, Candidate>;
-	private readonly results: ResultCache<SessionID, Candidate>;
+	readonly jobs: ActionStore<SessionID, Candidate>;
+	readonly results: ResultCache<SessionID, Candidate>;
 	private readonly branches: ActionStore<SessionID, Candidate>;
 	private readonly dispose: (candidate: Candidate) => void;
 
@@ -729,15 +728,6 @@ class RuntimeCandidateRegistry<SessionID, Candidate extends RuntimeCandidateEntr
 		this.results = new ResultCache(projectors, score);
 		this.branches = new ActionStore([], true);
 		this.dispose = dispose;
-	}
-
-	insertOrGetCompatible(
-		sessionID: SessionID,
-		candidate: Candidate,
-		canReuseProjected: (existing: Candidate, match: ProjectedActionKeyMatch) => boolean,
-		canReuseExact: (existing: Candidate) => boolean,
-	) {
-		return this.jobs.insertOrGetCompatible(sessionID, candidate, canReuseProjected, canReuseExact);
 	}
 
 	insertPending(sessionID: SessionID, candidate: Candidate): void {
@@ -754,18 +744,6 @@ class RuntimeCandidateRegistry<SessionID, Candidate extends RuntimeCandidateEntr
 	insertResult(sessionID: SessionID, candidate: Candidate): void {
 		this.detach(sessionID, candidate);
 		this.results.insert(sessionID, candidate);
-	}
-
-	recordActorHit(
-		sessionID: SessionID,
-		candidate: Candidate,
-		limits: ResultCacheLimits,
-	): void {
-		this.results.recordActorHit(sessionID, candidate, limits);
-	}
-
-	pending(sessionID: SessionID): readonly Candidate[] {
-		return this.jobs.values(sessionID);
 	}
 
 	lookup(sessionID: SessionID, key: ActionKey) {
@@ -797,14 +775,6 @@ class RuntimeCandidateRegistry<SessionID, Candidate extends RuntimeCandidateEntr
 		this.jobs.delete(sessionID, candidate);
 		this.results.delete(sessionID, candidate);
 		this.branches.delete(sessionID, candidate);
-	}
-
-	trim(
-		sessionID: SessionID,
-		limits: ResultCacheLimits,
-		canEvict: (candidate: Candidate) => boolean,
-	): Candidate[] {
-		return this.results.trim(sessionID, limits, canEvict);
 	}
 
 	snapshot(sessionID: SessionID) {
@@ -1620,7 +1590,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			priorityMs: scheduled.priorityMs,
 			background: scheduled.background,
 		});
-		const insertion = runtimeState.candidates.insertOrGetCompatible(
+		const insertion = runtimeState.candidates.jobs.insertOrGetCompatible(
 			session.id,
 			candidate,
 			(existing, match) =>
@@ -1663,8 +1633,8 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const startQueuedCandidates = (session: Session, preferred?: Candidate): void => {
 		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
-		const queued = runtimeState.candidates
-			.pending(session.id)
+		const queued = runtimeState.candidates.jobs
+			.values(session.id)
 			.filter(
 				(candidate) =>
 					candidate.work.execution.status === "queued" &&
@@ -1777,7 +1747,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const settled = candidate.work.controller.signal.aborted
 				? candidate.work.cancel(failure, completedAt, completedAt - startedAt)
 				: candidate.work.fail(failure, completedAt, completedAt - startedAt);
-			removeCandidate(session, candidate);
+			runtimeState.candidates.remove(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
 		} finally {
 			session.scheduler.complete(candidate);
@@ -1852,7 +1822,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!active()) return;
 		const preferred = rankCandidates(
 			action,
-			allCandidates(state.sessionID).filter(
+			runtimeState.candidates.all(state.sessionID).filter(
 				(candidate) => candidate.origin !== "actor_preview" && candidateWorld(candidate) === undefined,
 			),
 		)[0]?.candidate;
@@ -1919,7 +1889,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const current = record.state;
 		record.state = { status: "cancelled" };
 		if (current.status !== "candidate" || current.ownership !== "preview") return;
-		const candidate = candidateByID(state.sessionID, current.candidateID);
+		const candidate = runtimeState.candidates.find(state.sessionID, current.candidateID);
 		if (!candidate) return;
 		discardCandidate(state.session, candidate, failure, false);
 	};
@@ -2155,11 +2125,11 @@ export function makeStructuralSpeculativeActionRuntime<
 				};
 				reservation.adopt();
 				if (reservation.kind === "exclusive") {
-					removeCandidate(state.session, candidate);
+					runtimeState.candidates.remove(state.session.id, candidate);
 				} else if (candidate.origin === "actor_preview") {
-					removeCandidate(state.session, candidate);
+					runtimeState.candidates.remove(state.session.id, candidate);
 				} else {
-					runtimeState.candidates.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					runtimeState.candidates.results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 				}
 				attempt.select({
 					candidate,
@@ -2202,7 +2172,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				previousActorArrivedAt === undefined ? undefined : actorArrivedAt - previousActorArrivedAt,
 			);
 		}
-		const candidatesAtArrival = allCandidates(state.sessionID);
+		const candidatesAtArrival = runtimeState.candidates.all(state.sessionID);
 		const sequence = ++state.session.sequence;
 		const identity: ActorActionIdentity = {
 			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
@@ -2261,7 +2231,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!previewCandidateID) {
 				await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
 			}
-			const candidates = uniqueCandidates([...candidatesAtArrival, ...allCandidates(state.sessionID)]).filter(
+			const candidates = uniqueCandidates([...candidatesAtArrival, ...runtimeState.candidates.all(state.sessionID)]).filter(
 				(candidate) => candidateWorld(candidate) === undefined,
 			);
 			const ranked = [...rankCandidates(actualKey, candidates)].sort(
@@ -2454,7 +2424,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const settledCandidate =
 			candidate ??
 			(settlement.provider.kind === "speculative"
-				? candidateByID(state.sessionID, settlement.provider.candidateID)
+				? runtimeState.candidates.find(state.sessionID, settlement.provider.candidateID)
 				: undefined);
 		const settledCandidateDescriptor = settledCandidate
 			? Object.freeze(candidateEventDescriptor(settledCandidate))
@@ -2598,7 +2568,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			settlement.match.adoption.status === "adopted";
 		releaseActionContext(session, node.identity.id, adopted);
 		if ("candidateID" in node.execution && node.execution.candidateID) {
-			const candidate = candidateByID(session.id, node.execution.candidateID);
+			const candidate = runtimeState.candidates.find(session.id, node.execution.candidateID);
 			if (
 				candidate?.work.reservation.kind === "exclusive" &&
 				!nodesForCandidate(session, candidate.id).some((item) => item.predictionState.status !== "settled")
@@ -2785,7 +2755,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const dependency of node.action.dependsOn ?? []) {
 			const parentNode = session.plan.get(node.proposalID, dependency.actionID);
 			if (!parentNode || !("candidateID" in parentNode.execution) || !parentNode.execution.candidateID) continue;
-			const candidate = candidateByID(session.id, parentNode.execution.candidateID);
+			const candidate = runtimeState.candidates.find(session.id, parentNode.execution.candidateID);
 			if (!candidate) continue;
 			const parent = unresolvedWorld(candidate);
 			if (parent) parents.add(parent);
@@ -2963,7 +2933,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const startedAt = state.status === "running" ? state.startedAt : performance.now();
 		const completedAt = performance.now();
 		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
-		removeCandidate(session, candidate);
+		runtimeState.candidates.remove(session.id, candidate);
 		if (settled) queueCandidateEvent(session, candidate);
 		if (dispatch) dispatchReady(session);
 	};
@@ -2978,13 +2948,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			cancelCandidate(session, candidate, failure, dispatch);
 			return;
 		}
-		removeCandidate(session, candidate);
+		runtimeState.candidates.remove(session.id, candidate);
 	};
 
 	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause): void => {
 		let invalidated = false;
 		for (const candidate of new Set(candidates)) {
-			if (candidateByID(session.id, candidate.id) !== candidate) continue;
+			if (runtimeState.candidates.find(session.id, candidate.id) !== candidate) continue;
 			discardCandidate(session, candidate, failure, false);
 			session.plan.rearmExecution(candidate.id);
 			invalidated = true;
@@ -2992,13 +2962,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (invalidated) dispatchReady(session);
 	};
 
-	const removeCandidate = (session: Session, candidate: Candidate): void => {
-		runtimeState.candidates.remove(session.id, candidate);
-	};
-
 	const reconcileStores = async (state: Turn): Promise<void> => {
 		const available = new Set(state.definitions.map((definition) => definition.name));
-		for (const candidate of allCandidates(state.sessionID)) {
+		for (const candidate of runtimeState.candidates.all(state.sessionID)) {
 			if (!available.has(candidate.key.tool) ||
 				(candidate.work.execution.status === "queued" && !state.candidateNames.includes(candidate.key.tool)))
 				discardCandidate(state.session, candidate, cause("control", "tool_disabled"));
@@ -3007,12 +2973,12 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const trimResults = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of runtimeState.candidates.trim(
+		for (const candidate of runtimeState.candidates.results.trim(
 			session.id,
 			cacheLimits(settings),
 			(entry) => entry.origin !== "actor_preview" && reservationAvailable(entry.work.reservation),
 		)) {
-			removeCandidate(session, candidate);
+			runtimeState.candidates.remove(session.id, candidate);
 		}
 	};
 
@@ -3030,7 +2996,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const reconcileAuthoritativeEffects = (session: Session, action: ActionKey, adopted?: Candidate): void => {
 		const changed = authoritativeMutationResources(action, adopted);
 		if (!changed.length) return;
-		const candidates = allCandidates(session.id);
+		const candidates = runtimeState.candidates.all(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
 			if (candidate === adopted || (adopted && descendsFrom(candidate, adopted))) continue;
@@ -3138,7 +3104,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const planFailure = terminal ? cause("control", "session_terminal") : failure;
 		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
 		clearLaunchTimers(session);
-		for (const candidate of allCandidates(session.id)) {
+		for (const candidate of runtimeState.candidates.all(session.id)) {
 			if (!terminal || candidate.work.reservation.kind === "exclusive") {
 				discardCandidate(session, candidate, planFailure);
 			}
@@ -3225,7 +3191,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const candidates =
 			sessionID === undefined
 				? runtimeState.candidates.allScopes()
-				: allCandidates(sessionID);
+				: runtimeState.candidates.all(sessionID);
 		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
 		const telemetry = selectedSessions.map((session) => session.events.snapshot());
 		return {
@@ -3355,16 +3321,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		inspect,
 	};
 
-	function allCandidates(sessionID: SessionID): Candidate[] {
-		return runtimeState.candidates.all(sessionID);
-	}
-
-	function candidateByID(sessionID: SessionID, candidateID: string): Candidate | undefined {
-		return runtimeState.candidates.find(sessionID, candidateID);
-	}
-
 	function candidateExecutionDuration(session: Session, candidateID: string): number {
-		const execution = candidateByID(session.id, candidateID)?.work.execution;
+		const execution = runtimeState.candidates.find(session.id, candidateID)?.work.execution;
 		return execution && "executionMs" in execution ? execution.executionMs : 0;
 	}
 
