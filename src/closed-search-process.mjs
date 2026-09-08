@@ -1,17 +1,15 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import path from "node:path";
 import { serialize } from "node:v8";
 import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 
 /** Reuse execution capacity, never results. Busy producers and Actors own independent reservations. */
 export class ClosedSearchProcessPool {
-	#moduleFile; #workers = new Map(); #idle = new Map(); #retirement;
-	constructor(moduleFile) { this.#moduleFile = moduleFile; }
+	#workers = new Map(); #idle = new Map(); #retirement;
 	async request(role, input, options = {}) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		options.signal?.throwIfAborted();
-		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(this.#moduleFile);
+		const worker = this.#idle.get(role) ?? launchClosedSearchWorker();
 		this.#idle.delete(role);
 		if (!this.#workers.has(worker)) void worker.closure.then(() => {
 			this.#workers.delete(worker); if (this.#idle.get(role) === worker) this.#idle.delete(role);
@@ -36,10 +34,10 @@ export class ClosedSearchProcessPool {
 }
 
 /** Owns preparation, one admitted invocation, and hard retirement of a trusted search worker. */
-export function launchClosedSearchWorker(moduleFile, entry = new URL("./closed-search-kernel.mjs", import.meta.url)) {
+export function launchClosedSearchWorker(entry = new URL("./closed-search-kernel.mjs", import.meta.url)) {
 	const { limits } = CLOSED_SEARCH_PROFILE, started = performance.now();
-	const child = fork(entry, [path.resolve(moduleFile)], {
-		execArgv: ["--wasm-max-mem-pages=1024", "--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
+	const child = fork(entry, [], {
+		execArgv: ["--max-old-space-size=128"], serialization: "advanced", silent: true, windowsHide: true,
 		env: { ...CLOSED_SEARCH_PROFILE.environment, ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
 	});
 	const ready = Promise.withResolvers(), closure = Promise.withResolvers();

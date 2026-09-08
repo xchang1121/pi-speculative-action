@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+import { createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
 import { describe, expect, test } from "vitest";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -71,7 +72,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 		}
 	});
 
-	test("loads the Pi package and preserves installed engines when explicit setup fails", async () => {
+	test("loads Pi and executes captured find with only Pi's installed dependencies", async () => {
 		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-speculative-package-"));
 		const cwd = path.join(temporaryRoot, "workspace");
 		const agentDir = path.join(temporaryRoot, "agent");
@@ -80,18 +81,15 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 			const loaded = await discoverAndLoadExtensions([packageRoot], cwd, agentDir);
 			expect(loaded.errors).toEqual([]);
 			expect(loaded.extensions).toHaveLength(1);
-			const engine = path.join(agentDir, "closed-search.wasm"), setup = pathToFileURL(path.join(packageRoot, "src/setup-closed-search.mjs")).href;
-			await fs.writeFile(engine, "previous engine");
-			for (const [status, bytes, reason] of [[503, 0, "HTTP 503"], [200, 4, "archive integrity mismatch"], [200, 1048577, "download budget"]] as const) {
-				const script = `process.argv[2] = ${JSON.stringify(engine)};
-					globalThis.fetch = async () => new Response(new Uint8Array(${bytes}), { status: ${status} });
-					await import(${JSON.stringify(setup)});`;
-				const stderr = await execFileAsync(process.execPath, ["--input-type=module", "--eval", script], { cwd: packageRoot, windowsHide: true })
-					.then(() => "", (error) => error.stderr as string);
-				expect(stderr).toContain(reason);
-				expect(await fs.readFile(engine, "utf8")).toBe("previous engine");
-				expect(await fs.readdir(agentDir)).toEqual(["closed-search.wasm"]);
-			}
+			await fs.writeFile(path.join(cwd, "notes.txt"), "captured");
+			const { pool, invocations } = await createClosedSearchProfile(cwd);
+			try {
+				const find = invocations.get("find")!;
+				const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
+				expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
+				expect(invocations.has("grep")).toBe(false);
+				expect(await fs.readdir(agentDir)).toEqual([]);
+			} finally { await pool.dispose(); }
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
 		}

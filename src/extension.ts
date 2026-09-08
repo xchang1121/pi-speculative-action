@@ -240,7 +240,7 @@ export function normalizeSpeculativeActionSettings(
 ) {
 	return {
 		...normalizeSpeculativeAgentSettings(input),
-		searchExecution: input?.searchExecution === "closed" ? "closed" : "native",
+		searchExecution: input?.searchExecution === "captured" ? "captured" : "native",
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
@@ -276,7 +276,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
-		`Search execution when enabled: ${settings.searchExecution === "closed" ? "Portable search (Actor and speculation)" : "Native Pi"}`,
+		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
@@ -382,11 +382,10 @@ async function installController(
 	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
 	type SearchRoute = { ready: Promise<SearchProfile>; profile?: SearchProfile; error?: string };
 	let search: SearchRoute | undefined;
-	const closedSearchEnabled = () => currentSettings.enabled && currentSettings.searchExecution === "closed";
+	const closedSearchEnabled = () => currentSettings.enabled && currentSettings.searchExecution !== "native";
 	const prepareSearch = (): Promise<SearchProfile> => {
 		if (search) return search.ready;
-		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd,
-			path.join(getAgentDir(), "speculative-action", "closed-search.wasm")).then(
+		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd).then(
 				(profile) => (entry.profile = profile), (error) => { entry.error = String(error?.message ?? error); throw error; }) };
 		search = entry; return entry.ready;
 	};
@@ -471,7 +470,7 @@ async function installController(
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
 		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
-		searchDetail: !closedSearchEnabled() ? "Native Pi" : search?.error ?? (search?.profile ? "Portable search; workers start on demand" : "Portable search; not checked"),
+		searchDetail: !closedSearchEnabled() ? "Native Pi" : search?.error ?? `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? "workers start on demand" : "not checked"}`,
 	});
 	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const toolConflicts = new Map<string, string>();
@@ -1260,11 +1259,11 @@ async function openExecutionRoutes(
 					: () => ctx.ui.notify("No unified execution environment is installed for this profile.", "info"),
 			);
 		}
-		actions.set(`Search execution › ${settings.searchExecution === "closed" ? "Portable search" : "Native Pi"}`, async () => {
-			const choice = await ctx.ui.select("Search execution (grep/find)", ["Native Pi (default)", "Portable search (Actor + speculation)", BACK]);
+		actions.set(`Search execution › ${searchExecutionLabel(settings.searchExecution)}`, async () => {
+			const choice = await ctx.ui.select("Search execution", ["Native Pi (default)", "Captured find (Actor + speculation; no installation)", BACK]);
 			if (!choice || choice === BACK) return;
-			if (choice.startsWith("Portable")) ctx.ui.notify("Requires npm run setup:search. Uses fixed search engines, workspace inputs and ignore rules for BOTH Actor and speculation; not native rg/fd equivalence. Missing inputs, limits or setup errors fail the call, never silently switch semantics.", "warning");
-			await editor.setSettings({ ...settings, searchExecution: choice.startsWith("Portable") ? "closed" : "native" });
+			if (choice.startsWith("Captured")) ctx.ui.notify("Uses Pi's installed glob/ignore over captured workspace inputs for BOTH Actor find and speculation; not native fd equivalence. grep remains Native Pi or an available unified environment. Unproven inputs and limits fail the selected find call. No extra packages, binaries or downloads.", "warning");
+			await editor.setSettings({ ...settings, searchExecution: choice.startsWith("Captured") ? "captured" : "native" });
 		});
 		actions.set("Actor execution · always available", () =>
 			ctx.ui.notify("Actor execution is the authoritative final route and cannot be disabled here.", "info"));
@@ -1653,6 +1652,10 @@ function processRouteCapability(state: ProcessRouteSnapshot["state"]): Execution
 	return state === "ready" || state === "degraded"
 		? "ready"
 		: state === "idle" || state === "probing" ? "registered" : "unavailable";
+}
+
+function searchExecutionLabel(mode: string): string {
+	return mode === "captured" ? "Captured find; grep unchanged" : "Native Pi";
 }
 
 function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {

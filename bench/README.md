@@ -289,29 +289,21 @@ but are excluded from pooled latency and hit-rate statistics. This screening is
 not an official correctness grade; use the dataset harness for that guardrail.
 Use `--output-root` to choose the artifact directory.
 
-## 可移植执行内核资格实验
+## 无新增依赖的受控搜索验收
 
-`portable-kernel.mjs` 使用外部目录中显式安装的 `wasi-sh@0.11.0` 和 `ripgrep@0.3.1`：
+先执行 `npm run build`，然后运行：
 
 ```text
-node bench/portable-kernel.mjs <包含 node_modules 的外部目录>
+node bench/portable-kernel.mjs
 ```
 
-不自动下载、不增加生产依赖、不改 Actor 工具。固定命令检查 shell 与 rg 共用私有文件系统、
-写时复制、未授予 guest 宿主端口、固定虚拟元数据及实际 WASM 内存增长限制。执行在独立 Node
-进程中，经有界 IPC 传入输入，不传宿主文件句柄；单个 worker 不排队、不合并并发调用。
-200 ms deadline 和主动取消均测试已进入、此后不再调用 host import 的无限循环 guest；等待
-进程和 stdio 关闭后才返回失败，不依赖 guest 配合。内核时间不能作为 Pi 加速比。
-64 MiB WASM 限制、I/O 和消息配额只是已测试边界，不是整个进程的 RSS 上限或任意脚本沙箱承诺。
+只使用 Pi 已安装的 glob/ignore 和 Node，不需要额外包、模块文件或安装步骤。
+实际完整 Pi find、输入代理、Actor/producer 独立进程、现有 Runtime 和 TUI 均参与验收；
+仅模型和界面输入使用脚本。覆盖完成/跨轮次采纳、封存输入重算、运行中 join、双 producer
+并发、输入变化与逃逸链接拒绝、Actor 单次回退及关闭时排空 Actor/取消 producer。
+deadline/abort 还测试已经进入的不合作循环和阻塞输入；等进程及 stdio close 后才允许回退，
+晚到输入成功/失败均被消费。V8 堆限额不是整个进程的 RSS 保证，不声称任意脚本沙箱。
 
-增加 `--pi-tools` 可验证显式共同配置下的完整 Pi grep，先执行 `npm run build`。
-原版 Pi 0.84.1 的完整 grep、上下文回读及两个私有 imports 绑定都位于 worker；父进程只做
-原生对照和现有 Runtime/资源/事务验证。共同 profile 的 Actor 与投机使用相同的输入语义、
-虚拟时间、随机种子和 guest 环境，但有独立执行进程。仅模型预测使用 Faux，工具输出不做 mock。
-检查跨轮次完成采纳、三种输入重算、Runtime 运行中 join、宿主变化拒绝及真实收益门控；
-不同查询的 Actor 能在 producer 暂停期间独立完成，不把资源召回关系当作运行中覆盖证明。
-插件总开关禁用后检查 worker/stdio 自然关闭，再启用时同一 profile 的 Actor 单次 fallback。
-报告保留校准后的实际采纳或拒绝及原因，不为了保证命中而伪造耗时或绕开调度器。
-原生 Actor 与共同配置的暖执行均取三次中位数；准备、IPC/捕获、投机和采纳成本不混为一种指标。
-写入/管道配额和稀疏文件分配拒绝另有定向检查，后者直接测试 store，不冒充真实 Bash 命令。
-任意可写 shell、开放描述符快照、完整导入配额及原生等价性仍未获资格，不据此启用生产工具。
+原生 fd 与共同配置 Actor 分别采样，报告中列出两者的语义差异，不用投机端偷偷替换原生语义。
+结果复用时间只与同配置 Actor 到达后的基线比较，不冒充整体任务加速；未校准时如实记录。
+此资格不包括 grep、macOS 或 ARM64 ThinkThread Runtime；已有 Linux Bash benchmark 保持独立。

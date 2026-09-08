@@ -157,41 +157,42 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("selects one search profile for both routes, fails closed, and retires it on refresh or disable", async () => {
-		const fixture = await createFixture();
+		const fixture = await createFixture({ settings: JSON.parse('{"searchExecution":"closed"}') });
 		vi.stubEnv("PI_CODING_AGENT_DIR", fixture.cwd);
-		const prepare = vi.spyOn(piTools, "createClosedSearchProfile");
+		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockRejectedValue(new Error("Requalify Pi's installed glob"));
 		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
 		try {
 			await fixture.emit("session_start", {}, fixture.context);
+			await command("on");
+			for (const tool of ["grep", "find"]) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
+			expect(prepare).not.toHaveBeenCalled();
+			await command("off");
 			driveSettingsMenus(fixture, {
 				"Speculative action": ["Tools & execution", "Apply changes", "Close"],
 				"Tools & execution": ["Execution routes", "Back"],
 				"Execution routes": ["Search execution", "Back"],
-				"Search execution (grep/find)": ["Portable search"],
+				"Search execution": ["Captured find"],
 			});
 			await command("");
-			expect(fixture.store.effective()).toMatchObject({ enabled: false, searchExecution: "closed" });
+			expect(fixture.store.effective()).toMatchObject({ enabled: false, searchExecution: "captured" });
 			expect(prepare).not.toHaveBeenCalled();
 			await command("on");
-			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("npm run setup:search"), "warning");
-			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) {
-				await expect(fixture.tools.get(tool)!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("setup:search");
-			}
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Requalify Pi's installed glob"), "warning");
+			await expect(fixture.tools.get("find")!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).rejects.toThrow("Requalify");
 			expect(prepare).toHaveBeenCalledOnce();
 			expect((await fixture.resolveInvocation("read", { path: "a" }))?.authoritative).toBeUndefined();
 			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
 			const dispose = vi.fn(async () => {});
-			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", rg: "unused", limits: { inputBytes: 1024 } },
+			prepare.mockResolvedValue({ profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 } },
 				pool: { request: authoritative, dispose }, invocations: new Map(piTools.PI_CLOSED_SEARCH_TOOLS.map((tool) => [tool, {
 					executor: "test-search", authoritative, filesystem: authoritative,
 					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
 				}])) });
-			await command("status"); // Explicit refresh recovers an installed/repaired setup without restarting Pi.
-			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) {
-				expect((await fixture.tools.get(tool)!.execute("bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
-				expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`${tool}\\s+On\\s+Ready\\s+Ready\\s+Ready`, "u")), "info");
-			}
-			expect(authoritative).toHaveBeenCalledTimes(2);
+			await command("status"); // Refresh retires the old executor generation, not its captured inputs.
+			expect((await fixture.tools.get("find")!.execute("bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
+			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/find\s+On\s+Ready\s+Ready\s+Ready/u), "info");
+			expect(authoritative).toHaveBeenCalledOnce();
+			expect(await fixture.resolveInvocation("grep", { pattern: "x" })).toBeUndefined();
 			await command("status");
 			expect(dispose).toHaveBeenCalledOnce();
 			await command("off");

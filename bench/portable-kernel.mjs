@@ -7,48 +7,10 @@ import { serialize } from "node:v8";
 import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 import { createClosedSearchProfile, readClosedSearchInput } from "../dist/pi-tool-invocation.js";
 
-// Fixed-command qualification, not a plugin provider or an arbitrary-script sandbox.
-// Uses pure module bytes from explicit setup, never the CLI-bearing npm package.
-const moduleFile = process.argv[2];
-assert.ok(moduleFile, "Usage: node bench/portable-kernel.mjs <installed closed-search.wasm> [--pi-tools]");
+// No extra engines or installation: qualify the captured-input Pi find and its existing process outlet.
 const started = performance.now(), worker = await prepareWorker(true);
 try {
-	const seed = { "/workspace/a.txt": Buffer.from("before\nneedle\nafter\n"), "/workspace/sub/b.txt": Buffer.from("needle two\n") };
-	const kernel = (commands, options) => worker.request({ kind: "kernel", image: { files: seed, directories: [] }, commands }, options);
-	const [pipeline, search, overwrite] = await kernel([
-		{ name: "sh", args: ["-c", "cat /workspace/a.txt | grep needle > /workspace/derived.txt"] },
-		{ name: "rg", args: ["--json", "--line-number", "--color=never", "--sort=path", "--hidden", "--no-config", "--", "needle", "/workspace"] },
-		{ name: "sh", args: ["-c", "printf changed > /workspace/a.txt; cat /workspace/a.txt"] },
-	]);
-	assert.equal(pipeline.exitCode, 0, pipeline.stderr); assert.equal(search.exitCode, 0, search.stderr);
-	const matches = search.stdout.trim().split("\n").map(JSON.parse).filter((event) => event.type === "match")
-		.map((event) => [event.data.path.text, event.data.line_number, event.data.lines.text]);
-	assert.deepEqual(matches, [["/workspace/a.txt", 2, "needle\n"], ["/workspace/derived.txt", 1, "needle\n"], ["/workspace/sub/b.txt", 1, "needle two\n"]]);
-	assert.equal(overwrite.stdout, "changed"); assert.equal(seed["/workspace/a.txt"].toString(), "before\nneedle\nafter\n");
-	for (const command of ["cat /etc/hostname", "cat /dev/host", "cat /dev/hostreq", "curl https://example.com"]) {
-		assert.notEqual((await kernel([{ name: "sh", args: ["-c", command] }]))[0].exitCode, 0, command + ": unexpected host capability");
-	}
-	for (const command of ["printf '%01048577d' 1", "while :; do printf 'repeat\\n'; done | cat"]) {
-		await assert.rejects(kernel([{ name: "sh", args: ["-c", command] }]), /budget/, command);
-	}
-	await assert.rejects(worker.request({ kind: "kernel", image: { files: seed, directories: [] }, probeSparse: true }), /filesystem budget/);
-	assert.equal((await kernel([{ name: "sh", args: ["-c", "cat /workspace/a.txt"] }]))[0].stdout, seed["/workspace/a.txt"].toString());
-	for (let repeat = 0; repeat < 2; repeat++) assert.equal((await kernel([{ name: "sh", args: ["-c", "stat -c %Y /workspace/a.txt"] }]))[0].stdout, "1700000000\n");
-	assert.ok(pipeline.clocks > 0 && search.clocks > 0 && search.random > 0);
-	const rejectedModules = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-module-"));
-	try {
-		for (const [file, bytes, reason] of [["wrong", 4, /Requalify the search module/], ["large", 4 * 1024 * 1024 + 1, /search module byte budget/],
-			...(process.platform === "linux" ? [["fifo", undefined, /search module must be a regular file/]] : [])]) {
-			const target = path.join(rejectedModules, file);
-			if (bytes === undefined) execFileSync("mkfifo", [target]); else await fs.writeFile(target, Buffer.alloc(bytes));
-			const denied = launchClosedSearchWorker(target);
-			try { await assert.rejects(denied.ready, reason); assert.ok(denied.closed()); }
-			finally { await denied.dispose(); }
-		}
-	} finally { assert.equal(path.dirname(rejectedModules), path.resolve(os.tmpdir())); await fs.rm(rejectedModules, { recursive: true, force: true }); }
-	const pi = {};
-	if (process.argv.includes("--pi-tools")) for (const name of ["grep", "find"]) pi[name] = await qualifyPiSearch(name);
-	const extension = process.argv.includes("--pi-tools") ? await qualifySearchExtension() : undefined;
+	const pi = { find: await qualifyPiSearch("find") }, extension = await qualifySearchExtension();
 	const cancellation = [];
 	for (const mode of ["abort", "deadline", "input abort", "input deadline"]) {
 		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
@@ -57,7 +19,7 @@ try {
 			const arrived = performance.now(); let entered = false;
 			const reason = inputWait ? 0 : new Error("cancelled running guest");
 			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(reason); };
-			await assert.rejects(interrupted.request(inputWait ? { kind: "grep", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
+			await assert.rejects(interrupted.request(inputWait ? { kind: "find", root: process.cwd(), args: { pattern: "needle" } } : { kind: "spin" }, {
 				signal: controller.signal, timeoutMs: mode.endsWith("deadline") ? 200 : 5000,
 				onStarted: () => { if (!inputWait) abort(); },
 				onInput: async () => {
@@ -72,58 +34,58 @@ try {
 			cancellation.push({ mode, retirementMs: performance.now() - arrived });
 		} finally { late.resolve(); await interrupted.dispose(); }
 	}
-	console.log(JSON.stringify({ platform: process.platform, node: process.version, engines: worker.engines, profile: worker.profile,
-		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started,
-		assertions: { sharedFilesystem: true, copyOnWrite: true, noGrantedHostPorts: true, moduleMemoryCapMiB: 64,
-			writeBudget: true, sparseStoreWriteBudget: true, noPartialResultOnQuotaFailure: true, fixedMetadata: true, cancellation },
-		pipeline, search: { ...search, stdout: undefined, matches }, pi, extension,
-		admission: "explicit portable search and TUI integration; not arbitrary Bash, native search equivalence, macOS or ThinkThread Runtime qualification" }, null, 2));
+	console.log(JSON.stringify({ platform: process.platform, node: process.version, profile: worker.profile,
+		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started, cancellation, pi, extension,
+		admission: "Pi-owned find; no extra dependency/download; not native fd equivalence, grep, macOS or ThinkThread Runtime qualification" }, null, 2));
 } finally { await worker.dispose(); }
 
 async function prepareWorker(qualification = false) {
-	const worker = launchClosedSearchWorker(moduleFile, qualification ? new URL("./portable-worker.mjs", import.meta.url) : undefined);
+	const worker = launchClosedSearchWorker(qualification ? new URL("./portable-worker.mjs", import.meta.url) : undefined);
 	try { return { ...worker, ...await worker.ready }; }
 	catch (error) { await worker.dispose(); throw error; }
 }
 
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
 async function qualifyPiSearch(name) {
-	const { createGrepToolDefinition, createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
+	const { createFindToolDefinition } = await import("@earendil-works/pi-coding-agent");
 	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
 	const { captureResourceVersion } = await import("../dist/resource-version.js");
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-")), searchRoot = path.join(root, "search");
-	const { pool, profile, invocations } = await createClosedSearchProfile(root, moduleFile), bound = invocations.get(name);
-	const counts = { producer: 0, actor: 0, contextReads: 0 }, reads = new Set();
+	const { pool, profile, invocations } = await createClosedSearchProfile(root), bound = invocations.get(name);
+	const counts = { producer: 0, actor: 0 }, reads = new Set();
 	let inputRequests = 0, inputBytes = 0;
 	const execute = async (role, source, request, checkpoint) => {
 		counts[role]++;
 		let checkpointReached = false;
 		const inputs = source === fs ? await captureResourceVersion(undefined, root, semantics, profile.limits.inputBytes) : undefined;
 		try {
+			const view = inputs?.view ?? source;
+			const observed = { ...view, readFile: (target, ...options) => {
+				reads.add(path.posix.join("/workspace", path.relative(root, target).split(path.sep).join("/")));
+				return view.readFile(target, ...options);
+			} };
 			const output = await pool.request(role, { kind: name, root, args: request.args },
 				{ signal: request.signal, onInput: async (operation, target) => {
 					inputRequests++;
-					if (operation === "readFile") reads.add(target);
-					const value = await readClosedSearchInput(inputs?.view ?? source, root, operation, target, profile.limits.inputBytes);
+					const value = await readClosedSearchInput(observed, root, operation, target, profile.limits.inputBytes);
 					inputBytes += serialize(value).byteLength;
 					if (checkpoint && !checkpointReached && operation === "readFile" && target === "/workspace/.gitignore") {
 						checkpointReached = true; await checkpoint();
 					}
 					return value;
 				} });
-			counts.contextReads += output.contextReads;
 			return { result: output.result, isError: output.isError };
 		} finally { inputs?.release(); }
 	};
-	const tool = ({ grep: createGrepToolDefinition, find: createFindToolDefinition })[name](root);
+	const tool = createFindToolDefinition(root);
 	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const signal = new AbortController().signal, journeys = [];
-	const args = { pattern: name === "grep" ? "needle" : "*.txt", path: "search", ...(name === "grep" ? { context: 1 } : {}), limit: 1000 };
+	const args = { pattern: "*.txt", path: "search", limit: 1000 };
 	function journey(checkpoint, capacity = 1) {
 		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
@@ -181,17 +143,17 @@ async function qualifyPiSearch(name) {
 			"nested/skipped.txt": "needle skipped\n", "UPPER.TXT": "needle case\n", "中文 name.txt": "needle utf8\n",
 			"utf16.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("needle unicode\r\n", "utf16le")]) })) await fs.writeFile(path.join(searchRoot, file), content);
 		const behaviors = [];
-		for (const pattern of name === "find" ? ["empty", "nested/**/*.txt", "*.TXT", "absent", "*.txt"] : ["unicode", "needle", "absent"]) {
+		for (const pattern of ["empty", "nested/**/*.txt", "*.TXT", "absent", "*.txt"]) {
 			const query = { ...args, pattern, limit: 2 };
 			const output = (await execute("actor", fs, { args: query, signal })).result;
 			assert.deepEqual((await execute("producer", fs, { args: query, signal })).result, output);
 			const native = await tool.execute("native-case", query, signal);
 			const equal = JSON.stringify(output) === JSON.stringify(native);
 			behaviors.push({ pattern, nativeOutputEqual: equal, ...(!equal ? { native: native.content, profile: output.content } : {}) });
-			if (name === "find" && pattern === "empty") assert.equal(output.content[0].text, "empty/");
+			if (pattern === "empty") assert.equal(output.content[0].text, "empty/");
 			if (pattern === "nested/**/*.txt") assert.equal(output.content[0].text, "nested/kept.txt");
 			if (pattern === "*.TXT") assert.equal(output.content[0].text, "UPPER.TXT");
-			if (pattern === "absent") assert.equal(output.content[0].text, name === "find" ? "No files found matching pattern" : "No matches found");
+			if (pattern === "absent") assert.equal(output.content[0].text, "No files found matching pattern");
 		}
 		const external = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-external-")), link = path.join(searchRoot, "alias");
 		try {
@@ -224,7 +186,6 @@ async function qualifyPiSearch(name) {
 		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
 		assert.ok(!reads.has("/workspace/search/ignored.bin") && !reads.has("/workspace/search/ignored.txt"), "the broker transferred ignored content");
-		if (name === "grep") await assert.rejects(execute("actor", fs, { args: { ...args, path: "search/ignored.bin" }, signal }), /input byte budget/);
 		await assert.rejects(pool.request("actor", { kind: name, root, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		}), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
@@ -242,7 +203,7 @@ async function qualifyPiSearch(name) {
 		const beforeHit = counts.producer, adopted = await ready.actor("ready");
 		assert.deepEqual(adopted.output, expected); assert.equal(adopted.settlement.provider.kind, "speculative");
 		assert.equal(counts.producer, beforeHit, "completed adoption executed the search again");
-		const queries = [{ ...args, pattern: name === "grep" ? "after" : "data-0.txt", limit: 1 }, { ...args, pattern: "absent" }, { ...args, path: "." }];
+		const queries = [{ ...args, pattern: "data-0.txt", limit: 1 }, { ...args, pattern: "absent" }, { ...args, path: "." }];
 		for (const query of queries) {
 			const actor = await execute("actor", fs, { args: query, signal });
 			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
@@ -300,7 +261,6 @@ async function qualifyPiSearch(name) {
 		await cancelled.host.runtime.settingsChanged({ ...disabled, enabled: true });
 		await cancelled.start("recovery", false);
 		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
-		assert.equal(counts.contextReads > 0, name === "grep", "the original Pi context reread was not exercised");
 		const arrivals = { actor: Promise.withResolvers(), producer: Promise.withResolvers() }, drain = Promise.withResolvers();
 		const actor = execute("actor", fs, { args, signal }, async () => { arrivals.actor.resolve(); await drain.promise; });
 		const producer = execute("producer", fs, { args, signal }, async () => { arrivals.producer.resolve(); await drain.promise; });
@@ -340,7 +300,7 @@ async function qualifySearchExtension() {
 	const choices = new Map(Object.entries({
 		"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
 		"Tools & execution": ["Execution routes", "Back"], "Execution routes": ["Search execution", "Back"],
-		"Search execution (grep/find)": ["Portable search"],
+		"Search execution": ["Captured find"],
 	}));
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const context = { cwd, mode: "tui", hasUI: true, model, isProjectTrusted: () => true, getSystemPrompt: () => "qualification",
@@ -356,10 +316,9 @@ async function qualifySearchExtension() {
 	try {
 		await fs.mkdir(cwd); await fs.mkdir(path.join(agent, "speculative-action"), { recursive: true });
 		await fs.writeFile(path.join(cwd, "notes.txt"), "before\nneedle\nafter\n");
-		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false,
+		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false, searchExecution: "closed",
 			drafterGateEnabled: false, drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
-		const module = path.join(agent, "speculative-action", "closed-search.wasm"); await fs.copyFile(moduleFile, module);
 		await createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
 			...options, onEvent: (event) => { options.onEvent?.(event);
 				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate?.resolve(event.state);
@@ -369,10 +328,14 @@ async function qualifySearchExtension() {
 			getActiveTools: () => [...registered.keys()], getAllTools: () => [...registered.values()].map((tool) => ({ ...tool,
 				sourceInfo: { path: `<builtin:${tool.name}>`, source: "builtin", scope: "temporary", origin: "top-level" } })),
 		});
-		await emit("session_start"); await command("");
+		await emit("session_start"); await command("on");
+		const stockFind = createPiToolDefinitions(cwd).get("find"), oldArgs = { pattern: "notes.txt" };
+		assert.deepEqual(await invoke("find", oldArgs), await stockFind.execute("old", oldArgs, undefined, undefined, context));
+		assert.ok(!notices.some((message) => /WASM|setup:search|reselect/.test(message)));
+		await command("off"); await command("");
 		assert.match(notices.join("\n"), /settings applied/);
-		for (const name of ["grep", "find"]) {
-			const args = { pattern: name === "grep" ? "needle" : "notes.txt", path: "." }; selected = [name, args];
+		for (const name of ["find"]) {
+			const args = { pattern: "notes.txt", path: "." }; selected = [name, args];
 			await invoke(name, args); // Exclude worker startup from the warm Actor baseline.
 			const baselineAt = performance.now(), expected = await invoke(name, args), warmActorMs = performance.now() - baselineAt;
 			candidate = Promise.withResolvers(); settlement = Promise.withResolvers();
@@ -384,15 +347,13 @@ async function qualifySearchExtension() {
 			results[name] = { warmActorMs, hitMs, actorArrivalSpeedup: warmActorMs / hitMs };
 			await emit("agent_end");
 		}
-		await fs.rename(module, module + ".held"); await command("status");
-		await assert.rejects(invoke(...selected), /setup:search/); // Cannot reuse an old identity or silently switch to native search.
-		await fs.rename(module + ".held", module); await command("status"); await invoke(...selected);
+		await command("status"); await invoke(...selected);
 		await command("off");
 		const stock = createPiToolDefinitions(cwd).get(selected[0]);
 		assert.deepEqual(await invoke(...selected), await stock.execute("native", selected[1], undefined, undefined, context));
 		await emit("session_shutdown"); // The real store drains its publication queue at shutdown.
-		assert.equal(JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json"))).searchExecution, "closed");
-		return { results, appliedThroughTui: true, missingSetupRejected: true, refreshRecovered: true, disabledNativeActor: true };
+		assert.equal(JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json"))).searchExecution, "captured");
+		return { results, appliedThroughTui: true, noExtraSetup: true, obsoleteSettingsUseNative: true, refreshRetiresWorker: true, disabledNativeActor: true };
 	} finally {
 		try { await emit("session_shutdown"); }
 		finally {
