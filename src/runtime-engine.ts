@@ -1201,38 +1201,37 @@ export function makeStructuralSpeculativeActionRuntime<
 			) {
 				return;
 			}
-			for (const update of asUpdates(request.value)) {
-				if (session.lifecycle.sealed || !slot.active || scope.signal.aborted) break;
-				await admitUpdate(scope, source, update, request);
-			}
+			await admitUpdates(scope, source, request.value, request);
 		} finally {
 			slot.generations.delete(generation);
 			releaseSourceRequest(session, slot);
 		}
 	};
 
-	const admitUpdate = async (
+	const admitUpdates = async (
 		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
-		update: PlanUpdate,
+		updates: PlanUpdate | readonly PlanUpdate[] | undefined,
 		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
-		const key = planUpdateID(update);
-		const previous = session.planAdmissionTails.get(key) ?? Promise.resolve();
-		session.pendingAdmissions++;
-		let admission!: Promise<void>;
-		admission = previous
-			.then(() => applyUpdate(scope, source, update, request))
-			.catch(() => {
-				// One malformed proposal cannot poison later independent admissions.
-			})
-			.finally(() => {
-				session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
-				if (session.planAdmissionTails.get(key) === admission) session.planAdmissionTails.delete(key);
-			});
-		session.planAdmissionTails.set(key, admission);
-		await admission;
+		await Promise.allSettled(asUpdates(updates).map(async (update) => {
+			const key = planUpdateID(update);
+			const previous = session.planAdmissionTails.get(key) ?? Promise.resolve();
+			session.pendingAdmissions++;
+			let admission!: Promise<void>;
+			admission = previous
+				.then(() => applyUpdate(scope, source, update, request))
+				.catch(() => {
+					// One malformed proposal cannot poison later independent admissions.
+				})
+				.finally(() => {
+					session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
+					if (session.planAdmissionTails.get(key) === admission) session.planAdmissionTails.delete(key);
+				});
+			session.planAdmissionTails.set(key, admission);
+			await admission;
+		}));
 	};
 
 	const applyUpdate = async (
@@ -1289,10 +1288,10 @@ export function makeStructuralSpeculativeActionRuntime<
 				context.feedback = action.feedback;
 				context.draft = planActionDraft(node);
 			}
-			materializations.push(materializeAction(session, node));
+			materializations.push(materializeAction(session, node).finally(() => dispatchReady(session)));
 		}
-		await Promise.all(materializations);
-		dispatchReady(session);
+		await Promise.allSettled(materializations);
+		if (!materializations.length) dispatchReady(session);
 	};
 
 	const executionRouteFor = async (input: {
@@ -2472,20 +2471,12 @@ export function makeStructuralSpeculativeActionRuntime<
 									: candidateExecutionDuration(state.session, settlement.provider.candidateID),
 						order: settlement.actorAction.sequence,
 					});
-					for (const update of asUpdates(updates)) {
-						if (state.lifecycle === "active") {
-							await admitUpdate(
-								{
-									session: state.session,
-									startInput: state.startInput,
-									data: state.data,
-									settings: state.settings,
-									signal: state.generation.signal,
-								},
-								source,
-								update,
-							);
-						}
+					if (state.lifecycle === "active") {
+						await admitUpdates(
+							{ session: state.session, startInput: state.startInput, data: state.data,
+								settings: state.settings, signal: state.generation.signal },
+							source, updates,
+						);
 					}
 				} catch {
 					// Learning and continuation never alter an authoritative Actor result.

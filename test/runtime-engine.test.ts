@@ -213,54 +213,60 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
-	it("admits independent actions and proposals without head-of-line blocking", async () => {
-		const slow = barrier();
-		const slowStarted = barrier();
-		const independentExecuted = barrier(2);
+	it.each(["requests", "single", "batch", "revisions", "observed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
+		const slow = barrier(), slowStarted = barrier(), executed: string[] = [];
+		const replacementReady = candidateSucceeded(1, "replacement.ts");
+		const keyed: string[] = [];
+		const proposals = [
+			{ id: "proposal:0", source: "source", revision: 0, actions: [
+				{ id: "slow", type: "tool_call" as const, tool: "read", input: { path: "slow.ts" } },
+				{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "same-plan.ts" } },
+			] },
+			plan("source", "proposal:1", { path: "other-plan.ts" }),
+		];
+		const revisions = [proposals[0]!, { ...plan("source", "proposal:0", { path: "replacement.ts" }), revision: 1 }, proposals[1]!];
+		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, remove: ["slow"],
+			upsert: [{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "replacement.ts" } }] }, proposals[1]!];
+		const revised = mode === "revisions" || mode === "observed";
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			proposalCount: () => 2,
-			propose: ({ proposalIndex }) =>
-				proposalIndex === 0
-					? {
-							id: "proposal:0",
-							source: "source",
-							revision: 0,
-							actions: [
-								{ id: "slow", type: "tool_call", tool: "read", input: { path: "slow.ts" } },
-								{ id: "same-plan", type: "tool_call", tool: "read", input: { path: "same-plan.ts" } },
-							],
-						}
-					: plan("source", "proposal:1", { path: "other-plan.ts" }),
+			proposalCount: () => mode === "requests" ? 2 : 1,
+			propose: ({ proposalIndex }) => mode === "observed" ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
+			observe: ({ concrete }) => mode === "observed" && concrete.path === "seed.ts" ? observed : undefined,
 		};
 		const fixture = harness({
 			source,
 			actionKey: async (tool, args, context) => {
-				if (context.type === "start" && (args as { path?: unknown }).path === "slow.ts") {
-					slowStarted.arrive();
-					await slow.promise;
+				if (context.type === "start") {
+					keyed.push(String((args as { path?: unknown }).path));
+					if (keyed.at(-1) === "slow.ts") { slowStarted.arrive(); await slow.promise; }
 				}
 				return buildPiActionKey(tool, args, "/workspace");
 			},
-			execute: () => {
-				independentExecuted.arrive();
-				return "speculative";
-			},
+			execute: (_tool, concrete) => { executed.push(String(concrete.path)); return "speculative"; },
+			onEvent: replacementReady.observe,
 		});
-
+		let turnID = "parallel-admission";
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel-admission" });
-			await Promise.all([slowStarted.promise, independentExecuted.promise]);
-			expect(await fixture.runtime.consume(call("parallel-admission", { path: "same-plan.ts" }))).toBe(
-				"speculative",
-			);
+			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			if (mode === "observed") {
+				const seed = call(turnID, { path: "seed.ts" });
+				expect(await fixture.runtime.consume(seed)).toBeUndefined();
+				await fixture.runtime.actual({ ...seed, durationMs: 1, output: "Actor" });
+			}
+			await slowStarted.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), "same-plan.ts"]);
+			expect(keyed).not.toContain("replacement.ts");
+			if (revised) { slow.arrive(); await replacementReady.promise; }
+			if (mode === "observed") {
+				slow.arrive(); await fixture.runtime.finishTurn({ ...call(turnID), terminal: false });
+				turnID = "next-decision"; await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			}
+			expect(await fixture.runtime.consume(call(turnID, { path: revised ? "replacement.ts" : "same-plan.ts" }))).toBe("speculative");
 		} finally {
 			slow.arrive();
-			await fixture.runtime.finishTurn({
-				...call("parallel-admission"),
-				terminal: true,
-			});
+			await fixture.runtime.finishTurn({ ...call(turnID), terminal: true }); await fixture.runtime.dispose();
 		}
 	});
 

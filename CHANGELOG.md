@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Independent proposal batches share the existing per-plan admission lanes without a serial batch
+  barrier; revisions of one plan remain ordered. Ready actions can execute while a sibling's binding
+  or permission check is pending. Batch and materialization joins retain all admitted promises through
+  settlement, and empty updates still reconcile scheduling without introducing another queue or owner.
 - Queued continuations recheck their parent identity and target decision before claiming a source slot.
   Session closure retires plan launch authority before draining producers; expired, replaced or terminal
   work cannot restart prediction. Valid cross-turn continuations and retries remain eligible, and an

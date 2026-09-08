@@ -587,6 +587,7 @@ describe("speculative action host", () => {
 
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
 		const cwd = await temporaryWorkspace();
+		const permissionEntered = deferred<void>(), permissionReleased = deferred<void>();
 		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
 		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
 		const events: SpeculativeActionEvent<string>[] = [];
@@ -658,7 +659,12 @@ describe("speculative action host", () => {
 			}),
 			actorForkPlanSource: actorForkPlans,
 			complete: async () => assistant([], "stop"),
-			preflight: () => true,
+			preflight: async ({ args }) => {
+				if ((args as { path: string }).path === "notes.txt.sibling") {
+					permissionEntered.resolve(); await permissionReleased.promise;
+				}
+				return true;
+			},
 			executionWorlds: [toolRuntimeWorld()],
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
@@ -684,11 +690,11 @@ describe("speculative action host", () => {
 		};
 
 		await triggerFork("fork-hit");
-		await waitFor(() =>
-			events.some(
-				(event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded",
-			),
-		);
+		try {
+			await permissionEntered.promise;
+			await waitFor(() => events.some((event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded"));
+			expect(events.filter((event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "running")).toHaveLength(1);
+		} finally { permissionReleased.resolve(); }
 		await waitFor(
 			() => materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation").length === 2,
 		);
