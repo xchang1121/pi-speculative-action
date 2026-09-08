@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused
+  `alias` forwarding method was removed. Link metadata grants no authority to read the target.
 - Shared transactions now own a sealed plain-data result and give each reader/adoption a separate copy.
   Opaque prototypes, accessors, symbols and hidden fields are not shareable; failed sealing retires the
   branch without freezing or rewriting the Actor result. Only exclusive commits may update the settlement.

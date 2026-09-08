@@ -10,10 +10,11 @@ import {
 } from "./action-semantics.ts";
 import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
+import type { ToolFilesystemStat } from "./tool-settlement.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
-	readonly scope: ResourceDependencyScope | "stat" | "type" | "names" | "binding";
+	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "names" | "binding";
 };
 
 export type ResourceValidationMetrics = {
@@ -49,7 +50,7 @@ export type ResourceVersionToken = {
 type CapturedResource =
 	| { readonly type: "file"; readonly content?: Buffer; readonly size?: number }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
-	| { readonly type: "alias"; readonly target: string }
+	| { readonly type: "alias"; readonly target: string; readonly link: string }
 	| { readonly type: "special" }
 	| { readonly type: "missing" };
 
@@ -87,23 +88,19 @@ export class ResourceReadView {
 	capture(target: string, entry: CapturedResource): void {
 		if (!this.reserve(Buffer.byteLength(target) + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target) : 0))) return;
+			: entry.type === "alias" ? Buffer.byteLength(entry.target) + Buffer.byteLength(entry.link) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined)) return;
 		this.entries.set(key, entry);
 	}
-	alias(target: string, source: string): void {
-		if (!this.retained) return;
-		this.entry(source);
-		this.capture(target, { type: "alias", target: filesystemPathKey(source) });
-	}
 	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
-	stat = async (target: string, fields?: "type"): Promise<{ isDirectory: () => boolean; size?: number }> => {
+	stat = async (target: string, fields?: "type" | "entry"): Promise<ToolFilesystemStat> => {
 		const entry = await this.get(target, fields ?? "stat");
 		if (entry.type === "missing" || (!fields && entry.type === "file" && entry.content === undefined && entry.size === undefined)) return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory", size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined };
+		return { isDirectory: () => entry.type === "directory", size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined,
+			...(fields === "entry" ? { type: entry.type === "alias" ? "symlink" : entry.type, ...(entry.type === "alias" ? { link: entry.link } : {}) } : {}) };
 	};
 	readdir = async (target: string): Promise<string[]> => {
 		const entry = await this.get(target, "names");
@@ -146,16 +143,16 @@ export class ResourceReadView {
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		return this.entry(target);
+		return this.entry(target, scope !== "entry");
 	}
-	private entry(target: string): Exclude<CapturedResource, { type: "alias" }> {
+	private entry(target: string, follow = true): CapturedResource {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
 		const visited = new Set<string>();
 		while (!visited.has(current) && visited.size <= this.entries.size) {
 			visited.add(current);
 			const exact = this.entries.get(current);
-			if (exact?.type === "alias") { current = exact.target; continue; }
+			if (exact?.type === "alias" && follow) { current = exact.target; continue; }
 			if (exact) return exact;
 			let parent = path.dirname(current);
 			while (parent !== path.dirname(parent) && this.entries.get(parent)?.type !== "alias") parent = path.dirname(parent);
@@ -481,7 +478,7 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	if (event.type === "unknown") return true;
 	const dependencyPath = filesystemPathKey(dependency.path);
 	const changed = filesystemPathKey(event.path);
-	if (dependency.scope === "content" || dependency.scope === "stat" || dependency.scope === "type") {
+	if (["content", "stat", "type", "entry"].includes(dependency.scope)) {
 		if (dependencyPath === changed) return true;
 		// Some recursive watchers report only the containing directory for a file write.
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
@@ -543,7 +540,9 @@ async function fingerprintPath(
 			filesRead: 0,
 		};
 	}
-	const realTarget = await fingerprintIO(() => fs.realpath(target));
+	const realTarget = scope === "entry" && info.isSymbolicLink()
+		? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
+		: await fingerprintIO(() => fs.realpath(target));
 	assertInside(realRoot, realTarget);
 	const identity = filesystemPathKey(realTarget);
 	if (ancestors.has(identity)) throw new Error(`resource_symlink_cycle:${target}`);
@@ -554,22 +553,22 @@ async function fingerprintPath(
 			throw new Error(`resource_symlink_changed:${target}`);
 		}
 		const source = path.resolve(path.dirname(target), link);
-		const followed = await fingerprintPath(source, scope, realRoot, ancestors, view, descend);
-		view?.alias(target, source);
+		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, ancestors, view, descend);
+		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link });
 		return {
 			value: {
 				type: "symlink",
 				link,
 				mode: Number(after.mode),
 				resolved: identity,
-				target: followed.value,
+				target: followed?.value,
 			},
-			stamp: digest(["symlink", link, statStamp(after), followed.stamp]),
-			bytesRead: followed.bytesRead,
-			filesRead: followed.filesRead,
+			stamp: digest(["symlink", link, statStamp(after), followed?.stamp]),
+			bytesRead: followed?.bytesRead ?? 0,
+			filesRead: followed?.filesRead ?? 0,
 		};
 	}
-	if (scope === "stat" || scope === "type" || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
+	if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
 		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special",
 			...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 		return stableEntry(target, info, identity, scope);

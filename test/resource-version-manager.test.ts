@@ -232,6 +232,8 @@ describe("speculative action resource versions", () => {
 			const actual = await resolvePiToolInvocation(name, args, { cwd: root, environment: {} })!.filesystem!(token.view!,
 				{ args, callID: "spec", signal: new AbortController().signal });
 			token.view!.assertComplete();
+			expect(await token.view!.stat(alias, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(alias) });
+			expect((await token.view!.stat(directory ? path.join(alias, "value.txt") : target, "entry")).type).toBe("file");
 			const expected = await native.execute("actor", args);
 			expect(actual.result.content).toEqual(expected.content);
 			expect(Object.entries(actual.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
@@ -252,6 +254,19 @@ describe("speculative action resource versions", () => {
 			const escape = path.join(root, "escape");
 			await fs.symlink(directory ? outside : path.join(outside, "value.txt"), escape, type);
 			await expect(manager.capture([{ path: escape, scope: "tree_content" }], 8192)).rejects.toThrow("resource_symlink_escapes_workspace");
+			for (const destination of [directory ? outside : path.join(outside, "value.txt"), path.join(root, "missing"), escape]) {
+				await fs.rm(escape); await fs.symlink(destination, escape, type);
+				const metadata = await manager.capture(undefined, 8192), opened = vi.spyOn(fs, "open");
+				try {
+					expect(await metadata.view!.stat(escape, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(escape), size: undefined });
+					metadata.view!.seal();
+					expect(await manager.validate(metadata)).toMatchObject({ expired: false, filesRead: 0, bytesRead: 0 });
+					await expect(metadata.view!.evaluate((view) => view.readFile(escape))).rejects.toThrow("resource_access_unproven");
+					await fs.rm(escape); await fs.symlink(path.join(root, "changed"), escape, type);
+					expect((await manager.validate(metadata)).expired).toBe(true);
+					expect(opened).not.toHaveBeenCalled();
+				} finally { opened.mockRestore(); metadata.release(); }
+			}
 			await expect(token.view!.exists(path.join(alias, "unproven"))).rejects.toThrow("resource_access_unproven");
 		} finally { token.release(); manager.close(); }
 	});
@@ -264,6 +279,9 @@ describe("speculative action resource versions", () => {
 		const open = vi.spyOn(fs, "open");
 		try {
 			for (const target of paths) {
+				const metadata = await manager.capture([{ path: target, scope: "entry" }], 4096);
+				try { expect((await metadata.view!.stat(target, "entry")).type).toBe(target === root ? "directory" : "special"); }
+				finally { metadata.release(); }
 				await expect(captureStableFile(target)).rejects.toThrow("not_regular_file");
 				await expect(manager.capture([{ path: target, scope: "content" }])).rejects.toThrow("unsupported_resource_type:");
 			}
@@ -272,6 +290,7 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.each([
+		{ scope: "entry" as const, stale: ["kind"] },
 		{ scope: "type" as const, stale: ["kind"] },
 		{ scope: "stat" as const, stale: ["content", "kind"] },
 		{ scope: "entries" as const, stale: ["entry", "kind"] },
@@ -282,8 +301,8 @@ describe("speculative action resource versions", () => {
 			deep: "src/nested/added.ts", outside: ".gitignore", kind: "src/value.ts" })) {
 			const root = await workspace({ "src/value.ts": "one\n", "src/nested/existing.ts": "" });
 			const manager = new ResourceVersionManager(root, { watch: false });
-			const token = await manager.capture([{ path: scope === "type" || scope === "stat" ? "src/value.ts" : "src", scope }], 4096);
-			if (scope === "type") await expect(token.view!.evaluate((view) => view.stat(path.join(root, "src/value.ts")))).rejects.toThrow("unproven");
+			const token = await manager.capture([{ path: ["entry", "type", "stat"].includes(scope) ? "src/value.ts" : "src", scope }], 4096);
+			if (["entry", "type"].includes(scope)) await expect(token.view!.evaluate((view) => view.stat(path.join(root, "src/value.ts")))).rejects.toThrow("unproven");
 			if (change === "kind") { await fs.rm(path.join(root, relative)); await fs.mkdir(path.join(root, relative)); }
 			else await fs.writeFile(path.join(root, relative), "changed\n");
 			expect((await manager.validate(token)).expired, change).toBe(stale.includes(change));

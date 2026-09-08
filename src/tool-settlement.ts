@@ -26,13 +26,15 @@ export interface ToolProcessInvocation {
 	readonly timeout?: number;
 }
 
+export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string };
+
 /** Filesystem capabilities supplied by an execution world, never ambient host defaults. */
 export interface ToolFilesystemOperations {
 	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
 	readonly access: (target: string, writable?: boolean) => Promise<void>;
 	readonly exists?: (target: string) => boolean | Promise<boolean>;
-	/** File size requires its own evidence; a type-only query never exposes it. */
-	readonly stat?: (target: string, fields?: "type") => { isDirectory: () => boolean; size?: number } | Promise<{ isDirectory: () => boolean; size?: number }>;
+	/** File size needs its own evidence. `entry` exposes the final entry/link without following it. */
+	readonly stat?: (target: string, fields?: "type" | "entry") => ToolFilesystemStat | Promise<ToolFilesystemStat>;
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;
