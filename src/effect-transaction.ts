@@ -1,6 +1,6 @@
 import { type SpeculativeExecutionRoute, validateWorldBranch, type WorldBranch, type WorldResultCapture } from "./execution-world.ts";
 import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
-import { cloneSharedData } from "./stable-json.ts";
+import { cloneSharedData, immutableSnapshot } from "./stable-json.ts";
 
 export type EffectTransactionState =
 	| "begun"
@@ -82,21 +82,19 @@ export interface EffectTransaction<Output> extends WorldBranch<Output> {
 	readonly abort: () => Promise<void>;
 }
 
-interface MutableEffectTransactionAttempt extends EffectTransactionAttempt {
+interface MutableEffectTransactionAttempt extends Omit<EffectTransactionAttempt, "state"> {
 	stateValue: EffectTransactionState;
 }
 
 /** Coordinates begin → execute/seal → validate → commit/abort for every execution backend. */
 export class EffectTransactionCoordinator<Output> {
-	private readonly attempts = new WeakSet<MutableEffectTransactionAttempt>();
+	private readonly attempts = new WeakMap<EffectTransactionAttempt, MutableEffectTransactionAttempt>();
 	private sequence = 0;
 
 	begin(descriptor: EffectTransactionDescriptor): EffectTransactionAttempt {
-		const attempt: MutableEffectTransactionAttempt = {
-			id: `tx_${++this.sequence}`, descriptor: Object.freeze({ ...descriptor }), stateValue: "begun",
-			get state() { return this.stateValue; },
-		};
-		this.attempts.add(attempt);
+		const owned: MutableEffectTransactionAttempt = { id: `tx_${++this.sequence}`, descriptor: immutableSnapshot(descriptor), stateValue: "begun" };
+		const attempt = Object.freeze({ id: owned.id, descriptor: owned.descriptor, get state() { return owned.stateValue; } });
+		this.attempts.set(attempt, owned);
 		return attempt;
 	}
 
@@ -164,8 +162,8 @@ export class EffectTransactionCoordinator<Output> {
 	}
 
 	private owned(attempt: EffectTransactionAttempt): MutableEffectTransactionAttempt {
-		const mutable = attempt as MutableEffectTransactionAttempt;
-		if (!this.attempts.has(mutable)) throw new Error("effect transaction belongs to another coordinator");
+		const mutable = this.attempts.get(attempt);
+		if (!mutable) throw new Error("effect transaction belongs to another coordinator");
 		return mutable;
 	}
 

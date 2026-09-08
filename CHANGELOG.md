@@ -4,6 +4,8 @@
 
 ### Breaking Changes
 
+- Transaction attempts expose only an immutable descriptor and lifecycle view; route and validation
+  evidence are now owned snapshots, so external mutations cannot change reuse authority after issuance.
 - Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused
   `alias` forwarding method was removed. Link metadata grants no authority to read the target.
 - Shared transactions now own a sealed plain-data result and give each reader/adoption a separate copy.

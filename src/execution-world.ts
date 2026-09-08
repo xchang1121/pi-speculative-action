@@ -6,6 +6,7 @@ import {
 } from "./effect-model.ts";
 import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { immutableSnapshot } from "./stable-json.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
@@ -148,12 +149,12 @@ export interface WorldBranch<Output> {
 /** Only an actual backend proof can authorize a sealed result; path/event hints cannot replace it. */
 export async function validateWorldBranch<Output>(branch: WorldBranch<Output> | undefined, reuse: WorldReuseStrategy): Promise<ResourceValidation> {
 	try {
-		if (branch?.validate) return await branch.validate();
-		return branch && reuse === "exclusive_branch"
+		const validation: ResourceValidation = branch?.validate ? await branch.validate() : branch && reuse === "exclusive_branch"
 			? { status: "valid", metrics: zeroValidationMetrics() }
 			: { status: "indeterminate", cause: cause("freshness", "validation_unavailable"), metrics: zeroValidationMetrics() };
+		return immutableSnapshot(validation);
 	} catch (error) {
-		return { status: "indeterminate", cause: cause("freshness", "validation_failed", error instanceof Error ? error.message : String(error)), metrics: zeroValidationMetrics() };
+		return immutableSnapshot({ status: "indeterminate", cause: cause("freshness", "validation_failed", error instanceof Error ? error.message : String(error)), metrics: zeroValidationMetrics() });
 	}
 }
 

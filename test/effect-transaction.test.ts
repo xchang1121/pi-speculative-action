@@ -25,6 +25,7 @@ describe("EffectTransactionCoordinator", () => {
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const attempt = coordinator.begin({ tool: "arbitrary", callID: "call-1", route });
 			expect(attempt.state).toBe("begun");
+			expect("stateValue" in attempt).toBe(false); expect(Reflect.set(attempt, "state", "validated")).toBe(false);
 			for (const unowned of [{ ...attempt }, new EffectTransactionCoordinator<string>().begin(attempt.descriptor)])
 				await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
 			const transaction = await coordinator.execute(attempt, async () => branch({
@@ -87,14 +88,17 @@ describe("EffectTransactionCoordinator", () => {
 		const disposeBranch = vi.fn();
 		const disposeCapture = vi.fn();
 		const coordinator = new EffectTransactionCoordinator<string>();
-		const capturedAttempt = coordinator.begin({ tool: "custom", route: { ...route, reuse: "shared_result" } });
+		const offeredRoute = { ...route, reuse: "shared_result" as SpeculativeExecutionRoute["reuse"] };
+		const capturedAttempt = coordinator.begin({ tool: "custom", route: offeredRoute });
+		offeredRoute.reuse = "exclusive_branch"; offeredRoute.fingerprint = "changed after begin";
+		const offeredProof = { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: metrics() };
 		const capture = coordinator.capture(capturedAttempt, {
 			seal: async (output) =>
 				branch({
 					output,
 					validate: proof === "missing" ? undefined : async () => {
 						if (proof === "throws") throw new Error("no evidence");
-						return { status: "stale", cause: { stage: "freshness", code: "changed" }, metrics: metrics() };
+						return offeredProof;
 					},
 					dispose: disposeBranch,
 				}),
@@ -102,7 +106,10 @@ describe("EffectTransactionCoordinator", () => {
 		});
 		const transaction = (await capture.seal("actor-output")) as EffectTransaction<string>;
 
-		expect(await transaction.validate()).toMatchObject({ status: proof === "stale" ? "stale" : "indeterminate",
+		const validation = await transaction.validate();
+		Object.assign(offeredProof, { status: "valid" }); offeredProof.metrics.durationMs = 99;
+		expect(Reflect.set(validation, "status", "valid")).toBe(false); expect(Reflect.set(validation.metrics, "durationMs", 99)).toBe(false);
+		expect(validation).toMatchObject({ status: proof === "stale" ? "stale" : "indeterminate",
 			cause: { code: proof === "stale" ? "changed" : proof === "missing" ? "validation_unavailable" : "validation_failed" } });
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 		await transaction.abort();
