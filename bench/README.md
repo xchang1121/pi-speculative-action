@@ -23,6 +23,20 @@ five-second child begins, while recording the observable `TracerPid` difference:
 npm run bench:exec-boundary -- --output bench/results/local-exec-boundary.json
 ```
 
+## Dependency-free grep feasibility probe
+
+```sh
+node --experimental-strip-types bench/grep-captured-qualification.mjs
+```
+
+Uses only Pi's existing rg, with downloads disabled; missing rg reports a skip. On fixed flat
+UTF-8 fixtures it runs the complete stock tool over privately copied, token-owned inputs, then
+requires five real Runtime adoptions with identical output and no new producer execution. Native
+Pi, fixed-sort host Pi, producer preparation/execution, and ready-hit timings are separate.
+Sorting can change native limited results; this is **not** a transparent native replacement or
+a production grep route. General namespace/config/ignore/encoding, cancellation and benefit
+admission remain unqualified. Both wins and slower-than-native hits are retained in the output.
+
 ## ThinkThread real Runtime qualification
 
 From a source checkout with its real Agent POSIX SDK installed and `npm run build` complete,
