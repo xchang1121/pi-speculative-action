@@ -163,14 +163,14 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
   cwd = (await view.stat(cwd, "type")).realPath;
   assert.ok(cwd && rootStat.realPath, "resolved input names require captured evidence");
   // A changed spelling can change caller-glob matching even when directory contents are equal.
-  if (directory && query.glob) assert.ok(cwd === originalCwd && rootStat.realPath === originalTarget, "glob alias namespace is not qualified");
+  if (directory && query.glob) assert.ok(cwd === originalCwd, "glob cwd alias namespace is not qualified");
   const sourceTarget = directory ? rootStat.realPath : originalTarget;
   const map = (source) => {
     const relative = relativeFilesystemPath(volume, source);
     assert.notEqual(relative, undefined, "input crossed its declared filesystem root");
     return path.join(privateVolume, relative);
   };
-  const target = map(sourceTarget), privateCwd = map(cwd), marker = "pi-directory-" + randomUUID();
+  const target = map(sourceTarget), logicalTarget = map(originalTarget), privateCwd = map(cwd), marker = "pi-directory-" + randomUUID();
   const files = new Map(), loaded = new Set(), pending = new Map(), linkedConfigurations = new Set(); let entries = 0;
   const load = async (source, target) => {
     signal.throwIfAborted(); reads.add(path.relative(originalCwd, source));
@@ -190,6 +190,11 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
     const bytes = await view.readFile(source);
     if (!bytes.length) return undefined;
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytes.indexOf(10) < 0 ? bytes.length : bytes.indexOf(10))).replace(/\r$/, "");
+  };
+  const admitDirectory = async (parent, pattern) => {
+    const control = path.join(parent, ".rgignore");
+    if (!files.has(control)) files.set(control, undefined);
+    await fs.appendFile(control, `\n!/${pattern}/\n`);
   };
   const rules = async (source, target) => {
     await fs.mkdir(target, { recursive: true });
@@ -249,9 +254,9 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
       await walk(path.join(source, name), path.join(target, name));
     }
   };
-  const select = async (target, flags = []) => {
+  const select = async (targets, flags = []) => {
     const output = [], diagnostic = []; let bytes = 0;
-    const { code } = await runNative("selection", { file: rg, cwd: privateCwd, args: ["--files", "--null", "--hidden", ...flags, "--", target],
+    const { code } = await runNative("selection", { file: rg, cwd: privateCwd, args: ["--files", "--null", "--hidden", ...flags, "--", ...targets],
       options: { stdio: ["ignore", "pipe", "pipe"] } }, signal,
       ({ fd, data }) => { assert.ok((bytes += data.length) <= 1024 * 1024, "selected name budget"); (fd === 1 ? output : diagnostic).push(data); });
     assert.ok(code === 0 || code === 1, Buffer.concat(diagnostic).toString());
@@ -260,36 +265,59 @@ async function materializeSelected(view, cwd, destination, query, signal, reads,
     return new Set(decoded.split("\0").filter(Boolean).map((selected) => {
       const resolved = path.resolve(selected);
       assert.notEqual(relativeFilesystemPath(privateVolume, resolved), undefined, "rg selected an unowned input"); return resolved;
-    }).filter((selected) => !linkedConfigurations.has(selected)));
+    }));
   };
   if (directory) for (let source = sourceTarget;; source = path.dirname(source)) {
-    if (source !== sourceTarget) { await rules(source, map(source)); await fs.appendFile(path.join(map(source), ".rgignore"), "\n!/*/\n"); }
+    if (source !== sourceTarget) { await rules(source, map(source)); await admitDirectory(map(source), "*"); }
     if (source === volume) break;
   }
   await fs.mkdir(privateCwd, { recursive: true });
+  const parents = new Set([target]), deny = path.join(destination, "glob-deny");
+  if (query.glob) await fs.writeFile(deny, "*\n", { flag: "wx" });
   const selectedFiles = async (flags = []) => {
-    const ordinary = await select(privateVolume, flags);
-    const selected = query.glob ? await select(privateVolume, ["--glob", query.glob, ...flags]) : ordinary;
-    if (query.glob) for (const file of await select(target, ["--no-ignore", "--glob", query.glob, ...flags])) if (ordinary.has(file)) selected.add(file);
-    return new Set([...selected].filter((file) => relativeFilesystemPath(target, file) !== undefined));
+    const ordinary = await select([privateVolume], flags);
+    let selected = ordinary;
+    if (query.glob) {
+      const classify = async (extra) => new Set([...await select([...parents].map((parent) => path.join(logicalTarget, path.relative(target, parent))),
+        ["--no-ignore", "--max-depth=2", "--glob", query.glob, ...extra, ...flags])].map((file) => {
+        const relative = relativeFilesystemPath(logicalTarget, file); assert.notEqual(relative, undefined, "glob classification escaped its query");
+        return path.join(target, relative);
+      }));
+      // Native decisions under neutral/denied defaults distinguish explicit overrides without parsing a glob.
+      const allowed = await classify([]); selected = await classify(["--ignore-file", deny]);
+      for (const file of ordinary) if (allowed.has(file)) selected.add(file);
+    }
+    return new Set([...selected].filter((file) => relativeFilesystemPath(target, file) !== undefined && !linkedConfigurations.has(file) && (!files.has(file) || files.get(file) !== undefined)));
   };
   await walk(sourceTarget, target);
-  if (directory) await expand(target);
+  if (directory) {
+    await expand(target);
+    if (logicalTarget !== target) {
+      await fs.mkdir(path.dirname(logicalTarget), { recursive: true });
+      await fs.symlink(target, logicalTarget, process.platform === "win32" ? "junction" : "dir");
+    }
+  }
   while (pending.size) {
     const frontier = [...pending.keys()];
     for (const parent of frontier) await fs.writeFile(path.join(parent, marker), "", { flag: "wx" });
     const admitted = await selectedFiles(["--glob", "**/" + marker]);
     for (const parent of frontier) {
       await fs.unlink(path.join(parent, marker));
-      if (admitted.has(path.join(parent, marker))) await expand(parent); else pending.delete(parent);
+      if (admitted.has(path.join(parent, marker))) {
+        if (query.glob) {
+          const name = path.basename(parent); assert.ok(!/[\r\n]/.test(name), "directory rule name cannot contain a line ending");
+          await admitDirectory(path.dirname(parent), name.replace(/[\\*?\[\] ]/g, "\\$&"));
+        }
+        parents.add(parent); await expand(parent);
+      } else pending.delete(parent);
     }
   }
   const selected = directory ? await selectedFiles() : new Set([target]);
   for (const [target, source] of files) {
-    if (selected.has(target)) await load(source, target); // Restore raw config bytes after private-only pointer/ancestor transport.
+    if (source !== undefined && selected.has(target)) await load(source, target); // Restore raw config bytes after private-only pointer/ancestor transport.
     else { assert.notEqual(relativeFilesystemPath(privateVolume, target), undefined); await fs.unlink(target); }
   }
-  return { files: loaded.size, cwd: privateCwd, args: { ...query, path: target } };
+  return { files: loaded.size, cwd: privateCwd, args: { ...query, path: logicalTarget } };
 }
 
 async function qualifyNativeLinks() {
@@ -318,7 +346,7 @@ async function qualifyNativeLinks() {
 
 async function qualifyNamespace() {
   const cwd = path.join(root, "namespace"); await fs.mkdir(cwd);
-  for (const directory of [".git", ".git/info", "search", "search/nested", "search/empty", "search/blocked", "search/linked-config", "search/file-only", "search/file-only/deep", "rules"]) await fs.mkdir(path.join(cwd, directory));
+  for (const directory of [".git", ".git/info", "search", "search/nested", "search/empty", "search/blocked", "search/linked-config", "search/file-only", "search/file-only/deep", "search/syntax", "search/syntax/literal [x]", "search/syntax/!bang#", "rules"]) await fs.mkdir(path.join(cwd, directory));
   const fixtures = {
     ".git/HEAD": "ref: refs/heads/main\n", ".git/info/exclude": "excluded.txt\n",
     ".gitignore": "ignored.*\nsearch/blocked/\n", ".ignore": "*.tmp\n", "search/.gitignore": "*.log\n",
@@ -335,11 +363,13 @@ async function qualifyNamespace() {
     "search/linked-config/visible.txt": "needle visible beside linked config\n",
     "search/file-only/.ignore": "*\n!*/\n", "search/file-only/deep/.ignore": "!value.txt\n",
     "search/file-only/deep/value.txt": "needle reintroduced below excluded files\n",
+    "search/syntax/.ignore": "*\n", "search/syntax/literal [x]/value.txt": "needle literal directory\n", "search/syntax/!bang#/value.txt": "needle punctuation directory\n",
   };
   for (const [name, contents] of Object.entries(fixtures)) await fs.writeFile(path.join(cwd, name), contents);
   const outside = path.join(root, "outside-namespace"); await fs.mkdir(outside);
   await fs.writeFile(path.join(outside, "external.txt"), "needle outside captured namespace\n");
   const directoryLink = process.platform === "win32" ? "junction" : "dir";
+  const cwdAlias = path.join(root, "cwd-alias"); await fs.symlink(cwd, cwdAlias, directoryLink);
   for (const [name, target] of [["internal-link", path.join(cwd, "search/nested")], ["external-link", outside],
     ["dangling-link", path.join(cwd, "missing")], ["cycle-link", path.join(cwd, "search")]]) {
     const parent = process.platform === "win32" && ["external-link", "dangling-link"].includes(name) ? path.join(cwd, `edge-${name}`) : path.join(cwd, "search");
@@ -391,6 +421,8 @@ async function qualifyNamespace() {
     ["glob-root-negative", { path: "search", pattern: "needle", glob: "!search/" }],
     ["glob-positive-directory", { path: "search", pattern: "needle", glob: "**/blocked{,/**}" }],
     ["glob-negative-directory", { path: "search", pattern: "needle", glob: "!**/nested/" }],
+    ["glob-literal-directory", { path: "search/syntax", pattern: "needle", glob: "**/literal*{,/**}", context: 1 }],
+    ["glob-config-data", { path: "search/syntax", pattern: ".", glob: "**" }],
     ["mixed-encoding-context", { path: "search", pattern: "(?P<word>needle)", context: 1 }],
     ["literal-case", { path: "search", pattern: "n.e", literal: true, ignoreCase: true }],
     ["negative-query", { path: "search", pattern: "not-present-anywhere" }],
@@ -400,7 +432,12 @@ async function qualifyNamespace() {
     ["ignored-subtree-change", { path: "search", pattern: "needle" }],
     ["explicit-directory-link", { path: "search/internal-link", pattern: "needle" }],
     ["explicit-external-link", { path: process.platform === "win32" ? "edge-external-link/external-link" : "search/external-link", pattern: "needle" }],
-    ["unproven-link-glob", { path: "search/internal-link", pattern: "needle", glob: "*.txt" }, true],
+    ["link-glob", { path: "search/internal-link", pattern: "needle", glob: "*.txt" }],
+    ["link-glob-relative", { path: "search/internal-link", pattern: "needle", glob: "search/internal-link/keep.txt" }],
+    ["link-glob-physical-name", { path: "search/internal-link", pattern: "needle", glob: "search/nested/keep.txt" }],
+    ["link-glob-directory", { path: "search/cycle-link", pattern: "needle", glob: "**/blocked{,/**}" }],
+    ["link-glob-negative-directory", { path: "search/cycle-link", pattern: "needle", glob: "!**/nested/" }],
+    ["unproven-cwd-glob", { path: "search", pattern: "needle", glob: "search/a.txt" }, true, cwdAlias],
     ["explicit-dangling-link", { path: process.platform === "win32" ? "edge-dangling-link/dangling-link" : "search/dangling-link", pattern: "needle" }, true],
     ...(process.platform === "win32" ? [
       ["discovered-external-link", { path: "edge-external-link", pattern: "needle" }],
@@ -439,8 +476,8 @@ async function qualifyNamespace() {
     const changed = mutation ? async () => { await fs.writeFile(path.resolve(workspace, mutation[0]), mutation[1]); return reference(); } : undefined;
     const captured = await qualifyCaptured(workspace, args, expected, changed, rejected, label === "ignored-subtree-change");
     assert.ok(!captured.reads.some((file) => file.endsWith("ignored.bin")), "ignored payload must not consume the input budget");
-    if (!["explicit-ignored-directory", "glob-positive-directory"].includes(label)) assert.ok(!captured.enumerated.includes("search/blocked"), "ignored directory must not consume the enumeration budget");
-    if (label === "glob-negative-directory") assert.ok(!captured.enumerated.includes("search/nested"), "negative glob directory must not consume the enumeration budget");
+    if (!["explicit-ignored-directory", "glob-positive-directory", "link-glob-directory"].includes(label)) assert.ok(!captured.enumerated.includes("search/blocked"), "ignored directory must not consume the enumeration budget");
+    if (label.endsWith("glob-negative-directory")) assert.ok(!captured.enumerated.includes("search/nested"), "negative glob directory must not consume the enumeration budget");
     if (label !== "explicit-git-directory") assert.ok(!captured.enumerated.includes(".git"), "repository metadata uses its named configuration, not a recursive walk");
     checks.push({ label, outputBytes: expected instanceof Error ? 0 : Buffer.byteLength(JSON.stringify(expected)), ...captured });
     console.log(JSON.stringify({ semanticCase: checks.at(-1) }));

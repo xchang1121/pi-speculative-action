@@ -38,17 +38,21 @@ input cleanup before settlement; a tiny query may finish before its result-limit
 `--case=<label>[,<label>...]` selects semantic cases. The separate 16-process link characterization checks both
 `--files` and actual search: on this Windows rg, a discovered dangling junction is absent from the file
 list but makes search fail. No-follow captured entries therefore cannot alone authorize skipping it.
-The 33 semantic cases per OS cover named same-volume links, POSIX linked ignore files and skipped FIFO/
+The 40 semantic cases per OS cover named same-volume links, POSIX linked ignore files and skipped FIFO/
 discovered links, ancestor configurations, Git indirection and explicit Git-directory/data searches.
-Broken targets, cross-volume inputs and directory aliases combined with globs remain unqualified; the
+Directory-alias glob matching preserves logical names, including explicit directory overrides and
+negative-glob pruning. Broken targets, cross-volume inputs and cwd aliases combined with globs remain unqualified; the
 original-workspace Actor runs once, including its original error. No native-default behavior changes.
 
 Only the already-installed rg is used: a stable capture pins its SHA-256 and a task-owned executable copy.
 The original tool runs in separate bounded Actor/producer processes through the existing input protocol.
 Metadata and ignore-file evidence drive rg's own file selection; only selected raw bytes are copied.
 Directory expansion is lazy: temporary, uniquely named marker files test the next frontier with rg;
-the final marker override matches only these files, never their parent directory names. Ordinary,
-caller-glob and query-local selections retain native directory precedence and explicit-root admission.
+the final marker override matches only these files, never their parent directory names. Native glob
+classification under neutral/denied defaults distinguishes explicit overrides without interpreting the
+caller pattern. Only admitted parents become explicit roots for the next shallow classification;
+physical ignore evidence and logical query spellings remain distinct. Generated directory rules are
+removed before execution, and selected user configuration files are restored to their original bytes.
 Ignored and negative-glob subtrees must not be enumerated, including `.git` unless explicitly queried.
 Named parent configurations are captured up to the declared read-only volume root, without enumerating
 ancestors or recursively watching that root. Private path geometry preserves anchored rules; Git
@@ -69,7 +73,7 @@ timings stay separate; the small-mode timings are not performance claims. The pr
 disables ambient rg/global ignore configuration and sorts output; ancestor ignore files remain inputs.
 Native parent loading is disabled only on the fully materialized private namespace, preventing access
 to uncaptured host ancestors. This is **not** native-default equivalence or production admission:
-private materialization/selection cost, alias/glob namespaces and existing benefit gates still need
+private materialization/selection cost, cwd-alias namespaces and existing benefit gates still need
 qualification. Nothing is installed or downloaded; missing rg skips.
 
 ## ThinkThread real Runtime qualification
