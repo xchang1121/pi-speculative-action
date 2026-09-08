@@ -14,6 +14,7 @@ import type {
 	MaterializedSpeculativeCandidate,
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
+	SpeculativeDraftCandidate,
 	SpeculativePlanSource,
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
@@ -126,7 +127,7 @@ function harness(input: {
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
-	readonly preflight?: (signal: AbortSignal) => CandidatePreflight | Promise<CandidatePreflight>;
+	readonly preflight?: (signal: AbortSignal, candidate: SpeculativeDraftCandidate) => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly authorize?: () => CandidatePreflight;
 	readonly projection?: ActionProjectionRule<string>;
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
@@ -170,7 +171,7 @@ function harness(input: {
 			? { rejectCandidateOutput: ({ output }) => input.rejectCandidateOutput!(output) }
 			: {}),
 		actual: (call) => ({ id: call.id, tool: call.tool, input: call.input }),
-		preflightCandidate: ({ signal }) => input.preflight?.(signal) ?? { ok: true },
+		preflightCandidate: ({ signal, candidate }) => input.preflight?.(signal, candidate) ?? { ok: true },
 		authorizeCandidate: input.authorize,
 		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
@@ -266,10 +267,17 @@ describe("structural speculative runtime", () => {
 	it("settles matched and adopted as orthogonal facts exactly once", async () => {
 		const settlements: PredictionSettlement[] = [];
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));
+		const offered = { ...plan("source", "stale", {}), draftTokens: 3 };
+		offered.actions[0]!.input = {
+			get path() {
+				offered.draftTokens = 99;
+				return "README.md";
+			},
+		};
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: () => plan("source", "stale", { path: "README.md" }),
+			propose: () => offered,
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
@@ -300,6 +308,9 @@ describe("structural speculative runtime", () => {
 		expect(predictionEvents).toHaveLength(1);
 		expect(predictionEvents[0]!.type === "prediction" && predictionEvents[0]!.settlement).toBe(settlements[0]);
 		expect(actionKey).toHaveBeenCalledTimes(2);
+		expect(fixture.events.find((event) => event.type === "candidate")).toMatchObject({
+			candidate: { draftTokens: 3, totalDraftTokens: 3 },
+		});
 	});
 
 	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
@@ -1348,6 +1359,8 @@ describe("structural speculative runtime", () => {
 
 	it("adopts a target-state-valid child after its parent prediction misses", async () => {
 		let enabled = true;
+		let dependencyChange: boolean | undefined;
+		const childPrepared = barrier();
 		const executed: string[] = [];
 		const childReady = candidateSucceeded(1, "late.ts");
 		const source: Source = {
@@ -1361,6 +1374,13 @@ describe("structural speculative runtime", () => {
 		};
 		const fixture = harness({
 			source,
+			preflight: (_signal, candidate) => {
+				if (candidate.dependsOn?.length) {
+					dependencyChange = Reflect.set(candidate.dependsOn[0]!, "condition", "actor_adopted");
+					childPrepared.arrive();
+				}
+				return { ok: true };
+			},
 			execute: (_tool, input) => {
 				executed.push(String(input.path));
 				return `${String(input.path)}:output`;
@@ -1368,22 +1388,28 @@ describe("structural speculative runtime", () => {
 			onEvent: childReady.observe,
 		});
 
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
-		await childReady.promise;
-		expect(await fixture.runtime.consume(call("miss", { path: "other.ts" }))).toBeUndefined();
-		await fixture.runtime.actual({ ...call("miss", { path: "other.ts" }), durationMs: 1, output: "actor" });
-		await fixture.runtime.finishTurn({ ...call("miss"), terminal: false });
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
+			await childPrepared.promise;
+			expect(dependencyChange).toBe(false);
+			await childReady.promise;
+			expect(await fixture.runtime.consume(call("miss", { path: "other.ts" }))).toBeUndefined();
+			await fixture.runtime.actual({ ...call("miss", { path: "other.ts" }), durationMs: 1, output: "actor" });
+			await fixture.runtime.finishTurn({ ...call("miss"), terminal: false });
 
-		enabled = false;
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "target" });
-		expect(await fixture.runtime.consume(call("target", { path: "late.ts" }))).toBe("late.ts:output");
-		await fixture.runtime.finishTurn({ ...call("target"), terminal: true });
-		expect(executed).toEqual(["parent.ts", "late.ts"]);
-		expect(
-			fixture.events
-				.filter((event) => event.type === "prediction")
-				.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined)),
-		).toEqual([false, true]);
+			enabled = false;
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "target" });
+			expect(await fixture.runtime.consume(call("target", { path: "late.ts" }))).toBe("late.ts:output");
+			await fixture.runtime.finishTurn({ ...call("target"), terminal: true });
+			expect(executed).toEqual(["parent.ts", "late.ts"]);
+			expect(
+				fixture.events
+					.filter((event) => event.type === "prediction")
+					.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined)),
+			).toEqual([false, true]);
+		} finally {
+			await fixture.runtime.finishTurn({ ...call("target"), terminal: true });
+		}
 	});
 
 	it("keeps equal child actions isolated by parent world and rebases the adopted lineage", async () => {

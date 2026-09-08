@@ -25,24 +25,10 @@ export interface SpeculativeActionSettings {
 	readonly tools: readonly string[];
 }
 
-export interface SpeculativeDraftCandidate {
-	readonly type: "tool_call";
-	readonly tool: string;
-	readonly input: unknown;
-	readonly diagnostic?: string;
+export interface SpeculativeDraftCandidate extends Omit<PlanAction, "id" | "background"> {
 	readonly source?: string;
 	readonly proposalID?: string;
 	readonly actionID?: string;
-	readonly feedback?: unknown;
-	readonly dependsOn?: PlanAction["dependsOn"];
-	readonly horizon?: number;
-	readonly latestHorizon?: number;
-	readonly empiricalProbability?: number;
-	readonly conditionalProbability?: number;
-	readonly expectedDurationMs?: number;
-	readonly expectedLatencyBenefitMs?: number;
-	readonly resourceDemand?: number;
-	readonly depth?: number;
 }
 
 export type CandidatePreflight =

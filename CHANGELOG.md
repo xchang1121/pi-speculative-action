@@ -249,6 +249,10 @@
 
 ### Fixed
 
+- Capture plan headers, action identities and dependency records before input cloning. Producer or
+  preflight callbacks cannot rewrite an accepted revision, scheduling edge or draft-token accounting.
+  Dependencies are canonicalized and frozen once; revision comparison reuses those records and
+  preserves execution identity across harmless ordering/default-condition changes. Feedback stays opaque.
 - Register the shared resource-release promise before invoking cleanup. Synchronous callback reentry
   joins the same release instead of disposing twice; shutdown still waits for successful or failed cleanup.
 - Shared sealing and every borrower now preserve enumerable Symbol-keyed data, including Pi read

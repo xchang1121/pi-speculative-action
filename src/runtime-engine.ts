@@ -1244,10 +1244,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (session.lifecycle.sealed || scope.signal.aborted) return;
 		if (update.source !== source.id) return;
 		const acceptedUpdate = source.multiStepEnabled?.(scope.settings) === false ? immediateOnly(update) : update;
+		const draftTokens = finiteMetric(acceptedUpdate.draftTokens);
 		const applied = session.plan.apply(acceptedUpdate, session.decisionSequence);
 		if (!applied.accepted) return;
 		for (const retired of applied.retired) retirePlanAction(session, retired, cause("plan", "superseded"));
-		const draftTokens = finiteMetric(acceptedUpdate.draftTokens);
 		session.tokenTotal += draftTokens;
 		const materializations: Promise<void>[] = [];
 		for (const action of applied.upserted) {

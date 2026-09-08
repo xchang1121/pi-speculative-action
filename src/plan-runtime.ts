@@ -199,6 +199,7 @@ export class PlanRuntime {
 	private readonly plans = new Map<string, MutablePlan>();
 
 	apply(update: PlanUpdate, anchorDecisionSeq: number): PlanRuntimeUpdateResult {
+		update = { ...update };
 		return "actions" in update
 			? this.applyProposal(update, anchorDecisionSeq)
 			: this.applyDelta(update, anchorDecisionSeq);
@@ -398,9 +399,9 @@ export class PlanRuntime {
 		if (!current) return { accepted: false, reason: "proposal_missing" };
 		if (current.source !== delta.source) return { accepted: false, reason: "source_mismatch" };
 		if (delta.revision <= current.revision) return { accepted: false, reason: "stale_revision" };
+		const removals = new Set(delta.remove ?? []);
 		const validated = validateActions(delta.upsert ?? []);
 		if (!validated.ok) return { accepted: false, reason: validated.reason };
-		const removals = new Set(delta.remove ?? []);
 		if ([...removals].some((id) => !validToken(id))) return { accepted: false, reason: "invalid_action" };
 		const actions = new Map([...current.nodes].map(([id, node]) => [id, node.action]));
 		for (const id of removals) actions.delete(id);
@@ -627,24 +628,24 @@ function newNode(
 
 function dependencySatisfied(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
 	const execution = executionProjection(node.execution);
-	switch (canonicalCondition(condition)) {
+	switch (condition) {
 		case "actor_adopted":
 			return predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
 			return execution.status === "succeeded";
-		case "execution_settled":
+		default:
 			return executionSettled(execution);
 	}
 }
 
 function dependencyImpossible(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
 	const execution = executionProjection(node.execution);
-	switch (canonicalCondition(condition)) {
+	switch (condition) {
 		case "actor_adopted":
 			return node.opportunity.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
 		case "execution_succeeded":
 			return execution.status === "failed" || execution.status === "cancelled";
-		case "execution_settled":
+		default:
 			return false;
 	}
 }
@@ -732,38 +733,33 @@ function validateActions(
 ):
 	| { readonly ok: true; readonly actions: readonly PlanAction[] }
 	| { readonly ok: false; readonly reason: "duplicate_action" | "invalid_action" | "invalid_dependency" } {
-	const result: PlanAction[] = [];
+	// Capture scheduling records before cloning input graphs, which may invoke producer accessors.
+	const result = actions.map((source) => ({ ...source }));
 	const ids = new Set<string>();
-	for (const source of actions) {
+	for (const source of result) {
 		if (!validToken(source.id) || !validToken(source.tool) || source.type !== "tool_call") {
 			return { ok: false, reason: "invalid_action" };
 		}
 		if (ids.has(source.id)) return { ok: false, reason: "duplicate_action" };
 		ids.add(source.id);
-		const dependsOn = source.dependsOn
-			? Object.freeze(
-					source.dependsOn.map((dependency) => ({
-						...dependency,
-						condition: canonicalCondition(dependency.condition),
-					})),
-				)
-			: undefined;
-		if (dependsOn?.some((dependency) => !validToken(dependency.actionID))) {
-			return { ok: false, reason: "invalid_dependency" };
+		if (source.dependsOn) {
+			source.dependsOn = Object.freeze(
+				source.dependsOn.map(({ actionID, condition }) =>
+					Object.freeze({ actionID, condition: canonicalCondition(condition) }),
+				),
+			);
+			if (source.dependsOn.some((dependency) => !validToken(dependency.actionID))) {
+				return { ok: false, reason: "invalid_dependency" };
+			}
 		}
-		let input: unknown;
-		try {
-			input = immutableSnapshot(source.input);
-		} catch {
-			return { ok: false, reason: "invalid_action" };
+	}
+	try {
+		for (const source of result) {
+			source.input = immutableSnapshot(source.input);
+			Object.freeze(source);
 		}
-		result.push(
-			Object.freeze({
-				...source,
-				input,
-				...(dependsOn ? { dependsOn } : {}),
-			}),
-		);
+	} catch {
+		return { ok: false, reason: "invalid_action" };
 	}
 	return { ok: true, actions: Object.freeze(result) };
 }
@@ -797,21 +793,15 @@ function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	return (
 		left.tool === right.tool &&
 		isDeepStrictEqual(left.input, right.input) &&
-		isDeepStrictEqual(normalizedDependencies(left), normalizedDependencies(right))
+		isDeepStrictEqual(orderedDependencies(left), orderedDependencies(right))
 	);
 }
 
-function normalizedDependencies(action: PlanAction): ReadonlyArray<Required<PlanActionDependency>> {
-	return (action.dependsOn ?? [])
-		.map(
-			(dependency): Required<PlanActionDependency> => ({
-				actionID: dependency.actionID,
-				condition: canonicalCondition(dependency.condition),
-			}),
-		)
-		.sort(
-			(left, right) => left.actionID.localeCompare(right.actionID) || left.condition.localeCompare(right.condition),
-		);
+function orderedDependencies(action: PlanAction): readonly PlanActionDependency[] {
+	// Both actions already own canonical records; compare order without rebuilding or mutating them.
+	return [...(action.dependsOn ?? [])].sort(
+		(left, right) => left.actionID.localeCompare(right.actionID) || left.condition!.localeCompare(right.condition!),
+	);
 }
 
 function planNodeID(source: string, proposalID: string, actionID: string, revision: number): string {

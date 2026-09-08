@@ -82,11 +82,40 @@ describe("PlanRuntime", () => {
 		expect(clamped.get("plan", "clamped")).toMatchObject({ expectedDecisionSeq: 7, latestDecisionSeq: 7 });
 	});
 
-	it("binds one canonical action identity and rejects uncloneable input", () => {
+	it.each(["proposal", "delta"] as const)("owns %s identity before input capture and binds one canonical action key", (kind) => {
 		const plan = new PlanRuntime();
-		const input = { path: "keyed.ts" };
-		plan.apply(proposal([action("keyed", { input })]), 0);
-		input.path = "mutated.ts";
+		if (kind === "delta") plan.apply(proposal([action("retained")]), 0);
+		const feedback = () => undefined;
+		const offered = { ...action("keyed"), background: true, feedback };
+		const peer = { ...action("peer"), dependsOn: [{ actionID: "keyed" }] };
+		const update = kind === "proposal"
+			? { ...proposal([offered, peer]), draftTokens: 3 }
+			: { proposalID: "plan", source: "source", revision: 2, upsert: [offered, peer], remove: [] as string[], draftTokens: 3 };
+		let path = "keyed.ts", reads = 0;
+		offered.input = {
+			get path() {
+				reads++;
+				Object.assign(offered, { id: "drifted", tool: "write", background: false });
+				peer.id = "drifted-peer";
+				peer.dependsOn[0]!.actionID = "missing";
+				update.remove?.push("retained");
+				Object.assign(update, {
+					[kind === "proposal" ? "id" : "proposalID"]: "drifted", source: "drifted", revision: -1, draftTokens: 99,
+				});
+				return path;
+			},
+		};
+		expect(plan.apply(update, 0)).toMatchObject({
+			accepted: true,
+			plan: { id: "plan", source: "source", revision: kind === "proposal" ? 1 : 2, draftTokens: 3 },
+		});
+		path = "mutated.ts";
+		expect(reads).toBe(1);
+		expect(plan.get("plan", "keyed")?.action).toMatchObject({ id: "keyed", tool: "read", background: true });
+		expect(plan.get("plan", "keyed")?.action.feedback).toBe(feedback);
+		expect(plan.get("plan", "peer")?.action.dependsOn).toEqual([{ actionID: "keyed", condition: "execution_settled" }]);
+		if (kind === "delta") expect(plan.get("plan", "retained")).toBeDefined();
+		expect(Object.isFrozen(offered)).toBe(false);
 		const key = {
 			key: "key",
 			hash: "hash",
@@ -135,15 +164,19 @@ describe("PlanRuntime", () => {
 
 	it("keeps execution dependencies independent from Actor adoption", () => {
 		const plan = new PlanRuntime();
+		const dependency = { actionID: "parent", condition: "actor_adopted" as const };
 		plan.apply(
 			proposal([
 				action("parent"),
 				action("settled", { dependsOn: [{ actionID: "parent", condition: "execution_settled" }] }),
 				action("succeeded", { dependsOn: [{ actionID: "parent", condition: "execution_succeeded" }] }),
-				action("confirmed", { dependsOn: [{ actionID: "parent", condition: "actor_adopted" }] }),
+				action("confirmed", { dependsOn: [dependency] }),
 			]),
 			0,
 		);
+		Reflect.set(dependency, "condition", "execution_succeeded");
+		const exposed = plan.get("plan", "confirmed")!.action.dependsOn![0]!;
+		const changed = Reflect.set(exposed, "condition", "execution_succeeded");
 
 		expect(plan.takeReady(0).map((node) => node.action.id)).toEqual(["parent"]);
 		const execution = new CandidateExecution<string>("shared");
@@ -163,6 +196,9 @@ describe("PlanRuntime", () => {
 				.map((node) => node.action.id)
 				.sort(),
 		).toEqual(["settled", "succeeded"]);
+		expect(changed).toBe(false);
+		expect(Object.isFrozen(exposed)).toBe(true);
+		expect(Object.isFrozen(dependency)).toBe(false);
 		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
 		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
 
@@ -184,19 +220,29 @@ describe("PlanRuntime", () => {
 				action("critical", { expectedDurationMs: 20 }),
 				action("child", {
 					expectedDurationMs: 80,
-					dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }],
+					dependsOn: [{ actionID: "short" }, { actionID: "critical", condition: "execution_succeeded" }],
 				}),
 			]),
 			4,
 		);
 
-		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 10 });
+		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 90 });
 		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, criticalPathMs: 100 });
 		expect(plan.get("plan", "child")).toMatchObject({
 			earliestDecisionSeq: 6,
 			expectedDecisionSeq: 6,
 			criticalPathMs: 80,
 		});
+		const identity = plan.get("plan", "child")!.identity;
+		expect(plan.apply({
+			proposalID: "plan", source: "source", revision: 2,
+			upsert: [action("child", {
+				expectedDurationMs: 80,
+				dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }, { actionID: "short", condition: "execution_settled" }],
+			})],
+		}, 4)).toMatchObject({ accepted: true, retired: [] });
+		expect(plan.get("plan", "child")!.identity).toBe(identity);
+		expect(plan.get("plan", "child")!.action.dependsOn!.map((dependency) => dependency.actionID)).toEqual(["critical", "short"]);
 		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
 
 		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
