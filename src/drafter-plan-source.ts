@@ -40,11 +40,8 @@ interface DrafterBatch {
 	readonly utility: DrafterUtilityBatch;
 }
 
-interface DrafterPlanFeedback {
+interface DrafterPlanFeedback extends DrafterBatch {
 	readonly kind: "drafter_plan";
-	readonly model: Model<Api>;
-	readonly context: Context;
-	readonly options: SimpleStreamOptions;
 	readonly message: AssistantMessage;
 	readonly depth: number;
 }
@@ -65,6 +62,23 @@ export function createDrafterPlanSource(input: {
 }): DrafterPlanSourceController {
 	const batches = new Map<string, Promise<DrafterBatch>>();
 	const gate = new DrafterUtilityGate();
+	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal): Promise<AssistantMessage> => {
+		signal.throwIfAborted();
+		gate.requestStarted(batch.utility);
+		const startedAt = performance.now();
+		let failed = false;
+		try {
+			const message = await input.complete(batch.model, batch.context, { ...batch.options, signal });
+			if (message.stopReason === "error" || message.stopReason === "aborted")
+				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+			return message;
+		} catch (error) {
+			failed = !signal.aborted;
+			throw error;
+		} finally {
+			gate.requestSettled(batch.utility, performance.now() - startedAt, failed);
+		}
+	};
 	const source: AgentPlanSource = {
 		id: "drafter",
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
@@ -102,7 +116,6 @@ export function createDrafterPlanSource(input: {
 					const model = configuredDraftModel ?? startInput.actorModel;
 					const utility = gate.start(
 						drafterModelKey(model),
-						proposalCount,
 						settings.sourceConfig?.drafterGateEnabled !== false,
 					);
 					let configuredDraftOptions: SimpleStreamOptions | undefined;
@@ -141,25 +154,12 @@ export function createDrafterPlanSource(input: {
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
 			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
-			const requestStartedAt = performance.now();
-			let requestFailed = false;
-			let message: AssistantMessage;
-			try {
-				message = await input.complete(prepared.model, prepared.context, { ...draftOptions, signal });
-				if (message.stopReason === "error" || message.stopReason === "aborted") {
-					requestFailed = message.stopReason === "error" || !signal.aborted;
-					throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-				}
-			} catch (error) {
-				if (!signal.aborted) requestFailed = true;
-				throw error;
-			} finally {
-				gate.requestSettled(prepared.utility, performance.now() - requestStartedAt, requestFailed);
-			}
+			const request = { ...prepared, options: draftOptions };
+			const message = await completeDraft(request, signal);
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
 			if (!data.tools.has(call.name) || !candidateNames.includes(call.name)) return undefined;
-			const feedback = drafterFeedback(prepared.model, prepared.context, draftOptions, message, call, 0);
+			const feedback = drafterFeedback(request, message, call, 0);
 			return {
 				id: proposalID,
 				source: "drafter",
@@ -181,13 +181,11 @@ export function createDrafterPlanSource(input: {
 			};
 			const continuationOptions = { ...previous.options, toolChoice: "auto" as const };
 			if (!drafterContextFits(previous.model, context, continuationOptions.maxTokens)) return undefined;
-			const message = await input.complete(previous.model, context, { ...continuationOptions, signal });
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-			}
+			const request = { ...previous, context, options: continuationOptions };
+			const message = await completeDraft(request, signal);
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
 			if (!call) return undefined;
-			const next = drafterFeedback(previous.model, context, continuationOptions, message, call, previous.depth + 1);
+			const next = drafterFeedback(request, message, call, previous.depth + 1);
 			return {
 				proposalID,
 				source: "drafter",
@@ -217,22 +215,15 @@ export function createDrafterPlanSource(input: {
 		},
 		actorActionSettled: async (feedback) => {
 			const { settlement } = feedback;
+			const owner = asDrafterPlanFeedback(feedback.candidateFeedback);
 			if (
+				!owner ||
 				feedback.candidate?.source !== "drafter" ||
 				settlement.provider.kind !== "speculative" ||
-				!settlement.matchedPredictions.some(
-					(prediction) =>
-						prediction.source === "drafter" && prediction.proposalID.startsWith(`drafter:${feedback.turnID}:`),
-				)
+				!settlement.matchedPredictions.some((prediction) => prediction.source === "drafter")
 			)
 				return;
-			const batch = batches.get(agentBatchKey(feedback.sessionID, feedback.turnID));
-			if (!batch) return;
-			try {
-				gate.creditExecutionAhead((await batch).utility, settlement.provider.timing.executionAheadMs);
-			} catch {
-				// Source resolution failures cannot own an adopted speculative candidate.
-			}
+			gate.creditExecutionAhead(owner.utility, settlement.provider.timing.executionAheadMs);
 		},
 		finishSession: () => {
 			batches.clear();
@@ -253,7 +244,7 @@ function drafterContextFits(model: Model<Api>, context: Context, maxTokens: numb
 }
 
 function drafterModelKey(model: Model<Api>): string {
-	return JSON.stringify([model.provider, model.api, model.id]);
+	return JSON.stringify([model.provider, model.api, model.baseUrl, model.id]);
 }
 
 function asDrafterPlanFeedback(value: unknown): DrafterPlanFeedback | undefined {
@@ -281,18 +272,14 @@ function drafterPlanAction(
 }
 
 function drafterFeedback(
-	model: Model<Api>,
-	context: Context,
-	requestOptions: SimpleStreamOptions,
+	batch: DrafterBatch,
 	message: AssistantMessage,
 	call: AgentToolCall,
 	depth: number,
 ): DrafterPlanFeedback {
 	return {
+		...batch,
 		kind: "drafter_plan",
-		model,
-		context,
-		options: requestOptions,
 		message: { ...message, content: message.content.filter((item) => item.type !== "toolCall" || item === call) },
 		depth,
 	};

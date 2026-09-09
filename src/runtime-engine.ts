@@ -2431,6 +2431,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					...(key ? { action: key } : {}),
 					settlement,
 					...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
+					candidateFeedback: settledCandidate?.owner.draft.feedback,
 				});
 			} catch {
 				// Policy feedback cannot alter authoritative settlement or source learning.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { DrafterUtilityGate } from "../src/drafter-utility-gate.ts";
 import {
-	BenefitGate,
 	ForkBenefitGate,
 	type ForkBenefitGatePolicy,
 	type ForkBenefitObservation,
@@ -17,16 +17,22 @@ const POLICY: ForkBenefitGatePolicy = {
 
 describe("fork benefit gate", () => {
 	it("shares the same policy with source-neutral cost and benefit metrics", () => {
-		const gate = new BenefitGate();
+		const gate = new DrafterUtilityGate();
+		const skipped = gate.start("drafter", true);
+		gate.finish(skipped);
+		expect(gate.snapshot().samples).toBe(0);
 		for (let index = 0; index < 4; index++) {
-			expect(gate.decide("drafter", POLICY).allowed).toBe(true);
-			gate.observe("drafter", { costMs: 100, benefitMs: 0 }, POLICY);
+			const batch = gate.start("drafter", true);
+			expect(batch.allowed).toBe(true);
+			gate.requestStarted(batch); gate.requestStarted(batch);
+			gate.requestSettled(batch, 10); gate.finish(batch);
+			expect(gate.snapshot().samples).toBe(index);
+			gate.requestSettled(batch, 10);
+			gate.requestStarted(batch); gate.requestSettled(batch, 130);
+			gate.creditExecutionAhead(batch, 50);
+			expect(gate.snapshot()).toMatchObject({ samples: index + 1, expectedNetBenefitMs: -100 });
 		}
-		expect(gate.decide("drafter", POLICY)).toMatchObject({
-			allowed: false,
-			reason: "negative_utility",
-			expectedNetBenefitMs: -100,
-		});
+		expect(gate.start("drafter", true).allowed).toBe(false);
 	});
 
 	it("keeps profitable forks and suppresses a negative rolling window", () => {
@@ -52,9 +58,14 @@ describe("fork benefit gate", () => {
 			"utility_probe",
 		]);
 
-		gate.observe("failure", { ...sample(50, 0), failed: true }, POLICY);
-		gate.observe("failure", { ...sample(50, 0), failed: true }, POLICY);
+		const update = gate.observe("failure", sample(50, 0), POLICY);
+		update({ ...sample(50, 0), failed: true });
+		gate.observe("failure", { ...sample(50, 0), failed: true }, { ...POLICY, windowSize: 1 });
 		expect(gate.decide("failure", POLICY)).toMatchObject({ allowed: false, reason: "failure_circuit" });
+		update(sample(0, 500));
+		expect(gate.snapshot("failure")).toMatchObject({ samples: 1, expectedNetBenefitMs: -50, consecutiveFailures: 2 });
+		gate.reset(); update(sample(0, 500));
+		expect(gate.snapshot("failure").samples).toBe(0);
 	});
 
 	it("isolates models and bypasses policy when disabled", () => {

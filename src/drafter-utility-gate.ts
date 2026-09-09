@@ -5,13 +5,13 @@ export interface DrafterUtilityBatch {
 	readonly generation: number;
 	readonly policy: BenefitGatePolicy;
 	readonly allowed: boolean;
-	readonly expectedRequests: number;
-	settledRequests: number;
+	startedRequests: number;
+	pendingRequests: number;
 	costMs: number;
 	benefitMs: number;
 	failed: boolean;
 	finished: boolean;
-	observed: boolean;
+	update?: ReturnType<BenefitGate["observe"]>;
 }
 
 export interface DrafterUtilityGateSnapshot {
@@ -27,7 +27,7 @@ export class DrafterUtilityGate {
 	private skippedBatches = 0;
 	private latestKey?: string;
 
-	start(key: string, expectedRequests: number, enabled: boolean): DrafterUtilityBatch {
+	start(key: string, enabled: boolean): DrafterUtilityBatch {
 		const policy = { ...DEFAULT_BENEFIT_GATE_POLICY, enabled };
 		const decision = this.gate.decide(key, policy);
 		this.latestKey = key;
@@ -37,18 +37,22 @@ export class DrafterUtilityGate {
 			generation: this.generation,
 			policy,
 			allowed: decision.allowed,
-			expectedRequests: Number.isFinite(expectedRequests) ? Math.max(1, Math.floor(expectedRequests)) : 1,
-			settledRequests: 0,
+			startedRequests: 0,
+			pendingRequests: 0,
 			costMs: 0,
 			benefitMs: 0,
 			failed: false,
 			finished: false,
-			observed: false,
 		};
 	}
 
+	requestStarted(batch: DrafterUtilityBatch): void {
+		batch.startedRequests++;
+		batch.pendingRequests++;
+	}
+
 	requestSettled(batch: DrafterUtilityBatch, costMs: number, failed = false): void {
-		batch.settledRequests++;
+		batch.pendingRequests--;
 		batch.costMs += Number.isFinite(costMs) ? Math.max(0, costMs) : 0;
 		batch.failed ||= failed;
 		this.observe(batch);
@@ -56,6 +60,7 @@ export class DrafterUtilityGate {
 
 	creditExecutionAhead(batch: DrafterUtilityBatch, executionAheadMs: number): void {
 		batch.benefitMs += Number.isFinite(executionAheadMs) ? Math.max(0, executionAheadMs) : 0;
+		this.observe(batch);
 	}
 
 	finish(batch: DrafterUtilityBatch): void {
@@ -84,22 +89,14 @@ export class DrafterUtilityGate {
 	private observe(batch: DrafterUtilityBatch): void {
 		if (
 			batch.generation !== this.generation ||
-			batch.observed ||
 			!batch.allowed ||
 			!batch.policy.enabled ||
 			!batch.finished ||
-			batch.settledRequests < batch.expectedRequests
+			batch.startedRequests === 0 || batch.pendingRequests > 0
 		)
 			return;
-		batch.observed = true;
-		this.gate.observe(
-			batch.key,
-			{
-				costMs: batch.costMs,
-				benefitMs: batch.benefitMs,
-				...(batch.failed ? { failed: true } : {}),
-			},
-			batch.policy,
-		);
+		const observation = { costMs: batch.costMs, benefitMs: batch.benefitMs, failed: batch.failed };
+		if (batch.update) batch.update(observation);
+		else batch.update = this.gate.observe(batch.key, observation, batch.policy);
 	}
 }

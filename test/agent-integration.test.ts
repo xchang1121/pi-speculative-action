@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -115,6 +116,31 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
+	it("charges late Drafter continuations to the original rolling observation", async () => {
+		let now = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const tool = createReadTool(await temporaryWorkspace());
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => {
+			now += 100;
+			return drafterCall({ path: "notes.txt" });
+		} });
+		const request = { startInput: { ...startInput(tool), sessionID: "session" },
+			data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
+			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
+		const proposal = await controller.source.propose(request);
+		if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
+		controller.finishTurn("session", "turn-1");
+		await Promise.resolve();
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -100 });
+		await controller.source.continue!({ ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
+			tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
+			feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" });
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -200 });
+		controller.finishSession();
+		expect(controller.snapshot().samples).toBe(0);
+	});
+
 	it("prepares raw predictions and previews once and adopts their keyed execution for every Pi tool", async () => {
 		expect(mockToolCalls.map(([tool]) => tool)).toEqual(KEYABLE_TOOLS);
 		for (const [origin, phase] of [["prediction", "running"], ["prediction", "completed"], ["preview", "running"], ["preview", "completed"]] as const) {

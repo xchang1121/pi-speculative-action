@@ -60,8 +60,8 @@ export interface BenefitGateSnapshot {
 export type ForkBenefitGateSnapshot = BenefitGateSnapshot;
 
 interface GateState {
-	readonly netBenefits: number[];
-	consecutiveFailures: number;
+	readonly samples: Array<{ netBenefit: number; failed: boolean }>;
+	priorFailures: number;
 	suppressedSinceProbe: number;
 	totalSuppressed: number;
 }
@@ -72,15 +72,15 @@ export class BenefitGate {
 
 	decide(key: string, policy: BenefitGatePolicy): BenefitDecision {
 		const state = this.state(key);
-		const expected = mean(state.netBenefits);
+		const expected = mean(state.samples);
 		const base = {
-			samples: state.netBenefits.length,
+			samples: state.samples.length,
 			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
 		};
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
-		if (state.consecutiveFailures >= policy.failureThreshold)
+		if (consecutiveFailures(state) >= policy.failureThreshold)
 			return this.probeDecision(state, policy, "failure_probe", "failure_circuit", base);
-		if (state.netBenefits.length < policy.minSamples) return { allowed: true, reason: "warmup", ...base };
+		if (state.samples.length < policy.minSamples) return { allowed: true, reason: "warmup", ...base };
 		if ((expected ?? 0) >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
 		return this.probeDecision(state, policy, "utility_probe", "negative_utility", base);
 	}
@@ -89,25 +89,31 @@ export class BenefitGate {
 		key: string,
 		observation: BenefitObservation | ForkBenefitObservation,
 		policy: BenefitGatePolicy,
-	): void {
+	): (observation: BenefitObservation | ForkBenefitObservation) => void {
 		const state = this.state(key);
-		const costMs = "costMs" in observation ? observation.costMs : observation.forkLatencyMs;
-		const benefitMs = "benefitMs" in observation ? observation.benefitMs : observation.exactLeadMs;
-		state.netBenefits.push(metric(benefitMs) - metric(costMs));
-		if (state.netBenefits.length > policy.windowSize) {
-			state.netBenefits.splice(0, state.netBenefits.length - policy.windowSize);
-		}
-		state.consecutiveFailures = observation.failed ? state.consecutiveFailures + 1 : 0;
+		const sample = { netBenefit: 0, failed: false };
+		state.samples.push(sample);
+		// Late lineage costs/benefits amend one retained sample, never append another observation.
+		const update = (value: BenefitObservation | ForkBenefitObservation) => {
+			if (this.states.get(key) !== state || !state.samples.includes(sample)) return;
+			sample.netBenefit = "costMs" in value ? metric(value.benefitMs) - metric(value.costMs)
+				: metric(value.exactLeadMs) - metric(value.forkLatencyMs);
+			sample.failed = value.failed === true;
+		};
+		update(observation);
+		for (const evicted of state.samples.splice(0, Math.max(0, state.samples.length - policy.windowSize)))
+			state.priorFailures = evicted.failed ? state.priorFailures + 1 : 0;
 		state.suppressedSinceProbe = 0;
+		return update;
 	}
 
 	snapshot(key: string): BenefitGateSnapshot {
 		const state = this.state(key);
-		const expected = mean(state.netBenefits);
+		const expected = mean(state.samples);
 		return {
-			samples: state.netBenefits.length,
+			samples: state.samples.length,
 			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
-			consecutiveFailures: state.consecutiveFailures,
+			consecutiveFailures: consecutiveFailures(state),
 			suppressedDecisions: state.totalSuppressed,
 		};
 	}
@@ -136,8 +142,8 @@ export class BenefitGate {
 		const existing = this.states.get(key);
 		if (existing) return existing;
 		const created: GateState = {
-			netBenefits: [],
-			consecutiveFailures: 0,
+			samples: [],
+			priorFailures: 0,
 			suppressedSinceProbe: 0,
 			totalSuppressed: 0,
 		};
@@ -153,6 +159,10 @@ function metric(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-function mean(values: readonly number[]): number | undefined {
-	return values.length ? values.reduce((total, value) => total + value, 0) / values.length : undefined;
+function mean(values: GateState["samples"]): number | undefined {
+	return values.length ? values.reduce((total, value) => total + value.netBenefit, 0) / values.length : undefined;
+}
+
+function consecutiveFailures(state: GateState): number {
+	return state.samples.reduce((count, sample) => sample.failed ? count + 1 : 0, state.priorFailures);
 }

@@ -161,7 +161,7 @@ npm run setup:linux
 
 `candidateLimit` 默认在每次 Actor 决策并发发出两个单动作 Drafter 请求。宽度为 2 时它们组成延迟对冲：首个包含 schema 有效且已启用 `K(a)` 的响应被接纳，并通过 provider `AbortSignal` 取消仍在运行的同伴；错误、空响应和无效调用不会胜出。显式设为 3 或更高时保留所有完成样本，没有隐藏上限；额外请求的成本仍计入收益判断。
 
-`drafterGateEnabled` 默认为 `true`。它把并发根请求视为一个批次，滚动学习动作侧净收益：只有由 Drafter 实际拥有并被 Actor 采纳的工作才按真实工具 `executionAheadMs` 计收益，再减去该批所有请求的服务时间总和。前 4 批用于预热；持续负收益时暂停整批请求，但每跳过 4 次仍做一次有界探测，以便工作负载变化后恢复。设为 `false` 即恢复无条件 Drafter 批次；PatternAware 候选和 Drafter 后继请求不受此门控。
+`drafterGateEnabled` 默认为 `true`。它按模型与端点把并发根请求及其后继请求计入同一条滚动收益记录：Drafter 实际拥有、匹配预测并被 Actor 采纳的工作按真实工具 `executionAheadMs` 计收益，再减去所有已发起请求的服务时间。跨轮完成的后继请求和采纳更新原记录，不重复增加样本；记录离开滚动窗口后不再修改历史，未发起请求的批次不占样本。前 4 批用于预热；持续负收益时暂停新的根请求，但每跳过 4 次仍做一次有界探测。设为 `false` 即恢复无条件 Drafter 批次；PatternAware 和已启动计划的后继请求继续遵守各自的深度、时限与调度约束。
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 

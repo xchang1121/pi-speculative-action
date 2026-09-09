@@ -77,6 +77,10 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.executions).toEqual({ read: 2 });
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
+			const benefitMs = result.events.reduce((sum, event) => sum + (event.type === "actor_action" &&
+				event.settlement.provider.kind === "speculative" ? event.settlement.provider.timing.executionAheadMs : 0), 0);
+			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan", utility: { benefitMs } });
+			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1, utility: { benefitMs } });
 		}
 	});
 
@@ -198,6 +202,7 @@ async function runAgent(input: RunAgentInput) {
 	drafter.setResponses([...(input.draftTurns ?? [])]);
 	const events: SpeculativeActionEvent<string>[] = [], streamEvents: string[] = [], actorFallbacks: string[] = [];
 	const executions: Record<string, number> = {}, outputs: AgentToolResult<unknown>[] = [];
+	const draftFeedback: unknown[] = [];
 	const measuredTools = input.tools.map((base): AgentTool => ({
 		...base,
 		execute: async (callID, args, signal, onUpdate) => {
@@ -210,6 +215,7 @@ async function runAgent(input: RunAgentInput) {
 		complete: (model, context, options) => drafter.streamSimple(model, context, options).result(),
 		preflight: () => true, executionWorlds: [fauxRuntimeWorld()], patternStore: input.patternStore,
 		onActorActionMaterialized: input.onActorActionMaterialized,
+		onActorActionSettled: ({ candidateFeedback }) => { draftFeedback.push(candidateFeedback); },
 		onEvent: (event) => { events.push(event); return input.onEvent?.(event); },
 	});
 	let currentTurnID: string | undefined, lastTurnID: string | undefined, sequence = 0;
@@ -247,7 +253,7 @@ async function runAgent(input: RunAgentInput) {
 	});
 	try { await agent.prompt(prompt); }
 	finally { await host.dispose(); } // The real owner drains settlement; the fixture must not poll or reimplement it.
-	return { events, executions, streamEvents, actorFallbacks, outputs, summary: summarizeSpeculativeTrace(events) };
+	return { events, executions, streamEvents, actorFallbacks, outputs, draftFeedback, summary: summarizeSpeculativeTrace(events) };
 }
 
 function fauxRuntimeWorld(): SpeculativeAgentExecutionWorld {

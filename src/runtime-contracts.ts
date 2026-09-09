@@ -98,6 +98,8 @@ export interface ActorActionFeedback<SessionID> {
 	readonly settlement: ActorActionSettlement;
 	/** Frozen candidate attribution supplied without routing policy through the event sink. */
 	readonly candidate?: CandidateEventDescriptor;
+	/** Opaque producer-owned feedback of the execution owner, including cross-turn cache adoption. */
+	readonly candidateFeedback?: unknown;
 }
 
 /** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */
