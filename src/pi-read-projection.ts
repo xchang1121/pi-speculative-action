@@ -13,7 +13,7 @@ import {
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
-import { asRecord, buildActionKey, READ_DEFAULT_LIMIT, readActionRange } from "./action-semantics.ts";
+import { asRecord, readActionRange } from "./action-semantics.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** An incomplete Actor stream may start only the existing lossless read-range projection. */
@@ -21,21 +21,9 @@ export function canPreviewIncompletePiCall(tool: string, input: Readonly<Record<
 	return tool === "read" && typeof input.path === "string";
 }
 
-/** Production Pi read projection. Other tools remain exact-only. */
+/** Optional Pi text-output fast path. Default hosts reuse sealed inputs without this rule. */
 export const PI_READ_RANGE_PROJECTION_RULE = {
 	...READ_RANGE_ACTION_KEY_PROJECTOR,
-	coveringAction: (action) => {
-		const range = readActionRange(action);
-		if (!range || range.limit === 0 || range.limit >= READ_DEFAULT_LIMIT) return undefined;
-		return buildActionKey({
-			...action,
-			input: {
-				...action.input,
-				offset: Math.max(1, range.end - READ_DEFAULT_LIMIT + 1),
-				limit: READ_DEFAULT_LIMIT,
-			},
-		});
-	},
 	captureCoverage: (action, output) => {
 		if (action.tool !== "read" || output.isError) return undefined;
 		const details = output.result.details as { [READ_RANGE_COVERAGE_DETAILS_KEY]?: unknown } | undefined;

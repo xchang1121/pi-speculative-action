@@ -180,7 +180,6 @@ describe("speculative action host", () => {
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: proposal }], "toolUse"),
 					preflight: (request) => { permissions.push(request); return true; },
-					projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 					resolveInvocation: () => resourceExecution ? { ...invocation!, filesystem: async (view, request) => {
 						await speculativeExecution();
 						return resourceExecution(view, request);
@@ -229,7 +228,7 @@ describe("speculative action host", () => {
 					});
 					if (resourceExecution && origin === "prediction") {
 						const delivered = await result;
-						const pristine = withPiProjectionCoverage(toolName, args, structuredClone(delivered));
+						const pristine = structuredClone(delivered);
 						delivered.content.push({ type: "text", text: "Actor-owned edit" });
 						delivered.details = { actor: true };
 						const retained = await host.execute({ turnID, id: "another-owner", tool: toolName, args, tools: [tool] }, undefined, actorExecution);
@@ -237,16 +236,19 @@ describe("speculative action host", () => {
 						const query = toolName === "read" ? { path: "notes.txt", offset: 1, limit: 1 } : { path: ".", limit: 1 };
 						const narrowed = await host.execute({ turnID, id: "another-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution);
 						const native = toolName === "read" ? createReadTool(cwd) : createLsTool(cwd);
-						expect(narrowed).toEqual(withPiProjectionCoverage(toolName, query, await native.execute("native", query)));
+						expect(narrowed).toEqual(await native.execute("native", query));
+						narrowed.content.push({ type: "text", text: "Actor-owned query edit" });
+						expect(await host.execute({ turnID, id: "same-view", tool: toolName, args: query, tools: [tool] }, undefined, actorExecution))
+							.toEqual(await native.execute("native", query));
 						expect(speculativeExecution).toHaveBeenCalledTimes(2); // Re-evaluation uses the sealed inputs, not the host tool.
 						expect(actorExecution).not.toHaveBeenCalled();
 						for (const changed of [false, true]) {
 							const mutation = { path: changed && toolName === "ls" ? "added.txt" : "notes.txt", content: changed || toolName === "ls" ? "first\nchanged" : "one\ntwo\nthree\nfour" };
 							await host.execute({ turnID, id: `write:${changed}`, tool: "write", args: mutation, tools: [tool, writer] }, undefined,
 								() => writer.execute("native-write", mutation));
-							const fallback = vi.fn(async () => withPiProjectionCoverage(toolName, args, await native.execute("native-read", args as never)));
-							const repeated = await host.execute({ turnID, id: `after-write:${changed}`, tool: toolName, args, tools: [tool, writer] }, undefined, fallback);
-							expect(repeated).toEqual(withPiProjectionCoverage(toolName, args, await native.execute("control", args as never)));
+							const fallback = vi.fn(() => native.execute("native-read", query));
+							const repeated = await host.execute({ turnID, id: `after-write:${changed}`, tool: toolName, args: query, tools: [tool, writer] }, undefined, fallback);
+							expect(repeated).toEqual(await native.execute("control", query));
 							expect(fallback).toHaveBeenCalledTimes(changed ? 1 : 0);
 							if (!changed) expect(speculativeExecution).toHaveBeenCalledTimes(2);
 						}

@@ -1,7 +1,6 @@
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { createPiToolDefinitions } from "../pi-tool-invocation.ts";
-import { withPiProjectionCoverage } from "../pi-read-projection.ts";
 import { buildPiActionKey } from "../action-semantics.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
@@ -22,11 +21,7 @@ export async function runThinkThreadTool(
 	const tool = createPiToolDefinitions(cwd, { read: { autoResizeImages: request.autoResizeImages } }).get(request.tool);
 	if (!tool) throw new Error(`ThinkThread tool runner does not support ${request.tool}`);
 	try {
-		const result = withPiProjectionCoverage(
-			request.tool,
-			request.args,
-			await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never),
-		);
+		const result = await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never);
 		return { result, isError: false };
 	} catch (error) {
 		return toolErrorSettlement(error);

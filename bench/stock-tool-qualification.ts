@@ -11,7 +11,6 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
-import { withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
@@ -71,7 +70,7 @@ export async function qualifyStockTool(
 	], (id) => id !== primary?.world.id || primaryEnabled);
 	const actor = async (): Promise<ToolSettlement> => {
 		try {
-			return { result: withPiProjectionCoverage(name, args, await tool.execute(context.callID, args)), isError: false };
+			return { result: await tool.execute(context.callID, args), isError: false };
 		} catch (error) { return toolErrorSettlement(error); }
 	};
 	const reset = async () => {

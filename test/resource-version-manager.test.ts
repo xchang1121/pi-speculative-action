@@ -9,7 +9,6 @@ import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts"
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -159,16 +158,15 @@ describe("speculative action resource versions", () => {
 		}
 		const branch = await world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
 		try {
-			expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(key, branch.output)).toBeDefined();
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
 				{ path: "@value.txt", offset: 4, limit: 1 }, { path: file, offset: 5 }]) {
 				const action = PI_ACTION_SEMANTICS.buildKey("read", query, root, "", binding)!;
 				expect((await branch.reconstruct!({ action, args: query, callID: "actor", signal }))?.result)
-					.toEqual(withPiProjectionCoverage("read", query, await native.execute("native", query)));
+					.toEqual(await native.execute("native", query));
 			}
 			await expect(branch.reconstruct!({ action: key, args: { path: "unproven" }, callID: "bad", signal })).rejects.toThrow("unproven");
 			expect((await branch.validate!()).status).toBe("valid");
-			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.result).toEqual(withPiProjectionCoverage("read", args, await native.execute("native", args)));
+			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.result).toEqual(await native.execute("native", args));
 			await fs.writeFile(configuration, "B");
 			expect((await branch.validate!()).status).toBe(capturedOnly ? "stale" : "valid");
 		} finally { await branch.dispose(); }

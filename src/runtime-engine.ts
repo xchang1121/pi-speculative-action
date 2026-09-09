@@ -260,6 +260,8 @@ async function projectOutput<Output, StartInput, StateData>(
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
 	if (match.kind === "exact") return { ok: true, output, durationMs: 0 };
+	const retained = candidate.resultViews?.get(actor.key);
+	if (retained) return { ok: true, output: cloneSharedData(retained.output), durationMs: 0 };
 	const reconstruct = candidateBranch(candidate)?.reconstruct;
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
@@ -491,6 +493,27 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 	return Object.entries(value).reduce((sum, [key, item]) => sum + key.length * 2 + estimateValueBytes(item, seen), 0);
 }
 
+/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
+function retainResultView<Output, StartInput, StateData>(
+	candidate: CandidateRecord<Output, StartInput, StateData>, action: ActionKey, output: Output,
+	settings: SpeculativeActionSettings,
+): boolean {
+	if (candidate.key.key === action.key || candidate.resultViews?.has(action.key)) return false;
+	try {
+		const owned = cloneSharedData(output), bytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
+		const views = candidate.resultViews ??= new Map();
+		while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
+			const [key, previous] = views.entries().next().value!;
+			views.delete(key); candidate.estimatedBytes -= previous.bytes;
+		}
+		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
+			views.set(action.key, { output: owned, bytes }); candidate.estimatedBytes += bytes;
+			return true;
+		}
+	} catch { /* Optional retention cannot alter an already committed result. */ }
+	return false;
+}
+
 function resourcePathsOverlap(left: string, right: string): boolean {
 	return containsLogicalPath(left, right) || containsLogicalPath(right, left);
 }
@@ -593,6 +616,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	background: boolean;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number }>;
 	validationMs: number;
 	validationBytes: number;
 	validationFiles: number;
@@ -799,7 +823,10 @@ class StructuralRuntimeState<
 		this.candidates = new RuntimeCandidateRegistry(
 			this.projectionRules,
 			candidateCacheValue,
-			(candidate) => this.sessions.get(candidate.owner.startInput.sessionID)?.lifecycle.release(candidateBranch(candidate)),
+			(candidate) => {
+				candidate.resultViews?.clear();
+				this.sessions.get(candidate.owner.startInput.sessionID)?.lifecycle.release(candidateBranch(candidate));
+			},
 		);
 		this.emitEvent = async (event) => {
 			try {
@@ -2100,7 +2127,9 @@ export function makeStructuralSpeculativeActionRuntime<
 				} else if (candidate.origin === "actor_preview") {
 					runtimeState.candidates.remove(state.session.id, candidate);
 				} else {
+					const retained = retainResultView(candidate, actualKey, output, state.settings);
 					runtimeState.candidates.results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					if (retained) trimResults(state.session, state.settings);
 				}
 				attempt.select({
 					candidate,

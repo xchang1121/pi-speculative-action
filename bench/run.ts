@@ -20,11 +20,6 @@ import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from 
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 import { DEFAULTS } from "../src/common.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import {
-	canPreviewIncompletePiCall,
-	PI_READ_RANGE_PROJECTION_RULE,
-	withPiProjectionCoverage,
-} from "../src/pi-read-projection.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -292,7 +287,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		preflight: () => true,
 		resolveInvocation,
-		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		executionWorlds: [sandbox],
 		patternStateDirectory: input.patternState ?? path.join(task.runDirectory, "patterns"),
 		...(input.patternState
@@ -305,7 +299,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let currentTurnID: string | undefined;
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
-	const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
+	const actorStream = new ActorStreamPreviewTracker();
 	const toolIntentMs: number[] = [];
 	const actorTools = tools.map(
 		(base): AgentTool => ({
@@ -718,11 +712,7 @@ function instrumentTool(tool: AgentTool, addedLatencyMs: number, counters: ToolC
 			counters.executions[tool.name] = (counters.executions[tool.name] ?? 0) + 1;
 			try {
 				await delay(addedLatencyMs, signal);
-				return withPiProjectionCoverage(
-					tool.name,
-					args,
-					await tool.execute(callID, args as never, signal, onUpdate as never),
-				);
+				return await tool.execute(callID, args as never, signal, onUpdate as never);
 			} finally {
 				counters.serviceMs[tool.name] =
 					(counters.serviceMs[tool.name] ?? 0) + Math.max(0, performance.now() - startedAt);

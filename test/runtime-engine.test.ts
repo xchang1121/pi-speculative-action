@@ -951,6 +951,14 @@ describe("structural speculative runtime", () => {
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
 			expect(validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
+			if (scenario === "input-lookup") {
+				expect(await fixture.runtime.consume({ ...actor, id: "same-query" })).toBe("narrow");
+				expect(reconstruct).toHaveBeenCalledOnce();
+				changed = true;
+				expect(await fixture.runtime.consume({ ...actor, id: "stale-query" })).toBeUndefined();
+				expect(reconstruct).toHaveBeenCalledOnce();
+				expect(validate).toHaveBeenCalledTimes(3);
+			}
 			if (scenario === "output-preferred") expect(reconstruct).not.toHaveBeenCalled();
 			if (scenario === "output-valid") {
 				expect(await fixture.runtime.consume({ ...actor, id: "second-reader" })).toBe("narrow");
@@ -974,6 +982,32 @@ describe("structural speculative runtime", () => {
 			expect(fixture.events.filter((event) => event.type === "prediction").at(-1)?.settlement)
 				.toMatchObject({ observation: "observed", match: { matched: false } });
 		}
+	});
+
+	it.each([[2, 4096, 2], [1, 4096, 3], [2, 128, 3]])("bounds sealed query results by %i entries and %i bytes", async (entries, bytes, evaluations) => {
+		const ready = candidateSucceeded(), disposed = vi.fn();
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => String((args as { offset: number }).offset));
+		const fixture = harness({
+			source: { id: "source", enabled: () => true, propose: ({ startInput }) => startInput.turnID === "first"
+				? plan("source", "inputs", { path: "input", offset: 1, limit: 1 }) : undefined },
+			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
+			execute: () => ({ ...world("1", { onDispose: disposed,
+				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }) }), reconstruct }),
+			onEvent: ready.observe,
+		});
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "first" }); await ready.promise;
+			for (const [index, offset] of [2, 3, 2].entries()) {
+				const turnID = index === 2 ? "second" : "first";
+				if (index === 2) {
+					await fixture.runtime.finishTurn({ ...call("first"), terminal: false });
+					await fixture.runtime.startTurn({ sessionID: "session", turnID });
+				}
+				expect(await fixture.runtime.consume({ ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) })).toBe(String(offset));
+			}
+			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(fixture.executions()).toBe(1);
+		} finally { await fixture.runtime.dispose(); }
+		expect(disposed).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
 	});
 
 	it.each(["poisoned", "terminal", "disposed"] as const)("preserves claimed Actor commit ownership through %s", async (phase) => {

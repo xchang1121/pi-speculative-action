@@ -7,7 +7,6 @@ import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from ".
 import { asRecord, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion } from "./resource-version.ts";
-import { withPiProjectionCoverage } from "./pi-read-projection.ts";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -85,7 +84,7 @@ export function resolvePiToolInvocation(
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				const result = await definitions.get(tool)!.execute(request.callID, request.args as never, request.signal, undefined, context);
-				return { result: withPiProjectionCoverage(tool, request.args, result), isError: false };
+				return { result, isError: false };
 			},
 		};
 	}

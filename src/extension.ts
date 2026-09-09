@@ -33,11 +33,6 @@ import {
 } from "./common.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
-import {
-	canPreviewIncompletePiCall,
-	PI_READ_RANGE_PROJECTION_RULE,
-	withPiProjectionCoverage,
-} from "./pi-read-projection.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
@@ -305,7 +300,7 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const wrapperSources = new Map<string, string>();
-		const actorStream = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
+		const actorStream = new ActorStreamPreviewTracker();
 		const providerRequest = new AsyncLocalStorage<"drafter">();
 
 		pi.on("before_provider_request", (event) =>
@@ -540,7 +535,6 @@ async function installController(
 				...(piToolSettings.shellCommandPrefix ? { shellCommandPrefix: piToolSettings.shellCommandPrefix } : {}),
 			});
 		},
-		projectionRules: [PI_READ_RANGE_PROJECTION_RULE],
 		executionWorlds,
 		speculativeExecutionWorldEnabled,
 		actorForkPlanSource: selfSpeculation.actorForkPlanSource,
@@ -690,19 +684,9 @@ async function installController(
 				{ ...(turnID ? { turnID } : {}), id: callID, tool, args: input, tools: turnTools },
 				signal,
 				async (operation) =>
-					withPiProjectionCoverage(
-						operation.tool,
-						operation.input,
-						(operation.invocation?.authoritative ? (await operation.invocation.authoritative({
-							callID, args: operation.input, signal: operation.signal ?? new AbortController().signal,
-						})).result : await definition.execute(
-							callID,
-							operation.input as never,
-							operation.signal,
-							onUpdate as never,
-							nextContext,
-						)),
-					),
+					operation.invocation?.authoritative ? (await operation.invocation.authoritative({
+						callID, args: operation.input, signal: operation.signal ?? new AbortController().signal,
+					})).result : await definition.execute(callID, operation.input as never, operation.signal, onUpdate as never, nextContext),
 			);
 		},
 		statusText: () => {
@@ -782,12 +766,7 @@ function toolConflictSummary(conflicts: ReadonlyMap<string, string>): string {
 function toAgentTool(base: PiToolDefinition, context: () => ExtensionContext): AgentTool {
 	return {
 		...base,
-		execute: async (callID, input, signal, onUpdate) =>
-			withPiProjectionCoverage(
-				base.name,
-				input,
-				await base.execute(callID, input as never, signal, onUpdate as never, context()),
-			),
+		execute: (callID, input, signal, onUpdate) => base.execute(callID, input as never, signal, onUpdate as never, context()),
 	};
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_COVERAGE_DETAILS_KEY, type ReadRangeCoverage } from "../src/action-key-projection.ts";
-import { actionKeyCovers, actionKeyMatch, buildPiActionKey, readActionRange } from "../src/action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, buildPiActionKey } from "../src/action-semantics.ts";
 import { PI_READ_RANGE_PROJECTION_RULE } from "../src/pi-read-projection.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 
@@ -76,19 +76,6 @@ function outputText(output: ToolSettlement | undefined): string | undefined {
 }
 
 describe("Pi read range projection", () => {
-	it("executes a narrow prediction through its earliest default covering view", () => {
-		const predicted = readKey("notes.txt", 20, 5);
-		const covering = PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(predicted);
-		const deepCovering = PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 2500, 5));
-
-		expect(covering && readActionRange(covering)).toMatchObject({ offset: 1, limit: 2000 });
-		expect(covering && actionKeyCovers(covering, predicted, [PI_READ_RANGE_PROJECTION_RULE])).toBe(true);
-		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 100, 5))?.key).toBe(covering?.key);
-		expect(deepCovering && readActionRange(deepCovering)).toMatchObject({ offset: 505, limit: 2000 });
-		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20))).toBeUndefined();
-		expect(PI_READ_RANGE_PROJECTION_RULE.coveringAction?.(readKey("notes.txt", 20, 0))).toBeUndefined();
-	});
-
 	it.each([
 		{ name: "middle interval", spec: [1, 10], actor: [3, 2], lines: ["one", "two", "three", "four", "five"],
 			options: { totalLines: 20 }, text: "three\nfour\n\n[16 more lines in file. Use offset=5 to continue.]" },
