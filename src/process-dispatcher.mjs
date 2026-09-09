@@ -26,7 +26,10 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 	process.exitCode = 125;
 } else if (!configuration && args[0] === "--exec" && /^[12]{2}$/.test(args[1] ?? "") && args.length >= 4) {
 	await run(args[3], args.slice(4), args[2], [Number(args[1][0]), Number(args[1][1])]);
-} else if (!configuration && args.length === 2 && args[0] === "--probe-context" && process.cwd() === args[1]) {
+} else if (!configuration && args.length === 3 && args[0] === "--probe-context" && process.cwd() === args[1]) {
+	await run(args[2], [], args[2]);
+	if (process.exitCode !== 42) throw new Error("sandbox script read position is not preserved");
+	process.exitCode = 0;
 	fs.writeSync(1, JSON.stringify(executionContext()));
 } else if (!validConfiguration(configuration) || !invoked) {
 	await fallback();

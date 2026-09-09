@@ -99,7 +99,7 @@ import {
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v19";
+const BACKEND_EPOCH = "pi-linux-process-v20";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v2";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -1975,6 +1975,7 @@ async function probeExecutionContext(input: {
 	readonly logicalRoot: string;
 	readonly physicalRoot: string;
 }): Promise<DispatcherExecutionContext> {
+	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
 	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
 		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [
@@ -1990,6 +1991,7 @@ async function probeExecutionContext(input: {
 		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
 		"--probe-context",
 		input.logicalRoot,
+		path.join(input.logicalRoot, "script-position"),
 	]);
 	const outcome = await runSpawn(
 		input.strace,

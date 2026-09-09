@@ -90,6 +90,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
+Producer qualification now checks byte-preserving script execution. Binaries that skip script bytes are unavailable until rebuilt from the updated source and qualified; producer epoch v20 cold-misses prior proofs without clearing cache files.
+
 `setup:linux` qualifies and reports each row separately. It builds the packaged held-exec helper, applies the packaged transparent-exec change to the exact pinned Sandlock revision, installs the resulting plugin-specific binary only after behavioral probes pass, and optionally installs an official hash-verified `fuse-overlayfs` release under `~/.local`; it installs no daemon and does not alter Pi. Source/patch and installed-binary digests are stamped together. Missing Landlock, Rust, `strace`, FUSE, or the native helper disables only the dependent operation. Runtime probes repeat before use and fail closed. WSL must be version 2, and performance-sensitive workspaces should live in its native Linux filesystem. Detailed policy, transaction, and storage qualification is documented in the capability lattice.
 
 Select **Tools & execution → Execution routes → Search execution → Captured search**, then Apply, to share an explicit search executor between Actor and speculation (`searchExecution: "captured"`). **Native Pi** remains the default. Captured `find` uses only Pi's installed minimatch/ignore components and Node: workspace .gitignore layers, original filename spelling, deterministic case-sensitive glob matching and sorting, not native fd equivalence.

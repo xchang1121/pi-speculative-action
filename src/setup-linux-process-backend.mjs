@@ -95,9 +95,6 @@ async function installSandlock() {
 async function qualifySandlock(binary) {
 	await run(binary, ["check"]);
 	await run(binary, [
-		"run", "--chroot", "/", "--fs-read", "/", "--exec-mount", "/bin/false:/bin/true", "--", "/bin/false",
-	]);
-	await run(binary, [
 		"run", "--chroot", "/", "--fs-read", "/", "--", heldExec, "--probe-clean-fds",
 	]);
 	await run(binary, [
@@ -109,6 +106,8 @@ async function qualifySandlock(binary) {
 		const view = path.join(root, "view");
 		const image = path.join(view, "false");
 		await mkdir(view);
+		await writeFile(image, "#!/bin/sh\nexit 42\n", { mode: 0o700 });
+		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"], 42);
 		await copyFile(heldExec, image);
 		await chmod(image, 0o755);
 		await writeFile(

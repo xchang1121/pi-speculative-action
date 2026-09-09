@@ -113,7 +113,7 @@ describe("Linux process ExecutionWorld", () => {
 				});
 				restoreTransactions = () => recording.mockRestore();
 			}
-			const session = await open(input);
+			const session = await open({ ...input, signal: AbortSignal.any([AbortSignal.timeout(8000), ...(input.signal ? [input.signal] : [])]) });
 			const wrapped = { ...session, close: () => { const first = session.close(); onClose?.(input.workspace.sandboxRoot, first, session.close); return first; } };
 			closeSession = wrapped.close;
 			return wrapped;
@@ -140,7 +140,7 @@ describe("Linux process ExecutionWorld", () => {
 			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "barrier-worker"), [
 				"#!/bin/sh", "set -C",
-				"if : > \"$1/slot\" 2>/dev/null; then self=one other=two; else self=two other=one; fi",
+				"if ( : > \"$1/slot\" ) 2>/dev/null; then self=one other=two; else self=two other=one; fi",
 				": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
 			].join("\n"));
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
@@ -158,14 +158,13 @@ describe("Linux process ExecutionWorld", () => {
 			});
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "/usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }; printf '%32768s:end' ''",
+				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test.v1",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const text = branch.output.result.content[0];
-			expect(text?.type === "text" && text.text.endsWith(" ".repeat(32768) + ":end")).toBe(true);
-			expect(text?.type === "text" && text.text.split("\n").filter((line) => line === "trace-root-fallback")).toEqual(["trace-root-fallback"]);
+			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\n" + " ".repeat(32768) + ":end");
 			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length,
 				nextComplete: (await vi.mocked(captures[1]!.finish).mock.results[0]!.value).complete,
 			}).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });

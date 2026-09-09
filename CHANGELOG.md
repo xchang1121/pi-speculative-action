@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Linux producer epoch v20 requires script execution to preserve its file-descriptor read position.
+  Sandlock reuses its ELF classification instead of consuming script bytes in the ELF parser;
+  faulty binaries fail qualification and prior producer proofs cold-miss without clearing the store.
 - `createExecPrototype` now returns an owned, validated canonical prototype, so invalid identity
   fails at construction instead of the first key/seal call. stdin/FD records and nested plain data
   are copied without freezing caller data; opaque nested values and non-string platform identities

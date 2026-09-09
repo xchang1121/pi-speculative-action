@@ -28,7 +28,7 @@ index 96309ec..1925e1c 100644
      match &args.gpu {
          // `all` maps to an empty device list, which the core expands to every
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..67f53d6 100644
+index 6e4ab93..f06fe6e 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -76,6 +76,8 @@ pub(crate) struct ChrootCtx<'a> {
@@ -210,7 +210,15 @@ index 6e4ab93..67f53d6 100644
  
      // Read PT_INTERP from the binary. If it has one, open the image's
      // interpreter and create a memfd copy with PT_INTERP patched to
-@@ -1019,7 +1057,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -996,5 +1034,6 @@ pub(crate) async fn handle_chroot_exec(
+     // point at the injected interpreter fd. This ensures the kernel loads
+     // the image's ld-linux (not the host's), avoiding glibc version
+     // mismatches between ld.so and libc.so.
+-    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = read_pt_interp(src_fd) {
++    let interpreter = executable_is_elf.then(|| read_pt_interp(src_fd)).flatten();
++    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = interpreter {
+         // Open the image's interpreter from the chroot root (intentionally
+@@ -1019,7 +1058,7 @@ pub(crate) async fn handle_chroot_exec(
              flags: 0,
              srcfd: interp_src as u32,
              newfd: 0,
@@ -219,7 +227,7 @@ index 6e4ab93..67f53d6 100644
          };
          let child_interp_fd = unsafe {
              libc::ioctl(
-@@ -1068,7 +1106,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1068,7 +1107,7 @@ pub(crate) async fn handle_chroot_exec(
          flags: 0,
          srcfd: exec_fd.as_raw_fd() as u32,
          newfd: 0,
@@ -228,7 +236,7 @@ index 6e4ab93..67f53d6 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
-@@ -2482,6 +2520,7 @@ mod mount_ro_tests {
+@@ -2482,6 +2521,7 @@ mod mount_ro_tests {
              denied: &[],
              mounts,
              mount_ro,
