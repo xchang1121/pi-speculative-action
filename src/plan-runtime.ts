@@ -261,8 +261,9 @@ export class PlanRuntime {
 	): readonly PlanRuntimeNode[] {
 		const ready = this.mutableValues()
 			.filter(({ plan, node }) => {
+				if (node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
 				const snapshot = this.snapshot(plan, node);
-				return node.execution.status === "deferred" && snapshot.readiness === "ready" && shouldLaunch(snapshot);
+				return snapshot.readiness === "ready" && shouldLaunch(snapshot);
 			})
 			.sort(compareMutableNodes);
 		for (const { node } of ready) node.execution = { status: "scheduled" };
@@ -270,9 +271,7 @@ export class PlanRuntime {
 	}
 
 	launchable(): readonly PlanRuntimeNode[] {
-		return this.mutableValues()
-			.map(({ plan, node }) => this.snapshot(plan, node))
-			.filter((node) => node.execution.status === "deferred" && node.readiness === "ready");
+		return this.select((node) => node.execution.status === "deferred" && node.opportunity.state.status !== "settled", "ready");
 	}
 
 	promote(proposalID: string, actionID: string): PlanRuntimePromotion {
@@ -376,32 +375,28 @@ export class PlanRuntime {
 	}
 
 	values(): readonly PlanRuntimeNode[] {
-		return this.mutableValues().map(({ plan, node }) => this.snapshot(plan, node));
+		return this.select();
 	}
 
 	pending(): readonly PredictionPlanRuntimeNode[] {
-		return this.values().filter(isPendingPrediction);
+		return this.select((node) => node.opportunity.state.status === "pending");
 	}
 
 	matchable(decisionSequence: number): readonly PredictionPlanRuntimeNode[] {
 		const sequence = Math.max(0, Math.floor(decisionSequence));
-		return this.mutableValues().flatMap(({ plan, node }) => {
-			if (!this.isMatchable(plan, node, sequence)) return [];
-			const snapshot = this.snapshot(plan, node);
-			return isPendingPrediction(snapshot) ? [snapshot] : [];
-		});
+		return this.select((node, plan) => this.isMatchable(plan, node, sequence));
 	}
 
 	unsettled(): readonly PredictionPlanRuntimeNode[] {
-		return this.values().filter(isUnsettledPrediction);
+		return this.select((node) => node.opportunity.state.status !== "settled");
 	}
 
 	due(settledDecisionSeq: number): readonly PredictionPlanRuntimeNode[] {
-		return this.pending().filter((node) => node.latestDecisionSeq <= settledDecisionSeq);
+		return this.select((node) => node.opportunity.state.status === "pending" && node.latestDecisionSeq <= settledDecisionSeq);
 	}
 
 	drainBlocked(): readonly PlanRuntimeNode[] {
-		return this.values().filter((node) => node.readiness === "blocked");
+		return this.select((node) => node.opportunity.state.status !== "settled", "blocked");
 	}
 
 	clear(): void {
@@ -488,8 +483,21 @@ export class PlanRuntime {
 		return [...this.plans.values()].flatMap((plan) => [...plan.nodes.values()].map((node) => ({ plan, node })));
 	}
 
-	private snapshot(plan: MutablePlan, node: MutableNode): PlanRuntimeNode {
-		const base = {
+	private select(
+		include: (node: MutableNode, plan: MutablePlan) => boolean = () => true,
+		readiness?: PlanNodeReadiness,
+	): readonly PlanRuntimeNode[] {
+		const selected: PlanRuntimeNode[] = [];
+		for (const plan of this.plans.values()) for (const node of plan.nodes.values()) {
+			if (!include(node, plan)) continue;
+			const current = this.readiness(plan, node);
+			if (!readiness || current === readiness) selected.push(this.snapshot(plan, node, current));
+		}
+		return selected;
+	}
+
+	private snapshot(plan: MutablePlan, node: MutableNode, readiness = this.readiness(plan, node)): PlanRuntimeNode {
+		return Object.freeze({
 			identity: node.identity,
 			proposalID: plan.id,
 			source: plan.source,
@@ -502,10 +510,7 @@ export class PlanRuntime {
 			latestDecisionSeq: node.latestDecisionSeq,
 			criticalPathMs: node.criticalPathMs,
 			execution: executionProjection(node.execution),
-			readiness: this.readiness(plan, node),
-		};
-		return Object.freeze({
-			...base,
+			readiness,
 			prediction: node.opportunity.identity,
 			predictionState: node.opportunity.state,
 		});
@@ -513,29 +518,26 @@ export class PlanRuntime {
 
 	private readiness(plan: MutablePlan, node: MutableNode): PlanNodeReadiness {
 		if (node.opportunity.state.status === "settled") return "settled";
-		if (this.dependenciesImpossible(plan, node)) return "blocked";
-		return node.execution.status === "deferred" && this.dependenciesSatisfied(plan, node) ? "ready" : "waiting";
+		const readiness = this.dependencyReadiness(plan, node);
+		return readiness === "ready" && node.execution.status !== "deferred" ? "waiting" : readiness;
 	}
 
-	private dependenciesSatisfied(plan: MutablePlan, node: MutableNode): boolean {
-		return (node.action.dependsOn ?? []).every((dependency) => {
+	private dependencyReadiness(plan: MutablePlan, node: MutableNode): "ready" | "waiting" | "blocked" {
+		let readiness: "ready" | "waiting" = "ready";
+		for (const dependency of node.action.dependsOn ?? []) {
 			const parent = plan.nodes.get(dependency.actionID);
-			return parent ? dependencySatisfied(parent, dependency.condition) : false;
-		});
-	}
-
-	private dependenciesImpossible(plan: MutablePlan, node: MutableNode): boolean {
-		return (node.action.dependsOn ?? []).some((dependency) => {
-			const parent = plan.nodes.get(dependency.actionID);
-			return !parent || dependencyImpossible(parent, dependency.condition);
-		});
+			const state = parent ? dependencyReadiness(parent, dependency.condition) : "blocked";
+			if (state === "blocked") return state;
+			if (state === "waiting") readiness = state;
+		}
+		return readiness;
 	}
 
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
 		return (
 			node.opportunity.state.status === "pending" &&
 			node.earliestDecisionSeq <= decisionSequence &&
-			this.dependenciesSatisfied(plan, node)
+			this.dependencyReadiness(plan, node) === "ready"
 		);
 	}
 
@@ -593,28 +595,14 @@ function newNode(
 	};
 }
 
-function dependencySatisfied(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
-	const execution = executionProjection(node.execution);
-	switch (condition) {
-		case "actor_adopted":
-			return predictionAdopted(node.opportunity.settlement);
-		case "execution_succeeded":
-			return execution.status === "succeeded";
-		default:
-			return executionSettled(execution);
+function dependencyReadiness(node: MutableNode, condition: PlanActionDependencyCondition | undefined): "ready" | "waiting" | "blocked" {
+	if (condition === "actor_adopted") {
+		const settlement = node.opportunity.settlement;
+		return settlement === undefined ? "waiting" : predictionAdopted(settlement) ? "ready" : "blocked";
 	}
-}
-
-function dependencyImpossible(node: MutableNode, condition: PlanActionDependencyCondition | undefined): boolean {
 	const execution = executionProjection(node.execution);
-	switch (condition) {
-		case "actor_adopted":
-			return node.opportunity.settlement !== undefined && !predictionAdopted(node.opportunity.settlement);
-		case "execution_succeeded":
-			return execution.status === "failed" || execution.status === "cancelled";
-		default:
-			return false;
-	}
+	if (!executionSettled(execution)) return "waiting";
+	return condition === "execution_succeeded" && execution.status !== "succeeded" ? "blocked" : "ready";
 }
 
 function predictionMatched(settlement: PredictionSettlement | undefined): settlement is Extract<
@@ -663,14 +651,6 @@ function executionProjection(execution: MutableNodeExecution): PlanNodeExecution
 		cause: state.cause,
 		candidateID: execution.candidateID,
 	};
-}
-
-function isPendingPrediction(node: PlanRuntimeNode): node is PredictionPlanRuntimeNode {
-	return node.predictionState.status === "pending";
-}
-
-function isUnsettledPrediction(node: PlanRuntimeNode): node is PredictionPlanRuntimeNode {
-	return node.predictionState.status !== "settled";
 }
 
 function compareMutableNodes(

@@ -2,50 +2,10 @@ import { describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import { CandidateExecution } from "../src/candidate-execution.ts";
 import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
-import { PlanRuntime } from "../src/plan-runtime.ts";
+import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("PlanRuntime", () => {
-	it("keeps execution failure and later Actor confirmation as independent facts", () => {
-		const plan = new PlanRuntime();
-		plan.apply(proposal([action("parent")]), 0);
-		plan.takeReady(0);
-		const execution = new CandidateExecution<string>("shared");
-		plan.attachExecution("plan", "parent", "candidate", execution);
-		expect(plan.get("plan", "parent")?.execution).toEqual({ status: "queued", candidateID: "candidate" });
-		execution.start(1);
-		execution.fail(cause("execution", "tool_failed"), 2, 1);
-		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
-		const relation = { kind: "exact", distance: 0 } as const;
-		const opportunity = plan.claimMatch("plan", "parent", actor, relation)!;
-
-		const settlement = plan.confirm(opportunity, actor, {
-			status: "rejected",
-			candidateID: "candidate",
-			cause: cause("execution", "tool_failed"),
-		});
-
-		expect(settlement).toMatchObject({
-			observation: "observed",
-			match: { matched: true, adoption: { status: "rejected" } },
-		});
-		expect(settlement?.observation === "observed" && Object.isFrozen(settlement.match)).toBe(true);
-		expect(plan.get("plan", "parent")).toMatchObject({
-			execution: { status: "failed" },
-			predictionState: { status: "settled", settlement },
-		});
-		expect(
-			plan.confirm(
-				opportunity,
-				{ id: "actor-2", sequence: 2, turnID: "turn" },
-				{
-					status: "adopted",
-					candidateID: "candidate",
-				},
-			),
-		).toBeUndefined();
-	});
-
 	it("schedules at the expected horizon and retains the prediction until its latest horizon", () => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("future", { horizon: 0, latestHorizon: 2 })]), 4);
@@ -127,16 +87,7 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "peer")?.action.dependsOn).toEqual([{ actionID: "keyed", condition: "execution_settled" }]);
 		if (kind === "delta") expect(plan.get("plan", "retained")).toBeDefined();
 		expect(Object.isFrozen(offered)).toBe(false);
-		const key = {
-			key: "key",
-			hash: "hash",
-			tool: "read",
-			input: { path: "keyed.ts" },
-			resources: ["keyed.ts"],
-			semanticsEpoch: "1",
-			schemaHash: "schema",
-			executionFingerprint: "executor",
-		};
+		const key = buildPiActionKey("read", { path: "keyed.ts" }, "/workspace")!;
 		expect(plan.bindActionKey("plan", "keyed", key)).toBe(true);
 		expect(plan.bindActionKey("plan", "keyed", { ...key, hash: "other" })).toBe(false);
 		expect(plan.get("plan", "keyed")?.actionKey).toBe(key);
@@ -158,16 +109,7 @@ describe("PlanRuntime", () => {
 	it("keeps an execution-blocked node matchable without making it launchable", () => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("bash")]), 0);
-		const key = {
-			key: "key",
-			hash: "hash",
-			tool: "bash",
-			input: { command: "npm test" },
-			resources: ["."],
-			semanticsEpoch: "pi.bash.v2",
-			schemaHash: "schema",
-			executionFingerprint: "pi.bash.local.v2",
-		};
+		const key = buildPiActionKey("bash", { command: "npm test" }, "/workspace")!;
 
 		expect(plan.bindActionKey("plan", "bash", key)).toBe(true);
 		const blocked = cause("execution", "isolation_unavailable");
@@ -179,54 +121,65 @@ describe("PlanRuntime", () => {
 		]);
 	});
 
-	it("keeps execution dependencies independent from Actor adoption", () => {
-		const plan = new PlanRuntime();
-		const dependency = { actionID: "parent", condition: "actor_adopted" as const };
-		plan.apply(
-			proposal([
-				action("parent"),
+	it.each(["succeeded", "failed", "cancelled"] as const)("queries current dependencies independently of %s execution and Actor settlement", (status) => {
+		for (const outcome of ["adopted", "rejected", "miss", "unobserved"] as const) {
+			const plan = new PlanRuntime(), dependency = { actionID: "parent", condition: "actor_adopted" as const };
+			plan.apply(proposal([action("parent"),
 				action("settled", { dependsOn: [{ actionID: "parent", condition: "execution_settled" }] }),
 				action("succeeded", { dependsOn: [{ actionID: "parent", condition: "execution_succeeded" }] }),
 				action("confirmed", { dependsOn: [dependency] }),
-			]),
-			0,
-		);
-		Reflect.set(dependency, "condition", "execution_succeeded");
-		const exposed = plan.get("plan", "confirmed")!.action.dependsOn![0]!;
-		const changed = Reflect.set(exposed, "condition", "execution_succeeded");
-
-		expect(plan.takeReady(0).map((node) => node.action.id)).toEqual(["parent"]);
-		const execution = new CandidateExecution<string>("shared");
-		plan.attachExecution("plan", "parent", "candidate", execution);
-		execution.start(0);
-		execution.succeed("output", 1, 1);
-		expect(plan.matchable(1).map((node) => node.action.id)).toEqual(["parent"]);
-		expect(
-			plan
-				.matchable(2)
-				.map((node) => node.action.id)
-				.sort(),
-		).toEqual(["parent", "settled", "succeeded"]);
-		expect(
-			plan
-				.launchable()
-				.map((node) => node.action.id)
-				.sort(),
-		).toEqual(["settled", "succeeded"]);
-		expect(changed).toBe(false);
-		expect(Object.isFrozen(exposed)).toBe(true);
-		expect(Object.isFrozen(dependency)).toBe(false);
-		const actor = { id: "actor", sequence: 1, turnID: "turn" } as const;
-		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
-
-		plan.confirm(opportunity, actor, { status: "rejected", cause: cause("execution", "failed") });
-		expect(
-			plan
-				.launchable()
-				.map((node) => node.action.id)
-				.sort(),
-		).toEqual(["settled", "succeeded"]);
-		expect(plan.drainBlocked().map((node) => node.action.id)).toEqual(["confirmed"]);
+			]), 0);
+			Reflect.set(dependency, "condition", "execution_succeeded");
+			const exposed = plan.get("plan", "confirmed")!.action.dependsOn![0]!;
+			expect(Reflect.set(exposed, "condition", "execution_succeeded")).toBe(false);
+			expect(Object.isFrozen(exposed)).toBe(true);
+			expect(Object.isFrozen(dependency)).toBe(false);
+			expect(ids(plan.takeReady(0))).toEqual(["parent"]);
+			const execution = new CandidateExecution<string>("shared");
+			plan.attachExecution("plan", "parent", "candidate", execution);
+			const queued = plan.get("plan", "parent")!;
+			expect(queued.execution).toEqual({ status: "queued", candidateID: "candidate" });
+			execution.start(0);
+			expect(plan.launchable()).toEqual([]);
+			if (status === "succeeded") execution.succeed("output", 1, 1);
+			else execution[status === "failed" ? "fail" : "cancel"](cause("execution", "tool_failed"), 1, 1);
+			const runnable = ["settled", ...(status === "succeeded" ? ["succeeded"] : [])];
+			expect(ids(plan.matchable(1))).toEqual(["parent"]);
+			expect(ids(plan.matchable(2))).toEqual(["parent", ...runnable]);
+			expect(ids(plan.launchable())).toEqual(runnable);
+			expect(ids(plan.due(1))).toEqual(["parent"]);
+			const actor = { id: "first", sequence: 1, turnID: "turn" }, second = { id: "first", sequence: 2, turnID: "other-turn" };
+			const opportunity = plan.opportunity("plan", "parent")!, relation = { kind: "exact", distance: 0 } as const;
+			if (outcome === "adopted" || outcome === "rejected") {
+				expect(plan.claimMatch("plan", "parent", actor, relation)).toBe(opportunity);
+				expect(plan.claimMatch("plan", "parent", second, relation)).toBeUndefined();
+				expect(ids(plan.pending())).toEqual(["settled", "succeeded", "confirmed"]);
+				expect(plan.unsettled()).toHaveLength(4);
+				expect(plan.unobserve("plan", "parent", cause("control", "shutdown"))).toBeUndefined();
+				expect(opportunity.state.status).toBe("matching");
+				expect(plan.confirm(opportunity, second, { status: "rejected", cause: cause("matching", "wrong_actor") })).toBeUndefined();
+				const adoption = outcome === "adopted" ? { status: outcome, candidateID: "candidate" }
+					: { status: outcome, candidateID: "candidate", cause: cause("execution", "tool_failed") };
+				const settlement = plan.confirm(opportunity, actor, adoption);
+				expect(settlement).toMatchObject({ actorAction: actor, observation: "observed", match: { matched: true, adoption } });
+				expect(settlement?.observation === "observed" && Object.isFrozen(settlement.match)).toBe(true);
+				expect(plan.confirm(opportunity, second, { status: "adopted", candidateID: "candidate" })).toBeUndefined();
+			} else if (outcome === "miss") {
+				expect(plan.miss("plan", "parent", actor)).toMatchObject({ observation: "observed", match: { matched: false } });
+			} else expect(plan.unobserve("plan", "parent", cause("control", "turn_aborted"))).toMatchObject({ observation: "unobserved" });
+			expect(plan.unobserve("plan", "parent", cause("control", "late"))).toBeUndefined();
+			expect(plan.get("plan", "parent")).toMatchObject({ execution: { status }, predictionState: { status: "settled", settlement: opportunity.settlement } });
+			expect(queued.execution.status).toBe("queued");
+			expect(plan.values()).toHaveLength(4);
+			expect(ids(plan.pending())).toEqual(["settled", "succeeded", "confirmed"]);
+			expect(ids(plan.unsettled())).toEqual(ids(plan.pending()));
+			expect(ids(plan.due(2))).toEqual(ids(plan.pending()));
+			const ready = [...runnable, ...(outcome === "adopted" ? ["confirmed"] : [])];
+			expect(ids(plan.launchable())).toEqual(ready);
+			expect(ids(plan.matchable(2))).toEqual(ready);
+			expect(ids(plan.drainBlocked())).toEqual([...(status === "succeeded" ? [] : ["succeeded"]), ...(outcome === "adopted" ? [] : ["confirmed"])]);
+			expect(ids(plan.takeReady(1))).toEqual([...ready].sort());
+		}
 	});
 
 	it.each(["forward", "reverse"] as const)("derives deadlines and critical paths independently of %s graph order", (order) => {
@@ -356,47 +309,11 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "target")!.identity).toBe(current);
 	});
 
-	it("settles observed misses and unobserved control endings exactly once", () => {
-		const plan = new PlanRuntime();
-		plan.apply(proposal([action("miss"), action("aborted")]), 0);
-
-		expect(plan.miss("plan", "miss", { id: "actor", sequence: 1, turnID: "turn" })).toMatchObject({
-			observation: "observed",
-			match: { matched: false },
-		});
-		expect(plan.unobserve("plan", "miss", cause("control", "late"))).toBeUndefined();
-		expect(plan.unobserve("plan", "aborted", cause("control", "turn_aborted"))).toMatchObject({
-			observation: "unobserved",
-		});
-	});
-
-	it("lets only one concurrent Actor action claim an unsettled prediction", () => {
-		const plan = new PlanRuntime();
-		plan.apply(proposal([action("only")]), 0);
-		const first = { id: "first", sequence: 1, turnID: "turn" };
-		const second = { id: "first", sequence: 2, turnID: "other-turn" };
-		const relation = { kind: "exact", distance: 0 } as const;
-
-		expect(plan.claimMatch("plan", "only", first, relation)).toBeDefined();
-		expect(plan.claimMatch("plan", "only", second, relation)).toBeUndefined();
-		expect(plan.pending()).toHaveLength(0);
-		expect(plan.unsettled()).toHaveLength(1);
-		expect(plan.unobserve("plan", "only", cause("control", "shutdown"))).toBeUndefined();
-		expect(plan.opportunity("plan", "only")?.state.status).toBe("matching");
-		expect(
-			plan.confirm(plan.opportunity("plan", "only")!, second, {
-				status: "rejected",
-				cause: cause("matching", "wrong_actor"),
-			}),
-		).toBeUndefined();
-		expect(
-			plan.confirm(plan.opportunity("plan", "only")!, first, {
-				status: "rejected",
-				cause: cause("freshness", "resource_changed"),
-			}),
-		).toMatchObject({ actorAction: first, match: { matched: true } });
-	});
 });
+
+function ids(nodes: readonly PlanRuntimeNode[]): string[] {
+	return nodes.map((node) => node.action.id);
+}
 
 function proposal(actions: readonly PlanAction[]): PlanProposal {
 	return { id: "plan", source: "source", revision: 1, actions };
@@ -404,22 +321,13 @@ function proposal(actions: readonly PlanAction[]): PlanProposal {
 
 function action(
 	id: string,
-	options: {
-		readonly input?: unknown;
-		readonly horizon?: number;
-		readonly latestHorizon?: number;
-		readonly dependsOn?: PlanAction["dependsOn"];
-		readonly expectedDurationMs?: number;
-	} = {},
+	options: Partial<Omit<PlanAction, "id" | "type" | "tool">> = {},
 ): PlanAction {
 	return {
 		id,
 		type: "tool_call",
 		tool: "read",
+		...options,
 		input: options.input ?? { path: `${id}.ts` },
-		...(options.horizon !== undefined ? { horizon: options.horizon } : {}),
-		...(options.latestHorizon !== undefined ? { latestHorizon: options.latestHorizon } : {}),
-		...(options.dependsOn ? { dependsOn: options.dependsOn } : {}),
-		...(options.expectedDurationMs !== undefined ? { expectedDurationMs: options.expectedDurationMs } : {}),
 	};
 }
