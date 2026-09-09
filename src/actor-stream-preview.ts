@@ -1,7 +1,5 @@
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
-export type IncompleteActorCallPolicy = (tool: string, input: Readonly<Record<string, unknown>>) => boolean;
-
 export type ActorStreamPreview =
 	| { readonly type: "tool"; readonly tool: string }
 	| {
@@ -18,11 +16,6 @@ type StreamedCall = {
 /** Derives non-authoritative scheduling hints from the same Actor stream in every host integration. */
 export class ActorStreamPreviewTracker {
 	private readonly calls = new Map<number, StreamedCall>();
-	private readonly canPreviewIncomplete: IncompleteActorCallPolicy;
-
-	constructor(canPreviewIncomplete: IncompleteActorCallPolicy = () => false) {
-		this.canPreviewIncomplete = canPreviewIncomplete;
-	}
 
 	clear(): void {
 		this.calls.clear();
@@ -60,34 +53,13 @@ export class ActorStreamPreviewTracker {
 			state.toolPreviewed = true;
 			result.push({ type: "tool", tool: call.name });
 		}
-		const parsed = update.type === "toolcall_delta" ? streamedJsonObject(state.arguments) : undefined;
-		if (
-			parsed &&
-			!state.callPreviewed &&
-			call.name &&
-			call.id &&
-			(parsed.complete || this.canPreviewIncomplete(call.name, parsed.input))
-		) {
+		const parsed = update.type === "toolcall_delta" ? jsonObject(state.arguments) : undefined;
+		if (parsed && !state.callPreviewed && call.name && call.id) {
 			state.callPreviewed = true;
-			result.push({ type: "call", call: { id: call.id, name: call.name, arguments: parsed.input } });
+			result.push({ type: "call", call: { id: call.id, name: call.name, arguments: parsed } });
 		}
 		return result;
 	}
-}
-
-function streamedJsonObject(
-	value: string,
-): { readonly input: Record<string, unknown>; readonly complete: boolean } | undefined {
-	const complete = jsonObject(value);
-	if (complete) return { input: complete, complete: true };
-
-	const closable = jsonObject(`${value}}`);
-	if (closable) return { input: closable, complete: false };
-
-	const comma = lastTopLevelComma(value);
-	if (comma < 0) return undefined;
-	const prefix = jsonObject(`${value.slice(0, comma)}}`);
-	return prefix ? { input: prefix, complete: false } : undefined;
 }
 
 function jsonObject(value: string): Record<string, unknown> | undefined {
@@ -99,25 +71,4 @@ function jsonObject(value: string): Record<string, unknown> | undefined {
 	} catch {
 		return undefined;
 	}
-}
-
-function lastTopLevelComma(value: string): number {
-	let depth = 0;
-	let inString = false;
-	let escaped = false;
-	let comma = -1;
-	for (let index = 0; index < value.length; index++) {
-		const character = value[index];
-		if (inString) {
-			if (escaped) escaped = false;
-			else if (character === "\\") escaped = true;
-			else if (character === '"') inString = false;
-			continue;
-		}
-		if (character === '"') inString = true;
-		else if (character === "{" || character === "[") depth++;
-		else if (character === "}" || character === "]") depth--;
-		else if (character === "," && depth === 1) comma = index;
-	}
-	return comma;
 }

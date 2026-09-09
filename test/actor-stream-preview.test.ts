@@ -1,33 +1,23 @@
 import { createFauxCore, fauxAssistantMessage, fauxToolCall, type UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
-import { canPreviewIncompletePiCall } from "../src/pi-read-projection.ts";
 
 const prompt: UserMessage = { role: "user", content: "inspect", timestamp: 0 };
 
 describe("Actor stream previews", () => {
-	it("starts a read from a closed path field before later arguments finish", async () => {
+	it.each(["read", "grep", "custom"])("waits for complete %s input without rewriting its arguments", async (tool) => {
 		const input = { path: String.raw`src/a\"b.ts`, offset: 200, limit: 20 };
-		const result = await streamedCalls("read", input);
-
-		expect(result.calls).toEqual([{ path: input.path }]);
-		expect(result.callCharacter).toBeLessThanOrEqual(JSON.stringify({ path: input.path }).length);
-		expect(result.endCharacter - result.callCharacter).toBeGreaterThan(10);
-	});
-
-	it("waits for complete input when no projection accepts the prefix", async () => {
-		const input = { pattern: "TODO", path: "." };
-		const result = await streamedCalls("grep", input);
+		const result = await streamedCalls(tool, input);
 
 		expect(result.calls).toEqual([input]);
 		expect(result.callCharacter).toBe(result.endCharacter);
 	});
 
-	it("ignores delimiters in an unfinished string and closes only completed fields", () => {
+	it("ignores delimiters and completed fields until the full object arrives", () => {
 		const partial = fauxAssistantMessage(fauxToolCall("read", {}, { id: "chunked-read" }), {
 			stopReason: "toolUse",
 		});
-		const tracker = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
+		const tracker = new ActorStreamPreviewTracker();
 		tracker.observe({ type: "toolcall_start", contentIndex: 0, partial });
 
 		expect(
@@ -45,7 +35,10 @@ describe("Actor stream previews", () => {
 				delta: 'b.ts","offset":',
 				partial,
 			}),
-		).toEqual([{ type: "call", call: { id: "chunked-read", name: "read", arguments: { path: "src/a,]b.ts" } } }]);
+		).toEqual([]);
+		expect(tracker.observe({ type: "toolcall_delta", contentIndex: 0, delta: "200}", partial })).toEqual([
+			{ type: "call", call: { id: "chunked-read", name: "read", arguments: { path: "src/a,]b.ts", offset: 200 } } },
+		]);
 	});
 });
 
@@ -59,7 +52,7 @@ async function streamedCalls(tool: string, input: Record<string, unknown>) {
 	actor.setResponses([
 		fauxAssistantMessage(fauxToolCall(tool, input, { id: `${tool}-call` }), { stopReason: "toolUse" }),
 	]);
-	const tracker = new ActorStreamPreviewTracker(canPreviewIncompletePiCall);
+	const tracker = new ActorStreamPreviewTracker();
 	const calls: Record<string, unknown>[] = [];
 	let characters = 0;
 	let callCharacter = -1;

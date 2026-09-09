@@ -86,18 +86,6 @@ function uniqueProjectionRules<Output>(
 	return [...unique.values()];
 }
 
-function coveringAction<Output>(predicted: ActionKey, rules: readonly ActionProjectionRule<Output>[]): ActionKey {
-	for (const rule of rules) {
-		try {
-			const covering = rule.coveringAction?.(predicted);
-			if (covering && actionKeyCovers(covering, predicted, [rule])) return covering;
-		} catch {
-			// A projection optimization cannot change the predicted action.
-		}
-	}
-	return predicted;
-}
-
 function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): readonly PlanUpdate[] {
 	return value === undefined ? [] : Array.isArray(value) ? value : [value as PlanUpdate];
 }
@@ -1385,8 +1373,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
-		const executionAction = coveringAction(predictedAction, runtimeState.projectionRules);
-		const executionInput = asConcreteInput(executionAction.input);
+		const executionInput = asConcreteInput(predictedAction.input);
 		if (!executionInput) {
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
@@ -1405,7 +1392,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					tool: node.action.tool,
 					input: structuredClone(concrete),
 					predictedAction,
-					executionAction,
+					executionAction: predictedAction,
 					...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
 					...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
 					...(node.action.conditionalProbability !== undefined
@@ -1428,7 +1415,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			data: context.data,
 			settings: context.settings,
 			draft: context.draft,
-			action: executionAction,
+			action: predictedAction,
 			concrete: executionInput,
 			callID: `spec_${session.candidateSequence + 1}`,
 			index: session.candidateSequence,
@@ -1439,14 +1426,14 @@ export function makeStructuralSpeculativeActionRuntime<
 				failUnlaunchable(session, node, admission.cause);
 				return;
 			}
-			session.plan.bindActionKey(node.proposalID, node.action.id, executionAction);
+			session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction);
 			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, admission.cause)) {
 				failUnlaunchable(session, node, cause("plan", "execution_route_state_invalid"));
 			}
 			return;
 		}
 		context.executionRoute = admission.route;
-		session.plan.bindActionKey(node.proposalID, node.action.id, executionAction);
+		session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction);
 	};
 
 	const releaseActionContext = (session: Session, id: string, keepContinuation = false): void => {
