@@ -72,23 +72,11 @@ describe("SpeculationScheduler", () => {
 		scheduler.observeActorTiming(60, 120);
 		scheduler.observeActorTiming(70, 200);
 		for (const duration of [20, 40, 60, 100]) scheduler.observeSpeculativeService({ tool: "read" }, duration);
-		expect(
-			scheduler.launchDelay(
-				forecast({
-					decisionBatchesUntilCall: 3,
-					actorPhase: { kind: "decision", elapsedMs: 20 },
-					expectedDurationMs: 40,
-				}),
-				10,
-			),
-		).toBe(110);
-		expect(
-			scheduler.launchDelay(
-				forecast({ decisionBatchesUntilCall: 3, actorPhase: { kind: "cycle", elapsedMs: 20 } }),
-				10,
-			),
-		).toBe(150);
-		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3 }), 10)).toBe(170);
+		for (const [phase, expected] of [
+			[{ actorPhase: { kind: "decision", elapsedMs: 20 }, expectedDurationMs: 40 }, 110],
+			[{ actorPhase: { kind: "cycle", elapsedMs: 20 } }, 150],
+			[{}, 170],
+		] as const) expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, ...phase }), 10)).toBe(expected);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10)).toBe(0);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
 		const actionSpecific = forecast({
@@ -145,9 +133,9 @@ describe("SpeculationScheduler", () => {
 		scheduler.observeActorService(identity, 380);
 		scheduler.observeAdoption(identity, 70);
 		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
-		for (const duration of [100, 110, 120]) scheduler.observeActorService(actorIdentity, duration);
-		for (const duration of [5, 10, 20]) scheduler.observeAdoption(exact, duration);
-		for (const duration of [150, 160, 200]) scheduler.observeAdoption(inputs, duration);
+		for (const duration of [100, 110, 120, 130]) scheduler.observeActorService(actorIdentity, duration);
+		for (const duration of [5, 10, 15, 20]) scheduler.observeAdoption(exact, duration);
+		for (const duration of [150, 160, 180, 200]) scheduler.observeAdoption(inputs, duration);
 		expect(scheduler.evaluate([forecast({ ...identity, expectedDurationMs: 1 })]).expectedDurationMs).toBe(50);
 		expect(joinDecision(scheduler, identity)).toMatchObject({ expectedRemainingMs: 90, expectedActorMs: 380, expectedAdoptionMs: 70 });
 		for (const [adoptionIdentity, expectedAdoptionMs] of [[exact, 20], [inputs, 200]] as const) {
@@ -160,19 +148,15 @@ describe("SpeculationScheduler", () => {
 		});
 		for (const [adoptionIdentity, expectedAdoptionMs] of [
 			[{ ...exact, actionKeyHash: "new pair" }, 20],
+			[{ ...inputs, actionKeyHash: "new pair" }, 200],
 			[{ ...exact, operation: "other route:exact" }, 0],
 			[{ ...exact, executionFingerprint: "other executor" }, 0],
 		] as const) {
 			expect(joinDecision(scheduler, identity, {
 				actorIdentity: { ...actorIdentity, actionKeyHash: "new query" }, adoptionIdentity, state: "succeeded",
-			})).toMatchObject({ expectedActorMs: 100, expectedAdoptionMs });
+			})).toMatchObject({ allowed: true, expectedActorMs: 110, expectedAdoptionMs });
 		}
 
-		const tiny = new SpeculationScheduler<object>();
-		tiny.observeActorService(identity, 30);
-		tiny.observeAdoption(identity, 70);
-		expect(joinDecision(tiny, identity, { state: "succeeded", expectedSpeculativeDurationMs: 920 }))
-			.toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: -40 });
 		for (let index = 0; index < 1100; index++) {
 			const newer = { ...identity, executionFingerprint: `world-${index}` };
 			scheduler.observeActorService(newer, 1);
@@ -183,28 +167,25 @@ describe("SpeculationScheduler", () => {
 	});
 
 	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {
-		const heavy = new SpeculationScheduler<object>();
-		const identity = { tool: "bash", executionFingerprint: "linux-world:v1" };
-		heavy.observeActorService(identity, 2_687);
-		heavy.observeSpeculativeService(identity, 936);
-		heavy.observeAdoption(identity, 70);
-		const profitable = joinDecision(heavy, identity, { expectedSpeculativeDurationMs: 2_687 });
-		expect(profitable).toMatchObject({
-			allowed: true,
-			reason: "profitable",
-			expectedRemainingMs: 936,
-			expectedNetBenefitMs: 1_681,
-		});
-		expect(profitable.waitBudgetMs).toBeGreaterThan(936);
-
-		const boundary = new SpeculationScheduler<object>();
-		boundary.observeActorService(identity, 994);
-		boundary.observeSpeculativeService(identity, 973);
-		expect(joinDecision(boundary, identity, { expectedSpeculativeDurationMs: 994 })).toMatchObject({
-			allowed: false,
-			reason: "fallback_faster",
-			expectedNetBenefitMs: 21,
-		});
+		const identity = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "measured-action" };
+		for (const [actorMs, speculativeMs, adoptionMs, state, netMs, allowed] of [
+			[2687, 936, 70, "running", 1681, true],
+			[994, 973, 0, "running", 21, false],
+			[30, 920, 70, "succeeded", -40, false],
+		] as const) {
+			const scheduler = new SpeculationScheduler<object>();
+			for (let sample = 0; sample < 4; sample++) {
+				scheduler.observeActorService(identity, actorMs);
+				if (state === "running") scheduler.observeSpeculativeService(identity, speculativeMs);
+				if (adoptionMs) scheduler.observeAdoption(identity, adoptionMs);
+				if (state === "succeeded" && sample < 3) expect(joinDecision(scheduler, identity, { state }).allowed).toBe(true);
+			}
+			const decision = joinDecision(scheduler, identity, { state, expectedSpeculativeDurationMs: state === "running" ? actorMs : speculativeMs });
+			if (state === "succeeded") expect(joinDecision(scheduler, { ...identity, actionKeyHash: undefined }, { state }).allowed).toBe(true);
+			expect(decision).toMatchObject({ allowed, reason: allowed ? "profitable" : "fallback_faster",
+				expectedRemainingMs: state === "running" ? speculativeMs : 0, expectedNetBenefitMs: netMs });
+			if (allowed) expect(decision.waitBudgetMs).toBeGreaterThan(speculativeMs);
+		}
 	});
 
 	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
@@ -220,23 +201,12 @@ describe("SpeculationScheduler", () => {
 			actorSamples: 0,
 		});
 		scheduler.observeActorService(first, 100);
-		expect(joinDecision(scheduler, first)).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25 });
-		expect(joinDecision(scheduler, first, { actorElapsedMs: 80 }))
-			.toMatchObject({ allowed: false, reason: "fallback_faster", expectedNetBenefitMs: 19 });
+		expect(joinDecision(scheduler, first)).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25, expectedNetBenefitMs: 99 });
 
 		const cold = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 		cold.observeSpeculativeService(first, 900);
 		expect(joinDecision(cold, second)).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
-		expect(
-			cold.evaluate([
-				forecast({
-					tool: "bash",
-					executionFingerprint: second.executionFingerprint,
-					actionKeyHash: second.actionKeyHash,
-					expectedDurationMs: 200,
-				}),
-			]),
-		).toMatchObject({ expectedDurationMs: 900 });
+		expect(cold.evaluate([forecast({ ...second, expectedDurationMs: 200 })])).toMatchObject({ expectedDurationMs: 900 });
 	});
 
 	it("promotes shared work on foreground evidence and lets background work yield", () => {
@@ -275,24 +245,11 @@ describe("SpeculationScheduler", () => {
 
 	it("accepts world effects only when backend evidence matches the Actor execution world", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		expect(
-			scheduler.assessCompatibility(
-				{ status: "compatible", backend: "native", executionFingerprint: "world-a" },
-				"world-a",
-			),
-		).toEqual({ compatible: true });
-		expect(
-			scheduler.assessCompatibility(
-				{ status: "compatible", backend: "native", executionFingerprint: "world-a" },
-				"world-b",
-			),
-		).toEqual({ compatible: false, code: "execution_fingerprint_changed" });
-		expect(
-			scheduler.assessCompatibility(
-				{ status: "indeterminate", backend: "native", code: "attestation_missing" },
-				"world-a",
-			),
-		).toEqual({ compatible: false, code: "backend_indeterminate", detail: "attestation_missing" });
+		for (const [evidence, actor, result] of [
+			[{ status: "compatible", backend: "native", executionFingerprint: "world-a" }, "world-a", { compatible: true }],
+			[{ status: "compatible", backend: "native", executionFingerprint: "world-a" }, "world-b", { compatible: false, code: "execution_fingerprint_changed" }],
+			[{ status: "indeterminate", backend: "native", code: "attestation_missing" }, "world-a", { compatible: false, code: "backend_indeterminate", detail: "attestation_missing" }],
+		] as const) expect(scheduler.assessCompatibility(evidence, actor)).toEqual(result);
 	});
 });
 

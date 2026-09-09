@@ -50,6 +50,7 @@ const scheduler = new SpeculationScheduler<object>();
 const identity = {
 	tool: "bash",
 	executionFingerprint: "linux_process_reuse:measured-machine-class",
+	actionKeyHash: JSON.stringify(reuse.fixture),
 };
 for (const run of direct.runs) scheduler.observeActorService(identity, run.totalMs);
 for (const run of reuse.runs) {

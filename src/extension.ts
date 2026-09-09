@@ -994,7 +994,7 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 			[`Candidate requests per decision: ${settings.candidateLimit}`, () => edit("candidateLimit")],
 			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
 		] : [
-			[`Pause when measured cost exceeds benefit: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
+			[`Pause drafts on estimated negative utility: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
 			[`Follow-up tool steps: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
 			[`Maximum output tokens: ${settings.drafterMaxTokens ?? "Provider default"}`, () => edit("drafterMaxTokens")],
 			[`Temperature-0 candidates: ${settings.drafterDeterministicCandidates}`, () => edit("drafterDeterministicCandidates")],
@@ -1503,7 +1503,7 @@ function syntaxSettingLabel(value: string): string {
 }
 
 function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnapshot): string {
-	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? "" : `, ${formatDuration(gate.expectedNetBenefitMs)} expected net`}`;
+	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? ", benefit unmeasured" : `, ${formatDuration(gate.expectedNetBenefitMs)} budget estimate`}`;
 }
 
 function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
@@ -1515,7 +1515,7 @@ function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot)
 				]
 			: []),
 		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
-		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries), ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? "" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} expected net`}`,
+		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries), ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? ", benefit unmeasured" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} budget estimate`}`,
 		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,
 		`${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged)`,
 		`${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved`,

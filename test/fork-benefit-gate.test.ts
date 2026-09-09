@@ -2,21 +2,12 @@ import { describe, expect, it } from "vitest";
 import { DrafterUtilityGate } from "../src/drafter-utility-gate.ts";
 import {
 	BenefitGate,
-	type BenefitGatePolicy,
+	DEFAULT_BENEFIT_GATE_POLICY as POLICY,
 	type BenefitObservation,
 } from "../src/fork-benefit-gate.ts";
 
-const POLICY: BenefitGatePolicy = {
-	enabled: true,
-	minSamples: 4,
-	windowSize: 4,
-	minNetBenefitMs: 25,
-	probeInterval: 4,
-	failureThreshold: 2,
-};
-
 describe("fork benefit gate", () => {
-	it("charges request and adoption costs against calibrated Actor service, including late continuations", () => {
+	it("keeps censored hit benefit unknown while charging requests and late continuations", () => {
 		for (const expectedActorMs of [undefined, 50, 300]) {
 			const gate = new DrafterUtilityGate();
 			gate.finish(gate.start("drafter", true));
@@ -30,9 +21,17 @@ describe("fork benefit gate", () => {
 				gate.requestSettled(batch, 10);
 				gate.requestStarted(batch); gate.requestSettled(batch, 130);
 				gate.creditAdoption(batch, { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs });
-				expect(gate.snapshot()).toMatchObject({ samples: index + 1, expectedNetBenefitMs: (expectedActorMs ?? 0) - 250 });
+				expect(gate.snapshot().samples).toBe(index + 1);
+				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 250);
 			}
-			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs === 300);
+			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs !== 50);
+			if (expectedActorMs === undefined) {
+				for (let index = 0; index < 4; index++) {
+					const missed = gate.start("drafter", true);
+					gate.requestStarted(missed); gate.requestSettled(missed, 100); gate.finish(missed);
+				}
+				expect(gate.start("drafter", true).allowed).toBe(false);
+			}
 		}
 	});
 

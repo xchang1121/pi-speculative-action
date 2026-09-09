@@ -65,23 +65,12 @@ describe("ActorAction", () => {
 	});
 
 	it("settles isolation-blocked benefit with the same capped timing decomposition", () => {
-		const partiallyAhead = new ActorAction({ identity, tool: "bash", actionKey });
-		expect(partiallyAhead.deferToFallback([], 80)).toBe(true);
-		expect(partiallyAhead.settleActor(120, false, 1_000)).toMatchObject({
-			provider: {
-				kind: "actor",
-				durationMs: 120,
-				executionBlockedTiming: { attemptLeadMs: 80, executionAheadMs: 80, hitLatencyMs: 40 },
-			},
-		});
-
-		const fullyAhead = new ActorAction({ identity: { ...identity, id: "call-2" }, tool: "bash", actionKey });
-		fullyAhead.deferToFallback([], 200);
-		expect(fullyAhead.settleActor(120, false)).toMatchObject({
-			provider: {
-				executionBlockedTiming: { attemptLeadMs: 200, executionAheadMs: 120, hitLatencyMs: 0 },
-			},
-		});
+		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs, completedAt] of [[80, 80, 40, 1000], [200, 120, 0, undefined]]) {
+			const action = new ActorAction({ identity, tool: "bash", actionKey });
+			expect(action.deferToFallback([], attemptLeadMs)).toBe(true);
+			expect(action.settleActor(120, false, completedAt)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
+				executionBlockedTiming: { attemptLeadMs, executionAheadMs, hitLatencyMs } } });
+		}
 	});
 });
 

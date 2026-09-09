@@ -605,39 +605,34 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
-	it("gates persistently negative forks after warm-up without blocking bounded probes", async () => {
-		let requestSequence = 0;
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar" }),
-			requestID: () => `actor-${++requestSequence}`,
-			fetch: vi.fn(async (input) =>
-				Response.json(
-					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
-						? forkReceipt("read", { path: "never-used.txt" })
-						: { ok: true },
-				),
-			),
-		});
-		for (let decision = 1; decision <= 4; decision++) {
-			coordinator.startTurn(`turn-${decision}`, model(), context(), decision);
+	it("keeps censored adoptions eligible and gates measured negative forks after warm-up", async () => {
+		for (const expectedActorMs of [undefined, 0]) {
+			const coordinator = coordinatorFixture([], { forkTransport: "sidecar" },
+				Array.from({ length: 5 }, (_, index) => `actor-${index + 1}`),
+				(request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath ? forkReceipt("read", { path: "a.txt" }) : {});
+			for (let decision = 1; decision <= 4; decision++) {
+				coordinator.startTurn(`turn-${decision}`, model(), context(), decision);
+				coordinator.decorateActorPayload({ prompt: "P" });
+				coordinator.observeActorOutput(delta("thinking_delta", "reason"));
+				await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(decision));
+				coordinator.observeActorSettlement({
+					actorAction: { id: `actor-${decision}`, sequence: decision, turnID: `turn-${decision}` }, tool: "read", rejections: [],
+					matchedPredictions: [predictionFeedback("self-speculation", true, decision).settlement.prediction],
+					provider: { kind: "speculative", candidateID: "candidate", match: { kind: "exact", distance: 0 },
+						timing: { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs },
+						toolExecution: { startedAt: 0, completedAt: 10000 } },
+				});
+				coordinator.endTurn();
+			}
+
+			coordinator.startTurn("turn-5", model(), context(), 5);
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput(delta("thinking_delta", "reason"));
-			await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(decision));
-			coordinator.observeActorSettlement({
-				actorAction: { id: `actor-${decision}`, sequence: decision, turnID: `turn-${decision}` }, tool: "read", rejections: [],
-				matchedPredictions: [predictionFeedback("self-speculation", true, decision).settlement.prediction],
-				provider: { kind: "speculative", candidateID: "candidate", match: { kind: "exact", distance: 0 },
-					timing: { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100 },
-					toolExecution: { startedAt: 0, completedAt: 10000 } },
-			});
-			coordinator.endTurn();
+			await vi.waitFor(() => expect(coordinator.snapshot()).toMatchObject({
+				forkRequests: expectedActorMs === undefined ? 5 : 4, forkGateSkips: expectedActorMs === undefined ? 0 : 1, forkGateSamples: 4,
+			}));
+			await coordinator.dispose();
 		}
-
-		coordinator.startTurn("turn-5", model(), context(), 5);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
-		expect(coordinator.snapshot()).toMatchObject({ forkRequests: 4, forkGateSkips: 1, forkGateSamples: 4 });
-		await coordinator.dispose();
 	});
 
 	it("contains control-plane failures instead of rejecting Actor cleanup", async () => {

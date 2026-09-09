@@ -161,7 +161,7 @@ npm run setup:linux
 
 `candidateLimit` 默认在每次 Actor 决策并发发出两个单动作 Drafter 请求。宽度为 2 时，首个完成一次参数准备、校验与执行身份绑定的有效动作胜出，并通过 provider `AbortSignal` 取消仍在运行的同伴；空响应、绑定失败与取消后才完成的绑定不会胜出，也不重新准备参数。预测竞胜不代替隔离和采纳证明。显式设为 3 或更高时保留所有完成样本，额外请求仍计成本。
 
-`drafterGateEnabled` 默认为 `true`。按模型与端点合并根请求及后继成本；只有 Drafter 拥有且匹配预测的实际采纳，才按已校准的 Actor 服务时间计入收益，扣除拦截至采纳及结果保留的耗时和全部模型请求服务时间。没有 Actor 样本时收益为零，提前执行量不是节省。这是保守的请求预算估计，不能替代含执行争用与回收的端到端对照。跨轮反馈更新原样本，退出窗口后不再修改；未发请求不记样本。前 4 批预热，持续负收益时暂停根请求，每跳过 4 次有界探测；设为 `false` 关闭此门控。后继仍受深度、时限和调度约束。
+`drafterGateEnabled` 默认为 `true`，按模型与端点合并根请求、后继及采纳成本。仅给拥有执行且匹配预测的 Drafter 记采纳；没有历史回退耗时的命中收益保持未知，继续既有额度内的探索，不记零、不为测量强制重跑 Actor。已有估计仅作请求预算参考：回退本身可能包含下层复用，请求耗时也可与 Actor 重叠，均不是真实端到端净收益。前 4 批预热，可估收益持续不足或连续失配时暂停根请求，每跳过 4 次探测；设为 `false` 关闭门控。跨轮反馈修改原样本，退出窗口后不再修改；未发请求不记样本。后继仍受深度、时限和调度约束。
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 
@@ -184,7 +184,7 @@ fork 有两种传输方式：
 
 正数工具名置信度门槛会自动请求 token 概率。`requireLogprobs` 是 JSON 证据收集选项，用于关闭提前执行后仍想收集证据的场景，不再需要独立的 TUI 开关。
 
-`sidecar` 的模型级 fork 门控与 Drafter 共用 Actor 校准及采纳成本口径，按匹配来源分摊后再扣除 fork 请求时间。默认 4 个预热样本、每跳过 4 次探测；连续 2 次端点失败也进入探测回路，阈值可配置。关闭 `forkGateEnabled` 恢复无条件 fork。`fork_gate` 也作为 provider/SPORK 提示发送，执行由推理服务负责。
+`sidecar` 与 Drafter 共用上述未知收益及成本口径，按匹配来源分摊。默认 4 个预热样本、每跳过 4 次探测；连续 2 次端点失败进入探测回路，阈值可配置。关闭 `forkGateEnabled` 恢复无条件 fork。`fork_gate` 也作为 provider/SPORK 提示发送，由推理服务执行。
 
 D3 默认上限为 28 个 draft token，可显式配置，并再次受推理引擎硬上限约束；token 验收和动作侧收益分别计量。
 
@@ -256,16 +256,16 @@ try { await host.dispose(); } finally { await workspace.dispose(); }
 - `attemptLeadMs`：投机意图产生到 Actor 调用被拦截。
 - `executionAheadMs`：拦截前已完成的投机执行量，上限为实测工具时长。
 - `hitLatencyMs`：Actor 拦截至采纳及结果保留；会话回收另计。
-- `expectedActorMs`：同执行身份下 Actor 服务时间的保守估计；无样本时缺省。
+- `expectedActorMs`：历史回退服务耗时参考，可能含下层复用；无样本时缺省，不能冒充关闭投机的直接耗时。
 
-对因为缺少隔离而阻断的匹配，Actor 执行仍是唯一权威执行，但使用相同分解报告反事实潜力：
+候选准入只比较从当前时刻起的剩余等待、采纳和回退成本；检索等已付成本不重复扣除。已完成候选至少取得 4 个同动作、同采纳路径样本才按收益否决，宽泛类别或稀疏样本只作参考。端到端收益须另以相同任务和初态的启用／关闭投机对照计时，包含失败回退、争用和完整回收；提前执行量不等于节省。
+
+对缺少隔离而阻断的匹配，以下分解只报告反事实潜力，不计实际命中或节省：
 
 ```text
 executionBlockedPotentialHiddenLatencyMs = min(actorDuration, predictionLead)
 executionBlockedPotentialHitLatencyMs    = actorDuration - potentialHidden
 ```
-
-这些反事实值不会计入真实投机命中数，也不会混入真实隐藏时延。
 
 ## 验证
 

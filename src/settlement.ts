@@ -132,7 +132,7 @@ export interface ActorHitTiming {
 	readonly attemptLeadMs: number;
 	/** Actor interception through adoption and result retention; session cleanup is separate. */
 	readonly hitLatencyMs: number;
-	/** Calibrated Actor service estimate, absent until an Actor baseline is observed. */
+	/** Historical fallback-service estimate, absent without samples; not a no-speculation baseline. */
 	readonly expectedActorMs?: number;
 }
 

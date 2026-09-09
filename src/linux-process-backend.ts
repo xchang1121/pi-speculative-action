@@ -800,7 +800,7 @@ export class LinuxProcessReuseBackend {
 		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
 		signal?: AbortSignal,
 		scope?: ExecutionScope,
-		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
+		actor?: { readonly timing: ServiceTimingIdentity },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
 		let admission = actor ? this.processScheduler.assessCandidateJoin({ identity: actor.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
@@ -817,7 +817,6 @@ export class LinuxProcessReuseBackend {
 					admission = this.processScheduler.assessCandidateJoin({
 						identity: actor.timing, state: "running", expectedSpeculativeDurationMs: 1,
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
-						actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
 					});
 					if (!admission.allowed) return "miss";
 					const waitStarted = performance.now();
@@ -941,7 +940,7 @@ export class LinuxProcessReuseBackend {
 				(live) => this.plan(weakKey, projection, accepted, undefined, live),
 				process.signal,
 				scope,
-				{ timing, arrivedAt: requestStarted },
+				{ timing },
 			);
 			const plan = acquired.plan;
 			if (!plan || plan.certificate.result.exit.kind !== "code") {

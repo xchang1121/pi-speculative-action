@@ -1,3 +1,5 @@
+import type { ActorHitTiming } from "./settlement.ts";
+
 export interface BenefitGatePolicy {
 	readonly enabled: boolean;
 	readonly minSamples: number;
@@ -18,13 +20,14 @@ export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze({
 
 export interface BenefitObservation {
 	readonly costMs: number;
-	readonly benefitMs: number;
+	/** Missing for adopted work whose counterfactual service time was not observed. */
+	readonly benefitMs?: number;
 	readonly failed?: boolean;
 }
 
-/** Conservative request-budget credit; execution lead alone is not avoided Actor work. */
+/** Historical fallback service is an estimate; a censored hit is neither zero gain nor measured savings. */
 export function adoptionUtility(timing: ActorHitTiming): BenefitObservation {
-	return { costMs: metric(timing.hitLatencyMs), benefitMs: metric(timing.expectedActorMs ?? 0) };
+	return { costMs: metric(timing.hitLatencyMs), benefitMs: timing.expectedActorMs };
 }
 
 export type BenefitDecisionReason =
@@ -51,7 +54,7 @@ export interface BenefitGateSnapshot {
 }
 
 interface GateState {
-	readonly samples: Array<{ netBenefit: number; failed: boolean }>;
+	readonly samples: Array<{ netBenefit: number | undefined; failed: boolean }>;
 	priorFailures: number;
 	suppressedSinceProbe: number;
 	totalSuppressed: number;
@@ -71,8 +74,8 @@ export class BenefitGate {
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
 		if (consecutiveFailures(state) >= policy.failureThreshold)
 			return this.probeDecision(state, policy, "failure_probe", "failure_circuit", base);
-		if (state.samples.length < policy.minSamples) return { allowed: true, reason: "warmup", ...base };
-		if ((expected ?? 0) >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
+		if (state.samples.length < policy.minSamples || expected === undefined) return { allowed: true, reason: "warmup", ...base };
+		if (expected >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
 		return this.probeDecision(state, policy, "utility_probe", "negative_utility", base);
 	}
 
@@ -82,12 +85,12 @@ export class BenefitGate {
 		policy: BenefitGatePolicy,
 	): (observation: BenefitObservation) => void {
 		const state = this.state(key);
-		const sample = { netBenefit: 0, failed: false };
+		const sample: GateState["samples"][number] = { netBenefit: undefined, failed: false };
 		state.samples.push(sample);
 		// Late lineage costs/benefits amend one retained sample, never append another observation.
 		const update = (value: BenefitObservation) => {
 			if (this.states.get(key) !== state || !state.samples.includes(sample)) return;
-			sample.netBenefit = metric(value.benefitMs) - metric(value.costMs);
+			sample.netBenefit = value.benefitMs === undefined ? undefined : metric(value.benefitMs) - metric(value.costMs);
 			sample.failed = value.failed === true;
 		};
 		update(observation);
@@ -147,10 +150,10 @@ function metric(value: number): number {
 }
 
 function mean(values: GateState["samples"]): number | undefined {
-	return values.length ? values.reduce((total, value) => total + value.netBenefit, 0) / values.length : undefined;
+	return values.length && values.every((value) => value.netBenefit !== undefined)
+		? values.reduce((total, value) => total + value.netBenefit!, 0) / values.length : undefined;
 }
 
 function consecutiveFailures(state: GateState): number {
 	return state.samples.reduce((count, sample) => sample.failed ? count + 1 : 0, state.priorFailures);
 }
-import type { ActorHitTiming } from "./settlement.ts";

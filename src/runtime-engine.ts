@@ -1967,9 +1967,8 @@ export function makeStructuralSpeculativeActionRuntime<
 							? "running"
 							: "queued",
 				expectedSpeculativeDurationMs: candidate.expectedDurationMs,
-				actorElapsedMs: Math.max(0, performance.now() - actorArrivedAt),
 				...(executionAtDecision.status === "running"
-					? { elapsedMs: Math.max(0, actorArrivedAt - executionAtDecision.startedAt) }
+					? { elapsedMs: Math.max(0, performance.now() - executionAtDecision.startedAt) }
 					: {}),
 			});
 			if (!join.allowed) {

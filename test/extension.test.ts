@@ -397,7 +397,7 @@ describe("zero-modification Pi extension", () => {
 		]));
 		expect(menus.get("Model Drafter")).not.toEqual(expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]));
 		expect(menus.get("Model Drafter advanced")).toEqual(expect.arrayContaining([
-			"Pause when measured cost exceeds benefit: On", "Follow-up tool steps: 1", "Maximum output tokens: Provider default",
+			"Pause drafts on estimated negative utility: On", "Follow-up tool steps: 1", "Maximum output tokens: Provider default",
 			"Temperature-0 candidates: 1", "Sampling temperature: 0.7-0.7",
 		]));
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });

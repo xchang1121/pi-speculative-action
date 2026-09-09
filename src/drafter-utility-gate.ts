@@ -9,7 +9,7 @@ export interface DrafterUtilityBatch {
 	startedRequests: number;
 	pendingRequests: number;
 	costMs: number;
-	benefitMs: number;
+	benefitMs: number | undefined;
 	failed: boolean;
 	finished: boolean;
 	update?: ReturnType<BenefitGate["observe"]>;
@@ -62,7 +62,7 @@ export class DrafterUtilityGate {
 	creditAdoption(batch: DrafterUtilityBatch, timing: ActorHitTiming): void {
 		const utility = adoptionUtility(timing);
 		batch.costMs += utility.costMs;
-		batch.benefitMs += utility.benefitMs;
+		batch.benefitMs = batch.benefitMs === undefined || utility.benefitMs === undefined ? undefined : batch.benefitMs + utility.benefitMs;
 		this.observe(batch);
 	}
 

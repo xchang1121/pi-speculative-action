@@ -68,8 +68,6 @@ export interface CandidateJoinRequest {
 	readonly state: "queued" | "running" | "succeeded";
 	readonly expectedSpeculativeDurationMs: number;
 	readonly elapsedMs?: number;
-	/** Actor-side time already spent trying earlier candidates for this action. */
-	readonly actorElapsedMs?: number;
 }
 
 type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
@@ -285,14 +283,13 @@ export class SpeculationScheduler<Job extends object> {
 		const expectedSpeculativeMs =
 			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, 1);
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0;
-		const actorElapsedMs = finite(request.actorElapsedMs);
 		const expectedRemainingMs =
 			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs);
 		const expectedAdoptionMs = adoption?.value ?? 0;
 		const expectedNetBenefitMs =
 			expectedActorMs === undefined
 				? undefined
-				: expectedActorMs - actorElapsedMs - expectedRemainingMs - expectedAdoptionMs;
+				: expectedActorMs - expectedRemainingMs - expectedAdoptionMs;
 		const base = {
 			speculativeSamples: speculative?.samples ?? 0,
 			actorSamples: actor?.samples ?? 0,
@@ -304,10 +301,10 @@ export class SpeculationScheduler<Job extends object> {
 		};
 
 		if (request.state === "succeeded") {
-			// No execution wait remains, but measured validation/projection/commit can still exceed fallback.
+			// Sparse or wider-class fallback samples must not veto ready work. Sunk lookup costs cancel.
 			if (
-				expectedActorMs !== undefined &&
-				adoption !== undefined &&
+				actor?.exact && adoption?.exact &&
+				Math.min(actor.samples, adoption.samples) >= DEFAULT_BENEFIT_GATE_POLICY.minSamples &&
 				expectedNetBenefitMs !== undefined &&
 				expectedNetBenefitMs < 0
 			) {
@@ -330,7 +327,7 @@ export class SpeculationScheduler<Job extends object> {
 		}
 		const actorDeadlineMs = Math.max(
 			0,
-			expectedActorMs - actorElapsedMs - expectedAdoptionMs - policy.minNetBenefitMs,
+			expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs,
 		);
 		const estimatedDeadlineMs = expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
@@ -430,9 +427,9 @@ export class SpeculationScheduler<Job extends object> {
 		quantile: number,
 		selection: QuantileSelection = "lower",
 	): TimingEstimate | undefined {
-		for (const key of timingKeys(identity)) {
+		for (const [index, key] of timingKeys(identity).entries()) {
 			const window = windows.get(key), value = window?.estimate(quantile, selection);
-			if (value !== undefined) return { value, samples: window!.count };
+			if (value !== undefined) return { value, samples: window!.count, exact: Boolean(identity.actionKeyHash) && index === 0 };
 		}
 		return undefined;
 	}
@@ -441,6 +438,7 @@ export class SpeculationScheduler<Job extends object> {
 interface TimingEstimate {
 	readonly value: number;
 	readonly samples: number;
+	readonly exact: boolean;
 }
 
 class SampleWindow {

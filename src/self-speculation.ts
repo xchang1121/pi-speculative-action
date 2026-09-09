@@ -271,7 +271,7 @@ interface TurnState {
 	readonly candidateSourcesByID: Map<string, Set<string>>;
 	readonly candidateToolsByID: Map<string, Set<string>>;
 	readonly gateKey: string;
-	readonly forkUtility: { costMs: number; benefitMs: number };
+	readonly forkUtility: { costMs: number; benefitMs: number | undefined };
 	forkStartedAt?: number;
 	forkCompletedAt?: number;
 	forkFailed: boolean;
@@ -614,7 +614,8 @@ export class SelfSpeculationCoordinator {
 		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
 		const shares = Math.max(1, matchedSources.size), utility = adoptionUtility(settlement.provider.timing);
 		state.forkUtility.costMs += utility.costMs / shares;
-		state.forkUtility.benefitMs += utility.benefitMs / shares;
+		state.forkUtility.benefitMs = state.forkUtility.benefitMs === undefined || utility.benefitMs === undefined
+			? undefined : state.forkUtility.benefitMs + utility.benefitMs / shares;
 		this.totalForkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
 		this.forkActionAdoptions++;
 	}
