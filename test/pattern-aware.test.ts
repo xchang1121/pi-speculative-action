@@ -183,6 +183,8 @@ describe("PatternAware", () => {
 			}),
 		);
 		expect(store.recent("probe")).toEqual(before);
+		expect(store.predictAfterBatch("missing-payload", [input({ sessionID: "missing-payload", tool: "grep", input: { pattern: "TODO" } })])
+			.find((item) => item.tool === "read")).toBeUndefined();
 	});
 
 	test("learns provider batches canonically without inventing sibling causality", () => {
@@ -797,24 +799,8 @@ describe("PatternAware", () => {
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.empiricalProbability).toBeGreaterThan(0);
 		expect(candidate?.empiricalProbability).toBeLessThan(0.75);
-	});
-
-	test("still rejects unreliable argument mappers", () => {
-		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
-		expect(
-			store.registerValidatedPattern(
-				validatedGapPattern({ "0": 10 }, { id: "unreliable-binding", occurrences: 10, replayMatches: 7 }),
-			),
-		).toBe(false);
-	});
-
-	test("does not predict an action before all bound payloads are available", () => {
-		const store = new PatternAwareStore(settings());
-		trainGrepRead(store, "one", "src/a.ts");
-		trainGrepRead(store, "two", "src/b.ts");
-
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
-		expect(store.predict("probe").find((item) => item.tool === "read")).toBeUndefined();
+		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 },
+			{ id: "unreliable-binding", occurrences: 10, replayMatches: 7 }))).toBe(false);
 	});
 
 	test("learns indexed field fallbacks across historical samples", () => {
@@ -894,32 +880,6 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").find((item) => item.tool === "read")).toBeUndefined();
 	});
 
-	test("matches learned contexts by semantic output kind", () => {
-		const store = new PatternAwareStore(settings());
-		for (const sessionID of ["one", "two"]) {
-			store.observe(
-				input({
-					sessionID,
-					tool: "inspect",
-					input: { path: `src/${sessionID}.ts` },
-					output: { kind: "path", value: `src/${sessionID}.test.ts` },
-				}),
-			);
-			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
-			store.finishSession(sessionID);
-		}
-
-		store.observe(
-			input({
-				sessionID: "wrong-output",
-				tool: "inspect",
-				input: { path: "src/value.ts" },
-				output: { kind: "text", value: "src/value.test.ts" },
-			}),
-		);
-		expect(store.predict("wrong-output").find((item) => item.tool === "read")).toBeUndefined();
-	});
-
 	test("expands a structured collection when actor ordering varies", () => {
 		const store = new PatternAwareStore(settings());
 		trainResultReads(store, "one", ["src/a.ts", "src/b.ts"], ["src/b.ts", "src/a.ts"]);
@@ -970,7 +930,7 @@ describe("PatternAware", () => {
 
 	test("allocates collection variants by observed actor choice frequency", () => {
 		const store = new PatternAwareStore(settings());
-		acceptPattern(store, { "0": 10 }, {
+		const pattern = acceptPattern(store, { "0": 10 }, {
 			id: "ranked-results",
 			bindings: collectionBindings({ "0": 9, "1": 1 }),
 		});
@@ -989,6 +949,11 @@ describe("PatternAware", () => {
 
 		expect(likely?.conditionalProbability).toBeGreaterThan(unlikely?.conditionalProbability ?? 1);
 		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
+		expect(candidates).toHaveLength(2);
+		store.observe(input({ sessionID: "probe", tool: "read", input: { filePath: "src/unlikely.ts" } }));
+		expect(store.snapshot().find((item) => item.id === pattern.id)).toMatchObject({
+			historicalOpportunities: pattern.historicalOpportunities + 1, historicalMatches: pattern.historicalMatches + 1,
+		});
 	});
 
 	test("charges evidence-annealed mapper complexity for transforms and ungrounded payloads", () => {
@@ -1080,6 +1045,8 @@ describe("PatternAware", () => {
 		expect(store.predict("probe-after-four")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
+		store.observe(input({ sessionID: "wrong-output", tool: "inspect", input: {}, output: { kind: "text" } }));
+		expect(store.predict("wrong-output").find((item) => item.tool === "read")).toBeUndefined();
 	});
 
 	test("learns a reusable read range from varying actor windows", () => {
@@ -1113,89 +1080,13 @@ describe("PatternAware", () => {
 		});
 	});
 
-	test("uses directed K(a) coverage when validating a predicted action", () => {
-		const store = new PatternAwareStore(settings(), undefined, piActionSemantics());
-		const pattern = validatedGapPattern(
-			{ "0": 10 },
-			{
-				id: "projected-feedback",
-				bindings: constantBindings({ path: "src/index.ts", offset: 1, limit: 100 }),
-				targetSchemaHash: "read-schema",
-			},
-		);
-		expect(store.registerValidatedPattern(pattern)).toBe(true);
-
-		store.observe(input({ sessionID: "projected", tool: "grep", input: { pattern: "symbol" } }));
-		store.observe(
-			input({
-				sessionID: "projected",
-				tool: "read",
-				input: { path: "src/index.ts", offset: 20, limit: 10 },
-				schemaHash: "read-schema",
-			}),
-		);
-
-		const after = store.snapshot().find((item) => item.id === pattern.id);
-		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
-		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
-	});
-
-	test("memoizes repeated deterministic K(a) resolution, including misses", () => {
-		const semantics = piActionSemantics();
-		let resolutions = 0;
-		const store = new PatternAwareStore(settings(), undefined, {
-			...semantics,
-			actionKey: (...args) => {
-				resolutions++;
-				return semantics.actionKey(...args);
-			},
-		});
-		store.registerValidatedPattern(
-			validatedGapPattern(
-				{ "0": 10 },
-				{ id: "memoized-action-key", bindings: constantBindings({ path: "src/index.ts" }) },
-			),
-		);
-		store.registerValidatedPattern(
-			validatedGapPattern(
-				{ "0": 10 },
-				{ id: "memoized-missing-key", bindings: constantBindings({ path: "../outside.ts" }) },
-			),
-		);
-
-		store.observe(input({ sessionID: "memoized", tool: "grep", input: { pattern: "symbol" } }));
-		const first = store.predict("memoized");
-		const afterFirstPrediction = resolutions;
-		expect(first.find((candidate) => candidate.tool === "read")?.input).toEqual({ path: "src/index.ts" });
-		store.predict("memoized");
-		expect(resolutions).toBe(afterFirstPrediction);
-	});
-
-	test("validates any emitted binding variant instead of only the top-ranked input", () => {
-		const store = new PatternAwareStore(settings());
-		const pattern = validatedGapPattern(
-			{ "0": 10 },
-			{ id: "variant-feedback", bindings: collectionBindings() },
-		);
-		expect(store.registerValidatedPattern(pattern)).toBe(true);
-
-		store.observe(
-			input({
-				sessionID: "variant-probe",
-				tool: "grep",
-				input: { pattern: "TODO" },
-				output: { results: [{ path: "src/first.ts" }, { path: "src/second.ts" }] },
-			}),
-		);
-		expect(store.predict("variant-probe").filter((candidate) => candidate.tool === "read")).toHaveLength(2);
-		store.observe(input({ sessionID: "variant-probe", tool: "read", input: { filePath: "src/second.ts" } }));
-
-		const after = store.snapshot().find((item) => item.id === pattern.id);
-		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
-		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
-	});
-
 	test.each([
+		{
+			name: "covered",
+			bindings: constantBindings({ path: "src/index.ts", offset: 1, limit: 100 }),
+			actor: { path: "src/index.ts", offset: 20, limit: 10 },
+			actorSchemaHash: "read-schema",
+		},
 		{
 			name: "reverse coverage",
 			bindings: constantBindings({ path: "src/index.ts", offset: 20, limit: 10 }),
@@ -1214,7 +1105,7 @@ describe("PatternAware", () => {
 			actor: { path: "src/index.ts", offset: 20, limit: 10 },
 			actorSchemaHash: "new-read-schema",
 		},
-	])("does not validate projected feedback with $name", ({ name, bindings, actor, actorSchemaHash }) => {
+	])("accounts for projected feedback with $name", ({ name, bindings, actor, actorSchemaHash }) => {
 		const store = new PatternAwareStore(settings(), undefined, piActionSemantics());
 		const pattern = validatedGapPattern(
 			{ "0": 10 },
@@ -1227,16 +1118,21 @@ describe("PatternAware", () => {
 
 		const after = store.snapshot().find((item) => item.id === pattern.id);
 		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
-		expect(after?.historicalMatches).toBe(pattern.historicalMatches);
+		expect(after?.historicalMatches).toBe(pattern.historicalMatches + (name === "covered" ? 1 : 0));
 	});
 
-	test("deduplicates syntactic variants that resolve to the same canonical K(a)", () => {
-		const store = new PatternAwareStore(settings(), undefined, piActionSemantics());
+	test("deduplicates canonical K(a) variants and memoizes resolution, including misses", () => {
+		const semantics = piActionSemantics();
+		let resolutions = 0;
+		const store = new PatternAwareStore(settings(), undefined, { ...semantics,
+			actionKey: (...args) => { resolutions++; return semantics.actionKey(...args); },
+		});
 		for (const [id, bindings] of [
 			["default-implicit", constantBindings({ path: "src/index.ts" })],
 			["default-offset-explicit", constantBindings({ path: "src/index.ts", offset: 1 })],
 			["bounded-explicit", constantBindings({ path: "src/index.ts", offset: 1, limit: 2000 })],
 			["disjoint", constantBindings({ path: "src/index.ts", offset: 2200, limit: 10 })],
+			["unkeyable", constantBindings({ path: "../outside.ts" })],
 		] as const) {
 			acceptPattern(store, { "0": 10 }, { id, bindings });
 		}
@@ -1244,12 +1140,13 @@ describe("PatternAware", () => {
 		store.observe(input({ sessionID: "dedupe", tool: "grep", input: { pattern: "symbol" } }));
 		const reads = store.predict("dedupe").filter((candidate) => candidate.tool === "read");
 
-		expect(reads).toHaveLength(3);
+		expect(reads).toHaveLength(4);
 		expect(reads.map((candidate) => candidate.input)).toEqual(
 			expect.arrayContaining([
 				{ path: "src/index.ts" },
 				{ path: "src/index.ts", offset: 1, limit: 2000 },
 				{ path: "src/index.ts", offset: 2200, limit: 10 },
+				{ path: "../outside.ts" },
 			]),
 		);
 		expect(
@@ -1258,6 +1155,9 @@ describe("PatternAware", () => {
 		expect(reads.find((candidate) => candidate.input.offset === undefined)?.supportingPatternIDs).toEqual(
 			expect.arrayContaining(["default-implicit", "default-offset-explicit"]),
 		);
+		const afterFirstPrediction = resolutions;
+		store.predict("dedupe");
+		expect(resolutions).toBe(afterFirstPrediction);
 	});
 
 	test("promotes canonical same-session actions beyond context only with authoritative, schema-compatible support", () => {

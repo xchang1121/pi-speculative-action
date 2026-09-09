@@ -91,107 +91,59 @@ describe("speculative action common", () => {
 		expect(buildPiActionKey("edit", { path: "file", edits: [] }, "/workspace")).toBeUndefined();
 	});
 
-	it("namespaces K(a) by semantics, executor identity, and validated schema", () => {
-		const base = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { alpha: 1, beta: 2 },
-			schemaHash: "schema-a",
-		});
-		const reordered = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { beta: 2, alpha: 1 },
-			schemaHash: "schema-a",
-		});
-		const nextSemantics = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { alpha: 1, beta: 2 },
-			schemaHash: "schema-a",
-			semanticsEpoch: "custom.v2",
-		});
-		const nextSchema = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { alpha: 1, beta: 2 },
-			schemaHash: "schema-b",
-		});
-		const implicitSchema = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { value: 1 },
-		});
-		const explicitEmptySchema = buildActionKey({
-			tool: "custom",
-			resources: ["resource"],
-			input: { value: 1 },
-			schemaHash: "",
-		});
-
-		expect(reordered.key).toBe(base.key);
-		expect(new Set([base.key, nextSemantics.key, nextSchema.key]).size).toBe(3);
-		expect(implicitSchema.key).toBe(explicitEmptySchema.key);
+	it("namespaces K(a) by semantics and schema while normalizing only equivalent inputs", () => {
+		const input = { tool: "custom", resources: ["resource"], input: { alpha: 1, beta: 2 }, schemaHash: "schema-a" };
+		const base = buildActionKey(input);
+		expect(buildActionKey({ ...input, input: { beta: 2, alpha: 1 } }).key).toBe(base.key);
+		expect(new Set([
+			base.key, buildActionKey({ ...input, semanticsEpoch: "custom.v2" }).key,
+			buildActionKey({ ...input, schemaHash: "schema-b" }).key,
+		]).size).toBe(3);
+		expect(buildActionKey({ ...input, schemaHash: undefined }).key).toBe(buildActionKey({ ...input, schemaHash: "" }).key);
 		expect(base.schemaHash).toBe("schema-a");
 	});
 
-	it("allows read projection only inside one schema namespace", () => {
-		const broad = buildPiActionKey("read", { path: "a.ts", offset: 1, limit: 100 }, "/workspace", "schema-a");
-		const compatible = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-a");
-		const changedSchema = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-b");
-		const grepBroad = buildPiActionKey("grep", { pattern: "TODO", limit: 100 }, "/workspace", "schema-a");
-		const grepNarrow = buildPiActionKey("grep", { pattern: "TODO", limit: 10 }, "/workspace", "schema-a");
-		const findBroad = buildPiActionKey("find", { pattern: "*.ts", limit: 100 }, "/workspace", "schema-a");
-		const findNarrow = buildPiActionKey("find", { pattern: "*.ts", limit: 10 }, "/workspace", "schema-a");
+	it("matches directed read coverage and classifies incompatible keys without exposing inputs", () => {
 		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
-
-		expect(broad && compatible ? actionKeyMatches(broad, compatible, projectors) : false).toBe(true);
-		expect(broad && changedSchema ? actionKeyMatches(broad, changedSchema, projectors) : true).toBe(false);
-		expect(broad && changedSchema ? actionKeyProjectionPartitions(broad, projectors) : []).not.toEqual(
-			changedSchema ? actionKeyProjectionPartitions(changedSchema, projectors) : [],
-		);
-		expect(grepBroad && grepNarrow ? actionKeyMatches(grepBroad, grepNarrow, projectors) : true).toBe(false);
-		expect(findBroad && findNarrow ? actionKeyMatches(findBroad, findNarrow, projectors) : true).toBe(false);
-	});
-
-	it("classifies K(a) mismatches without exposing action inputs", () => {
-		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
-		const broad = buildPiActionKey("read", { path: "a.ts", offset: 1, limit: 100 }, "/workspace", "schema-a");
-		const narrow = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-a");
-		const otherPath = buildPiActionKey(
-			"read",
-			{ path: "secret-name.ts", offset: 20, limit: 10 },
-			"/workspace",
-			"schema-a",
-		);
-		const otherSchema = buildPiActionKey("read", { path: "a.ts", offset: 20, limit: 10 }, "/workspace", "schema-b");
-		const otherTool = buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a");
-		const otherExecutor = buildActionKey({
-			tool: "read",
-			resources: narrow?.resources ?? [],
-			input: { ...(narrow?.input ?? {}) },
-			schemaHash: "schema-a",
-			semanticsEpoch: broad?.semanticsEpoch,
-			executionFingerprint: "other-executor",
-		});
-
-		expect(broad && narrow ? actionKeyMismatchReason(broad, narrow, projectors) : "missing").toBeUndefined();
-		expect(narrow ? actionKeyMismatchReason(narrow, narrow, projectors) : "missing").toBeUndefined();
-		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad, projectors) : "missing").toBe(
-			"projection_not_applicable",
-		);
-		expect(broad && narrow ? actionKeyMismatchReason(narrow, broad) : "missing").toBe("different_core");
-		expect(broad && otherPath ? actionKeyMismatchReason(broad, otherPath, projectors) : "missing").toBe(
-			"different_core",
-		);
-		expect(broad && otherSchema ? actionKeyMismatchReason(broad, otherSchema, projectors) : "missing").toBe(
-			"different_schema",
-		);
-		expect(broad ? actionKeyMismatchReason(otherExecutor, broad, projectors) : "missing").toBe("different_executor");
-		expect(broad && otherTool ? actionKeyMismatchReason(otherTool, broad, projectors) : "missing").toBe(
-			"different_tool",
-		);
-		expect(JSON.stringify(actionKeyMismatchReason(broad!, otherPath!, projectors))).not.toContain("secret-name");
+		const read = (input: Record<string, unknown>, schema = "schema-a") =>
+			buildPiActionKey("read", { path: "src/runtime.ts", ...input }, "/workspace", schema)!;
+		const broad = read({ offset: 100, limit: 160 }), narrow = read({ offset: 220, limit: 30 });
+		for (const [input, matches, covers] of [
+			[{ offset: 220, limit: 30 }, true, true],
+			[{ offset: 250, limit: 30 }, true, false],
+			[{ offset: 261, limit: 1 }, false, false],
+			[{ offset: 80, limit: 30 }, false, false],
+		] as const) {
+			const actor = read(input);
+			expect(actionKeyMatches(broad, actor, projectors)).toBe(matches);
+			expect(actionKeyCovers(broad, actor, projectors)).toBe(covers);
+		}
+		expect(actionKeyMatches(broad, narrow)).toBe(false);
+		expect(actionKeyMatches(narrow, narrow)).toBe(true);
+		expect(actionKeyMatch(broad, narrow, projectors)).toEqual({ kind: "projected", projector: "read.range", distance: 130 });
+		expect(actionKeyMismatchReason(broad, narrow, projectors)).toBeUndefined();
+		expect(actionKeyMismatchReason(narrow, narrow, projectors)).toBeUndefined();
+		expect(actionKeyMismatchReason(narrow, broad, projectors)).toBe("projection_not_applicable");
+		expect(actionKeyMismatchReason(narrow, broad)).toBe("different_core");
+		expect(actionKeyProjectionPartitions(broad, projectors)).toEqual(actionKeyProjectionPartitions(narrow, projectors));
+		const otherPath = read({ path: "secret-name.ts", offset: 220, limit: 30 });
+		const otherSchema = read(narrow.input, "schema-b");
+		const otherExecutor = buildActionKey({ tool: "read", resources: narrow.resources, input: narrow.input,
+			schemaHash: "schema-a", semanticsEpoch: broad.semanticsEpoch, executionFingerprint: "other-executor" });
+		for (const [key, reason] of [
+			[otherPath, "different_core"], [otherSchema, "different_schema"], [otherExecutor, "different_executor"],
+			[buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a")!, "different_tool"],
+		] as const) expect(actionKeyMismatchReason(broad, key, projectors)).toBe(reason);
+		expect(actionKeyMatches(broad, otherSchema, projectors)).toBe(false);
+		expect(actionKeyProjectionPartitions(broad, projectors)).not.toEqual(actionKeyProjectionPartitions(otherSchema, projectors));
+		expect(JSON.stringify(actionKeyMismatchReason(broad, otherPath, projectors))).not.toContain("secret-name");
+		for (const tool of ["grep", "find"]) {
+			const wide = buildPiActionKey(tool, { pattern: "TODO", limit: 100 }, "/workspace", "schema-a")!;
+			const short = buildPiActionKey(tool, { pattern: "TODO", limit: 10 }, "/workspace", "schema-a")!;
+			expect(actionKeyMatches(wide, short, projectors)).toBe(false);
+		}
+		expect(actionKeyMatches({ ...broad, key: "opaque" }, narrow, projectors)).toBe(true);
+		expect(actionKeyMatches({ ...broad, key: "opaque", input: { ...broad.input, path: "other.ts" } }, narrow, projectors)).toBe(false);
 	});
 
 	it("selects prediction tools independently from their execution route", () => {
@@ -299,59 +251,5 @@ describe("speculative action common", () => {
 		expect(actionKeyProjectionPartitions(speculative, [broken])).toEqual([]);
 	});
 
-	it("matches a potentially projectable read while rejecting impossible ranges", () => {
-		const speculative = buildPiActionKey("read", { path: "src/runtime.ts", offset: 100, limit: 160 }, "/workspace");
-		const contained = buildPiActionKey("read", { path: "src/runtime.ts", offset: 220, limit: 30 }, "/workspace");
-		const needsCompleteCoverage = buildPiActionKey(
-			"read",
-			{ path: "src/runtime.ts", offset: 250, limit: 30 },
-			"/workspace",
-		);
-		const startsAfterPlannedRange = buildPiActionKey(
-			"read",
-			{ path: "src/runtime.ts", offset: 261, limit: 1 },
-			"/workspace",
-		);
-		const uncovered = buildPiActionKey("read", { path: "src/runtime.ts", offset: 80, limit: 30 }, "/workspace");
 
-		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
-		expect(speculative && contained ? actionKeyMatches(speculative, contained) : true).toBe(false);
-		expect(contained ? actionKeyMatches(contained, contained) : false).toBe(true);
-		expect(speculative && contained ? actionKeyMatches(speculative, contained, projectors) : false).toBe(true);
-		expect(speculative && contained ? actionKeyCovers(speculative, contained, projectors) : false).toBe(true);
-		expect(
-			speculative && needsCompleteCoverage
-				? actionKeyMatches(speculative, needsCompleteCoverage, projectors)
-				: false,
-		).toBe(true);
-		expect(
-			speculative && needsCompleteCoverage ? actionKeyCovers(speculative, needsCompleteCoverage, projectors) : true,
-		).toBe(false);
-		expect(
-			speculative && startsAfterPlannedRange
-				? actionKeyMatches(speculative, startsAfterPlannedRange, projectors)
-				: true,
-		).toBe(false);
-		expect(speculative && uncovered ? actionKeyMatches(speculative, uncovered, projectors) : true).toBe(false);
-		expect(speculative && contained ? actionKeyMatch(speculative, contained, projectors) : undefined).toEqual({
-			kind: "projected",
-			projector: "read.range",
-			distance: 130,
-		});
-		expect(speculative && contained ? actionKeyProjectionPartitions(speculative, projectors) : undefined).toEqual(
-			contained ? actionKeyProjectionPartitions(contained, projectors) : undefined,
-		);
-		expect(
-			speculative && contained ? actionKeyMatches({ ...speculative, key: "opaque" }, contained, projectors) : false,
-		).toBe(true);
-		expect(
-			speculative && contained
-				? actionKeyMatches(
-						{ ...speculative, key: "opaque", input: { ...speculative.input, path: "other.ts" } },
-						contained,
-						projectors,
-					)
-				: true,
-		).toBe(false);
-	});
 });

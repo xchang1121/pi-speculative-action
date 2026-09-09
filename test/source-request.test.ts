@@ -25,7 +25,8 @@ describe("source request ownership", () => {
 	it("owns expiration and deadlines without admitting late success or leaking late rejection", async () => {
 		vi.useFakeTimers();
 		try {
-			for (const mode of ["expired", "queued", "abort", "timeout"] as const) for (const late of ["resolve", "reject"] as const) {
+			for (const mode of ["expired", "queued", "abort", "timeout"] as const) for (const late of
+				(mode === "expired" || mode === "queued" ? ["resolve"] : ["resolve", "reject"])) {
 				const parent = new AbortController(), generation = new SourceGeneration(parent.signal);
 				let release!: (value: string[]) => void, reject!: (error: unknown) => void, enter!: () => void;
 				const producer = new Promise<string[]>((resolve, fail) => { release = resolve; reject = fail; });

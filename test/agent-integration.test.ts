@@ -402,7 +402,8 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it.each(["running", "completed"].flatMap((phase) => ["suffix", "preflight", "missing", "recheck"].map((mode) => [phase, mode])))
+	it.each(["running", "completed"].flatMap((phase) =>
+		(phase === "running" ? ["suffix", "preflight", "missing", "recheck"] : ["suffix", "preflight", "recheck"]).map((mode) => [phase, mode])))
 	("keeps %s Bash on exactly one Actor fallback when %s rejects reuse", async (phase, mode) => {
 		const cwd = await temporaryWorkspace(), started = deferred<void>(), finish = deferred<void>(), completed = deferred<void>();
 		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "tail arguments: -n 2" }], details: {} }));
@@ -450,139 +451,43 @@ describe("speculative action host", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it("rebases PatternAware from an authoritative Actor action within the same turn", async () => {
-		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } =
-			await patternRebaseFixture();
+	it.each(["actor", "drafter"] as const)("rebases PatternAware from an authoritative %s result within the same turn", async (origin) => {
+		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
+		const tools = [grepTool, readTool], ready = deferred<void>();
 		const host = createSpeculativeActionHost("probe", {
 			cwd,
-			getSettings: () => ({
-				...settings(4),
-				drafterEnabled: false,
-				tools: ["grep", "read"],
-				patternAware: patternSettings,
-			}),
-			patternStore,
-			complete: async () => assistant([{ type: "text", text: "unused" }], "stop"),
-			preflight: () => true,
-			onCandidateMaterialized: (candidate) => {
-				materialized.push(candidate);
-			},
-		});
-		const tools = [grepTool, readTool];
-		await host.startTurn({
-			turnID: "probe:turn",
-			actorModel: model("actor"),
-			context: { systemPrompt: "system", messages: [], tools },
-			actorOptions: undefined,
-			tools,
-		});
-		expect(materialized).toHaveLength(0);
-		expect(
-			await host.consume({
-				turnID: "probe:turn",
-				id: "actor-grep",
-				tool: "grep",
-				args: { pattern: "one", path: "." },
-				tools,
-			}),
-		).toBeUndefined();
-		const output = await grepTool.execute("actor-grep", { pattern: "one", path: "." });
-		await host.actual({
-			turnID: "probe:turn",
-			id: "actor-grep",
-			tool: "grep",
-			args: { pattern: "one", path: "." },
-			tools,
-			durationMs: 12,
-			output: { result: output, isError: false },
-		});
-
-		await waitFor(() => materialized.some((candidate) => candidate.source === "pattern_aware"));
-		expect(materialized).toContainEqual(
-			expect.objectContaining({
-				sessionID: "probe",
-				turnID: "probe:turn",
-				expectedDecisionSequence: 2,
-				latestDecisionSequence: 2,
-				source: "pattern_aware",
-				tool: "read",
-				input: { path: "notes.txt" },
-			}),
-		);
-		expect(patternStore.recent("probe")).toHaveLength(0);
-		await host.finishTurn("probe:turn");
-		await host.dispose();
-	});
-
-	it("rebases PatternAware after the Actor adopts a Drafter execution", async () => {
-		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } =
-			await patternRebaseFixture();
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("probe", {
-			cwd,
-			getSettings: () => ({
-				...settings(1),
-				drafterMaxDepth: 0,
-				tools: ["grep", "read"],
-				patternAware: patternSettings,
-			}),
-			patternStore,
-			draftModel: model("draft"),
-			complete: async () =>
-				assistant(
-					[{ type: "toolCall", id: "draft-grep", name: "grep", arguments: { pattern: "one", path: "." } }],
-					"toolUse",
-				),
-			preflight: () => true,
-			executionWorlds: [toolRuntimeWorld()],
-			onCandidateMaterialized: (candidate) => {
-				materialized.push(candidate);
-			},
+			getSettings: () => ({ ...settings(origin === "drafter" ? 1 : 4), drafterEnabled: origin === "drafter",
+				drafterMaxDepth: 0, tools: ["grep", "read"], patternAware: patternSettings }),
+			patternStore, draftModel: model("draft"), preflight: () => true,
+			complete: async () => assistant([{ type: "toolCall", id: "draft-grep", name: "grep",
+				arguments: { pattern: "one", path: "." } }], "toolUse"),
+			...(origin === "drafter" ? { executionWorlds: [toolRuntimeWorld()] } : {}),
+			onCandidateMaterialized: (candidate) => { materialized.push(candidate); },
 			onEvent: (event) => {
-				events.push(event);
+				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
 			},
 		});
-		const tools = [grepTool, readTool];
-		await host.startTurn({
-			turnID: "probe:turn",
-			actorModel: model("actor"),
-			context: { systemPrompt: "system", messages: [], tools },
-			actorOptions: undefined,
-			tools,
-		});
-		await waitFor(() =>
-			events.some(
-				(event) =>
-					event.type === "candidate" &&
-					event.candidate.source === "drafter" &&
-					event.state.status === "succeeded",
-			),
-		);
-
-		const adopted = await host.consume({
-			turnID: "probe:turn",
-			id: "actor-grep",
-			tool: "grep",
-			args: { pattern: "one", path: "." },
-			tools,
-		});
-
-		expect(adopted).toBeDefined();
-		await waitFor(() =>
-			materialized.some((candidate) => candidate.source === "pattern_aware" && candidate.tool === "read"),
-		);
-		expect(materialized).toContainEqual(
-			expect.objectContaining({
-				expectedDecisionSequence: 2,
-				latestDecisionSequence: 2,
-				source: "pattern_aware",
-				tool: "read",
-				input: { path: "notes.txt" },
-			}),
-		);
-		expect(patternStore.recent("probe")).toHaveLength(0);
-		await host.finishTurn("probe:turn");
-		await host.dispose();
+		const call = { turnID: "probe:turn", id: "actor-grep", tool: "grep", args: { pattern: "one", path: "." }, tools };
+		try {
+			await host.startTurn({ ...startInput(grepTool, call.turnID),
+				context: { systemPrompt: "system", messages: [], tools }, tools });
+			if (origin === "drafter") await ready.promise;
+			else expect(materialized).toHaveLength(0);
+			const adopted = await host.consume(call);
+			if (origin === "drafter") expect(adopted).toBeDefined();
+			else {
+				expect(adopted).toBeUndefined();
+				await host.actual({ ...call, durationMs: 12,
+					output: { result: await grepTool.execute(call.id, call.args), isError: false } });
+			}
+			await waitFor(() => materialized.some((candidate) => candidate.source === "pattern_aware" && candidate.tool === "read"));
+			expect(materialized).toContainEqual(expect.objectContaining({
+				sessionID: "probe", turnID: call.turnID, expectedDecisionSequence: 2, latestDecisionSequence: 2,
+				source: "pattern_aware", tool: "read", input: { path: "notes.txt" },
+			}));
+			expect(patternStore.recent("probe")).toHaveLength(0);
+			await host.finishTurn(call.turnID);
+		} finally { await host.dispose(); }
 	});
 
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {

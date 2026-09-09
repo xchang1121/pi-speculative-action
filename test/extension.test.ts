@@ -39,26 +39,12 @@ afterEach(async () => {
 });
 
 describe("zero-modification Pi extension", () => {
-	it("registers stock-shaped overrides and returns a speculative hit without executing the base tool", async () => {
-		const fixture = await createFixture({
-			consume: async () => ({ result: textResult("cached"), isError: false }),
-		});
+	it("registers stock overrides, previews the stream without claiming it, then adopts once", async () => {
+		const fixture = await createFixture({ consume: async () => ({ result: textResult("cached"), isError: false }) });
 		await fixture.emit("session_start", {}, fixture.context);
-
 		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-		const read = fixture.tools.get("read");
+		const read = fixture.tools.get("read")!;
 		expect(read).toMatchObject({ name: "read", label: "read" });
-		await fixture.emit("context", { messages: [] }, fixture.context);
-		const result = await read?.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
-
-		expect(result?.content).toEqual([{ type: "text", text: "cached" }]);
-		expect(fixture.host.consume).toHaveBeenCalledOnce();
-		expect(fixture.host.actual).not.toHaveBeenCalled();
-	});
-
-	it("previews the streamed tool before its complete call without claiming either", async () => {
-		const fixture = await createFixture();
-		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.emit("context", { messages: [] }, fixture.context);
 		const partial = {
 			content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }],
@@ -105,6 +91,10 @@ describe("zero-modification Pi extension", () => {
 			undefined,
 		);
 		expect(fixture.host.consume).not.toHaveBeenCalled();
+		const result = await read.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
+		expect(result.content).toEqual([{ type: "text", text: "cached" }]);
+		expect(fixture.host.consume).toHaveBeenCalledOnce();
+		expect(fixture.host.actual).not.toHaveBeenCalled();
 	});
 
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {

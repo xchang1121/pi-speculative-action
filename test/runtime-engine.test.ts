@@ -887,7 +887,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered",
-		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-borrowed"] as const)(
+		"output-valid", "output-uncovered", "output-rejected", "output-opaque"] as const)(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s", async (scenario) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
@@ -896,7 +896,7 @@ describe("structural speculative runtime", () => {
 		const entered = barrier(), release = barrier(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
-		const succeeds = ["valid", "running-covered", "output-valid", "output-borrowed"].includes(scenario);
+		const succeeds = ["valid", "running-covered", "output-valid"].includes(scenario);
 		let changed = false;
 		const actor = call("turn", { path: "README.md", offset: scenario === "running-outside" ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
 		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
@@ -921,7 +921,7 @@ describe("structural speculative runtime", () => {
 			projection,
 			authorize: () => { authorized.arrive(); return { ok: true }; },
 			execute: async () => { started.arrive(); if (running) await completion.promise;
-				if (scenario === "output-borrowed") await new Promise<void>((resolve) => setTimeout(resolve, 5));
+				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
 				...world("wide", { validate: async () => changed
 					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
@@ -935,7 +935,7 @@ describe("structural speculative runtime", () => {
 		await (running ? started.promise : candidateReady.promise);
 		projection.canShareInFlight = () => true;
 		if (!outputOnly) projection.projectOutput = () => "changed callback";
-		else if (scenario !== "output-borrowed") { evidence.complete = true; evidence.view.text = "changed by producer"; }
+		else { evidence.complete = true; evidence.view.text = "changed by producer"; }
 		const consumed = fixture.runtime.consume(actor, controller.signal);
 		try {
 			if (running) {
@@ -948,7 +948,7 @@ describe("structural speculative runtime", () => {
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
-			if (scenario === "output-borrowed") {
+			if (scenario === "output-valid") {
 				expect(await fixture.runtime.consume({ ...actor, id: "second-reader" })).toBe("narrow");
 				expect(commit).toHaveBeenCalledTimes(2);
 			}

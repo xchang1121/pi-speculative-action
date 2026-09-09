@@ -68,37 +68,4 @@ describe("actor fork plan source", () => {
 		expect(source.probeSignal("turn-finished")?.aborted).toBe(true);
 	});
 
-	it("preserves complete call batches and their evidence", async () => {
-		const source = createActorForkPlanSource();
-		source.startTurn("turn-batch");
-		const delivered = source.waitForBatches("turn-batch", new AbortController().signal);
-		source.publish("turn-batch", [
-			{
-				id: "fork:v1:batch",
-				calls: [
-					{ id: "0:fork", index: 0, callID: "call-a", format: "structured", tool: "read", input: { path: "a.txt" } },
-					{ id: "1:fork", index: 1, tool: "read", input: { path: "b.txt" } },
-				],
-				evidence: [
-					{
-						candidateIDs: ["candidate-a"],
-						sources: ["self-speculation"],
-						provenance: [{ proposalID: "proposal", actionID: "action" }],
-						actionIdentities: [],
-						draftTokenCount: 12,
-						confidence: 0.95,
-						score: { joint_speculation_probability: 0.7 },
-						fork: { total_ms: 25 },
-					},
-				],
-			},
-		]);
-
-		expect(await delivered).toMatchObject([
-			{
-				calls: [{ callID: "call-a", input: { path: "a.txt" } }, { input: { path: "b.txt" } }],
-				evidence: [{ confidence: 0.95, fork: { total_ms: 25 } }],
-			},
-		]);
-	});
 });

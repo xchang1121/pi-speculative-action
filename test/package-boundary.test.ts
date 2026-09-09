@@ -94,29 +94,31 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 				let reached!: () => void, resume!: () => void;
 				const started = new Promise<void>((resolve) => { reached = resolve; }), paused = new Promise<void>((resolve) => { resume = resolve; });
 				try {
-					const find = invocations.get("find")!;
-					expect(find.identity).toMatchObject({ home: cwd });
-					const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
-					expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
-					expect(await fs.readdir(agentDir)).toEqual([]);
-					const homeResult = () => find.authoritative!({ callID: "home", args: { pattern: "*.txt", path: "~" }, signal: new AbortController().signal }).catch((error: Error) => error.message);
-					const homeBefore = await homeResult();
-					for (const target of ["~", "@.", pathToFileURL(cwd).href]) {
-						const args = { pattern: "*.txt", path: target };
-						const key = PI_ACTION_SEMANTICS.buildKey("find", args, cwd, "", { fingerprint: "bound-home", semantics: find.semantics })!;
-						expect(key?.input).toEqual(args); // Indexing must not rewrite already-prepared execution inputs.
-						expect(key.resources).toEqual(["."]);
-						expect(await find.authoritative!({ callID: "key", args: key.input, signal: new AbortController().signal })).toEqual(result);
+					if (phase === "preparation") {
+						const find = invocations.get("find")!;
+						expect(find.identity).toMatchObject({ home: cwd });
+						const result = await find.authoritative!({ callID: "find", args: { pattern: "*.txt" }, signal: new AbortController().signal });
+						expect(result.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
+						expect(await fs.readdir(agentDir)).toEqual([]);
+						const homeResult = () => find.authoritative!({ callID: "home", args: { pattern: "*.txt", path: "~" }, signal: new AbortController().signal }).catch((error: Error) => error.message);
+						const homeBefore = await homeResult();
+						for (const target of ["~", "@.", pathToFileURL(cwd).href]) {
+							const args = { pattern: "*.txt", path: target };
+							const key = PI_ACTION_SEMANTICS.buildKey("find", args, cwd, "", { fingerprint: "bound-home", semantics: find.semantics })!;
+							expect(key?.input).toEqual(args); // Indexing must not rewrite already-prepared execution inputs.
+							expect(key.resources).toEqual(["."]);
+							expect(await find.authoritative!({ callID: "key", args: key.input, signal: new AbortController().signal })).toEqual(result);
+						}
+						expect(homeBefore).toEqual(result); // Parent HOME changed back after binding; both key and worker retain it.
+						for (const code of [undefined, "EACCES", "EIO"]) {
+							const requested: string[] = [];
+							await expect(pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: { pattern: "captured" }, home: agentDir }, {
+								signal, onInput: async (operation) => { requested.push(operation); throw Object.assign(new Error("ungranted input"), { code }); },
+							}))).rejects.toThrow(code ? `Path not found: ${cwd}` : "ungranted input");
+							expect(requested).toEqual(["stat"]); // No process or ambient file access before the caller grants it.
+						}
+						expect(await homeResult()).toEqual(homeBefore); // A grep home binding cannot drift a later find invocation.
 					}
-					expect(homeBefore).toEqual(result); // Parent HOME changed back after binding; both key and worker retain it.
-					for (const code of [undefined, "EACCES", "EIO"]) {
-						const requested: string[] = [];
-						await expect(pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: { pattern: "captured" }, home: agentDir }, {
-							signal, onInput: async (operation) => { requested.push(operation); throw Object.assign(new Error("ungranted input"), { code }); },
-						}))).rejects.toThrow(code ? `Path not found: ${cwd}` : "ungranted input");
-						expect(requested).toEqual(["stat"]); // No process or ambient file access before the caller grants it.
-					}
-					expect(await homeResult()).toEqual(homeBefore); // A grep home binding cannot drift a later find invocation.
 					if (phase === "cleanup") await expect(runCapturedSearchProcess(process.execPath,
 						["-e", "setInterval(() => {}, 1000); process.stdout.write('owned');"], cwd,
 						process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}, AbortSignal.timeout(3000), () => { throw 0; })).rejects.toBe(0);

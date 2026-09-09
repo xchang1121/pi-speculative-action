@@ -221,32 +221,15 @@ describe("ExecutionWorldRouter", () => {
 			.toBe("ready");
 	});
 
-	it.each([
-		["Windows", "Linux host required"],
-		["macOS", "Linux host required"],
-		["WSL 1", "required namespace unavailable"],
-	] as const)("routes portable tools but blocks Bash on %s", (_platform, processDetail) => {
-		const status = toolStatuses(platformWorlds("unavailable", processDetail));
-		expect(status).toEqual({
+	it.each(["unavailable", "ready"] as const)("keeps portable routes independent of process capability=%s", (state) => {
+		expect(toolStatuses(platformWorlds(state, "process capability"))).toEqual({
 			read: "ready",
 			grep: "unavailable",
 			find: "unavailable",
 			ls: "ready",
 			write: "registered",
 			edit: "registered",
-			bash: "unavailable",
-		});
-	});
-
-	it.each(["Linux", "WSL 2"])("routes Bash when the Linux process world is ready on %s", () => {
-		expect(toolStatuses(platformWorlds("ready", "process isolation ready"))).toEqual({
-			read: "ready",
-			grep: "unavailable",
-			find: "unavailable",
-			ls: "ready",
-			write: "registered",
-			edit: "registered",
-			bash: "ready",
+			bash: state,
 		});
 	});
 

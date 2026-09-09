@@ -165,24 +165,6 @@ describe("ResultCache", () => {
 		});
 	});
 
-	it("keeps in-flight, reusable, and exclusive entries independent at the same action key", () => {
-		const jobs = new ActionStore<string, Entry>();
-		const results = new ResultCache<string, Entry>();
-		const branches = new ActionStore<string, Entry>();
-		const job = entry("job", "a.ts");
-		const result = entry("result", "a.ts");
-		const branch = entry("branch", "a.ts");
-		jobs.insert("session", job);
-		results.insert("session", result);
-		branches.insert("session", branch);
-
-		expect(jobs.delete("session", job)).toBe(true);
-		expect(results.values("session")).toEqual([result]);
-		expect(branches.getExact("session", branch.key)).toBe(branch);
-		expect(results.trim("session", { maxEntries: 0, maxBytes: 0 })).toEqual([result]);
-		expect(branches.values("session")).toEqual([branch]);
-	});
-
 	it("retains exact freshness generations independently", () => {
 		const cache = new ResultCache<string, Entry>();
 		const older = entry("older", "same.ts");

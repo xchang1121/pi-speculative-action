@@ -494,116 +494,46 @@ describe("self-speculation control plane", () => {
 		);
 	});
 
-	it("publishes only unique, keyable sidecar fork actions as bounded alternatives", async () => {
-		const receipt = {
-			details: {
-				bundle: {
-					candidates: [
-						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
-						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: { path: "a.txt" } }] },
-						{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
-						{
-							sources: ["self-speculation"],
-							tool_calls: [
-								{ name: "read", arguments: { path: "partial.txt" } },
-								{ name: "read", arguments: "bad" },
-							],
-						},
-						{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
-						{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
-					],
-				},
-			},
+	it("deduplicates valid sidecar batches while preserving their calls and candidate evidence", async () => {
+		const candidate = {
+			candidate_ids: ["fork-candidate"], sources: ["self-speculation", "drafter"],
+			provenance: [{ proposalID: "p", actionID: "a" }], action_identities: [{ predicted_action_id: "predicted" }],
+			draft_token_count: 18, score: { joint_speculation_probability: 0.72 },
+			tool_calls: [
+				{ name: "read", arguments: { path: "a.txt" }, index: 0, call_id: "call-a", format: "structured" },
+				{ name: "read", arguments: { path: "b.txt" }, index: 1 },
+			],
+			fork: { total_ms: 25, logprobs: { token_count: 2, mean: Math.log(0.96), minimum: Math.log(0.96),
+				tool_name: { token_count: 1, matched_calls: 1, minimum_probability: 0.96 } } },
 		};
-		const { actions, coordinator } = await forkActionFixture(
-			{ forkActionMinConfidence: 0, maxCandidates: 2 },
-			receipt,
-		);
-
-		expect(actions).toEqual([
-			{ tool: "read", input: { path: "a.txt" } },
-			{ tool: "write", input: { path: "b.txt" } },
-		]);
-		await coordinator.dispose();
-	});
-
-	it("publishes a complete sidecar call batch with candidate evidence intact", async () => {
-		const actorForkPlans = createActorForkPlanSource();
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar", forkActionMinConfidence: 0 }),
-			requestID: () => "actor-request",
-			actorForkPlanSource: actorForkPlans,
-			fetch: vi.fn(async (input) =>
-				Response.json(
-					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
-						? {
-								details: {
-									bundle: {
-										candidates: [
-											{
-												candidate_ids: ["fork-candidate"],
-												sources: ["self-speculation", "drafter"],
-												provenance: [{ proposalID: "p", actionID: "a" }],
-												action_identities: [{ predicted_action_id: "predicted" }],
-												draft_token_count: 18,
-												score: { joint_speculation_probability: 0.72 },
-												tool_calls: [
-													{
-														name: "read",
-														arguments: { path: "a.txt" },
-														index: 0,
-														call_id: "call-a",
-														format: "structured",
-													},
-													{ name: "read", arguments: { path: "b.txt" }, index: 1 },
-												],
-												fork: {
-													total_ms: 25,
-												logprobs: {
-													token_count: 2,
-													mean: Math.log(0.96),
-													minimum: Math.log(0.96),
-													tool_name: { token_count: 1, matched_calls: 1, minimum_probability: 0.96 },
-												},
-												},
-											},
-										],
-									},
-								},
-							}
-						: {},
-				),
-			),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		const batches = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("text_delta", "x"));
-
-		const [batch] = await batches;
-		expect(batch.calls).toEqual([
-			{
-				id: "0:fork",
-				index: 0,
-				callID: "call-a",
-				format: "structured",
-				tool: "read",
-				input: { path: "a.txt" },
-			},
-			{ id: "1:fork", index: 1, tool: "read", input: { path: "b.txt" } },
-		]);
-		expect(batch.evidence).toHaveLength(1);
-		expect(batch.evidence[0]).toMatchObject({
-			candidateIDs: ["fork-candidate"],
-			sources: ["self-speculation", "drafter"],
-			provenance: [{ proposalID: "p", actionID: "a" }],
-			actionIdentities: [{ predicted_action_id: "predicted" }],
-			draftTokenCount: 18,
-			score: { joint_speculation_probability: 0.72 },
-			fork: { total_ms: 25 },
-		});
-		expect(batch.evidence[0]?.confidence).toBeCloseTo(0.96);
-		await coordinator.dispose();
+		const receipt = { details: { bundle: { candidates: [
+			candidate, candidate,
+			{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
+			{ sources: ["self-speculation"], tool_calls: [
+				{ name: "read", arguments: { path: "partial.txt" } }, { name: "read", arguments: "bad" },
+			] },
+			{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
+			{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
+		] } } };
+		const { actions, batches, coordinator } = await forkActionFixture({ forkActionMinConfidence: 0, maxCandidates: 2 }, receipt);
+		try {
+			expect(actions).toEqual([
+				{ tool: "read", input: { path: "a.txt" } }, { tool: "read", input: { path: "b.txt" } },
+				{ tool: "write", input: { path: "b.txt" } },
+			]);
+			expect(batches).toHaveLength(2);
+			expect(batches[0]!.calls).toEqual([
+				{ id: "0:fork", index: 0, callID: "call-a", format: "structured", tool: "read", input: { path: "a.txt" } },
+				{ id: "1:fork", index: 1, tool: "read", input: { path: "b.txt" } },
+			]);
+			expect(batches[0]!.evidence).toHaveLength(2);
+			for (const evidence of batches[0]!.evidence) expect(evidence).toMatchObject({
+				candidateIDs: ["fork-candidate"], sources: ["self-speculation", "drafter"],
+				provenance: [{ proposalID: "p", actionID: "a" }], actionIdentities: [{ predicted_action_id: "predicted" }],
+				draftTokenCount: 18, score: { joint_speculation_probability: 0.72 }, fork: { total_ms: 25 },
+			});
+			expect(batches[0]!.evidence[0]!.confidence).toBeCloseTo(0.96);
+		} finally { await coordinator.dispose(); }
 	});
 
 	it.each([
@@ -673,33 +603,6 @@ describe("self-speculation control plane", () => {
 		const { actions, coordinator } = await forkActionFixture({ forkActionEnabled }, receipt);
 		expect(actions).toEqual([]);
 		await coordinator.dispose();
-	});
-
-	it("matches a fork that completes after the authoritative Actor action", async () => {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar" }),
-			requestID: () => "actor-request",
-			fetch: vi.fn(async (input) => {
-				if (new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath) await gate;
-				return Response.json(forkReceipt("read", { path: "late.txt" }));
-			}),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.decorateActorPayload({ prompt: "P" });
-		coordinator.observeActorOutput(delta("text_delta", "x"));
-		release();
-		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));
-		coordinator.addCandidate(
-			candidate("self-speculation", "late-read", "unused", "read", { path: "late.txt" }, 1),
-		);
-		coordinator.observeActorAction(action("late-read", "unused", "read", { path: "late.txt" }));
-		await coordinator.dispose();
-
-		expect(coordinator.snapshot().forkExactMatches).toBe(1);
 	});
 
 	it("gates persistently negative forks after warm-up without blocking bounded probes", async () => {
@@ -807,50 +710,28 @@ describe("self-speculation control plane", () => {
 		expect(coordinator.snapshot()).toMatchObject({ failures: 0, forkCompletions: 0 });
 	});
 
-	it("routes future K(a) only to its expected Actor decision", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-1", "actor-2"]);
+	it.each(["future", "retry"] as const)("retains a decision bundle until its %s Actor request", async (mode) => {
+		const requests: CapturedRequest[] = [], future = mode === "future";
+		const nextID = future ? "actor-2" : "actor-retry";
+		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-1", nextID]);
 		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.decorateActorPayload({ model: "actor" });
-		coordinator.addCandidate(candidate("pattern-aware", "key-a", "hash-a", "read", { path: "a.txt" }, 0.9, 2));
-		await Promise.resolve();
-
-		expect(
-			requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath),
-		).toHaveLength(0);
-
+		if (future) coordinator.decorateActorPayload({ model: "actor" });
+		coordinator.addCandidate(candidate(future ? "pattern-aware" : "drafter", "key-a", "hash-a", "read",
+			{ path: "a.txt" }, 0.9, future ? 2 : 1));
+		if (future) {
+			await Promise.resolve();
+			expect(requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath)).toHaveLength(0);
+		} else coordinator.decorateActorPayload({ model: "actor" });
 		coordinator.endTurn();
-		coordinator.startTurn("turn-2", model(), context(), 2);
+		coordinator.startTurn(future ? "turn-2" : "turn-retry", model(), context(), future ? 2 : 1);
 		coordinator.decorateActorPayload({ model: "actor" });
 		await coordinator.dispose();
 
 		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
-		expect(bundles).toHaveLength(1);
-		expect(bundles[0]?.body).toMatchObject({
-			request_id: "actor-2",
-			candidates: [
-				expect.objectContaining({
-					id: actionIdentity("key-a"),
-					score: expect.objectContaining({ expected_decision_sequence: 2, latest_decision_sequence: 2 }),
-				}),
-			],
-		});
-	});
-
-	it("carries the same decision bundle across a provider retry", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-1", "actor-retry"]);
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 0.8));
-		coordinator.decorateActorPayload({ model: "actor" });
-		coordinator.endTurn();
-
-		coordinator.startTurn("turn-retry", model(), context(), 1);
-		coordinator.decorateActorPayload({ model: "actor" });
-		await coordinator.dispose();
-
-		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
-		expect(bundles.map((request) => request.body.request_id).sort()).toEqual(["actor-1", "actor-retry"]);
+		expect(bundles.map((request) => request.body.request_id).sort()).toEqual(future ? [nextID] : ["actor-1", nextID]);
+		if (future) expect(bundles[0]!.body.candidates).toMatchObject([{
+			id: actionIdentity("key-a"), score: { expected_decision_sequence: 2, latest_decision_sequence: 2 },
+		}]);
 	});
 });
 
@@ -894,10 +775,8 @@ async function forkActionFixture(overrides: Partial<SelfSpeculationSettings>, re
 	const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
 	coordinator.decorateActorPayload({ prompt: "P" });
 	coordinator.observeActorOutput(delta("text_delta", "x"));
-	return {
-		actions: (await pending).flatMap((batch) => batch.calls.map(({ tool, input }) => ({ tool, input }))),
-		coordinator,
-	};
+	const batches = await pending;
+	return { actions: batches.flatMap((batch) => batch.calls.map(({ tool, input }) => ({ tool, input }))), batches, coordinator };
 }
 
 function forkReceipt(

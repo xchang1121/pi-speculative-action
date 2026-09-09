@@ -202,6 +202,8 @@
 
 ### Changed
 
+- Consolidated redundant prediction, key/projection, routing and extension tests into existing fixtures.
+  Removed duplicate pseudo-platform and lifecycle cases; the suite is 493 lines and 17 entries smaller.
 - The existing Git process owner now binds private repository/index arguments once. Workspace and
   transaction capture share regular-blob decoding while retaining their separate byte limits;
   removed redundant sandbox fields and repeated option declarations without another forwarding layer.
