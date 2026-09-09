@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- `createExecPrototype` now returns an owned, validated canonical prototype, so invalid identity
+  fails at construction instead of the first key/seal call. stdin/FD records and nested plain data
+  are copied without freezing caller data; opaque nested values and non-string platform identities
+  are rejected. Only module-owned normalized prototypes skip recapture; v7 semantic keys are unchanged.
 - `ProcessReuseRequest` now requires `weakKey` instead of `prototype`. Derive it once with
   `processWeakKey(boundPrototype)` at the invocation boundary and reuse it for scheduler timing,
   handoff reservation and persistent/live lookup. A key locates candidates; it does not grant replay

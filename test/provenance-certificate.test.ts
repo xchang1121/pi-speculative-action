@@ -7,6 +7,7 @@ import {
 	createExecPrototype,
 	dependencyPathsetKey,
 	type DynamicDependency,
+	type OrderedEffectEvent,
 	parseProcessCertificate,
 	processStrongKey,
 	processWeakKey,
@@ -163,9 +164,25 @@ describe("process provenance certificates", () => {
 		expect(JSON.stringify(first)).not.toContain("--compile");
 		expect(first).not.toHaveProperty("argv");
 		expect(Object.isFrozen(first.environment)).toBe(true);
+		const stdin = Object.freeze({ type: "bytes" as const, digest: sha256Digest("input"), eof: true, metadata: { label: "stdin" } });
+		const fd = { fd: 3, type: "regular" as const, flagsDigest: sha256Digest("flags"), offset: 0, metadata: { label: "fd" } };
+		const argv = Buffer.from("tool\0--compile\0"), inheritedFDs = [fd];
+		const captured = createExecPrototype({ ...first, environment, argv, stdin, inheritedFDs });
+		expect([Object.isFrozen(fd), Object.isFrozen(stdin.metadata), Object.isFrozen(fd.metadata)]).toEqual([false, false, false]);
+		const key = processWeakKey(captured);
+		stdin.metadata.label = fd.metadata.label = "changed";
+		fd.offset = 99; inheritedFDs.length = 0; argv.fill(0);
+		expect(captured.stdin).toMatchObject({ metadata: { label: "stdin" } });
+		expect(captured.inheritedFDs).toMatchObject([{ offset: 0, metadata: { label: "fd" } }]);
+		expect(Object.isFrozen(Reflect.get(captured.stdin, "metadata"))).toBe(true);
+		expect(Object.isFrozen(Reflect.get(captured.inheritedFDs[0]!, "metadata"))).toBe(true);
+		expect(captured.argvDigest).toBe(sha256Digest("tool\0--compile\0"));
+		expect(processWeakKey(captured)).toBe(key);
+		expect(() => createExecPrototype({ ...first, environment: { "BAD=NAME": "value" }, argv })).toThrow("process prototype environment is incomplete");
 		for (const patch of [
 			{ environmentComplete: false }, { fileDescriptorTableComplete: false }, { umask: -1 },
 			{ executableDigest: "invalid" }, { environment: [...first.environment, first.environment[0]] },
+			{ platformFingerprint: { mutable: true } },
 			{ stdin: undefined }, { stdin: { type: "bytes", digest: "invalid", eof: true } },
 			{ inheritedFDs: [{ fd: 3, type: "regular", flagsDigest: "invalid" }] },
 		]) {
@@ -184,7 +201,7 @@ describe("process provenance certificates", () => {
 	] as const)("owns an exact dependency set independently of capture order (%s, %s)", (left, right, id) => {
 		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };
-		const semantic = prototype({ [right]: "second", [left]: "first", MODE: "build" });
+		let semantic!: ReturnType<typeof prototype>;
 		const seal = (dependencies: DynamicDependency[]) => sealProcessCertificate({
 			prototype: semantic, producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies, taints: [] },
@@ -192,7 +209,11 @@ describe("process provenance certificates", () => {
 		});
 		let first!: ReturnType<typeof seal>, frozenValues: unknown[] = [];
 		const freezing = vi.spyOn(Object, "freeze");
-		try { first = seal([a, b, a]); frozenValues = freezing.mock.calls.map(([value]) => value); } finally { freezing.mockRestore(); }
+		try {
+			semantic = prototype({ [right]: "second", [left]: "first", MODE: "build" });
+			processWeakKey(semantic);
+			first = seal([a, b, a]); frozenValues = freezing.mock.calls.map(([value]) => value);
+		} finally { freezing.mockRestore(); }
 		expect({
 			prototypeCopies: frozenValues.filter((value) => value && typeof value === "object" && "argvDigest" in value).length,
 			exclusionCopies: frozenValues.filter((value) => Array.isArray(value) && value[0] === ".git" && value[1] === ".pi").length,
@@ -201,9 +222,10 @@ describe("process provenance certificates", () => {
 		expect(first.id).toBe(id); // Golden v7 identities from the pre-refactor implementation.
 		expect(dependencyPathsetKey(first.dependencyCertificate)).toBe(dependencyPathsetKey(second.dependencyCertificate));
 		expect(first).toEqual(second);
+		expect(first.prototype).toBe(semantic);
 		expect(first.weakKey).toBe(processWeakKey(semantic));
 		expect(first.strongKey).toBe(processStrongKey(first.weakKey, { complete: true, dependencies: [b, a], taints: [] }));
-		expect(parseProcessCertificate(first)).toEqual(first);
+		expect(parseProcessCertificate(JSON.parse(JSON.stringify(first)))).toEqual(first);
 		expect(first.dependencyCertificate.dependencies).toEqual([a, b].map((dependency) => ({ ...dependency, parentExcludedEntries: [".git", ".pi"] })));
 		expect(a.parentExcludedEntries).toEqual([".pi", ".git", ".pi"]);
 		expect(first.dependencyCertificate.dependencies[0]).not.toBe(a);
@@ -311,83 +333,40 @@ describe("process provenance certificates", () => {
 		expect(key(absentWithParent)).not.toBe(key(absentWithoutParent));
 	});
 
-	it("rejects conflicting sizes for one content-addressed effect", () => {
-		const digest = sha256Digest("same digest");
-		expect(() =>
-			sealProcessCertificate({
-				prototype: prototype(),
-				producer: PRODUCER,
-				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-				result: {
-					replayProfile: "buffered_noninteractive",
-					journal: [
-						{ sequence: 0, kind: "output", fd: 1, data: { digest, size: 11 } },
-						{
-							sequence: 1,
-							kind: "workspace",
-							path: "/workspace/out",
-							before: { kind: "absent" },
-							after: { kind: "file", data: { digest, size: 12 }, mode: 0o644 },
-						},
-					],
-					exit: { kind: "code", code: 0 },
-				},
-			}),
-		).toThrow("conflicting effect artifact sizes");
-	});
-
-	it("seals exact typed directory state and rejects malformed topology effects", () => {
-		const entriesDigest = sha256Digest("empty directory");
-		const certificate = sealProcessCertificate({
+	it("seals typed effects and rejects malformed topology and conflicting artifact sizes", () => {
+		const seal = (journal: readonly OrderedEffectEvent[]) => sealProcessCertificate({
 			prototype: prototype(),
 			producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-			result: {
-				replayProfile: "buffered_noninteractive",
-				journal: [
-					{
-						sequence: 0,
-						kind: "workspace",
-						path: "/workspace/generated",
-						before: { kind: "absent" },
-						after: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
-					},
-					{
-						sequence: 1,
-						kind: "workspace",
-						path: "/workspace/obsolete",
-						before: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
-						after: { kind: "absent" },
-					},
-				],
-				exit: { kind: "code", code: 0 },
-			},
+			result: { replayProfile: "buffered_noninteractive", journal, exit: { kind: "code", code: 0 } },
 		});
+		const entriesDigest = sha256Digest("empty directory"), digest = sha256Digest("same digest");
+		const certificate = seal([
+			{
+				sequence: 0, kind: "workspace", path: "/workspace/generated", before: { kind: "absent" },
+				after: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 },
+			},
+			{
+				sequence: 1, kind: "workspace", path: "/workspace/obsolete",
+				before: { kind: "directory", entriesDigest, mode: 0o750, uid: 1000, gid: 1000 }, after: { kind: "absent" },
+			},
+		]);
 		expect(certificate.result.journal[0]).toMatchObject({
 			kind: "workspace",
 			after: { kind: "directory", entriesDigest, mode: 0o750 },
 		});
 
-		expect(() =>
-			sealProcessCertificate({
-				prototype: prototype(),
-				producer: PRODUCER,
-				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-				result: {
-					replayProfile: "buffered_noninteractive",
-					journal: [
-						{
-							sequence: 0,
-							kind: "workspace",
-							path: "/workspace/generated",
-							before: { kind: "absent" },
-							after: { kind: "directory", entriesDigest: "not-a-digest", mode: 0o750, uid: -1, gid: 1000 },
-						},
-					] as never,
-					exit: { kind: "code", code: 0 },
-				},
-			}),
-		).toThrow("invalid directory effect state");
+		expect(() => seal([{
+			sequence: 0, kind: "workspace", path: "/workspace/generated", before: { kind: "absent" },
+			after: { kind: "directory", entriesDigest: "not-a-digest", mode: 0o750, uid: -1, gid: 1000 },
+		}] as never)).toThrow("invalid directory effect state");
+		expect(() => seal([
+			{ sequence: 0, kind: "output", fd: 1, data: { digest, size: 11 } },
+			{
+				sequence: 1, kind: "workspace", path: "/workspace/out", before: { kind: "absent" },
+				after: { kind: "file", data: { digest, size: 12 }, mode: 0o644 },
+			},
+		])).toThrow("conflicting effect artifact sizes");
 	});
 });
 

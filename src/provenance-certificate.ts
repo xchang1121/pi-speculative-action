@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { stableEqual, stableStringify } from "./stable-json.ts";
+import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 
 export const PROCESS_CERTIFICATE_VERSION = 7 as const;
 export type Sha256Digest = `sha256:${string}`;
@@ -210,20 +210,15 @@ export interface ProcessPrototypeInput extends Omit<ExecPrototype, "argvDigest" 
 }
 
 export function createExecPrototype(input: ProcessPrototypeInput): ExecPrototype {
-	const argvBytes = input.argv instanceof Uint8Array ? input.argv : Buffer.from(stableStringify(input.argv), "utf8");
-	const { argv: _argv, environment: rawEnvironment, ...identity } = input;
-	const environment = Object.entries(rawEnvironment)
-		.map(([name, value]): SemanticEnvironmentEntry =>
+	const { argv, environment: rawEnvironment, ...identity } = input;
+	const argvDigest = sha256Digest(argv instanceof Uint8Array ? argv : Buffer.from(stableStringify(argv), "utf8"));
+	return normalizePrototype({
+		...identity, argvDigest, environmentComplete: true,
+		environment: Object.entries(rawEnvironment).map(([name, value]): SemanticEnvironmentEntry =>
 			value === undefined
 				? { name, present: false }
 				: { name, present: true, valueDigest: sha256Digest(Buffer.from(value, "utf8")) },
-		)
-		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-	return deepFreeze({
-		...identity,
-		argvDigest: sha256Digest(argvBytes),
-		environment,
-		environmentComplete: true as const,
+		),
 	});
 }
 
@@ -422,15 +417,19 @@ export function isSha256Digest(value: unknown): value is Sha256Digest {
 	return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
 }
 
+// Only this module's owned, validated records may skip capture, never arbitrary frozen inputs.
+const normalizedPrototypes = new WeakSet<ExecPrototype>();
+
 function normalizePrototype(input: ExecPrototype): ExecPrototype {
+	if (normalizedPrototypes.has(input)) return input;
 	const {
 		executablePath, executableDigest, argvDigest, logicalCwd, platformFingerprint, umask, processContextDigest,
 		environmentComplete, fileDescriptorTableComplete, environment: rawEnvironment, inheritedFDs: rawDescriptors, stdin: rawStdin,
 	} = input;
-	const stdin = { ...rawStdin };
+	const stdin = cloneSharedData({ ...rawStdin });
 	if (!environmentComplete) throw new Error("process prototype requires a complete environment");
 	if (!fileDescriptorTableComplete) throw new Error("process prototype requires a complete descriptor table");
-	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || !platformFingerprint) {
+	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || typeof platformFingerprint !== "string" || !platformFingerprint) {
 		throw new Error("process prototype identity is incomplete");
 	}
 	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) {
@@ -455,7 +454,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	const descriptors = new Set<number>();
 	const inheritedFDs = [...rawDescriptors]
 		.map((source) => {
-			const fd = { ...source };
+			const fd = cloneSharedData({ ...source });
 			if (!Number.isSafeInteger(fd.fd) || fd.fd < 0 || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
 				throw new Error("process prototype descriptor table is invalid");
 			}
@@ -473,7 +472,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	) {
 		throw new Error("process stdin identity is invalid");
 	}
-	return deepFreeze({
+	const prototype: ExecPrototype = deepFreeze({
 		executablePath,
 		executableDigest,
 		argvDigest,
@@ -487,6 +486,8 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		inheritedFDs,
 		platformFingerprint,
 	});
+	normalizedPrototypes.add(prototype);
+	return prototype;
 }
 
 function normalizeProducerProof(proof: ProcessProducerProof): ProcessProducerProof {

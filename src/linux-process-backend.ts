@@ -399,11 +399,13 @@ export class LinuxProcessReuseBackend {
 					if (!invocation) return this.actorReplayMiss(host, request);
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
-					const prototype = await actorTopLevelPrototype(
+					const platformFingerprint = await this.resolvePlatformFingerprint();
+					const prototype = await topLevelProcessPrototype(
 						invocation,
 						request,
+						definedProcessEnvironment(request.environment),
 						projection,
-						await this.resolvePlatformFingerprint(),
+						platformFingerprint,
 					);
 					const weakKey = processWeakKey(prototype);
 					timing = processTimingIdentity(prototype, weakKey);
@@ -2261,15 +2263,6 @@ function validDispatcherContext(value: unknown): value is DispatcherExecutionCon
 
 function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
 	return invocation.commandTransport === "argv" ? [...invocation.shellArgs, command] : [...invocation.shellArgs];
-}
-
-async function actorTopLevelPrototype(
-	invocation: ToolProcessInvocation,
-	request: ProcessExecutionRequest,
-	projection: ExecutionPathProjection,
-	platformFingerprint: Sha256Digest,
-): Promise<ExecPrototype> {
-	return topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint);
 }
 
 async function topLevelProcessPrototype(
