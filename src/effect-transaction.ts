@@ -213,7 +213,8 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
 		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
-			if (cleanupPromise || validation?.status !== "valid" || !["validated", "committed"].includes(attempt.stateValue)) return undefined;
+			// Borrowing sealed inputs grants no commit authority; freshness is checked after evaluation.
+			if (cleanupPromise || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;
 			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then(cloneSharedData);
 			reconstructions.add(task);
 			try { return await task; } finally { reconstructions.delete(task); }

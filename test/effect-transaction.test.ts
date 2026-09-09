@@ -69,7 +69,7 @@ describe("EffectTransactionCoordinator", () => {
 				commit: async () => { if (phase === "committing") await borrow(); return "committed"; }, dispose,
 			}));
 			const request = { action: buildPiActionKey("read", { path: "notes" }, "/workspace")!, args: {}, callID: "actor", signal: new AbortController().signal };
-			if (phase !== "validation") await transaction.validate();
+			if (phase === "committing" || phase === "committed") await transaction.validate();
 			if (phase === "committed") await transaction.commit();
 			const invoke = () => phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
 			const operations = Promise.allSettled(Array.from({ length: closing === "external" && ["reconstruction", "committed"].includes(phase) ? 2 : 1 }, invoke));
@@ -185,9 +185,10 @@ describe("EffectTransactionCoordinator", () => {
 			expect(Object.getPrototypeOf(borrowed.details)).toBe(Object.prototype);
 			borrowed.content.push("reader edit"); borrowed.details[metadataKey].push("reader edit");
 			expect(transaction.output).toEqual(expected);
-			await transaction.validate!();
 			expect(await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,
 				args: {}, callID: "actor", signal: new AbortController().signal })).toEqual(expected);
+			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
+			await transaction.validate!();
 			const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
 			Object.assign(source, { commitMetrics: { durationMs: 2, validationMs: 1, bytesValidated: 1, resourcesValidated: 1, resourcesCommitted: 1 } });
 			expect(transaction.commitMetrics).toMatchObject({ resourcesCommitted: 1 });

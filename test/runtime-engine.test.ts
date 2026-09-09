@@ -898,6 +898,9 @@ describe("structural speculative runtime", () => {
 		const outputOnly = scenario.startsWith("output-");
 		const succeeds = ["valid", "running-covered", "output-valid", "output-preferred", "input-lookup"].includes(scenario);
 		let changed = false;
+		const validate = vi.fn(async (): Promise<ResourceValidation> => changed
+			? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
+			: { status: "valid", metrics: zeroValidationMetrics() });
 		const actor = call("turn", { path: "README.md", offset: ["running-outside", "input-lookup"].includes(scenario) ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
 		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
 		const projection = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
@@ -924,9 +927,7 @@ describe("structural speculative runtime", () => {
 			execute: async () => { started.arrive(); if (running) await completion.promise;
 				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
-				...world("wide", { validate: async () => changed
-					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
-					: { status: "valid", metrics: zeroValidationMetrics() } }),
+				...world("wide", { validate }),
 				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
@@ -949,6 +950,7 @@ describe("structural speculative runtime", () => {
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+			expect(validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
 			if (scenario === "output-preferred") expect(reconstruct).not.toHaveBeenCalled();
 			if (scenario === "output-valid") {
 				expect(await fixture.runtime.consume({ ...actor, id: "second-reader" })).toBe("narrow");

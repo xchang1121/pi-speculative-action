@@ -2032,13 +2032,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					attempt.rejectCandidate(candidate.id, choice.match, execution.cause);
 					continue;
 				}
-				const before = await validateCandidate(candidate);
-				if (stopCandidate(candidate)) break;
-				if (before.status !== "valid") {
-					attempt.rejectCandidate(candidate.id, choice.match, before.cause);
-					if (before.status === "stale") invalidateCandidates(state.session, [candidate], before.cause);
-					continue;
-				}
 				const branch = execution.output;
 				const compatibility = state.session.scheduler.assessCompatibility(
 					branch.compatibility,
@@ -2051,7 +2044,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 
-				// Projection is pure and must succeed before the irreversible world commit.
+				// Evaluate sealed data first, then prove freshness once immediately before commit.
 				const projection = await projectOutput(
 					candidate,
 					actualKey,
@@ -2067,14 +2060,12 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 				candidate.projectionMs += projection.durationMs;
-				if (choice.match.kind !== "exact") {
-					const after = await validateCandidate(candidate);
-					if (stopCandidate(candidate)) break;
-					if (after.status !== "valid") {
-						attempt.rejectCandidate(candidate.id, choice.match, after.cause);
-						if (after.status === "stale") invalidateCandidates(state.session, [candidate], after.cause);
-						continue;
-					}
+				const validation = await validateCandidate(candidate);
+				if (stopCandidate(candidate)) break;
+				if (validation.status !== "valid") {
+					attempt.rejectCandidate(candidate.id, choice.match, validation.cause);
+					if (validation.status === "stale") invalidateCandidates(state.session, [candidate], validation.cause);
+					continue;
 				}
 				let output = projection.output;
 				try {
