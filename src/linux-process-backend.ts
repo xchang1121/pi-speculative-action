@@ -1022,12 +1022,12 @@ export class LinuxProcessReuseBackend {
 		const ready = await this.resolveReady();
 		const started = performance.now();
 		const transaction = await session.workspace.transactions.begin();
-		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
-		const tracePrefix = path.join(traceRoot, "process");
+		let traceRoot: string | undefined;
 		let outcome: SpawnOutcome | undefined;
-		let observedProcessMs: number | undefined;
 		let transactionFinishing = false;
 		try {
+			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
+			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			const command = straceCommand(ready.strace, tracePrefix, [
@@ -1054,7 +1054,7 @@ export class LinuxProcessReuseBackend {
 				environment: request.environment,
 				signal: session.signal,
 			});
-			observedProcessMs = Math.max(0, performance.now() - processStarted);
+			const observedProcessMs = Math.max(0, performance.now() - processStarted);
 			try {
 				transactionFinishing = true;
 				const [delta, observation] = await Promise.all([
@@ -1155,7 +1155,7 @@ export class LinuxProcessReuseBackend {
 			this.add(session, "executionMs", durationMs);
 			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
-			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
+			if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
 	}
 

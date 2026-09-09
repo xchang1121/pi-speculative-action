@@ -263,6 +263,9 @@
 
 ### Fixed
 
+- Trace-directory allocation now sits inside the begun workspace transaction's cleanup boundary.
+  Allocation failure aborts that capture before dispatcher fallback, so later commands are not
+  incorrectly marked as overlapping; cleanup only removes an actually allocated directory.
 - Linux process sessions release inside workspace execution, before post-tool capture and cleanup.
   Top-level and broker work register before dispatch, share cancellation and one closing promise,
   and drain even after transport loss. Broker evidence/publication cleanup is awaited separately

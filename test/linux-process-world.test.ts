@@ -19,6 +19,7 @@ import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invo
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
+import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import {
 	createLinuxProcessBenchmark,
 	forkReusableBash,
@@ -91,16 +92,27 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("owns output independently of tracer descriptors, preserves concurrency and rejects an internal pipe", async ({ skip }) => {
+	test("owns output and capture lifetimes, preserves concurrency and rejects an internal pipe", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
-		const { readlink, readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { readlink, readFile: readTrace, rm: removeFile, mkdtemp: allocateRoot } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const kill = process.kill.bind(process), killing = vi.spyOn(process, "kill");
 		const open = fixture.backend.open.bind(fixture.backend);
 		let closeSession: (() => Promise<void>) | undefined;
 		let onClose: ((workspace: string, first: Promise<void>, close: () => Promise<void>) => void) | undefined;
+		const captures: WorkspaceTransactionCapture[] = [];
+		let restoreTransactions: (() => void) | undefined;
 		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+			if (!restoreTransactions) {
+				const begin = input.workspace.transactions.begin;
+				const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
+					const capture = await begin(), recorded = { finish: vi.fn(capture.finish), abort: vi.fn(capture.abort) };
+					captures.push(recorded);
+					return recorded;
+				});
+				restoreTransactions = () => recording.mockRestore();
+			}
 			const session = await open(input);
 			const wrapped = { ...session, close: () => { const first = session.close(); onClose?.(input.workspace.sandboxRoot, first, session.close); return first; } };
 			closeSession = wrapped.close;
@@ -136,16 +148,29 @@ describe("Linux process ExecutionWorld", () => {
 			await chmod(path.join(fixture.workspace, "redirect-worker"), 0o755);
 			await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 			const executionFingerprint = await fixture.backend.fingerprint();
+			let allocationFailed = false;
+			allocations.mockImplementation((...args) => {
+				if (!allocationFailed && path.basename(String(args[0])) === "trace-") {
+					allocationFailed = true;
+					return Promise.reject(Object.assign(new Error("injected trace allocation failure"), { code: "ENOSPC" }));
+				}
+				return allocateRoot(...args);
+			});
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }; printf '%32768s:end' ''",
+				command: "/usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test.v1",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const text = branch.output.result.content[0];
 			expect(text?.type === "text" && text.text.endsWith(" ".repeat(32768) + ":end")).toBe(true);
-			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(2);
+			expect(text?.type === "text" && text.text.split("\n").filter((line) => line === "trace-root-fallback")).toEqual(["trace-root-fallback"]);
+			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length,
+				nextComplete: (await vi.mocked(captures[1]!.finish).mock.results[0]!.value).complete,
+			}).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
+			expect(captures[0]!.finish).not.toHaveBeenCalled();
+			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
 			await branch.dispose();
@@ -227,14 +252,17 @@ describe("Linux process ExecutionWorld", () => {
 					onClose = undefined;
 				}
 			}
-			for (const root of await Promise.all(allocations.mock.results.map(({ value }) => value))) {
+			for (const result of await Promise.allSettled(allocations.mock.results.map(({ value }) => value))) {
+				const root = result.status === "fulfilled" ? result.value : undefined;
 				if (typeof root === "string" && path.basename(root).startsWith("pi-process-output-")) await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
 			}
 		} finally {
+			restoreTransactions?.();
 			servers.mockRestore();
 			opening.mockRestore();
 			killing.mockRestore();
 			spawning.mockRestore();
+			allocations.mockRestore();
 			sampling.mockRestore();
 			await branch?.dispose();
 			await fixture.dispose();
