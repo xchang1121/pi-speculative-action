@@ -102,8 +102,7 @@ export function createLinuxProcessExecutionWorld(
 			roots.add(sourceRoot);
 			const selected = await qualify(sourceRoot);
 			let session: LinuxProcessSession | undefined;
-			try {
-				return await workspaceSandbox.fork({
+			return workspaceSandbox.fork({
 				cwd: sourceRoot,
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
@@ -147,12 +146,11 @@ export function createLinuxProcessExecutionWorld(
 						return { result, isError: false };
 					} catch (error) {
 						return toolErrorSettlement(error);
+					} finally {
+						await session.close();
 					}
 				},
-				});
-			} finally {
-				await session?.close();
-			}
+			});
 			},
 		},
 		dispose: async () => {

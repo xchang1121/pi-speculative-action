@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
+import { existsSync } from "node:fs";
 import * as filesystem from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
@@ -92,8 +94,28 @@ describe("Linux process ExecutionWorld", () => {
 	test("owns output independently of tracer descriptors, preserves concurrency and rejects an internal pipe", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
-		const { readlink } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { readlink, readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
+		const kill = process.kill.bind(process), killing = vi.spyOn(process, "kill");
+		const open = fixture.backend.open.bind(fixture.backend);
+		let closeSession: (() => Promise<void>) | undefined;
+		let onClose: ((workspace: string, first: Promise<void>, close: () => Promise<void>) => void) | undefined;
+		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+			const session = await open(input);
+			const wrapped = { ...session, close: () => { const first = session.close(); onClose?.(input.workspace.sandboxRoot, first, session.close); return first; } };
+			closeSession = wrapped.close;
+			return wrapped;
+		});
+		const createServer = net.createServer;
+		let broker: { server: net.Server; socket: net.Socket; path: string } | undefined;
+		const servers = vi.spyOn(net, "createServer").mockImplementation((...args) => {
+			const server = createServer(...args);
+			server.on("connection", (socket) => {
+				const address = server.address();
+				if (typeof address === "string" && path.basename(address).startsWith("broker-")) broker = { server, socket, path: address };
+			});
+			return server;
+		});
 		const spawning = vi.mocked(childProcess.spawn);
 		const allocations = vi.mocked(filesystem.mkdtemp);
 		const sampling = vi.spyOn(filesystem, "readlink").mockImplementation((...args) => {
@@ -112,7 +134,8 @@ describe("Linux process ExecutionWorld", () => {
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
 			await writeFile(path.join(fixture.workspace, "redirect-worker"), "#!/bin/sh\nprintf 'redirected\\n'\n");
 			await chmod(path.join(fixture.workspace, "redirect-worker"), 0o755);
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
+			const executionFingerprint = await fixture.backend.fingerprint();
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
 				command: "mkdir barrier; barrier-worker barrier & barrier-worker barrier & wait; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; }; printf '%32768s:end' ''",
@@ -127,24 +150,90 @@ describe("Linux process ExecutionWorld", () => {
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
 			await branch.dispose();
 			branch = undefined;
-			for (const failure of ["spawn", "abort"] as const) {
+			for (const failure of ["spawn", "abort", "nested-abort", "nested-seal", "session-close"] as const) {
 				const controller = new AbortController();
-				const args = { command: "while :; do :; done" };
+				const args = { command: failure === "nested-seal" ? "/bin/true" : failure === "spawn" || failure === "abort" ? "while :; do :; done" : "/bin/sleep 1" };
+				let nested: childProcess.ChildProcess | undefined, nestedClosed: Promise<void> | undefined, ownedAtClose = false;
+				const closeTasks: Promise<void>[] = [];
+				const closing = new Promise<void>((resolve) => { onClose = (workspace, first, close) => {
+					ownedAtClose = existsSync(workspace);
+					if (failure === "nested-seal") closeTasks.push(first, close());
+					resolve();
+				}; });
+				let reachCapture!: () => void, releaseCapture!: () => void, captureCleaned!: () => void, traceRoot: string | undefined, socketRemoved = false;
+				const captureStarted = new Promise<void>((resolve) => { reachCapture = resolve; });
+				const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+				const captureCleanup = new Promise<void>((resolve) => { captureCleaned = resolve; });
+				const reading = vi.spyOn(filesystem, "readFile").mockImplementation((...args) => {
+					if (failure === "nested-seal" && !traceRoot && String(args[0]).includes("/trace-")) {
+						traceRoot = path.dirname(String(args[0])); reachCapture();
+						return captureGate.then(() => readTrace(...args)) as ReturnType<typeof readTrace>;
+					}
+					return readTrace(...args);
+				});
+				const removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
+					if (String(args[0]) === broker?.path) socketRemoved = true;
+					const removed = removeFile(...args);
+					if (String(args[0]) === traceRoot) void removed.then(captureCleaned, captureCleaned);
+					return removed;
+				});
+				let restoreServerClose: (() => void) | undefined;
 				const context = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
 				const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "output-lifetime", { fingerprint: executionFingerprint, context })!;
 				spawning.mockImplementation((...input) => {
 					const top = JSON.stringify(input[1]).includes("top-trace-");
 					const child = spawn(...(top && failure === "spawn" ? [path.join(fixture.root, "missing-executable"), input[1], input[2]] : input) as Parameters<typeof spawn>);
 					if (top && failure === "abort") child.once("spawn", () => controller.abort());
+					if ((failure === "session-close" && top) || (failure.startsWith("nested-") && JSON.stringify(input[1]).includes("/trace-"))) {
+						nested = child;
+						nestedClosed = new Promise((resolve) => child.once("close", () => resolve()));
+						if (failure === "nested-abort") child.once("spawn", () => { kill(-child.pid!, "SIGSTOP"); controller.abort(); });
+						if (failure === "session-close") child.once("spawn", () => { kill(-child.pid!, "SIGSTOP"); closeTasks.push(closeSession!()); });
+					}
 					return child;
 				});
-				await expect(fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
-					callID: failure, signal: controller.signal })).rejects.toThrow("top-level workspace capture is missing");
+				const running = fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
+					callID: failure, signal: controller.signal });
+				void running.catch(() => undefined);
+				try {
+					if (failure === "nested-abort" || failure === "session-close") {
+						await closing;
+						expect(nested?.pid).toBeTypeOf("number");
+						expect({ ownedAtClose, childCancelled: killing.mock.calls.some(([pid, signal]) => pid === -nested!.pid! && signal === "SIGKILL") })
+							.toEqual({ ownedAtClose: true, childCancelled: true });
+						}
+					if (failure === "nested-seal") {
+						await captureStarted;
+						const transport = broker!, closeServer = transport.server.close.bind(transport.server);
+						let reached!: () => void;
+						const serverStopped = new Promise<void>((resolve) => { reached = resolve; });
+						const stopping = vi.spyOn(transport.server, "close").mockImplementation((callback) => closeServer((error) => { callback?.(error); reached(); }));
+						restoreServerClose = () => stopping.mockRestore();
+						transport.socket.destroy(); controller.abort();
+						await serverStopped; // Production's close callback resumes before this observation, without a time threshold.
+						expect({ ownedAtClose, sharedClose: closeTasks[0] === closeTasks[1], socketRemoved })
+							.toEqual({ ownedAtClose: true, sharedClose: true, socketRemoved: false });
+						releaseCapture();
+					}
+					await expect(running).rejects.toThrow("top-level workspace capture is missing");
+				} finally {
+					releaseCapture();
+					if (nested?.pid && nested.exitCode === null && nested.signalCode === null) try { kill(-nested.pid, "SIGKILL"); } catch { /* Already reaped. */ }
+					await nestedClosed;
+					if (traceRoot) await captureCleanup;
+					await Promise.allSettled(closeTasks);
+					await running.then((value) => value.dispose(), () => undefined);
+					restoreServerClose?.(); reading.mockRestore(); removing.mockRestore();
+					onClose = undefined;
+				}
 			}
 			for (const root of await Promise.all(allocations.mock.results.map(({ value }) => value))) {
 				if (typeof root === "string" && path.basename(root).startsWith("pi-process-output-")) await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
 			}
 		} finally {
+			servers.mockRestore();
+			opening.mockRestore();
+			killing.mockRestore();
 			spawning.mockRestore();
 			sampling.mockRestore();
 			await branch?.dispose();
@@ -158,11 +247,11 @@ describe("Linux process ExecutionWorld", () => {
 		const backend = new LinuxProcessReuseBackend({ storeRoot });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
-		let payload = "";
-		const close = vi.fn(async () => {});
+		let payload = "", ownedAtClose = false;
+		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
-			metrics: emptyWorldReuseMetrics, seal: async () => [], close,
+			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
 		}));
 		try {
@@ -176,6 +265,7 @@ describe("Linux process ExecutionWorld", () => {
 			try { expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]); }
 			finally { await branch.dispose(); }
 			expect(close).toHaveBeenCalledOnce();
+			expect(ownedAtClose).toBe(true);
 		} finally {
 			await world.dispose?.();
 			await rm(root, { recursive: true, force: true });

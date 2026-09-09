@@ -261,6 +261,10 @@
 
 ### Fixed
 
+- Linux process sessions release inside workspace execution, before post-tool capture and cleanup.
+  Top-level and broker work register before dispatch, share cancellation and one closing promise,
+  and drain even after transport loss. Broker evidence/publication cleanup is awaited separately
+  from socket shutdown; final workspace-owned sealing still precedes workspace reclamation.
 - Certificate sealing hashes its captured, validated records directly, avoiding a second prototype
   and dependency normalization. Raw key APIs and persisted parsing still validate evidence; the v7
   hash format and replay eligibility rules are unchanged.
