@@ -263,7 +263,11 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
 		const existing = this.index.insert(scope, entry);
-		if (!existing) this.placeCold(scope, entry);
+		if (!existing) {
+			const metadata = this.metadata.get(scope) ?? new Map<Entry, ResultCacheEvidence>();
+			metadata.set(entry, { segment: "cold", insertedAt: this.now(), actorHits: 0 });
+			this.metadata.set(scope, metadata);
+		}
 		return existing;
 	}
 
@@ -279,7 +283,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		const current = this.evidenceOf(scope, entry);
 		if (!current) return [];
 		const now = this.now();
-		this.metadataFor(scope).set(entry, {
+		this.metadata.get(scope)!.set(entry, {
 			...current,
 			segment: "hot",
 			actorHits: current.actorHits + 1,
@@ -334,45 +338,7 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 	}
 
 	trim(scope: Scope, limits: ResultCacheLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
-		const maxEntries = finiteLimit(limits.maxEntries);
-		const maxBytes = finiteLimit(limits.maxBytes);
-		let entries = this.index.values(scope);
-		let bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
-		const evicted: Entry[] = [];
-		while (entries.length > maxEntries || bytes > maxBytes) {
-			const victim =
-				this.lowestValue(
-					scope,
-					entries.filter((entry) => this.segmentOf(scope, entry) === "cold" && canEvict(entry)),
-				) ??
-				this.lowestValue(
-					scope,
-					entries.filter((entry) => this.segmentOf(scope, entry) === "hot" && canEvict(entry)),
-				);
-			if (!victim) break;
-			bytes -= entryBytes(victim);
-			this.delete(scope, victim);
-			evicted.push(victim);
-			entries = this.index.values(scope);
-		}
-		return evicted;
-	}
-
-	private metadataFor(scope: Scope): Map<Entry, ResultCacheEvidence> {
-		const existing = this.metadata.get(scope);
-		if (existing) return existing;
-		const created = new Map<Entry, ResultCacheEvidence>();
-		this.metadata.set(scope, created);
-		return created;
-	}
-
-	private placeCold(scope: Scope, entry: Entry): void {
-		const now = this.now();
-		this.metadataFor(scope).set(entry, {
-			segment: "cold",
-			insertedAt: now,
-			actorHits: 0,
-		});
+		return this.retireExcess(scope, this.index.values(scope), limits, (entry) => this.delete(scope, entry), canEvict);
 	}
 
 	private rebalanceHot(scope: Scope, limits: ResultCacheLimits): readonly Entry[] {
@@ -382,35 +348,42 @@ export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
 		const hotEntryLimit =
 			entryCapacity === 0 || fraction === 0 ? 0 : Math.max(1, Math.floor(entryCapacity * fraction));
 		const hotByteLimit = Math.floor(byteCapacity * fraction);
-		const demoted: Entry[] = [];
-		const now = this.now();
-		while (true) {
-			const hotEntries = this.index.values(scope).filter((entry) => this.segmentOf(scope, entry) === "hot");
-			const hotBytes = hotEntries.reduce((total, entry) => total + entryBytes(entry), 0);
-			if (hotEntries.length <= hotEntryLimit && hotBytes <= hotByteLimit) break;
-			const victim = this.lowestValue(scope, hotEntries, now);
-			if (!victim) break;
-			const current = this.evidenceOf(scope, victim)!;
-			this.metadataFor(scope).set(victim, {
-				...current,
-				segment: "cold",
-			});
-			demoted.push(victim);
-		}
-		return demoted;
+		return this.retireExcess(scope,
+			this.index.values(scope).filter((entry) => this.segmentOf(scope, entry) === "hot"),
+			{ maxEntries: hotEntryLimit, maxBytes: hotByteLimit },
+			(entry) => this.metadata.get(scope)!.set(entry, { ...this.evidenceOf(scope, entry)!, segment: "cold" }));
 	}
 
-	private lowestValue(scope: Scope, entries: readonly Entry[], now = this.now()): Entry | undefined {
-		return entries.reduce<Entry | undefined>((lowest, entry) => {
-			if (!lowest) return entry;
-			const evidence = this.evidenceOf(scope, entry);
-			const lowestEvidence = this.evidenceOf(scope, lowest);
-			if (!evidence) return lowest;
-			if (!lowestEvidence) return entry;
-			return finiteValue(this.score(entry, evidence, now)) < finiteValue(this.score(lowest, lowestEvidence, now))
-				? entry
-				: lowest;
-		}, undefined);
+	/** Rank once at one observation time; protected entries still occupy the shared budget. */
+	private retireExcess(
+		scope: Scope,
+		entries: readonly Entry[],
+		limits: ResultCacheLimits,
+		retire: (entry: Entry) => void,
+		canRetire: (entry: Entry) => boolean = () => true,
+	): Entry[] {
+		let count = entries.length, bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+		const maxEntries = finiteLimit(limits.maxEntries), maxBytes = finiteLimit(limits.maxBytes);
+		const withinBudget = () => count <= maxEntries && bytes <= maxBytes;
+		if (withinBudget()) return [];
+		const now = this.now(), ranked = [];
+		for (const entry of entries) {
+			const evidence = this.metadata.get(scope)?.get(entry);
+			if (evidence && canRetire(entry)) ranked.push({
+				entry, evidence, hot: Number(evidence.segment === "hot"), value: finiteValue(this.score(entry, { ...evidence }, now)),
+			});
+		}
+		ranked.sort((left, right) => left.hot - right.hot || left.value - right.value);
+		const retired: Entry[] = [];
+		for (const { entry, evidence } of ranked) {
+			if (withinBudget()) break;
+			if (!canRetire(entry) || this.metadata.get(scope)?.get(entry) !== evidence) continue;
+			retired.push(entry);
+			count--;
+			bytes -= entryBytes(entry);
+			retire(entry);
+		}
+		return retired;
 	}
 }
 

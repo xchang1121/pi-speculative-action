@@ -123,60 +123,57 @@ describe("ActionStore", () => {
 });
 
 describe("ResultCache", () => {
-	it("owns reuse evidence independently from cold/hot retention", () => {
-		const cache = new ResultCache<string, Entry>([], (item) =>
-			item.id === "valuable" ? 100 : item.id === "shared" ? 1 : Number.NaN,
-		);
-		const shared = entry("shared", "a.ts", 1, 20, 8);
-		const valuable = entry("valuable", "b.ts", 1, 20, 8);
-		const worthless = entry("worthless", "c.ts", 1, 20, 8);
-		cache.insert("one", shared);
-		cache.insert("two", shared);
-		cache.insert("one", valuable);
-		cache.recordActorHit("one", shared);
-		const sharedEvidence = cache.evidenceOf("one", shared);
-		expect(cache.insert("one", shared)).toBe(shared);
-		expect(cache.evidenceOf("one", shared)).toEqual(sharedEvidence);
-		expect(cache.recordActorHit("one", valuable, { maxEntries: 2, maxBytes: 16, hotFraction: 0.5 })).toEqual([
-			shared,
-		]);
-		cache.insert("one", worthless);
-
-		expect(cache.evidenceOf("one", shared)).toMatchObject({
-			segment: "cold",
-			actorHits: 1,
-		});
-		expect(cache.evidenceOf("one", valuable)).toMatchObject({
-			segment: "hot",
-			actorHits: 1,
-		});
-		expect(cache.evidenceOf("two", shared)).toMatchObject({
-			segment: "cold",
-			actorHits: 0,
-		});
-		expect(cache.trim("one", { maxEntries: 2, maxBytes: 16 })).toEqual([worthless]);
-		expect(cache.trim("one", { maxEntries: 1, maxBytes: 8 })).toEqual([shared]);
-		expect(cache.values("one")).toEqual([valuable]);
-		expect(cache.snapshot("one")).toEqual({
-			coldEntries: 0,
-			hotEntries: 1,
-			coldBytes: 0,
-			hotBytes: 8,
-		});
-	});
-
-	it("retains exact freshness generations independently", () => {
-		const cache = new ResultCache<string, Entry>();
-		const older = entry("older", "same.ts");
-		const fresh = entry("fresh", "same.ts");
-		cache.insert("session", older);
-		cache.insert("session", fresh);
-
-		expect(cache.lookup("session", fresh.key).map((item) => item.entry.id)).toEqual(["fresh", "older"]);
-		expect(cache.evidenceOf("session", older)).toBeDefined();
-		expect(cache.evidenceOf("session", fresh)).toBeDefined();
-		expect(cache.delete("session", fresh)).toBe(true);
-		expect(cache.values("session")).toEqual([older]);
+	it("retains scoped freshness and reuse evidence through bounded cache pressure", () => {
+		for (const copies of [1, 170]) {
+			let scores = 0;
+			const cache = new ResultCache<string, Entry>([], (item) => {
+				scores++;
+				return item.id.startsWith("valuable") ? 100 : item.id.startsWith("shared") ? 1 : Number.NaN;
+			});
+			const group = (name: string) => Array.from({ length: copies }, (_, index) =>
+				entry(`${name}:${index}`, `${name}-${index}.ts`, 1, 20, 8));
+			const shared = group("shared"), valuable = group("valuable"), worthless = group("worthless");
+			for (const item of shared) {
+				cache.insert("one", item);
+				cache.insert("two", item);
+				cache.recordActorHit("one", item);
+				const evidence = cache.evidenceOf("one", item);
+				expect(cache.insert("one", item)).toBe(item);
+				expect(cache.evidenceOf("one", item)).toEqual(evidence);
+			}
+			for (const item of valuable) cache.insert("one", item);
+			const limits = { maxEntries: 2 * copies, maxBytes: 16 * copies, hotFraction: 0.5 };
+			for (const item of valuable) {
+				const last = item === valuable.at(-1);
+				scores = 0;
+				expect(cache.recordActorHit("one", item, last ? limits : undefined)).toEqual(last ? shared : []);
+				expect(scores).toBeLessThanOrEqual(2 * copies);
+			}
+			for (const [scope, entries, segment, actorHits] of [
+				["one", shared, "cold", 1], ["one", valuable, "hot", 1], ["two", shared, "cold", 0],
+			] as const) {
+				for (const item of entries) expect(cache.evidenceOf(scope, item)).toMatchObject({ segment, actorHits });
+			}
+			for (const item of worthless) cache.insert("one", item);
+			const trim = (expected: Entry[], budget = limits, canEvict?: (item: Entry) => boolean) => {
+				scores = 0;
+				const count = cache.values("one").length;
+				expect(cache.trim("one", budget, canEvict)).toEqual(expected);
+				expect(scores).toBeLessThanOrEqual(count);
+			};
+			// Borrowed results count toward the budget even when pressure cannot yet evict them.
+			trim(worthless.slice(1), limits, (item) => worthless.includes(item) && item !== worthless[0]);
+			expect(cache.values("one")).toHaveLength(2 * copies + 1);
+			trim([worthless[0]!]);
+			trim(shared, { ...limits, maxEntries: copies, maxBytes: 8 * copies });
+			const older = valuable[0]!, fresh = { ...older, id: "fresh" };
+			cache.insert("one", fresh);
+			expect(cache.lookup("one", fresh.key).map((item) => item.entry)).toEqual([fresh, older]);
+			for (const item of [older, fresh]) expect(cache.evidenceOf("one", item)).toBeDefined();
+			expect(cache.delete("one", fresh)).toBe(true);
+			expect(cache.values("one")).toEqual(valuable);
+			expect(cache.snapshot("one")).toEqual({ coldEntries: 0, hotEntries: copies, coldBytes: 0, hotBytes: 8 * copies });
+		}
 	});
 
 	it("decays proven reuse value while keeping validation and projection costs honest", () => {
