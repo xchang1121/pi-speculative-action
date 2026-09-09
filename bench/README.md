@@ -98,7 +98,7 @@ npm run bench:thinkthread-tools
 
 ## 录制与模型消融
 
-私有 `pi-llm-tape` 只作分析，不回放或公开提示词。仅完整消息上下文相同的 Actor/Drafter 请求配对，工具名和全部参数必须精确匹配：
+外部 `pi-llm-tape` 仅将完整消息上下文相同的 Actor/Drafter 请求配对，工具名和全部参数须精确匹配：
 
 ```sh
 npm run bench:tape -- \
@@ -106,48 +106,44 @@ npm run bench:tape -- \
   --actor-model deepseek-v4-pro --drafter-model deepseek-v4-flash
 ```
 
-报告区分原始/唯一 K(a)、重复请求、精确命中、Actor 完成前就绪、解码领先及 Drafter 总服务时间，并按派发顺序对宽度 1、2、3、8 进行对照。请求成本按 Actor 决策计一次，动作覆盖单独计量，不能让并行工具重复放大请求费用。录制不复制进仓库。
+报告区分原始/唯一 K(a)、重复请求、精确命中、Actor 完成前就绪、解码领先及 Drafter 总服务时间，并按派发顺序对宽度 1、2、3、8 对照。请求成本按 Actor 决策计一次，动作覆盖单独计量，不能让并行工具重复放大请求费用。
 
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。
 
 先在环境中提供 `DEEPSEEK_API_KEY`，再显式运行需要模型/网络的阶段：
 
 ```sh
-npm run bench:ablation -- --instance axios__axios-5316 --label baseline --latency remote --candidate-limit 8
-npm run bench:suite -- --suite swe_diverse --repeats 3 --label baseline --latency remote --candidate-limit 8
+npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
+npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative --candidate-limit 2
 ```
 
 PowerShell 可以用隐藏输入设置密钥，完成后移除环境项：
 
 ```powershell
 $env:DEEPSEEK_API_KEY = Read-Host -MaskInput "DeepSeek API 密钥"
-npm run bench:ablation -- --instance axios__axios-5316 --label baseline --latency remote
+npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
 Remove-Item Env:DEEPSEEK_API_KEY
 ```
 
 API key 只从环境读取，不写入产物或交给基准 shell 子进程。工作区与 JSON 默认位于系统临时目录，`--output-root` 可显式选定位置。`--prepare-only` 只检查数据集与新 checkout，不发模型请求。
 
-默认预算为 128 轮；`turnLimitReached=true` 表示未完成，不能用于保留算法的决策。`--drafter-max-depth N` 默认 1、0 为单步；后继占用下一决策既有额度而不扩大宽度。`--drafter-disabled --pattern-aware --pattern-state <目录>` 隔离历史模式实验；显式状态目录共享逻辑仓库身份与学习结果，不共享工作区文件，省略时各次运行隔离。
+默认预算为 128 轮；`turnLimitReached=true` 表示未完成。`--speculation-disabled` 关闭投机，`--drafter-disabled` 仅关闭 Drafter。`--drafter-max-depth N` 默认 1、0 为单步；后继沿用下一决策额度。`--drafter-disabled --pattern-aware --pattern-state <目录>` 隔离历史模式实验；显式状态目录共享逻辑仓库身份与学习结果，不共享工作区文件，省略时各次运行隔离。
 
-延迟配置对 Actor 和投机加同一确定性延迟：native 不加延迟，remote/sandbox/heavy 表示不同工具成本。本模型 runner 使用资源路线与生产 Git 世界，不把 Bash 预测未执行算作命中；原生 Linux 进程资格使用上一节独立入口。
+模型 runner 使用生产 Host.execute、Git 事务和 TUI 同样绑定的 read/ls 封存输入路线。移除只延迟 Actor 回调的人工 `--latency` 档位；工具按实际耗时执行。原工具回调、Actor 预览和投机采纳分别计数。Native grep/find 和 Bash 保留 Actor，提前执行资格使用前述独立入口。
 
 ## 计时与验收规则
 
-模型 runner 从一次权威轨迹重建串行时间，只用于重叠诊断；命中拦截了直接执行，不能由此获得关闭投机的真实基线：
+`actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-```text
-serializedCounterfactualMs = nonToolMs + authoritativeToolMs
-```
+加速比为 `serializedCounterfactualMs / actualEndToEndMs`；分子等于 `actualEndToEndMs + hiddenLatencyMs`，也等于 `nonToolMs + authoritativeToolMs`。本次采纳候选计入权威工具时间，未采用预测和旧缓存不计入；重叠可包含 Actor 自身并行，`executionAheadMs` 仅表示执行领先。
 
-`authoritativeToolMs` 只计本次启动并最终进入 Actor 路径的工作，包含采纳候选，不含未采用预测和旧缓存。`hiddenLatencyMs` 也可能含 Actor 自身的并行重叠；`executionAheadMs` 是执行领先，缺隔离的计时只是潜力，均不代表净节省。模型 runner 的 teardown 单列；评估端到端收益时必须另做同任务、同初态的开/关投机对照，并把清理、失败回退和资源争用包含在内。
-
-1. 固定任务、模型、候选数、延迟配置和超时，每次只改变一个算法因素。
-2. 要求 `git diff --check` 通过并保留任务完成信息；同时比较命中率、串行/实际时间比、重叠、提前量、工具工作量与模型成本。
+1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
+2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
 3. 延迟比较要求 `patchCandidate=true`：低于轮次上限、无超时/Agent 错误、补丁非空且干净，并与 gold patch 文件有交集。
 4. `patchCandidate` 只是筛选，不是正确性结论；仍须由数据集工具链/容器执行 `FAIL_TO_PASS`、`PASS_TO_PASS`。
 5. 只有重复测量改善时延、且正确性和资源没有退化时，才支持保留实现；必须保留负收益边界。
 
-套件串行运行，进程失败即停止，分别保存结果并汇总 `suite-result.json`。串行/实际时间比是总和之比，只表示重叠；其 95% 任务聚类 bootstrap 区间不能把该诊断变成因果收益，同任务重复不能拆散，p95 使用最近秩。
+套件串行运行，失败即停止，结果汇入 `suite-result.json`。加速比使用串行总时长之和除以端到端时长之和，标明分子来自本次轨迹；95% bootstrap 按任务聚类，不拆散同任务重复，p95 使用最近秩。独立对照可另用 `pairedLatencyStatistics` 汇总。
 
 汇总命中率为总命中/总 Actor 动作。未通过 `patchCandidate` 的运行保留失败原因，但不纳入汇总延迟和命中率，仍不能据此代替官方正确性评分。
 

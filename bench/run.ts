@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "node:util";
 import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type Api, type Message, type Model } from "@earendil-works/pi-ai";
+import { type Api, type Model } from "@earendil-works/pi-ai";
 import { getModels, getProviders, streamSimple } from "@earendil-works/pi-ai/compat";
 import {
 	createBashTool,
@@ -17,24 +17,17 @@ import {
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 import { DEFAULTS } from "../src/common.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 
 const DATASET_ROWS =
 	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
-
-const latencyProfiles = {
-	native: { read: 0, grep: 0, find: 0, ls: 0, bash: 0, edit: 0, write: 0 },
-	remote: { read: 120, grep: 180, find: 140, ls: 80, bash: 0, edit: 120, write: 120 },
-	sandbox: { read: 250, grep: 350, find: 300, ls: 150, bash: 600, edit: 350, write: 350 },
-	heavy: { read: 800, grep: 1_000, find: 900, ls: 500, bash: 1_500, edit: 1_000, write: 1_000 },
-} as const;
-
-type LatencyProfile = keyof typeof latencyProfiles;
 
 interface DatasetRow {
 	readonly instance_id: string;
@@ -76,12 +69,12 @@ interface BenchmarkOptions {
 	readonly maxConcurrentActions: number;
 	readonly maxTurns: number;
 	readonly timeoutMs: number;
-	readonly latency: LatencyProfile;
 	readonly repoCache: string;
 	readonly runRoot: string;
 	readonly output?: string;
 	readonly patternState?: string;
 	readonly drafterEnabled: boolean;
+	readonly speculationEnabled: boolean;
 	readonly patternAware: boolean;
 	readonly prepareOnly: boolean;
 }
@@ -111,12 +104,12 @@ const { values } = parseArgs({
 		"max-concurrent-actions": { type: "string", default: String(DEFAULTS.maxConcurrentActions) },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
-		latency: { type: "string", default: "remote" },
 		"repo-cache": { type: "string" },
 		"run-root": { type: "string" },
 		output: { type: "string" },
 		"pattern-state": { type: "string" },
 		"drafter-disabled": { type: "boolean", default: false },
+		"speculation-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
 	},
@@ -124,7 +117,6 @@ const { values } = parseArgs({
 });
 
 const instance = required(values.instance, "--instance");
-const latency = latencyProfile(values.latency);
 const repoCache = path.resolve(values["repo-cache"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-cache"));
 const runRoot = path.resolve(values["run-root"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-runs"));
 const options: BenchmarkOptions = {
@@ -148,12 +140,12 @@ const options: BenchmarkOptions = {
 	maxConcurrentActions: positiveInteger(values["max-concurrent-actions"], "--max-concurrent-actions"),
 	maxTurns: positiveInteger(values["max-turns"], "--max-turns"),
 	timeoutMs: positiveInteger(values["timeout-ms"], "--timeout-ms"),
-	latency,
 	repoCache,
 	runRoot,
 	...(values.output ? { output: path.resolve(values.output) } : {}),
 	...(values["pattern-state"] ? { patternState: path.resolve(values["pattern-state"]) } : {}),
 	drafterEnabled: !(values["drafter-disabled"] ?? false),
+	speculationEnabled: !values["speculation-disabled"],
 	patternAware: values["pattern-aware"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 };
@@ -207,9 +199,9 @@ async function prepareTask(input: BenchmarkOptions): Promise<PreparedTask> {
 
 async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
+	const taskStartedAt = performance.now();
 	const events: SpeculativeActionEvent<string>[] = [];
 	const counters: ToolCounters = { executions: {}, serviceMs: {} };
-	const profile = latencyProfiles[input.latency];
 	const shellEnvironment = benchmarkShellEnvironment();
 	const tools = [
 		createReadTool(task.workspace),
@@ -222,7 +214,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}),
 		createEditTool(task.workspace),
 		createWriteTool(task.workspace),
-	].map((tool) => instrumentTool(tool, profile[tool.name as keyof typeof profile] ?? 0, counters));
+	];
 	const workspaceSandbox = new WorkspaceSandboxService(), sandbox = workspaceSandbox.createExecutionWorld();
 	const resolveInvocation = (tool: string, args: unknown) =>
 		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
@@ -243,7 +235,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		readonly input?: unknown;
 	}> = [];
 	const settings: SpeculativeAgentSettingsInput = {
-		enabled: true,
+		enabled: input.speculationEnabled,
 		drafterEnabled: input.drafterEnabled,
 		drafterMaxDepth: input.drafterMaxDepth,
 		drafterMaxTokens: input.drafterMaxTokens,
@@ -287,7 +279,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		preflight: () => true,
 		resolveInvocation,
-		executionWorlds: [sandbox],
+		executionWorlds: [sandbox, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
+			tools: PI_OPERATION_TOOLS.resources, maxBytes: () => DEFAULTS.resourceCacheMaxBytes,
+		})],
 		patternStateDirectory: input.patternState ?? path.join(task.runDirectory, "patterns"),
 		...(input.patternState
 			? { patternWorkspaceIdentity: path.join(input.repoCache, "pattern-workspaces", safeName(task.row.repo)) }
@@ -301,6 +295,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let turnSequence = 0;
 	const actorStream = new ActorStreamPreviewTracker();
 	const toolIntentMs: number[] = [];
+	const actorActionsByTool: Record<string, number> = {};
 	const actorTools = tools.map(
 		(base): AgentTool => ({
 			...base,
@@ -308,56 +303,41 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				const turnID = currentTurnID;
 				if (!turnID) throw new Error("Actor tool executed outside an active turn");
 				const intentStartedAt = performance.now();
-				const cached = await host.consume(
-					{ turnID, id: callID, tool: base.name, args, tools },
-					signal,
-				);
-				if (cached) {
-					toolIntentMs.push(performance.now() - intentStartedAt);
-					return cached.result;
-				}
-				const toolStartedAt = performance.now();
+				increment(actorActionsByTool, base.name);
 				try {
-					const result = await base.execute(callID, args as never, signal, onUpdate as never);
-					await host.actual({
-						turnID,
-						id: callID,
-						tool: base.name,
-						args,
-						tools,
-						durationMs: performance.now() - toolStartedAt,
-						output: { result, isError: false },
-					});
-					toolIntentMs.push(performance.now() - intentStartedAt);
-					return result;
-				} catch (error) {
-					await host.actual({
-						turnID,
-						id: callID,
-						tool: base.name,
-						args,
-						tools,
-						durationMs: performance.now() - toolStartedAt,
-						output: {
-							result: {
-								content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-								details: {},
-							},
-							isError: true,
+					return await host.execute(
+						{ turnID, id: callID, tool: base.name, args, tools }, signal,
+						async (operation) => {
+							const startedAt = performance.now();
+							increment(counters.executions, base.name);
+							try {
+								return await base.execute(callID, operation.input as never, operation.signal, onUpdate as never);
+							} finally {
+								counters.serviceMs[base.name] = (counters.serviceMs[base.name] ?? 0) + performance.now() - startedAt;
+							}
 						},
-					});
-					throw error;
+					);
+				} finally {
+					toolIntentMs.push(performance.now() - intentStartedAt);
 				}
 			},
 		}),
 	);
 	const agent = new Agent({
-		streamFn: (actorModel, context, streamOptions) =>
-			streamSimple(actorModel, context, {
+		streamFn: async (actorModel, context, streamOptions) => {
+			actorStream.clear();
+			currentTurnID = `turn-${++turnSequence}`;
+			lastTurnID = currentTurnID;
+			await host.startTurn(
+				{ turnID: currentTurnID, actorModel, context: { ...context, tools }, actorOptions: streamOptions, tools },
+				streamOptions?.signal,
+			);
+			return streamSimple(actorModel, context, {
 				...streamOptions,
 				temperature: input.actorTemperature,
 				maxTokens: input.actorMaxTokens,
-			}),
+			});
+		},
 		sessionId: sessionID,
 		shouldStopAfterTurn: () => turnSequence >= input.maxTurns,
 		initialState: {
@@ -393,37 +373,16 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				}
 			}
 		}
-		if (event.type === "turn_start") {
-			actorStream.clear();
-			currentTurnID = `turn-${++turnSequence}`;
-			lastTurnID = currentTurnID;
-			await host.startTurn(
-				{
-					turnID: currentTurnID,
-					actorModel: input.actor,
-					context: {
-						systemPrompt: agent.state.systemPrompt,
-						messages: standardMessages(
-							turnSequence === 1 ? [...agent.state.messages, prompt] : agent.state.messages,
-						),
-						tools,
-					},
-					actorOptions: { signal },
-					tools,
-				},
-				signal,
-			);
-		}
 		if (event.type === "turn_end" && currentTurnID) {
 			const turnID = currentTurnID;
 			currentTurnID = undefined;
 			await host.finishTurn(turnID, false);
 		}
-		if (event.type === "agent_end" && lastTurnID) await host.finishTurn(lastTurnID, true);
 	});
 
-	const taskStartedAt = performance.now();
-	let taskCompletedAt: number | undefined;
+	const agentStartedAt = performance.now();
+	let agentCompletedAt: number;
+	let taskCompletedAt: number;
 	let timedOut = false;
 	const timeout = setTimeout(() => {
 		timedOut = true;
@@ -432,10 +391,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	try {
 		await agent.prompt(prompt);
 	} finally {
-		taskCompletedAt = performance.now();
+		agentCompletedAt = performance.now();
 		clearTimeout(timeout);
-		if (lastTurnID) await host.finishTurn(lastTurnID, true);
-		try { await host.dispose(); } finally { await workspaceSandbox.dispose(); }
+		try {
+			if (lastTurnID) await host.finishTurn(lastTurnID, true);
+		} finally {
+			try { await host.dispose(); } finally { await workspaceSandbox.dispose(); }
+		}
+		taskCompletedAt = performance.now();
 	}
 	const summary = summarizeSpeculativeTrace(events);
 	const sourceRequestKinds: Record<string, number> = {};
@@ -448,9 +411,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const candidateStartsByTool: Record<string, number> = {};
 	const candidateStartsByDepth: Record<string, number> = {};
 	const speculativeHitsByDepth: Record<string, number> = {};
-	const actorActionsByTool: Record<string, number> = {};
 	const speculativeHitsByTool: Record<string, number> = {};
-	const actorFallbacksByTool: Record<string, number> = {};
+	const actorFallbacksByTool: Record<string, number> = input.speculationEnabled ? {} : { ...actorActionsByTool };
+	const actorPreviewsByTool: Record<string, number> = {};
 	const speculativeHitsByRelation: Record<string, number> = {};
 	const speculativeHitProvidersBySource: Record<string, number> = {};
 	const actorActionMatchesByPredictionSource: Record<string, number> = {};
@@ -504,7 +467,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 		if (event.type !== "actor_action") continue;
 		const { provider, tool } = event.settlement;
-		actorActionsByTool[tool] = (actorActionsByTool[tool] ?? 0) + 1;
 		const matchedPredictionSources = [
 			...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source)),
 		];
@@ -523,7 +485,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				: {}),
 		});
 		if (provider.kind === "actor") {
-			actorFallbacksByTool[tool] = (actorFallbacksByTool[tool] ?? 0) + 1;
+			increment(provider.origin === "preview" ? actorPreviewsByTool : actorFallbacksByTool, tool);
 			continue;
 		}
 		increment(speculativeHitProvidersBySource, event.candidate?.source ?? "cache");
@@ -532,14 +494,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		const relation = provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`;
 		speculativeHitsByRelation[relation] = (speculativeHitsByRelation[relation] ?? 0) + 1;
 	}
-	const agentPromptMs = Math.max(0, (taskCompletedAt ?? performance.now()) - taskStartedAt);
-	const actualEndToEndMs = Math.max(agentPromptMs, summary.endToEndMs);
+	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
 	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
-	const executionBlockedCounterfactualEndToEndMs = Math.max(
-		0,
-		actualEndToEndMs - summary.executionBlockedPotentialHiddenLatencyMs,
-	);
 	const nonToolMs = Math.max(0, serializedCounterfactualMs - summary.toolExecutionMs);
 	const actorUsage = agent.state.messages
 		.filter((message) => message.role === "assistant")
@@ -587,9 +544,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			maxConcurrentActions: input.maxConcurrentActions,
 			maxTurns: input.maxTurns,
 			timeoutMs: input.timeoutMs,
-			latencyProfile: input.latency,
-			latencyMs: profile,
 			patternAware: input.patternAware,
+			speculationEnabled: input.speculationEnabled,
+			timingScope: "setup, Agent prompt, terminal settlement, host and workspace disposal",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: {
 				priority: ["runtime_sandbox", "local_fallback", "actor_fallback"],
@@ -603,20 +560,25 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		summary: {
 			actualEndToEndMs,
+			setupMs: agentStartedAt - taskStartedAt,
+			agentPromptMs: agentCompletedAt - agentStartedAt,
+			teardownMs: taskCompletedAt - agentCompletedAt,
 			serializedCounterfactualMs,
 			nonToolMs,
 			authoritativeToolMs: summary.toolExecutionMs,
 			hiddenLatencyMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
-			actorActions: summary.actorActions,
+			actorActions: toolIntentMs.length,
 			actorActionsByTool,
 			speculativeHits: summary.speculativeHits,
 			speculativeHitsByDepth,
 			speculativeHitsByTool,
 			speculativeHitsByRelation,
-			actorFallbacks: summary.actorFallbacks,
+			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : toolIntentMs.length,
+			actorPreviews: summary.actorPreviews,
+			actorPreviewsByTool,
 			actorFallbacksByTool,
-			hitRate: summary.hitRate,
+			hitRate: toolIntentMs.length ? summary.speculativeHits / toolIntentMs.length : 0,
 			sourceRequests: summary.sourceRequests,
 			sourceRequestKinds,
 			sourceRequestsBySource,
@@ -636,15 +598,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			executionBlockedAttemptLeadMs: summary.executionBlockedAttemptLeadMs,
 			executionBlockedPotentialHiddenLatencyMs: summary.executionBlockedPotentialHiddenLatencyMs,
 			executionBlockedPotentialHitLatencyMs: summary.executionBlockedPotentialHitLatencyMs,
-			executionBlockedCounterfactualEndToEndMs,
-			executionBlockedPotentialSpeedup:
-				executionBlockedCounterfactualEndToEndMs > 0
-					? actualEndToEndMs / executionBlockedCounterfactualEndToEndMs
-					: 1,
-			combinedPotentialAccelerationRatio:
-				executionBlockedCounterfactualEndToEndMs > 0
-					? serializedCounterfactualMs / executionBlockedCounterfactualEndToEndMs
-					: 1,
 			speculativeExecutionMs: summary.speculativeExecutionMs,
 			actorExecutionMs: summary.actorExecutionMs,
 			candidateStarted: summary.candidateStarted,
@@ -678,8 +631,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			timedOut,
 			agentError: agent.state.errorMessage,
 			toolIntentMs,
-			toolExecutions: counters.executions,
-			toolServiceMs: counters.serviceMs,
+			rawActorToolExecutions: counters.executions,
+			rawActorToolServiceMs: counters.serviceMs,
 			changedFiles,
 			goldFiles,
 			testPatchFiles,
@@ -700,23 +653,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterPredictions: drafterPredictionTrace,
 			candidateStarts: candidateStartTrace,
 			actorActions: actorActionTrace,
-		},
-	};
-}
-
-function instrumentTool(tool: AgentTool, addedLatencyMs: number, counters: ToolCounters): AgentTool {
-	return {
-		...tool,
-		execute: async (callID, args, signal, onUpdate) => {
-			const startedAt = performance.now();
-			counters.executions[tool.name] = (counters.executions[tool.name] ?? 0) + 1;
-			try {
-				await delay(addedLatencyMs, signal);
-				return await tool.execute(callID, args as never, signal, onUpdate as never);
-			} finally {
-				counters.serviceMs[tool.name] =
-					(counters.serviceMs[tool.name] ?? 0) + Math.max(0, performance.now() - startedAt);
-			}
 		},
 	};
 }
@@ -778,13 +714,6 @@ function model(value: string): Model<Api> {
 	return resolved;
 }
 
-function standardMessages(messages: readonly AgentMessage[]): Message[] {
-	return messages.filter(
-		(message): message is Extract<AgentMessage, { role: "user" | "assistant" | "toolResult" }> =>
-			message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
-
 function patchFiles(patch: string): string[] {
 	return [
 		...new Set(
@@ -804,11 +733,6 @@ function lines(value: string): string[] {
 
 function increment(counts: Record<string, number>, key: string): void {
 	counts[key] = (counts[key] ?? 0) + 1;
-}
-
-function latencyProfile(value: string | undefined): LatencyProfile {
-	if (value && Object.hasOwn(latencyProfiles, value)) return value as LatencyProfile;
-	throw new Error(`Invalid --latency ${value}; expected ${Object.keys(latencyProfiles).join(", ")}`);
 }
 
 function positiveInteger(value: string | undefined, option: string): number {
@@ -845,22 +769,6 @@ async function exists(value: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-function delay(durationMs: number, signal?: AbortSignal): Promise<void> {
-	if (durationMs <= 0) return Promise.resolve();
-	if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
-	return new Promise((resolve, reject) => {
-		const onAbort = () => {
-			clearTimeout(timer);
-			reject(signal?.reason ?? new Error("aborted"));
-		};
-		const timer = setTimeout(() => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}, durationMs);
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
 }
 
 function command(file: string, args: readonly string[], cwd?: string): Promise<CommandResult> {

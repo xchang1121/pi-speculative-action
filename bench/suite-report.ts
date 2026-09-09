@@ -58,6 +58,7 @@ export function summarizeSuite(
 		allRunsScreenedIn: runs.length > 0 && accepted.length === runs.length,
 		statistics: {
 			primaryEstimator: "ratio_of_means",
+			baseline: "same_run_serialized_counterfactual",
 			cluster: "instance",
 			bootstrapSamples: statistics.bootstrapSamples,
 			seed: statistics.seed,
@@ -88,6 +89,7 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 	return ordered[Math.max(1, Math.ceil(percentile * ordered.length)) - 1];
 }
 
+/** The caller records whether each baseline is measured independently or reconstructed. */
 export function pairedLatencyStatistics(
 	observations: readonly PairedLatencyObservation[],
 	options: SuiteStatisticsOptions = {},

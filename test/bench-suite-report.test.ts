@@ -36,6 +36,7 @@ describe("ablation suite report", () => {
 			allRunsScreenedIn: false,
 			statistics: {
 				primaryEstimator: "ratio_of_means",
+				baseline: "same_run_serialized_counterfactual",
 				cluster: "instance",
 				bootstrapSamples: 10_000,
 				seed: 42,
