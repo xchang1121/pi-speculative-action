@@ -1178,16 +1178,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		const session = scope.session;
 		session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
 		try {
-			if (
-				request.request.kind === "proposal" &&
-				request.settlement.status === "produced" &&
-				request.value !== undefined &&
-				slot.active &&
-				!scope.signal.aborted &&
-				source.concurrentProposalPolicy?.(scope.settings) === "first_produced"
-			) {
-				cancelCompetingProposals(session, slot);
-			}
 			queueSourceRequestEvent(session, turnID, scope.settings, request);
 			if (
 				request.settlement.status !== "produced" ||
@@ -1369,6 +1359,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		} catch {
 			predictedAction = undefined;
 		}
+		if (context.admissionSignal.aborted) {
+			failUnlaunchable(session, node, cause("source", "generation_expired"));
+			return;
+		}
 		if (!predictedAction) {
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
@@ -1378,6 +1372,11 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
+		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
+		const slot = context.sourceSlot;
+		if (slot?.active && slot.requestKind === "proposal" &&
+			runtimeState.sourcesByID.get(node.source)?.concurrentProposalPolicy?.(context.settings) === "first_produced")
+			cancelCompetingProposals(session, slot);
 		const onCandidateMaterialized = adapter.onCandidateMaterialized;
 		if (onCandidateMaterialized) {
 			session.effects.enqueue(() =>

@@ -602,70 +602,63 @@ describe("structural speculative runtime", () => {
 		);
 	});
 
-	it("cancels outstanding initial proposal siblings only after the first produced result", async () => {
-		const winnerGate = barrier();
-		const proposalsEntered = barrier(3);
-		const requestsSettled = barrier(3);
-		const candidateReady = candidateSucceeded();
-		const entered: number[] = [];
-		const aborted: number[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			proposalCount: () => 3,
-			concurrentProposalPolicy: () => "first_produced",
-			propose: async ({ proposalIndex, signal }) => {
-				entered.push(proposalIndex);
-				proposalsEntered.arrive();
-				if (proposalIndex === 0) return undefined;
-				if (proposalIndex === 1) {
-					await winnerGate.promise;
-					return plan("source", "winner", { path: "README.md" });
+	it("races proposals only after one valid binding and ignores cancelled materialization", async () => {
+		for (const mode of ["empty", "invalid", "throw", "late"] as const) {
+			const entered = barrier(3), first = barrier(), winner = barrier(), binding = barrier();
+			const ready = candidateSucceeded(), aborted: number[] = [], materialized: string[] = [];
+			const key = vi.fn(async (tool: string, args: unknown) => {
+				if ((args as { path: string }).path === "first.ts") {
+					if (mode === "late") await binding.promise;
+					else if (mode === "throw") throw new Error("binding failed");
+					else return undefined;
 				}
-				return new Promise<undefined>((resolve) => {
-					signal.addEventListener(
-						"abort",
-						() => {
-							aborted.push(proposalIndex);
-							resolve(undefined);
-						},
-						{ once: true },
-					);
-				});
-			},
-		};
-		const fixture = harness({
-			source,
-			onEvent: (event) => {
-				if (event.type === "source_request") requestsSettled.arrive();
-				candidateReady.observe(event);
-			},
-		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await proposalsEntered.promise;
-		winnerGate.arrive();
-		await Promise.all([requestsSettled.promise, candidateReady.promise]);
-
-		expect(aborted).toEqual([2]);
-		expect(
-			fixture.events
-				.filter((event) => event.type === "source_request")
-				.map((event) => [event.request.request.index, event.request.settlement]),
-		).toEqual(
-			expect.arrayContaining([
-				[0, expect.objectContaining({ status: "empty" })],
-				[1, expect.objectContaining({ status: "produced" })],
-				[
-					2,
-					expect.objectContaining({
-						status: "aborted",
-						cause: expect.objectContaining({ code: "proposal_race_lost" }),
-					}),
-				],
-			]),
-		);
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+				return buildPiActionKey(tool, args, "/workspace");
+			});
+			const fixture = harness({
+				source: {
+					id: "source", enabled: () => true, proposalCount: () => 3,
+					concurrentProposalPolicy: () => "first_produced",
+					propose: async ({ proposalIndex, signal }) => {
+						signal.addEventListener("abort", () => aborted.push(proposalIndex), { once: true });
+						entered.arrive();
+						await entered.promise;
+						if (proposalIndex === 0) return mode === "empty" ? undefined : plan("source", "first", { path: "first.ts" });
+						if (proposalIndex === 1) {
+							await winner.promise;
+							return plan("source", "winner", { path: "README.md" });
+						}
+						return new Promise<undefined>((resolve) => signal.addEventListener("abort", () => resolve(undefined), { once: true }));
+					},
+				},
+				actionKey: key,
+				onCandidateMaterialized: ({ input }) => { materialized.push(String(input.path)); },
+				onEvent: (event) => {
+					if (event.type === "source_request" && event.request.request.index === 0) first.arrive();
+					ready.observe(event);
+				},
+			});
+			try {
+				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+				await first.promise;
+				expect(aborted, mode).toEqual([]);
+				winner.arrive();
+				await ready.promise;
+				expect(aborted, mode).toEqual([2]);
+				binding.arrive();
+				expect(await fixture.runtime.consume(call("turn"))).toBe("speculative");
+				await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+				expect(materialized, mode).toEqual(["README.md"]);
+				expect(key).toHaveBeenCalledTimes(mode === "empty" ? 2 : 3);
+				expect(fixture.executions()).toBe(1);
+				expect(fixture.events).toContainEqual(expect.objectContaining({ type: "source_request",
+					request: expect.objectContaining({ request: expect.objectContaining({ index: 2 }),
+						settlement: expect.objectContaining({ status: "aborted", cause: expect.objectContaining({ code: "proposal_race_lost" }) }) }) }));
+			} finally {
+				winner.arrive();
+				binding.arrive();
+				await fixture.runtime.dispose();
+			}
+		}
 	});
 
 	it("does not deduplicate equal K(a) work across different execution routes", async () => {
