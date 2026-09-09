@@ -102,7 +102,7 @@ export function createLinuxProcessExecutionWorld(
 			roots.add(sourceRoot);
 			const selected = await qualify(sourceRoot);
 			let session: LinuxProcessSession | undefined;
-			return workspaceSandbox.fork({
+			const branch = await workspaceSandbox.fork({
 				cwd: sourceRoot,
 				action: context.action,
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
@@ -151,6 +151,11 @@ export function createLinuxProcessExecutionWorld(
 					}
 				},
 			});
+			if (session) {
+				const ownership = session.ownership, commit = branch.commit.bind(branch);
+				Object.assign(branch, { commit: () => ownership.commit(commit) });
+			}
+			return branch;
 			},
 		},
 		dispose: async () => {

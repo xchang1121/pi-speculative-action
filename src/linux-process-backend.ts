@@ -87,7 +87,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffRegistry, type ProcessHandoff } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "./process-handoff.ts";
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
@@ -148,6 +148,7 @@ type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: 
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	readonly ownership: ProcessHandoffOwnership;
 	readonly metrics: () => LinuxProcessReuseMetrics;
 	/** Join the outer workspace transaction delta to the process observation before validation. */
 	readonly seal: (changes: readonly SandboxWorkspaceChange[]) => Promise<readonly SandboxDirectoryChange[]>;
@@ -232,6 +233,7 @@ interface DispatcherResponse {
 
 interface ActiveSession {
 	readonly token: string;
+	readonly ownership: ProcessHandoffOwnership;
 	readonly sourceRoot: string;
 	readonly workspace: SandboxWorkspaceContext;
 	readonly invocation: ToolProcessInvocation;
@@ -291,7 +293,7 @@ export class LinuxProcessReuseBackend {
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry;
 	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
-	private readonly processScheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
+	private readonly processScheduler = new SpeculationScheduler<object>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly replayWorkspace = new WorkspaceSandboxService();
@@ -499,12 +501,14 @@ export class LinuxProcessReuseBackend {
 			socketPath,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			pending: new Set<Promise<unknown>>(),
+			ownership: new ProcessHandoffOwnership(),
 			nestedEvidence: [],
 			incompleteReasons: new Set<string>(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		await listenUnixSocket(server, socketPath);
 		return {
+			ownership: session.ownership,
 			executor: { execute: (request) => {
 				const pending = Promise.resolve().then(() => this.executeTopLevel(session, request))
 					.finally(() => { session.pending.delete(pending); });
@@ -784,6 +788,7 @@ export class LinuxProcessReuseBackend {
 			(live) => this.plan(weakKey, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
 			session.signal,
 			session.scope,
+			{ ownership: session.ownership },
 		);
 		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined);
 		if (!acquired.work) throw new Error("process work reservation failed");
@@ -798,12 +803,12 @@ export class LinuxProcessReuseBackend {
 	private async acquireProcessResult(
 		weakKey: Sha256Digest,
 		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
-		signal?: AbortSignal,
-		scope?: ExecutionScope,
-		actor?: { readonly timing: ServiceTimingIdentity },
+		signal: AbortSignal | undefined,
+		scope: ExecutionScope | undefined,
+		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
-		let admission = actor ? this.processScheduler.assessCandidateJoin({ identity: actor.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
+		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
 		if (admission && !admission.allowed) {
 			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
 		}
@@ -811,11 +816,11 @@ export class LinuxProcessReuseBackend {
 			key: weakKey,
 			scope,
 			lookup,
-			...(actor ? {
+			...("timing" in participant ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
 					admission = this.processScheduler.assessCandidateJoin({
-						identity: actor.timing, state: "running", expectedSpeculativeDurationMs: 1,
+						identity: participant.timing, state: "running", expectedSpeculativeDurationMs: 1,
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 					});
 					if (!admission.allowed) return "miss";
@@ -826,7 +831,7 @@ export class LinuxProcessReuseBackend {
 					throwIfAborted(signal);
 					return "miss";
 				},
-			} : { role: "producer" as const }),
+			} : { role: "producer" as const, ownership: participant.ownership }),
 		});
 		return {
 			...(acquired.kind === "hit" ? { plan: acquired.plan } : {}),

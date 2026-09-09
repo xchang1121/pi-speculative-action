@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { EffectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import {
@@ -70,8 +71,8 @@ try {
 	const jobControl = await run([tracer, "/bin/bash", "-c", "(sleep 0.05; kill -CONT $$) & kill -STOP $$; printf resumed"]);
 	if (jobControl.code !== 0 || jobControl.stdout.toString() !== "resumed") throw new Error("ptrace changed job-control stops");
 	const detached = await run([tracer, "/bin/bash", "-c", "sleep 1 >/dev/null 2>&1 &"]);
-	if (detached.code !== 0 || detached.durationMs > 500) throw new Error("ptrace waited for a detached shell child");
-	const childConversion = process.arch === "x64" ? await conversionAblation() : undefined;
+	if (detached.code !== 0 || detached.durationMs < 900) throw new Error("ptrace released an owned child after parent exit");
+	const childConversion = process.arch === "x64" ? await conversionAblation(tracer) : undefined;
 	await writeBenchmarkReport({
 		schemaVersion: 1,
 		measuredAt: new Date().toISOString(),
@@ -115,10 +116,11 @@ function assertSame(expected: Outcome, actual: Outcome): void {
 		throw new Error("pass-through tracer changed the command result");
 }
 
-async function conversionAblation() {
+async function conversionAblation(heldExecBinary: string) {
 	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
 	const replayBackend = new LinuxProcessReuseBackend({
 		storeRoot: fixture.storeRoot,
+		heldExecBinary,
 		sandlockBinary: "/pi-dependency-disabled/sandlock",
 		straceBinary: "/pi-dependency-disabled/strace",
 	});
@@ -291,14 +293,6 @@ int main(int argc, char **argv) {
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
-		const beforeMiss = fixture.backend.actorMetrics();
-		const missStarted = performance.now();
-		const miss = await joiningActor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
-		const missMs = performance.now() - missStarted;
-		const missMetrics = metricDelta(beforeMiss, fixture.backend.actorMetrics());
-		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
-		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
-
 		const joinBefore = fixture.backend.metrics();
 		const joiningTask = forkReusableBash(fixture, {
 			label: "held-joining-producer",
@@ -333,11 +327,17 @@ int main(int argc, char **argv) {
 		assert(textOutput(joiningOutput!) === "actor-join\nworker:v2\n", "Actor child output was lost or executed more than once");
 		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
 		assert(
-			joinMetrics.requests === 1 && joinMetrics.hits + joinMetrics.misses === 1 &&
-				joinMetrics.actorTimedHits === joinMetrics.hits &&
-				(joinMetrics.hits === 0 ? joinMetrics.reusedProcessMs === 0 : joinMetrics.actorBaselineMs > 0 && joinMetrics.reusedProcessMs > 0),
-			`Actor acquisition did not settle exactly once: ${JSON.stringify(joinMetrics)}`,
+			joinMetrics.requests === 1 && joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 &&
+				joinMetrics.actorTimedHits === 0 && joinMetrics.actorBaselineMs === 0 && joinMetrics.reusedProcessMs > 0,
+			`Uncalibrated Actor did not join its child exactly once: ${JSON.stringify(joinMetrics)}`,
 		);
+		const beforeMiss = fixture.backend.actorMetrics();
+		const missStarted = performance.now();
+		const miss = await joiningActor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
+		const missMs = performance.now() - missStarted;
+		const missMetrics = metricDelta(beforeMiss, fixture.backend.actorMetrics());
+		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
+		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const completedChild = "worker completed.txt volatile";
 		const completedBefore = fixture.backend.metrics();
@@ -362,6 +362,9 @@ int main(int argc, char **argv) {
 			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:v2\n", "completed child transfer changed its effect");
 			assert(completedMetrics.hits === 1 && completedMetrics.joinedHits === 0 && completedMetrics.sameTurnHits === 1,
 				`Actor did not claim completed same-turn work: ${JSON.stringify(completedMetrics)}`);
+			assert(await completedBranch.commit().then(() => false, (error) =>
+				error instanceof EffectCommitFailure && error.disposition === "recoverable" && error.message.includes("partially consumed")),
+				"enclosing branch retained adoption authority after its one-shot child was consumed");
 		} finally {
 			await completedBranch.dispose();
 		}
@@ -438,7 +441,7 @@ int main(int argc, char **argv) {
 			},
 			joining: {
 				// A fixed arrival lead is a workload parameter, not a promise that joining beats fallback.
-				disposition: joinMetrics.hits === 0 ? "actor" : joinMetrics.joinedHits ? "joined" : "completed",
+				disposition: "joined",
 				actorMs: joiningMs,
 				leadMs,
 				hits: joinMetrics.hits,

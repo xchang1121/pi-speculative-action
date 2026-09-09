@@ -1,5 +1,28 @@
 import type { ExecutionScope } from "./execution-world.ts";
+import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
+
+/** One-shot children and their enclosing branch share adoption authority. */
+export class ProcessHandoffOwnership {
+	private state: "available" | "partial" | "whole" = "available";
+
+	get wholeClaimed(): boolean { return this.state === "whole"; }
+
+	claimChild(): boolean {
+		if (this.wholeClaimed) return false;
+		this.state = "partial";
+		return true;
+	}
+
+	async commit<T>(apply: () => Promise<T>): Promise<T> {
+		if (this.state === "partial") throw effectCommitFailure(new Error("process execution was partially consumed"), "recoverable");
+		this.state = "whole";
+		try { return await apply(); } catch (error) {
+			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") this.state = "available";
+			throw error;
+		}
+	}
+}
 
 export interface ProcessHandoff {
 	readonly completion: Promise<void>;
@@ -14,6 +37,7 @@ type HandoffState =
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
+	readonly ownership: ProcessHandoffOwnership;
 	readonly settle: () => void;
 }
 
@@ -29,7 +53,7 @@ interface AcquireBase<Plan> {
 }
 
 type AcquireOptions<Plan> = AcquireBase<Plan> & (
-	| { readonly role: "producer" }
+	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership }
 	| {
 			readonly role: "actor";
 			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss">;
@@ -54,10 +78,23 @@ export class ProcessHandoffRegistry {
 	async acquire<Plan>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		let joined = false;
 		while (true) {
-			const selected = await this.lookup(options);
-			if (selected.kind === "hit") return { ...selected, joined };
-			if (options.role === "producer" || !selected.running) return this.miss(options, joined);
-			if ((await options.waitForRunning(selected.running)) !== "completed") return this.miss(options, joined);
+			const persisted = await options.lookup();
+			if (persisted) return { kind: "hit", plan: persisted, joined };
+			const records = this.byKey.get(options.key) ?? [];
+			for (const record of [...records].reverse()) {
+				if (record.state.status !== "completed" || !record.state.candidate || !sameScope(record.scope, options.scope)) continue;
+				const candidate = record.state.candidate, oneShot = candidate.dependencyCertificate.taints.length > 0;
+				if (oneShot && record.ownership.wholeClaimed) continue;
+				const plan = await options.lookup(candidate);
+				if (!plan || record.state.status !== "completed" || record.state.candidate !== candidate ||
+					(oneShot && !record.ownership.claimChild())) continue;
+				record.state = { status: "claimed", candidate };
+				this.remove(options.key, record);
+				return { kind: "hit", plan, joined };
+			}
+			if (options.role === "producer") return { kind: "work", work: this.reserve(options.key, options.ownership, options.scope), joined };
+			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope));
+			if (!running || (await options.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
 			joined = true;
 		}
 	}
@@ -74,7 +111,7 @@ export class ProcessHandoffRegistry {
 	}
 
 	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate): boolean {
-		const record = this.record(key, handoff);
+		const record = this.byKey.get(key)?.find((record) => record === handoff);
 		if (!record || record.state.status !== "running") return false;
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
 		record.settle();
@@ -99,37 +136,7 @@ export class ProcessHandoffRegistry {
 		this.byKey.clear();
 	}
 
-	private async lookup<Plan>(
-		options: AcquireOptions<Plan>,
-	): Promise<
-		| { readonly kind: "hit"; readonly plan: Plan }
-		| { readonly kind: "miss"; readonly running?: ProcessHandoff }
-	> {
-		const persisted = await options.lookup();
-		if (persisted) return { kind: "hit", plan: persisted };
-		const records = this.byKey.get(options.key) ?? [];
-		for (const record of [...records].reverse()) {
-			if (record.state.status !== "completed" || !record.state.candidate || !sameScope(record.scope, options.scope)) continue;
-			const candidate = record.state.candidate;
-			const plan = await options.lookup(candidate);
-			if (!plan || record.state.status !== "completed" || record.state.candidate !== candidate) continue;
-			record.state = { status: "claimed", candidate };
-			this.remove(options.key, record);
-			return { kind: "hit", plan };
-		}
-		return {
-			kind: "miss",
-			running: records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope)),
-		};
-	}
-
-	private miss<Plan>(options: AcquireOptions<Plan>, joined: boolean): ProcessHandoffAcquisition<Plan> {
-		return options.role === "producer"
-			? { kind: "work", work: this.reserve(options.key, options.scope), joined }
-			: { kind: "miss", joined };
-	}
-
-	private reserve(key: Sha256Digest, scope?: ExecutionScope): ProcessHandoff {
+	private reserve(key: Sha256Digest, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): ProcessHandoff {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => {
@@ -138,6 +145,7 @@ export class ProcessHandoffRegistry {
 		const record: HandoffRecord = {
 			completion,
 			scope,
+			ownership,
 			startedAt: performance.now(),
 			state: { status: "running" },
 			settle,
@@ -146,10 +154,6 @@ export class ProcessHandoffRegistry {
 		records.push(record);
 		this.byKey.set(key, records);
 		return record;
-	}
-
-	private record(key: Sha256Digest, handoff: ProcessHandoff): HandoffRecord | undefined {
-		return this.byKey.get(key)?.find((record) => record === handoff);
 	}
 
 	private remove(key: Sha256Digest, record: HandoffRecord): void {

@@ -14,6 +14,7 @@ import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { LinuxHeldExecBoundary } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { ProcessHandoffOwnership } from "../src/process-handoff.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
@@ -319,8 +320,10 @@ describe("Linux process ExecutionWorld", () => {
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
 		let payload = "", ownedAtClose = false;
+		const ownership = new ProcessHandoffOwnership();
 		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
+			ownership,
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
@@ -333,7 +336,13 @@ describe("Linux process ExecutionWorld", () => {
 			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, root, "", { fingerprint: "fake-process", context: invocation })!;
 			const branch = await world.speculation.execute({ cwd: root, toolName: "bash", args, action, callID: "opaque",
 				tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal });
-			try { expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]); }
+			try {
+				expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]);
+				await expect(branch.commit()).resolves.toEqual(branch.output);
+				await expect(branch.commit()).resolves.toEqual(branch.output);
+				expect(branch.commitMetrics).toBeDefined();
+				expect(ownership.claimChild()).toBe(false);
+			}
 			finally { await branch.dispose(); }
 			expect(close).toHaveBeenCalledOnce();
 			expect(ownedAtClose).toBe(true);
