@@ -886,8 +886,8 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered",
-		"output-valid", "output-uncovered", "output-rejected", "output-opaque"] as const)(
+	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
+		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup"] as const)(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s", async (scenario) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
@@ -896,11 +896,12 @@ describe("structural speculative runtime", () => {
 		const entered = barrier(), release = barrier(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
-		const succeeds = ["valid", "running-covered", "output-valid"].includes(scenario);
+		const succeeds = ["valid", "running-covered", "output-valid", "output-preferred", "input-lookup"].includes(scenario);
 		let changed = false;
-		const actor = call("turn", { path: "README.md", offset: scenario === "running-outside" ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
+		const actor = call("turn", { path: "README.md", offset: ["running-outside", "input-lookup"].includes(scenario) ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
 		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
 		const projection = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
+			canShareInFlight: scenario === "running-throws" ? () => { throw new Error("proof unavailable"); } : READ_RANGE_ACTION_KEY_PROJECTOR.canShareInFlight,
 			captureCoverage: () => scenario === "output-opaque" ? Object.assign(Object.create({}), evidence) : evidence,
 			projectOutput: ({ coverage }: { coverage: unknown }): string | undefined => {
 				if (!outputOnly) return undefined;
@@ -909,12 +910,12 @@ describe("structural speculative runtime", () => {
 				borrowed.complete = false; borrowed.view.text = "changed by borrower";
 				return output;
 			} };
-		const reconstruct: NonNullable<WorldBranch<string>["reconstruct"]> = async (request) => {
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async (request) => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
 			entered.arrive(); await release.promise;
 			if (scenario === "rejected") throw new Error("evaluation failed");
 			return scenario === "uncovered" ? undefined : "narrow";
-		};
+		});
 		const fixture = harness({
 			source: { id: "source", enabled: () => true,
 				propose: () => plan("source", "projection", { path: "README.md", offset: 1, limit: 100 }) },
@@ -926,7 +927,7 @@ describe("structural speculative runtime", () => {
 				...world("wide", { validate: async () => changed
 					? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
 					: { status: "valid", metrics: zeroValidationMetrics() } }),
-				...(scenario === "legacy-miss" || outputOnly ? {} : { reconstruct }),
+				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
 			onEvent: candidateReady.observe,
@@ -948,6 +949,7 @@ describe("structural speculative runtime", () => {
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+			if (scenario === "output-preferred") expect(reconstruct).not.toHaveBeenCalled();
 			if (scenario === "output-valid") {
 				expect(await fixture.runtime.consume({ ...actor, id: "second-reader" })).toBe("narrow");
 				expect(commit).toHaveBeenCalledTimes(2);
@@ -958,12 +960,17 @@ describe("structural speculative runtime", () => {
 				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
 				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
 					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
-						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, "read.range"]) });
+						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, scenario === "input-lookup" ? "resource.inputs" : "read.range"]) });
 			}
 		} finally {
 			completion.arrive(); release.arrive(); await consumed;
 			await fixture.runtime.finishTurn({ ...actor, terminal: true });
 			admission.mockRestore(); adoption.mockRestore();
+		}
+		if (scenario === "input-lookup") {
+			expect(fixture.events.filter((event) => event.type === "actor_action").at(-1)?.settlement.matchedPredictions).toEqual([]);
+			expect(fixture.events.filter((event) => event.type === "prediction").at(-1)?.settlement)
+				.toMatchObject({ observation: "observed", match: { matched: false } });
 		}
 	});
 
@@ -1110,7 +1117,7 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.actual({ ...mutation, durationMs: 1, output: "Actor" });
 			gate.arrive(); if (phase === "running") await ready.promise;
 			expect(executions).toBe(phase === "running" ? 2 : 1);
-			expect(settlements).toHaveLength(phase === "observation" ? 1 : 0);
+			expect(settlements).toHaveLength(0);
 			await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
 			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
 			const actor = call("turn-2", { path: "future.ts" }), hit = !["sealed stale", "sealed unproven"].includes(phase);
@@ -1119,7 +1126,7 @@ describe("structural speculative runtime", () => {
 			expect(commits).toHaveBeenCalledTimes(hit ? 1 : 0);
 			await fixture.runtime.finishTurn({ ...actor, terminal: true });
 			expect(settlements).toHaveLength(1);
-			expect(settlements[0]).toMatchObject({ observation: "observed", match: { matched: true, adoption: { status: hit && phase !== "observation" ? "adopted" : "rejected" } } });
+			expect(settlements[0]).toMatchObject({ observation: "observed", match: { matched: true, adoption: { status: hit ? "adopted" : "rejected" } } });
 		} finally { gate.arrive(); await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true }); }
 	});
 

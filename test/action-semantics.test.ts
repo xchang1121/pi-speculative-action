@@ -5,6 +5,7 @@ import {
 	type ActionKeyProjector,
 	type ActionSemanticsDefinition,
 	ActionSemanticsRegistry,
+	actionKeyCovers,
 	actionKeyMatch,
 	actionKeyMismatchReason,
 	buildActionKey,
@@ -132,6 +133,10 @@ describe("ActionSemanticsRegistry", () => {
 			kind: "projected",
 			projector: "permissive",
 		});
+		const covering = { ...permissive, id: "covering", canShareInFlight: () => true };
+		expect(actionKeyCovers(base, sameEnvelope, [permissive])).toBe(false);
+		expect(actionKeyCovers(base, sameEnvelope, [permissive, covering])).toBe(true);
+		expect(actionKeyMatch(base, sameEnvelope, [permissive, covering], true)).toMatchObject({ kind: "projected", projector: "covering" });
 
 		for (const [field, value, reason] of [["tool", "grep", "different_tool"], ["semanticsEpoch", "read.v2", "different_semantics"],
 			["schemaHash", "schema.v2", "different_schema"], ["executionFingerprint", "executor.v2", "different_executor"]]) {

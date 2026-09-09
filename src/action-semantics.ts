@@ -342,23 +342,16 @@ export function actionKeyCovers(
 	actor: ActionKey,
 	projectors: readonly ActionKeyProjector[] = [],
 ): boolean {
-	const match = actionKeyMatch(speculative, actor, projectors);
-	if (!match) return false;
-	if (match.kind === "exact") return true;
-	const projector = projectors.find((candidate) => candidate.id === match.projector);
-	if (!projector?.canShareInFlight) return false;
-	try {
-		return projector.canShareInFlight(speculative, actor);
-	} catch {
-		return false;
-	}
+	return actionKeyMatch(speculative, actor, projectors, true) !== undefined;
 }
 
-/** K(a_s) can satisfy K(a) exactly, or when some π maps K(a_s) to K(a). */
+/** Lookup relation only; adoption still requires realized output/input coverage and branch evidence. */
 export function actionKeyMatch(
 	speculative: ActionKey,
 	actor: ActionKey,
 	projectors: readonly ActionKeyProjector[] = [],
+	/** Prediction matching requires request containment, not merely overlapping reusable inputs. */
+	requireCoverage = false,
 ): ActionKeyMatch | undefined {
 	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
 	if (
@@ -373,6 +366,7 @@ export function actionKeyMatch(
 	for (const projector of projectors) {
 		let projected: ProjectedActionKey | undefined;
 		try {
+			if (requireCoverage && projector.canShareInFlight?.(speculative, actor) !== true) continue;
 			projected = projector.project(speculative, actor);
 		} catch {
 			continue;

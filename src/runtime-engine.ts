@@ -4,7 +4,6 @@ import type {
 	ActionKeyMatch,
 	ActionKeyProjector,
 	ActionSemanticsRegistry,
-	ProjectedActionKeyMatch,
 } from "./action-semantics.ts";
 import { actionKeyCovers, actionKeyMatch, ownActionKeyProjector, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorCallAttempt } from "./actor-call-attempt.ts";
@@ -232,12 +231,9 @@ function candidateBranch<Output, StartInput, StateData>(
 function canShareInFlight<Output, StartInput, StateData>(
 	candidate: CandidateRecord<Output, StartInput, StateData>,
 	actor: ActionKey,
-	match: ProjectedActionKeyMatch,
 	rules: readonly ActionProjectionRule<Output>[],
 ): boolean {
-	if (!activeExecution(candidate)) return false;
-	const rule = rules.find((item) => item.id === match.projector);
-	return rule?.canShareInFlight?.(candidate.key, actor) === true;
+	return activeExecution(candidate) && actionKeyCovers(candidate.key, actor, rules);
 }
 
 function captureCoverage<Output>(
@@ -271,13 +267,14 @@ async function projectOutput<Output, StartInput, StateData>(
 	if (!reconstruct && (!coverage || !rule.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		const projected = reconstruct ? await reconstruct(request) : cloneSharedData(await rule.projectOutput!({
+		let projected = coverage && rule.projectOutput ? cloneSharedData(await rule.projectOutput({
 			speculative: candidate.key,
 			actor,
 			output,
-			coverage: cloneSharedData(coverage!.value),
+			coverage: cloneSharedData(coverage.value),
 			keyMatch: match,
-		}));
+		})) : undefined;
+		if (projected === undefined) projected = await reconstruct?.(request);
 		const durationMs = Math.max(0, performance.now() - startedAt);
 		return projected === undefined
 			? { ok: false, cause: cause("projection", "view_not_covered") }
@@ -1576,11 +1573,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		const insertion = runtimeState.candidates.jobs.insertOrGetCompatible(
 			session.id,
 			candidate,
-			(existing, match) =>
+			(existing) =>
 				existing.origin === "prediction" &&
 				sameSpeculativeExecutionRoute(existing.route, route) &&
 				candidateWorld(existing) === parent &&
-				canShareInFlight(existing, node.actionKey!, match, runtimeState.projectionRules),
+				canShareInFlight(existing, node.actionKey!, runtimeState.projectionRules),
 			(existing) =>
 				existing.origin === "prediction" &&
 				sameSpeculativeExecutionRoute(existing.route, route) &&
@@ -2688,7 +2685,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			)
 				continue;
 			if (lookup.match.kind === "projected") {
-				if (!canShareInFlight(candidate, key, lookup.match, runtimeState.projectionRules)) continue;
+				if (!canShareInFlight(candidate, key, runtimeState.projectionRules)) continue;
 			}
 			if (candidate.work.execution.status === "succeeded") {
 				const validation = await validateCandidate(candidate);
@@ -2814,12 +2811,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		const now = performance.now();
 		return candidates
 			.flatMap((candidate) => {
-				const match = actionKeyMatch(candidate.key, action, runtimeState.projectionRules);
-				if (!match || !activeExecution(candidate)) return [];
 				const execution = candidate.work.execution;
 				// Input recall is not a proof that unfinished work can satisfy this Actor query.
-				if (execution.status !== "succeeded" && match.kind === "projected" &&
-					!canShareInFlight(candidate, action, match, runtimeState.projectionRules)) return [];
+				const match = actionKeyMatch(candidate.key, action, runtimeState.projectionRules, execution.status !== "succeeded");
+				if (!match || !activeExecution(candidate)) return [];
 				const remainingMs =
 					execution.status === "running"
 						? Math.max(0, candidate.expectedDurationMs - (now - execution.startedAt))
@@ -2863,7 +2858,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		decisionSequence: number,
 	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] =>
 		nearestPredictions(session, decisionSequence, (node) => {
-			const relation = actionKeyMatch(node.actionKey!, action, runtimeState.projectionRules);
+			const relation = actionKeyMatch(node.actionKey!, action, runtimeState.projectionRules, true);
 			return relation ? { node, relation } : undefined;
 		});
 
