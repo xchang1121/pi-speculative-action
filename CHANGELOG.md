@@ -1,366 +1,45 @@
-# Changelog
+# 更新记录
 
-## [Unreleased]
+## 当前实现
 
-### Breaking Changes
+本文维护当前行为与重要边界，不累计已经撤销的功能方案和版本叙述；历史改动保存在 Git 提交记录中。
 
-- Linux producer epoch v20 requires script execution to preserve its file-descriptor read position.
-  Sandlock reuses its ELF classification instead of consuming script bytes in the ELF parser;
-  faulty binaries fail qualification and prior producer proofs cold-miss without clearing the store.
-- `createExecPrototype` now returns an owned, validated canonical prototype, so invalid identity
-  fails at construction instead of the first key/seal call. stdin/FD records and nested plain data
-  are copied without freezing caller data; opaque nested values and non-string platform identities
-  are rejected. Only module-owned normalized prototypes skip recapture; v7 semantic keys are unchanged.
-- `ProcessReuseRequest` now requires `weakKey` instead of `prototype`. Derive it once with
-  `processWeakKey(boundPrototype)` at the invocation boundary and reuse it for scheduler timing,
-  handoff reservation and persistent/live lookup. A key locates candidates; it does not grant replay
-  authority. Producer, current-resource, artifact and observation-contract checks remain unchanged.
-- Canonical JSON named keys, process environments and dependency identities now use exact UTF-16
-  ordering instead of locale collation. Process certificates move to v7: v6 weak keys cold-miss and
-  timing-inclusive legacy IDs are rejected. No store clear is performed; existing GC policy still applies.
-  Exact duplicate dependencies collapse once per normalization; conflicting evidence still fails closed.
-- Projector/rule identifiers and callback slots are captured at registration across semantics, Host,
-  Runtime and candidate indexes; later provider edits do not redefine an indexed relation or adoption.
-  Output coverage must be shareable plain data and each callback receives a separate copy. Opaque
-  evidence declines output projection without disabling independently sealed-input reconstruction.
-- Closed-search v5 optionally binds captured grep through the existing TUI search choice. Qualified
-  existing engines are Windows x64 rg 15.2.0 and Linux x64 rg 14.1.0; unavailable rg leaves find independent.
-  The explicit profile sorts paths and disables ambient rg/global ignore configuration, not parent rules.
-  Native Pi remains the default; a bound call never switches executor on failure. Pool retirement owns
-  native close, prepared-input cleanup and the pinned executable; no dependency or installation was added.
-- Closed-search v4 binds HOME in executor identity and keeps prepared arguments unchanged in K(a).
-  Worker requests now take `{ kind, root, home, args }`; bootstrap environment is not invocation identity.
-- Search pool `run(role, operation, signal)` replaces request forwarding: the lease now owns input
-  preparation and final cleanup as well as the worker. Retirement cancels producers, drains Actors,
-  and retains outstanding cleanup even after a worker has physically closed.
-- Captured-input profiles declare `resourceScope: "captured_inputs"`, which never certifies an ambient
-  Actor execution window. Read the scope from the definition; removed the unused registry forwarding method.
-- Transaction attempts and sealed views own immutable route, resource, validation, execution and compatibility
-  evidence. Backend operation slots are bound at sealing; later provider changes cannot replace proof,
-  adoption or cleanup. Opaque checkpoint handles and method receivers stay with their backend owner.
-  Revalidation waits an already-reserved commit; commit telemetry remains available after settlement.
-- Resource views expose no-follow final-entry metadata through `stat(path, "entry")`; the unused
-  `alias` forwarding method was removed. Link metadata grants no authority to read the target.
-- Shared transactions now own a sealed data result and give each reader/adoption a separate copy.
-  Enumerable Symbol data keys survive copying. Opaque prototypes, proxies, accessors, Symbol values
-  and hidden fields are not shareable; failed sealing retires the branch without freezing or rewriting
-  the Actor result. Only exclusive commits may update the settlement.
-- Gateway world calls now take their already-bound execution context directly; removed the unused
-  `ToolExecutionContextFactory` callback boundary and redundant capture/descriptor forwarding.
-- Scheduler preemption now requests cancellation without releasing capacity. Executors return their
-  slot through `complete`; the redundant `discard` alias and untracked preview admission are removed.
-- Removed `WorldBranch.watch`, `watchResourceVersion` and `ResourceVersionManager.subscribe`.
-  Shared results require a backend `validate` proof on reuse; Actor path overlap and filesystem events
-  no longer evict a sealed result. Pending work and checkpoint descendants still invalidate conservatively.
-- Removed the global workspace convenience functions (`createWorkspaceSandbox`, `commitSandboxDelta`,
-  `forkSandboxWorkspace`, `withSandboxWorkspace`, `prepareSandboxWorkspace`, `closeWorkspaceSandboxPools`,
-  `workspaceSandboxFingerprint`, `qualifyWorkspaceSandboxDriver`). Own a `WorkspaceSandboxService` and
-  call its equivalent methods; Bash replay now drains its own commit lifetime instead of a global singleton.
-- A rejected `resolveInvocation` now fails that Actor invocation instead of silently selecting another executor.
-  `ToolOperation.invocation` remains available without a cache key; explicitly bound profile semantics also
-  govern routing, observation, resource contention, and candidate invalidation.
-- Removed `BASH_TAIL_LINES_ACTION_KEY_PROJECTOR`, `PI_BASH_TAIL_LINES_PROJECTION_RULE`,
-  `BashTailLinesView`, and `bashTailLinesView`: shell text cannot prove the behavior of a resolved
-  `tail` command. Exact Bash adoption and native process-certificate reuse remain available.
-- Removed the unused `ActionReuseKind`, `actionKeyProjects`, and `artifact_seed` planner surfaces;
-  process reuse now has one completed-replay path and otherwise executes the Actor action.
-- Removed provider-side self-fork controls from Drafter-model requests. Self-speculation now decorates and forks only the authoritative Actor stream.
-- Split materialized prediction identity into exact `predictedAction` and lossless covering `executionAction`; target-decoder candidates no longer inherit execution-projection identity.
-- Replaced the separate `keyProjectors` and `projectOutput` integration hooks with unified `projectionRules`; each lossless rule now owns its key relation, realized coverage proof, output reconstruction, and directed in-flight compatibility.
-- Added required `ActionKey.schemaHash`; canonical keys now include execution class and validated input schema, preventing reuse after an in-session tool contract change.
-- Removed the deprecated `ToolCache`, `maxCandidates`, `liveReadonly`, `minEmpiricalProbability`, and fixed single-step `mode` compatibility surfaces.
-- Replaced inferred hit `savedMs`, `waitedMs`, `consumeOverheadMs`, `actorLeadMs`, and wall-clock speedup telemetry with monotonic `executionAheadMs`, `hitLatencyMs`, and diagnostic `attemptLeadMs`; execution overlap is capped by measured execution time, and matching leases no longer rewrite the timing owner of a deduplicated or cached job.
-- Replaced copied plan/candidate statuses and split feedback callbacks with authoritative execution, prediction, and Actor-action settlements. Preparation hints no longer emit Actor prediction outcomes.
-- Renamed ambiguous summary and inspection fields to `predictionRejectedAfterMatch`, `actorCandidateRejections`, `candidateTerminalCauses`, and `exclusiveCandidates`/`sharedCandidates`.
-- Renamed the plan dependency and continuation signal from `actor_confirmed` to `actor_adopted`; a key match without a usable result no longer satisfies downstream work.
-- Renamed source request horizons and `requestLifetime: "actor_action"` to decision-batch units; one Actor response may contain several parallel tool actions but advances prediction time only once.
-- Split action identity from execution isolation. `ActionKey` no longer contains an execution class; adapters now resolve a `SpeculativeExecutionRoute` after K(a) materialization.
-- Replaced the three tool groups (`resourceCached`, `sandbox`, and `predictionOnly`) with one prediction-enabled `tools` list. Legacy grouped settings are accepted only at the configuration migration boundary.
-- Replaced the single sandbox option with `executionWorlds`. A runtime-scoped world takes priority for every tool.
-- Renamed prediction-only fallback telemetry to the general execution-blocked terminology.
-- Unified every successful speculative tool exit as a backend-owned `WorldBranch`. Removed the adapter's parallel resource-version callbacks and the redundant `ResourceVersionPolicy`; validation, invalidation, commit, and disposal now follow the branch lifecycle.
-- Replaced tool-to-backend `localIsolation` declarations and opaque route handles with action-effect declarations and one `ExecutionWorldRouter`; runtime worlds cover the full tool surface, unavailable worlds fall through during resolution, and all preparation, fork, and disposal stays behind the router.
+### 动作身份与预测
 
-### Added
+- Drafter、Actor probe 和 PatternAware 共用计划、调度与结算。参数在生成 K(a) 前准备一次，键与实际执行器绑定后不再漂移。
+- K(a) 包含语义、schema、已准备参数和执行身份；资源新鲜度由封存证据独立证明。来源、调用编号和轮次不构成执行等价性。
+- 计划更新先捕获不可变输入，再进入按计划排序的准入通道；父动作发生语义变化时更新后代绑定。已被 Actor 借用的事务保留结算权。
+- 候选索引保存注册时的成员关系与投影规则；验证失败、删除重插或回调修改不能复活退休记录。
+- Drafter 宽度默认两个单动作请求，首个有效结果可取消仍运行的同伴；更宽采样由显式设置控制。后继预测沿用下一决策的请求额度。
+- Actor probe 只派生自权威 Actor 流。目标 token 验收与工具动作采纳分别计量，不把注册确认或仅键匹配算作收益。
 
-- K(a) captures the selected profile metadata, canonicalizer and execution binding before calling
-  provider canonicalization. Already-issued definitions retain identity without repeated normalization;
-  mutable provider records are freshly captured for each call, not cached as results or configurations.
-- PatternAware lease retirement shares one settlement across all release callers, including flush
-  failures; the lease remains registered before entering persistence callbacks and decrements only once.
-- PatternAware shares feedback counter definitions across types, initialization and persistence
-  validation, and deep-copies each public snapshot once. Persistence fields and versions are unchanged.
-- Validation and reconstruction register their borrowed lifetime before entering backend callbacks,
-  including callbacks that synchronously request transaction retirement.
-- Gateway retirement drains transaction sealing-failure cleanup before disposing execution worlds.
-- Runtime candidate indexing now calls its existing pending/result stores directly for local operations;
-  removed seven forwarding helpers while retaining atomic cross-store transitions and branch disposal.
-- Find and grep qualification share the existing bounded search worker and its owned process/input
-  protocol. Removed the separate grep worker and secondary tool discovery; no production grep route
-  is enabled. OS input errors retain stock Pi handling, while unproven input authority rejects the call.
-- Bounded grep cost qualification (`--cost-only`, optionally `--case=repository,unicode`) trains the
-  same Host on original Actor calls before measuring adoption, reports fallback separately, and checks
-  exact-once Actor execution without changing the benefit gate or enabling production grep.
-- Dependency-free grep qualification now includes captured ancestor configurations and Git indirection,
-  keeping native repository detection and original Actor fallback. Production grep remains unchanged.
-- Explicit filesystem operations may bind a read-only capture root and inspect captured resolved names.
-  The default remains the workspace; external named inputs share the existing token budget and validation.
-- Consolidated authoritative execution and observation into the gateway's single frozen settlement;
-  observer failures cannot replace the Actor result, and poisoned reuse still forbids fallback.
-- Captured find uses Pi's installed matching/ignore components; the experimental search installer and its dependencies were removed.
-- Fixed-search execution uses one bounded process with asynchronous, invocation-owned input requests;
-  the old relay thread/shared-memory mailbox is removed. Full-tool qualification shares the production
-  protocol; imports are inert, and arbitrary qualification commands are denied by the production kernel.
-- Extracted the fixed closed-search kernel and invocation-owned input failures into the packaged
-  implementation used by qualification. Native Actor defaults are unchanged; captured find shares
-  worker pooling and TUI profile selection, while grep remains in qualification.
-- Added task-clustered bootstrap confidence intervals and nearest-rank p95 to
-  suite latency reports; pooled acceleration remains a ratio of means, and
-  repeats of the same instance stay in one resampled cluster.
-- Added an optional ThinkThread profile that pre-executes self-contained `read`, `ls`, `write`,
-  and `edit` calls and captures Actor-authorized `grep`/`find` results for later validation.
-  External-process search and Bash remain on the Actor path when their dependencies are unsealed.
-- Added capability-derived tool policy: startup diagnostics now keep unroutable preferences inactive,
-  prediction sources receive only safe current tools, and the TUI reuses this result without per-tool probes.
-- Added user-facing reuse accounting led by all tool calls. Bash child-command hit rate and matched-command
-  savings appear only when relevant, as a separate secondary measure that is never added to tool-call reuse.
-  TUI cache tiers are named by purpose.
-- Added a driver-native workspace structure contract shared by top-level provenance and nested
-  transactions. OverlayFS now prewarms one immutable lower snapshot per content commit and
-  reconstructs each logical tree from only typed upper paths and ancestors.
-- Added cost-qualified COW selection for the trace-guarded Linux process world: exact Git baseline
-  trees below the conservative measured 256-entry boundary retain Git, while larger trees may use a fully
-  probed `clone_fd` OverlayFS mount. Generic mutation fallbacks remain on portable Git.
-- Added fail-closed observation of workspace-driver semantic gaps. `EXDEV`, `EOPNOTSUPP`, `ENOTSUP`,
-  and `ENOSYS` results on workspace resources make provenance indeterminate, including a handled
-  lower-directory rename that would otherwise produce a different result from the Actor filesystem.
-- Made the Linux process world drain its backend and then reclaim only its owned workspace pools on
-  disposal; parallel worlds and tests no longer delete one another's live upper layers.
-- Added a capability-selected Linux/WSL workspace driver using hash-pinned `fuse-overlayfs`, one
-  immutable Git lower tree shared across forks, private upper/work layers outside the sandbox's
-  writable process area, and exact Git fallback whenever the complete mount lifecycle is unavailable.
-- Added a typed OverlayFS effect frontier: copy-ups and creations are read directly from the upper
-  journal, 0/0 whiteouts and opaque directories expand only the affected immutable Git subtree, and
-  final bytes still pass merged-view/checkpoint comparison plus atomic Actor-world validation.
-- Added OverlayFS lifecycle health demotion and conservative resource retention: recovered unmount
-  failures send later `auto` routes to Git, while storage under an unverified live mount is never
-  deleted or recycled.
-- Kept the workspace transaction clock out of the speculative namespace: OverlayFS routes now hold
-  an anonymous `O_TMPFILE` inode in private upper-layer storage and prove its timestamp ordering
-  against the merged view; Git routes keep their named clock in the private process parent. No
-  runtime control entry is observable through the Bash workspace.
-- Quarantined pools behind an unverified live FUSE mount: they leave the allocation index, never
-  enter idle reclamation, and no longer block plugin shutdown while their backing storage is retained.
-- Added fail-closed tracing for persistent file semantics outside the typed transaction, including
-  extended attributes, explicit timestamp updates, allocation changes, and mutating file ioctls.
-- Added reusable process-cache miss diagnostics that preserve the exact dependency paths which made
-  a previously eligible pathset stale.
-- Added generic cost-aware candidate adoption to the Runtime scheduler. Exact-action and
-  tool/execution-world timing classes now keep Actor execution, speculative execution, and
-  validation/projection/commit distributions separate; unfinished joins receive measured deadlines
-  and completed hits can fall back when adoption itself is slower.
-- Added typed directory creation/removal across process observation, provenance journals, parent
-  checkpoints, completed replay, atomic workspace adoption, final-state verification, and rollback.
-  Directory records preserve entry digests, mode, uid, and gid; metadata/type/link transitions outside
-  the modeled subset continue to fail closed.
-- Added verified artifact-closure leases: every referenced output/file blob is loaded and SHA-256
-  checked before replay side effects, duplicate references are deduplicated, and replay no longer
-  reopens CAS files after mutation begins.
-- Added a fail-closed Linux/WSL 2 process execution world using private Git branches, user/PID/network/IPC/UTS/mount namespaces, Sandlock Landlock/seccomp policy, and exact adoption-time provenance validation.
-- Added parent-independent, cross-turn process certificates with exact exec prototypes, dynamic file/directory/absence/symlink dependencies, ordered output/effect replay, at-most-once broker semantics, and single-flight publication.
-- Added transparent mount-namespace exec interposition that preserves the command-visible `PATH` and environment, plus a pinned `npm run setup:linux` installer for Sandlock.
-- Added a generic async process outlet and effect-capability routing so process-backed tools retain their own validation and formatting without tool-name-specific sandbox implementations.
-- Added a reproducible real-machine Pi Bash qualification that proves cross-parent hits, ordered output/effect equality, adoption freshness, and dependency-change invalidation.
-- Added authoritative observation capture: a successful read-only Actor fallback can transfer its pre-execution freshness evidence and one real output into the existing shared result cache without a duplicate tool invocation or a second cache implementation.
-- Added a target-verification ledger that calibrates decoder candidate order by model, endpoint, format, tool, and source while keeping token evidence separate from semantic action learning.
-- Added a policy-facing Actor settlement channel; the sidecar fork gate now credits only source-attributed, actually adopted `executionAheadMs` instead of intent-match wall-clock lead.
-- Sidecar fork handoff now preserves complete parallel tool-call batches and their candidate, provenance, score, call-format, timing, and logprob evidence instead of flattening the first call into an alternative.
-- Added Runtime-owned Actor action materialization and collision-resistant SHA-256 decoder candidate IDs, removing the self-speculation coordinator's parallel K(a) reconstruction.
-- Added a configurable SPORK minimum-token confidence gate for sidecar action execution; the default 0.90 threshold fails closed on missing evidence without suppressing the underlying fork or decoder telemetry.
-- Added a bounded, turn-scoped handoff that admits complete sidecar-fork tool calls to the ordinary speculative-action Runtime without issuing another inference request.
-- Added a batch-atomic action-Drafter utility gate that charges all root proposal service, credits only realized Drafter-owned tool execution ahead, and retains bounded recovery probes; it is independently configurable from target-decoder self-speculation.
-- Added clear-time target-verification telemetry with per-candidate IDs, Drafter/PatternAware source correlation, and separate resolved, accepted, rejected, and unresolved draft-token counters.
-- Added a model-scoped net-benefit gate for sidecar forks with bounded recovery probes, endpoint-failure backoff, strict Actor K(a) outcome telemetry, and tape replay analysis.
-- Added an opt-in SPORK/self-speculation bridge with stable Actor request IDs, provider and sidecar fork transports, bounded control requests, configurable model-format boundaries, and package/TUI settings.
-- Added one ranked target-decoder bundle for every validated concrete K(a), merging identical Drafter and PatternAware predictions with source/proposal provenance even when local execution is unavailable.
-- Added non-mutating PatternAware prediction rebasing after authoritative Actor actions and adopted Drafter results, allowing actual tool outputs to revise later same-turn actions before the normal learning boundary.
-- Added a standalone repository boundary with its own TypeScript configuration, dependency lock, and Pi public-loader test; development no longer requires a Pi monorepo checkout.
-- Added a speculative tool runtime with a host adapter, conservative action keys, resource validation, lifecycle events, and running or ready result reuse.
-- Added canonical sandbox keys, an explicit sandbox host boundary, temporary `write`/`edit` execution, verified adoption, and opt-in bash process execution.
-- Added private Git worktree snapshots, multi-file bash change capture, transactional world commit with rollback, and normalized cache/actual telemetry.
-- Added a source-built Rust sandbox backend for Linux, macOS, and Windows, plus a versioned TypeScript broker, hash-verified packaged asset discovery, and fail-closed native process execution.
-- Added an installable zero-modification Pi package that uses public lifecycle events, same-name tool overrides, public stock tool factories, and package-owned settings.
-- Added a hierarchical Pi TUI for prediction, scheduling/cache, tool policy, and isolation, with configured, active, OCI, and native backend health reported separately.
-- Added PatternAware online action-pattern learning with late-bound templates, future-gap leases, compact persistence, preparation hints, and utility-based resource scheduling.
-- Added gap-weighted and decayed PatternAware inference, suffix backoff, collection mappers, retryable persisted analyzers, and multi-step frontiers.
-- Added watcher-backed resource versions with exact-validation fallback, eager invalidation, byte-bounded per-session caches, pooled Git workspaces, and phase-level runtime metrics.
-- Added an indexed per-session tool cache with atomic exact-key registration for cross-turn single-flight reuse.
-- Added production Pi `read` range projection backed by structured realized-output coverage; grep and find remain exact-key-only.
-- Added probation/protected speculative cache tiers: new results remain eviction-first until a successful actor hit promotes them, with bounded protected occupancy by entries and bytes.
-- Added aggregate, input-free K(a) rejection counts to hit and miss telemetry.
-- Added one `ExecutionWorldRouter` with the priority `runtime_sandbox` → registered local fallback → Actor fallback.
-- Added `resource_snapshot` as the local route for `read`, `grep`, `find`, and `ls`, and `workspace_branch` as the Git-worktree route for `write` and `edit`.
-- Added an explicit `execution_blocked` plan state. Blocked predictions remain matchable without being confused with an impossible dependency.
-- Added counterfactual timing for isolation-blocked matches using the same capped lead-time decomposition as adopted speculative work.
+### 执行、证据与事务
 
-### Changed
+- 唯一 Router 选择统一执行环境、本地安全后备或 Actor；预测源不选择后端，K(a) 不随隔离路线改变。
+- Windows/WSL 共用封存输入上的原版 read/ls，write/edit 沿用工作区事务。输入重算不扩大权限，输出投影另需真实覆盖证明。
+- 资源指纹批次失败后停止领取新项，等待已启动读取和文件句柄关闭，再返回原始错误；递归目录与平铺依赖共用该路径。
+- 所有者关闭时先停止准入，再排空物理执行、取消、输入准备、封存、事务借用与清理，之后回收所属工作区。
+- 进程会话拥有顶层调用和整个 broker 请求链；并发 close 共用同一完成。trace 分配失败也会终止已开始的事务捕获。
+- Sandlock 只对 ELF 调用解释器解析器，脚本输入不被预读消耗；Runtime 和安装器通过真实脚本执行检查生产者资格。
+- `createExecPrototype` 返回已校验且自有的规范原型。进程消费者接收在调用边界生成一次的 `weakKey`，不重复规范化，也不把键当作执行许可。
+- 证书身份使用精确字符顺序和当前执行契约。重放前一次性验证完整输出/效果闭包；CAS 不会在部分采纳后重新读取产物。
+- 原子发布只回收成功独占创建的临时文件；GC 与失败的并行维护必须由原有执行生命周期等待。
+- 共享事务和投影结果持有独立副本，保留可枚举 Symbol 数据。无法证明共享性的值拒绝复用，不改写 Actor 权威结果。
+- Actor 采纳依次验证等价性、权限、新鲜度、生产者保证、收益与提交。可证明无效果的拒绝允许恰好一次 fallback；不确定或部分提交失败禁止重跑。
 
-- Consolidated redundant prediction, key/projection, routing and extension tests into existing fixtures.
-  Removed duplicate pseudo-platform and lifecycle cases; the suite is 493 lines and 17 entries smaller.
-- The existing Git process owner now binds private repository/index arguments once. Workspace and
-  transaction capture share regular-blob decoding while retaining their separate byte limits;
-  removed redundant sandbox fields and repeated option declarations without another forwarding layer.
-- Prediction, Actor preview and observed-result candidates share one initializer for identity sequence,
-  reservation ownership and accounting defaults; origin-specific timing, coverage and routes remain explicit.
-- Settings menus share their existing action loop and grouped editors; labels, dynamic submenus,
-  staged updates and destructive-action confirmation retain their behavior without parallel handlers.
-- Resource snapshots are now observation-only authority; speculative execution requires a provider
-  with an actual isolation guarantee. Bash whole-command and child reuse share the process coordinator.
-- Bash telemetry now separates eliminated process work from calibrated Actor critical-path savings;
-  uncalibrated hits report unavailable timing instead of manufacturing a speedup.
-- Reorganized the Pi TUI around direct source and tool choices. Sampling, learned-pattern internals, Actor-fork protocol details, benefit gates, scheduling, and storage now live under Advanced settings with mode-dependent fields hidden.
-- A five-point WSL2 stock Pi Bash sweep now retains both sides of the measured adoption crossover.
-  Zero-, 40-, and 43-round in-flight candidates fall back, while 48- and 96-round candidates join;
-  the conservative 96-round estimate saves 1705.23 ms. A completed zero-round hit also falls back
-  because its 70.41 ms median adoption cost exceeds 28.72 ms median direct execution.
-- A five-pair WSL2 stock Pi Bash qualification of a child that creates two directories and a 32 MiB
-  deterministic artifact reduced median-of-medians from 2686.65 ms direct to 936.26 ms replayed
-  (65.1%, 2.87x), with 15/15 hits and zero taints. Preserved short-task results also show a 384.56 ms
-  direct task regressing to 937.24 ms under replay, establishing cost-aware admission as required
-  follow-up rather than treating every valid certificate as profitable.
-- Large process effects now replay from their prevalidated artifact closure. A 128 MiB regular-file
-  effect reduced median complete Pi Bash hit latency from 2084.65 ms to 1928.33 ms (7.5%) while
-  closing the integrity-check/reopen race.
-- Process-certificate lookup now captures each distinct dynamic dependency pathset once and derives
-  the current strong key against every historical state in that group. Reverting a 32 MiB input with
-  eight cached states reduced median exact validation from 294.11 ms to 38.14 ms and complete Pi Bash
-  hit latency from 1259.85 ms to 1003.94 ms on the qualified WSL2 host.
-- Width-two Drafter requests now use first-valid hedged admission: the first schema-valid enabled action cancels only still-running initial-proposal siblings through their existing provider signals. Empty, failed, and invalid responses cannot win; explicitly wider sampling still admits all responses. Recorded strict hits, lead, and D3 verifier work are unchanged while 7.78% of width-two service is removable residual work.
-- Reduced the default independent Drafter request width from eight to the tape-derived Pareto point of two; explicit `candidateLimit` settings remain uncapped, while the retained width preserves all recorded exact hits and lead with 30% fewer requests than the full recorded cohort.
-- Raised the default target-decoder action draft cap from 20 to the tape-derived Pareto saturation point of 28 tokens; explicit user and engine caps still win.
-- PatternAware now carries an unchanged K(a)/horizon set across the provider-turn boundary instead of issuing a duplicate prediction opportunity; changed authoritative feedback still emits a fresh candidate set for normal runtime arbitration.
-- Detached the repository from its former GitHub fork network while preserving the standalone speculative-action history; `xchang1121/pi` is now an independent repository.
-- The Pi package manifest now loads `src/extension.ts` directly, so Git installation works without monorepo build artifacts; npm packing still builds the exported `dist` library.
-- Actor stream previews now start lossless covering reads when a complete path field is decoded; final K(a), realized coverage, and freshness remain authoritative.
-- Read projection now reuses Pi coding-agent's public truncation contract and compact, in-memory coverage descriptors; projected single-flight reuse also requires explicit opt-in.
-- World commit now serializes overlapping targets, uses staged atomic replacement, preserves file modes, and removes newly created directories during rollback.
-- Drafter candidates now reuse exact and containing-read cache entries, deduplicate in-flight work, and replace stale resource entries before execution.
-- Resource candidates now use probation/protected, value-aware eviction, and sandbox failures fall back without mutating the real workspace.
-- Renamed read-only execution telemetry and settings to `resource_cached`/`resourceCached`.
-- Pattern-aware and drafter predictions now deduplicate onto shared jobs, learned actions can be admitted immediately after authoritative results, and in-flight work is preempted by explicit utility and per-session cache budgets.
-- PatternAware persistence now stores shared events once and references them from inference pools, preserving cross-process mapper evidence without repeatedly serializing tool payloads.
-- PatternAware now calibrates each co-occurring target against one provider decision opportunity, preserving marginal confidence for parallel tool batches and migrating persisted counters.
-- PatternAware now learns executable tool payloads separately from K(a), retains multiple replayable argument mappings for one control context, and ranks each branch against all observed target-tool alternatives for that context.
-- PatternAware now launches at the first quartile of its learned future-gap distribution while retaining the largest observed gap as the miss deadline, increasing useful lead time without widening the match window.
-- Actor lookup cascades across authorization, freshness, execution, compatibility, projection, and world-commit failures before falling back to real execution.
-- Compatible cache insertion is now atomic and directed, so a broader running read can single-flight a narrower request without ever coalescing in the unsafe reverse direction.
-- Native sandbox protocol v3 now forwards the configured shell and requires an explicit process-isolation attestation; Linux recursively enforces read-only host mounts and readiness probes verify mount isolation.
-- K(a) remains a uniform canonical action key; registered projection rules now require both a potential key relation and validated realized-output coverage before reconstructing an actor result.
-- Drafter rounds now issue `candidateLimit` independent one-action requests concurrently, retain one low-temperature accuracy sample and diverse remaining samples, and rely on the existing K(a) relation to deduplicate execution.
-- Drafter output budgets and arbitrary-count sampling are now configurable recommendations; configured request and OCI worker counts no longer have hidden implementation caps.
-- Drafter and PatternAware now emit only source-neutral actions; neither source can select an execution mechanism.
-- Scheduler forecasts, resource arbitration, events, and cache snapshots derive isolation from the resolved route instead of K(a).
-- In-flight and retained candidates are reused only when both K(a) compatibility and execution-route identity hold.
-- The Pi TUI now exposes one tool policy and explains the runtime-sandbox, resource-snapshot, Git-worktree, and Actor-fallback boundary.
-- Documentation and benchmark output now distinguish actual hidden latency from execution-blocked counterfactual potential.
+### 搜索与界面
 
-### Fixed
+- Native Pi 是默认搜索方式；TUI 的 Captured search 显式共同绑定 Actor 与投机执行器。
+- 受控 find 复用 Pi 已有匹配/忽略组件；grep 只使用已验收的现有 rg，不新增安装或下载。缺少 rg 不影响受控 find。
+- 搜索输入包含被消费的原始字节、具名祖先/Git 配置、正负元数据和 HOME 身份；原版 Pi 负责完整输出、上下文和截断。
+- 该 profile 明确排序并禁用环境 rg/全局 ignore 配置，不宣称等价于原生默认。绑定失败不暗中换回另一执行器。
+- TUI 区分预测、重放、观察与提前执行能力；设置在 Apply 后生效，刷新与关闭等待真实操作完成。
+- 根 README 是唯一中文使用入口；基准说明单独描述低负载验收、性能测试和平台限制。
 
-- Trace-directory allocation now sits inside the begun workspace transaction's cleanup boundary.
-  Allocation failure aborts that capture before dispatcher fallback, so later commands are not
-  incorrectly marked as overlapping; cleanup only removes an actually allocated directory.
-- Linux process sessions release inside workspace execution, before post-tool capture and cleanup.
-  Top-level and broker work register before dispatch, share cancellation and one closing promise,
-  and drain even after transport loss. Broker evidence/publication cleanup is awaited separately
-  from socket shutdown; final workspace-owned sealing still precedes workspace reclamation.
-- Certificate sealing hashes its captured, validated records directly, avoiding a second prototype
-  and dependency normalization. Raw key APIs and persisted parsing still validate evidence; the v7
-  hash format and replay eligibility rules are unchanged.
-- Immutable publication takes cleanup ownership only after exclusive temporary-file creation. Partial
-  writes close their native handle and reclaim their temporary; creation collisions preserve the other
-  publisher's file, and existing-target deduplication is unchanged.
-- Failed store scans and GC removals drain every already-started sibling before propagating the
-  original error. Successful operations keep their parallel path; no new queue or error wrapper is added.
-- Certificate publication waits for any due store maintenance it starts, so the existing admitted
-  execution lifetime drains GC before shutdown. Maintenance failures still preserve the publication
-  result; collection frequency, store serialization and memory-before-persistence handoffs are unchanged.
-- Dependency equality counts already-captured records without locale-sensitive sorting. Reordering
-  distinct Unicode action IDs preserves bindings and descendant identities; changes to dependency
-  conditions or multiplicity still renew execution, and the producer's visible edge order is retained.
-- Plan scheduling reuses the graph's validated topological order for deadlines and critical paths,
-  removing repeated recursive traversals and temporary graph indexes. Prediction confirmation locates
-  its current node directly while preserving retired opportunities' independent settlement authority.
-- Semantic parent replacement also renews dependent action identities and bindings, using the existing
-  dependency validation walk and retirement path. Late reuse cannot attach an old parent world to the
-  renewed chain; independent actions, metadata-only updates and normal parent adoption retain reuse.
-  Prediction retirement respects an Actor's candidate lease, with cleanup after adoption or release.
-- Plan updates capture their headers, actions, dependencies, removals and inputs before waiting in
-  the existing admission lanes. Application reuses that owned capture and rechecks current revision
-  and graph validity; producer edits cannot redirect a queued revision. Proposal and delta share one
-  apply path, with next-step-only filtering captured at handoff under the same turn settings.
-- Prediction matching retains its computed key relation instead of invoking projection again for each
-  selected opportunity. One pass selects the nearest prediction per plan, preserving latest-due or
-  nearest-future priority, stable ties and plan order; tool hints still do not claim a prediction.
-- Prediction launch work is registered before lookup and validation callbacks. It rechecks current
-  plan identity before and after asynchronous reuse validation, and only attaches a result still owned
-  by the candidate registry. Shutdown, supersession and cache retirement cannot revive stale launches
-  or attach an old execution to a replacement node; full disposal drains outstanding launch work.
-- Independent proposal batches share the existing per-plan admission lanes without a serial batch
-  barrier; revisions of one plan remain ordered. Ready actions can execute while a sibling's binding
-  or permission check is pending. Batch and materialization joins retain all admitted promises through
-  settlement, and empty updates still reconcile scheduling without introducing another queue or owner.
-- Queued continuations recheck their parent identity and target decision before claiming a source slot.
-  Session closure retires plan launch authority before draining producers; expired, replaced or terminal
-  work cannot restart prediction. Valid cross-turn continuations and retries remain eligible, and an
-  already-claimed Actor transaction retains its commit and settlement ownership through closure.
-- Session shutdown drains physical prediction and continuation producers even after their admission
-  wait times out or is cancelled. Late failures stay contained; terminal shared-result retention remains.
-  Cancellation before the producer microtask prevents launch, and Drafter preparation rechecks its
-  request signal before starting a model call after asynchronous model/options resolution.
-- Capture plan headers, action identities and dependency records before input cloning. Producer or
-  preflight callbacks cannot rewrite an accepted revision, scheduling edge or draft-token accounting.
-  Dependencies are canonicalized and frozen once; revision comparison reuses those records and
-  preserves execution identity across harmless ordering/default-condition changes. Feedback stays opaque.
-- Register the shared resource-release promise before invoking cleanup. Synchronous callback reentry
-  joins the same release instead of disposing twice; shutdown still waits for successful or failed cleanup.
-- Shared sealing and every borrower now preserve enumerable Symbol-keyed data, including Pi read
-  coverage, without dropping metadata or rejecting an otherwise reusable production result.
-  Output-only projection results are owned before revalidation and commit, so provider or Actor edits
-  cannot rewrite another adoption. Opaque projected views decline reuse and retain exactly-once fallback.
-- Candidate retirement removes the exact and projection memberships captured at insertion, without
-  recalling partial provider functions. Lookup and reuse predicates reject retired registrations,
-  including delete/reinsert of the same entry; reentrant insertion resolves the current scope.
-  Repeated insertion of one retained result preserves its existing reuse evidence.
-- Bind Actor arguments and executor metadata to owned snapshots before reuse; asynchronous binding
-  and later configuration mutation cannot change the command or descriptor behind its K(a).
-- Prepare each prediction's arguments once before K(a); permission checks and execution no longer
-  rerun non-idempotent Pi preparation or mutate the source's proposed arguments.
-- File evidence now captures stable descriptor identities, follows and seals symlink chains, rejects
-  special files, and treats watchers only as early invalidation hints.
-- Strace evidence now reconstructs unfinished/resumed syscalls, selects the root from process
-  topology, and waits for stdio closure before sealing a certificate.
-- Indeterminate or partially rolled-back commits now poison the effect transaction and prevent a
-  second Actor execution; only proven-clean failures may fall back.
-- Authoritative observation fallbacks no longer invalidate overlapping reusable results; only actions whose semantics may mutate workspace resources advance cache invalidation.
-- Target-decoder candidate bundles are now routed by the Plan Runtime's absolute expected Actor decision sequence, so output-informed and multi-step predictions cannot be submitted to an already-finished request; same-decision retries retain the bundle and stale decisions are dropped.
-- Self-speculation cleanup now waits for in-flight candidate and sidecar-fork submissions, fences the package-level disabled state, and keeps Drafter request identities isolated from the Actor request.
-- Output-informed Drafter continuations now permit a terminal response instead of forcing an unrelated tool call after the speculative branch has completed.
-- A newly captured exact-key result remains reachable when an older cache generation cannot be freshness-validated; bounded cache retention now owns both generations until one is proven stale or evicted.
-- Continuation work can be reused immediately, but its prediction is anchored to the first causally eligible Actor decision; same-batch reuse is no longer misattributed as a future-step match.
-- A continuation targeting the next Actor decision is no longer cancelled by a sibling tool call from the same parallel Actor response.
-- Probation cache aging now advances after each Actor decision batch, after matching, so a completed multi-step prediction remains adoptable through its declared deadline even when a batch contains multiple tool calls.
-- Query K(a) now preserves `read`'s omitted-limit semantics and rejects numeric views that Pi tools do not interpret as stable integer ranges.
-- Tool error settlements are discarded before they can become reusable speculative cache entries.
-- Package shutdown now releases owned workspace sandbox pools immediately instead of retaining Windows file watchers until the idle timeout.
-- Native release manifests and smoke requests now use protocol v4 and verify the isolation attestation.
-- Shell dispatch recognizes Windows-style executable paths even when protocol tests run on a non-Windows host.
-- Missing Docker or Podman no longer produces a global sandbox warning when the native fallback is ready.
-- Cache lookup, telemetry, and speculative cleanup failures can no longer replace an authoritative stock Pi tool result.
-- Same-name tools registered during normal extension initialization now remain authoritative and are excluded from speculation regardless of load order; stock tool renderers are preserved for both TUI and HTML output.
-- Execution-blocked predictions remain K(a)-matchable and no longer enter the dependency-impossible settlement path.
-- Execution-world warm-up now prepares the same healthy backend selected by route resolution when an earlier registered capability is unavailable.
+### 验证边界
 
-### Removed
-
-- Removed the bundled OCI, native process, and Windows AppContainer backends and their setup paths. The package no longer installs or launches Docker/Podman and no longer mutates OS sandbox state.
-- Removed process-backend routing and installation settings from the Pi extension; embedding runtimes can inject a runtime-wide `ExecutionWorld` instead.
+- 当前完整测试为 Windows 529 通过、16 跳过；WSL 544 通过、1 跳过，共 545 项。两端 check/build 与相关定向测试通过。
+- 新故障覆盖优先改造已有夹具，不盲增测试条目。最近一次精简删除了 17 个冗余条目；本次资源排空修正未新增条目。
+- Windows x64 与 WSL Linux x64 的受控搜索及脚本驱动 TUI 已验收；性能测量与普通回归分开，不把候选就绪等同于有收益。
+- Linux Bash 保留整体、子进程和运行中复用。缺少 Landlock 时仅能消费可接受的既有证书；独立 Actor 未命中证书生产仍未完成。
+- macOS/ARM64、真实 ThinkThread Runtime 和历史绝对代码预算仍未验收完成。ThinkThread 实现、SDK、安装路径及依赖保持受保护状态。

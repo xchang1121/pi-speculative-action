@@ -1,88 +1,89 @@
-# Pi speculative action
+# Pi 投机执行
 
-This standalone package adds speculative tool execution to Pi without modifying Pi core. It predicts future tool calls with Drafter and PatternAware, executes only actions with a proven isolation route, and lets the Actor adopt a matching result.
+这个独立 package 在不修改 Pi 本体的前提下加入投机工具执行。Drafter 与 PatternAware 预测未来工具调用；只有存在可证明安全的隔离路线时才提前执行；Actor 发出等价动作后可以采纳对应结果。
 
-The repository is deliberately independent of the Pi monorepo: it has its own Git history, build configuration, tests, and dependency lock. Pi packages are declared as peers. Canonical path identity lazily uses the installed Pi path resolver (not currently a public export); an incompatible layout declines caching. It does not import a Pi source checkout, use workspace path aliases, or require a matching `main` branch.
+本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。Pi package 以 peer 形式声明；路径身份惰性调用已安装 Pi 的路径解析器（当前并非公共 export），布局不兼容时放弃缓存；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
 
-This is a standalone GitHub repository. Its reachable history contains only speculative-action changes and no Pi monorepo parent or source tree.
+## 架构
 
-## Architecture
+Runtime 分为四个相互独立的层次：
 
-The runtime has four independent layers:
+1. **投机源**：模型 Drafter、Actor probe 与历史模式预测只产生与执行方式无关的 `PlanAction`。
+2. **动作身份**：Pi 参数只准备一次，然后封存 `K(a)` 与实际执行器绑定。键包含工具语义、已验证 schema、参数和资源名称；动态资源版本属于执行证据，不混入另一套键。无损投影还必须证明真实结果覆盖目标动作。
+3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
+4. **调度与结算**：Scheduler 决定启动时机与资源竞争；`ExecutionWorld` 只产生封存后的效果载体，由唯一的 `EffectTransaction` 管理验证、采纳、放弃与提交状态；结算只记录一次匹配、采纳、回退和计时。
 
-1. **Sources** — the model Drafter, Actor probe, and learned patterns emit source-neutral `PlanAction` values.
-2. **Action identity** — `K(a)` canonicalizes tool semantics, validated schema, arguments, resources, and executor identity. Lossless projection rules may prove that one result covers another action.
-3. **Execution routing** — action semantics declare only observable effects; one `ExecutionWorldRouter` selects and prepares an isolation capability. The selected route is deliberately not part of `K(a)`.
-4. **Scheduling and settlement** — the Scheduler controls launch timing and resource pressure; `ExecutionWorld` produces a sealed effect artifact, while one `EffectTransaction` owns validation, adoption, abort, and commit state. Settlement records match, adoption, fallback, and timing once.
+执行路线具有固定优先级：
 
-Execution routes use this fixed priority:
-
-| Priority | Route | Scope |
+| 优先级 | 路线 | 范围 |
 |---|---|---|
-| 1 | Installed unified environment | An injected runtime-wide world; preferred when qualified for this tool |
-| 2 | Local `runtime_sandbox` | The qualified Linux/WSL process world; independent of the unified-environment switch |
-| 2 | `resource_snapshot` | Observe Actor reads, or execute explicitly bound stock `read` / `ls` operations over bounded, sealed inputs; never permission to pre-execute an arbitrary host function |
-| 2 | `workspace_branch` | Local fallback for `write` and `edit` using a private Git worktree and conflict-checked commit |
-| 3 | Actor fallback | If no safe route exists, no speculative tool invocation occurs |
+| 1 | 已安装的统一执行环境 | 宿主注入的 Runtime 全局世界；探测通过且能够覆盖当前工具时优先 |
+| 2 | 本地 `runtime_sandbox` | 合格的 Linux/WSL 进程世界；独立于统一环境开关 |
+| 2 | `resource_snapshot` | 观察 Actor 结果，或让显式绑定的原版 `read`、`ls` 操作读取封存输入；不授权提前执行任意 host function |
+| 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
+| 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
-On Linux and WSL 2, the default extension includes a lightweight process world. It forks the operation into the same private workspace primitive used by mutation tools, then confines it with Sandlock's Landlock/seccomp policy and virtual filesystem. The current provider deliberately creates no user, PID, or mount namespace, so commands retain the Actor's native identity. Failure of any kernel, binary, or policy probe removes this route; Windows, macOS, WSL 1, and incomplete Linux installations therefore keep Pi's ordinary Actor execution rather than silently weakening isolation.
+在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有工作区原语，再用 Sandlock 的 Landlock/seccomp 策略与虚拟文件系统限制进程。当前实现刻意不创建 user、PID 或 mount namespace，因此命令保留 Actor 的原生身份。任何内核能力、binary 或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。
 
-Startup diagnostics intersect each execution world's effect guarantees and explicit executor bindings with each tool's requirements. With qualified Pi 0.84.1 bindings, the portable resource route enables `read` / `ls`; Git enables `write` / `edit`; a ready Linux/WSL 2 process world adds `bash`. An injected world can enable more tools when it supplies their required guarantees. A selected tool with no safe route keeps its preference but remains inactive and is not sent to prediction sources. Native Windows and WSL are separate execution environments; macOS still requires real-host qualification.
+能力由提供者的效果保证、已验证的工具绑定和当前设置共同决定：Pi 0.84.1 的封存资源绑定支持 `read`、`ls`，Git 支持 `write`、`edit`，合格 Linux/WSL 2 进程世界再支持 `bash`。这不是按操作系统写一套工具规则；Windows 与 Linux 共用文件操作实现，macOS 使用同一实现但尚缺真机资格测试。没有安全路线的工具保留预测偏好，但不会提前执行。
 
-The resource route reuses Pi's own file-tool implementation, including image handling and output formatting. The existing token owns bounded inputs captured on access, their evidence, and their lifetime; there is no additional cache. Sealing stops further capture: another query may recompute over these inputs, but cannot expand their authority. Exceeded budgets, escaping links, unsupported content reads, or changed input semantics reject adoption. Host Actor output needs a separately proven execution window, including ancestor path bindings. This observation capability is unavailable on Windows: restoring the same renamed directory/junction can preserve its inode and timestamps. Controlled `read` / `ls` speculation and its cross-turn reuse remain available; native Actor execution stays unchanged. Image options and model image support enter executor identity. Pi's private path/MIME helpers are version-qualified; other versions get observation only where proven. Native `grep` / `find` still require a complete process provider, including configuration, subprocesses, and context-file reads.
+资源按实际访问采集，沿用同一个 token 的预算、证据、所有权和释放机制，不增加缓存层；原版 Pi 负责图片、截断和结果格式。封存后停止采集，新查询只能使用已有输入，不能扩张权限；预算超限、链接逸出、特殊文件内容或输入语义变化均拒绝采纳。原生 Actor 输出则必须额外证明完整执行窗口，包括祖先路径绑定。Windows 暂不提供这项观察能力：把同一个目录/junction 移走再移回可以保持 inode 和时间戳，不能据此证明 Actor 未读到中间状态；受控 `read`、`ls` 提前执行及其跨轮次复用仍保留，Actor 原生执行不变。图片选项和模型图片能力进入执行身份；路径/MIME helper 按 Pi 版本验收，其他版本只在有证明时保留观察。原生 `grep/find` 仍需完整进程提供者，不能遗漏配置、子进程或 Pi 回读文件。
 
-Process interception is structural. A single async process outlet preserves each Pi tool's validation, streaming, truncation, and result formatting. Inside the Linux world, exact exec-only mappings leave `PATH`, file opens, metadata, directory contents, writes, cwd, and environment unchanged while routing executable launches to one broker. On x86-64 Linux, a native Actor boundary also stops real child `execve` events before their first instruction. Both routes use the same executable/argv/cwd/environment/process-context key, dependency certificates, result journal, and planner—not a Bash-text cache. A validated child can therefore be reused under a different parent Bash string, while a miss continues the Actor child exactly once.
+进程拦截是结构式的：统一异步出口保留 Pi 工具自己的校验、流式输出、截断和结果格式；Linux 世界只映射精确 exec 调用，不改写 `PATH`、普通文件访问、cwd 或环境。x86-64 Linux 的原生 Actor 边界还会在子进程第一条用户态指令前暂停真实 `execve`。两条路线共用可执行文件字节、argv、逻辑 cwd、环境、描述符、凭据、限制、平台和策略证据；不同父 Bash 可以复用同一个子进程，未命中则让原 Actor 子进程继续一次，不建立 Bash 文本缓存。
 
-Each reusable result is a persisted provenance certificate containing dynamically observed files, directories, negative lookups, symlinks, executable/DSO identities, ordered stdout/stderr, exit status, and atomic regular-file effects. Every dependency is revalidated before reuse. The enclosing speculative branch separately records top-level process provenance and revalidates it immediately before Actor adoption; tainted, incomplete, stale, interactive, mutable-host, network, IPC, unsupported, or observably different confinement state fails closed.
+每个可复用结果都是持久化 provenance certificate，包含动态观察到的文件、目录、负查找、symlink、executable/DSO 身份、有序 stdout/stderr、退出状态和原子 regular-file 效果。每次复用都会重新验证全部依赖。外层投机 branch 还会独立记录顶层进程 provenance，并在 Actor 采纳前再次验证；tainted、不完整、过期、交互式、可变宿主输入、网络、IPC 或不支持的观察一律关闭复用。
 
-Lookup follows a weak-exec-key / dynamic-pathset / strong-input-key hierarchy. Historical certificates that observed the same pathset share one current-world capture; observation semantics such as dependency role, metadata policy, negative-parent enumeration, and private-entry exclusions remain part of the pathset identity. See the research and platform notes and the WSL2 multi-history qualification.
+证书查找采用“精确 exec 弱键 → 动态路径集 → 当前输入强键”。具有同一动态路径集的多代历史证书只捕获一次当前依赖，但文件角色、metadata 策略、负查找父目录和后端私有条目排除仍属于路径集身份，不会为了提高命中率而放宽等价条件。研究依据与跨平台路线记录在 Bash 复用研究说明，真机多历史基准见 WSL2 结果。
 
-Before replay begins, the complete content-addressed output/effect closure is loaded and integrity checked once. Output wire data and all file-effect bytes are materialized before the transactional commit, so replay neither reopens a deleted CAS blob nor begins a fallback-prone partial adoption. The 128 MiB WSL2 qualification measures the resulting I/O reduction.
+Replay 开始前会一次性装载并校验完整的 content-addressed 输出/效果闭包；输出 wire 数据与全部文件效果都在事务提交前准备完成。因此校验之后即使底层 CAS 文件被删除，也不会在部分采纳后退回真实执行。128 MiB 文件效果的真机结果见 WSL2 artifact closure 基准。
 
-Nested process misses use the same generic workspace-transaction outlet as the outer execution world. Fenced, content-free inode change tokens select candidate paths; immutable baseline/prior-frontier bytes and stable descriptor reads remain the exact authority. Overlap, a non-advancing filesystem clock, or unsupported inode semantics disables publication instead of guessing. The transaction driver initializes lazily, so replay-only branches do not pay its observation cost. This removed whole-tree content snapshots and reduced qualified cold Pi Bash latency by 7.4% on WSL2.
+嵌套进程 miss 与外层执行世界共享同一个通用工作区事务出口：经过同文件系统时钟栅栏保护的无内容 inode 变化令牌只负责筛选候选路径，不可变基线/既有精确前沿字节与稳定文件描述符读取才是内容权威；事务重叠、文件系统时钟无法前进或 inode 语义不受支持时直接禁止发布而不猜测。事务驱动只在首次打开变更区间时惰性初始化，纯回放分支不支付观察成本。它消除了整树内容快照，并在 WSL2 真机上把 Pi Bash 冷执行降低了 7.4%。
 
-## Correctness boundaries
+## 正确性边界
 
-- Prediction sources never choose an execution backend.
-- `K(a)` never changes because a different isolation backend is available.
-- In-flight and cached work is reused only when its producer proof is accepted by the consumer; observations of confinement state remain reusable inside the same confinement domain but cannot cross into the Actor domain.
-- Cross-parent process results are reusable across turns only after exact prototype matching and full dynamic-dependency validation; the parent shell command is deliberately absent from that nested key.
-- The Linux world preserves native UID/GID/process identity and the visible `PATH`, maps only the private workspace onto its logical source path, denies common credential stores and the certificate store, and permits persistent writes only in the private branch.
-- Broker uncertainty is at-most-once: after a request may have executed, a lost reply returns an error instead of re-running the command.
-- On a read-only Actor fallback, a capture-capable world snapshots freshness before the host call and seals that same authoritative output into the shared cache. It never invokes the tool a second time; later turns still repeat authorization, exact freshness validation, compatibility, projection, and commit.
-- Actor adoption still requires action equivalence, permission, fresh resource evidence, compatible world evidence, successful projection, and successful commit.
-- Shared results require a backend freshness proof on every reuse; missing or failed validation declines adoption. Actor writes and watcher events cannot replace that proof or blindly evict sealed results. Pending work and checkpoint descendants still invalidate conservatively; watchers remain evidence against an unstable Actor observation window.
-- A tool with neither a runtime sandbox nor a registered local fallback is execution-blocked but remains matchable for learning and counterfactual measurement.
-- Same-name custom tools remain authoritative and are excluded unless the host explicitly supplies matching semantics and execution capability.
-- Input evidence protects the bound file operations' content/path semantics, not zero host metadata effects: sampling can update access times. Content reads of known non-regular inputs are rejected before opening, but this JavaScript capture is not kernel protection against concurrent hostile replacement with a device. Workloads requiring metadata/event-level noninterference need a separately qualified snapshot or isolation provider; the resource route does not provide that guarantee.
+- 投机源不能选择执行后端。
+- 隔离后端变化不会改变 `K(a)`。
+- 进行中和已完成工作只能在消费者接受生产者保证时复用；观察到隔离状态的结果不能未经证明跨入 Actor 环境。
+- 跨父进程、跨轮次复用必须同时通过精确 exec prototype 与全部动态依赖验证；父 shell 命令刻意不进入子进程 key。
+- Linux 世界保留原生 UID/GID/进程身份和用户可见 `PATH`，只把私有工作区映射到逻辑源码路径，拒绝读取常见 credential store 与证书仓，并只允许向私有 branch 写入持久效果。
+- Broker 遵守 at-most-once：请求可能已经执行后若响应丢失，会返回错误而不是再次运行命令。
+- 只读 Actor 回退时，支持结果捕获的 World 会在宿主调用前记录新鲜度基线，再把这一次权威输出封装进共享缓存；它不会再次调用工具。后续轮次仍须重新通过权限、精确新鲜度、兼容性、投影与提交检查。
+- Actor 采纳仍必须依次通过动作等价、权限、资源新鲜度、World 兼容性、投影与提交检查。
+- 同时缺少 Runtime 沙箱和已注册本地后备的工具会被标记为 execution-blocked，但仍可参与匹配、学习和反事实计时。
+- 同名自定义工具保持权威；除非宿主显式提供一致的语义与执行能力，否则不会参与投机。
+- 输入证据保护已绑定文件操作的内容和路径语义，不保证宿主元数据零副作用：采样可能更新访问时间。已知特殊文件的内容读取会在打开前拒绝，但 JavaScript 捕获不是防止恶意并发替换为设备文件的内核边界。要求 metadata/事件级无干扰的任务需要另行验收的快照或隔离提供者；当前资源路线不提供这项保证。
 
-`read` retains lossless range projection backed by realized output coverage. Other queries may be recomputed only from a world's sealed inputs; an input lookup is not output equivalence. Metadata evidence follows consumed fields: `ls` and captured `find` need names/types, not file sizes, so content-only growth need not invalidate them. A subsequent content read still requires its own size/content proof. Bash reuse requires an exact whole-command match or native process certificates. A textual suffix such as `| tail -n 20` is not a proof: `tail` may be a function or a different executable with different output, effects, or exit status.
+资源指纹采集失败后停止领取新项，排空同批已经启动的读取、关闭其文件句柄，再返回原始错误。会话关闭还须等待执行、输入准备、封存、事务借用与清理结束，之后才能回收所属工作区。
 
-## Install and use
+共享结果每次复用都必须取得后端的新鲜度证明，校验缺失或失败便放弃采纳。Actor 写入和 watcher 事件不再按路径直接删除封存结果，也不能替代精确证明；未完成工作及 checkpoint 后代仍保守失效。内部 watcher 继续用于否定不稳定的 Actor 观察窗口。
 
-The repository root is the Pi package root. A local checkout can be loaded or installed directly, without building Pi or editing its source:
+`read` 保留由真实输出覆盖范围证明的无损区间投影。其他查询只能在 World 封存的输入上重新计算，输入召回不等于输出等价。元数据证据按实际消费的字段区分：`ls` 和受控 `find` 只需要名字、类型，不需要文件大小，因此仅内容增长不必让候选失效；后续读取内容仍需单独证明大小和内容。Bash 复用依赖完整命令精确匹配或原生进程证书；`| tail -n 20` 这样的文本不能充当证明，因为 `tail` 可能是函数或其他可执行文件，输出、副作用和退出码都可能不同。
+
+## 安装与运行
+
+仓库根目录就是 Pi package 根目录。本地 checkout 可以直接加载或安装，不需要构建 Pi，也不会修改 Pi 本体：
 
 ```sh
 pi -e /absolute/path/to/pi-speculative-action
 pi install /absolute/path/to/pi-speculative-action
 ```
 
-Pi can install the repository directly:
+Pi 可以直接安装该仓库：
 
 ```sh
 pi install https://github.com/xchang1121/pi
 ```
 
-Linux and WSL 2 expose independent capabilities rather than one all-or-nothing backend:
+Linux / WSL 2 的能力分别探测，不要求消费路径具备全部生产依赖：
 
-| Capability | Minimum host support |
+| 能力 | 最小条件 |
 | --- | --- |
-| Replay an existing complete command certificate | Node.js and the local certificate store; no Landlock or `strace` on the hit path |
-| Reuse a completed or running child under a different Actor Bash | x86-64 Linux, the small native helper, `ptrace`, and `pidfd_getfd` for Pi's pipe descriptors |
-| Produce new speculative Bash certificates | Git, `strace`, a C/Rust build toolchain, the packaged pinned Sandlock build, and a successfully qualified Landlock/seccomp virtual-root policy |
-| Accelerate large workspace transactions | Optional, hash-verified `fuse-overlayfs`; Git remains the safe fallback |
+| 已有整条命令证书重放 | Node、证书存储和当前资源/事务验证；命中路径不要求 Landlock 或 `strace` |
+| 跨父 Bash 子进程重放或运行中接管 | x86-64 Linux、原生 helper、`ptrace`，以及 Pi 管道所需的 `pidfd_getfd` |
+| 提前执行 Bash 并生产证书 | Git、`strace`、合格 Sandlock/Landlock/seccomp 和透明 exec 边界；从源码构建另需 C/Rust 工具链 |
+| 加速大型工作区事务 | 可选且通过完整探测的 `fuse-overlayfs`；否则保留 Git |
 
-For all tiers, install the available system dependencies and run the best-effort qualifier:
+如确实需要安装可选 Linux 后端，可准备现有安装器所需环境，再运行分级资格检查：
 
 ```sh
 sudo apt-get install git strace build-essential
@@ -90,28 +91,28 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 npm run setup:linux
 ```
 
-Producer qualification now checks byte-preserving script execution. Binaries that skip script bytes are unavailable until rebuilt from the updated source and qualified; producer epoch v20 cold-misses prior proofs without clearing cache files.
+生产者资格检查脚本是否从第一个字节完整执行。未通过探测的 binary 不可作为生产者；只有符合当前执行契约的证据才能复用，不转换旧证书，也不主动清空存储。无合格生产者且没有可接受证书时，Actor 正常执行，但不能自行预热进程证书。
 
-`setup:linux` qualifies and reports each row separately. It builds the packaged held-exec helper, applies the packaged transparent-exec change to the exact pinned Sandlock revision, installs the resulting plugin-specific binary only after behavioral probes pass, and optionally installs an official hash-verified `fuse-overlayfs` release under `~/.local`; it installs no daemon and does not alter Pi. Source/patch and installed-binary digests are stamped together. Missing Landlock, Rust, `strace`, FUSE, or the native helper disables only the dependent operation. Runtime probes repeat before use and fail closed. WSL must be version 2, and performance-sensitive workspaces should live in its native Linux filesystem. Detailed policy, transaction, and storage qualification is documented in the capability lattice.
+`setup:linux` 会编译 held-exec helper，把透明 exec 修改应用到精确固定的 Sandlock revision，并在行为探针通过后安装插件专用 binary；source/patch 与实际安装文件的 digest 会一起盖章。在具备 `/dev/fuse` 的 x86-64/aarch64 主机上，它还会安装来自官方 release、经过固定 SHA-256 校验的 `fuse-overlayfs` 静态程序。它不会修改 Pi，也不会安装 daemon。Runtime 每次仍会重新探测 Landlock ABI 6+、Sandlock、strace，以及完整的 OverlayFS copy-up/whiteout/匿名事务时钟/卸载生命周期。共享 lower 快照后，Linux 进程世界只有在探测通过且精确不可变基线至少包含 256 个条目（本机复测后的保守边界）时才自动选择 host-visible COW；小工作区以及通用 `write`/`edit` 后备继续使用 Git。每个 content commit 只预热并共享一份驱动原生 lower 结构快照；外层观察和嵌套事务用它与各自的类型化 upper journal 重建 merged tree。事务时钟是在私有 upper 存储中的匿名 `O_TMPFILE` inode，并由探测证明其与 merged-view 时间戳的顺序关系，因此 Bash 看不到 Runtime 控制路径。若工作区内出现驱动导致的 `EXDEV`、`EOPNOTSUPP`、`ENOTSUP` 或 `ENOSYS`，完整 trace 会使该分支不可采纳；这覆盖 FUSE 无法透明复现的 lower 目录 rename 等操作。二进制、marker、匿名 inode 或时钟投影不受支持，挂载失败或发生可恢复的生命周期异常，都会让后续路线降级到 Git-worktree；无法确认已经卸载的活挂载及其 pool 会被隔离保留，但不会阻塞插件退出。WSL 必须为版本 2，checkout 应放在 WSL 原生 Linux 文件系统中。
 
-Select **Tools & execution → Execution routes → Search execution → Captured search**, then Apply, to share an explicit search executor between Actor and speculation (`searchExecution: "captured"`). **Native Pi** remains the default. Captured `find` uses only Pi's installed minimatch/ignore components and Node: workspace .gitignore layers, original filename spelling, deterministic case-sensitive glob matching and sorting, not native fd equivalence.
+在 **Tools & execution → Execution routes → Search execution** 选择 **Captured search**，再 Apply，让 Actor 与投机共享显式搜索执行器（`searchExecution: "captured"`）；默认仍为 **Native Pi**。受控 `find` 只使用 Pi 已安装的 minimatch/ignore 组件和 Node，处理工作区内分层 .gitignore，保留文件名原文，使用确定的大小写敏感 glob 匹配和排序，不等价于原生 fd。
 
-Captured `grep` additionally accepts an already-present rg: Windows x64 15.2.0 or Linux x64 14.1.0. Preparation reads Pi's binary directory/PATH, pins the executable bytes and verifies a private copy under a five-second deadline; nothing is installed or downloaded. Both sides use the pinned engine, bound HOME and original prepared arguments. This profile sorts paths and disables `RIPGREP_CONFIG_PATH` and global Git ignores; parent ignore rules remain inputs. It is **not Native Pi's default semantics**. The existing input token captures selected raw bytes, named ancestor/Git configuration, and positive/negative metadata; rg itself selects files on a private tree. Ignored subtrees and Git objects are not recursively read. Native defaults, unsupported versions/platforms and an unavailable rg keep their Actor route; a missing rg does not disable captured find.
+受控 `grep` 还可使用已有的 rg：Windows x64 15.2.0 或 Linux x64 14.1.0。准备时只读查找 Pi 的二进制目录/PATH，固定可执行文件字节，并在 5 秒期限内验证私有副本；不安装、不下载。两侧使用固定引擎、绑定的 HOME 和原始已准备参数。此 profile 按路径排序，禁用 `RIPGREP_CONFIG_PATH` 和全局 Git ignore，仍捕获父级忽略规则，**不是 Native Pi 默认语义**。已有输入 token 保存所选原始字节、具名祖先/Git 配置及正负元数据，rg 在私有目录中自行选择文件，不递归读取被忽略子树或 Git 对象。原生默认、未验收的平台/版本或缺少 rg 时保留 Actor 路线；缺少 rg 不会关闭受控 find。
 
-The existing resource/candidate store owns admission and retained-input recomputation; ambient Actor observation cannot certify a captured-only profile. Explicit refresh checks availability again. Once bound, a captured call retains its executor even on failure: a rejected producer may fall back once to the same profile's Actor, not silently to Native Pi. Input/result budgets are 8 MiB/1 MiB; worker requests have a five-second deadline including startup. Caller cancellation and pool retirement also await input preparation, native process/stream closure and temporary-tree cleanup. Workers start on demand; disabling drains Actors, cancels producers and restores Native Pi. Obsolete settings use the default without migration prompts. Windows/WSL x64 production routes and scripted TUI callbacks are qualified; macOS/ARM64 and real ThinkThread Runtime acceptance remain unverified. This fixed trusted executor is not an arbitrary Bash or hostile-JavaScript sandbox. See the [bounded qualification commands](./bench/README.md#captured-search-production-qualification); startup/materialization costs are separate, and a ready candidate need not be profitable.
+准入、采纳和封存输入重算仍由已有 resource/candidate store 负责；宿主 Actor 观察不能为 captured-only profile 授权。显式刷新可重新检查可用性。已绑定调用即使失败也保留执行器：producer 被拒绝可恰好回退一次到同 profile 的 Actor，不能暗中改回 Native Pi。输入/结果预算为 8 MiB/1 MiB，worker 请求含启动期限为 5 秒；调用取消和池关闭还须等待输入准备、原生进程/流关闭及私有目录清理。工作进程按需启动，关闭插件排空 Actor、取消 producer 并恢复原生 Pi；旧设置直接回到默认值。Windows/WSL x64 生产路线及脚本驱动的真实 TUI 回调已验收；macOS/ARM64 和真实 ThinkThread Runtime 仍未验收。这是固定可信执行器，不是任意 Bash 或恶意 JavaScript 沙箱。见[有界资格命令](./bench/README.md#受控搜索资格)：启动与输入准备单独计时，候选就绪不代表值得采纳。
 
-The `pi.extensions` manifest points to `src/extension.ts`, which Pi loads through its public TypeScript extension loader. Git installation therefore does not depend on checked-in build artifacts or dev dependencies. `dist` is only the conventional JavaScript/types entry point for npm consumers and is generated during `npm pack` or `npm publish`.
+`pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 
-Programmatic consumers should use the narrow npm entry matching their layer: `./core` for the host-neutral runtime and effect transaction contracts, `./process-reuse` for provenance certificates/planning/CAS, `./pattern-aware` for learning, and `./extension` for Pi integration. The root entry remains as a compatibility aggregate. The dependency closure of `./core` and `./process-reuse` is tested to contain no Pi package.
+以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口提供公共 API 聚合。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-Open `/speculative-action` in the TUI. The first level contains only the main switch, save location, the model-Drafter/Actor-fork/learned-pattern source choices, and tool policy. Sampling, decoder protocol, benefit gates, scheduling, and storage limits live under **Advanced settings**; disabled gates and transport-inapplicable action-handoff fields are hidden. The menu no longer exposes L1/L2 or internal `sandbox` types. **Execution routes** exposes the actual hierarchy: an installed unified environment, local safe fallback (sealed inputs, workspace transactions, or qualified processes), then an Actor route that is always available. The first two layers can be staged independently; disabling them does not disable Actor observation or Bash history replay. Its per-tool matrix separates **Predict**, **Replay**, **Observe**, and **Fork**, so enabling a prediction source is not confused with the platform's ability to execute that tool early. Capability diagnostics initialize only while the plugin is enabled: opening **Execution routes** refreshes enabled providers, while disabled routes remain unprobed and start no helper. Applying the main switch or route policy settles route diagnostics before the UI reports completion. Turn registration is memory-only, so a layer can be enabled mid-turn. Explicit refresh rechecks a previously disconnected Runtime. Disabling Bash prediction does not disable Actor Bash history replay. Every edit—including Enabled and Restore defaults—is staged until Apply; switching “All projects”/“This project” reloads that layer, while a project file stores only differences from normalized shared settings. Actor-path Bash reuse and process reuse inside speculative branches have separate counters. Status reports producer-observed process work reused separately from an Actor-path latency estimate; until prior authoritative samples calibrate that estimate it says `Actor timing unavailable` instead of inventing saved time. Same-run overlap remains labelled as observed overlap, not causal speedup. JSON byte limits use bytes, TUI memory inputs use MiB, and work without a safe route remains with the Actor.
+在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、本地安全 fallback（封存输入、工作区事务或合格进程） 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关或层级策略时，会先完成路由诊断更新，再提示完成并刷新 footer。回合登记只修改内存，支持回合中途启用思程层；显式刷新也会重新检查已经断开的 Runtime。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
 
-Settings are owned by the package:
+配置由 package 自己管理：
 
-- global: `<agent-dir>/speculative-action.json`
-- project: `<workspace>/.pi/speculative-action.json`
+- 全局：`<agent-dir>/speculative-action.json`
+- 项目：`<workspace>/.pi/speculative-action.json`
 
-Example:
+示例：
 
 ```json
 {
@@ -158,62 +159,57 @@ Example:
 }
 ```
 
-`candidateLimit` defaults to two concurrent one-action Drafter requests per Actor decision. At width two they act as a latency hedge: the first response containing a schema-valid enabled `K(a)` is admitted and its still-running peer is canceled through the provider `AbortSignal`; errors, empty responses, and invalid calls do not win. Strict action and target-token replay retained all 6 available exact hits, the complete lead, and identical D3 verifier work, while identifying 7.78% of width-two Drafter service as removable residual work. Widths above two retain every completed sample and remain available without a hidden cap for models that produce useful wider diversity.
+`candidateLimit` 默认在每次 Actor 决策并发发出两个单动作 Drafter 请求。宽度为 2 时它们组成延迟对冲：首个包含 schema 有效且已启用 `K(a)` 的响应被接纳，并通过 provider `AbortSignal` 取消仍在运行的同伴；错误、空响应和无效调用不会胜出。显式设为 3 或更高时保留所有完成样本，没有隐藏上限；额外请求的成本仍计入收益判断。
 
-`drafterGateEnabled` defaults to `true`. It treats the concurrent root requests as one batch and learns their action-side net utility: actual tool `executionAheadMs` credited only to Drafter-owned adopted work, minus the summed service time of every request in the batch. Four warm-up batches precede suppression; one bounded probe every four skipped decisions lets a changed workload recover. Set it to `false` to restore unconditional Drafter batches. PatternAware candidates and Drafter continuations are not gated.
+`drafterGateEnabled` 默认为 `true`。它把并发根请求视为一个批次，滚动学习动作侧净收益：只有由 Drafter 实际拥有并被 Actor 采纳的工作才按真实工具 `executionAheadMs` 计收益，再减去该批所有请求的服务时间总和。前 4 批用于预热；持续负收益时暂停整批请求，但每跳过 4 次仍做一次有界探测，以便工作负载变化后恢复。设为 `false` 即恢复无条件 Drafter 批次；PatternAware 候选和 Drafter 后继请求不受此门控。
 
-`drafterMaxDepth` is the number of output-informed successor requests allowed after each initial one-action Drafter request. A successor occupies that source's existing slot for the next Actor decision rather than increasing per-decision request width; set it to `0` for single-step Drafter behavior.
+`drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 
-`drafterMaxTokens` is an optional hard cap. Omit it—or clear the TUI field—to use the provider's output limit, which avoids truncating long commands and structured tool arguments.
+`drafterMaxTokens` 是可选的硬上限。省略该项——或清空 TUI 输入框——会使用服务商默认输出上限，避免长命令和结构化工具参数被截断。
 
-The Drafter always receives the same complete history as the Actor and uses the lowest thinking level its Pi model metadata permits (`off` when supported). Before either a root or output-informed request, the source compares that history plus the requested output allowance with the Drafter model's own `contextWindow`. A shorter model that cannot fit it is skipped locally: the plugin never truncates, summarizes, or triggers a second compaction path for the Drafter.
+Drafter 始终接收与 Actor 相同的完整历史，并采用 Pi 模型元数据允许的最低思考强度（支持关闭时即关闭）。每次根请求及基于工具输出的后继请求发出前，投机源都会用 Drafter 自身的 `contextWindow` 检查完整历史和输出额度；较短模型无法容纳时直接在本地跳过，不会截断、摘要，也不会为 Drafter 触发第二条压缩路径。
 
-### Actor probe and target verification
+### Actor probe 与目标验证
 
-`selfSpeculation` is opt-in and is also gated by the package-level `enabled` switch. Its Actor probe is derived only from the authoritative Actor inference stream; the separate model Drafter is never self-forked. The same request-scoped coordinator also copies every schema-valid concrete model-Drafter or PatternAware prediction into one target-verification bundle. Decoder identity remains the exact Actor-visible `predictedAction`; a wider lossless `executionAction` is carried separately for scheduling and result reuse. Identical predicted keys are sent once with merged source/proposal provenance, including predictions that cannot be executed locally, so the target model can verify their boundary-relative tool-call tokens.
+`selfSpeculation` 默认关闭，并且同时受 package 顶层 `enabled` 总开关约束。Actor probe 只从权威 Actor 推理流派生，独立的模型 Drafter 请求永远不会被自分叉。同一个 request-scoped 协调器还会把每个通过 schema 校验并完成参数物化的模型 Drafter 或 PatternAware 预测复制到目标验证候选包。解码身份始终使用 Actor 可见的精确 `predictedAction`；为调度和结果复用而扩大的无损 `executionAction` 则独立携带。相同预测 key 只发送一次，并合并来源与 proposal 归因。即使某个动作缺少本地隔离、不能提前执行，它仍可作为边界相对的 tool-call token 交给目标模型验证。
 
-The coordinator binds one stable request ID to each Actor decision, submits the ranked bundle for that exact absolute decision sequence to `POST /self-speculation/candidates`, and clears it with `POST /self-speculation/clear` after all pending submissions and probes settle. Predictions for later decisions stay buffered until the matching Actor request starts; an unchanged decision retry inherits its bundle, while older predictions are discarded. Network and decoding failures are best-effort acceleration failures and never replace Actor behavior.
+协调器为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 probe 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 
-When the target returns a clear-time `verification` object, the coordinator records real proposed, accepted, rejected, and unresolved draft tokens separately from registration receipts. Candidate IDs and sources update a model/endpoint/format/tool/source decoder ledger, whose smoothed acceptance probability calibrates later candidate ordering. Runtime Actor settlement independently trains action utility: a sidecar fork receives benefit only when a matching prediction is actually adopted, using its source-attributed share of realized `executionAheadMs`. Token rejection never changes semantic action probabilities, and an action-key match alone no longer pays the fork gate. `acceptedDraftTokens` remains the registration acknowledgement counter for API compatibility and must not be interpreted as target acceptance.
+如果目标端在 clear 响应中返回 `verification`，协调器会把真实的 proposed、accepted、rejected 和 unresolved draft token 与注册回执分开统计。candidate ID 与来源会更新按模型、端点、格式、工具和来源分区的 decoder ledger，其平滑验收概率会校准后续候选排序。Runtime 的 Actor 结算则独立训练动作收益：sidecar fork 只有在匹配预测被真实采纳时才获得收益，且按来源分摊实际 `executionAheadMs`。token 拒绝不会改写动作语义概率，单纯 action-key 命中也不再给 fork gate 记收益。`acceptedDraftTokens` 表示注册确认，不能当作目标模型验收。
 
-There are two fork transports:
+fork 有两种传输方式：
 
-- `sidecar` posts the first Actor output snapshot and its original request context to `POST /self-speculation/fork`. A low-confidence result is retained for D3 and retried from a later Actor snapshot, with one probe in flight, a 50-update progress step, and a five-attempt bound. This is the portable reference path implemented by the companion `self-speculation` package. With `forkActionEnabled`, the earliest confident complete probe candidate re-enters the ordinary action Runtime as one atomic proposal: parallel tool calls stay together, while distinct candidate batches remain alternatives. Each call carries the batch's candidate IDs, source/proposal provenance, score, call identity, format, probe timing, and logprob evidence through Runtime feedback. The calls use the same schema validation, K(a) deduplication, execution policy, Scheduler, and Actor settlement as Drafter and PatternAware actions. The default `forkActionMinConfidence` of `0.9` admits the whole batch only when the minimum top-1 probability across its tool-name tokens reaches the threshold; argument-token uncertainty is deliberately excluded. Incomplete calls and missing or malformed evidence fail closed. Set the threshold to `0` to admit unscored batches.
-- `provider` places a versioned `self_speculation` control object only in the authoritative Actor provider payload, including D2's five-attempt, 50-token cadence and minimum tool-name probability gate. Use it only with a provider that explicitly implements this SPORK contract and can expose the requested logprobs. Drafter-model requests are deliberately left untouched. Ordinary OpenAI-compatible servers may ignore unknown fields; field injection alone is not an implementation.
+- `sidecar`：在 Actor 第一个输出片段到达后，把快照和原始请求上下文发送到 `POST /self-speculation/fork`。低置信结果仍保留给 D3，并等待更新的 Actor 快照后再次探测；任一时刻只运行一个 probe，默认每 50 个非空流更新推进一次，最多 5 次。这是配套 `self-speculation` 仓库实现的可移植参考路径。打开 `forkActionEnabled` 后，最早达到置信门槛的完整 probe candidate 会作为一个原子 proposal 重新进入普通动作 Runtime：同批并行 tool call 保持在一起，不同 candidate 批次才互为备选。每个调用都通过 Runtime feedback 携带该批次的 candidate ID、来源/proposal 归因、score、call identity、format、probe timing 和 logprob 证据，并复用 Drafter/PatternAware 相同的 schema 校验、K(a) 去重、执行策略、Scheduler 和 Actor 结算。`forkActionMinConfidence` 默认为 `0.9`，只计算工具名 token 的最低 top-1 概率，参数 token 的不确定性不会误伤动作接纳；调用不完整、证据缺失或格式错误时关闭失败，设为 `0` 可恢复接纳无分数批次。
+- `provider`：只把 `self_speculation` 控制对象放进权威 Actor 请求，其中包括 D2 的 5 次上限、50-token 步长和工具名最低概率门。只有明确实现该 SPORK 协议、并能提供所需 logprob 的 provider 才应使用此模式；Drafter 模型请求不会被修改。普通 OpenAI-compatible 服务可能直接忽略未知字段；仅注入字段并不等于已经实现自投机。
 
-A positive tool-name confidence threshold automatically requests token probabilities. `requireLogprobs` remains a JSON compatibility override for collecting that evidence when early execution is disabled; it no longer needs a separate TUI switch.
+正数工具名置信度门槛会自动请求 token 概率。`requireLogprobs` 是 JSON 证据收集选项，用于关闭提前执行后仍想收集证据的场景，不再需要独立的 TUI 开关。
 
-For `sidecar`, the model-scoped fork gate learns a rolling net utility of `exact Actor lead - fork latency`. It allows four warm-up observations by default, suppresses a persistently negative fork, and still sends one bounded probe every four skipped decisions so a changed workload can recover. Two consecutive endpoint failures use the same probe circuit. All thresholds are configurable above; disabling `forkGateEnabled` restores unconditional forks. The same `fork_gate` policy is included as a provider/SPORK hint, but a provider transport must enforce that hint itself.
+在 `sidecar` 模式下，按模型隔离的 fork 门控从实际采纳中学习收益：只按来源分摊真实工具 `executionAheadMs`，再扣除 fork 延迟，不把仅键匹配或意图领先记作收益。默认先放行 4 个样本；持续负收益时暂停请求，但每跳过 4 次仍做一次有界探测，使工作负载改变后可以恢复。连续 2 次 endpoint 失败也进入同一探测回路。上述阈值都可配置；关闭 `forkGateEnabled` 即恢复无条件 fork。同一份 `fork_gate` 策略也会作为 provider/SPORK 提示发送，但 provider 传输需要由推理服务自行执行该策略。
 
-The default D3 cap is 28 draft tokens. In the strict DeepSeek-tokenizer tape replay, raising the former cap of 20 to 28 added 12 accepted tokens, no rejected tokens, and 10 saved target-step proxies; 32 added nothing further. This remains configurable and is bounded again by the inference engine.
+D3 默认上限为 28 个 draft token，可显式配置，并再次受推理引擎硬上限约束；token 验收和动作侧收益分别计量。
 
-The JSON file additionally accepts `requestIDField` and all three route paths. JSON and TUI expose the common endpoint, bearer-token environment-variable name, limits, fork-gate policy, Actor model Profile, tool-call format, decoder, temperature, and expert syntax overrides. `actorProfile` selects the protocol used to format and encode final Actor D3 candidates and defaults to `auto`. Profile-aware provider payloads use protocol version 2. For compatibility, setting only a legacy `draftFormat` keeps the version-1 provider shape; an explicit Profile uses version 2 and takes precedence. Boundary and forced-prefix overrides default to `auto`, so the inference adapter derives CoT closure, the name-aligned probe prefix, parser framing, and D3 boundary from one model format. An explicit override must describe that same format. These control routes can alter inference and should remain private or sit behind an authenticated proxy; `apiKeyEnv` reads only the named environment variable and never stores its value.
+JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、Actor 模型 Profile、tool-call 格式、decoder、温度和专家级语法覆盖。`actorProfile` 决定最终按什么协议为 Actor 格式化和编码 D3 candidate，默认是 `auto`。显式 Actor Profile 优先于 `draftFormat` 格式覆盖；候选始终按 Actor 的格式和 tokenizer 编码。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
 
-For Qwen3.5-family checkpoints, including Qwen3.8 deployment aliases, set
-`actorProfile` to `qwen35_xml` when the Actor provider uses the model's native
-`tools=` chat template. Use `qwen35_tagged_json` only when the Actor request itself is
-rendered with the paper-aligned JSON protocol provided by the companion
-`self-speculation` package; Qwen3's SPORK/Hermes JSON path uses
-`qwen3_tagged_json`. Changing only the sidecar fork to JSON would make its
-prefix differ from the Actor and prevent exact KV-cache reuse. Pi never embeds a
-Qwen boundary token ID; the inference integration derives it with the target
-tokenizer.
+对于 Qwen3.5 系列（包括 Qwen3.8 部署别名），如果 Actor provider 使用模型原生的
+`tools=` chat template，应把 `actorProfile` 设为 `qwen35_xml`。只有 Actor 请求本身也通过配套
+`self-speculation` 包按论文 JSON 协议渲染时，才使用 `qwen35_tagged_json`。Qwen3 的
+SPORK/Hermes JSON 路径使用 `qwen3_tagged_json`。只把 sidecar fork 改成
+JSON 会导致其 token 前缀与 Actor 不同，无法精确复用 KV cache。Pi 不内置 Qwen 边界 token
+ID；推理集成始终使用目标 tokenizer 派生边界。
 
-Use `actorProfile: "deepseek_v4_dsml"` for a DeepSeek V4 Actor following its
-native DSML protocol. Pi only transports the Profile and records the resolved
-server result; the companion package owns DSML parsing, formatting, boundaries,
-and D3 capability checks. Pi submits provider-neutral structured tool calls, so
-the Actor Profile remains authoritative for re-serialization and tokenization
-regardless of the Drafter's original text protocol; Drafter tokens are never
-injected directly.
+DeepSeek V4 原生 DSML 路径使用 `actorProfile: "deepseek_v4_dsml"`。Pi 只透传 Profile
+和记录服务端返回的实际解析结果；DSML parser、formatter、boundary 以及 D3 能力校验由
+`self-speculation` 实现。Pi 提交的是 provider-neutral 的结构化 tool call，因此无论 Drafter
+最初使用什么文本协议，都由 Actor Profile 重新格式化并使用 Actor tokenizer 编码，不能直接
+注入 Drafter token。
 
-When PatternAware multi-step mode is enabled, each authoritative Actor action—including a Drafter result adopted by the Actor—is projected together with its actual output and used for a non-mutating, same-turn prediction rebase. Learning remains deferred to the normal authoritative batch boundary. An unchanged cross-turn `K(a)`/horizon set is carried forward instead of re-issued, preventing a losing alternative from restarting after a shared winner is adopted.
+PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor 采纳的 Drafter 结果——都会连同真实输出一起做一次不修改学习状态的同轮重基准；正式学习仍在权威 batch 边界进行。若跨轮的 `K(a)` 与 horizon 集合完全不变，则沿用提前签发的机会而不重复创建，避免共享命中被采纳后又启动同组落选候选。
 
-The former `resourceCached` / `sandbox` / `predictionOnly` object is accepted only as a migration input and is normalized to the single `tools` list.
+工具策略使用一个 `tools` 数组，不按执行后端分组。
 
-## ThinkThread profile (Linux)
+## ThinkThread Profile（Linux）
 
-The optional `./thinkthread-extension` entry uses ThinkThread to pre-execute `read`, `ls`, `write`, and `edit` without changing Pi or replacing the default Linux backends. Install and launch it from Linux (Orb on macOS):
+可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行 `read`、`ls`、`write`、`edit`，不修改 Pi 本体，也不替换默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -221,66 +217,64 @@ cd /path/to/project
 tt pi-speculative-action
 ```
 
-The installer accepts `--agent-posix-package /path/to/sdk.tgz` and `--speculative-action-package /path/to/spec.tgz` for prebuilt packages, and repeatable `--model provider/model` delegation. It pins Agent POSIX SDK 0.1.0, verifies protocol 2 and the contract fingerprint, and installs a schema-4 profile plus a private runtime under `~/.local/share/pi-speculative-action`. Pi, Node, `fd`, and `rg` must already be available to the profile. Profile settings live under that installation's `config` directory; project `.pi/speculative-action.json` overrides still apply.
+安装脚本支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 使用预构建包，以及重复的 `--model provider/model` 授权。它固定 Agent POSIX SDK 0.1.0，校验 protocol 2 和契约指纹，安装 schema-4 Profile，并把独立运行时放在 `~/.local/share/pi-speculative-action`。环境需要预先提供 Profile 可访问的 Pi、Node、`fd` 和 `rg`。Profile 配置保存在安装目录的 `config` 下，项目 `.pi/speculative-action.json` 仍可覆盖。
 
-The profile shares the existing execution and observation boundaries:
+Profile 共享已有的执行与观察边界：
 
-- `speculation.execute`: `read`, `ls`, `write`, and `edit` use Pi's stock implementations against a turn-shared BASE, sealed `fs.run`, then `fs.verify`/conflict-checked `fs.apply`. Eight executions can share a BASE. Actor mutation fallbacks invalidate it before Runtime settlement can launch successors.
-- Actor `read` and `ls` results use the host's existing resource observation provider, including its stable execution-window proof. ThinkThread snapshot/content equality alone cannot prove that a live Actor call did not observe an intermediate A→B→A state, so there is no second ThinkThread Actor-result cache. This path needs neither the SDK nor the speculative runner. `EffectTransaction` owns adoption state for both operations.
+- `speculation.execute`：`read`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
+- Actor 的 `read`、`ls` 统一使用宿主既有 resource observation，包括完整执行窗口的稳定性证明。思程 snapshot/content 相等不能证明 Actor 没有读到 A→B→A 的中间状态，因此不再维护第二套思程 Actor 结果快照。这条路径不需要 SDK 或投机 runner；两条路径仍由 `EffectTransaction` 管理采纳状态。
 
-The profile's ThinkThread world is tried first; the native Linux process provider and Git workspace provider remain downstream routes. Bash is outside the portable runner and uses the native process world only when its actual environment passes qualification. Registration does not guarantee that an outer ThinkThread sandbox permits nested tracing, helpers, or handoff. In particular, the public ThinkThread Runtime is currently aarch64-only while Actor held-exec supports x86-64 Linux. Unavailable capabilities fall back to the Actor; full feature or performance parity under ThinkThread is not yet qualified. Ordinary source loading still uses the unchanged default provider and never loads the optional SDK.
+Profile 会先尝试思程 world，并保留原生 Linux 进程 provider 与 Git 工作区 provider。Bash 不进入可移植 runner，只有当前环境的探测通过后才使用原生进程 world。注册 fallback 不代表外层思程允许嵌套 tracing、helper 或 handoff；公开思程 Runtime 当前只有 aarch64 包，Actor held-exec 实现却限定 x86-64 Linux。缺失的能力回退 Actor，不能保证思程中的完整能力或性能不低于原生路径。普通源码加载仍使用原来的默认 provider，不加载可选 SDK。
 
-`fs.run` inherits the profile's fixed network policy (`all` in the supplied profile); time and randomness remain real. Only the qualified fixed stock-tool runner is admitted. Stock `grep/find` inherit executable and external configuration inputs (including rg preprocessors); neither workspace-only observation nor current ThinkThread verification proves their closure. Their declared host-process effects therefore block these routes, leaving Actor execution unchanged. A provider must prove the actual process dependencies/effects before re-enabling them; there is no configuration-file blacklist. Bash likewise requires the native process proof. Workspace verification is not a complete dynamic process-dependency certificate, and no per-run network narrowing, time/random virtualization, or strict process-certificate equivalence is claimed. Supervisor-owned requests support durable recovery and terminal-record cleanup, but this adapter does not persist request IDs across a Pi-process crash.
+`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收已具备证明的固定 stock-tool runner。原生 `grep/find` 继承外部配置和可执行程序（rg 配置还可指定预处理程序）；工作区快照和当前思程验证均不能证明完整闭包。因此它们声明真实的宿主进程效果，由能力矩阵自动阻止无证据的提前执行和结果复用，Actor 行为保持原样。只有提供实际进程依赖/效果证明的 provider 才能重新启用，不维护配置文件黑名单。Bash 同样需要原生进程证明。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
 
-The pinned Agent POSIX SDK archive is a locked development dependency and the installer's default payload, so a clean `npm ci` can check, test, build, and pack the optional adapter without a sibling checkout or manifest mutation. `--agent-posix-package` remains available for an explicit offline override. The profile defaults to two Drafter requests and eight concurrent tool executions; these remain configurable through `/speculative-action`.
+固定版本的 Agent POSIX SDK 归档现在既是 lockfile 管理的开发依赖，也是安装器的默认载荷；干净 checkout 只需 `npm ci` 即可检查、测试、构建和打包可选适配器，不依赖兄弟仓，也不再临时改写 manifest。`--agent-posix-package` 仍可显式覆盖为离线包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 
-## Runtime sandbox integration
+## 接入 Runtime 沙箱
 
-The Pi extension registers configured runtime providers first, then preserves the native Linux process world and Git workspace fallback. `createExecutionWorlds` therefore extends the route hierarchy instead of replacing its safety fallback. The lower-level host API still accepts an explicit `executionWorlds` list for embedders that own the complete lifecycle. Each world declares effect guarantees and, where needed, a supported tool scope; both constrain routing, including warm-up before a concrete action exists. The router confirms availability before returning a route and rechecks routing policy before execution. An unavailable primary falls through before execution; a failed execution is not blindly rerun in another provider. Every successful backend—including process provenance, resource snapshots and Git worktrees—returns the same sealed `WorldBranch` artifact. The gateway wraps it in one `EffectTransaction`, which exclusively owns freshness validation, adoption, abort and commit state while the artifact retains compatibility evidence and backend-local cleanup.
+Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表。World 同时声明 effect guarantee 与必要的工具作用域；没有具体 action 的预热也遵守作用域。Router 在返回 route 前确认后端可用，执行前再次检查层级策略；首选 provider 不可用时在执行前降级，已经执行失败的动作不会盲目换环境重跑。每个成功后端返回同一种 `WorldBranch`，Gateway 将其包装为 `EffectTransaction`，统一管理新鲜度验证、采纳、放弃与提交；载体保留兼容性证据与后端局部清理职责。
 
 ```ts
 const workspace = new WorkspaceSandboxService();
 const host = createSpeculativeActionHost(sessionID, {
   cwd,
   executionWorlds: [runtimeSandbox, workspace.createExecutionWorld()],
-  // model, policy, and tool integration omitted
+  // 省略模型、权限与工具接入
 });
-// At the end of the owning session:
+// 所属会话结束时：
 try { await host.dispose(); } finally { await workspace.dispose(); }
 ```
 
-The first available runtime-wide world wins for every process-backed tool whose execution context can be proven. Without one, the router considers fallback worlds compatible with the action's declared effects. Absence of both is represented by an undefined route, which the Runtime turns into `execution:isolation_unavailable` and an Actor fallback. Resolution, preparation, fork, and disposal all pass through the same router; tools cannot retain a direct backend handle. Persisted process certificates live under `<agent-dir>/speculative-action/process-reuse` and are content-addressed, policy-versioned, and safe to discard.
+第一个可用的 Runtime 全局沙箱会覆盖所有能够证明 execution context 的进程型工具；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。持久进程证书位于 `<agent-dir>/speculative-action/process-reuse`，使用内容寻址与当前生产者执行契约隔离，可以随时删除。
 
-## Timing
+## 计时口径
 
-For an adopted result:
+对被采纳的结果：
 
-- `attemptLeadMs`: speculative intent to Actor interception.
-- `executionAheadMs`: speculative execution completed before interception, capped by measured tool duration.
-- `hitLatencyMs`: interception to authoritative settlement.
+- `attemptLeadMs`：投机意图产生到 Actor 调用被拦截。
+- `executionAheadMs`：拦截前已完成的投机执行量，上限为实测工具时长。
+- `hitLatencyMs`：Actor 调用被拦截到权威结果完成结算。
 
-For an isolation-blocked match, the Actor execution is authoritative. The same decomposition is reported as counterfactual potential:
+对因为缺少隔离而阻断的匹配，Actor 执行仍是唯一权威执行，但使用相同分解报告反事实潜力：
 
 ```text
 executionBlockedPotentialHiddenLatencyMs = min(actorDuration, predictionLead)
 executionBlockedPotentialHitLatencyMs    = actorDuration - potentialHidden
 ```
 
-These values never inflate actual speculative hits or actual hidden latency.
+这些反事实值不会计入真实投机命中数，也不会混入真实隐藏时延。
 
-## Validation
+## 验证
 
 ```sh
 npm install --ignore-scripts
 npm run check
 npm run build
-npm test
+npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
-# Linux/WSL only: production Pi Bash tool + process-world qualification
+# 仅 Linux/WSL：真实 Pi Bash 工具与 process world 资格测试
 npm run bench:linux-process
-npm run bench:linux-pathset
-npm run bench:linux-artifacts
 npm pack --dry-run
 ```
 
-See [bench/README.md](./bench/README.md) for the single-trajectory ablation methodology.
+日常验证优先使用现有小型夹具与单 worker，两平台顺序运行；大输入、模型请求和性能压力测试按阶段单独执行，不随结构性修正反复运行。完整消融方法及资格命令见 [验证说明](./bench/README.md)。

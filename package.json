@@ -44,7 +44,6 @@
 		"vendor",
 		"scripts/install-thinkthread-profile.sh",
 		"README.md",
-		"README-CN.md",
 		"CHANGELOG.md",
 		"LICENSE"
 	],
