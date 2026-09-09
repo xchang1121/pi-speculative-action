@@ -466,6 +466,15 @@ describe("PatternAware", () => {
 				),
 			),
 		).toBe(true);
+		for (const version of [persisted.version - 1, persisted.version + 1]) {
+			const unsupported = JSON.stringify({ ...persisted, version });
+			await fs.writeFile(file, unsupported);
+			const ignored = new PatternAwareStore(settings(), file);
+			await ignored.load(); await ignored.flush();
+			expect(ignored.snapshot()).toEqual([]);
+			expect(await fs.readFile(file, "utf8")).toBe(unsupported);
+		}
+		await fs.writeFile(file, raw);
 		const second = new PatternAwareStore(settings(), file);
 		await second.load();
 		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
@@ -475,13 +484,13 @@ describe("PatternAware", () => {
 		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
-	test.each([17, 18])("restores only valid patterns and feedback from persistence v%s and owns every public snapshot", async (version) => {
+	test("restores only valid current patterns, indexed pools and feedback, and owns every public snapshot", async () => {
 		const file = await patternFile("corrupt-state");
 		const restoredInput = { path: "README.md", fields: { "\u00e9": 2, "e\u0301": 1 } };
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
 		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
-		await fs.writeFile(file, JSON.stringify({ version,
+		await fs.writeFile(file, JSON.stringify({ version: 18,
 			patterns: [valid,
 				{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
 				{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
@@ -490,9 +499,9 @@ describe("PatternAware", () => {
 					({ ...valid, id: `bad-feedback-${key}-${index}`, feedback: { ...valid.feedback, [key]: value } }))),
 				...(["rejectedAfterMatch", "unobserved"] as const).map((key) => ({ ...valid, id: `bad-feedback-${key}`, feedback: { ...valid.feedback, [key]: { invalid: -1 } } })),
 			],
-			events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }],
-			pools: [1, 99].map((target) => ({ key: `bad-reference-${target}`, context: [{ tool: "grep", outcome: "success" }],
-				targetTool: "read", samples: [{ context: [0], target, gap: 0 }] })), sequenceCounts: [],
+			events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }, event({ sessionID: "one", tool: "read", input: restoredInput })],
+			pools: [1, 99, 2].map((target) => ({ key: `bad-sample-${target}`, context: [{ tool: "grep", outcome: "success" }],
+				targetTool: "read", gap: 0, samples: [{ context: [0], target, gap: target === 2 ? 1 : 0 }] })), sequenceCounts: [],
 		}));
 		const store = new PatternAwareStore(settings({ minOccurrences: 1 }), file);
 		await expect(store.load()).resolves.toBeUndefined();
@@ -552,24 +561,6 @@ describe("PatternAware", () => {
 		} finally { await Promise.allSettled([first.release(), second.release(), predictorOnly.release(), differentAnalyzer.release()]); }
 	});
 
-	test("discards persisted patterns from a different schema version", async () => {
-		const file = await patternFile("schema-version");
-		await fs.writeFile(
-			file,
-			JSON.stringify({
-				version: 12,
-				patterns: [validatedGapPattern({ "0": 10 })],
-				pools: [],
-				sequenceCounts: [],
-			}),
-		);
-
-		const store = new PatternAwareStore(settings(), file);
-		await store.load();
-
-		expect(store.snapshot()).toEqual([]);
-	});
-
 	test("enforces the configured context bound while learning, restoring, and registering patterns", async () => {
 		const file = await patternFile("context-bound");
 		const long = validatedGapPattern(
@@ -599,43 +590,6 @@ describe("PatternAware", () => {
 			store.finishSession(sessionID);
 		}
 		expect(store.snapshot()).toEqual([]);
-	});
-
-	test.each([13, 14])("migrates v%s evidence by gap without loading its mixed mapper patterns", async (version) => {
-		const file = await patternFile("gap-migration");
-		const sample = (sessionID: string, filePath: string, gap: number) => ({
-			context: [event({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] })],
-			target: event({ sessionID, tool: "read", input: { filePath } }),
-			gap,
-		});
-		await fs.writeFile(
-			file,
-			JSON.stringify({
-				version,
-				patterns: [validatedGapPattern({ "0": 10 }, { id: "stale-legacy" })],
-				pools: [
-					{
-						key: "legacy-mixed-gap",
-						context: [{ tool: "grep", outcome: "success" }],
-						targetTool: "read",
-						samples: [sample("immediate", "src/a.ts", 0), sample("delayed", "src/b.ts", 1)],
-						inferred: { '["filePath"]': { type: "constant", value: "src/c.ts" } },
-						observations: 2,
-						nextInferenceAt: 100,
-					},
-				],
-				sequenceCounts: [],
-			}),
-		);
-
-		const store = new PatternAwareStore(settings(), file);
-		await store.load();
-		expect(store.snapshot()).toEqual([]);
-		trainGrepRead(store, "fresh", "src/c.ts");
-
-		expect(store.snapshot()).toEqual([
-			expect.objectContaining({ targetTool: "read", occurrences: 2, gapCounts: { "0": 2 } }),
-		]);
 	});
 
 	test("transfers data-flow patterns across processes before global support", async () => {

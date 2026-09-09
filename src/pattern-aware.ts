@@ -226,9 +226,9 @@ type PersistedPatternPool = Omit<PatternPool, "samples"> & {
 };
 
 type PersistedState = {
-	readonly version: number;
+	readonly version: typeof PERSISTENCE_VERSION;
 	readonly patterns: ReadonlyArray<PatternAwarePattern>;
-	readonly events?: ReadonlyArray<PatternAwareEvent>;
+	readonly events: ReadonlyArray<PatternAwareEvent>;
 	readonly pools: ReadonlyArray<unknown>;
 	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
@@ -274,10 +274,6 @@ const MAX_PATH_SOURCES = 24;
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
 const PERSISTENCE_VERSION = 18;
-const MIN_MIGRATABLE_PERSISTENCE_VERSION = 13;
-const INDEXED_POOL_PERSISTENCE_VERSION = 16;
-const COMPATIBLE_PATTERN_VERSION = 17;
-const BATCH_CONTROL_OPPORTUNITY_VERSION = 18;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -351,63 +347,41 @@ export class PatternAwareStore {
 			.catch(() => undefined);
 		if (
 			!parsed ||
-			!Number.isInteger(parsed.version) ||
-			parsed.version < MIN_MIGRATABLE_PERSISTENCE_VERSION ||
-			parsed.version > PERSISTENCE_VERSION ||
+			parsed.version !== PERSISTENCE_VERSION ||
 			!Array.isArray(parsed.patterns) ||
+			!Array.isArray(parsed.events) ||
 			!Array.isArray(parsed.pools) ||
 			!Array.isArray(parsed.sequenceCounts)
 		)
 			return;
-		if (parsed.version >= COMPATIBLE_PATTERN_VERSION) {
-			for (const item of parsed.patterns) {
-				const pattern = mutablePattern(item);
-				if (
-					!pattern ||
-					pattern.context.length > this.settings.maxContextLength ||
-					pattern.context.some((event) => event.tool === "$llm")
-				)
-					continue;
-				this.patterns.set(pattern.id, pattern);
-				this.clock = Math.max(this.clock, pattern.lastSeenSequence);
-			}
-		}
-		const restoredPools =
-			parsed.version >= INDEXED_POOL_PERSISTENCE_VERSION
-				? mutableIndexedPools(parsed.events, parsed.pools)
-				: parsed.pools.flatMap((item) => mutablePool(item) ?? []);
-		for (const pool of restoredPools) {
+		for (const item of parsed.patterns) {
+			const pattern = mutablePattern(item);
 			if (
-				!pool ||
+				!pattern ||
+				pattern.context.length > this.settings.maxContextLength ||
+				pattern.context.some((event) => event.tool === "$llm")
+			)
+				continue;
+			this.patterns.set(pattern.id, pattern);
+			this.clock = Math.max(this.clock, pattern.lastSeenSequence);
+		}
+		for (const pool of mutablePools(parsed.events, parsed.pools)) {
+			if (
 				pool.context.length > this.settings.maxContextLength ||
 				pool.context.some((event) => event.tool === "$llm")
 			)
 				continue;
-			for (const [gap, samples] of samplesByGap(pool.samples)) {
-				const key = patternPoolKey(pool.context, pool.targetTool, pool.targetSchemaHash, gap);
-				const compatible = parsed.version >= COMPATIBLE_PATTERN_VERSION && pool.gap === gap;
-				const restored = {
-					key,
-					context: pool.context,
-					targetTool: pool.targetTool,
-					...(pool.targetSchemaHash ? { targetSchemaHash: pool.targetSchemaHash } : {}),
-					gap,
-					samples,
-					...(compatible && pool.patternIDs?.length ? { patternIDs: pool.patternIDs } : {}),
-				};
-				this.pools.set(key, restored);
-				this.addControlOpportunities(restored, restored.samples, 1);
-				for (const patternID of restored.patternIDs ?? []) {
-					if (this.patterns.get(patternID)?.dependencies.length === 0) {
-						this.patternSupportSessions.set(patternID, new Set(samples.map((sample) => sample.target.sessionID)));
-					}
+			this.pools.set(pool.key, pool);
+			this.addControlOpportunities(pool, pool.samples, 1);
+			for (const patternID of pool.patternIDs ?? []) {
+				if (this.patterns.get(patternID)?.dependencies.length === 0) {
+					this.patternSupportSessions.set(patternID, new Set(pool.samples.map((sample) => sample.target.sessionID)));
 				}
 			}
 			for (const sample of pool.samples) {
 				this.clock = Math.max(this.clock, sample.target.sequence, ...sample.context.map((event) => event.sequence));
 			}
 		}
-		if (parsed.version < BATCH_CONTROL_OPPORTUNITY_VERSION) this.migrateBatchControlOpportunities();
 		this.sequenceModel.restore(parsed.sequenceCounts);
 		this.sequenceModel.trim(this.settings.maxPatterns);
 		this.indexDirty = true;
@@ -1223,31 +1197,6 @@ export class PatternAwareStore {
 		}
 		if (references.size) this.controlOpportunitiesByContext.set(key, references);
 		else this.controlOpportunitiesByContext.delete(key);
-	}
-
-	private migrateBatchControlOpportunities() {
-		const oldCounts = new Map<string, number>();
-		for (const pool of this.pools.values()) {
-			const key = patternControlKey(pool.context, pool.gap);
-			oldCounts.set(key, (oldCounts.get(key) ?? 0) + pool.samples.length);
-		}
-		for (const pool of this.pools.values()) {
-			const key = patternControlKey(pool.context, pool.gap);
-			const duplicateOpportunities = Math.max(0, (oldCounts.get(key) ?? 0) - this.controlOpportunities(pool));
-			for (const patternID of pool.patternIDs ?? []) {
-				const pattern = this.patterns.get(patternID);
-				if (!pattern) continue;
-				const support = pool.samples.filter((sample) =>
-					this.bindingsCoverSample(pattern.bindings, pattern.targetTool, pattern.targetSchemaHash, sample),
-				);
-				const duplicateMatches = support.length - controlOpportunityCount(support);
-				pattern.historicalMatches = Math.max(0, pattern.historicalMatches - duplicateMatches);
-				pattern.historicalOpportunities = Math.max(
-					pattern.historicalMatches,
-					pattern.historicalOpportunities - duplicateOpportunities,
-				);
-			}
-		}
 	}
 
 	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
@@ -2825,83 +2774,47 @@ function numericRecord(value: unknown): Record<string, number> | undefined {
 	return record as Record<string, number>;
 }
 
-function mutablePool(value: unknown): PatternPool | undefined {
-	const record = asRecord(value);
-	if (!record || !Array.isArray(record.samples)) return;
-	const samples = record.samples.flatMap((item) => {
-		const sample = asRecord(item);
-		if (
-			!sample ||
-			!Array.isArray(sample.context) ||
-			!sample.context.every(isPersistedEvent) ||
-			!isPersistedEvent(sample.target) ||
-			!isFiniteNumber(sample.gap)
-		)
-			return [];
-		return [
-			{
-				context: structuredClone(sample.context) as PatternAwareEvent[],
-				target: structuredClone(sample.target) as PatternAwareEvent,
-				gap: Math.max(0, Math.floor(sample.gap)),
-			},
-		];
-	});
-	return mutablePoolRecord(record, samples);
-}
-
-function mutableIndexedPools(eventsValue: unknown, pools: ReadonlyArray<unknown>): PatternPool[] {
-	if (!Array.isArray(eventsValue)) return [];
+function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<unknown>): PatternPool[] {
 	const events = eventsValue.map((item) =>
 		isPersistedEvent(item) ? (structuredClone(item) as PatternAwareEvent) : undefined,
 	);
 	return pools.flatMap((value) => {
 		const record = asRecord(value);
-		if (!record || !Array.isArray(record.samples)) return [];
+		if (!record || !Array.isArray(record.samples) || typeof record.key !== "string" ||
+			typeof record.targetTool !== "string" || !Array.isArray(record.context) ||
+			!record.context.every(isEventSignature) || !isNonNegativeInteger(record.gap)) return [];
 		const samples = record.samples.flatMap((item) => {
 			const sample = asRecord(item);
 			if (
 				!sample ||
 				!Array.isArray(sample.context) ||
-				!sample.context.every(isEventReference) ||
-				!isEventReference(sample.target) ||
-				!isFiniteNumber(sample.gap)
+				!sample.context.every(isNonNegativeInteger) ||
+				!isNonNegativeInteger(sample.target) ||
+				sample.gap !== record.gap
 			)
 				return [];
 			const context = sample.context.map((id) => events[id as number]);
 			const target = events[sample.target as number];
 			if (!target || context.some((event) => !event)) return [];
-			return [{ context: context as PatternAwareEvent[], target, gap: Math.max(0, Math.floor(sample.gap)) }];
+			return [{ context: context as PatternAwareEvent[], target, gap: record.gap as number }];
 		});
-		return mutablePoolRecord(record, samples) ?? [];
+		if (!samples.length) return [];
+		const context = structuredClone(record.context) as PatternAwareEventSignature[];
+		const targetSchemaHash = typeof record.targetSchemaHash === "string" ? record.targetSchemaHash : undefined;
+		const patternIDs = Array.isArray(record.patternIDs) ? record.patternIDs.filter((item): item is string => typeof item === "string") : [];
+		return [{
+			key: patternPoolKey(context, record.targetTool, targetSchemaHash, record.gap),
+			context,
+			targetTool: record.targetTool,
+			...(targetSchemaHash ? { targetSchemaHash } : {}),
+			gap: record.gap,
+			samples,
+			...(patternIDs.length ? { patternIDs: [...new Set(patternIDs)] } : {}),
+		}];
 	});
 }
 
-function mutablePoolRecord(record: Record<string, unknown>, samples: PatternSample[]): PatternPool | undefined {
-	if (
-		typeof record.key !== "string" ||
-		typeof record.targetTool !== "string" ||
-		!Array.isArray(record.context) ||
-		!record.context.every(isEventSignature) ||
-		!samples.length
-	)
-		return;
-	const patternIDs = Array.isArray(record.patternIDs)
-		? record.patternIDs.filter((item): item is string => typeof item === "string")
-		: typeof record.patternID === "string"
-			? [record.patternID]
-			: [];
-	return {
-		key: record.key,
-		context: structuredClone(record.context) as PatternAwareEventSignature[],
-		targetTool: record.targetTool,
-		...(typeof record.targetSchemaHash === "string" ? { targetSchemaHash: record.targetSchemaHash } : {}),
-		gap: isFiniteNumber(record.gap) ? Math.max(0, Math.floor(record.gap)) : samples[0]!.gap,
-		samples,
-		...(patternIDs.length ? { patternIDs: [...new Set(patternIDs)] } : {}),
-	};
-}
-
-function isEventReference(value: unknown): value is number {
+function isNonNegativeInteger(value: unknown): value is number {
 	return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
@@ -2926,16 +2839,6 @@ function controlOpportunityID(event: PatternAwareEvent) {
 
 function controlOpportunityCount(samples: ReadonlyArray<PatternSample>) {
 	return new Set(samples.map((sample) => controlOpportunityID(sample.target))).size;
-}
-
-function samplesByGap(samples: ReadonlyArray<PatternSample>) {
-	const groups = new Map<number, PatternSample[]>();
-	for (const sample of samples) {
-		const group = groups.get(sample.gap) ?? [];
-		group.push(sample);
-		groups.set(sample.gap, group);
-	}
-	return groups;
 }
 
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
