@@ -53,9 +53,8 @@ export class PpmCountTrie {
 		const lastSeen = nonNegativeInteger(sequence);
 		this.increment(this.root, target, 1, lastSeen, halfLife);
 		let current = this.root;
-		const suffix = history.slice(-this.order);
-		for (let index = suffix.length - 1; index >= 0; index--) {
-			const token = suffix[index];
+		for (let index = history.length - 1; index >= Math.max(0, history.length - this.order); index--) {
+			const token = history[index];
 			if (token === undefined) continue;
 			const child = current.children.get(token) ?? node();
 			current.children.set(token, child);
@@ -91,12 +90,17 @@ export class PpmCountTrie {
 		sequence = 0,
 		halfLife = 0,
 	): PpmProbabilityEstimate | undefined {
-		if (!target || this.root.total <= 0) return undefined;
+		return target ? this.distribution(history, sequence, halfLife).get(target) : undefined;
+	}
+
+	/** Compute the suffix evidence once for every competing target in this prediction frontier. */
+	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, PpmProbabilityEstimate> {
+		const estimates = new Map<string, PpmProbabilityEstimate>();
+		if (this.root.total <= 0) return estimates;
 		const suffixNodes: Array<{ readonly node: CountNode; readonly order: number }> = [{ node: this.root, order: 0 }];
 		let current = this.root;
-		const suffix = history.slice(-this.order);
-		for (let index = suffix.length - 1, order = 1; index >= 0; index--, order++) {
-			const token = suffix[index];
+		for (let order = 1; order <= Math.min(history.length, this.order); order++) {
+			const token = history[history.length - order];
 			if (token === undefined) continue;
 			const child = current.children.get(token);
 			if (!child) break;
@@ -108,32 +112,28 @@ export class PpmCountTrie {
 		if (deterministic >= 0) suffixNodes.length = deterministic + 1;
 
 		let remaining = 1;
-		let probability = 0;
-		let matchedOrder = -1;
-		let evidence = 0;
 		for (const item of suffixNodes.reverse()) {
-			const weighted = [...item.node.targets.values()].map((value) => decayedCount(value, sequence, halfLife));
-			const total = weighted.reduce((sum, count) => sum + count, 0);
-			const distinct = weighted.filter((count) => count > 0).length;
+			const weighted = [...item.node.targets].map(([target, value]) => [target, decayedCount(value, sequence, halfLife)] as const);
+			const total = weighted.reduce((sum, [, count]) => sum + count, 0);
+			const distinct = weighted.filter(([, count]) => count > 0).length;
 			if (total <= 0 || distinct <= 0) continue;
 			const denominator = total + distinct;
-			const count = decayedCount(item.node.targets.get(target), sequence, halfLife);
-			if (count > 0) {
-				probability += remaining * (count / denominator);
-				if (item.order > matchedOrder) {
-					matchedOrder = item.order;
-					evidence = count;
-				}
+			for (const [target, count] of weighted) {
+				if (count <= 0) continue;
+				const previous = estimates.get(target);
+				estimates.set(target, {
+					probability: (previous?.probability ?? 0) + remaining * (count / denominator),
+					order: previous?.order ?? item.order,
+					evidence: previous?.evidence ?? count,
+					escapeMass: 0,
+				});
 			}
 			remaining *= distinct / denominator;
 		}
-		if (matchedOrder < 0) return undefined;
-		return {
-			probability: clampProbability(probability),
-			order: matchedOrder,
-			evidence,
-			escapeMass: clampProbability(remaining),
-		};
+		for (const [target, estimate] of estimates) {
+			estimates.set(target, { ...estimate, probability: clampProbability(estimate.probability), escapeMass: clampProbability(remaining) });
+		}
+		return estimates;
 	}
 
 	probability(history: readonly string[], target: string, sequence = 0, halfLife = 0): number | undefined {

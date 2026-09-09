@@ -618,15 +618,9 @@ export class PatternAwareStore {
 				groups.set(identity, group);
 			}
 		}
-		const ppmEstimates = new Map<string, PpmProbabilityEstimate | undefined>();
-		const estimatePpm = (tool: string) => {
-			if (!ppmEstimates.has(tool))
-				ppmEstimates.set(
-					tool,
-					this.sequenceModel.estimate(sequenceContext, tool, this.clock, settings.decayHalfLifeEvents),
-				);
-			return ppmEstimates.get(tool);
-		};
+		let ppmEstimates: ReadonlyMap<string, PpmProbabilityEstimate> | undefined;
+		const estimatePpm = (tool: string) => (ppmEstimates ??=
+			this.sequenceModel.distribution(sequenceContext, this.clock, settings.decayHalfLifeEvents)).get(tool);
 		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>

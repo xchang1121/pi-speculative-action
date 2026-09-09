@@ -2,15 +2,19 @@ import { describe, expect, it } from "vitest";
 import { PpmCountTrie } from "../src/ppm-count-trie.ts";
 
 describe("PpmCountTrie", () => {
-	it("counts the root and every bounded suffix exactly once", () => {
-		const model = new PpmCountTrie(2);
+	it.each([0, 2])("counts the root and every bounded suffix exactly once at order %i", (order) => {
+		const model = new PpmCountTrie(order);
 		model.observe(["old", "recent", "latest"], "read", 7);
 
 		expect(model.snapshot()).toEqual([
 			{ context: [], counts: { read: 1 }, lastSeen: 7 },
-			{ context: ["recent", "latest"], counts: { read: 1 }, lastSeen: 7 },
-			{ context: ["latest"], counts: { read: 1 }, lastSeen: 7 },
+			...(order ? [
+				{ context: ["recent", "latest"], counts: { read: 1 }, lastSeen: 7 },
+				{ context: ["latest"], counts: { read: 1 }, lastSeen: 7 },
+			] : []),
 		]);
+		expect(model.size).toBe(order + 1);
+		expect(model.estimate(["old", "recent", "latest"], "read")?.order).toBe(Math.min(order, 1));
 	});
 
 	it("uses the longest matching suffix to disambiguate a shared unigram", () => {
@@ -128,7 +132,7 @@ describe("PpmCountTrie", () => {
 		expect(model.snapshot()).toEqual(restored.snapshot());
 		expect(model.snapshot().map((row) => row.context)).toEqual([[], ["ancestor", "leaf"]]);
 		for (const target of ["read", "bash", "grep"]) {
-			expect(model.estimate(["ancestor", "leaf"], target, 8, 2)).toEqual(
+			expect(model.distribution(["ancestor", "leaf"], 8, 2).get(target)).toEqual(
 				restored.estimate(["ancestor", "leaf"], target, 8, 2),
 			);
 		}
