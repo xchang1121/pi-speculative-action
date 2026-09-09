@@ -2,10 +2,9 @@ import {
 	certificateReplayable,
 	dependencyPathsetKey,
 	type DynamicDependencyCertificate,
-	type ExecPrototype,
+	isSha256Digest,
 	type ProcessProducerProof,
 	processStrongKey,
-	processWeakKey,
 	type ProcessProvenanceCertificate,
 	type ProvenanceTaint,
 	referencedArtifacts,
@@ -25,7 +24,8 @@ export interface ReplayObservationContract {
 }
 
 export interface ProcessReuseRequest {
-	readonly prototype: ExecPrototype;
+	/** Static exec identity already derived from the caller's bound invocation; not replay authority. */
+	readonly weakKey: Sha256Digest;
 	readonly contract: ReplayObservationContract;
 	readonly validation?: ProvenanceValidationContext;
 	/** Optional host policy for accepting proof produced under a different execution authority. */
@@ -103,7 +103,8 @@ export class ProcessReusePlanner {
 				artifactBytesRead,
 				durationMs: Math.max(0, performance.now() - startedAt),
 			});
-		const weakKey = processWeakKey(request.prototype);
+		const weakKey = request.weakKey;
+		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live?.certificate.weakKey === weakKey ? request.live : undefined;
 		const acceptedTaints = [...new Set([
 			...(request.validation?.acceptedTaints ?? []),

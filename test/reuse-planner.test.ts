@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createExecPrototype,
+	processWeakKey,
 	sealProcessCertificate,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
@@ -28,11 +29,15 @@ describe("ProcessReusePlanner", () => {
 	it("reuses the same nested exec across different parent commands after strong validation", async () => {
 		const fixture = await fixtureWithCertificate();
 		const planner = new ProcessReusePlanner({ store: fixture.store });
-		const plan = await planner.plan({
-			prototype: fixture.prototype,
+		const request = {
+			weakKey: fixture.weakKey,
 			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
-		});
+		};
+		for (const weakKey of [undefined, "invalid", "sha256:ABC", 123]) {
+			await expect(planner.plan({ ...request, weakKey: weakKey as never })).rejects.toThrow("invalid process weak key");
+		}
+		const plan = await planner.plan(request);
 
 		expect(plan).toMatchObject({
 			kind: "completed_replay",
@@ -42,18 +47,11 @@ describe("ProcessReusePlanner", () => {
 		// Parent Bash text is intentionally absent from ExecPrototype/WeakKey.
 		expect(JSON.stringify(fixture.prototype)).not.toContain("parent-wrapper");
 		expect(await planner.plan({
-			prototype: fixture.prototype, contract: { ...contract(), sink: "pipe" },
-			validation: { resolvePath: () => fixture.input },
+			...request, contract: { ...request.contract, sink: "pipe" },
 		})).toMatchObject({ kind: "miss", reasons: ["observation_contract_incompatible"] });
 
 		await writeFile(fixture.input, "changed");
-		expect(
-			await planner.plan({
-				prototype: fixture.prototype,
-				contract: contract(),
-				validation: { resolvePath: () => fixture.input },
-			}),
-		).toMatchObject({
+		expect(await planner.plan(request)).toMatchObject({
 			kind: "miss",
 			reasons: ["dependency_changed"],
 			changedDependencies: ["/workspace/input.txt"],
@@ -79,7 +77,7 @@ describe("ProcessReusePlanner", () => {
 		await mkdir(path.dirname(file), { recursive: true }); await mkdir(index, { recursive: true });
 		const bytes = JSON.stringify(legacy);
 		await writeFile(file, bytes); await writeFile(path.join(index, `${id}.ref`), "");
-		const planner = new ProcessReusePlanner({ store }), request = { prototype: certificate.prototype, contract: contract() };
+		const planner = new ProcessReusePlanner({ store }), request = { weakKey: processWeakKey(certificate.prototype), contract: contract() };
 		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 } });
 		expect(await readFile(file, "utf8")).toBe(bytes);
 		await expect(store.get(legacy.id)).rejects.toThrow("certificate integrity check failed");
@@ -91,7 +89,7 @@ describe("ProcessReusePlanner", () => {
 	it("lets the execution authority reject an otherwise matching producer proof", async () => {
 		const fixture = await fixtureWithCertificate();
 		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
-			prototype: fixture.prototype,
+			weakKey: fixture.weakKey,
 			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 			acceptProducer: () => false,
@@ -104,7 +102,7 @@ describe("ProcessReusePlanner", () => {
 		const fixture = await fixtureWithCertificate(false, ["confinement_observation"]);
 		const planner = new ProcessReusePlanner({ store: fixture.store });
 		const request = {
-			prototype: fixture.prototype,
+			weakKey: fixture.weakKey,
 			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		};
@@ -119,7 +117,7 @@ describe("ProcessReusePlanner", () => {
 		const fixture = await fixtureWithCertificate(true);
 		const get = vi.spyOn(fixture.store.artifacts, "get");
 		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
-			prototype: fixture.prototype,
+			weakKey: fixture.weakKey,
 			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		});
@@ -151,23 +149,32 @@ describe("ProcessReusePlanner", () => {
 			result: fixture.certificate.result,
 		});
 		const planner = new ProcessReusePlanner({ store: fixture.store });
+		const unrelatedKey = processWeakKey({ ...fixture.prototype, argvDigest: sha256Digest("unrelated argv") });
 		const request = {
-			prototype: fixture.prototype,
+			weakKey: fixture.weakKey,
 			contract: contract(),
 			validation: { resolvePath: () => fixture.input },
 		};
 
-		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: [] } })).toMatchObject({
-			kind: "miss", reasons: ["certificate_tainted"],
-		});
-		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
-			kind: "completed_replay", source: "live", certificate: { id: live.id },
-		});
-		expect(find).not.toHaveBeenCalled();
-		await writeFile(fixture.input, "changed");
-		expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
-			kind: "miss", reasons: ["dependency_changed"],
-		});
+		const freezing = vi.spyOn(Object, "freeze");
+		try {
+			expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: [] } })).toMatchObject({
+				kind: "miss", reasons: ["certificate_tainted"],
+			});
+			expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
+				kind: "completed_replay", source: "live", certificate: { id: live.id },
+			});
+			expect(find).not.toHaveBeenCalled();
+			expect(await planner.plan({ ...request, weakKey: unrelatedKey, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
+				kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 },
+			});
+			expect(find).toHaveBeenCalledOnce(); expect(find).toHaveBeenCalledWith(unrelatedKey);
+			await writeFile(fixture.input, "changed");
+			expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
+				kind: "miss", reasons: ["dependency_changed"],
+			});
+			expect(freezing.mock.calls.filter(([value]) => value && typeof value === "object" && "argvDigest" in value)).toHaveLength(0);
+		} finally { freezing.mockRestore(); find.mockRestore(); }
 	});
 
 	it("captures one dynamic pathset once when matching several historical input states", async () => {
@@ -197,7 +204,7 @@ describe("ProcessReusePlanner", () => {
 		await writeFile(input, "one");
 
 		const plan = await new ProcessReusePlanner({ store }).plan({
-			prototype,
+			weakKey: processWeakKey(prototype),
 			contract: contract(),
 			validation: { resolvePath: () => input },
 		});
@@ -250,7 +257,7 @@ async function fixtureWithCertificate(
 		},
 	});
 	await store.put(certificate);
-	return { certificate, input, prototype, root, store };
+	return { certificate, input, prototype, weakKey: processWeakKey(prototype), root, store };
 }
 
 function processPrototype() {

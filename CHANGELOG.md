@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- `ProcessReuseRequest` now requires `weakKey` instead of `prototype`. Derive it once with
+  `processWeakKey(boundPrototype)` at the invocation boundary and reuse it for scheduler timing,
+  handoff reservation and persistent/live lookup. A key locates candidates; it does not grant replay
+  authority. Producer, current-resource, artifact and observation-contract checks remain unchanged.
 - Canonical JSON named keys, process environments and dependency identities now use exact UTF-16
   ordering instead of locale collation. Process certificates move to v7: v6 weak keys cold-miss and
   timing-inclusive legacy IDs are rejected. No store clear is performed; existing GC policy still applies.

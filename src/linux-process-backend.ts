@@ -405,10 +405,11 @@ export class LinuxProcessReuseBackend {
 						projection,
 						await this.resolvePlatformFingerprint(),
 					);
-					timing = processTimingIdentity(prototype, processWeakKey(prototype));
-					const admission = this.actorAdmission(timing, "succeeded");
+					const weakKey = processWeakKey(prototype);
+					timing = processTimingIdentity(prototype, weakKey);
+					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded", expectedSpeculativeDurationMs: 1 });
 					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
-					const plan = await this.plan(prototype, projection, acceptProducer);
+					const plan = await this.plan(weakKey, projection, acceptProducer);
 					if (!plan) return this.actorReplayMiss(host, request, timing);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
@@ -601,7 +602,7 @@ export class LinuxProcessReuseBackend {
 		);
 		this.add(session, "wholeCommandRequests");
 		const plan = await this.plan(
-			prototype,
+			processWeakKey(prototype),
 			session.projection,
 			(candidate) => compatibleProducer(session.producer, candidate),
 			session,
@@ -768,7 +769,7 @@ export class LinuxProcessReuseBackend {
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
 			weakKey,
-			(live) => this.plan(prototype, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
+			(live) => this.plan(weakKey, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
 			undefined,
 			session.scope,
 		);
@@ -790,7 +791,7 @@ export class LinuxProcessReuseBackend {
 		actor?: { readonly timing: ServiceTimingIdentity; readonly arrivedAt: number },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
-		let admission = actor ? this.actorAdmission(actor.timing, "succeeded") : undefined;
+		let admission = actor ? this.processScheduler.assessCandidateJoin({ identity: actor.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
 		if (admission && !admission.allowed) {
 			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
 		}
@@ -801,7 +802,8 @@ export class LinuxProcessReuseBackend {
 			...(actor ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
-					admission = this.actorAdmission(actor.timing, "running", {
+					admission = this.processScheduler.assessCandidateJoin({
+						identity: actor.timing, state: "running", expectedSpeculativeDurationMs: 1,
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 						actorElapsedMs: Math.max(0, performance.now() - actor.arrivedAt),
 					});
@@ -824,25 +826,15 @@ export class LinuxProcessReuseBackend {
 		};
 	}
 
-	private actorAdmission(
-		identity: ServiceTimingIdentity,
-		state: "running" | "succeeded",
-		timing: { readonly elapsedMs?: number; readonly actorElapsedMs?: number } = {},
-	) {
-		return this.processScheduler.assessCandidateJoin({
-			identity, state, expectedSpeculativeDurationMs: 1, ...timing,
-		});
-	}
-
 	private async plan(
-		prototype: ExecPrototype,
+		weakKey: Sha256Digest,
 		projection: ExecutionPathProjection,
 		acceptProducer: (producer: ProcessProducerProof) => boolean,
 		session?: ActiveSession,
 		live?: ProcessProvenanceCertificate,
 	): Promise<CompletedProcessPlan | undefined> {
 		const plan = await this.planner.plan({
-			prototype,
+			weakKey,
 			acceptProducer,
 			contract: {
 				sink: "buffered",
@@ -934,7 +926,7 @@ export class LinuxProcessReuseBackend {
 				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(
 				weakKey,
-				(live) => this.plan(prototype, projection, accepted, undefined, live),
+				(live) => this.plan(weakKey, projection, accepted, undefined, live),
 				process.signal,
 				scope,
 				{ timing, arrivedAt: requestStarted },
