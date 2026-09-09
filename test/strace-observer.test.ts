@@ -14,11 +14,12 @@ const STAT_DIGEST = filesystemObservationDigest({
 });
 
 /** Owns a complete per-PID transcript, including its filesystem lifetime. */
-async function observe(processes: Record<number, readonly string[]>, options?: StraceObservationOptions) {
+async function observe(processes: Record<number, readonly string[]>, options?: StraceObservationOptions, terminated = true) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-observer-"));
 	const prefix = path.join(root, "process");
 	try {
-		await Promise.all(Object.entries(processes).map(([pid, lines]) => fs.writeFile(prefix + "." + pid, lines.join("\n"))));
+		await Promise.all(Object.entries(processes).map(([pid, lines]) =>
+			fs.writeFile(prefix + "." + pid, [...lines, ...(terminated ? ["+++ exited with 0 +++"] : [])].join("\n"))));
 		return await observeStrace(prefix, "/usr/bin/example", "/work", options);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
@@ -90,7 +91,11 @@ describe("strace provenance decoder", () => {
 	});
 
 	test("fails closed on missing process evidence or malformed syntax", async () => {
-		for (const [lines, reasons, others] of [
+		for (const [lines, reasons, others, terminated = true] of [
+			[[EXEC], ["process_exit_unproven:100"], {}, false],
+			[[EXEC, "+++ unfinished +++"], ["process_exit_unproven:100"], {}, false],
+			[[EXEC, "+++ exited with 0 +++", 'open("later", O_RDONLY) = 3'], ["process_exit_unproven:100"], {}, false],
+			[[EXEC, "fork() = 101", "+++ exited with 0 +++"], ["process_exit_unproven:101"], { 101: [EXEC] }, false],
 			[[EXEC, "<... openat resumed>) = 3</work/lost.txt>"], ["resumed_without_unfinished:100:openat"]],
 			[[EXEC, "fchdir(9) = 0", "clone(child_stack=NULL, flags=SIGCHLD) = 201"], ["child_trace_missing:201", "fchdir_unparsed:100"]],
 			[[EXEC, 'openat(AT_FDCWD, "file", O_RDONLY <unfinished ...>'], ["unfinished:100:openat"]],
@@ -99,7 +104,7 @@ describe("strace provenance decoder", () => {
 			[[EXEC], ["target_filesystem_context_unproven"], { 99: ["clone3({flags=CLONE_FS}, 88) = 100"] }],
 			[["clone(child_stack=NULL, flags=CLONE_FS|SIGCHLD) = 101", EXEC], ["target_filesystem_context_unproven"], { 101: ['chdir("elsewhere") = 0'] }],
 		] as const) {
-			const observation = await observe({ 100: lines, ...others });
+			const observation = await observe({ 100: lines, ...others }, undefined, terminated);
 			expect(observation).toMatchObject({ complete: false, incompleteReasons: reasons });
 			expect(observation.taints).toContain("trace_incomplete");
 		}

@@ -79,8 +79,8 @@ Linux / WSL 2 的能力分别探测，不要求消费路径具备全部生产依
 | 能力 | 最小条件 |
 | --- | --- |
 | 已有整条命令证书重放 | Node、证书存储和当前资源/事务验证；命中路径不要求 Landlock 或 `strace` |
-| 跨父 Bash 子进程重放或运行中接管 | x86-64 Linux、原生 helper、`ptrace`，以及 Pi 管道所需的 `pidfd_getfd` |
-| 提前执行 Bash 并生产证书 | Git、`strace`、合格 Sandlock/Landlock/seccomp 和透明 exec 边界；从源码构建另需 C/Rust 工具链 |
+| 跨父 Bash 子进程重放或运行中接管 | x86-64 Linux、通过当前协议资格的原生 helper、`ptrace`，以及 Pi 管道所需的 `pidfd_getfd` |
+| 提前执行 Bash 并生产证书 | Git、支持 `--kill-on-exit` 的 `strace`、合格 Sandlock/Landlock/seccomp 和透明 exec 边界；从源码构建另需 C/Rust 工具链 |
 | 加速大型工作区事务 | 可选且通过完整探测的 `fuse-overlayfs`；否则保留 Git |
 
 如确实需要安装可选 Linux 后端，可准备现有安装器所需环境，再运行分级资格检查：

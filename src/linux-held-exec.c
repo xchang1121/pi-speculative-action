@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-	PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
+	PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL;
 
 #define MAX_LINE 1024
 #define MAX_OUTPUT_EVENTS 65536
@@ -310,24 +310,21 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		return 72;
 	}
 	close(gate[1]);
-	int status = 0;
+	int status = 0, root_status = -1;
 	unsigned exec_events = 0;
 	struct traced_process *processes = NULL;
-	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); return 70; }
+	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); goto fatal; }
 	for (;;) {
 		pid_t pid = waitpid(-1, &status, __WALL);
 		if (pid < 0) {
 			if (errno == EINTR) continue;
-			if (errno == ECHILD) return 125;
-			return 74;
+			if (errno == ECHILD) break;
+			goto fatal;
 		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
+			if (pid == root) root_status = status;
 			release_process(&processes, pid);
-			if (pid != root) continue;
-			if (WIFEXITED(status)) return WEXITSTATUS(status);
-			signal(WTERMSIG(status), SIG_DFL);
-			raise(WTERMSIG(status));
-			return 128 + WTERMSIG(status);
+			continue;
 		}
 		if (!WIFSTOPPED(status)) continue;
 		unsigned event = (unsigned)status >> 16;
@@ -337,11 +334,11 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0 || track_process(&processes, (pid_t)child) < 0) goto fatal;
 		}
 		if (event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
-			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) return 75;
+			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
 			continue;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
-			if (skip && replace_with_exit(pid, skip_code) < 0) return 76;
+			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
 			if (socket_path) {
 				int observer = actor_decision(pid, socket_path, token, execution_id);
 				if (observer == -2) goto fatal;
@@ -350,10 +347,18 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			}
 		}
 		if (event != 0) delivered = 0;
-		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) return 75;
+		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
 	}
+	while (processes) release_process(&processes, processes->pid);
+	if (root_status < 0) return 125;
+	if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
+	signal(WTERMSIG(root_status), SIG_DFL);
+	raise(WTERMSIG(root_status));
+	return 128 + WTERMSIG(root_status);
 fatal:
 	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
+	while (waitpid(-1, &status, __WALL) > 0 || errno == EINTR) {}
+	while (processes) release_process(&processes, processes->pid);
 	return 125;
 }
 
@@ -361,7 +366,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("4");
+		puts("5");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {

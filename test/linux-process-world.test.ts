@@ -37,6 +37,34 @@ describe("Linux process ExecutionWorld", () => {
 		execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
+			const completed = path.join(root, "descendant-completed"), pidFile = path.join(root, "descendant-pid");
+			const command = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 0.1; echo done > ${completed}' </dev/null >/dev/null 2>&1 & exit 7`;
+			expect(childProcess.spawnSync(binary, ["/bin/bash", "-c", command]).status).toBe(7);
+			expect(await readFile(completed, "utf8"), "parent exit must drain detached descendants").toBe("done\n");
+			await rm(pidFile);
+			const tracer = childProcess.spawn(binary, ["/bin/bash", "-c", command.replace("sleep 0.1", "sleep 10").replace("exit 7", "wait")]);
+			const stopped = new Promise<void>((resolve) => tracer.once("close", () => resolve()));
+			let pid = 0;
+			try {
+				for (let retry = 0; retry < 100 && !pid; retry++) {
+					pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+					if (!pid) await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				expect(pid).toBeGreaterThan(0);
+				tracer.kill("SIGKILL");
+				await stopped;
+				let alive = true;
+				for (let retry = 0; retry < 100 && alive; retry++) {
+					const state = (await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "")).match(/\) (\w) /)?.[1];
+					alive = state !== undefined && state !== "Z";
+					if (alive) await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				expect(alive, "killed tracer must not release its tracees to run").toBe(false);
+			} finally {
+				tracer.kill("SIGKILL");
+				if (pid) try { process.kill(-pid, "SIGKILL"); } catch { /* Already reaped. */ }
+				await stopped;
+			}
 			for (const disposition of [undefined, "recoverable", "poisoned"] as const) {
 				const after = path.join(root, `after-${disposition}`);
 				const commit = vi.fn(async () => {
@@ -57,6 +85,22 @@ describe("Linux process ExecutionWorld", () => {
 				}
 				expect(commit).toHaveBeenCalledOnce();
 			}
+			let release!: () => void, started!: () => void, closed = false;
+			const entered = new Promise<void>((resolve) => { started = resolve; });
+			const completion = new Promise<void>((resolve) => { release = resolve; });
+			const executor = boundary.executor({ execute: async () => {
+				started(); await completion; return { exitCode: 0 };
+			} }, { sourceRoot: root, realShell: "/bin/bash", decide: async () => ({ kind: "continue" }) });
+			const running = executor.execute({ command: ":", cwd: root, environment: {}, onData: () => {} });
+			await entered;
+			const closing = boundary.close().then(() => { closed = true; });
+			try {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(closed, "close must wait for the owned executor and concurrent callers").toBe(false);
+				const concurrent = boundary.close().then(() => { expect(closed).toBe(true); });
+				release();
+				await Promise.all([closing, concurrent, running]);
+			} finally { release(); await Promise.allSettled([closing, running]); }
 		} finally {
 			await boundary.close();
 			await rm(root, { recursive: true, force: true });

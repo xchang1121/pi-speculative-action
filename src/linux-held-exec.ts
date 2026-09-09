@@ -8,7 +8,7 @@ import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
 
-const HELPER_PROTOCOL_VERSION = 4;
+const HELPER_PROTOCOL_VERSION = 5;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -61,6 +61,7 @@ interface ActiveExecution {
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
 	readonly pending: Set<Promise<void>>;
 	readonly controller: AbortController;
+	readonly completion: Promise<void>;
 	failure?: Error;
 }
 
@@ -80,7 +81,7 @@ export class LinuxHeldExecBoundary {
 	private readonly server: net.Server;
 	private readonly sockets = new Set<net.Socket>();
 	private readonly socketPath: string;
-	private closed = false;
+	private closing?: Promise<void>;
 
 	private constructor(binary: string, socketPath: string) {
 		this.shellPath = binary;
@@ -119,15 +120,17 @@ export class LinuxHeldExecBoundary {
 			execute: async (request) => {
 				// The transport never owns caller-provided environment entries. A collision
 				// therefore disables handoff for this launch and preserves stock Bash semantics.
-				if (this.closed || request.signal?.aborted || PRIVATE_ENV_NAMES.some((name) => Object.hasOwn(request.environment, name))) {
+				if (this.closing || request.signal?.aborted || PRIVATE_ENV_NAMES.some((name) => Object.hasOwn(request.environment, name))) {
 					return fallback.execute(request);
 				}
 				const execution = randomBytes(24).toString("hex");
 				const controller = new AbortController();
+				let finished!: () => void;
 				const active: ActiveExecution = {
 					sourceRoot: options.sourceRoot,
 					decide: options.decide,
 					pending: new Set<Promise<void>>(), controller,
+					completion: new Promise<void>((resolve) => { finished = resolve; }),
 					signal: AbortSignal.any([controller.signal, ...(request.signal ? [request.signal] : [])]),
 				};
 				this.active.set(execution, active);
@@ -146,19 +149,21 @@ export class LinuxHeldExecBoundary {
 				} finally {
 					await Promise.allSettled(active.pending);
 					this.active.delete(execution);
+					finished();
 					if (active.failure) throw active.failure;
 				}
 			},
 		};
 	}
 
-	async close(): Promise<void> {
-		if (this.closed) return;
-		this.closed = true;
-		for (const active of this.active.values()) active.controller.abort(new Error("held-exec boundary disposed"));
-		for (const socket of this.sockets) socket.destroy();
-		await new Promise<void>((resolve) => this.server.close(() => resolve()));
-		await rm(this.socketPath, { force: true }).catch(() => undefined);
+	close(): Promise<void> {
+		return this.closing ??= Promise.resolve().then(async () => {
+			const stopped = new Promise<void>((resolve) => this.server.close(() => resolve()));
+			for (const active of this.active.values()) active.controller.abort(new Error("held-exec boundary disposed"));
+			for (const socket of this.sockets) socket.destroy();
+			await Promise.allSettled([stopped, ...[...this.active.values()].map((active) => active.completion)]);
+			await rm(this.socketPath, { force: true }).catch(() => undefined);
+		});
 	}
 
 	private async serve(socket: net.Socket): Promise<void> {

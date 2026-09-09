@@ -24,7 +24,7 @@ export function straceCommand(
 	tracePrefix: string,
 	command: readonly string[],
 ): readonly string[] {
-	return [strace, "-ff", "-qq", "-yy", "-v", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
+	return [strace, "--kill-on-exit", "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
 }
 
 export type ObservedProcessPath =
@@ -57,6 +57,7 @@ export interface StraceObservationOptions {
 interface TraceFile {
 	readonly pid: number;
 	readonly lines: readonly TraceLine[];
+	readonly terminated: boolean;
 }
 
 type TraceRoot = { readonly file: TraceFile; readonly start: number };
@@ -207,7 +208,8 @@ export async function observeStrace(
 		const pid = Number.parseInt(name.slice(prefix.length), 10);
 		if (!Number.isSafeInteger(pid) || pid <= 0) continue;
 		const contents = await readFile(path.join(directory, name), "utf8");
-		files.push({ pid, lines: reassembleSyscalls(contents.split(/\r?\n/), pid) });
+		files.push({ pid, lines: reassembleSyscalls(contents.split(/\r?\n/), pid),
+			terminated: /(?:^|\n)\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(contents) });
 	}
 	const target = path.posix.resolve(executablePath);
 	const root = selectTraceRoot(files, target);
@@ -228,6 +230,10 @@ export async function observeStrace(
 	let complete = true;
 	const incompleteReasons = new Set<string>();
 	for (const [pid, process] of selected) {
+		if (!process.file.terminated) {
+			complete = false;
+			incompleteReasons.add(`process_exit_unproven:${pid}`);
+		}
 		let cwd = process.cwd;
 		for (const line of process.file.lines.slice(process.start)) {
 			if (process.fs.shared && (line.name === "chdir" || line.name === "fchdir") && syscallSucceeded(line)) process.fs.changed = true;

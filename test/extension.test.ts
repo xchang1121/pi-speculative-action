@@ -285,10 +285,6 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
 		expect(menus.get("Actor probe")?.some((label) => /^(Use forked calls|Minimum tool-name confidence)/u.test(label))).toBe(false);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Replay, Observe, and Fork are independent"), "info");
-		expect(fixture.ui.notify).toHaveBeenCalledWith(
-			expect.stringContaining(`Actor Bash history: ${process.platform === "linux" ? "Ready" : "Unavailable"}`),
-			"info",
-		);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/bash\s+Off\s+(Ready|Unavailable)/u), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
@@ -309,29 +305,32 @@ describe("zero-modification Pi extension", () => {
 
 	it("publishes applied settings only after the Actor route refresh settles", async () => {
 		type Prepared = Awaited<ReturnType<LinuxProcessReuseBackend["prepareActorReplay"]>>;
-		let release!: (route: Prepared) => void;
-		const pending = new Promise<Prepared>((resolve) => { release = resolve; });
-		const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockReturnValue(pending);
-		try {
-			const fixture = await createFixture({ settings: { enabled: false }, defaultExecutionWorlds: true });
-			driveSettingsMenus(fixture, {
-				"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
-				"Tools & execution": ["Execution routes", "Back"],
-			});
-			await fixture.emit("session_start", {}, fixture.context);
-			const applying = Promise.resolve(
-				fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
-			);
-			await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
-			expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.map(([refresh]) => refresh)).toEqual([false, false, true]);
-			expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Diagnostics refresh enabled providers only"), "info");
-			expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
-			release({ state: "unavailable", detail: "test route unavailable" });
-			await applying;
-			expect(fixture.ui.notify).toHaveBeenCalledWith("Speculative-action settings applied.", "info");
-			expect(vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1]).toContain("providers 1/4 ready");
-		} finally {
-			prepare.mockRestore();
+		for (const [state, label] of [["ready", "Ready"], ["degraded", "Limited"], ["unavailable", "Unavailable"]] as const) {
+			let release!: (route: Prepared) => void;
+			const pending = new Promise<Prepared>((resolve) => { release = resolve; });
+			const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockReturnValue(pending);
+			try {
+				const fixture = await createFixture({ settings: { enabled: false }, defaultExecutionWorlds: true });
+				driveSettingsMenus(fixture, {
+					"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Status", "Close"],
+					"Tools & execution": ["Execution routes", "Back"],
+				});
+				await fixture.emit("session_start", {}, fixture.context);
+				const applying = Promise.resolve(
+					fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
+				);
+				await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+				expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.map(([refresh]) => refresh)).toEqual([false, false, true]);
+				expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Diagnostics refresh enabled providers only"), "info");
+				expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");
+				release({ state, detail: "qualified test route", executor: { execute: async () => ({ exitCode: 0 }) } });
+				await applying;
+				expect(fixture.ui.notify).toHaveBeenCalledWith("Speculative-action settings applied.", "info");
+				expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining(`Actor Bash history: ${label}`), "info");
+				expect(vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1]).toContain(`providers ${state === "unavailable" ? 1 : 2}/4 ready`);
+			} finally {
+				prepare.mockRestore();
+			}
 		}
 	});
 
