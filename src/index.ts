@@ -10,12 +10,6 @@ export {
 	type BenefitGateSnapshot,
 	type BenefitObservation,
 	DEFAULT_BENEFIT_GATE_POLICY,
-	ForkBenefitGate,
-	type ForkBenefitDecision,
-	type ForkBenefitDecisionReason,
-	type ForkBenefitGatePolicy,
-	type ForkBenefitGateSnapshot,
-	type ForkBenefitObservation,
 } from "./fork-benefit-gate.ts";
 export {
 	type ActionKeyMismatchReason,

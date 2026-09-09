@@ -130,8 +130,10 @@ export interface ActorHitTiming {
 	readonly executionAheadMs: number;
 	/** Execution-owning source request to Actor interception. */
 	readonly attemptLeadMs: number;
-	/** Actor interception through authoritative result settlement. */
+	/** Actor interception through adoption and result retention; session cleanup is separate. */
 	readonly hitLatencyMs: number;
+	/** Calibrated Actor service estimate, absent until an Actor baseline is observed. */
+	readonly expectedActorMs?: number;
 }
 
 /** Latency an isolation-blocked match could hide if a safe execution route were available. */

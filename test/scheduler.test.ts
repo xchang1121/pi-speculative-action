@@ -71,7 +71,7 @@ describe("SpeculationScheduler", () => {
 		scheduler.observeActorTiming(50, 100);
 		scheduler.observeActorTiming(60, 120);
 		scheduler.observeActorTiming(70, 200);
-		for (const duration of [20, 40, 60, 100]) scheduler.observeService("read", duration);
+		for (const duration of [20, 40, 60, 100]) scheduler.observeSpeculativeService({ tool: "read" }, duration);
 		expect(
 			scheduler.launchDelay(
 				forecast({
@@ -124,7 +124,7 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([long]).priorityMs).toBe(240);
 
 		scheduler.observeActorTiming(20);
-		scheduler.observeService("read", 10);
+		scheduler.observeSpeculativeService({ tool: "read" }, 10);
 		const short = forecast({
 			expectedDurationMs: 80,
 			expectedLatencyBenefitMs: 40,

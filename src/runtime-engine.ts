@@ -1994,6 +1994,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				attempt.rejectCandidate(candidate.id, choice.match, cause("matching", "candidate_reserved"));
 				continue;
 			}
+			const attemptStartedAt = performance.now();
+			let waitMs = 0;
 			try {
 				if (candidate.work.execution.status === "queued") {
 					preemptForActor(
@@ -2018,11 +2020,13 @@ export function makeStructuralSpeculativeActionRuntime<
 					attempt.rejectCandidate(candidate.id, choice.match, authorization);
 					continue;
 				}
+				const waitStartedAt = performance.now();
 				const waiting = await waitForCandidate(
 					candidate.work.completion,
 					signal,
 					join.reason === "ready" ? undefined : join.waitBudgetMs,
 				);
+				waitMs = performance.now() - waitStartedAt;
 				if (stopCandidate(candidate)) break;
 				if (waiting.status === "aborted") {
 					attempt.interruptCandidate(candidate.id, cause("control", "actor_aborted"));
@@ -2094,19 +2098,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 
-				const adoptedAt = performance.now();
-				state.session.scheduler.observeAdoption(
-					adoptionIdentity,
-					Math.max(0, adoptedAt - Math.max(actorArrivedAt, execution.completedAt)),
-				);
-				const timing = {
-					executionAheadMs: Math.min(
-						execution.executionMs,
-						Math.max(0, actorArrivedAt - execution.startedAt),
-					),
-					attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
-					hitLatencyMs: Math.max(0, adoptedAt - actorArrivedAt),
-				};
 				reservation.adopt();
 				if (reservation.kind === "exclusive") {
 					runtimeState.candidates.remove(state.session.id, candidate);
@@ -2121,12 +2112,18 @@ export function makeStructuralSpeculativeActionRuntime<
 					candidate,
 					match: choice.match,
 					output,
-					timing,
+					timing: {
+						executionAheadMs: Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.startedAt)),
+						attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
+						hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
+						...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
+					},
 					toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
 				});
 				break;
 			} finally {
 				reservation.release();
+				state.session.scheduler.observeAdoption(adoptionIdentity, Math.max(0, performance.now() - attemptStartedAt - waitMs));
 			}
 		}
 	};

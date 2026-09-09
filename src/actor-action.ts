@@ -176,6 +176,8 @@ function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {
 		executionAheadMs: finite(timing.executionAheadMs),
 		attemptLeadMs: finite(timing.attemptLeadMs),
 		hitLatencyMs: finite(timing.hitLatencyMs),
+		...(timing.expectedActorMs !== undefined && Number.isFinite(timing.expectedActorMs)
+			? { expectedActorMs: finite(timing.expectedActorMs) } : {}),
 	});
 }
 

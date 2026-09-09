@@ -209,9 +209,9 @@ describe("Linux process ExecutionWorld", () => {
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const text = branch.output.result.content[0];
 			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\n" + " ".repeat(32768) + ":end");
-			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length,
-				nextComplete: (await vi.mocked(captures[1]!.finish).mock.results[0]!.value).complete,
-			}).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
+			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
+			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length, nextComplete: nextCapture.complete },
+				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
 			expect(captures[0]!.finish).not.toHaveBeenCalled();
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);

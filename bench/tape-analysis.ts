@@ -1,5 +1,5 @@
 import { stableStringify } from "../src/stable-json.ts";
-import { ForkBenefitGate, type ForkBenefitGatePolicy } from "../src/fork-benefit-gate.ts";
+import { BenefitGate, type BenefitGatePolicy } from "../src/fork-benefit-gate.ts";
 
 interface TapeChunk {
 	readonly atMs?: number;
@@ -201,19 +201,19 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 	};
 }
 
-/** Replay the production rolling gate with the fastest-completing same-context Drafter as a D1 proxy. */
+/** Simulate the rolling policy using decode lead as a proxy, not measured Actor savings. */
 export function analyzeTapeForkGate(
 	tape: LlmTape,
 	actorModel: string,
 	drafterModel: string,
-	policy: ForkBenefitGatePolicy,
+	policy: BenefitGatePolicy,
 ): TapeForkGateAnalysis {
 	const { parsed } = parseTape(tape);
 	const draftersByContext = groupBy(
 		parsed.filter((exchange) => exchange.model === drafterModel),
 		(exchange) => exchange.contextKey,
 	);
-	const gate = new ForkBenefitGate();
+	const gate = new BenefitGate();
 	let decisions = 0;
 	let allowed = 0;
 	let exactHitsAvailable = 0;
@@ -242,7 +242,7 @@ export function analyzeTapeForkGate(
 		gatedForkCostMs += proxy.endedAtMs;
 		gatedNetBenefitMs += net;
 		if (exact) exactHitsRetained++;
-		gate.observe(actorModel, { forkLatencyMs: proxy.endedAtMs, exactLeadMs }, policy);
+		gate.observe(actorModel, { costMs: proxy.endedAtMs, benefitMs: exactLeadMs }, policy);
 	}
 	return {
 		decisions,

@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { DrafterUtilityGate } from "../src/drafter-utility-gate.ts";
 import {
-	ForkBenefitGate,
-	type ForkBenefitGatePolicy,
-	type ForkBenefitObservation,
+	BenefitGate,
+	type BenefitGatePolicy,
+	type BenefitObservation,
 } from "../src/fork-benefit-gate.ts";
 
-const POLICY: ForkBenefitGatePolicy = {
+const POLICY: BenefitGatePolicy = {
 	enabled: true,
 	minSamples: 4,
 	windowSize: 4,
@@ -16,27 +16,28 @@ const POLICY: ForkBenefitGatePolicy = {
 };
 
 describe("fork benefit gate", () => {
-	it("shares the same policy with source-neutral cost and benefit metrics", () => {
-		const gate = new DrafterUtilityGate();
-		const skipped = gate.start("drafter", true);
-		gate.finish(skipped);
-		expect(gate.snapshot().samples).toBe(0);
-		for (let index = 0; index < 4; index++) {
-			const batch = gate.start("drafter", true);
-			expect(batch.allowed).toBe(true);
-			gate.requestStarted(batch); gate.requestStarted(batch);
-			gate.requestSettled(batch, 10); gate.finish(batch);
-			expect(gate.snapshot().samples).toBe(index);
-			gate.requestSettled(batch, 10);
-			gate.requestStarted(batch); gate.requestSettled(batch, 130);
-			gate.creditExecutionAhead(batch, 50);
-			expect(gate.snapshot()).toMatchObject({ samples: index + 1, expectedNetBenefitMs: -100 });
+	it("charges request and adoption costs against calibrated Actor service, including late continuations", () => {
+		for (const expectedActorMs of [undefined, 50, 300]) {
+			const gate = new DrafterUtilityGate();
+			gate.finish(gate.start("drafter", true));
+			expect(gate.snapshot().samples).toBe(0);
+			for (let index = 0; index < 4; index++) {
+				const batch = gate.start("drafter", true);
+				expect(batch.allowed).toBe(true);
+				gate.requestStarted(batch); gate.requestStarted(batch);
+				gate.requestSettled(batch, 10); gate.finish(batch);
+				expect(gate.snapshot().samples).toBe(index);
+				gate.requestSettled(batch, 10);
+				gate.requestStarted(batch); gate.requestSettled(batch, 130);
+				gate.creditAdoption(batch, { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs });
+				expect(gate.snapshot()).toMatchObject({ samples: index + 1, expectedNetBenefitMs: (expectedActorMs ?? 0) - 250 });
+			}
+			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs === 300);
 		}
-		expect(gate.start("drafter", true).allowed).toBe(false);
 	});
 
 	it("keeps profitable forks and suppresses a negative rolling window", () => {
-		const gate = new ForkBenefitGate();
+		const gate = new BenefitGate();
 		for (const observation of [sample(65, 396), sample(80, 0), sample(54, 402), sample(81, 0)]) {
 			expect(gate.decide("model", POLICY).allowed).toBe(true);
 			gate.observe("model", observation, POLICY);
@@ -49,7 +50,7 @@ describe("fork benefit gate", () => {
 	});
 
 	it("periodically probes negative utility and an unhealthy endpoint", () => {
-		const gate = new ForkBenefitGate();
+		const gate = new BenefitGate();
 		for (let index = 0; index < 4; index++) gate.observe("utility", sample(100, 0), POLICY);
 		expect([1, 2, 3, 4].map(() => gate.decide("utility", POLICY).reason)).toEqual([
 			"negative_utility",
@@ -69,7 +70,7 @@ describe("fork benefit gate", () => {
 	});
 
 	it("isolates models and bypasses policy when disabled", () => {
-		const gate = new ForkBenefitGate();
+		const gate = new BenefitGate();
 		for (let index = 0; index < 4; index++) gate.observe("bad", sample(100, 0), POLICY);
 		expect(gate.decide("bad", POLICY).allowed).toBe(false);
 		expect(gate.decide("fresh", POLICY)).toMatchObject({ allowed: true, reason: "warmup" });
@@ -77,6 +78,6 @@ describe("fork benefit gate", () => {
 	});
 });
 
-function sample(forkLatencyMs: number, exactLeadMs: number): ForkBenefitObservation {
-	return { forkLatencyMs, exactLeadMs };
+function sample(costMs: number, benefitMs: number): BenefitObservation {
+	return { costMs, benefitMs };
 }

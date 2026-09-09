@@ -223,7 +223,7 @@ export function createDrafterPlanSource(input: {
 				!settlement.matchedPredictions.some((prediction) => prediction.source === "drafter")
 			)
 				return;
-			gate.creditExecutionAhead(owner.utility, settlement.provider.timing.executionAheadMs);
+			gate.creditAdoption(owner.utility, settlement.provider.timing);
 		},
 		finishSession: () => {
 			batches.clear();

@@ -623,6 +623,13 @@ describe("self-speculation control plane", () => {
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 			await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(decision));
+			coordinator.observeActorSettlement({
+				actorAction: { id: `actor-${decision}`, sequence: decision, turnID: `turn-${decision}` }, tool: "read", rejections: [],
+				matchedPredictions: [predictionFeedback("self-speculation", true, decision).settlement.prediction],
+				provider: { kind: "speculative", candidateID: "candidate", match: { kind: "exact", distance: 0 },
+					timing: { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100 },
+					toolExecution: { startedAt: 0, completedAt: 10000 } },
+			});
 			coordinator.endTurn();
 		}
 

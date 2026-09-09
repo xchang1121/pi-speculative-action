@@ -161,7 +161,7 @@ npm run setup:linux
 
 `candidateLimit` 默认在每次 Actor 决策并发发出两个单动作 Drafter 请求。宽度为 2 时，首个完成一次参数准备、校验与执行身份绑定的有效动作胜出，并通过 provider `AbortSignal` 取消仍在运行的同伴；空响应、绑定失败与取消后才完成的绑定不会胜出，也不重新准备参数。预测竞胜不代替隔离和采纳证明。显式设为 3 或更高时保留所有完成样本，额外请求仍计成本。
 
-`drafterGateEnabled` 默认为 `true`。它按模型与端点把并发根请求及其后继请求计入同一条滚动收益记录：Drafter 实际拥有、匹配预测并被 Actor 采纳的工作按真实工具 `executionAheadMs` 计收益，再减去所有已发起请求的服务时间。跨轮完成的后继请求和采纳更新原记录，不重复增加样本；记录离开滚动窗口后不再修改历史，未发起请求的批次不占样本。前 4 批用于预热；持续负收益时暂停新的根请求，但每跳过 4 次仍做一次有界探测。设为 `false` 即恢复无条件 Drafter 批次；PatternAware 和已启动计划的后继请求继续遵守各自的深度、时限与调度约束。
+`drafterGateEnabled` 默认为 `true`。按模型与端点合并根请求及后继成本；只有 Drafter 拥有且匹配预测的实际采纳，才按已校准的 Actor 服务时间计入收益，扣除拦截至采纳及结果保留的耗时和全部模型请求服务时间。没有 Actor 样本时收益为零，提前执行量不是节省。这是保守的请求预算估计，不能替代含执行争用与回收的端到端对照。跨轮反馈更新原样本，退出窗口后不再修改；未发请求不记样本。前 4 批预热，持续负收益时暂停根请求，每跳过 4 次有界探测；设为 `false` 关闭此门控。后继仍受深度、时限和调度约束。
 
 `drafterMaxDepth` 表示每个单动作 Drafter 初始请求之后，最多允许多少次利用已完成工具输出的后继请求。后继请求占用该投机源在下一次 Actor 决策上的既有 slot，不会增加每个决策的请求宽度；设为 `0` 即恢复单步 Drafter。
 
@@ -175,7 +175,7 @@ Drafter 始终接收与 Actor 相同的完整历史，并采用 Pi 模型元数�
 
 协调器为每次 Actor 决策绑定一个稳定 request ID，只把绝对 decision sequence 与本次请求一致的排序候选包发送到 `POST /self-speculation/candidates`，并在所有候选提交和 probe 完成后调用 `POST /self-speculation/clear`。面向后续决策的预测会保留到对应 Actor 请求启动；同一决策的重试会继承候选包，过期预测则被丢弃。网络或解码失败只会损失加速机会，不会改变 Actor 的正确性路径。
 
-如果目标端在 clear 响应中返回 `verification`，协调器会把真实的 proposed、accepted、rejected 和 unresolved draft token 与注册回执分开统计。candidate ID 与来源会更新按模型、端点、格式、工具和来源分区的 decoder ledger，其平滑验收概率会校准后续候选排序。Runtime 的 Actor 结算则独立训练动作收益：sidecar fork 只有在匹配预测被真实采纳时才获得收益，且按来源分摊实际 `executionAheadMs`。token 拒绝不会改写动作语义概率，单纯 action-key 命中也不再给 fork gate 记收益。`acceptedDraftTokens` 表示注册确认，不能当作目标模型验收。
+如果目标端在 clear 响应中返回 `verification`，协调器单独统计真实的 proposed、accepted、rejected 和 unresolved draft token。candidate ID 与来源更新按模型、端点、格式、工具和来源分区的 decoder ledger，校准后续排序。Actor 结算独立训练动作采纳概率和收益；token 拒绝不改写动作语义概率，单纯键匹配不计收益。`acceptedDraftTokens` 仍是注册确认，不能当作目标模型验收。
 
 fork 有两种传输方式：
 
@@ -184,7 +184,7 @@ fork 有两种传输方式：
 
 正数工具名置信度门槛会自动请求 token 概率。`requireLogprobs` 是 JSON 证据收集选项，用于关闭提前执行后仍想收集证据的场景，不再需要独立的 TUI 开关。
 
-在 `sidecar` 模式下，按模型隔离的 fork 门控从实际采纳中学习收益：只按来源分摊真实工具 `executionAheadMs`，再扣除 fork 延迟，不把仅键匹配或意图领先记作收益。默认先放行 4 个样本；持续负收益时暂停请求，但每跳过 4 次仍做一次有界探测，使工作负载改变后可以恢复。连续 2 次 endpoint 失败也进入同一探测回路。上述阈值都可配置；关闭 `forkGateEnabled` 即恢复无条件 fork。同一份 `fork_gate` 策略也会作为 provider/SPORK 提示发送，但 provider 传输需要由推理服务自行执行该策略。
+`sidecar` 的模型级 fork 门控与 Drafter 共用 Actor 校准及采纳成本口径，按匹配来源分摊后再扣除 fork 请求时间。默认 4 个预热样本、每跳过 4 次探测；连续 2 次端点失败也进入探测回路，阈值可配置。关闭 `forkGateEnabled` 恢复无条件 fork。`fork_gate` 也作为 provider/SPORK 提示发送，执行由推理服务负责。
 
 D3 默认上限为 28 个 draft token，可显式配置，并再次受推理引擎硬上限约束；token 验收和动作侧收益分别计量。
 
@@ -255,7 +255,8 @@ try { await host.dispose(); } finally { await workspace.dispose(); }
 
 - `attemptLeadMs`：投机意图产生到 Actor 调用被拦截。
 - `executionAheadMs`：拦截前已完成的投机执行量，上限为实测工具时长。
-- `hitLatencyMs`：Actor 调用被拦截到权威结果完成结算。
+- `hitLatencyMs`：Actor 拦截至采纳及结果保留；会话回收另计。
+- `expectedActorMs`：同执行身份下 Actor 服务时间的保守估计；无样本时缺省。
 
 对因为缺少隔离而阻断的匹配，Actor 执行仍是唯一权威执行，但使用相同分解报告反事实潜力：
 

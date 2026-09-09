@@ -7,8 +7,6 @@ export interface BenefitGatePolicy {
 	readonly failureThreshold: number;
 }
 
-export type ForkBenefitGatePolicy = BenefitGatePolicy;
-
 export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze({
 	enabled: true,
 	minSamples: 4,
@@ -24,10 +22,9 @@ export interface BenefitObservation {
 	readonly failed?: boolean;
 }
 
-export interface ForkBenefitObservation {
-	readonly forkLatencyMs: number;
-	readonly exactLeadMs: number;
-	readonly failed?: boolean;
+/** Conservative request-budget credit; execution lead alone is not avoided Actor work. */
+export function adoptionUtility(timing: ActorHitTiming): BenefitObservation {
+	return { costMs: metric(timing.hitLatencyMs), benefitMs: metric(timing.expectedActorMs ?? 0) };
 }
 
 export type BenefitDecisionReason =
@@ -39,8 +36,6 @@ export type BenefitDecisionReason =
 	| "negative_utility"
 	| "failure_circuit";
 
-export type ForkBenefitDecisionReason = BenefitDecisionReason;
-
 export interface BenefitDecision {
 	readonly allowed: boolean;
 	readonly reason: BenefitDecisionReason;
@@ -48,16 +43,12 @@ export interface BenefitDecision {
 	readonly expectedNetBenefitMs?: number;
 }
 
-export type ForkBenefitDecision = BenefitDecision;
-
 export interface BenefitGateSnapshot {
 	readonly samples: number;
 	readonly expectedNetBenefitMs?: number;
 	readonly consecutiveFailures: number;
 	readonly suppressedDecisions: number;
 }
-
-export type ForkBenefitGateSnapshot = BenefitGateSnapshot;
 
 interface GateState {
 	readonly samples: Array<{ netBenefit: number; failed: boolean }>;
@@ -87,17 +78,16 @@ export class BenefitGate {
 
 	observe(
 		key: string,
-		observation: BenefitObservation | ForkBenefitObservation,
+		observation: BenefitObservation,
 		policy: BenefitGatePolicy,
-	): (observation: BenefitObservation | ForkBenefitObservation) => void {
+	): (observation: BenefitObservation) => void {
 		const state = this.state(key);
 		const sample = { netBenefit: 0, failed: false };
 		state.samples.push(sample);
 		// Late lineage costs/benefits amend one retained sample, never append another observation.
-		const update = (value: BenefitObservation | ForkBenefitObservation) => {
+		const update = (value: BenefitObservation) => {
 			if (this.states.get(key) !== state || !state.samples.includes(sample)) return;
-			sample.netBenefit = "costMs" in value ? metric(value.benefitMs) - metric(value.costMs)
-				: metric(value.exactLeadMs) - metric(value.forkLatencyMs);
+			sample.netBenefit = metric(value.benefitMs) - metric(value.costMs);
 			sample.failed = value.failed === true;
 		};
 		update(observation);
@@ -152,9 +142,6 @@ export class BenefitGate {
 	}
 }
 
-/** Backward-compatible constructor name for fork-specific consumers. */
-export { BenefitGate as ForkBenefitGate };
-
 function metric(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
@@ -166,3 +153,4 @@ function mean(values: GateState["samples"]): number | undefined {
 function consecutiveFailures(state: GateState): number {
 	return state.samples.reduce((count, sample) => sample.failed ? count + 1 : 0, state.priorFailures);
 }
+import type { ActorHitTiming } from "./settlement.ts";

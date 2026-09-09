@@ -629,37 +629,20 @@ export class PatternAwareStore {
 			);
 			const representative = ordered[0]!;
 			const patterns = ordered.map((item) => item.pattern);
-			const horizon = learnedGroupHorizon(patterns, settings, this.clock);
-			const latestHorizon = Math.max(horizon, learnedGroupHorizon(patterns, settings, this.clock, 1));
-			const gapCoverage = groupGapCoverage(patterns, horizon, settings, this.clock);
+			const { horizon, latestHorizon, gapCoverage } = groupGapTiming(patterns, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const targetTool = representative.pattern.targetTool;
 			const ppmEstimate = estimatePpm(targetTool);
-			const totalWeight = ordered.reduce(
-				(total, item) =>
-					total +
-					Math.max(1, item.pattern.occurrences) *
-						recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
-				0,
-			);
-			const variantProbability =
-				ordered.reduce(
-					(total, item) =>
-						total +
-						item.variantProbability *
-							Math.max(1, item.pattern.occurrences) *
-							recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
-					0,
-				) / Math.max(1, totalWeight);
-			const expectedDurationMs =
-				ordered.reduce(
-					(total, item) =>
-						total +
-						Math.max(0, item.pattern.averageDurationMs) *
-							Math.max(1, item.pattern.occurrences) *
-							recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents),
-					0,
-				) / Math.max(1, totalWeight);
+			let totalWeight = 0, weightedVariants = 0, weightedDuration = 0;
+			for (const item of ordered) {
+				const occurrences = Math.max(1, item.pattern.occurrences);
+				const decay = recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
+				totalWeight += occurrences * decay;
+				weightedVariants += item.variantProbability * occurrences * decay;
+				weightedDuration += Math.max(0, item.pattern.averageDurationMs) * occurrences * decay;
+			}
+			const variantProbability = weightedVariants / Math.max(1, totalWeight);
+			const expectedDurationMs = weightedDuration / Math.max(1, totalWeight);
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability(replayProbability * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
@@ -1258,7 +1241,7 @@ export class PatternAwareStore {
 				patternID: pattern.id,
 				triggerSequence,
 				expectedInputs: applyBindingsVariants(pattern.bindings, context),
-				remaining: learnedGroupHorizon([pattern], this.settings, this.clock, 1),
+				remaining: groupGapTiming([pattern], this.settings, this.clock).latestHorizon,
 			});
 		}
 		session.replacePending(pending);
@@ -2436,37 +2419,25 @@ function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSet
 	);
 }
 
-function learnedGroupHorizon(
-	patterns: ReadonlyArray<MutablePattern>,
-	settings: PatternAwareSettings,
-	clock: number,
-	coverage = settings.futureGapCoverage,
-) {
-	const gaps = combineWeightedGaps(patterns, settings, clock);
-	if (!gaps.length) return 0;
-	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
-	const target = total * coverage;
-	let covered = 0;
-	for (const [gap, weight] of gaps) {
-		covered += weight;
-		if (covered >= target) return gap;
-	}
-	return gaps.at(-1)?.[0] ?? 0;
-}
-
-function groupGapCoverage(
-	patterns: ReadonlyArray<MutablePattern>,
-	horizon: number,
-	settings: PatternAwareSettings,
-	clock: number,
-) {
+function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {
 	const gaps = combineWeightedGaps(patterns, settings, clock);
 	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
-	if (total <= 0) return 0;
-	return Math.max(
-		0,
-		Math.min(1, gaps.filter(([gap]) => gap <= horizon).reduce((sum, [, weight]) => sum + weight, 0) / total),
-	);
+	const quantile = (coverage: number) => {
+		const target = total * coverage;
+		let covered = 0;
+		for (const [gap, weight] of gaps) {
+			covered += weight;
+			if (covered >= target) return gap;
+		}
+		return gaps.at(-1)?.[0] ?? 0;
+	};
+	const horizon = quantile(settings.futureGapCoverage);
+	return {
+		horizon,
+		latestHorizon: Math.max(horizon, quantile(1)),
+		gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1,
+			gaps.filter(([gap]) => gap <= horizon).reduce((sum, [, weight]) => sum + weight, 0) / total)),
+	};
 }
 
 function combineWeightedGaps(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {

@@ -1,4 +1,5 @@
-import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { adoptionUtility, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import type { ActorHitTiming } from "./settlement.ts";
 
 export interface DrafterUtilityBatch {
 	readonly key: string;
@@ -58,8 +59,10 @@ export class DrafterUtilityGate {
 		this.observe(batch);
 	}
 
-	creditExecutionAhead(batch: DrafterUtilityBatch, executionAheadMs: number): void {
-		batch.benefitMs += Number.isFinite(executionAheadMs) ? Math.max(0, executionAheadMs) : 0;
+	creditAdoption(batch: DrafterUtilityBatch, timing: ActorHitTiming): void {
+		const utility = adoptionUtility(timing);
+		batch.costMs += utility.costMs;
+		batch.benefitMs += utility.benefitMs;
 		this.observe(batch);
 	}
 

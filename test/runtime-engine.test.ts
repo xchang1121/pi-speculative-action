@@ -405,7 +405,7 @@ describe("structural speculative runtime", () => {
 		gate.arrive();
 		await candidateReady.promise;
 		await fixture.runtime.actual({ ...call("prediction"), durationMs: 100, output: "actor" });
-		await fixture.runtime.finishTurn({ ...call("prediction"), terminal: true });
+		await fixture.runtime.finishTurn({ ...call("prediction"), terminal: false });
 		expect(
 			fixture.events.find(
 				(event) => event.type === "actor_action" && event.turnID === "prediction",
@@ -416,6 +416,12 @@ describe("structural speculative runtime", () => {
 				rejections: [{ cause: { code: "candidate_join_deadline" } }],
 			},
 		});
+		enabled = false;
+		await fixture.runtime.startTurn({ sessionID: "session", turnID: "retained" });
+		expect(await fixture.runtime.consume(call("retained"))).toBe("learned");
+		await fixture.runtime.finishTurn({ ...call("retained"), terminal: true });
+		expect(fixture.events.find((event) => event.type === "actor_action" && event.turnID === "retained"))
+			.toMatchObject({ settlement: { provider: { kind: "speculative", timing: { expectedActorMs: 100 } } } });
 	});
 
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
@@ -944,6 +950,7 @@ describe("structural speculative runtime", () => {
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
 			expect(validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
+			if (["rejected", "changed", "uncovered", "output-rejected"].includes(scenario)) expect(adoption).toHaveBeenCalledOnce();
 			if (scenario === "input-lookup") {
 				expect(await fixture.runtime.consume({ ...actor, id: "same-query" })).toBe("narrow");
 				expect(reconstruct).toHaveBeenCalledOnce();

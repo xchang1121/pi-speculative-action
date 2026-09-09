@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_BENEFIT_GATE_POLICY,
-	ForkBenefitGate,
-	type ForkBenefitGatePolicy,
+	adoptionUtility, BenefitGate,
+	type BenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
 import {
 	createActorForkPlanSource,
@@ -271,7 +271,7 @@ interface TurnState {
 	readonly candidateSourcesByID: Map<string, Set<string>>;
 	readonly candidateToolsByID: Map<string, Set<string>>;
 	readonly gateKey: string;
-	forkExecutionAheadMs: number;
+	readonly forkUtility: { costMs: number; benefitMs: number };
 	forkStartedAt?: number;
 	forkCompletedAt?: number;
 	forkFailed: boolean;
@@ -327,7 +327,7 @@ export class SelfSpeculationCoordinator {
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
 	readonly actorForkPlanSource: ActorForkPlanSource;
-	private readonly forkGate = new ForkBenefitGate();
+	private readonly forkGate = new BenefitGate();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
 	private readonly background = new Set<Promise<void>>();
@@ -404,7 +404,7 @@ export class SelfSpeculationCoordinator {
 			candidateSourcesByID: new Map(),
 			candidateToolsByID: new Map(),
 			gateKey: modelKey(model),
-			forkExecutionAheadMs: 0,
+			forkUtility: { costMs: 0, benefitMs: 0 },
 			forkFailed: false,
 			ended: false,
 			gateSampleRecorded: false,
@@ -612,9 +612,10 @@ export class SelfSpeculationCoordinator {
 		if (!state) return;
 		const matchedSources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
 		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
-		const share = settlement.provider.timing.executionAheadMs / Math.max(1, matchedSources.size);
-		state.forkExecutionAheadMs += share;
-		this.totalForkExecutionAheadMs += share;
+		const shares = Math.max(1, matchedSources.size), utility = adoptionUtility(settlement.provider.timing);
+		state.forkUtility.costMs += utility.costMs / shares;
+		state.forkUtility.benefitMs += utility.benefitMs / shares;
+		this.totalForkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
 		this.forkActionAdoptions++;
 	}
 
@@ -947,8 +948,8 @@ export class SelfSpeculationCoordinator {
 		this.forkGate.observe(
 			state.gateKey,
 			{
-				costMs: state.forkCompletedAt - state.forkStartedAt,
-				benefitMs: state.forkExecutionAheadMs,
+				costMs: state.forkCompletedAt - state.forkStartedAt + state.forkUtility.costMs,
+				benefitMs: state.forkUtility.benefitMs,
 				...(state.forkFailed ? { failed: true } : {}),
 			},
 			forkGatePolicy(state.settings),
@@ -1074,7 +1075,7 @@ function forkGatePayload(settings: SelfSpeculationSettings): Readonly<Record<str
 	};
 }
 
-function forkGatePolicy(settings: SelfSpeculationSettings): ForkBenefitGatePolicy {
+function forkGatePolicy(settings: SelfSpeculationSettings): BenefitGatePolicy {
 	return {
 		enabled: settings.forkGateEnabled,
 		minSamples: settings.forkGateMinSamples,

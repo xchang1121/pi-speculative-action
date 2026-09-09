@@ -260,11 +260,6 @@ export class SpeculationScheduler<Job extends object> {
 		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
 	}
 
-	/** Backward-compatible alias for speculative service observations. */
-	observeService(tool: string, durationMs: number): void {
-		this.observeSpeculativeService({ tool }, durationMs);
-	}
-
 	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number): void {
 		this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
 	}
