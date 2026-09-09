@@ -1837,8 +1837,9 @@ async function createProcessInterposition(input: {
 		} catch {
 			continue;
 		}
-		for (const name of entries) {
-			if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) continue;
+		// Bound independent entry preparation; every probe and link settles before evidence capture.
+		for (let start = 0; start < entries.length; start += 16) await Promise.all(entries.slice(start, start + 16).map(async (name) => {
+			if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) return;
 			const sourceEntry = path.join(directory.source, name);
 			const viewEntry = path.join(directory.view, name);
 			try {
@@ -1862,7 +1863,7 @@ async function createProcessInterposition(input: {
 			} catch {
 				// An entry that cannot be proved executable remains visible through its original directory.
 			}
-		}
+		}));
 		if (!dependencySources.has(directory.source)) {
 			dependencySources.add(directory.source);
 			dependencies.push(

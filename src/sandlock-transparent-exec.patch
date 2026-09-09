@@ -370,3 +370,70 @@ index abcd92c..3ccac11 100644
      pub deterministic_dirs: bool,
      pub virtual_hostname: Option<String>,
      pub has_http_acl: bool,
+diff --git a/crates/sandlock-core/src/chroot/resolve.rs b/crates/sandlock-core/src/chroot/resolve.rs
+index f796767..d448105 100644
+--- a/crates/sandlock-core/src/chroot/resolve.rs
++++ b/crates/sandlock-core/src/chroot/resolve.rs
+@@ -1,4 +1,6 @@
+ use std::path::{Path, PathBuf};
++use std::os::fd::AsRawFd;
++use std::os::unix::fs::OpenOptionsExt;
+
+ use crate::sys::fs::openat2_in_root;
+
+@@ -186,10 +188,15 @@ pub fn resolve_chroot_mounts(mounts: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, Pat
+     mounts
+         .iter()
+         .map(|(virtual_path, host_path)| {
+-            (
+-                virtual_path.clone(),
+-                std::fs::canonicalize(host_path).unwrap_or_else(|_| host_path.clone()),
+-            )
++            // Resolve the whole path in the kernel instead of one readlink per component.
++            // Keep canonicalize's fallback for missing procfs, deleted files, or non-path fds.
++            let resolved = std::fs::OpenOptions::new().read(true)
++                .custom_flags(libc::O_PATH | libc::O_CLOEXEC).open(host_path)
++                .and_then(|file| std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())))
++                .ok().filter(|p| p.is_absolute() && !p.to_string_lossy().ends_with(" (deleted)"))
++                .or_else(|| std::fs::canonicalize(host_path).ok())
++                .unwrap_or_else(|| host_path.clone());
++            (virtual_path.clone(), resolved)
+         })
+         .collect()
+ }
+@@ -233,21 +240,20 @@ mod tests {
+     #[test]
+     fn resolve_chroot_mounts_canonicalizes_existing_and_falls_back_on_missing() {
+         let dir = TempDir::new().unwrap();
+-        let existing = dir.path().join("src");
+-        std::fs::create_dir(&existing).unwrap();
+-        let missing = PathBuf::from("/nonexistent/sandlock/mount-src");
+-
+-        let resolved = resolve_chroot_mounts(&[
+-            (PathBuf::from("/data"), existing.clone()),
+-            (PathBuf::from("/cache"), missing.clone()),
+-        ]);
+-
+-        // Virtual destinations are preserved verbatim.
+-        assert_eq!(resolved[0].0, PathBuf::from("/data"));
+-        assert_eq!(resolved[1].0, PathBuf::from("/cache"));
+-        // Existing source is canonicalized; missing source falls back as-is.
+-        assert_eq!(resolved[0].1, existing.canonicalize().unwrap());
+-        assert_eq!(resolved[1].1, missing);
++        let root = dir.path();
++        std::fs::write(root.join("file"), "content").unwrap();
++        std::fs::write(root.join("literal (deleted)"), "content").unwrap();
++        symlink(root, root.join("alias")).unwrap();
++        symlink("file", root.join("link")).unwrap();
++        symlink("missing", root.join("dangling")).unwrap();
++        symlink("loop", root.join("loop")).unwrap();
++        for source in [root.to_path_buf(), root.join("file"), root.join("alias/link"),
++            root.join("dangling"), root.join("loop"), root.join("missing"),
++            root.join("literal (deleted)"), PathBuf::from("."), PathBuf::from("/dev/null")] {
++            let destination = PathBuf::from("/virtual/unchanged");
++            let expected = std::fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
++            assert_eq!(resolve_chroot_mounts(&[(destination.clone(), source)]), vec![(destination, expected)]);
++        }
+     }
+
+     #[test]
