@@ -26,8 +26,10 @@ export interface BenefitObservation {
 }
 
 /** Historical fallback service is an estimate; a censored hit is neither zero gain nor measured savings. */
-export function adoptionUtility(timing: ActorHitTiming): BenefitObservation {
-	return { costMs: metric(timing.hitLatencyMs), benefitMs: timing.expectedActorMs };
+export function creditAdoption(utility: { costMs: number; benefitMs?: number }, timing: ActorHitTiming, shares = 1): void {
+	utility.costMs += metric(timing.hitLatencyMs) / shares;
+	utility.benefitMs = utility.benefitMs === undefined || timing.expectedActorMs === undefined
+		? undefined : utility.benefitMs + metric(timing.expectedActorMs) / shares;
 }
 
 export type BenefitDecisionReason =
@@ -72,11 +74,17 @@ export class BenefitGate {
 			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
 		};
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
-		if (consecutiveFailures(state) >= policy.failureThreshold)
-			return this.probeDecision(state, policy, "failure_probe", "failure_circuit", base);
-		if (state.samples.length < policy.minSamples || expected === undefined) return { allowed: true, reason: "warmup", ...base };
-		if (expected >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
-		return this.probeDecision(state, policy, "utility_probe", "negative_utility", base);
+		const failing = consecutiveFailures(state) >= policy.failureThreshold;
+		if (!failing) {
+			if (state.samples.length < policy.minSamples || expected === undefined) return { allowed: true, reason: "warmup", ...base };
+			if (expected >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
+		}
+		if (++state.suppressedSinceProbe >= policy.probeInterval) {
+			state.suppressedSinceProbe = 0;
+			return { allowed: true, reason: failing ? "failure_probe" : "utility_probe", ...base };
+		}
+		state.totalSuppressed++;
+		return { allowed: false, reason: failing ? "failure_circuit" : "negative_utility", ...base };
 	}
 
 	observe(
@@ -115,37 +123,22 @@ export class BenefitGate {
 		this.states.clear();
 	}
 
-	private probeDecision(
-		state: GateState,
-		policy: BenefitGatePolicy,
-		probeReason: "utility_probe" | "failure_probe",
-		skipReason: "negative_utility" | "failure_circuit",
-		base: Pick<BenefitDecision, "samples" | "expectedNetBenefitMs">,
-	): BenefitDecision {
-		state.suppressedSinceProbe++;
-		if (state.suppressedSinceProbe >= policy.probeInterval) {
-			state.suppressedSinceProbe = 0;
-			return { allowed: true, reason: probeReason, ...base };
-		}
-		state.totalSuppressed++;
-		return { allowed: false, reason: skipReason, ...base };
-	}
-
 	private state(key: string): GateState {
-		const existing = this.states.get(key);
-		if (existing) return existing;
-		const created: GateState = {
-			samples: [],
-			priorFailures: 0,
-			suppressedSinceProbe: 0,
-			totalSuppressed: 0,
-		};
-		this.states.set(key, created);
-		return created;
+		let state = this.states.get(key);
+		if (!state) {
+			state = {
+				samples: [],
+				priorFailures: 0,
+				suppressedSinceProbe: 0,
+				totalSuppressed: 0,
+			};
+			this.states.set(key, state);
+		}
+		return state;
 	}
 }
 
-function metric(value: number): number {
+export function metric(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 

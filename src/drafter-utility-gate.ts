@@ -1,4 +1,4 @@
-import { adoptionUtility, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { creditAdoption, metric, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
 import type { ActorHitTiming } from "./settlement.ts";
 
 export interface DrafterUtilityBatch {
@@ -54,15 +54,13 @@ export class DrafterUtilityGate {
 
 	requestSettled(batch: DrafterUtilityBatch, costMs: number, failed = false): void {
 		batch.pendingRequests--;
-		batch.costMs += Number.isFinite(costMs) ? Math.max(0, costMs) : 0;
+		batch.costMs += metric(costMs);
 		batch.failed ||= failed;
 		this.observe(batch);
 	}
 
 	creditAdoption(batch: DrafterUtilityBatch, timing: ActorHitTiming): void {
-		const utility = adoptionUtility(timing);
-		batch.costMs += utility.costMs;
-		batch.benefitMs = batch.benefitMs === undefined || utility.benefitMs === undefined ? undefined : batch.benefitMs + utility.benefitMs;
+		creditAdoption(batch, timing);
 		this.observe(batch);
 	}
 
@@ -98,8 +96,7 @@ export class DrafterUtilityGate {
 			batch.startedRequests === 0 || batch.pendingRequests > 0
 		)
 			return;
-		const observation = { costMs: batch.costMs, benefitMs: batch.benefitMs, failed: batch.failed };
-		if (batch.update) batch.update(observation);
-		else batch.update = this.gate.observe(batch.key, observation, batch.policy);
+		if (batch.update) batch.update(batch);
+		else batch.update = this.gate.observe(batch.key, batch, batch.policy);
 	}
 }

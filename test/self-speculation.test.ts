@@ -50,13 +50,19 @@ describe("self-speculation control plane", () => {
 		});
 	});
 
-	it("buffers every source, merges the same K(a), and submits one ordered Actor bundle", async () => {
+	it.each([false, true])("buffers an ordered Actor bundle while preserving predicted identity (covering=%s)", async (covering) => {
 		const requests: CapturedRequest[] = [];
 		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-request"]);
 		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 0.7));
-		coordinator.addCandidate(candidate("pattern-aware", "key-a", "hash-a", "read", { path: "a.txt" }, 0.9));
-		coordinator.addCandidate(candidate("drafter", "key-b", "hash-b", "read", { path: "b.txt" }, 0.8));
+		const candidates = covering ? [
+			candidate("drafter", "predicted-a", "unused-a", "read", { path: "a.txt", offset: 1 }, 0.8, 1, 1, "covering"),
+			candidate("pattern-aware", "predicted-b", "unused-b", "read", { path: "a.txt", offset: 5 }, 0.7, 1, 1, "covering"),
+		] : [
+			candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 0.7),
+			candidate("pattern-aware", "key-a", "hash-a", "read", { path: "a.txt" }, 0.9),
+			candidate("drafter", "key-b", "hash-b", "read", { path: "b.txt" }, 0.8),
+		];
+		for (const value of candidates) coordinator.addCandidate(value);
 
 		expect(requests).toHaveLength(0);
 		const actorPayload = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, unknown>;
@@ -78,7 +84,10 @@ describe("self-speculation control plane", () => {
 		});
 		expect(bundle?.body).not.toHaveProperty("format");
 		expect(bundle?.body).not.toHaveProperty("boundary");
-		expect(bundle?.body.candidates).toEqual([
+		expect(bundle?.body.candidates).toEqual(covering ? ["predicted-a", "predicted-b"].map((key) => expect.objectContaining({
+			id: actionIdentity(key),
+			action_identity: expect.objectContaining({ execution_action_id: actionIdentity("covering"), projected: true }),
+		})) : [
 			expect.objectContaining({
 				id: actionIdentity("key-a"),
 				action_identity: {
@@ -98,38 +107,6 @@ describe("self-speculation control plane", () => {
 			path: SELF_SPECULATION_DEFAULTS.clearPath,
 			body: { version: 1, request_id: "actor-request" },
 		});
-	});
-
-	it("keeps distinct predicted actions when they share one covering execution", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-request"]);
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(
-			candidate("drafter", "predicted-a", "unused-a", "read", { path: "a.txt", offset: 1 }, 0.8, 1, 1, "covering"),
-		);
-		coordinator.addCandidate(
-			candidate("pattern-aware", "predicted-b", "unused-b", "read", { path: "a.txt", offset: 5 }, 0.7, 1, 1, "covering"),
-		);
-		coordinator.decorateActorPayload({ model: "actor" });
-		await coordinator.dispose();
-
-		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
-		expect(bundle?.body.candidates).toEqual([
-			expect.objectContaining({
-				id: actionIdentity("predicted-a"),
-				action_identity: expect.objectContaining({
-					execution_action_id: actionIdentity("covering"),
-					projected: true,
-				}),
-			}),
-			expect.objectContaining({
-				id: actionIdentity("predicted-b"),
-				action_identity: expect.objectContaining({
-					execution_action_id: actionIdentity("covering"),
-					projected: true,
-				}),
-			}),
-		]);
 	});
 
 	it("binds the provider self-fork contract once to the stable Actor request", async () => {
@@ -407,29 +384,22 @@ describe("self-speculation control plane", () => {
 		});
 	});
 
-	it("contains malformed optional verification without breaking cleanup", async () => {
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkEnabled: false }),
-			requestID: () => "actor-request",
-			fetch: vi.fn(async () =>
-				Response.json({
-					verification: {
-						num_draft_tokens: 2,
-						num_accepted_draft_tokens: 2,
-						num_rejected_draft_tokens: 1,
-					},
-				}),
-			),
-		});
+	it.each(["malformed verification", "HTTP failure"])("contains %s without breaking cleanup", async (scenario) => {
+		const malformed = scenario === "malformed verification";
+		const coordinator = coordinatorFixture([], { forkEnabled: false }, ["actor-request"], () => malformed
+			? { verification: { num_draft_tokens: 2, num_accepted_draft_tokens: 2, num_rejected_draft_tokens: 1 } }
+			: new Response("failure", { status: 503 }));
 		coordinator.startTurn("turn-1", model(), context(), 1);
+		if (!malformed) coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 1));
 		coordinator.decorateActorPayload({ model: "actor" });
 
 		await expect(coordinator.dispose()).resolves.toBeUndefined();
 
 		expect(coordinator.snapshot()).toMatchObject({
 			verificationRequests: 0,
-			failures: 1,
-			lastError: "self-speculation verification token counts are inconsistent",
+			failures: malformed ? 1 : 2,
+			lastError: malformed ? "self-speculation verification token counts are inconsistent"
+				: "self-speculation control plane returned HTTP 503",
 		});
 	});
 
@@ -557,28 +527,15 @@ describe("self-speculation control plane", () => {
 		const requests: CapturedRequest[] = [];
 		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 3, retryStreamUpdates: 1 });
 		let probe = 0;
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar" }),
-			requestID: () => "actor-request",
-			actorForkPlanSource: actorForkPlans,
-			fetch: vi.fn(async (input, init) => {
-				const path = new URL(String(input)).pathname;
-				if (path !== SELF_SPECULATION_DEFAULTS.forkPath) return Response.json({});
-				requests.push({ path, body: JSON.parse(String(init?.body)) as Record<string, any> });
-				probe++;
-				return Response.json(
-					forkReceipt(
-						"read",
-						{ path: probe === 1 ? "early.txt" : "stable.txt" },
-						{
-							token_count: 2,
-							mean: -0.1,
-							tool_name: { minimum_probability: probe === 1 ? 0.5 : 0.95 },
-						},
-					),
-				);
-			}),
-		});
+		const coordinator = coordinatorFixture(requests, { forkTransport: "sidecar" }, ["actor-request"], (request) => {
+			if (request.path !== SELF_SPECULATION_DEFAULTS.forkPath) return {};
+			probe++;
+			return forkReceipt("read", { path: probe === 1 ? "early.txt" : "stable.txt" }, {
+				token_count: 2,
+				mean: -0.1,
+				tool_name: { minimum_probability: probe === 1 ? 0.5 : 0.95 },
+			});
+		}, actorForkPlans);
 		coordinator.startTurn("turn-d2", model(), context(), 1);
 		const pending = actorForkPlans.waitForBatches("turn-d2", new AbortController().signal);
 		coordinator.decorateActorPayload({ prompt: "P" });
@@ -588,7 +545,7 @@ describe("self-speculation control plane", () => {
 
 		const batches = await pending;
 		expect(batches[0]?.calls[0]?.input).toEqual({ path: "stable.txt" });
-		expect(requests.map((request) => request.body.snapshot)).toMatchObject([
+		expect(requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath).map((request) => request.body.snapshot)).toMatchObject([
 			{ attempt: 1, generated_text: "first" },
 			{ attempt: 2, generated_text: "first later" },
 		]);
@@ -635,70 +592,35 @@ describe("self-speculation control plane", () => {
 		}
 	});
 
-	it("contains control-plane failures instead of rejecting Actor cleanup", async () => {
-		const settings = enabledSettings({ forkEnabled: false });
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => settings,
-			requestID: () => "actor-request",
-			fetch: vi.fn(async () => new Response("failure", { status: 503 })),
-		});
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 1));
-		coordinator.decorateActorPayload({});
-
-		await expect(coordinator.dispose()).resolves.toBeUndefined();
-		expect(coordinator.snapshot()).toEqual(
-			expect.objectContaining({ failures: 2, lastError: "self-speculation control plane returned HTTP 503" }),
-		);
-	});
-
 	it("waits for an in-flight sidecar fork before clearing its request", async () => {
-		const paths: string[] = [];
+		const requests: CapturedRequest[] = [];
 		let releaseFork!: () => void;
 		const forkGate = new Promise<void>((resolve) => {
 			releaseFork = resolve;
 		});
-		const settings = enabledSettings({ forkTransport: "sidecar" });
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => settings,
-			requestID: () => "actor-request",
-			fetch: vi.fn(async (input) => {
-				const path = new URL(String(input)).pathname;
-				paths.push(path);
-				if (path === SELF_SPECULATION_DEFAULTS.forkPath) await forkGate;
-				return Response.json({ ok: true });
-			}),
+		const coordinator = coordinatorFixture(requests, { forkTransport: "sidecar" }, ["actor-request"], async (request) => {
+			if (request.path === SELF_SPECULATION_DEFAULTS.forkPath) await forkGate;
 		});
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		coordinator.decorateActorPayload({ prompt: "P" });
 		coordinator.observeActorOutput(delta("text_delta", "x"));
 		const disposed = coordinator.dispose();
-		await vi.waitFor(() => expect(paths).toContain(SELF_SPECULATION_DEFAULTS.forkPath));
-		expect(paths).not.toContain(SELF_SPECULATION_DEFAULTS.clearPath);
+		await vi.waitFor(() => expect(requests).toContainEqual(expect.objectContaining({ path: SELF_SPECULATION_DEFAULTS.forkPath })));
+		expect(requests).not.toContainEqual(expect.objectContaining({ path: SELF_SPECULATION_DEFAULTS.clearPath }));
 
 		releaseFork();
 		await disposed;
-		expect(paths.at(-1)).toBe(SELF_SPECULATION_DEFAULTS.clearPath);
+		expect(requests.at(-1)?.path).toBe(SELF_SPECULATION_DEFAULTS.clearPath);
 	});
 
 	it("cancels an in-flight sidecar probe when Runtime stops waiting for its source", async () => {
 		const actorForkPlans = createActorForkPlanSource();
-		const coordinator = new SelfSpeculationCoordinator({
-			settings: () => enabledSettings({ forkTransport: "sidecar" }),
-			requestID: () => "actor-request",
-			actorForkPlanSource: actorForkPlans,
-			fetch: vi.fn(async (input, init) => {
-				if (new URL(String(input)).pathname !== SELF_SPECULATION_DEFAULTS.forkPath)
-					return Response.json({});
-				return await new Promise<Response>((_resolve, reject) => {
-					init?.signal?.addEventListener(
-						"abort",
-						() => reject(new DOMException("aborted", "AbortError")),
-						{ once: true },
-					);
-				});
-			}),
-		});
+		const coordinator = coordinatorFixture([], { forkTransport: "sidecar" }, ["actor-request"], async (request, init) => {
+			if (request.path !== SELF_SPECULATION_DEFAULTS.forkPath) return {};
+			return await new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+			});
+		}, actorForkPlans);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		const runtime = new AbortController();
 		const pending = actorForkPlans.waitForBatches("turn-1", runtime.signal);
@@ -746,33 +668,30 @@ function coordinatorFixture(
 	requests: CapturedRequest[],
 	overrides: Partial<SelfSpeculationSettings>,
 	requestIDs: string[],
-	response?: (request: CapturedRequest) => unknown,
+	response?: (request: CapturedRequest, init?: RequestInit) => unknown,
+	actorForkPlanSource?: ReturnType<typeof createActorForkPlanSource>,
 ): SelfSpeculationCoordinator {
 	const settings = enabledSettings(overrides);
 	return new SelfSpeculationCoordinator({
 		settings: () => settings,
 		requestID: () => requestIDs.shift() ?? "unexpected-request",
-		fetch: vi.fn(async (input, init) => {
+		actorForkPlanSource,
+		fetch: async (input, init) => {
 			const request = {
 				path: new URL(String(input)).pathname,
-				body: JSON.parse(String(init?.body)) as Record<string, any>,
+				body: JSON.parse(String(init?.body)),
 			};
 			requests.push(request);
-			return Response.json(response?.(request) ?? { ok: true });
-		}),
+			const result = await response?.(request, init);
+			return result instanceof Response ? result : Response.json(result ?? { ok: true });
+		},
 	});
 }
 
 async function forkActionFixture(overrides: Partial<SelfSpeculationSettings>, receipt: unknown) {
 	const actorForkPlans = createActorForkPlanSource({ maxAttempts: 1 });
-	const coordinator = new SelfSpeculationCoordinator({
-		settings: () => enabledSettings({ forkTransport: "sidecar", ...overrides }),
-		requestID: () => "actor-request",
-		actorForkPlanSource: actorForkPlans,
-		fetch: vi.fn(async (input) =>
-			Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}),
-		),
-	});
+	const coordinator = coordinatorFixture([], { forkTransport: "sidecar", ...overrides }, ["actor-request"],
+		(request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath ? receipt : {}, actorForkPlans);
 	coordinator.startTurn("turn-1", model(), context(), 1);
 	const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
 	coordinator.decorateActorPayload({ prompt: "P" });
@@ -849,34 +768,21 @@ function actionIdentity(key: string): string {
 }
 
 function predictionFeedback(source: string, adopted: boolean, sequence: number): PredictionFeedback<string> {
-	const base = {
+	return {
 		sessionID: "session-1",
 		turnID: "turn-1",
 		tool: "read",
-	};
-	const settlementBase = {
-		prediction: {
-			id: `${source}:${sequence}`,
-			source,
-			proposalID: `${source}:proposal`,
-			actionID: `${source}:action`,
+		settlement: {
+			prediction: { id: `${source}:${sequence}`, source, proposalID: `${source}:proposal`, actionID: `${source}:action` },
+			observation: "observed",
+			actorAction: { id: `actor:${sequence}`, sequence, decisionSequence: 1, turnID: "turn-1" },
+			...(adopted ? { match: {
+				matched: true,
+				relation: { kind: "exact", distance: 0 },
+				adoption: { status: "adopted", candidateID: `candidate:${sequence}` },
+			} } : { match: { matched: false } }),
 		},
-		observation: "observed" as const,
-		actorAction: { id: `actor:${sequence}`, sequence, decisionSequence: 1, turnID: "turn-1" },
 	};
-	return adopted
-		? {
-				...base,
-				settlement: {
-					...settlementBase,
-					match: {
-						matched: true,
-						relation: { kind: "exact", distance: 0 },
-						adoption: { status: "adopted", candidateID: `candidate:${sequence}` },
-					},
-				},
-			}
-		: { ...base, settlement: { ...settlementBase, match: { matched: false } } };
 }
 
 function action(key: string, hash: string, tool: string, input: Record<string, unknown>): ActionKey {

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_BENEFIT_GATE_POLICY,
-	adoptionUtility, BenefitGate,
+	creditAdoption, BenefitGate,
 	type BenefitGatePolicy,
 } from "./fork-benefit-gate.ts";
 import {
@@ -560,7 +560,14 @@ export class SelfSpeculationCoordinator {
 				request_id: state.requestID,
 				model: modelPayload(state.model),
 				context: contextPayload(state.context, state.providerPayload),
-				snapshot: actorProbeSnapshotPayload(probe),
+				snapshot: {
+					attempt: probe.attempt,
+					generated_text: probe.generatedText,
+					content: probe.content,
+					reasoning: probe.reasoning,
+					chunk_count: probe.outputChunks,
+					output_chunk_count: probe.outputChunks,
+				},
 				options: forkPayload(settings),
 			},
 			settings,
@@ -612,10 +619,8 @@ export class SelfSpeculationCoordinator {
 		if (!state) return;
 		const matchedSources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
 		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
-		const shares = Math.max(1, matchedSources.size), utility = adoptionUtility(settlement.provider.timing);
-		state.forkUtility.costMs += utility.costMs / shares;
-		state.forkUtility.benefitMs = state.forkUtility.benefitMs === undefined || utility.benefitMs === undefined
-			? undefined : state.forkUtility.benefitMs + utility.benefitMs / shares;
+		const shares = matchedSources.size;
+		creditAdoption(state.forkUtility, settlement.provider.timing, shares);
 		this.totalForkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
 		this.forkActionAdoptions++;
 	}
@@ -949,8 +954,8 @@ export class SelfSpeculationCoordinator {
 		this.forkGate.observe(
 			state.gateKey,
 			{
+				...state.forkUtility,
 				costMs: state.forkCompletedAt - state.forkStartedAt + state.forkUtility.costMs,
-				benefitMs: state.forkUtility.benefitMs,
 				...(state.forkFailed ? { failed: true } : {}),
 			},
 			forkGatePolicy(state.settings),
@@ -1051,17 +1056,6 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 		...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
 		...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 		fork_gate: forkGatePayload(settings),
-	};
-}
-
-function actorProbeSnapshotPayload(snapshot: ActorProbeSnapshot): Readonly<Record<string, unknown>> {
-	return {
-		attempt: snapshot.attempt,
-		generated_text: snapshot.generatedText,
-		content: snapshot.content,
-		reasoning: snapshot.reasoning,
-		chunk_count: snapshot.outputChunks,
-		output_chunk_count: snapshot.outputChunks,
 	};
 }
 

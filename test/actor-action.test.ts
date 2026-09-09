@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
+import { ActorCallAttempt } from "../src/actor-call-attempt.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
 
@@ -19,18 +20,18 @@ const actionKey = {
 describe("ActorAction", () => {
 	it("owns candidate rejections and one authoritative provider", () => {
 		const action = new ActorAction({ identity, tool: "read", actionKey });
-		expect(action.reject("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
-		const settled = action.adopt(
-			"fresh",
-			exact,
-			{
-				executionAheadMs: 40,
-				attemptLeadMs: 55,
-				hitLatencyMs: 3,
-			},
-			{ startedAt: 10, completedAt: 50 },
-			[{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }],
-		);
+		const release = vi.fn(), attempt = new ActorCallAttempt<{ readonly id: string }, string>({
+			action, fallback: cause("matching", "no_candidate"), releaseActorAdmission: release,
+		});
+		expect(attempt.rejectCandidate("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
+		expect(attempt.select({ candidate: { id: "fresh" }, match: exact, output: "value",
+			timing: { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3 },
+			toolExecution: { startedAt: 10, completedAt: 50 },
+		})).toBe(true);
+		expect(attempt.settleSelection([{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }], "speculative"))
+			.toEqual({ status: "adopted", candidateID: "fresh" });
+		expect(attempt.settleSelection([], "speculative")).toBeUndefined();
+		const settled = action.settlement;
 
 		expect(settled).toMatchObject({
 			actorAction: identity,
@@ -50,18 +51,30 @@ describe("ActorAction", () => {
 			),
 		).toBeUndefined();
 		expect(action.settleActor(100, false)).toBeUndefined();
+		attempt.close(); attempt.close();
+		expect(release).toHaveBeenCalledOnce();
 	});
 
 	it("spans interception and exactly one Actor fallback completion", () => {
-		const action = new ActorAction({ identity, tool: "bash" });
-		action.reject("failed", exact, cause("execution", "tool_failed"));
-		expect(action.deferToFallback()).toBe(true);
-		expect(action.reject("late", exact, cause("execution", "late"))).toBe(false);
-		expect(action.settleActor(Number.NaN, true)).toMatchObject({
-			rejections: [{ candidateID: "failed" }],
-			provider: { kind: "actor", durationMs: 0, isError: true },
-		});
-		expect(action.settleActor(1, false)).toBeUndefined();
+		for (const rejected of [false, true]) {
+			const action = new ActorAction({ identity, tool: "bash" }), release = vi.fn();
+			const attempt = new ActorCallAttempt({ action, fallback: cause("matching", "no_candidate"), releaseActorAdmission: release });
+			if (rejected) {
+				const failure = cause("execution", "tool_failed");
+				expect(attempt.rejectCandidate("failed", exact, failure)).toBe(true);
+				expect(attempt.fallback).toEqual({ cause: failure, candidateID: "failed" });
+				expect(attempt.deferToFallback()).toEqual({ status: "rejected", cause: failure, candidateID: "failed" });
+			}
+			attempt.close(); attempt.close();
+			expect(release).toHaveBeenCalledOnce();
+			expect(action.state.status).toBe("awaiting_fallback");
+			expect(action.reject("late", exact, cause("execution", "late"))).toBe(false);
+			expect(action.settleActor(Number.NaN, true)).toMatchObject({
+				rejections: rejected ? [{ candidateID: "failed" }] : [],
+				provider: { kind: "actor", durationMs: 0, isError: true },
+			});
+			expect(action.settleActor(1, false)).toBeUndefined();
+		}
 	});
 
 	it("settles isolation-blocked benefit with the same capped timing decomposition", () => {

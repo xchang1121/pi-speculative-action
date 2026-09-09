@@ -19,6 +19,7 @@ import type {
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
+import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 
 interface Start {
@@ -1055,47 +1056,60 @@ describe("structural speculative runtime", () => {
 		} finally { release.arrive(); await Promise.allSettled([consuming, closing]); await fixture.runtime.dispose(); }
 	});
 
-	it("settles a K(a) match as incompatible without committing backend effects", async () => {
-		const commit = vi.fn(async () => "committed");
+	it.each(["indeterminate", "compatibility_drift", "classified", "unclassified"] as const)("preserves %s rejection through the transaction and Actor fallback", async (scenario) => {
+		const indeterminate = scenario === "indeterminate", incompatible = indeterminate || scenario === "compatibility_drift";
+		const actor = indeterminate ? call("turn") : { ...call("turn"), tool: "write", input: { path: "a.txt", content: "a" } };
+		const failure = cause("freshness", "backend_conflict"), dispose = vi.fn();
+		const commit = vi.fn(async () => {
+			if (incompatible) return "speculative";
+			throw scenario === "classified" ? effectCommitFailure(new Error("changed"), "recoverable", "changed", failure)
+				: effectCommitFailure(new Error("commit failed"), "recoverable");
+		});
+		const transactions = new EffectTransactionCoordinator<string>(), candidateReady = candidateSucceeded();
+		const gateway = new ToolExecutionGateway<undefined, string>([]), executeActor = vi.fn(async () => "Actor");
 		const settlements: PredictionSettlement[] = [];
-		const candidateReady = candidateSucceeded();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "incompatible", { path: "README.md" }),
-			onSettled: ({ settlement }) => {
-				settlements.push(settlement);
-			},
-		};
 		const fixture = harness({
-			source,
-			execute: () => ({
-				...world("sealed"),
-				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
-				compatibility: { status: "indeterminate", backend: "test", code: "attestation_missing" },
-				commit,
-			}),
+			source: { id: "source", enabled: () => true,
+				propose: () => indeterminate ? plan("source", "incompatible", actor.input) : undefined,
+				onSettled: ({ settlement }) => { settlements.push(settlement); } },
+			execute: async (tool, concrete) => {
+				const fingerprint = buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint;
+				const source = { ...world("speculative", { resources: ["a.txt"], executionFingerprint: fingerprint }), capturedBytes: 1,
+					compatibility: incompatible
+						? { status: indeterminate ? "indeterminate" as const : "incompatible" as const, backend: "test", code: indeterminate ? "attestation_missing" : "sealed_incompatible" }
+						: { status: "compatible" as const, backend: "test", executionFingerprint: fingerprint },
+					validate: async () => ({ status: "valid" as const, metrics: zeroValidationMetrics() }), commit, dispose };
+				const transaction = await transactions.execute(transactions.begin({ tool, callID: actor.id,
+					route: indeterminate ? RESOURCE_ROUTE : MUTATION_ROUTE }), async () => source);
+				Object.assign(source.compatibility, { status: "compatible", executionFingerprint: fingerprint });
+				return transaction;
+			},
 			onEvent: candidateReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await candidateReady.promise;
-
-		expect(await fixture.runtime.consume(call("turn"))).toBeUndefined();
-		await fixture.runtime.actual({ ...call("turn"), durationMs: 1, output: "actor" });
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
-		expect(commit).not.toHaveBeenCalled();
-		expect(settlements).toEqual([
-			expect.objectContaining({
-				match: expect.objectContaining({
-					matched: true,
-					adoption: expect.objectContaining({
-						status: "rejected",
-						cause: expect.objectContaining({ stage: "compatibility", code: "backend_indeterminate" }),
-					}),
-					relation: expect.any(Object),
-				}),
-			}),
-		]);
+		try {
+			await fixture.runtime.startTurn(actor);
+			if (!indeterminate) await fixture.runtime.previewActorCall(actor);
+			await candidateReady.promise;
+			await expect(gateway.executeAuthoritative({ tool: actor.tool, input: actor.input }, executeActor, {
+				reuse: () => fixture.runtime.consume(actor), settled: async (settlement) => {
+					if (settlement.status === "succeeded") await fixture.runtime.actual({ ...actor, ...settlement });
+				},
+			})).resolves.toBe("Actor");
+			expect(executeActor).toHaveBeenCalledOnce();
+			await fixture.runtime.finishTurn({ ...actor, terminal: indeterminate });
+			await vi.waitFor(() => expect(fixture.events.some((event) => event.type === "actor_action")).toBe(true));
+			const settlement = fixture.events.find((event) => event.type === "actor_action")?.settlement;
+			expect(settlement?.rejections[0]?.cause).toMatchObject(scenario === "classified" ? failure : incompatible
+				? { stage: "compatibility", code: indeterminate ? "backend_indeterminate" : "backend_incompatible",
+					detail: indeterminate ? "attestation_missing" : "sealed_incompatible" } : { stage: "commit", code: "world_commit_failed" });
+			expect(settlement?.provider).toMatchObject({ kind: "actor", origin: "fallback" });
+			expect(commit).toHaveBeenCalledTimes(incompatible ? 0 : 1);
+			expect(dispose).toHaveBeenCalledOnce();
+			if (indeterminate) expect(settlements).toEqual([expect.objectContaining({ match: {
+				matched: true, relation: { kind: "exact", distance: 0 },
+				adoption: { status: "rejected", candidateID: expect.any(String), cause: settlement?.rejections[0]?.cause },
+			} })]);
+		} finally { await fixture.runtime.dispose(); await gateway.dispose(); }
 	});
 
 	it("keeps one turn on its settings snapshot while master disable remains immediate", async () => {
