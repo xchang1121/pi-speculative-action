@@ -9,7 +9,6 @@ import {
 	DEFAULTS,
 	normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection,
-	type SpeculativeToolSelectionInput,
 } from "./common.ts";
 import type {
 	AgentConsumeInput,
@@ -76,8 +75,8 @@ export interface SpeculativeAgentSettingsInput {
 	readonly predictionTimeoutMs?: number;
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly selfSpeculation?: SelfSpeculationSettingsInput;
-	/** Legacy grouped input is accepted only for configuration migration. */
-	readonly tools?: SpeculativeToolSelectionInput;
+	/** Prediction selection, independent of execution permissions; omitted uses the registered tools. */
+	readonly tools?: readonly string[];
 }
 
 /** Shared host/package boundary: the TUI and runtime must interpret saved policy identically. */

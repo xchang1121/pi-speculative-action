@@ -58,9 +58,7 @@ export {
 export {
 	clampCandidateLimit,
 	DEFAULTS,
-	type LegacySpeculativeToolGroups,
 	normalizeSpeculativeToolSelection,
-	type SpeculativeToolSelectionInput,
 } from "./common.ts";
 export { calculateContextTokens as usageTokenCount } from "@earendil-works/pi-agent-core";
 export type { ExecutionScope } from "./execution-world.ts";

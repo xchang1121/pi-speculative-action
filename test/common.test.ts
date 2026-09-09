@@ -162,13 +162,12 @@ describe("speculative action common", () => {
 		expect(inferredActionEffect("bash")).toBe("unbounded");
 		expect(inferredActionEffect("edit")).toBe("workspace_mutation");
 		expect(normalizeSpeculativeToolSelection(["bash", "read", "bash", "unknown"])).toEqual(["bash", "read"]);
-		expect(
-			normalizeSpeculativeToolSelection({
-				resourceCached: ["read"],
-				sandbox: ["write"],
-				predictionOnly: ["bash"],
-			}),
-		).toEqual(["read", "write", "bash"]);
+		expect(normalizeSpeculativeToolSelection(undefined)).toEqual(DEFAULTS.tools);
+		expect(normalizeSpeculativeToolSelection(["custom", "read", "bash", "custom"], ["read", "custom"]))
+			.toEqual(["custom", "read"]);
+		for (const input of [[], { resourceCached: ["read"], sandbox: [], predictionOnly: [] }, ["read", 1], null]) {
+			expect(normalizeSpeculativeToolSelection(input)).toEqual([]);
+		}
 	});
 
 	it("defines equivalence through an injected projection without changing K(a)", () => {

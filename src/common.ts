@@ -1,18 +1,5 @@
-import {
-	KEYABLE_TOOLS,
-	OBSERVATION_ACTION_TOOLS,
-	UNBOUNDED_ACTION_TOOLS,
-	WORKSPACE_MUTATION_ACTION_TOOLS,
-} from "./action-semantics.ts";
+import { KEYABLE_TOOLS } from "./action-semantics.ts";
 import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
-
-export interface LegacySpeculativeToolGroups {
-	readonly resourceCached?: readonly string[];
-	readonly sandbox?: readonly string[];
-	readonly predictionOnly?: readonly string[];
-}
-
-export type SpeculativeToolSelectionInput = readonly string[] | LegacySpeculativeToolGroups;
 
 export interface DrafterToolDefinition {
 	readonly name: string;
@@ -52,23 +39,15 @@ export function clampCandidateLimit(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }
 
-/** Normalize the current tool list and migrate the former three-group configuration at one boundary. */
+/** Only omitted selection defaults to allowed tools; malformed input disables prediction. */
 export function normalizeSpeculativeToolSelection(
 	value: unknown,
 	allowed: readonly string[] = KEYABLE_TOOLS,
 ): readonly string[] {
+	const items = value === undefined ? allowed : value;
+	if (!Array.isArray(items) || !items.every((item): item is string => typeof item === "string")) return [];
 	const allowedSet = new Set(allowed);
-	const select = (items: readonly string[]) => [...new Set(items.filter((item) => allowedSet.has(item)))];
-	if (Array.isArray(value)) {
-		return value.every((item): item is string => typeof item === "string") ? select(value) : select(allowed);
-	}
-	if (!value || typeof value !== "object") return select(allowed);
-	const legacy = value as Record<string, unknown>;
-	return select([
-		...stringArrayOr(legacy.resourceCached, OBSERVATION_ACTION_TOOLS),
-		...stringArrayOr(legacy.sandbox, WORKSPACE_MUTATION_ACTION_TOOLS),
-		...stringArrayOr(legacy.predictionOnly, UNBOUNDED_ACTION_TOOLS),
-	]);
+	return [...new Set(items.filter((item) => allowedSet.has(item)))];
 }
 
 export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {
@@ -105,8 +84,4 @@ export function drafterRequestTemperature(
 		((settings.drafterTemperatureMax - settings.drafterTemperatureMin) * (index - deterministic)) /
 			(stochasticCount - 1)
 	);
-}
-
-function stringArrayOr(value: unknown, fallback: readonly string[]): readonly string[] {
-	return Array.isArray(value) && value.every((item): item is string => typeof item === "string") ? value : fallback;
 }
