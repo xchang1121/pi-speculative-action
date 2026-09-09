@@ -486,7 +486,7 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 }
 
 async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, view?: ResourceReadView) {
-	return mapLimit(dependencies, FINGERPRINT_CONCURRENCY, async (dependency) => {
+	return mapFingerprints(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
 		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
@@ -593,7 +593,7 @@ async function fingerprintPath(
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
 	const selected = [...entries].sort((left, right) => left.name.localeCompare(right.name));
 	const descendants = new Set(ancestors).add(identity);
-	const children = scope === "names" ? [] : await mapLimit(selected, FINGERPRINT_CONCURRENCY, async (entry) => {
+	const children = scope === "names" ? [] : await mapFingerprints(selected, async (entry) => {
 		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
@@ -687,21 +687,20 @@ function assertInside(realRoot: string, target: string): void {
 	if (!containsFilesystemPath(realRoot, target)) throw new Error(`resource_symlink_escapes_workspace:${target}`);
 }
 
-async function mapLimit<Input, Output>(
+async function mapFingerprints<Input, Output>(
 	values: ReadonlyArray<Input>,
-	limit: number,
-	run: (value: Input, index: number) => Promise<Output>,
+	run: (value: Input) => Promise<Output>,
 ) {
 	const output: Output[] = [];
 	let cursor = 0;
-	await Promise.all(
-		Array.from({ length: Math.min(Math.max(1, limit), values.length) }, async () => {
-			while (cursor < values.length) {
-				const index = cursor++;
-				output[index] = await run(values[index], index);
-			}
-		}),
-	);
+	const pending = Array.from({ length: Math.min(FINGERPRINT_CONCURRENCY, values.length) }, async () => {
+		while (cursor < values.length) {
+			const index = cursor++;
+			output[index] = await run(values[index]);
+		}
+	});
+	try { await Promise.all(pending); }
+	catch (error) { cursor = values.length; await Promise.allSettled(pending); throw error; }
 	return output;
 }
 
