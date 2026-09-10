@@ -338,7 +338,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
-		return this.lifecycle.admit(() => this.select("speculation", request, preparation, (world) => world.speculation, (_world, route) => route));
+		return this.lifecycle.admit(() => this.select("speculation", request, preparation, (_world, route) => route));
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
@@ -358,7 +358,6 @@ export class ExecutionWorldRouter<Context, Output> {
 			"observation",
 			request,
 			preparation,
-			(world) => world.observation,
 			async (world, route) => {
 				const capture = await world.observation!.capture(context);
 				return Object.freeze({ route, capture });
@@ -417,7 +416,6 @@ export class ExecutionWorldRouter<Context, Output> {
 		kind: "speculation" | "observation",
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
-		operationFor: (world: ExecutionWorld<Context, Output>) => ExecutionWorldOperation | undefined,
 		select: (
 			world: ExecutionWorld<Context, Output>,
 			route: SpeculativeExecutionRoute,
@@ -426,7 +424,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worldsByID.values()) {
 				if (world.scope !== scope || (kind === "speculation" && !this.speculationEnabled(world.id))) continue;
-				const operation = operationFor(world);
+				const operation = world[kind];
 				if (!operation) continue;
 				try {
 					if (!supportsTool(operation, request.action?.tool ?? request.tool)) continue;

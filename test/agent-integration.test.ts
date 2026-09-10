@@ -173,9 +173,11 @@ describe("speculative action host", () => {
 				const sandbox = resourceExecution
 					? createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [toolName], maxBytes: () => 1024 * 1024 })
 					: toolRuntimeWorld();
+				const prepareWorld = vi.fn(async () => {});
+				let predictions = origin === "prediction";
 				const host = createSpeculativeActionHost(`session-${turnID}`, {
 					cwd,
-					getSettings: () => ({ ...settings(), drafterEnabled: origin === "prediction", drafterMaxDepth: 0, tools: [toolName] }),
+					getSettings: () => ({ ...settings(), drafterEnabled: predictions, drafterMaxDepth: 0, tools: [toolName] }),
 					draftModel: model("draft"),
 					complete: async () =>
 						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: proposal }], "toolUse"),
@@ -184,7 +186,7 @@ describe("speculative action host", () => {
 						await speculativeExecution();
 						return resourceExecution(view, request);
 					} } : invocation,
-					executionWorlds: [sandbox],
+					executionWorlds: [{ ...sandbox, speculation: { ...sandbox.speculation!, prepare: prepareWorld } }],
 					onEvent: (event) => {
 						events.push(event);
 						if (event.type === "candidate" && event.state.status === "succeeded") completed.resolve();
@@ -192,11 +194,16 @@ describe("speculative action host", () => {
 					},
 				});
 				try {
+					await host.startTurn(startInput({ ...tool, name: "unregistered" }, `${turnID}:without-tool`));
+					await host.finishTurn(`${turnID}:without-tool`, true);
+					expect(prepareWorld).not.toHaveBeenCalled();
 					await host.startTurn({ ...startInput(tool, turnID), tools: resourceExecution ? [tool, writer] : [tool] });
+					expect(prepareWorld.mock.calls.length > 0).toBe(predictions);
 					if (origin === "preview") for (let repeat = 0; repeat < 2; repeat++) {
 						await host.previewActorCall({ turnID, id: `actor-${toolName}`, tool: toolName, args: proposal, tools: [tool] });
 					}
 					await started.promise;
+					expect(prepareWorld).toHaveBeenCalled();
 					expect(prepareArguments).toHaveBeenCalledOnce();
 					for (const { args, action } of permissions) expect(args).toEqual(action.input);
 					if (phase === "completed") { release(); await completed.promise; }
@@ -254,6 +261,10 @@ describe("speculative action host", () => {
 						}
 					}
 					await host.finishTurn(turnID, true);
+					predictions = false; prepareWorld.mockClear();
+					await host.startTurn(startInput(tool, `${turnID}:without-predictions`));
+					await host.finishTurn(`${turnID}:without-predictions`, true);
+					expect(prepareWorld).not.toHaveBeenCalled();
 				} finally {
 					release();
 					await host.dispose();
@@ -541,6 +552,8 @@ describe("speculative action host", () => {
 	it.each(["actor", "drafter"] as const)("rebases PatternAware from an authoritative %s result within the same turn", async (origin) => {
 		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
 		const tools = [grepTool, readTool], ready = deferred<void>();
+		const world = toolRuntimeWorld();
+		const fingerprint = vi.fn(origin === "drafter" ? world.speculation.fingerprint : () => { throw new Error("Fixture world unavailable"); });
 		const host = createSpeculativeActionHost("probe", {
 			cwd,
 			getSettings: () => ({ ...settings(origin === "drafter" ? 1 : 4), drafterEnabled: origin === "drafter",
@@ -548,7 +561,7 @@ describe("speculative action host", () => {
 			patternStore, draftModel: model("draft"), preflight: () => true,
 			complete: async () => assistant([{ type: "toolCall", id: "draft-grep", name: "grep",
 				arguments: { pattern: "one", path: "." } }], "toolUse"),
-			...(origin === "drafter" ? { executionWorlds: [toolRuntimeWorld()] } : {}),
+			executionWorlds: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
 			onCandidateMaterialized: (candidate) => { materialized.push(candidate); },
 			onEvent: (event) => {
 				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
@@ -558,6 +571,7 @@ describe("speculative action host", () => {
 		try {
 			await host.startTurn({ ...startInput(grepTool, call.turnID),
 				context: { systemPrompt: "system", messages: [], tools }, tools });
+			expect(fingerprint).toHaveBeenCalled();
 			if (origin === "drafter") await ready.promise;
 			else expect(materialized).toHaveLength(0);
 			const adopted = await host.consume(call);
@@ -585,6 +599,7 @@ describe("speculative action host", () => {
 		const events: SpeculativeActionEvent<string>[] = [];
 		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 		const actorForkPlans = createActorForkPlanSource();
+		const prepare = vi.fn(async () => {}), world = toolRuntimeWorld();
 		let forkPath = "notes.txt";
 		let forkMinimumLogprob = Math.log(0.95);
 		let actionSourceEnabled = true;
@@ -657,7 +672,7 @@ describe("speculative action host", () => {
 				}
 				return true;
 			},
-			executionWorlds: [toolRuntimeWorld()],
+			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
 			onCandidateMaterialized: (candidate) => {
@@ -672,7 +687,9 @@ describe("speculative action host", () => {
 			},
 		});
 		const triggerFork = async (turnID: string) => {
+			prepare.mockClear();
 			await host.startTurn(startInput(tool, turnID));
+			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput({ type: "text_delta", contentIndex: 0, delta: "x", partial: undefined as never });
 		};

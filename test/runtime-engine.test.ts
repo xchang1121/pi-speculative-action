@@ -1267,9 +1267,10 @@ describe("structural speculative runtime", () => {
 
 	it("binds the actual executor independently from pending or completed preview identity", async () => {
 		for (const [formalPath, settlePreview] of [
-			["preview.ts", false], ["formal.ts", false], ["preview.ts", true],
+			["preview.ts", false], ["formal.ts", false], ["preview.ts", true], ["preview.ts", "next-event"],
 		] as const) {
 			const gate = barrier(), firstKeyStarted = barrier();
+			const resolveExecution = vi.fn(() => undefined);
 			let executor = "preview", actionKeys = 0, captured: ActionKey | undefined;
 			const fixture = harness({
 				source: { id: "disabled", enabled: () => false, propose: () => undefined },
@@ -1282,7 +1283,7 @@ describe("structural speculative runtime", () => {
 					}
 					return PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: identity });
 				},
-				resolveExecution: () => undefined,
+				resolveExecution,
 				captureAuthoritativeResult: (action) => { captured = action; return undefined; },
 			});
 			const turnID = `in-flight-key:${formalPath}:${settlePreview}`;
@@ -1290,18 +1291,20 @@ describe("structural speculative runtime", () => {
 			const previewCall = call(turnID, { path: "preview.ts" });
 			const preview = fixture.runtime.previewActorCall(previewCall);
 			await firstKeyStarted.promise;
-			if (settlePreview) {
+			if (settlePreview === true) {
 				gate.arrive();
 				await preview;
 			}
 			executor = "actor";
 			const actorCall = { ...previewCall, input: { path: formalPath } };
-			const consumed = fixture.runtime.consume(actorCall);
+			const consumed = settlePreview === "next-event"
+				? new Promise<void>(setImmediate).then(() => fixture.runtime.consume(actorCall)) : fixture.runtime.consume(actorCall);
 			gate.arrive(); await preview;
 			expect(await consumed).toBeUndefined();
 			expect(captured?.executionFingerprint).toBe("actor");
 			expect(captured?.input.path).toBe(formalPath);
 			expect(actionKeys).toBe(2);
+			expect(resolveExecution, String(settlePreview)).toHaveBeenCalledTimes(settlePreview === true ? 1 : 0);
 			await fixture.runtime.actual({ ...actorCall, durationMs: 1, output: "actor" });
 			await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
 		}

@@ -55,7 +55,7 @@ Linux/WSL 2 进程世界共用文件工具的私有工作区，再以 Sandlock �
 
 资源指纹采集失败后停止领取新项并排空读取与句柄。文件绑定的新目录按 Actor 当前 umask、默认 ACL 和继承策略创建，不复制私有目录权限；新建后回读或访问检查若缺少权限证明，则交还 Actor 执行。会话关闭等待执行、输入、封存、事务与清理结束，再回收工作区。
 
-各后端共用流式参数跟踪：逐片扫描嵌套、字符串和转义边界，完整对象才严格解析，提示发出后停止累积。完整意图可在 Actor 继续输出时提前转换封存数据，沿用原缓存预算；正式调用已到达则跳过准备。采纳只等待相同动作与执行器的准备，并重新授权、验证与提交。提示和准备不发布权威结果或宿主效果；Actor 写入和 watcher 事件不能代替精确证明，未完成工作及 checkpoint 后代仍保守失效。
+各后端共用流式参数跟踪：逐片扫描嵌套、字符串和转义边界，完整对象才严格解析，提示发出后停止累积。完整意图新建候选或转换封存结果前让出一次事件处理，正式调用已到达则跳过准备；既有候选仍可提升或接续。采纳只等待相同动作与执行器的准备，并重新授权、验证与提交。准备不发布权威结果或宿主效果；Actor 写入和 watcher 事件不能代替精确证明，未完成工作及 checkpoint 后代仍保守失效。
 
 默认主机使用通用封存输入求值，不启用 `read` 范围裁剪；已删除自动扩大预测动作的接口和未完成参数的补齐逻辑。新参数首次仍运行原计算，不声称能自动增量化任意黑盒程序。已有 `PI_READ_RANGE_PROJECTION_RULE` 仅供显式选择：它需配合真实输出覆盖证据，适用于大文件首次窄范围查询。元数据按实际消费字段取证；名字/类型查询不依赖文件大小，内容查询另行证明。Bash 依赖精确命令或原生进程证书，不能从 `| tail -n 20` 等文本推断等价。
 
@@ -232,7 +232,7 @@ SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可�
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；`createExecutionWorlds` 扩展执行层级，Host API 也接受显式 `executionWorlds`。World 声明 effect guarantee 与工具作用域，预热同样遵守。Router 在选路和执行前确认可用层级；已执行失败的动作不盲目换环境重跑。后端返回 `WorldBranch`，Gateway 包装为 `EffectTransaction`，统一管理验证、采纳和回收；兼容证据与局部句柄仍由后端负责。可选 `validateAndCommit` 仅供共享观察合并新鲜度证明与不改变 Actor 状态的后端提交，每次仍须重新验证；事务不会提前发布结果，独占分支忽略此接口。
+Pi 扩展按 Runtime、Linux 进程和 Git fallback 注册执行层级；`createExecutionWorlds` 扩展层级，Host 也接受显式 `executionWorlds`。World 声明效果保证与工具作用域。回合只为已注册、配置选中且存在启用预测源的工具预热；完整 Actor 意图仍可提前准备，但在让出事件处理后须确认对应正式调用尚未到达。
 
 ```ts
 const workspace = new WorkspaceSandboxService();
@@ -245,7 +245,7 @@ const host = createSpeculativeActionHost(sessionID, {
 try { await host.dispose(); } finally { await workspace.dispose(); }
 ```
 
-第一个可用的 Runtime 全局沙箱会覆盖所有能够证明 execution context 的进程型工具；不存在时，Router 才检查与动作效果兼容的本地后备。两者都不存在时返回空 route，Runtime 将其结算为 `execution:isolation_unavailable` 并回退 Actor。解析、准备、fork 与 dispose 全部经过同一个 Router，工具侧不会持有可绕开的后端对象。持久进程证书位于 `<agent-dir>/speculative-action/process-reuse`，使用内容寻址与当前生产者执行契约隔离，可以随时删除。
+Router 在选路与执行前检查能力，优先采用合格 Runtime，再检查本地后备；缺少安全路线则以 `execution:isolation_unavailable` 回退 Actor，已经执行失败的动作不换环境重跑。解析、准备、fork 与 dispose 共用 Router。后端返回 `WorldBranch`，Gateway 以 `EffectTransaction` 管理验证、采纳和回收；后端持有兼容证据与局部句柄。可选 `validateAndCommit` 仅供共享观察合并验新与无效果提交，每次仍需验新，独占分支忽略该接口。持久证书按内容和生产者契约隔离在 `<agent-dir>/speculative-action/process-reuse`，可以随时删除。
 
 ## 计时口径
 

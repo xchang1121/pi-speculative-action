@@ -271,9 +271,6 @@ export function createSpeculativeActionHost(
 			},
 		};
 	};
-	const prepareExecutionWorlds = async (tools: readonly string[], signal?: AbortSignal): Promise<void> => {
-		await Promise.all([...new Set(tools)].map((tool) => resolveExecutionRoute(tool, signal)));
-	};
 	const drafterPlans = createDrafterPlanSource({
 		sessionID,
 		draftModel: options.draftModel,
@@ -289,6 +286,8 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
+	const sources = [patternPlans.source, drafterPlans.source,
+		...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])];
 	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string) => {
 		const resolved = await options.resolveInvocation?.(tool, input);
 		const invocation = resolved && Object.freeze({ ...resolved,
@@ -315,11 +314,7 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources: [
-			patternPlans.source,
-			drafterPlans.source,
-			...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : []),
-		],
+		sources,
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
@@ -395,9 +390,10 @@ export function createSpeculativeActionHost(
 			} catch {
 				// Optional inference integration cannot prevent source launch or Actor execution.
 			}
-			void prepareExecutionWorlds(settings.tools, signal).catch(() => {
-				// Turn warm-up is best-effort; route resolution remains authoritative.
-			});
+			if (sources.some((source) => source.enabled(settings))) {
+				void Promise.all(settings.tools.filter((name) => startInput.tools.some((tool) => tool.name === name))
+					.map((tool) => resolveExecutionRoute(tool, signal))).catch(() => {});
+			}
 			patternPlans.turnStarted(startInput, settings);
 		},
 		onTurnFinished: ({ startInput, settings, terminal }) => {

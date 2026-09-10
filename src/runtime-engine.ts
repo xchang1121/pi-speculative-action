@@ -1832,6 +1832,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			return;
 		}
 		if (!record) return;
+		await new Promise<void>(setImmediate);
+		if (!active()) return;
 		const executionSignal = signal ?? state.generation.signal;
 		const concrete = asConcreteInput(action.input);
 		if (!concrete) return;
