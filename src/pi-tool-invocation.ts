@@ -168,7 +168,7 @@ export async function createClosedSearchProfile(cwd: string) {
 					},
 				});
 			} finally {
-				capture?.release();
+				await capture?.release();
 				if (privateRoot) { assert.equal(path.dirname(privateRoot), engine!.root); await fs.rm(privateRoot, { recursive: true, force: true }); }
 			}
 		}, request.signal);

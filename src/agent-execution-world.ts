@@ -57,6 +57,7 @@ export function createResourceSnapshotExecutionWorld(
 		const setupStarted = performance.now();
 		const root = onDemand ? (context.action.executionContext as ToolInvocation | undefined)?.filesystemRoot ?? context.cwd : context.cwd;
 		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, root, actionSemantics, retainBytes);
+		let disposal: void | Promise<void>;
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
 			view: version.view,
@@ -70,11 +71,15 @@ export function createResourceSnapshotExecutionWorld(
 					if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs);
 				} catch (error) {
-					releaseResourceVersion(owned);
+					await releaseResourceVersion(owned);
 					throw error;
 				}
 			},
-			dispose: () => { if (version) releaseResourceVersion(version); version = undefined; },
+			dispose: () => {
+				const released = version;
+				version = undefined;
+				return disposal ??= releaseResourceVersion(released);
+			},
 		};
 	};
 	return {
@@ -139,9 +144,8 @@ function resourceSnapshotBranch(
 			return output;
 		},
 		dispose: () => {
-			const released = owned;
 			owned = undefined;
-			releaseResourceVersion(released);
+			return version.release();
 		},
 	};
 }

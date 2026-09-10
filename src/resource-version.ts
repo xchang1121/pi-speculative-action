@@ -44,7 +44,8 @@ export type ResourceVersionToken = {
 	readonly manager: ResourceVersionManager;
 	/** Best-effort retained inputs; absence never weakens the token's exact freshness evidence. */
 	readonly view?: ResourceReadView;
-	readonly release: () => void;
+	/** Revoke access immediately; completion includes admitted reads and ownership release. */
+	readonly release: () => void | Promise<void>;
 };
 
 type CapturedResource = (
@@ -62,6 +63,7 @@ export class ResourceReadView {
 	private capturedBytes = 0;
 	private sealed = false;
 	private pending?: Promise<void>;
+	private disposal?: Promise<void>;
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
 	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>) {
@@ -133,7 +135,11 @@ export class ResourceReadView {
 		if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending");
 		this.assertComplete(); this.sealed = true;
 	}
-	dispose(): void { if (!this.owner) this.entries.clear(); this.failure = new Error("resource_snapshot_disposed"); }
+	dispose(): void | Promise<void> {
+		if (!this.owner) this.entries.clear();
+		this.failure = new Error("resource_snapshot_disposed");
+		return this.disposal ??= this.pending?.then(() => {}, () => {});
+	}
 	private async get(target: string, scope: ResourceDependency["scope"]) {
 		this.assertComplete();
 		if (this.load && !this.sealed) {
@@ -215,7 +221,11 @@ export class ResourceVersionManager {
 		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>(), preciseContent: string[] = [];
 		const releases = [this.acquireReference()];
 		let view: ResourceReadView | undefined;
-		const release = releaseOnce(() => { view?.dispose(); observations.clear(); for (const stop of releases.reverse()) stop(); });
+		const release = releaseOnce(() => {
+			const finish = () => { observations.clear(); for (const stop of releases.reverse()) stop(); };
+			const pending = view?.dispose();
+			return pending ? pending.then(finish) : finish();
+		});
 		try {
 			await this.ready;
 			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
@@ -246,7 +256,7 @@ export class ResourceVersionManager {
 				manager: this, ...(retained ? { view: retained } : {}), release,
 			};
 		} catch (error) {
-			release();
+			await release();
 			throw error;
 		}
 	}
@@ -429,9 +439,9 @@ export function validateResourceVersion(token: unknown): Promise<ResourceVersion
 		: Promise.resolve(validation(performance.now(), true, "resource_version_missing", "exact"));
 }
 
-export function releaseResourceVersion(token: unknown): void {
+export function releaseResourceVersion(token: unknown): void | Promise<void> {
 	if (!isResourceVersionToken(token)) return;
-	token.release();
+	return token.release();
 }
 
 export function isResourceVersionToken(value: unknown): value is ResourceVersionToken {
@@ -739,12 +749,12 @@ function missingResource(error: unknown): boolean {
 	return code === "ENOENT" || code === "ENOTDIR";
 }
 
-function releaseOnce(release: () => void): () => void {
+function releaseOnce<Result>(release: () => Result): () => Result | undefined {
 	let released = false;
+	let result: Result | undefined;
 	return () => {
-		if (released) return;
-		released = true;
-		release();
+		if (!released) { released = true; result = release(); }
+		return result;
 	};
 }
 

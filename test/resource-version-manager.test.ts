@@ -116,21 +116,26 @@ describe("speculative action resource versions", () => {
 				vi.spyOn(broken, "close").mockImplementationOnce(async () => { await close(); fail(); });
 			}
 			const token = phase === "pending" ? await manager.capture(undefined, 8192) : undefined;
+			let release: void | Promise<void> = undefined;
 			const pending = (token ? Promise.allSettled([token.view!.readFile(path.join(root, "value")), token.view!.readFile(path.join(root, "value"))])
 				.then((entries) => entries.map((entry) => entry.status)) : manager.capture(phase === "tree" ? [{ path: root, scope: "tree_content" }] :
 					[{ path: "value", scope: "content" }, { path: "broken", scope: "content" }], 8192).then((token) => token.release(), (error: unknown) => error))
 				.finally(() => { settled = true; });
 			try {
 				await entered;
-				if (token) { expect((await manager.seal(token)).expired).toBe(true); token.release(); }
-				else {
-					await failed; await new Promise<void>((resolve) => setImmediate(resolve));
-					expect({ settled, released: idle.mock.calls.length, reading: handle.fd >= 0 }, phase).toEqual({ settled: false, released: 0, reading: true });
+				if (token) {
+					expect((await manager.seal(token)).expired).toBe(true);
+					release = token.release(); expect(token.release()).toBe(release);
+					await expect(token.view!.readFile(path.join(root, "value"))).rejects.toThrow("disposed");
 				}
+				else await failed;
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect({ settled, released: idle.mock.calls.length, reading: handle.fd >= 0 }, phase).toEqual({ settled: false, released: 0, reading: true });
 				resume();
 				if (token) expect(await pending).toEqual(["rejected", "rejected"]); else expect(await pending).toBe(failure);
+				await release;
 				expect([handle.fd, broken?.fd ?? -1, idle.mock.calls.length, open.mock.calls.length]).toEqual([-1, -1, 1, token ? 1 : 2]);
-			} finally { resume(); await pending; token?.release(); await Promise.all([handle.close(), broken?.close()]); open.mockRestore(); manager.close(); }
+			} finally { resume(); await pending; await token?.release(); await Promise.all([handle.close(), broken?.close()]); open.mockRestore(); manager.close(); }
 		}
 	});
 
