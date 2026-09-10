@@ -94,7 +94,7 @@ npm run bench:thinkthread-tools
 
 基线中的原生 read/grep/find/ls 仅在 Actor 授权后执行，不代表可以提前运行宿主函数。首选路线选择失败就是资格失败，不能用原生通过替代。准备、producer、已完成采纳是分开的单样本；poisoned 采纳保留所属夹具，不继续写工作区。
 
-普通测试复用的是本地 wire runner，不是真实 Runtime。Profile 内 Bash 仍须另行通过原生进程/in-flight 资格；冲突、取消恢复和隐式依赖闭包也是独立验收项。
+真实 TUI 的开关须 Apply 才生效；该 Profile 的 held-exec 返回 `EACCES`，Bash 提前执行不可用，文件后备与 Actor 保留。注册后备不授予嵌套 tracing/handoff 权限；wire 测试和 fs snapshot 检查不授予 Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
 ## 录制与模型消融
 

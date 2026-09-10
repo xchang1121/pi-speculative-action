@@ -99,7 +99,7 @@ npm run setup:linux
 
 受控 `grep` 还可使用已有的 rg：Windows x64 15.2.0 或 Linux x64 14.1.0。准备时只读查找 Pi 的二进制目录/PATH，固定可执行文件字节，并在 5 秒期限内验证私有副本；不安装、不下载。两侧使用固定引擎、绑定的 HOME 和原始已准备参数。此 profile 按路径排序，禁用 `RIPGREP_CONFIG_PATH` 和全局 Git ignore，仍捕获父级忽略规则，**不是 Native Pi 默认语义**。已有输入 token 保存所选原始字节、具名祖先/Git 配置及正负元数据，rg 在私有目录中自行选择文件，不递归读取被忽略子树或 Git 对象。原生默认、未验收的平台/版本或缺少 rg 时保留 Actor 路线；缺少 rg 不会关闭受控 find。
 
-准入、采纳和封存输入重算仍由已有 resource/candidate store 负责；宿主 Actor 观察不能为 captured-only profile 授权。显式刷新可重新检查可用性。已绑定调用即使失败也保留执行器：producer 被拒绝可恰好回退一次到同 profile 的 Actor，不能暗中改回 Native Pi。输入/结果预算为 8 MiB/1 MiB，worker 请求含启动期限为 5 秒；调用取消和池关闭还须等待输入准备、原生进程/流关闭及私有目录清理。工作进程按需启动，关闭插件排空 Actor、取消 producer 并恢复原生 Pi；旧设置直接回到默认值。Windows/WSL x64 生产路线及脚本驱动的真实 TUI 回调已验收；macOS/ARM64 和真实 ThinkThread Runtime 仍未验收。这是固定可信执行器，不是任意 Bash 或恶意 JavaScript 沙箱。见[有界资格命令](./bench/README.md#受控搜索资格)：启动与输入准备单独计时，候选就绪不代表值得采纳。
+准入、采纳和封存输入重算仍由已有 resource/candidate store 负责；宿主 Actor 观察不能为 captured-only profile 授权。显式刷新可重新检查可用性。已绑定调用即使失败也保留执行器：producer 被拒绝可恰好回退一次到同 profile 的 Actor，不能暗中改回 Native Pi。输入/结果预算为 8 MiB/1 MiB，worker 请求含启动期限为 5 秒；调用取消和池关闭还须等待输入准备、原生进程/流关闭及私有目录清理。工作进程按需启动，关闭插件排空 Actor、取消 producer 并恢复原生 Pi；旧设置直接回到默认值。Windows/WSL x64 生产路线及脚本驱动的真实 TUI 回调已验收；macOS/ARM64 及思程内的受控搜索仍未验收。这是固定可信执行器，不是任意 Bash 或恶意 JavaScript 沙箱。见[有界资格命令](./bench/README.md#受控搜索资格)：启动与输入准备单独计时，候选就绪不代表值得采纳。
 
 `pi.extensions` 指向 `src/extension.ts`，由 Pi 的公共 TypeScript 扩展加载器直接加载。因此 Git 安装不依赖已提交的构建产物或 dev dependency。`dist` 只作为 npm 使用时的标准 JavaScript/类型入口，在 `npm pack` 或 `npm publish` 时生成。
 
@@ -211,7 +211,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## ThinkThread Profile（Linux）
 
-可选入口 `./thinkthread-extension` 通过 ThinkThread 提前执行 `read`、`ls`、`write`、`edit`，不修改 Pi 本体，也不替换默认 Linux 后端。在 Linux（macOS 使用 Orb）中安装、启动：
+可选入口 `./thinkthread-extension` 接入 ThinkThread 的 `read`、`ls`、`write`、`edit`；普通源码入口保留默认 provider，不加载可选 SDK。[alpha4](https://gitcode.com/aideveloper/capsule_public) 提供 ARM64/x86_64 Linux RPM；Windows 使用 WSL2，macOS 使用 Orb。先准备 Runtime 和可访问的 Pi、Node，再安装 Profile：
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -219,18 +219,16 @@ cd /path/to/project
 tt pi-speculative-action
 ```
 
-安装脚本支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 使用预构建包，以及重复的 `--model provider/model` 授权。它固定 Agent POSIX SDK 0.1.0，校验 protocol 2 和契约指纹，安装 schema-4 Profile，并把独立运行时放在 `~/.local/share/pi-speculative-action`。环境需要预先提供 Profile 可访问的 Pi、Node、`fd` 和 `rg`。Profile 配置保存在安装目录的 `config` 下，项目 `.pi/speculative-action.json` 仍可覆盖。
+安装器支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 和重复的 `--model provider/model` 授权；校验 SDK 0.1.0、protocol 2 及契约指纹，写入 schema-4 Profile 和 `~/.local/share/pi-speculative-action`。配置位于安装目录的 `config`，项目 `.pi/speculative-action.json` 可覆盖。原生搜索另需 Profile 可访问的 `fd`/`rg`。
 
-Profile 共享已有的执行与观察边界：
+- 投机工具使用原版 Pi，同轮共享 BASE，经封存的 `fs.run` 执行，再由 `fs.verify` / `fs.apply` 检查新鲜度与冲突。Actor 变更回退会在结算和启动后继前使 BASE 失效。
+- Actor 的 `read/ls` 仍由宿主资源观察证明完整执行窗口；snapshot/content 相等不足以排除 A→B→A。此路径不使用 SDK/runner，不维护独立思程结果快照，与投机路径共用 `EffectTransaction`。
 
-- `speculation.execute`：`read`、`ls`、`write`、`edit` 使用 Pi 原生实现，同轮共享 BASE，执行封存的 `fs.run`，再通过 `fs.verify` / 带冲突检查的 `fs.apply` 采纳；八个执行可共享 BASE。Actor 变更回退会在 Runtime 结算、启动后继动作前使 BASE 失效。
-- Actor 的 `read`、`ls` 统一使用宿主既有 resource observation，包括完整执行窗口的稳定性证明。思程 snapshot/content 相等不能证明 Actor 没有读到 A→B→A 的中间状态，因此不再维护第二套思程 Actor 结果快照。这条路径不需要 SDK 或投机 runner；两条路径仍由 `EffectTransaction` 管理采纳状态。
+`fs.run` 继承封存的 Profile 网络策略（默认 `all`），不虚拟时间/随机数，也不提供单次网络收窄。这里只接入固定 stock-tool runner；原生 `grep/find` 的外部配置、预处理器和子进程，以及 Bash，仍须完整进程依赖/效果证明。工作区或 snapshot 内容相等不足以授权这些路线，能力矩阵会阻止无证据的提前执行，保留 Actor。SDK 可协调 Supervisor 持久请求及终态清理，适配器不跨 Pi 进程崩溃保存 request ID。
 
-Profile 会先尝试思程 world，并保留原生 Linux 进程 provider 与 Git 工作区 provider。Bash 不进入可移植 runner，只有当前环境的探测通过后才使用原生进程 world。注册 fallback 不代表外层思程允许嵌套 tracing、helper 或 handoff；公开思程 Runtime 当前只有 aarch64 包，Actor held-exec 实现却限定 x86-64 Linux。缺失的能力回退 Actor，不能保证思程中的完整能力或性能不低于原生路径。普通源码加载仍使用原来的默认 provider，不加载可选 SDK。
+本机 alpha4 x86_64 已通过 `read/ls/edit` 采纳及七项生命周期检查；新文件 `write` 因私有分支的异步 `realpath` 返回 `EACCES` 仍未通过，失败候选被拒绝后 Actor 恰好执行一次。小文件样本未获净加速。TUI 的 Ready 表示连接与路线准备成功，工具资格仍须执行[真实 Runtime 检查](./bench/README.md#thinkthread-真实-runtime-资格)。
 
-`fs.run` 继承 Profile 的固定网络策略（附带配置为 `all`），时间和随机数仍是真实值。该 world 只接收已具备证明的固定 stock-tool runner。原生 `grep/find` 继承外部配置和可执行程序（rg 配置还可指定预处理程序）；工作区快照和当前思程验证均不能证明完整闭包。因此它们声明真实的宿主进程效果，由能力矩阵自动阻止无证据的提前执行和结果复用，Actor 行为保持原样。只有提供实际进程依赖/效果证明的 provider 才能重新启用，不维护配置文件黑名单。Bash 同样需要原生进程证明。工作区验证不等于完整的动态进程依赖证书；不宣称单次网络收窄、时间/随机数虚拟化或严格进程证书等价。Supervisor 持有的请求支持持久恢复和终态记录清理，但适配器不会跨 Pi 进程崩溃持久化 request ID。
-
-固定版本的 Agent POSIX SDK 归档现在既是 lockfile 管理的开发依赖，也是安装器的默认载荷；干净 checkout 只需 `npm ci` 即可检查、测试、构建和打包可选适配器，不依赖兄弟仓，也不再临时改写 manifest。`--agent-posix-package` 仍可显式覆盖为离线包。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
+SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可检查、测试、构建和打包，无需兄弟仓或改写 manifest。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 
 ## 接入 Runtime 沙箱
 
