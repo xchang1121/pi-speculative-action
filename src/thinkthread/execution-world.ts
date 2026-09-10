@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -23,27 +24,30 @@ import {
 	type ExecutionWorldRequest,
 	type WorldBranch,
 	type WorldCommitMetrics,
-	type WorldCompatibilityEvidence,
 } from "../execution-world.ts";
 import { effectCommitFailure } from "../effect-transaction.ts";
+import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { relativeFilesystemPath, slash } from "../path-utils.ts";
-import { resourceDependencies } from "../resource-version.ts";
+import { ResourceReadView, ResourceVersionManager, resourceDependencies, type ResourceVersionToken } from "../resource-version.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
-import type { ToolSettlement } from "../tool-settlement.ts";
+import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
 import { DurableFsExecutor } from "./durable-fs.ts";
 import { createThinkThreadClient } from "./control-transport.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
-import { type SnapshotLease, type ThinkThreadCheckpoint, ThinkThreadSnapshotPool } from "./snapshot-pool.ts";
+import { type SnapshotLease, ThinkThreadSnapshotPool } from "./snapshot-pool.ts";
 import {
-	decodeThinkThreadToolRunnerResponse,
+	decodeThinkThreadToolRunnerRequest, decodeThinkThreadToolRunnerResponse,
 	encodeThinkThreadToolRunnerRequest,
+	encodeThinkThreadToolRunnerResponse,
 	THINKTHREAD_TOOL_NAMES,
 	THINKTHREAD_TOOL_RUNNER_VERSION,
 	type ThinkThreadToolName,
+	type ThinkThreadToolRunnerRequest,
 } from "./tool-runner-protocol.ts";
 
 const WORLD_ID = "ThinkThread";
 const RUNNER_MAX_OUTPUT_BYTES = 512 * 1024;
+const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DIFF_PAGE_LIMIT = 256;
 const CAPABILITIES = [...new Set([...RESOURCE_OBSERVATION_EFFECTS.capabilities, ...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities])];
@@ -68,6 +72,8 @@ export function createThinkThreadExecutionWorld(
 	const runnerPath = options.runnerPath ?? fileURLToPath(new URL("./tool-runner.js", import.meta.url));
 	const nodePath = options.nodePath ?? process.execPath;
 	const autoResizeImages = options.autoResizeImages ?? true;
+	const snapshotInputs = process.platform === "linux" && options.runnerPath === undefined &&
+		options.runnerFingerprint === undefined && options.nodePath === undefined;
 	let prepared: Promise<PreparedWorld> | undefined;
 	let runnerFingerprint: Promise<string> | undefined;
 	const lifetime = new AbortController();
@@ -98,7 +104,7 @@ export function createThinkThreadExecutionWorld(
 			runnerFingerprint = attempt;
 		}
 		return [
-			"thinkthread-fs-run",
+			"thinkthread-fs-v2", snapshotInputs ? "sealed-inputs" : "runner",
 			CONTRACT_FINGERPRINT,
 			THINKTHREAD_TOOL_RUNNER_VERSION,
 			await runnerFingerprint,
@@ -139,11 +145,11 @@ export function createThinkThreadExecutionWorld(
 				await fingerprint();
 				return {
 					state: "ready",
-					detail: `ThinkThread fs.run: ${TOOL_NAMES.join(", ")}; ambient process tools require a complete process proof`,
+					detail: `ThinkThread ${snapshotInputs ? "sealed regular inputs; " : ""}fs.run: ${TOOL_NAMES.join(", ")}; ambient process tools require a complete process proof`,
 				};
 			},
 			execute: (context) => execute(context, (world, input) =>
-			forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages)),
+				forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages, snapshotInputs)),
 		},
 		actorFallbackSettled: async () => {
 			const world = await prepared;
@@ -194,6 +200,7 @@ async function forkThinkThreadWorld(
 	runnerPath: string,
 	nodePath: string,
 	autoResizeImages: boolean,
+	snapshotInputs: boolean,
 ): Promise<WorldBranch<ToolSettlement>> {
 	const setupStarted = performance.now();
 	const tool = toolName(context.toolName);
@@ -203,6 +210,7 @@ async function forkThinkThreadWorld(
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
 		: await world.pool.acquireRoot(context.executionScope ?? { sessionID: context.cwd, turnID: context.callID });
 	let target: SnapshotLease | undefined;
+	let inputs: Awaited<ReturnType<typeof captureSnapshotInputs>>;
 	try {
 		context.signal.throwIfAborted();
 		const request = encodeThinkThreadToolRunnerRequest({
@@ -212,6 +220,17 @@ async function forkThinkThreadWorld(
 			args: context.args,
 			...settings,
 		});
+		if (snapshotInputs && !context.parentCheckpoint && PI_ACTION_SEMANTICS.effect(tool) === "observation" &&
+			dependencies.length && dependencies.every((dependency) => dependency.scope === "content")) {
+			inputs = await captureSnapshotInputs(world, context, source.lease.id, dependencies, decodeThinkThreadToolRunnerRequest(request));
+			context.signal.throwIfAborted();
+			if (inputs) return thinkThreadWorldBranch({
+				output: inputs.output, source: source.lease, lineage: source.lineage, depth: source.depth,
+				resources: context.action.resources, capturedBytes: 0,
+				setupMs: inputs.setupFinishedAt - setupStarted, captureMs: inputs.captureMs, nativeInputs: inputs.version,
+				executionFingerprint: context.action.executionFingerprint, ...world, dependencies,
+			});
+		}
 		const writes: FsRunWrites = PI_ACTION_SEMANTICS.effect(tool) === "observation" ? "deny" : "snapshot";
 		const runParams: FsRunKeyParamsV1 = {
 			snapshotId: source.lease.id,
@@ -241,7 +260,7 @@ async function forkThinkThreadWorld(
 			? await changedResources(world.client, source.lease.id, target.id)
 			: [...context.action.resources];
 		const setupMs = Math.max(0, performance.now() - setupStarted - run.metrics.executeMs - run.metrics.sealMs);
-		return new ThinkThreadWorldBranch({
+		return thinkThreadWorldBranch({
 			output,
 			source: source.lease,
 			target,
@@ -258,8 +277,7 @@ async function forkThinkThreadWorld(
 			dependencies,
 		});
 	} catch (error) {
-		await target?.release().catch(() => undefined);
-		await source.lease.release().catch(() => undefined);
+		await Promise.allSettled([inputs?.version.release(), target?.release(), source.lease.release()]);
 		throw error;
 	}
 }
@@ -279,107 +297,37 @@ interface ThinkThreadBranchInput {
 	readonly durable: DurableFsExecutor;
 	readonly pool: ThinkThreadSnapshotPool;
 	readonly dependencies: readonly FsDependency[];
+	readonly nativeInputs?: ResourceVersionToken;
 }
 
-class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
-	readonly output: ToolSettlement;
-	readonly backend = WORLD_ID;
-	readonly checkpoint: ThinkThreadCheckpoint;
-	readonly resources: readonly string[];
-	readonly capturedBytes: number;
-	readonly executionMetrics: { readonly setupMs: number; readonly captureMs: number };
-	readonly compatibility: WorldCompatibilityEvidence;
-	private readonly source: SnapshotLease;
-	private readonly target?: SnapshotLease;
-	private readonly client: AgentPosixClient;
-	private readonly durable: DurableFsExecutor;
-	private readonly pool: ThinkThreadSnapshotPool;
-	private readonly dependencies: readonly FsDependency[];
-	private metrics?: WorldCommitMetrics;
-	private commitPromise?: Promise<ToolSettlement>;
-	private disposed = false;
-
-	constructor(input: ThinkThreadBranchInput) {
-		this.output = input.output;
-		this.source = input.source;
-		this.target = input.target;
-		this.resources = Object.freeze([...input.resources]);
-		this.capturedBytes = input.capturedBytes;
-		this.executionMetrics = Object.freeze({ setupMs: input.setupMs, captureMs: input.captureMs });
-		this.compatibility = Object.freeze({
-			status: "compatible",
-			backend: WORLD_ID,
-			executionFingerprint: input.executionFingerprint,
-		});
-		this.client = input.client;
-		this.durable = input.durable;
-		this.pool = input.pool;
-		this.dependencies = input.dependencies;
-		this.checkpoint = input.pool.checkpoint(input.target ?? input.source, input.lineage, input.depth + 1);
-	}
-
-	get commitMetrics(): WorldCommitMetrics | undefined {
-		return this.metrics;
-	}
-
-	get validateAndCommit(): WorldBranch<ToolSettlement>["validateAndCommit"] {
-		return this.target ? undefined : this.validateReadCommit;
-	}
-
-	async validate(): Promise<ResourceValidation> {
-		const result = await this.client.fs.verify({
-			snapshotId: this.source.id,
-			dependencies: [...this.dependencies],
-		});
-		const metrics = {
-			durationMs: result.durationMs,
-			bytesRead: result.comparedBytes,
-			filesRead: result.comparedEntries,
-			mode: "exact" as const,
-		};
-		return result.status === "matched"
-			? { status: "valid", metrics }
-			: { status: "stale", cause: cause("freshness", "thinkthread_dependency_changed"), metrics };
-	}
-
-	commit(): Promise<ToolSettlement> {
-		if (this.disposed) return Promise.reject(new Error("ThinkThread branch is disposed"));
-		this.commitPromise ??= this.commitOnce();
-		return this.commitPromise;
-	}
-
-	async dispose(): Promise<void> {
-		if (this.disposed) return;
-		this.disposed = true;
-		await this.commitPromise?.catch(() => undefined);
-		await Promise.allSettled([this.target?.release(), this.source.release()]);
-	}
-
-	private async validateReadCommit(): Promise<ResourceValidation> {
-		if (this.commitPromise) {
-			await this.commitPromise;
-			if (this.disposed) throw new Error("ThinkThread branch is disposed");
-			return this.validate();
-		}
-		if (this.disposed) throw new Error("ThinkThread branch is disposed");
-		let validation: ResourceValidation | undefined;
-		const pending = this.commitOnce((proof) => { validation = proof; });
-		this.commitPromise = pending;
-		try { await pending; }
-		catch (error) {
-			// A failed proof did not commit; later validation may retry an indeterminate observation.
-			if (validation?.status === "valid") throw error;
-			if (this.commitPromise === pending) this.commitPromise = undefined;
-			if (!validation) throw error;
-		}
-		return validation!;
-	}
-
-	private async commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
+function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<ToolSettlement> {
+	const { output, source, target, client, durable, pool, dependencies, nativeInputs } = input;
+	let metrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	let validating: Promise<ResourceValidation> | undefined, disposal: Promise<void> | undefined, disposed = false;
+	const nativeCause = async () => {
+		try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
+		catch (error) { return cause("freshness", "thinkthread_input_authority_changed", error instanceof Error ? error.message : String(error)); }
+		return undefined;
+	};
+	const validateOnce = async (): Promise<ResourceValidation> => {
+		const started = performance.now(), before = await nativeCause();
+		const result = before ? undefined : await client.fs.verify({ snapshotId: source.id, dependencies: [...dependencies] });
+		const changed = before ?? await nativeCause();
+		const metrics = { durationMs: performance.now() - started, bytesRead: result?.comparedBytes ?? 0,
+			filesRead: result?.comparedEntries ?? 0, mode: "exact" as const };
+		return changed || result?.status !== "matched"
+			? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
+			: { status: "valid", metrics };
+	};
+	const validate = (): Promise<ResourceValidation> => {
+		if (disposed) return Promise.reject(new Error("ThinkThread branch is disposed"));
+		return validating ??= validateOnce().finally(() => { validating = undefined; });
+	};
+	async function commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
 		const started = performance.now();
 		try {
-			if (!this.target) {
-				const validation = await this.validate();
+			if (!target) {
+				const validation = await validate();
 				onValidation?.(validation);
 				if (validation.status !== "valid") {
 					throw effectCommitFailure(
@@ -389,7 +337,7 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 						validation.cause,
 					);
 				}
-				this.metrics = {
+				metrics = {
 					durationMs: Math.max(0, performance.now() - started),
 					validationMs: validation.metrics.durationMs,
 					bytesValidated: validation.metrics.bytesRead,
@@ -397,22 +345,22 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 					resourcesCommitted: 0,
 				};
 			} else {
-				const apply = await this.durable.apply({
-					baseSnapshotId: this.source.id,
-					targetSnapshotId: this.target.id,
-					dependencies: [...this.dependencies],
+				const apply = await durable.apply({
+					baseSnapshotId: source.id,
+					targetSnapshotId: target.id,
+					dependencies: [...dependencies],
 					policyId: "safe_content_v1",
 				});
-				this.metrics = {
+				metrics = {
 					durationMs: Math.max(0, performance.now() - started),
 					validationMs: 0,
 					bytesValidated: 0,
-					resourcesValidated: this.dependencies.length,
+					resourcesValidated: dependencies.length,
 					resourcesCommitted: apply.changedPaths,
 				};
-				await this.pool.invalidate();
+				await pool.invalidate();
 			}
-			return this.output;
+			return output;
 		} catch (error) {
 			if (error instanceof ThinkThreadDurableError && error.code === "FsApplyConflict") {
 				throw effectCommitFailure(
@@ -425,6 +373,125 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 			throw error;
 		}
 	}
+	return {
+		output, backend: WORLD_ID, resources: Object.freeze([...input.resources]), capturedBytes: input.capturedBytes,
+		checkpoint: pool.checkpoint(target ?? source, input.lineage, input.depth + 1),
+		executionMetrics: Object.freeze({ setupMs: input.setupMs, captureMs: input.captureMs }),
+		compatibility: Object.freeze({ status: "compatible", backend: WORLD_ID, executionFingerprint: input.executionFingerprint }),
+		get commitMetrics() { return metrics; },
+		validate,
+		validateAndCommit: target ? undefined : async () => {
+			if (commitPromise) {
+				await commitPromise;
+				return validate();
+			}
+			if (disposed) throw new Error("ThinkThread branch is disposed");
+			let validation: ResourceValidation | undefined;
+			const pending = commitOnce((proof) => { validation = proof; });
+			commitPromise = pending;
+			try { await pending; }
+			catch (error) {
+				// A failed proof did not commit; later validation may retry an indeterminate observation.
+				if (validation?.status === "valid") throw error;
+				if (commitPromise === pending) commitPromise = undefined;
+				if (!validation) throw error;
+			}
+			return validation!;
+		},
+		commit: () => disposed ? Promise.reject(new Error("ThinkThread branch is disposed")) : (commitPromise ??= commitOnce()),
+		dispose: () => {
+			disposed = true;
+			return disposal ??= (async () => {
+				await Promise.allSettled([commitPromise, validating]);
+				await Promise.allSettled([target?.release(), source.release(), nativeInputs?.release()]);
+			})();
+		},
+	};
+}
+
+/** Consume immutable regular inputs through the stock operation seam; other shapes retain fs.run. */
+async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeToolExecutionContext,
+	snapshotId: FsSnapshotId, dependencies: readonly FsDependency[], request: ThinkThreadToolRunnerRequest) {
+	if (typeof world.client.fs.snapshotStat !== "function" || typeof world.client.fs.snapshotPread !== "function") return undefined;
+	const files = new Map<string, { path: string; bytes: number }>();
+	let totalBytes = 0;
+	try {
+		for (const resource of context.action.resources) {
+			context.signal.throwIfAborted();
+			const target = path.resolve(context.cwd, resource), relative = relativeFilesystemPath(context.cwd, target);
+			if (!relative) return undefined;
+			const parts = slash(relative).split("/");
+			for (let end = 1; end < parts.length; end++) {
+				const parent = await world.client.fs.snapshotStat({ snapshotId, path: parts.slice(0, end).join("/") });
+				if (!("kind" in parent) || parent.kind !== "directory") return undefined;
+			}
+			const entry = await world.client.fs.snapshotStat({ snapshotId, path: slash(relative) });
+			if (!("kind" in entry) || entry.kind !== "file" || !Number.isSafeInteger(entry.len) || entry.len < 0 ||
+				(totalBytes += entry.len + 2 * Buffer.byteLength(target) + 64) > MAX_INPUT_BYTES) return undefined;
+			files.set(target, { path: slash(relative), bytes: entry.len });
+		}
+	} catch { return undefined; } // Missing entries or unavailable snapshot metadata retain the isolated runner.
+	if (!files.size) return undefined;
+	const manager = new ResourceVersionManager(context.cwd, { watch: false, onIdle: () => manager.close() });
+	const version = await manager.capture([...files.keys()].map((target) => ({ path: target, scope: "stat" })));
+	const loaded = new Set<string>();
+	let view: ResourceReadView | undefined, retained = false;
+	try {
+		for (const target of files.keys()) await assertNoSymlinkPath(context.cwd, target);
+		await assertInputAuthority(version);
+		const matched = await world.client.fs.verify({ snapshotId, dependencies: [...dependencies] });
+		if (matched.status !== "matched") throw new Error("ThinkThread snapshot inputs changed before execution");
+		await assertInputAuthority(version);
+		view = new ResourceReadView(MAX_INPUT_BYTES, async (dependency) => {
+			context.signal.throwIfAborted();
+			const target = path.resolve(dependency.path), file = files.get(target);
+			if (!file || !["content", "stat", "type"].includes(dependency.scope)) throw new Error("ThinkThread input operation is unproven");
+			if (loaded.has(target)) return;
+			view!.reserve(file.bytes);
+			const chunks: Buffer[] = [];
+			let offset = 0;
+			for (;;) {
+				context.signal.throwIfAborted();
+				const result = await world.client.fs.snapshotPread({ snapshotId, path: file.path, offset, length: 65536 });
+				const bytes = Buffer.from(result.dataBase64, "base64");
+				if (result.offset !== offset || result.bytesRead !== bytes.length || bytes.length > 65536 || offset + bytes.length > file.bytes)
+					throw new Error("ThinkThread snapshot input length is unproven");
+				chunks.push(bytes); offset += bytes.length;
+				if (result.eof) break;
+				if (!bytes.length) throw new Error("ThinkThread snapshot input did not advance");
+			}
+			if (offset !== file.bytes) throw new Error("ThinkThread snapshot input is incomplete");
+			view!.capture(target, { type: "file", content: Buffer.concat(chunks, offset), realPath: target });
+			loaded.add(target);
+		});
+		const { resolvePiToolInvocation } = await import("../pi-tool-invocation.ts");
+		const execute = resolvePiToolInvocation(request.tool, request.args, { cwd: context.cwd, environment: {},
+			autoResizeImages: request.autoResizeImages, modelSupportsImages: request.modelSupportsImages })?.filesystem;
+		if (!execute) throw new Error("ThinkThread input execution requires its qualified stock Pi version");
+		const setupFinishedAt = performance.now();
+		let output: ToolSettlement;
+		try { output = await execute(view, { ...request, signal: context.signal }); }
+		catch (error) { output = toolErrorSettlement(error); }
+		const captureStarted = performance.now();
+		context.signal.throwIfAborted(); view.seal();
+		await assertInputAuthority(version);
+		const frame = Buffer.from(encodeThinkThreadToolRunnerResponse(output));
+		if (frame.length > RUNNER_MAX_OUTPUT_BYTES) throw new Error("ThinkThread tool runner output exceeded 512 KiB");
+		context.signal.throwIfAborted();
+		output = decodeThinkThreadToolRunnerResponse(frame);
+		retained = true;
+		return { output, setupFinishedAt, captureMs: performance.now() - captureStarted, version };
+	} finally {
+		await view?.dispose();
+		if (!retained) await version.release();
+	}
+}
+
+/** Snapshot metadata omits ACL/owner authority. Fence current access and all ancestor bindings as well. */
+async function assertInputAuthority(version: ResourceVersionToken): Promise<void> {
+	for (const observation of version.observations.values()) if (observation.scope === "stat") await access(observation.path, constants.R_OK);
+	const validation = await version.manager.seal(version);
+	if (validation.expired) throw new Error(validation.reason ?? "ThinkThread input authority changed");
 }
 
 /** The stock runner may consume only its declared executor contract, including both image options. */

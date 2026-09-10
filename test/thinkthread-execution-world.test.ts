@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
 import {
 	type AgentPosixClient,
 	parseFsPayloadId,
@@ -212,7 +213,7 @@ describe("ThinkThread execution world", () => {
 			"snapshot",
 			{ path: "notes.txt", scope: "content" },
 		],
-	] as const)("maps %s to its exact fs.run and dependency policy", async (tool, args, writes, dependency) => {
+	] as const)("maps %s to sealed inputs or its exact fs.run and dependency policy", async (tool, args, writes, dependency) => {
 		const fixture = fakeClient();
 		const { world, cwd } = await startWorld(fixture);
 		const branch = await world.speculation.execute(context(tool, args, cwd, `${tool}-1`));
@@ -227,6 +228,7 @@ describe("ThinkThread execution world", () => {
 		await branch.dispose();
 		await world.finishTurn("turn");
 		await world.dispose?.();
+		if (tool === "read" && process.platform === "linux") await verifySnapshotInputs();
 	});
 
 	it("rejects a run whose returned key does not match the preflight key", async () => {
@@ -279,11 +281,11 @@ describe("ThinkThread execution world", () => {
 	});
 
 	it("joins read validation and commit without losing direct freshness, retries, or cleanup ownership", async () => {
-		for (const mode of ["direct", "shared", "retry", "dispose"] as const) {
+		for (const mode of ["direct", "shared", "retry", "dispose", "direct-dispose"] as const) {
 			const fixture = fakeClient(), { world, cwd } = await startWorld(fixture);
 			const source = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
 			const coordinator = new EffectTransactionCoordinator<typeof source.output>();
-			const branch = mode === "direct" ? source : await coordinator.execute(coordinator.begin({ tool: "read", route: {
+			const branch = mode === "direct" || mode === "direct-dispose" ? source : await coordinator.execute(coordinator.begin({ tool: "read", route: {
 				isolation: "runtime_sandbox", reuse: "shared_result", scope: "runtime", backend: world.id, fingerprint: "test",
 			} }), async () => source);
 			const verify = fixture.verify.getMockImplementation()!;
@@ -295,15 +297,19 @@ describe("ThinkThread execution world", () => {
 					await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
 					await expect(branch.commit()).rejects.toThrow("requires successful validation");
 				}
-				if (mode === "dispose") {
+				if (mode === "dispose" || mode === "direct-dispose") {
 					let enter!: () => void, release!: () => void;
 					const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
 					fixture.verify.mockImplementationOnce(async () => { enter(); await gate; return verify(); });
 					const validating = branch.validate!(); await entered;
 					const disposal = branch.dispose();
+					const repeated = branch.dispose(); let released = false;
+					void Promise.resolve(repeated).then(() => { released = true; });
 					await world.finishTurn("turn"); expect(fixture.snapshotRemove).not.toHaveBeenCalled();
-					release(); await validating; await disposal;
-					await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" });
+					expect(released).toBe(false);
+					release(); await validating; await disposal; await repeated;
+					if (mode === "direct-dispose") await expect(branch.commit()).rejects.toThrow("disposed");
+					else await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" });
 				} else {
 					await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
 					if (mode !== "direct") {
@@ -385,6 +391,59 @@ describe("ThinkThread execution world", () => {
 		await world.dispose?.();
 	});
 });
+
+async function verifySnapshotInputs() {
+	const directory = await mkdtemp(path.join(process.env.THINKTHREAD_FS ?? process.cwd(), "thinkthread-inputs-"));
+	const cwd = process.env.THINKTHREAD_FS ?? directory, file = path.join(directory, "notes.txt"), relative = path.relative(cwd, file);
+	const bytes = Buffer.from("alpha\nbeta\n");
+	try {
+		for (const mode of ["complete", "malformed", "stale", "changed", "large", "runner", "node", "fingerprint", "cancel"]) {
+			await writeFile(file, bytes);
+			const fixture = fakeClient({ verifyStatus: mode === "stale" ? "stale" : "matched" });
+			let enter!: () => void, release!: () => void;
+			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			const snapshotPread = vi.fn(async ({ offset = 0, length = 65536 }) => {
+				if (mode === "cancel") { enter(); await gate; }
+				if (mode === "changed") await writeFile(file, "changed\n");
+				const content = bytes.subarray(offset, offset + length);
+				return { offset, bytesRead: content.length + (mode === "malformed" ? 1 : 0), dataBase64: content.toString("base64"), eof: true };
+			});
+			Object.assign(fixture.client.fs, { snapshotPread,
+				snapshotStat: vi.fn(async ({ path: name }: { path: string }) => ({ kind: name === relative ? "file" : "directory",
+					len: mode === "large" ? 8 * 1024 * 1024 : bytes.length, mode: 0o644 })),
+			});
+			const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client,
+				...(mode === "runner" ? { runnerPath: "/custom/runner.js" } : mode === "node" ? { nodePath: "/custom/node" } :
+					mode === "fingerprint" ? { runnerFingerprint: "custom" } : {}) });
+			const controller = new AbortController(), input = { ...context("read", { path: relative }, cwd, "read"), signal: controller.signal };
+			const supplied = vi.fn(async () => { throw new Error("supplied host function must not execute"); });
+			input.action = { ...input.action, executionContext: { ...(input.action.executionContext as object), filesystem: supplied } };
+			let branch: Awaited<ReturnType<typeof world.speculation.execute>> | undefined;
+			try {
+				const executing = world.speculation.execute(input);
+				if (mode === "cancel") {
+					const rejected = expect(executing).rejects.toThrow(); await entered;
+					controller.abort(); let disposed = false;
+					const disposal = world.dispose!().then(() => { disposed = true; });
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					expect(disposed).toBe(false); expect(fixture.snapshotRemove).not.toHaveBeenCalled();
+					release(); await rejected; await disposal;
+				} else if (["malformed", "stale", "changed"].includes(mode)) await expect(executing).rejects.toThrow();
+				else {
+					branch = await executing;
+					if (mode === "complete") {
+						const expected = { result: await createReadTool(cwd).execute("read", { path: relative }), isError: false };
+						const first = branch.validate!(), second = branch.validate!(); expect(first).toBe(second); await first;
+						await expect(branch.commit()).resolves.toEqual(expected);
+					} else expect(snapshotPread).not.toHaveBeenCalled();
+				}
+				expect(supplied).not.toHaveBeenCalled();
+				expect(fixture.run).toHaveBeenCalledTimes(["large", "runner", "node", "fingerprint"].includes(mode) ? 1 : 0);
+			} finally { release(); await branch?.dispose(); await world.dispose!(); }
+			expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
+		}
+	} finally { await rm(directory, { recursive: true, force: true }); }
+}
 
 function context(toolName: string, args: unknown, cwd: string, callID: string, settings: Partial<PiToolInvocationOptions> = {}) {
 	const invocation = ["read", "ls", "write", "edit"].includes(toolName)

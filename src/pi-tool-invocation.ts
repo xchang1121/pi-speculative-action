@@ -9,6 +9,9 @@ import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion } from "./resource-version.ts";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
+import process from "node:process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { Worker } from "node:worker_threads";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
@@ -83,7 +86,9 @@ export function resolvePiToolInvocation(
 				});
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
-				const result = await definitions.get(tool)!.execute(request.callID, request.args as never, request.signal, undefined, context);
+				// Stock cancellation can reject before its internal operation and image worker finish.
+				const result = await settleFilesystemOperation<ToolSettlement["result"]>(() =>
+					definitions.get(tool)!.execute(request.callID, request.args as never, undefined, undefined, context), request.signal);
 				return { result, isError: false };
 			},
 		};
@@ -115,6 +120,29 @@ export function resolvePiToolInvocation(
 			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}),
 		},
 	};
+}
+
+const filesystemWorkers = new AsyncLocalStorage<Promise<void>[]>();
+let filesystemExecutions = 0;
+const ownFilesystemWorker = (worker: Worker) => {
+	filesystemWorkers.getStore()?.push(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
+};
+
+/** Only the qualified stock filesystem contract runs here; unrelated Actor workers keep their owner. */
+async function settleFilesystemOperation<Result>(operation: () => Promise<Result>, signal?: AbortSignal): Promise<Result> {
+	signal?.throwIfAborted();
+	const workers: Promise<void>[] = [];
+	if (filesystemExecutions++ === 0) process.on("worker", ownFilesystemWorker);
+	let result: Result;
+	try { result = await filesystemWorkers.run(workers, operation); }
+	finally {
+		// Node queues its worker-created event on nextTick, even if the tool already resolved.
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		while (workers.length) await Promise.all(workers.splice(0));
+		if (--filesystemExecutions === 0) process.off("worker", ownFilesystemWorker);
+	}
+	signal?.throwIfAborted();
+	return result;
 }
 
 /** Bind captured-input searches without installing anything or reading workspace inputs. */
