@@ -286,8 +286,6 @@ export function createSpeculativeActionHost(
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
-	const sources = [patternPlans.source, drafterPlans.source,
-		...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])];
 	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string) => {
 		const resolved = await options.resolveInvocation?.(tool, input);
 		const invocation = resolved && Object.freeze({ ...resolved,
@@ -314,12 +312,17 @@ export function createSpeculativeActionHost(
 		AgentStateData
 	>({
 		actionSemantics,
-		sources,
+		sources: [patternPlans.source, drafterPlans.source, ...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
 		stateData: (input) => ({
 			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
+			prepareExecution: (names, signal) => {
+				if (signal.aborted) return;
+				void Promise.all(names.filter((name) => input.tools.some((tool) => tool.name === name))
+					.map((tool) => resolveExecutionRoute(tool, signal))).catch(() => {});
+			},
 			schemaHashes: definitionSchemaHashes(
 				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
 			),
@@ -379,7 +382,7 @@ export function createSpeculativeActionHost(
 		},
 		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
 		projectionRules,
-		onTurnStarted: async ({ startInput, decisionSequence, settings, signal }) => {
+		onTurnStarted: async ({ startInput, decisionSequence, settings }) => {
 			try {
 				await options.onTurnStarted?.({
 					turnID: startInput.turnID,
@@ -389,10 +392,6 @@ export function createSpeculativeActionHost(
 				});
 			} catch {
 				// Optional inference integration cannot prevent source launch or Actor execution.
-			}
-			if (sources.some((source) => source.enabled(settings))) {
-				void Promise.all(settings.tools.filter((name) => startInput.tools.some((tool) => tool.name === name))
-					.map((tool) => resolveExecutionRoute(tool, signal))).catch(() => {});
 			}
 			patternPlans.turnStarted(startInput, settings);
 		},

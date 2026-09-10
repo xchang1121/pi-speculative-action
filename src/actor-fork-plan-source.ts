@@ -50,6 +50,8 @@ interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
 	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
 	readonly controller: AbortController;
+	/** A request can start before Runtime binds its preparation callback. */
+	preparation?: true | (() => void);
 	generatedText: string;
 	content: string;
 	reasoning: string;
@@ -77,7 +79,13 @@ export class ActorForkPlanSource {
 		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
-		propose: async ({ startInput, candidateNames, signal }) => {
+		propose: async ({ startInput, data, candidateNames, signal }) => {
+			const pending = this.pending.get(startInput.turnID);
+			if (pending && !pending.settled && !pending.controller.signal.aborted) {
+				const prepare = () => data.prepareExecution?.(candidateNames, signal);
+				if (pending.preparation === true) prepare();
+				else pending.preparation = prepare;
+			}
 			const batches = await this.waitForBatches(startInput.turnID, signal);
 			const allowed = new Set(candidateNames);
 			return batches
@@ -171,6 +179,16 @@ export class ActorForkPlanSource {
 
 	probeSignal(turnID: string): AbortSignal | undefined {
 		return this.pending.get(turnID)?.controller.signal;
+	}
+
+	/** Warm only after the coordinator admits an actual sidecar request. */
+	startProbe(turnID: string): AbortSignal | undefined {
+		const pending = this.pending.get(turnID);
+		if (pending && !pending.settled && !pending.controller.signal.aborted) {
+			if (typeof pending.preparation === "function") pending.preparation();
+			pending.preparation = true;
+		}
+		return pending?.controller.signal;
 	}
 
 	finishActorStream(turnID: string): void {

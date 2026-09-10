@@ -37,6 +37,8 @@ export interface AgentConsumeInput {
 export interface AgentStateData {
 	readonly tools: ReadonlyMap<string, AgentTool>;
 	readonly schemaHashes: Readonly<Record<string, string>>;
+	/** Best-effort preparation when a prediction request is ready to start. */
+	readonly prepareExecution?: (tools: readonly string[], signal: AbortSignal) => void;
 }
 
 export type AgentPlanSource = SpeculativePlanSource<

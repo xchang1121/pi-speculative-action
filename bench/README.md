@@ -135,7 +135,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
 
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立关闭投机的耗时不能代入分子。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮先分别求和分子、分母，再相除。
+主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；独立 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。

@@ -552,7 +552,7 @@ export class SelfSpeculationCoordinator {
 		}
 		this.forks++;
 		state.forkStartedAt ??= performance.now();
-		const signal = this.actorForkPlanSource.probeSignal(state.turnID);
+		const signal = this.actorForkPlanSource.startProbe(state.turnID);
 		const task = this.post(
 			settings.forkPath,
 			{

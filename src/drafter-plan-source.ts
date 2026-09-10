@@ -154,6 +154,7 @@ export function createDrafterPlanSource(input: {
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
 			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
+			if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, signal);
 			const request = { ...prepared, options: draftOptions };
 			const message = await completeDraft(request, signal);
 			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");

@@ -116,8 +116,9 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
-	it("charges late Drafter continuations to the original rolling observation", async () => {
+	it("prepares active requests and charges late Drafter continuations to their original observation", async () => {
 		let now = 0;
+		const prepareExecution = vi.fn();
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		const tool = createReadTool(await temporaryWorkspace());
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => {
@@ -125,7 +126,7 @@ describe("speculative action host", () => {
 			return drafterCall({ path: "notes.txt" });
 		} });
 		const request = { startInput: { ...startInput(tool), sessionID: "session" },
-			data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution },
 			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
 			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
 		const proposal = await controller.source.propose(request);
@@ -137,8 +138,38 @@ describe("speculative action host", () => {
 			tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
 			feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" });
 		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -200 });
+		expect(prepareExecution).toHaveBeenCalledOnce();
+		for (let turn = 2; turn <= 5; turn++) {
+			const turnID = `turn-${turn}`;
+			const next = await controller.source.propose({ ...request, startInput: { ...request.startInput, turnID } });
+			expect(Boolean(next)).toBe(turn < 5);
+			expect(prepareExecution).toHaveBeenCalledTimes(Math.min(turn, 4));
+			controller.finishTurn("session", turnID);
+			await Promise.resolve();
+		}
+		expect(controller.snapshot().skippedBatches).toBe(1);
 		controller.finishSession();
 		expect(controller.snapshot().samples).toBe(0);
+		const fork = createActorForkPlanSource();
+		for (const phase of ["request-first", "runtime-first", "skipped", "aborted", "settled", "finished"]) {
+			const prepareExecution = vi.fn(), signal = new AbortController();
+			fork.startTurn(phase);
+			if (phase === "settled" || phase === "finished") {
+				fork.startProbe(phase);
+				if (phase === "settled") fork.publish(phase, []);
+				else fork.finishActorStream(phase);
+			}
+			if (phase === "request-first") fork.startProbe(phase);
+			const proposal = fork.source.propose({ ...request, startInput: { ...request.startInput, turnID: phase },
+				data: { ...request.data, prepareExecution }, signal: signal.signal });
+			expect(prepareExecution).toHaveBeenCalledTimes(phase === "request-first" ? 1 : 0);
+			if (phase === "aborted") signal.abort();
+			if (phase !== "skipped") { fork.startProbe(phase); fork.startProbe(phase); }
+			expect(prepareExecution).toHaveBeenCalledTimes(phase.endsWith("first") ? 1 : 0);
+			fork.publish(phase, []);
+			await proposal;
+			fork.closeTurn(phase);
+		}
 	});
 
 	it("prepares raw predictions and previews once and adopts their keyed execution for every Pi tool", async () => {
@@ -198,7 +229,7 @@ describe("speculative action host", () => {
 					await host.finishTurn(`${turnID}:without-tool`, true);
 					expect(prepareWorld).not.toHaveBeenCalled();
 					await host.startTurn({ ...startInput(tool, turnID), tools: resourceExecution ? [tool, writer] : [tool] });
-					expect(prepareWorld.mock.calls.length > 0).toBe(predictions);
+					expect(prepareWorld).not.toHaveBeenCalled();
 					if (origin === "preview") for (let repeat = 0; repeat < 2; repeat++) {
 						await host.previewActorCall({ turnID, id: `actor-${toolName}`, tool: toolName, args: proposal, tools: [tool] });
 					}
@@ -571,8 +602,8 @@ describe("speculative action host", () => {
 		try {
 			await host.startTurn({ ...startInput(grepTool, call.turnID),
 				context: { systemPrompt: "system", messages: [], tools }, tools });
-			expect(fingerprint).toHaveBeenCalled();
-			if (origin === "drafter") await ready.promise;
+			expect(fingerprint).not.toHaveBeenCalled();
+			if (origin === "drafter") { await ready.promise; expect(fingerprint).toHaveBeenCalled(); }
 			else expect(materialized).toHaveLength(0);
 			const adopted = await host.consume(call);
 			if (origin === "drafter") expect(adopted).toBeDefined();
@@ -689,9 +720,11 @@ describe("speculative action host", () => {
 		const triggerFork = async (turnID: string) => {
 			prepare.mockClear();
 			await host.startTurn(startInput(tool, turnID));
-			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
+			expect(prepare).not.toHaveBeenCalled();
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput({ type: "text_delta", contentIndex: 0, delta: "x", partial: undefined as never });
+			if (actionSourceEnabled) await waitFor(() => prepare.mock.calls.length > 0);
+			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
 		};
 		const finishTurn = async (turnID: string) => {
 			await host.finishTurn(turnID);
@@ -792,6 +825,7 @@ describe("speculative action host", () => {
 		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
 		const complete = vi.fn(async () => drafterCall({ path: "notes.txt" }));
 		const tool = createReadTool(cwd);
+		const world = toolRuntimeWorld(), prepare = vi.fn(async () => {});
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
@@ -804,6 +838,7 @@ describe("speculative action host", () => {
 				return {};
 			},
 			complete,
+			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
 			preflight: () => true,
 			onEvent: (event) => { if (event.type === "source_request") settled.resolve(); },
 		});
@@ -822,6 +857,7 @@ describe("speculative action host", () => {
 				release.resolve(); await closing;
 			}
 			expect(complete).not.toHaveBeenCalled();
+			expect(prepare).not.toHaveBeenCalled();
 		} finally { release.resolve(); await closing; await host.dispose(); }
 	});
 
