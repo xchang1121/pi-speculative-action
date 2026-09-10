@@ -1021,20 +1021,25 @@ async function prepareSandboxWorkspaceFor(
 	throwIfAborted(options.signal);
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
+	throwIfAborted(options.signal);
 	const repository = await acquireSandboxRepository(state, sourceRoot, options.gitBinary ?? "git");
 	try {
+		throwIfAborted(options.signal);
 		const concreteOptions =
 			options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" as const } : options;
 		const resolved = await resolveWorkspaceDriver(state, concreteOptions, sourceRoot, repository);
+		throwIfAborted(options.signal);
+		const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT, options.signal);
+		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
-			const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
 			const baseline = await acquireOverlayBaseline(repository, commit);
 			try {
+				throwIfAborted(options.signal);
 				await overlayBaselineStructure(baseline);
 			} finally {
 				releaseOverlayBaseline(baseline);
 			}
-		} else await ensurePreparedSandbox(repository);
+		} else await ensurePreparedSandbox(repository, commit, options.signal);
 		throwIfAborted(options.signal);
 	} finally {
 		releaseSandboxRepository(repository);
@@ -1351,8 +1356,10 @@ async function createSandboxRepository(
 async function acquireSandboxBaseline(
 	repository: PooledGitRepository,
 	authorEnvironment: Readonly<Record<string, string>>,
+	signal?: AbortSignal,
 ): Promise<string> {
 	return withRepositoryLock(repository, async () => {
+		throwIfAborted(signal);
 		if (repository.commit && repository.version) {
 			const [current, indexed] = await Promise.all([
 				repository.versions.validate(repository.version),
@@ -1361,9 +1368,11 @@ async function acquireSandboxBaseline(
 			if (!current.expired && indexed.length === 0) return repository.commit;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
+			throwIfAborted(signal);
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			let retained = false;
 			try {
+				throwIfAborted(signal);
 				const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
 				const indexed = repository.commit ? await sandboxIndexChanges(repository) : [];
 				const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
@@ -1380,6 +1389,7 @@ async function acquireSandboxBaseline(
 					await repository.index(["read-tree", "--empty"]);
 					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				}
+				throwIfAborted(signal);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				if (repository.commit) {
 					const previousTree = (await repository.git(["show", "-s", "--format=%T", repository.commit])).toString("utf8").trim();
@@ -1395,6 +1405,7 @@ async function acquireSandboxBaseline(
 					{ environment: authorEnvironment },
 				)).toString("utf8").trim();
 				if ((await repository.versions.validate(version)).expired) continue;
+				throwIfAborted(signal);
 				await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				repository.commit = commit;
 				replaceSandboxVersion(repository, version);
@@ -1458,11 +1469,11 @@ function batchPathspecs(pathspecs: readonly string[]): string[][] {
 	return batches;
 }
 
-async function ensurePreparedSandbox(repository: PooledGitRepository): Promise<void> {
-	const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
+async function ensurePreparedSandbox(repository: PooledGitRepository, commit: string, signal?: AbortSignal): Promise<void> {
 	const existing = repository.prepared;
 	if (existing) {
 		const prepared = await existing;
+		throwIfAborted(signal);
 		if (prepared.commit === commit) return;
 		if (repository.prepared === existing) repository.prepared = undefined;
 		await discardPreparedSandbox(repository, prepared);
@@ -1471,6 +1482,7 @@ async function ensurePreparedSandbox(repository: PooledGitRepository): Promise<v
 		await repository.prepared;
 		return;
 	}
+	throwIfAborted(signal);
 	const pending = attachSandboxWorkspace(repository, commit);
 	repository.prepared = pending;
 	try {

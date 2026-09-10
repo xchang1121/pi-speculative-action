@@ -17,6 +17,7 @@ import {
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
+import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import {
@@ -32,7 +33,7 @@ let sandbox: WorkspaceSandboxService;
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
-	return { ...fs, mkdir: vi.fn(fs.mkdir), writeFile: vi.fn(fs.writeFile) };
+	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), writeFile: vi.fn(fs.writeFile) };
 });
 
 afterEach(async () => {
@@ -40,6 +41,47 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
+	it("stops cancelled preparation between stages without cancelling a concurrent owner", async () => {
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
+			const root = await temporaryRoot("cancel-prepare"), controller = new AbortController();
+			let entered!: () => void, release!: () => void, workspaces = 0, captures = 0;
+			const started = new Promise<void>((resolve) => { entered = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			const capture = ResourceVersionManager.prototype.capture;
+			const observer = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementation(async function (this: ResourceVersionManager, ...args) {
+				captures++;
+				const token = await capture.apply(this, args);
+				if (phase === "baseline") { entered(); await gate; }
+				return token;
+			});
+			vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
+				const directory = await fs.mkdtemp(prefix, options);
+				if (String(prefix).endsWith(`${path.sep}action-`)) workspaces++;
+				if (phase === "repository" && String(prefix).includes("pi-speculative-action-pool-")) { entered(); await gate; }
+				return directory;
+			});
+			const pending = sandbox.prepare(root, { driver: "git", signal: controller.signal });
+			try {
+				await Promise.race([started, pending.then(() => { throw new Error("Preparation did not reach the held stage"); })]);
+				const other = owner === "none" ? Promise.resolve() : sandbox.prepare(root,
+					{ driver: "git", ...(owner === "cancelled" ? { signal: controller.signal } : {}) });
+				controller.abort(new Error("owner closed")); release();
+				const [cancelled, live] = await Promise.allSettled([pending, other]);
+				expect(cancelled).toMatchObject({ status: "rejected", reason: { message: "owner closed" } });
+				expect(live.status).toBe(owner === "cancelled" ? "rejected" : "fulfilled");
+				expect(workspaces).toBe(Number(owner === "active"));
+				expect(captures).toBe(Number(phase === "baseline") + Number(owner === "active"));
+				const branch = await sandbox.createExecutionWorld({ driver: "git" }).speculation.execute(
+					context(root, "write", writeTool, { path: "value.txt", content: "live owner\n" }));
+				await branch.commit(); await branch.dispose();
+				expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("live owner\n");
+			} finally {
+				release(); await pending.catch(() => undefined); observer.mockRestore(); vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp);
+				await sandbox.closePools([root]); await rm(root, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("keeps pool and lock ownership inside an explicit service lifecycle", async () => {
 		const root = await temporaryRoot("service-lifecycle");
 		const first = new WorkspaceSandboxService();

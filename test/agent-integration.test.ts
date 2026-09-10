@@ -204,7 +204,7 @@ describe("speculative action host", () => {
 				const sandbox = resourceExecution
 					? createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [toolName], maxBytes: () => 1024 * 1024 })
 					: toolRuntimeWorld();
-				const prepareWorld = vi.fn(async () => {});
+				const prepareWorld = vi.fn(async (_input: { signal?: AbortSignal }) => {});
 				let predictions = origin === "prediction";
 				const host = createSpeculativeActionHost(`session-${turnID}`, {
 					cwd,
@@ -292,6 +292,7 @@ describe("speculative action host", () => {
 						}
 					}
 					await host.finishTurn(turnID, true);
+					if (origin === "prediction") expect(prepareWorld.mock.calls[0]![0].signal?.aborted).toBe(true);
 					predictions = false; prepareWorld.mockClear();
 					await host.startTurn(startInput(tool, `${turnID}:without-predictions`));
 					await host.finishTurn(`${turnID}:without-predictions`, true);

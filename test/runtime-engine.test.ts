@@ -650,10 +650,13 @@ describe("structural speculative runtime", () => {
 				expect(aborted, mode).toEqual([]);
 				winner.arrive();
 				await ready.promise;
-				expect(aborted, mode).toEqual([2]);
+				expect(aborted, mode).toContain(2);
+				expect(aborted, mode).not.toContain(1);
+				if (mode === "late") expect(aborted).toContain(0);
 				binding.arrive();
 				expect(await fixture.runtime.consume(call("turn"))).toBe("speculative");
 				await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
+				expect([...aborted].sort()).toEqual([0, 1, 2]);
 				expect(materialized, mode).toEqual(["README.md"]);
 				expect(key).toHaveBeenCalledTimes(mode === "empty" ? 2 : 3);
 				expect(fixture.executions()).toBe(1);

@@ -5,7 +5,7 @@ import { runSourceRequest, SourceGeneration } from "../src/source-request.ts";
 const request = { source: "source", turnID: "turn", index: 0, kind: "proposal", targetDecisionSequence: 1 } as const;
 
 describe("source request ownership", () => {
-	it("classifies independent production/count outcomes and detaches successful requests", async () => {
+	it("classifies independent outcomes while keeping producer work within its generation", async () => {
 		for (const [value, count, status, code] of [
 			[["a"], 1, "produced", undefined], [[], 0, "empty", undefined], [["a"], NaN, "empty", undefined],
 			[0, 0, "error", "producer_error"], [["a"], new Error("malformed"), "error", "result_error"],
@@ -17,8 +17,10 @@ describe("source request ownership", () => {
 			});
 			expect(settled.settlement).toMatchObject({ status, ...(code ? { cause: { stage: "source", code } } : {}) });
 			expect(Object.isFrozen(settled.request) && Object.isFrozen(settled.settlement)).toBe(true);
-			generation.expire(cause("control", "turn_finished"));
 			expect(producerSignal?.aborted).toBe(false);
+			generation.expire(cause("control", "turn_finished"));
+			expect(producerSignal?.aborted).toBe(true);
+			expect(producerSignal?.reason).toEqual(generation.expiration);
 		}
 	});
 

@@ -232,7 +232,7 @@ SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可�
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展按 Runtime、Linux 进程和 Git fallback 注册执行层级；`createExecutionWorlds` 扩展层级，Host 也接受显式 `executionWorlds`。World 声明效果保证与工具作用域。Drafter/sidecar 请求通过门控与准备后，才为已注册且配置选中的工具预热；跳过请求不预热。完整 Actor 意图仍可提前准备，但在让出事件处理后须确认对应正式调用尚未到达。
+Pi 扩展依次注册 Runtime、Linux 进程和 Git fallback；`createExecutionWorlds` 与 Host 的 `executionWorlds` 可扩展层级。World 声明效果保证和工具作用域。仅已准入的 Drafter/sidecar 请求预热已注册的选中工具；模型返回后仍响应所属请求与回合的取消，Git 在阶段边界停止。完整 Actor 意图可提前准备，但让出事件处理后须确认正式调用尚未到达。
 
 ```ts
 const workspace = new WorkspaceSandboxService();

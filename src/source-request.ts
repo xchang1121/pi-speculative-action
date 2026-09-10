@@ -64,58 +64,54 @@ export async function runSourceRequest<Value>(input: {
 	}
 
 	const controller = new AbortController();
-	const abortFromGeneration = () => controller.abort(input.generation.expiration);
-	input.generation.signal.addEventListener("abort", abortFromGeneration, { once: true });
+	// Produced proposals can leave preparation in flight until their generation closes.
+	const signal = AbortSignal.any([input.generation.signal, controller.signal]);
 	const producer = Promise.resolve()
 		.then(() => {
-			controller.signal.throwIfAborted();
-			return input.produce(controller.signal);
+			signal.throwIfAborted();
+			return input.produce(signal);
 		})
 		.then(
 			(value) => ({ kind: "produced" as const, value }),
 			(error) => ({ kind: "error" as const, error }),
 		);
 
-	try {
-		const waited = await waitForCandidate(producer, input.generation.signal, finiteTimeout(input.timeoutMs));
-		if (waited.status === "deadline") {
-			const expiration = cause("source", "timeout");
-			controller.abort(expiration);
-			return result(input.request, startedAt, { status: "timeout", cause: expiration });
-		}
-		if (waited.status === "aborted" || !input.generation.active) {
-			return result(input.request, startedAt, {
-				status: "aborted",
-				cause: cause("source", input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail),
-			});
-		}
-		const outcome = waited.value;
-		if (outcome.kind === "error") {
-			return result(input.request, startedAt, {
-				status: "error",
-				cause: cause("source", "producer_error", errorDetail(outcome.error)),
-			});
-		}
-		let proposalCount: number;
-		try {
-			proposalCount = finiteCount(input.count(outcome.value));
-		} catch (error) {
-			return result(input.request, startedAt, {
-				status: "error",
-				cause: cause("source", "result_error", errorDetail(error)),
-			});
-		}
-		return {
-			...result(
-				input.request,
-				startedAt,
-				proposalCount > 0 ? { status: "produced", proposalCount } : { status: "empty" },
-			),
-			value: outcome.value,
-		};
-	} finally {
-		input.generation.signal.removeEventListener("abort", abortFromGeneration);
+	const waited = await waitForCandidate(producer, input.generation.signal, finiteTimeout(input.timeoutMs));
+	if (waited.status === "deadline") {
+		const expiration = cause("source", "timeout");
+		controller.abort(expiration);
+		return result(input.request, startedAt, { status: "timeout", cause: expiration });
 	}
+	if (waited.status === "aborted" || !input.generation.active) {
+		return result(input.request, startedAt, {
+			status: "aborted",
+			cause: cause("source", input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail),
+		});
+	}
+	const outcome = waited.value;
+	if (outcome.kind === "error") {
+		return result(input.request, startedAt, {
+			status: "error",
+			cause: cause("source", "producer_error", errorDetail(outcome.error)),
+		});
+	}
+	let proposalCount: number;
+	try {
+		proposalCount = finiteCount(input.count(outcome.value));
+	} catch (error) {
+		return result(input.request, startedAt, {
+			status: "error",
+			cause: cause("source", "result_error", errorDetail(error)),
+		});
+	}
+	return {
+		...result(
+			input.request,
+			startedAt,
+			proposalCount > 0 ? { status: "produced", proposalCount } : { status: "empty" },
+		),
+		value: outcome.value,
+	};
 }
 
 function result(
