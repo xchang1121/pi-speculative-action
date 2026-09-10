@@ -74,6 +74,8 @@ export interface SandboxDirectoryState {
 
 export interface SandboxDirectoryChange extends SandboxChangeTarget {
 	readonly kind: "directory";
+	/** Preserve native creation policy; private directory permissions are not Actor metadata. */
+	readonly operation?: "mkdir";
 	readonly before?: SandboxDirectoryState;
 	readonly after?: SandboxDirectoryState;
 }
@@ -888,9 +890,9 @@ async function commitSandboxExecution(
 							applied.push(change);
 						} else if (!change.before) {
 							await createParentDirectories(change.root, change.target, createdDirectories);
-							await mkdir(change.target, { mode: change.after.mode });
+							await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
 							applied.push(change);
-							if (process.platform !== "win32") await chmod(change.target, change.after.mode);
+							if (!change.operation && process.platform !== "win32") await chmod(change.target, change.after.mode);
 						} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
 							await chmod(change.target, change.after.mode);
 							applied.push(change);
@@ -922,7 +924,7 @@ async function commitSandboxExecution(
 				}
 				for (const change of changes) {
 					if (change.validationOnly || change.kind !== "directory" || !change.after) continue;
-					if (!sameDirectoryState(await readSandboxDirectoryState(change.target), change.after)) {
+					if (!(await sameDirectoryAfter(change.target, change))) {
 						throw new Error(`directory changed while committing: ${change.resource}`);
 					}
 				}
@@ -1086,21 +1088,23 @@ async function executeMutation(
 				const previous = changes.get(key);
 				if (previous && previous.kind !== "directory") throw new Error("Workspace directory input changed type");
 				if (!previous) record(key, { ...targetRecord(target), kind: "directory", before,
-					...(before ? { validationOnly: true } : {}) });
+					...(before ? { validationOnly: true } : { operation: "mkdir" }) });
 				return { file, before, key };
 			};
 			let output: ToolSettlement;
 			try {
 				output = await execute({
 					readFile: (target, limit) => track(async () => {
-						const { before } = await fileInput(target);
+						const { before, captured } = await fileInput(target);
 						if (!before) throw new Error("Workspace input does not exist");
+						assertExistingInputPolicy(captured);
 						return Buffer.from(before.content.subarray(0, limit));
 					}),
 					access: (target, writable) => track(async () => {
 						const entry = (await lstat(await physical(target))).isDirectory() ? directoryInput : fileInput;
 						const { file, key } = await entry(target);
 						const mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0), captured = changes.get(key)!;
+						assertExistingInputPolicy(captured);
 						await access(file, mode);
 						if (captured.before !== undefined) record(key, { ...captured, accessMode: (captured.accessMode ?? 0) | mode });
 					}),
@@ -1780,8 +1784,8 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 				if (!change.after) await rmdir(target);
 				else if (!change.before) {
 					await createParentDirectories(workspace.sandboxRoot, target);
-					await mkdir(target, { mode: change.after.mode });
-					if (process.platform !== "win32") await chmod(target, change.after.mode);
+					await mkdir(target, change.operation ? undefined : { mode: change.after.mode });
+					if (!change.operation && process.platform !== "win32") await chmod(target, change.after.mode);
 				} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
 					await chmod(target, change.after.mode);
 				}
@@ -1794,7 +1798,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 		for (const change of ancestor.changes) {
 			if (change.validationOnly || change.kind !== "directory") continue;
 			const target = path.resolve(workspace.sandboxRoot, change.resource);
-			if (!sameDirectoryState(await readSandboxDirectoryState(target), change.after)) {
+			if (!(await sameDirectoryAfter(target, change))) {
 				throw new Error(`execution checkpoint directory mismatch: ${change.resource}`);
 			}
 		}
@@ -2094,6 +2098,9 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 	if (!containsFilesystemPath(root, target) || (target === root && !change.validationOnly) || target !== path.resolve(root, change.resource)) {
 		throw new Error(`sandbox commit path escapes workspace: ${change.resource}`);
 	}
+	if (change.kind === "directory" && change.operation && (change.before || !change.after)) {
+		throw new Error("Native directory creation requires an absent baseline and a sealed result");
+	}
 	await assertNoSymlinkPath(root, target);
 }
 
@@ -2156,6 +2163,16 @@ function sameSandboxBaseline(
 			? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
 }
 
+async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange): Promise<boolean> {
+	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
+	return change.operation ? (await lstat(target)).isDirectory() : sameDirectoryState(await readSandboxDirectoryState(target), change.after);
+}
+
+function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
+	// Default ACLs and other inherited creation policy are not observable through this binding.
+	if (!change.validationOnly && change.before === undefined) throw new Error("Created input permissions require authoritative execution");
+}
+
 function sameOptionalState(left: RegularFileState | undefined, right: RegularFileState | undefined): boolean {
 	if (!left || !right) return left === right;
 	if (Buffer.compare(left.content, right.content) !== 0) return false;
@@ -2177,7 +2194,8 @@ function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): Sandbox
 		}
 		if (
 			filesystemPathKey(previous.root) !== filesystemPathKey(change.root) ||
-			(previous.kind === "directory") !== (change.kind === "directory") || previous.validationOnly !== change.validationOnly
+			(previous.kind === "directory") !== (change.kind === "directory") || previous.validationOnly !== change.validationOnly ||
+			previous.operation !== change.operation
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
@@ -2191,7 +2209,6 @@ function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): Sandbox
 		const previousFile = previous as SandboxFileChange;
 		const changeFile = change as SandboxFileChange;
 		if (
-			previousFile.operation !== changeFile.operation ||
 			!sameOptionalBytes(previousFile.before, changeFile.before) ||
 			(previousFile.beforeMode !== undefined &&
 				changeFile.beforeMode !== undefined &&

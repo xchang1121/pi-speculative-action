@@ -341,13 +341,15 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("materializes an empty-directory checkpoint before a child file delta", async () => {
+	it("preserves native directory creation and rejects unproven self-observation", async () => {
 		const root = await temporaryRoot("directory-lineage");
 		const directory = path.join(root, "generated", "nested");
+		const mask = process.umask();
 		try {
+			process.umask(0o022);
 			const world = sandbox.createExecutionWorld();
 			const parent = await world.speculation.execute(boundContext(root, async (view) => {
-				await view.mkdir!(directory); await view.access(directory, true); return settlement("directory");
+				await view.mkdir!(directory); return settlement("directory");
 			}));
 			const child = await world.speculation.execute({
 				...context(root, "write", writeTool, { path: "generated/nested/value.txt", content: "child\n" }),
@@ -357,11 +359,25 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(parent.resources).toEqual(["generated", "generated/nested"]);
 			expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
 			await expect(stat(directory)).rejects.toThrow();
+			process.umask(0o077);
+			const native = path.join(root, "native", "nested"); await mkdir(native, { recursive: true });
 			await parent.commit();
 			expect((await stat(directory)).isDirectory()).toBe(true);
+			expect((await stat(directory)).mode).toBe((await stat(native)).mode);
 			await child.commit();
 			expect(await readFile(path.join(directory, "value.txt"), "utf8")).toBe("child\n");
+			for (const operation of ["read", "file-access", "directory-access"]) {
+				const created = path.join(root, operation);
+				await expect(world.speculation.execute(boundContext(root, async (view) => {
+					if (operation === "directory-access") await view.mkdir!(created);
+					else await view.writeFile!(created, "private\n");
+					await (operation === "read" ? view.readFile(created) : view.access(created, true)).catch(() => undefined);
+					return settlement("unproven permissions");
+				}))).rejects.toThrow("Created input permissions require authoritative execution");
+				await expect(stat(created)).rejects.toThrow();
+			}
 		} finally {
+			process.umask(mask);
 			await rm(root, { recursive: true, force: true });
 		}
 	});
