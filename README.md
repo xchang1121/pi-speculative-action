@@ -1,8 +1,8 @@
 # Pi 投机执行
 
-这个独立 package 在不修改 Pi 本体的前提下加入投机工具执行。Drafter 与 PatternAware 预测未来工具调用；只有存在可证明安全的隔离路线时才提前执行；Actor 发出等价动作后可以采纳对应结果。
+Pi 独立插件通过 Drafter、Actor probe 与 PatternAware 预测工具调用；具备安全隔离能力才提前执行，Actor 发出等价动作后采纳结果。
 
-本仓库刻意与 Pi monorepo 解耦：它拥有独立的 Git 历史、构建配置、测试和依赖锁。Pi package 以 peer 形式声明；路径身份惰性调用已安装 Pi 的路径解析器（当前并非公共 export），布局不兼容时放弃缓存；不导入 Pi 源码工作树、不使用 workspace 路径别名，也不要求存在对应的 `main` 分支。
+仓库独立维护 Git 历史、构建、测试和依赖锁，Pi package 作为 peer 依赖。路径身份惰性使用已安装 Pi 的路径解析器（尚非公共 export），布局不兼容时放弃缓存；不依赖 Pi 源码树、workspace 别名或特定 `main` 分支。
 
 ## 架构
 
@@ -20,7 +20,7 @@ Runtime 分为四个相互独立的层次：
 | 1 | 已安装的统一执行环境 | 宿主注入的 Runtime 全局世界；探测通过且能够覆盖当前工具时优先 |
 | 2 | 本地 `runtime_sandbox` | 合格的 Linux/WSL 进程世界；独立于统一环境开关 |
 | 2 | `resource_snapshot` | 观察 Actor 结果，或让显式绑定的原版 `read`、`ls` 操作读取封存输入；不授权提前执行任意 host function |
-| 2 | `workspace_branch` | `write`、`edit` 的本地后备，在私有 Git worktree 中执行并进行冲突检查后提交 |
+| 2 | `workspace_branch` | 显式文件操作绑定的本地后备；私有工作区封存输入与效果，同锁验证后提交；默认接入 `write`、`edit` |
 | 3 | Actor 回退 | 没有安全路线时完全不发起投机工具执行 |
 
 在 Linux 与 WSL 2 中，默认扩展会注册一个轻量进程世界。它先使用与变更工具相同的私有工作区原语，再用 Sandlock 的 Landlock/seccomp 策略与虚拟文件系统限制进程。当前实现刻意不创建 user、PID 或 mount namespace，因此命令保留 Actor 的原生身份。任何内核能力、binary 或策略探测失败都会移除这条路线；Windows、macOS、WSL 1 或依赖不完整的 Linux 仍走 Pi 的普通 Actor 执行，不会静默降低隔离强度。

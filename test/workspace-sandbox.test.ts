@@ -1,19 +1,20 @@
 import { execFile } from "node:child_process";
-import { chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createEditTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import { buildPiActionKey } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, buildPiActionKey } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import {
 	effectCapabilitiesCover,
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
-import type { ToolSettlement } from "../src/tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
@@ -31,7 +32,7 @@ let sandbox: WorkspaceSandboxService;
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
-	return { ...fs, mkdir: vi.fn(fs.mkdir) };
+	return { ...fs, mkdir: vi.fn(fs.mkdir), writeFile: vi.fn(fs.writeFile) };
 });
 
 afterEach(async () => {
@@ -126,7 +127,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				const first = branch.commit();
 				expect(branch.commit()).toBe(first);
 				await first;
-				expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
+				expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: initial === undefined ? 2 : 1 });
 				expect(await readFile(target)).toEqual(expectedBytes);
 			}
 			expect(forbidden.execute).not.toHaveBeenCalled();
@@ -264,21 +265,52 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("rejects adoption after the Actor changes the same file", async () => {
+	it("validates consumed inputs and written outputs together without rewriting reads", async () => {
 		const root = await temporaryRoot("conflict");
-		const target = path.join(root, "value.txt");
+		const input = path.join(root, "input.txt"), target = path.join(root, "output.txt");
+		const directory = path.join(root, "readable"); await mkdir(directory);
+		await writeFile(path.join(directory, "keep"), "");
+		const world = sandbox.createExecutionWorld();
 		try {
-			await writeFile(target, "base\n", "utf8");
-			const args = { path: "value.txt", edits: [{ oldText: "base", newText: "speculative" }] };
-			const branch = await sandbox.createExecutionWorld().speculation.execute(context(root, "edit", editTool, args));
-			await writeFile(target, "actor\n", "utf8");
-
-			const failed = branch.commit();
-			expect(branch.commit()).toBe(failed);
-			await expect(failed).rejects.toThrow("resource changed before commit: value.txt");
-			expect(branch.commitMetrics).toBeUndefined();
-			expect(await readFile(target, "utf8")).toBe("actor\n");
+			for (const changed of [undefined, input, target, "permission", "directory-permission"]) {
+				await writeFile(input, "base\n"); await writeFile(target, "before\n");
+				const before = await stat(input, { bigint: true });
+				const branch = await world.speculation.execute(boundContext(root, async (view) => {
+					await view.access(input, true);
+					await view.access(directory);
+					const bytes = await view.readFile(input);
+					await view.writeFile!(target, bytes.toString());
+					return settlement((await view.readFile(target)).toString());
+				}));
+				expect(branch.resources).toEqual(["output.txt"]);
+				expect(await readFile(target, "utf8")).toBe("before\n");
+				if (changed === "permission") await chmod(input, 0o444);
+				else if (changed === "directory-permission") await chmod(directory, 0);
+				else if (changed) await writeFile(changed, "actor\n");
+				const permissionChange = changed === "permission" || changed === "directory-permission";
+				const permissionDenied = permissionChange && !(await access(changed === "permission" ? input : directory,
+					changed === "permission" ? fsConstants.R_OK | fsConstants.W_OK : fsConstants.R_OK).then(() => true, () => false));
+				const commit = branch.commit();
+				expect(branch.commit()).toBe(commit);
+				if (changed && (!permissionChange || permissionDenied)) {
+					if (permissionDenied) await expect(commit).rejects.toThrow();
+					else await expect(commit).rejects.toThrow(`resource changed before commit: ${path.basename(changed)}`);
+					expect(branch.commitMetrics).toBeUndefined();
+					expect(await readFile(target, "utf8")).toBe(changed === target ? "actor\n" : "before\n");
+				} else {
+					await expect(commit).resolves.toEqual(settlement("base\n"));
+					expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1, resourcesValidated: 3 });
+					const after = await stat(input, { bigint: true });
+					expect([after.ino, after.mtimeNs]).toEqual([before.ino, before.mtimeNs]);
+					if (!changed) expect(after.ctimeNs).toBe(before.ctimeNs);
+					expect(await readFile(target, "utf8")).toBe("base\n");
+				}
+				await branch.dispose();
+				await chmod(input, 0o666); await chmod(directory, 0o755);
+			}
 		} finally {
+			await chmod(input, 0o666).catch(() => undefined);
+			await chmod(directory, 0o755).catch(() => undefined);
 			await rm(root, { recursive: true, force: true });
 		}
 	});
@@ -311,32 +343,18 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("materializes an empty-directory checkpoint before a child file delta", async () => {
 		const root = await temporaryRoot("directory-lineage");
-		const directory = path.join(root, "generated");
+		const directory = path.join(root, "generated", "nested");
 		try {
-			const parent = await sandbox.fork({
-				cwd: root,
-				action: requiredAction("write", { path: "generated", content: "" }, root),
-				execute: async (workspace) => {
-					await mkdir(path.join(workspace.sandboxRoot, "generated"));
-					return settlement("directory");
-				},
-				afterCapture: async (workspace) => {
-					const after = await readSandboxDirectoryState(path.join(workspace.sandboxRoot, "generated"));
-					if (!after) throw new Error("directory state missing");
-					return [{ kind: "directory", root, target: directory, resource: "generated", after }];
-				},
-			});
-			const child = await sandbox.fork({
-				cwd: root,
-				action: requiredAction("write", { path: "generated/value.txt", content: "child\n" }, root),
+			const world = sandbox.createExecutionWorld();
+			const parent = await world.speculation.execute(boundContext(root, async (view) => {
+				await view.mkdir!(directory); await view.access(directory, true); return settlement("directory");
+			}));
+			const child = await world.speculation.execute({
+				...context(root, "write", writeTool, { path: "generated/nested/value.txt", content: "child\n" }),
 				parentCheckpoint: parent.checkpoint,
-				execute: async (workspace) => {
-					await writeFile(path.join(workspace.sandboxRoot, "generated", "value.txt"), "child\n");
-					return settlement("child");
-				},
 			});
 
-			expect(parent.resources).toEqual(["generated"]);
+			expect(parent.resources).toEqual(["generated", "generated/nested"]);
 			expect(child.checkpoint?.lineage).toBe(parent.checkpoint?.lineage);
 			await expect(stat(directory)).rejects.toThrow();
 			await parent.commit();
@@ -688,17 +706,55 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("fails a cancelled warm-up before allocating a private workspace", async () => {
+	it("drains admitted file requests and refuses cancelled or swallowed failures", async () => {
 		const root = await temporaryRoot("cancelled");
-		const controller = new AbortController();
-		controller.abort(new Error("cancelled"));
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		const target = path.join(root, "held.txt"), world = sandbox.createExecutionWorld();
 		try {
+			const controller = new AbortController(); controller.abort(new Error("cancelled"));
 			await expect(sandbox.prepare(root, { signal: controller.signal })).rejects.toThrow("cancelled");
+			for (const cancelled of [false, true]) {
+				await fs.writeFile(target, "before");
+				let enter!: () => void, unblock!: () => void;
+				const entered = new Promise<void>((resolve) => { enter = resolve; }), release = new Promise<void>((resolve) => { unblock = resolve; });
+				const abort = new AbortController();
+				let outlet: Parameters<NonNullable<ToolInvocation["filesystem"]>>[0];
+				vi.mocked(writeFile).mockImplementation(async (file, data, options) => {
+					if (String(file).endsWith("held.txt") && String(file) !== target) { enter(); await release; }
+					return fs.writeFile(file, data, options);
+				});
+				let settled = false;
+				const pending = world.speculation.execute({ ...boundContext(root, async (view) => {
+					outlet = view; void view.writeFile!(target, "after"); return settlement("done");
+				}), signal: abort.signal }).finally(() => { settled = true; });
+				await Promise.race([entered, pending.then(() => { throw new Error("File request did not reach the held write"); })]);
+				try { expect(settled).toBe(false); if (cancelled) abort.abort(new Error("cancelled")); }
+				finally { unblock(); }
+				if (cancelled) await expect(pending).rejects.toThrow("cancelled");
+				else { const branch = await pending; await branch.commit(); await branch.dispose(); }
+				await expect(outlet!.writeFile!(target, "late")).rejects.toThrow("execution lifetime is closed");
+				expect(await readFile(target, "utf8")).toBe(cancelled ? "before" : "after");
+				vi.mocked(writeFile).mockImplementation(fs.writeFile);
+			}
+			await expect(world.speculation.execute(boundContext(root, async (view) => {
+				await view.readFile(path.join(root, "absent")).catch(() => undefined); return settlement("ignored failure");
+			}))).rejects.toThrow("Workspace input does not exist");
 		} finally {
+			vi.mocked(writeFile).mockImplementation(fs.writeFile);
 			await rm(root, { recursive: true, force: true });
 		}
 	});
 });
+
+const boundSemantics = new ActionSemanticsRegistry([{ tool: "transform", epoch: "test-operation", effect: "workspace_mutation",
+	requirements: WORKSPACE_PATH_MUTATION_EFFECTS, canonicalize: () => ({ input: {}, resources: [] }) }]);
+function boundContext(root: string, filesystem: NonNullable<ToolInvocation["filesystem"]>) {
+	const action = boundSemantics.buildKey("transform", {}, root, "test-schema", {
+		fingerprint: "test-operation", context: { executor: "test-operation", filesystem },
+	});
+	if (!action) throw new Error("bound action is missing");
+	return { cwd: root, tool: writeTool, toolName: "transform", args: {}, action, callID: "bound", signal: new AbortController().signal };
+}
 
 function context<Schema extends (typeof writeTool)["parameters"] | (typeof editTool)["parameters"]>(
 	root: string,
