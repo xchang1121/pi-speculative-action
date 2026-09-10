@@ -221,7 +221,7 @@ tt pi-speculative-action
 
 安装器支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 和重复的 `--model provider/model` 授权；校验 SDK 0.1.0、protocol 2 及契约指纹，写入 schema-4 Profile 和 `~/.local/share/pi-speculative-action`。配置位于安装目录的 `config`，项目 `.pi/speculative-action.json` 可覆盖。原生搜索另需 Profile 可访问的 `fd`/`rg`。
 
-- 投机工具使用原版 Pi，同轮共享 BASE。共享观察首次采纳合并 `fs.verify` 与只读后端提交，后续使用仍逐次验新；写入保留 `fs.apply` 原子冲突检查。Actor 变更回退在结算和启动后继前使 BASE 失效。
+- runner 直接加载已验收 Pi 0.84.1 的原版工具模块，避免加载完整 Agent 入口；该内部入口不是稳定公共 API，版本变化拒绝 runner 并保留 Actor。投机同轮共享 BASE；共享观察首次采纳合并 `fs.verify` 与只读提交，后续逐次验新，写入保留 `fs.apply` 冲突检查。Actor 变更结算前使 BASE 失效。
 - Actor 的 `read/ls` 仍由宿主资源观察证明完整执行窗口；snapshot/content 相等不足以排除 A→B→A。此路径不使用 SDK/runner，不维护独立思程结果快照，与投机路径共用 `EffectTransaction`。
 
 `fs.run` 继承封存的 Profile 网络策略（默认 `all`），不虚拟时间/随机数，也不提供单次网络收窄。这里只接入固定 stock-tool runner；原生 `grep/find` 的外部配置、预处理器和子进程，以及 Bash，仍须完整进程依赖/效果证明。工作区或 snapshot 内容相等不足以授权这些路线，能力矩阵会阻止无证据的提前执行，保留 Actor。SDK 可协调 Supervisor 持久请求及终态清理，适配器不跨 Pi 进程崩溃保存 request ID。

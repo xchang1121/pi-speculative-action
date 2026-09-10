@@ -92,6 +92,8 @@ npm run bench:thinkthread-tools
 
 创建夹具前通过 SDK `selfView/fs.stat` 确认 Runtime，环境变量不足为证。对照 Actor、原生 fallback 和生产 Gateway 的 `fs.run/validate/commit`：同 cwd/path 的完整输出、文件内容/模式须相同，采纳前工作区不变。原生工具仅在 Actor 授权后运行，不能替代失败的首选路线；准备、执行、采纳分别计单样本，poisoned 夹具保留且不再写入。
 
+生产 runner 直接加载已验收 Pi 0.84.1 的原版工具模块，其他版本拒绝隔离执行。首次共享采纳只验新一次，直接 commit 与后续消费者仍各自验新。
+
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
 ## 录制与模型消融

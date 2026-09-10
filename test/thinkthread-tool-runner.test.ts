@@ -1,14 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as filesystem from "node:fs/promises";
 import { formatThrownValue } from "@earendil-works/pi-ai";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
 import { qualifyStockTool, STOCK_TOOL_CASES } from "../bench/stock-tool-qualification.ts";
+import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
 	decodeThinkThreadToolRunnerRequest, decodeThinkThreadToolRunnerResponse,
 	encodeThinkThreadToolRunnerRequest, encodeThinkThreadToolRunnerResponse, THINKTHREAD_TOOL_RUNNER_VERSION,
 } from "../src/thinkthread/tool-runner-protocol.ts";
 
+vi.mock("node:fs/promises", { spy: true });
+
 describe("ThinkThread stock Pi tool runner", () => {
-	it("round-trips an integrity-checked request and response frame", () => {
+	it("round-trips integrity-checked frames and rejects unqualified Pi modules", async () => {
 		const request = {
 			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: "read" as const,
 			callID: "call-read", args: { path: "notes.txt" }, autoResizeImages: true,
@@ -27,6 +31,9 @@ describe("ThinkThread stock Pi tool runner", () => {
 			const result = decodeThinkThreadToolRunnerResponse(Buffer.from(encodeThinkThreadToolRunnerResponse(toolErrorSettlement(error))));
 			expect(result).toEqual({ result: { content: [{ type: "text", text: formatThrownValue(error) }], details: {} }, isError: true });
 		}
+		const version = vi.spyOn(filesystem, "readFile").mockResolvedValueOnce('{"version":"0.84.2"}');
+		try { await expect(runThinkThreadTool(request)).rejects.toThrow("Requalify the installed Pi tool modules"); }
+		finally { version.mockRestore(); }
 	});
 
 	it.each(STOCK_TOOL_CASES)("matches stock Pi %s and its applicable fallback (local runner, not Runtime)", async (name, args) => {

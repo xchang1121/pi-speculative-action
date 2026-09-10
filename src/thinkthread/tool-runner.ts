@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-import { createPiToolDefinitions } from "../pi-tool-invocation.ts";
+import { readFile } from "node:fs/promises";
 import { buildPiActionKey } from "../action-semantics.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
@@ -18,8 +18,11 @@ export async function runThinkThreadTool(
 	const action = buildPiActionKey(request.tool, request.args, cwd);
 	if (!action) throw new Error("Runner cannot prove the stock tool path identity");
 	for (const resource of action.resources) await assertNoSymlinkPath(cwd, path.resolve(cwd, resource));
-	const tool = createPiToolDefinitions(cwd, { read: { autoResizeImages: request.autoResizeImages } }).get(request.tool);
-	if (!tool) throw new Error(`ThinkThread tool runner does not support ${request.tool}`);
+	const pi = import.meta.resolve("@earendil-works/pi-coding-agent");
+	if (JSON.parse(await readFile(new URL("../package.json", pi), "utf8")).version !== "0.84.1")
+		throw new Error("Requalify the installed Pi tool modules before isolated execution");
+	const { createToolDefinition } = await import(new URL("./core/tools/index.js", pi).href);
+	const tool = createToolDefinition(request.tool, cwd, { read: { autoResizeImages: request.autoResizeImages } });
 	try {
 		const result = await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never);
 		return { result, isError: false };
