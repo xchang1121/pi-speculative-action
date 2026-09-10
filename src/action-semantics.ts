@@ -10,7 +10,7 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
-import { immutableSnapshot, stableStringify } from "./stable-json.ts";
+import { immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
@@ -158,23 +158,22 @@ export class ActionSemanticsRegistry {
 		const { fingerprint, context, semantics } = execution ?? {};
 		const definition = semantics ? normalizeDefinition(semantics) : this.definition(tool);
 		if (!definition) return undefined;
-		let canonical: CanonicalAction | undefined;
 		try {
-			canonical = definition.canonicalize(input, cwd);
+			const canonical = definition.canonicalize(input, cwd);
+			if (!canonical || !canonical.resources.every((resource) => typeof resource === "string")) return undefined;
+			return buildActionKey({
+				tool,
+				resources: canonical.resources,
+				input: canonical.input,
+				schemaHash,
+				semanticsEpoch: definition.epoch,
+				executionFingerprint: fingerprint,
+				executionContext: context,
+				semantics: semantics ? definition : undefined,
+			});
 		} catch {
 			return undefined;
 		}
-		if (!canonical || !canonical.resources.every((resource) => typeof resource === "string")) return undefined;
-		return buildActionKey({
-			tool,
-			resources: canonical.resources,
-			input: canonical.input,
-			schemaHash,
-			semanticsEpoch: definition.epoch,
-			executionFingerprint: fingerprint,
-			executionContext: context,
-			semantics: semantics ? definition : undefined,
-		});
 	}
 }
 
@@ -302,6 +301,7 @@ export function buildActionKey(input: {
 	const semantics = input.semantics ? normalizeDefinition(input.semantics) : undefined;
 	if (semantics && (semantics.tool !== input.tool || semantics.epoch !== semanticsEpoch)) throw new Error("action contract identity mismatch");
 	const canonicalInput = immutableSnapshot(input.input);
+	if (!isImmutableSnapshot(canonicalInput)) throw new Error("Action input has no immutable data identity");
 	const key = stableStringify({
 		tool: input.tool,
 		semanticsEpoch,
@@ -494,7 +494,7 @@ function canonicalGrep(input: unknown, cwd: string): CanonicalAction | undefined
 		input: {
 			pattern: record.pattern,
 			path: root,
-			glob: typeof record.glob === "string" ? record.glob : undefined,
+			...(typeof record.glob === "string" ? { glob: record.glob } : {}),
 			ignoreCase: record.ignoreCase === true,
 			literal: record.literal === true,
 			context: normalizeNonNegativeInteger(record.context, 0),
@@ -539,7 +539,7 @@ function canonicalBash(input: unknown, cwd: string): CanonicalAction | undefined
 		input: {
 			command: record.command,
 			cwd: normalizedCwd,
-			timeout: finiteOrUndefined(record.timeout),
+			...(finiteOrUndefined(record.timeout) !== undefined ? { timeout: record.timeout } : {}),
 		},
 	};
 }

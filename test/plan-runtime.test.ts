@@ -93,17 +93,20 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "keyed")?.actionKey).toBe(key);
 		expect(plan.get("plan", "keyed")?.action.input).toEqual({ path: "keyed.ts" });
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
-		const invalid = new PlanRuntime();
-		if (kind === "delta") invalid.apply(proposal([action("retained")]), 0);
-		const uncloneable = action("uncloneable", { horizon: 1, input: { callback: () => undefined } });
-		const future = kind === "proposal" ? proposal([action("now"), uncloneable])
-			: { proposalID: "plan", source: "source", revision: 2, upsert: [uncloneable], remove: ["retained"] };
-		expect(invalid.apply(future, 0)).toEqual({ accepted: false, reason: "invalid_action" });
-		const immediate = PlanRuntime.capture(future, false);
-		if (!("update" in immediate)) throw new Error(immediate.reason);
-		expect(invalid.apply(immediate.update, 0)).toMatchObject({
-			accepted: true, plan: { actions: kind === "proposal" ? [{ id: "now" }] : [] },
-		});
+		const child = { value: 0 };
+		for (const input of [{ callback: () => undefined }, { value: new Date(0) }, { value: new Map() }, { value: new Set() }, { left: child, right: child }]) {
+			const invalid = new PlanRuntime();
+			if (kind === "delta") invalid.apply(proposal([action("retained")]), 0);
+			const uncloneable = action("uncloneable", { horizon: 1, input });
+			const future = kind === "proposal" ? proposal([action("now"), uncloneable])
+				: { proposalID: "plan", source: "source", revision: 2, upsert: [uncloneable], remove: ["retained"] };
+			expect(invalid.apply(future, 0)).toEqual({ accepted: false, reason: "invalid_action" });
+			const immediate = PlanRuntime.capture(future, false);
+			if (!("update" in immediate)) throw new Error(immediate.reason);
+			expect(invalid.apply(immediate.update, 0)).toMatchObject({
+				accepted: true, plan: { actions: kind === "proposal" ? [{ id: "now" }] : [] },
+			});
+		}
 	});
 
 	it("keeps an execution-blocked node matchable without making it launchable", () => {

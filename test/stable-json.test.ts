@@ -1,8 +1,22 @@
 import { describe, expect, test } from "vitest";
-import { stableEqual, stableStringify } from "../src/stable-json.ts";
+import { immutableSnapshot, isImmutableSnapshot, stableEqual, stableStringify } from "../src/stable-json.ts";
 
 describe("stable JSON values", () => {
-	test("preserves canonical object and integer-index key order", () => {
+	test("owns immutable data and preserves canonical object and integer-index key order", () => {
+		const child = { values: [1, null, true, "data"] }, caller = Object.freeze({ left: child, right: child });
+		const owned = immutableSnapshot(caller);
+		expect(isImmutableSnapshot(caller)).toBe(false);
+		expect(owned).not.toBe(caller);
+		expect(owned.left).toBe(owned.right);
+		child.values.push(2);
+		expect(owned.left.values).toEqual([1, null, true, "data"]);
+		expect(() => owned.left.values.push(3)).toThrow();
+		expect(isImmutableSnapshot(owned)).toBe(false);
+		const tree = immutableSnapshot({ left: child, right: { values: [] } }), next = immutableSnapshot(tree);
+		expect(isImmutableSnapshot(tree)).toBe(true);
+		expect(next).toEqual(tree);
+		expect(next).not.toBe(tree);
+		expect(next.left).not.toBe(tree.left);
 		const first = { zebra: 1, "10": "ten", alpha: { right: 2, left: 1 }, "2": "two", "01": "named" };
 		const second = { "01": "named", "2": "two", alpha: { left: 1, right: 2 }, "10": "ten", zebra: 1 };
 
@@ -26,6 +40,15 @@ describe("stable JSON values", () => {
 		);
 		expect(stableEqual({ omitted: undefined, kept: sparse }, { kept: Array(6).fill(null) })).toBe(true);
 		expect(stableEqual(sparse, [null, null, null, null, null, 1])).toBe(false);
+		const cycle: Record<string, unknown> = {}; cycle.self = cycle;
+		for (const value of [new Date(0), new Map([["value", 0]]), new Set([0]), cycle, -0, NaN, Infinity,
+			{ omitted: undefined }, [undefined], Array(1), Object.assign([0], { extra: 1 })]) {
+			expect(isImmutableSnapshot(immutableSnapshot({ value }))).toBe(false);
+		}
+		const opaque = immutableSnapshot({ date: new Date(0), map: new Map([["value", 0]]), set: new Set([0]) });
+		opaque.date.setTime(1); opaque.map.set("value", 1); opaque.set.add(1);
+		expect([opaque.date.getTime(), opaque.map.get("value"), opaque.set.size]).toEqual([1, 1, 2]);
+		expect(isImmutableSnapshot(opaque)).toBe(false);
 	});
 
 	test("ignores custom toJSON while retaining enumerable data", () => {

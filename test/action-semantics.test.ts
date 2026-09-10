@@ -205,7 +205,14 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.buildKey("unknown", {}, "/workspace")).toBeUndefined();
 	});
 
-	it("fails closed when canonicalization rejects, throws, or returns malformed resources", () => {
+	it("fails closed when canonicalization rejects, throws, or returns unkeyable data", () => {
+		const cycle: Record<string, unknown> = {}; cycle.self = cycle;
+		const child = { value: 0 };
+		for (const value of [new Date(0), new Map([["value", 0]]), new Set([0]), cycle, -0, NaN, { omitted: undefined }, { left: child, right: child }]) {
+			const input = { value }, contract = resourceDefinition("opaque", "opaque.v1", () => ({ input, resources: [] }));
+			expect(() => buildActionKey({ tool: "opaque", input, resources: [] })).toThrow("immutable data identity");
+			expect(new ActionSemanticsRegistry([contract]).buildKey("opaque", {}, "/workspace")).toBeUndefined();
+		}
 		const registry = new ActionSemanticsRegistry([
 			resourceDefinition("reject", "reject.v1", () => undefined),
 			resourceDefinition("throw", "throw.v1", () => {

@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { immutableSnapshot } from "./stable-json.ts";
+import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type {
@@ -703,6 +703,7 @@ function validateActions(
 	try {
 		for (const source of result) {
 			source.input = immutableSnapshot(source.input);
+			if (!isImmutableSnapshot(source.input)) return { ok: false, reason: "invalid_action" };
 			Object.freeze(source);
 		}
 	} catch {

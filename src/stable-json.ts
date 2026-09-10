@@ -12,14 +12,29 @@ export function stableEqual(left: unknown, right: unknown): boolean {
 	return equalObject(left, right);
 }
 
-/** Own a structured value before exposing its immutable identity to another lifecycle. */
+const immutableSnapshots = new WeakSet<object>();
+
+/** Only owned, lossless data trees can carry an immutable execution identity. */
+export function isImmutableSnapshot(value: unknown): boolean {
+	return isObject(value) ? immutableSnapshots.has(value) : value === undefined || value === null ||
+		typeof value === "string" || typeof value === "boolean" ||
+		(typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0));
+}
+
+/** Each invocation owns its structured values, including already sealed data. */
 export function immutableSnapshot<Value>(value: Value): Value {
 	const owned = structuredClone(value), seen = new WeakSet<object>();
-	const freeze = (item: unknown): void => {
-		if (!isObject(item) || seen.has(item)) return;
+	const freeze = (item: unknown): boolean => {
+		if (!isObject(item)) return isImmutableSnapshot(item);
+		if (seen.has(item)) return false;
 		seen.add(item);
-		for (const child of Object.values(item)) freeze(child);
+		const array = Array.isArray(item), keys = Object.keys(item);
+		let immutable = Object.getPrototypeOf(item) === (array ? Array.prototype : Object.prototype);
+		if (array && (keys.length !== item.length || keys.some((key) => !isArrayIndex(key)))) immutable = false;
+		for (const child of Object.values(item)) if (!freeze(child) || child === undefined) immutable = false;
 		Object.freeze(item);
+		if (immutable) immutableSnapshots.add(item);
+		return immutable;
 	};
 	freeze(owned);
 	return owned;

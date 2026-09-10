@@ -46,7 +46,7 @@ import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } f
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { nonNegativeInteger, positiveInteger } from "./setting-input.ts";
-import { immutableSnapshot } from "./stable-json.ts";
+import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
@@ -295,7 +295,8 @@ export function createSpeculativeActionHost(
 			...(resolved.identity !== undefined ? { identity: immutableSnapshot(resolved.identity) } : {}),
 			...(resolved.process ? { process: immutableSnapshot(resolved.process) } : {}),
 		});
-		const action = schemaHash === undefined ? undefined : actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
+		const action = schemaHash === undefined || ![input, invocation?.identity, invocation?.process].every(isImmutableSnapshot)
+			? undefined : actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
 			? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
 		return { ...(invocation ? { invocation } : {}), ...(action ? { action } : {}) };
 	};

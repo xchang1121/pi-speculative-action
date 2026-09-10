@@ -8,7 +8,7 @@ import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-wo
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
@@ -383,7 +383,8 @@ describe("speculative action host", () => {
 
 	it("binds one Actor operation through matching, fallback and settlement", async () => {
 		const cwd = await temporaryWorkspace();
-		for (const mode of ["keyed", "unkeyable", "outside-turn", "binding-error"]) {
+		for (const mode of ["keyed", "presealed", "unkeyable", "outside-turn", "binding-error"]) {
+			const keyed = mode === "keyed" || mode === "presealed";
 			let profile = "initial", boundKey: unknown;
 			const metadata = { command: "npm test", cwd, shell: process.execPath, commandTransport: "argv" as const,
 				environment: { PROFILE: "initial" }, shellArgs: ["--initial"] };
@@ -408,25 +409,83 @@ describe("speculative action host", () => {
 			});
 			try {
 				if (mode !== "outside-turn") await host.startTurn(startInput(tool));
+				const mutableArgs = mode === "unkeyable" ? {} : { command: "npm test" };
 				const call = { ...(mode !== "outside-turn" ? { turnID: "turn-1" } : {}), id: "actor-bash", tool: "bash",
-					args: mode === "unkeyable" ? {} : { command: "npm test" }, tools: mode === "outside-turn" ? [] : [tool] };
+					args: mode === "presealed" ? PI_ACTION_SEMANTICS.buildKey("bash", mutableArgs, cwd)!.input : mutableArgs,
+					tools: mode === "outside-turn" ? [] : [tool] };
 				const admitted = structuredClone(call.args);
 				const pending = host.execute(call, undefined, async (operation) => {
 					metadata.environment.PROFILE = "reconfigured"; metadata.shellArgs.push("--later"); metadata.command = "later";
 					expect(operation.input).toEqual(admitted);
+					expect(operation.input).not.toBe(call.args);
 					expect(operation.invocation).toEqual({ executor: "initial", identity: descriptor, process: descriptor });
-					expect(operation.action?.executionContext).toEqual(mode === "keyed" ? operation.invocation : undefined);
-					expect(operation.action?.input.command).toBe(mode === "keyed" ? "npm test" : undefined);
+					expect(operation.action?.executionContext).toEqual(keyed ? operation.invocation : undefined);
+					expect(operation.action?.input.command).toBe(keyed ? "npm test" : undefined);
 					boundKey = operation.action;
 					return actor();
 				});
 				const outcome = mode === "binding-error" ? expect(pending).rejects.toBe(problem) : expect(pending).resolves.toHaveProperty("content.0.text", "built");
-				await bindingStarted.promise; profile = "next"; call.args.command = "changed during binding"; releaseBinding.resolve();
+				await bindingStarted.promise; profile = "next"; mutableArgs.command = "changed during binding";
+				releaseBinding.resolve();
 				await outcome;
 				await host.finishTurn("turn-1", true);
 				expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledTimes(mode === "binding-error" ? 0 : 1);
-				if (mode === "keyed") { expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey); }
+				if (keyed) { expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey); }
 			} finally { releaseBinding.resolve(); await host.dispose(); }
+		}
+	});
+
+	it("uses one Actor fallback for opaque inputs and bindings while retaining exact plain-data reuse", async () => {
+		const cwd = await temporaryWorkspace();
+		const actionSemantics = new ActionSemanticsRegistry([{ ...PI_ACTION_SEMANTICS.definition("read")!, tool: "inspect",
+			canonicalize: (input) => ({ input: input as Record<string, unknown>, resources: [] }) }]);
+		const shapes: Array<[string, (value: number) => unknown, (value: unknown) => number]> = [
+			["Date", (value) => new Date(value), (value) => (value as Date).getTime()],
+			["Map", (value) => new Map([["value", value]]), (value) => (value as Map<string, number>).get("value")!],
+			["Set", (value) => new Set([value]), (value) => [...value as Set<number>][0]!],
+			["undefined field", (value) => value ? {} : { present: undefined }, (value) => Object.hasOwn(value as object, "present") ? 0 : 1],
+			["signed zero", (value) => value ? 0 : -0, (value) => Object.is(value, -0) ? 0 : 1],
+			["nonfinite", (value) => value ? null : NaN, (value) => value === null ? 1 : 0],
+			["sparse", (value) => value ? [null] : Array(1), (value) => 0 in (value as unknown[]) ? 1 : 0],
+			["array property", (value) => Object.assign([0], { extra: value }), (value) => (value as { extra: number }).extra],
+			["cycle", (value) => { const node = { value, self: {} }; node.self = node; return node; }, (value) => (value as { value: number }).value],
+			["alias", (value) => { const child = { value: 0 }; return value ? { left: { value: 0 }, right: { value: 0 } } : { left: child, right: child }; },
+				(value) => { const node = value as { left: object; right: object }; return node.left === node.right ? 0 : 1; }],
+			["plain", (value) => ({ nested: { value } }), (value) => (value as { nested: { value: number } }).nested.value],
+		];
+		for (const [shape, make, inspect] of shapes) for (const boundary of ["input", "identity", "process"] as const) for (const next of [0, 1]) {
+			let profile = 0;
+			const ready = deferred<void>(), disposed = vi.fn();
+			const result = (value: number) => ({ content: [{ type: "text" as const, text: String(value) }], details: {} });
+			const actor = vi.fn(async (input: { value: unknown }) => result(boundary === "input" ? inspect(input.value) : profile));
+			const tool: AgentTool<typeof mockToolSchema> = { name: "inspect", label: "inspect", description: "Pure fixture inspection",
+				parameters: mockToolSchema, prepareArguments: (input) => { const { value } = input as { value: number }; return { value: boundary === "input" ? make(value) : value }; },
+				execute: async (_id, input) => actor(input) };
+			const execute = vi.fn((context: Parameters<SpeculativeAgentExecutionWorld["speculation"]["execute"]>[0]) => {
+				const binding = context.action.executionContext as { identity?: { value: unknown }; process?: { value: unknown } };
+				return { result: result(inspect(boundary === "input" ? (context.args as { value: unknown }).value : binding[boundary]!.value)), isError: false };
+			});
+			const resolveInvocation = vi.fn(() => boundary === "input" ? undefined : { executor: "fixture.v1", ...(boundary === "identity"
+				? { identity: { value: make(profile) } } : { process: { command: "inspect", cwd, environment: {}, shell: process.execPath,
+					shellArgs: [], commandTransport: "argv" as const, value: make(profile) } }) });
+			const host = createSpeculativeActionHost("shapes", { cwd, actionSemantics,
+				getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 0, tools: ["inspect"] }),
+				draftModel: model("draft"), complete: async () => assistant([{ type: "toolCall", id: "draft", name: "inspect", arguments: { value: 0 } }], "toolUse"),
+				resolveInvocation, preflight: () => true, executionWorlds: [mockRuntimeWorld(execute, disposed)],
+				onEvent: (event) => { if (event.type === "source_request" || event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+			});
+			try {
+				await host.startTurn(startInput(tool)); await ready.promise;
+				await new Promise<void>((resolve) => setImmediate(resolve)); profile = next;
+				const args = { value: boundary === "input" ? make(next) : 0 };
+				const output = await host.execute({ turnID: "turn-1", id: "actor", tool: "inspect", args, tools: [tool] }, undefined,
+					(operation) => actor(operation.input as { value: unknown }));
+				expect(output, `${shape}/${boundary}/${next}`).toEqual(result(next));
+				expect(actor).toHaveBeenCalledTimes(shape === "plain" && next === 0 ? 0 : 1);
+				expect(execute).toHaveBeenCalledTimes(shape === "plain" ? 1 : 0);
+				expect(resolveInvocation).toHaveBeenCalledTimes(2);
+			} finally { await host.dispose(); }
+			expect(disposed).toHaveBeenCalledOnce();
 		}
 	});
 
