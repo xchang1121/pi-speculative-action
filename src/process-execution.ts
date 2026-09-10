@@ -22,7 +22,7 @@ export type PreparedProcessExecutionRoute =
 	| (ProcessRouteSnapshot & { readonly state: "unavailable" });
 export interface ProcessExecutionRoute {
 	readonly enabled: () => boolean;
-	readonly prepare: () => Promise<PreparedProcessExecutionRoute>;
+	readonly prepare: (refresh: boolean) => Promise<PreparedProcessExecutionRoute>;
 	readonly reset?: () => Promise<void>;
 }
 
@@ -73,7 +73,7 @@ export class ProcessExecutionCoordinator {
 
 	async refreshActorRoute(): Promise<ProcessRouteSnapshot> {
 		await this.resetActorRoute();
-		if (!this.disposed && this.actorRoute?.enabled()) await this.prepareActorRoute()?.preparation;
+		if (!this.disposed && this.actorRoute?.enabled()) await this.prepareActorRoute(true)?.preparation;
 		return this.actorDiagnostics();
 	}
 
@@ -97,12 +97,12 @@ export class ProcessExecutionCoordinator {
 		try { return await execution; } finally { generation.executions.delete(execution); }
 	}
 
-	private prepareActorRoute(): ActorProcessGeneration | undefined {
+	private prepareActorRoute(refresh = false): ActorProcessGeneration | undefined {
 		if (!this.actorRoute) throw new Error("Actor process reuse is not configured");
 		if (this.actor) return "retirement" in this.actor ? undefined : this.actor;
 		const generation: ActorProcessGeneration = {
 			executions: new Set(),
-			preparation: Promise.resolve().then(() => this.actorRoute!.prepare())
+			preparation: Promise.resolve().then(() => this.actorRoute!.prepare(refresh))
 			.catch((error): PreparedProcessExecutionRoute => ({
 				state: "unavailable",
 				detail: error instanceof Error ? error.message : String(error),

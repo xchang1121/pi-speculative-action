@@ -320,6 +320,7 @@ describe("zero-modification Pi extension", () => {
 					fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
 				);
 				await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+				expect(prepare).toHaveBeenCalledWith(expect.anything(), expect.anything(), true);
 				expect(vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.map(([refresh]) => refresh)).toEqual([false, false, true]);
 				expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Diagnostics refresh enabled providers only"), "info");
 				expect(fixture.ui.notify).not.toHaveBeenCalledWith("Speculative-action settings applied.", "info");

@@ -29,9 +29,11 @@ describe("persistent provenance store", () => {
 	it.each(["held", "scan_failure", "delete_failure"] as const)("drains admitted publication and every maintenance sibling (%s)", async (phase) => {
 		const root = await temporaryRoot();
 		const initial = new ProvenanceCertificateStore(root);
+		expect(await initial.mayHaveCertificates()).toBe(false);
 		const first = await initial.artifacts.put("output bytes");
 		const duplicateArtifact = await initial.artifacts.put(Buffer.from("output bytes"));
 		expect(duplicateArtifact).toEqual(first);
+		expect(await initial.mayHaveCertificates()).toBe(false);
 		const certificate = completed(first, 123);
 		const duplicate = completed(first, 456, "test", 999);
 		expect(duplicate.id).toBe(certificate.id);
@@ -41,6 +43,7 @@ describe("persistent provenance store", () => {
 		for (const version of [2, 6]) expect(parseProcessCertificate({ ...certificate, version })).toBeUndefined();
 		expect(await initial.put(certificate)).toBe(true);
 		expect(await initial.put(duplicate)).toBe(false);
+		expect(await initial.mayHaveCertificates()).toBe(true);
 
 		const reopened = new ProvenanceCertificateStore(root);
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
@@ -125,6 +128,11 @@ describe("persistent provenance store", () => {
 		expect(store.limits).toEqual({ maxCertificates: 2, maxBytes: 2 * 1024 * 1024 });
 		await store.clear();
 		expect(await store.stats()).toMatchObject({ certificates: 0, artifacts: 0, totalBytes: 0 });
+		expect(await store.mayHaveCertificates()).toBe(false);
+		await filesystem.mkdir(path.join(root, "certificates", "00"), { recursive: true });
+		expect(await store.mayHaveCertificates()).toBe(true);
+		const unavailable = vi.spyOn(filesystem, "readdir").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+		try { expect(await store.mayHaveCertificates()).toBe(true); } finally { unavailable.mockRestore(); }
 		expect(closure?.read(secondArtifact).toString("utf8")).toBe("second");
 	});
 

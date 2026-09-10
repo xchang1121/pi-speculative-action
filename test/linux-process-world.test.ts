@@ -107,32 +107,69 @@ describe("Linux process ExecutionWorld", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
-	test("skips completed replay lookup when Actor execution is cheaper", async ({ skip }) => {
+	test("defers empty replay, retains later evidence and drains lazy preparation before refresh", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");
 		const host = { execute: vi.fn(async () => ({ exitCode: 0 })) };
+		const held = { execute: vi.fn(async () => ({ exitCode: 0 })) }, close = vi.fn(async () => {});
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const opening = vi.spyOn(LinuxHeldExecBoundary, "open").mockImplementation(async () => {
+			await pending;
+			return { shellPath: fixture.shellPath, executor: () => held, close } as unknown as LinuxHeldExecBoundary;
+		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
+		const observed = vi.spyOn(SpeculationScheduler.prototype, "observeActorService");
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockReturnValue({
 			allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
 			speculativeSamples: 1, actorSamples: 1, adoptionSamples: 1,
 			expectedRemainingMs: 0, expectedAdoptionMs: 100,
 			expectedActorMs: 10, expectedNetBenefitMs: -90,
 		});
+		const invocation = vi.fn(() => resolvePiToolInvocation("bash", { command: ":" }, {
+			cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath,
+		})?.process);
+		const coordinator = new ProcessExecutionCoordinator(host, {
+			enabled: () => true,
+			prepare: (refresh) => fixture.backend.prepareActorReplay(host, {
+				sourceRoot: fixture.workspace, invocation,
+				held: { realShell: fixture.shellPath, executor: () => held },
+			}, refresh),
+			reset: () => fixture.backend.resetActorReplay(),
+		});
+		const invoke = () => coordinator.operations.exec(":", fixture.workspace, { env: fixture.environment, onData: () => {} });
+		let calls: Promise<unknown> | undefined, refreshing: Promise<unknown> | undefined;
 		try {
-			const command = ":";
-			const executor = fixture.backend.completedReplayExecutor(host, {
-				sourceRoot: fixture.workspace,
-				invocation: () => resolvePiToolInvocation("bash", { command }, {
-					cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath,
-				})?.process,
-			});
-			await executor.execute({
-				command, cwd: fixture.workspace, environment: fixture.environment, onData: () => undefined,
-			});
+			await invoke();
 			expect(host.execute).toHaveBeenCalledOnce();
-			expect(planner).not.toHaveBeenCalled();
+			expect(invocation).not.toHaveBeenCalled(); expect(opening).not.toHaveBeenCalled(); expect(observed).not.toHaveBeenCalled();
+			expect(coordinator.actorDiagnostics().state).toBe("degraded");
+			await mkdir(path.join(fixture.storeRoot, "certificates", "00"), { recursive: true });
+			calls = Promise.all([invoke(), invoke()]);
+			await vi.waitFor(() => expect(opening).toHaveBeenCalledOnce());
+			await fixture.backend.store.clear();
+			refreshing = coordinator.refreshActorRoute();
+			await invoke();
+			expect(host.execute).toHaveBeenCalledTimes(2); expect(close).not.toHaveBeenCalled();
+			expect(coordinator.actorDiagnostics().state).toBe("probing");
+			release(); await Promise.all([calls, refreshing]);
+			expect(held.execute).toHaveBeenCalledTimes(2); expect(invocation).toHaveBeenCalledTimes(2);
+			expect(planner).not.toHaveBeenCalled(); expect(admission).toHaveBeenCalledTimes(2);
+			expect(observed).toHaveBeenCalledTimes(2); expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
+			expect(coordinator.actorDiagnostics().state).toBe("ready");
+			await invoke(); // Clearing evidence is rechecked even after the helper was initialized.
+			expect(host.execute).toHaveBeenCalledTimes(3); expect(invocation).toHaveBeenCalledTimes(2);
+			const availability = vi.spyOn(fixture.backend.store, "mayHaveCertificates").mockImplementationOnce(async () => {
+				await fixture.backend.check(); return false; // A producer can begin while the empty lookup awaits IO.
+			});
+			try { await invoke(); expect(held.execute).toHaveBeenCalledTimes(3); } finally { availability.mockRestore(); }
+			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
+			await coordinator.refreshActorRoute();
+			expect(coordinator.actorDiagnostics()).toMatchObject({ state: "degraded", detail: expect.stringContaining("functional probe failed") });
+			await invoke(); expect(host.execute).toHaveBeenCalledTimes(4);
 		} finally {
-			admission.mockRestore();
+			release(); await Promise.allSettled([calls, refreshing]);
+			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore(); observed.mockRestore();
 			await fixture.dispose();
 		}
 	});

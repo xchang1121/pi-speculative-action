@@ -353,27 +353,39 @@ export class LinuxProcessReuseBackend {
 		return Object.freeze({ ...this.actorCounters });
 	}
 
-	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions): Promise<PreparedProcessExecutionRoute> {
+	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
-		let executor = host;
 		let state: "degraded" | "ready" = "degraded";
-		let detail = "matching whole Bash calls; this shell cannot hold child processes";
-		if (options.held) try {
-			const boundary = await (this.heldExec ??= LinuxHeldExecBoundary.open({
-				storeRoot: this.options.storeRoot,
-				...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
-			}));
-			executor = boundary.executor(options.held.executor(boundary.shellPath), {
-				realShell: options.held.realShell,
-				sourceRoot: path.resolve(options.sourceRoot),
-				decide: (process) => this.decideHeldExec(process, options.held?.scope?.()),
-			}, host);
-			state = "ready";
-			detail = "matching whole Bash calls plus completed or running child processes";
-		} catch (error) {
-			detail = `matching whole Bash calls; child handoff unavailable (${errorMessage(error)})`;
-		}
-		return { state, detail, executor: this.completedReplayExecutor(executor, options) };
+		let detail = options.held ? "Bash history; child handoff checked when evidence exists or on refresh"
+			: "matching whole Bash calls; this shell cannot hold child processes";
+		let prepared: Promise<ProcessExecutor> | undefined;
+		const prepare = async () => {
+			let executor = host;
+			if (options.held) try {
+				const boundary = await (this.heldExec ??= LinuxHeldExecBoundary.open({
+					storeRoot: this.options.storeRoot,
+					...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
+				}));
+				executor = boundary.executor(options.held.executor(boundary.shellPath), {
+					realShell: options.held.realShell,
+					sourceRoot: path.resolve(options.sourceRoot),
+					decide: (process) => this.decideHeldExec(process, options.held?.scope?.()),
+				}, host);
+				state = "ready";
+				detail = "matching whole Bash calls plus completed or running child processes";
+			} catch (error) {
+				detail = `matching whole Bash calls; child handoff unavailable (${errorMessage(error)})`;
+			}
+			return this.completedReplayExecutor(executor, options);
+		};
+		if (refresh) await (prepared = prepare());
+		return { get state() { return state; }, get detail() { return detail; }, executor: {
+			execute: async (request) => {
+				// A started backend may still publish children. Recheck after IO; never cache emptiness.
+				if ((!this.ready && !(await this.store.mayHaveCertificates()) && !this.ready) || this.disposed) return host.execute(request);
+				return (await (prepared ??= prepare())).execute(request);
+			},
+		} };
 	}
 
 	async resetActorReplay(): Promise<void> {

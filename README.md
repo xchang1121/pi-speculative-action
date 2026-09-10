@@ -105,7 +105,13 @@ npm run setup:linux
 
 以代码方式接入时，应按层次使用窄入口：`./core` 提供与宿主无关的 Runtime 与效果事务契约，`./process-reuse` 提供 provenance certificate、规划与 CAS，`./pattern-aware` 提供学习层，`./extension` 提供 Pi 接入。根入口提供公共 API 聚合。测试会递归确认 `./core` 与 `./process-reuse` 的依赖闭包不包含任何 Pi package。
 
-在 TUI 中打开 `/speculative-action`。第一层只保留总开关、保存位置、模型 Drafter/Actor fork/历史模式三类预测源和工具策略；采样、解码协议、收益门控、调度与存储容量统一放在“Advanced settings”。关闭的门控参数以及当前 transport 不会使用的动作交接项会自动隐藏。“Execution routes”按真实顺序显示统一执行环境、本地安全 fallback（封存输入、工作区事务或合格进程） 和始终可用的 Actor；前两层可以分别暂存开关，且不会连带关闭 Actor 观察或 Bash 历史重放。菜单不再暴露 L1/L2 或内部 `sandbox` 类型，而是在逐工具矩阵中分开显示 **Predict、Replay、Observe、Fork**，不再把“允许预测”误写成“当前平台能够提前执行”。能力诊断只在插件启用时初始化：显式打开“Execution routes”会刷新已启用的提供者，关闭状态下的路线保持未探测，也不会启动 helper。应用总开关或层级策略时，会先完成路由诊断更新，再提示完成并刷新 footer。回合登记只修改内存，支持回合中途启用思程层；显式刷新也会重新检查已经断开的 Runtime。关闭 Bash 预测不会关闭 Actor Bash 历史重放。包括 Enabled 和 Restore defaults 在内的修改都要到 Apply 才生效；切换“All projects”/“This project”会重新载入该层，而项目文件只保存相对规范化共享配置的差异。Actor 路径的 Bash 复用与投机分支内部的进程复用分别计数；状态把“生产者实测、此次无需重跑的进程工作量”和“Actor 路径延迟估计”分开显示，在取得先前权威执行样本前明确显示 `Actor timing unavailable`，不再虚构省时。同次运行的重叠仍标为 observed overlap，而不是因果加速。JSON 容量单位是字节，TUI 内存输入单位是 MiB；没有安全路线的工作始终由 Actor 执行。
+在 TUI 中打开 `/speculative-action`。第一层提供总开关、保存位置、模型 Drafter/Actor fork/历史模式和工具策略；采样、协议、收益门控、调度与容量放在“Advanced settings”。关闭的门控参数和当前 transport 不使用的交接项隐藏。所有修改，包括 Enabled 和 Restore defaults，都在 Apply 后生效；切换“All projects”/“This project”会重载该层，项目文件只保存相对共享配置的差异。
+
+“Execution routes”依次显示统一执行环境、本地安全 fallback（封存输入、工作区事务或合格进程）和 Actor。前两层可分别开关，不连带关闭 Actor 观察或 Bash 历史重放；逐工具显示 **Predict、Replay、Observe、Fork**。插件启用后，打开路线页会实际刷新已启用提供者；应用开关或策略也先等待诊断，再提示完成并刷新 footer。未启用的路线不探测、不启动 helper。回合登记只改内存，可中途启用思程；显式刷新会重查断开的 Runtime。
+
+Linux Bash 在证书目录为空且后端尚未启动时直接运行 Actor，省去重放身份准备和子进程 helper 启动；每次重查目录，空分片或 I/O 不确定时仍走完整检查。已有或正在准备的后端也保留该路线。显式刷新仍运行 helper 功能自检，未探测不报可用；关闭 Bash 预测仍保留历史重放。
+
+Actor Bash 与投机分支内的复用分别计数。状态分开显示生产者实测工作量和 Actor 延迟估计；没有权威样本时显示 `Actor timing unavailable`，不记零成本或虚构省时。同次重叠标为 observed overlap，不作因果加速。JSON 容量单位是字节，TUI 内存单位是 MiB；无安全路线时由 Actor 执行。
 
 配置由 package 自己管理：
 

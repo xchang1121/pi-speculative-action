@@ -242,6 +242,12 @@ export class ProvenanceCertificateStore {
 		return certificates;
 	}
 
+	/** Cheap conservative hint: empty shards and IO uncertainty still retain the replay route. */
+	async mayHaveCertificates(): Promise<boolean> {
+		try { return (await readdir(this.managedPath("certificates"))).length > 0; }
+		catch (error) { return !missing(error); }
+	}
+
 	async stats(refresh = false): Promise<ProvenanceStoreStats> {
 		await this.maintenance;
 		if (refresh || !this.statsValue) this.statsValue = inventoryStats(await this.inventory(), this.limits);

@@ -47,6 +47,7 @@ describe("ProcessExecutionCoordinator", () => {
 				expect(coordinator.actorDiagnostics()).toEqual({ state: "unavailable", detail: "helper unavailable" });
 			}
 			expect(prepare).toHaveBeenCalledOnce();
+			expect(prepare).toHaveBeenCalledWith(false);
 			const retire = () => dispose ? coordinator.dispose() : coordinator.refreshActorRoute();
 			const retiredCalls = Promise.allSettled([retire(), retire()]);
 			const during = Promise.allSettled([invoke("during")]);
@@ -60,6 +61,7 @@ describe("ProcessExecutionCoordinator", () => {
 			expect((await retiredCalls).every((result) => result.status === "fulfilled")).toBe(true);
 			expect(reset).toHaveBeenCalledOnce();
 			expect(coordinator.actorDiagnostics().state).toBe(dispose ? "unavailable" : "degraded");
+			if (!dispose) expect(prepare).toHaveBeenLastCalledWith(true);
 			await invoke("after");
 			expect(calls).toContain("raw:during");
 			expect(calls.slice(0, 2)).toEqual(["raw:disabled", "world:scoped"]);
