@@ -13,6 +13,7 @@ export interface SpeculativeTaskTiming {
 	readonly toolExecutionMs: number;
 	readonly serializedMs: number;
 	readonly hiddenLatencyMs: number;
+	/** Distinct accepted producer/query computations in this task, not Actor call count. */
 	readonly authoritativeToolCount: number;
 }
 

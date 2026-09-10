@@ -15,6 +15,7 @@ export interface ActorCandidateSelection<Candidate extends { readonly id: string
 	readonly output: Output;
 	readonly timing: ActorHitTiming;
 	readonly toolExecution: TimelineInterval;
+	readonly projection?: TimelineInterval;
 }
 
 export interface ActorCallFallback {

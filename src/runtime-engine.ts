@@ -6,7 +6,7 @@ import type {
 	ActionSemanticsRegistry,
 } from "./action-semantics.ts";
 import { actionKeyCovers, actionKeyMatch, ownActionKeyProjector, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
-import { ActorCallAttempt } from "./actor-call-attempt.ts";
+import { ActorCallAttempt, type ActorCandidateSelection } from "./actor-call-attempt.ts";
 import { ActorAction } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation } from "./candidate-execution.ts";
 import {
@@ -247,9 +247,9 @@ async function projectOutput<Output, StartInput, StateData>(
 	rules: readonly ActionProjectionRule<Output>[],
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
-	if (match.kind === "exact") return { ok: true, output, durationMs: 0 };
+	if (match.kind === "exact") return { ok: true, output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained) return { ok: true, output: cloneSharedData(retained.output), durationMs: 0 };
+	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution };
 	const reconstruct = candidateBranch(candidate)?.reconstruct;
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
@@ -265,10 +265,10 @@ async function projectOutput<Output, StartInput, StateData>(
 			keyMatch: match,
 		})) : undefined;
 		if (projected === undefined) projected = await reconstruct?.(request);
-		const durationMs = Math.max(0, performance.now() - startedAt);
-		return projected === undefined
-			? { ok: false, cause: cause("projection", "view_not_covered") }
-			: { ok: true, output: projected, durationMs };
+		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
+		const execution = Object.freeze({ startedAt, completedAt: performance.now() });
+		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
+		return { ok: true, output: projected, execution };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
@@ -483,19 +483,19 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 
 /** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
 function retainResultView<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>, action: ActionKey, output: Output,
+	candidate: CandidateRecord<Output, StartInput, StateData>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
 	settings: SpeculativeActionSettings,
 ): boolean {
-	if (candidate.key.key === action.key || candidate.resultViews?.has(action.key)) return false;
+	if (!projection.execution || candidate.resultViews?.has(action.key)) return false;
 	try {
-		const owned = cloneSharedData(output), bytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
+		const owned = cloneSharedData(projection.output), bytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
 		const views = candidate.resultViews ??= new Map();
 		while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
 			const [key, previous] = views.entries().next().value!;
 			views.delete(key); candidate.estimatedBytes -= previous.bytes;
 		}
 		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-			views.set(action.key, { output: owned, bytes }); candidate.estimatedBytes += bytes;
+			views.set(action.key, { output: owned, bytes, execution: projection.execution }); candidate.estimatedBytes += bytes;
 			return true;
 		}
 	} catch { /* Optional retention cannot alter an already committed result. */ }
@@ -604,7 +604,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	background: boolean;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number }>;
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval }>;
 	validationMs: number;
 	validationBytes: number;
 	validationFiles: number;
@@ -639,8 +639,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly authoritativeResultCaptures: Map<ActorAction, AuthoritativeResultCapture<Output>>;
 	readonly turns: Set<string>;
 	readonly actorPhaseIntervals: TimelineInterval[];
-	readonly authoritativeToolIntervals: TimelineInterval[];
-	readonly authoritativeCandidateIDs: Set<string>;
+	readonly authoritativeToolIntervals: Map<string | object, TimelineInterval>;
 	actorAdmissionTail: Promise<void>;
 	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
@@ -690,7 +689,7 @@ interface ClaimedPrediction {
 }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly durationMs: number }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -856,8 +855,7 @@ class StructuralRuntimeState<
 			authoritativeResultCaptures: new Map(),
 			turns: new Set(),
 			actorPhaseIntervals: [],
-			authoritativeToolIntervals: [],
-			authoritativeCandidateIDs: new Set(),
+			authoritativeToolIntervals: new Map(),
 			actorAdmissionTail: Promise.resolve(),
 			planAdmissionTails: new Map(),
 			settings,
@@ -968,8 +966,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (session.taskStartedAt === undefined) {
 				session.taskStartedAt = startedAt;
 				session.actorPhaseIntervals.length = 0;
-				session.authoritativeToolIntervals.length = 0;
-				session.authoritativeCandidateIDs.clear();
+				session.authoritativeToolIntervals.clear();
 			}
 			const state: Turn = {
 				key,
@@ -1836,11 +1833,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				const projected = await projectOutput(candidate, action, execution.output.output, match,
 					runtimeState.projectionRules, { action, args: action.input, callID: actualCall.id!,
 						signal: signal ?? state.generation.signal });
-				if (projected.ok) {
-					candidate.projectionMs += projected.durationMs;
-					if (active() && runtimeState.candidates.find(state.sessionID, candidate.id) === candidate &&
-						retainResultView(candidate, action, projected.output, state.settings)) trimResults(state.session, state.settings);
-				}
+				if (projected.ok && active() && runtimeState.candidates.find(state.sessionID, candidate.id) === candidate &&
+					retainResultView(candidate, action, projected, state.settings)) trimResults(state.session, state.settings);
 			} finally {
 				lease.release();
 			}
@@ -1975,7 +1969,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				...actorIdentity,
 				actionKeyHash: JSON.stringify([candidate.key.hash, actualKey.hash]),
 				operation: JSON.stringify([route.backend, route.fingerprint, route.scope, route.isolation, route.reuse,
-					choice.match.kind === "exact" ? "exact" : choice.match.projector]),
+					choice.match.kind === "exact" ? "exact" : choice.match.projector,
+					...(candidate.resultViews?.has(actualKey.key) ? ["retained"] : [])]),
 			};
 			const join = state.session.scheduler.assessCandidateJoin({
 				identity: actionTimingIdentity(candidate.key),
@@ -2099,7 +2094,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					attempt.rejectCandidate(candidate.id, choice.match, projection.cause);
 					continue;
 				}
-				candidate.projectionMs += projection.durationMs;
 				const validation = await validateCandidate(candidate);
 				if (stopCandidate(candidate)) break;
 				if (validation.status !== "valid") {
@@ -2127,7 +2121,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				} else if (candidate.origin === "actor_preview") {
 					runtimeState.candidates.remove(state.session.id, candidate);
 				} else {
-					const retained = retainResultView(candidate, actualKey, output, state.settings);
+					const retained = retainResultView(candidate, actualKey, projection, state.settings);
 					runtimeState.candidates.results.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 					if (retained) trimResults(state.session, state.settings);
 				}
@@ -2142,6 +2136,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
 					},
 					toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
+					...(projection.execution ? { projection: projection.execution } : {}),
 				});
 				break;
 			} finally {
@@ -2272,7 +2267,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					forgetActorAction(state.session, actualCall.id, actorAction);
 					confirmPredictions(state.session, matchingPredictions, identity, adoption);
 					reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
-					queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
+					queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
 					state.session.effects.enqueue(() => dispatchReady(state.session));
 					return selected.output;
 				}
@@ -2292,7 +2287,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					},
 				);
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
-				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected.candidate);
+				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				return selected.output;
 			}
@@ -2414,22 +2409,16 @@ export function makeStructuralSpeculativeActionRuntime<
 		actualCall: ActualToolCall,
 		actorAction: ActorAction,
 		output: Output | undefined,
-		candidate?: Candidate,
+		selection?: ActorCandidateSelection<Candidate, Output>,
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		if (
-			settlement.provider.kind === "actor" ||
-			!state.session.authoritativeCandidateIDs.has(settlement.provider.candidateID)
-		) {
-			state.session.authoritativeToolIntervals.push(settlement.provider.toolExecution);
-			if (settlement.provider.kind === "speculative") {
-				state.session.authoritativeCandidateIDs.add(settlement.provider.candidateID);
-			}
-		}
+		state.session.authoritativeToolIntervals.set(settlement.provider.kind === "speculative"
+			? settlement.provider.candidateID : settlement.actorAction, settlement.provider.toolExecution);
+		if (selection?.projection) state.session.authoritativeToolIntervals.set(selection.projection, selection.projection);
 		const key = actorAction.actionKey;
 		const settledCandidate =
-			candidate ??
+			selection?.candidate ??
 			(settlement.provider.kind === "speculative"
 				? runtimeState.candidates.find(state.sessionID, settlement.provider.candidateID)
 				: undefined);
@@ -3018,8 +3007,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session.taskStartedAt = undefined;
 		session.lastActorArrivedAt = undefined;
 		session.actorPhaseIntervals.length = 0;
-		session.authoritativeToolIntervals.length = 0;
-		session.authoritativeCandidateIDs.clear();
+		session.authoritativeToolIntervals.clear();
 	};
 
 	const beginTurnClosure = (
@@ -3237,7 +3225,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			startedAt,
 			completedAt,
 			actorPhases: session.actorPhaseIntervals,
-			authoritativeTools: session.authoritativeToolIntervals,
+			authoritativeTools: [...session.authoritativeToolIntervals.values()],
 		});
 		resetTaskTimeline(session);
 		const event: SpeculativeActionEvent<SessionID> = {

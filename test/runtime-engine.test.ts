@@ -979,13 +979,15 @@ describe("structural speculative runtime", () => {
 				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
 				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
 					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
-						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, scenario === "input-lookup" ? "resource.inputs" : "read.range"]) });
+						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, scenario === "input-lookup" ? "resource.inputs" : "read.range",
+						...(preview || ["input-lookup", "output-valid"].includes(scenario) ? ["retained"] : [])]) });
 			}
 		} finally {
 			completion.arrive(); release.arrive(); await Promise.all([preparation, consumed]);
 			await fixture.runtime.finishTurn({ ...actor, terminal: true });
 			admission.mockRestore(); adoption.mockRestore();
 		}
+		expect(fixture.events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? 2 : 0);
 		if (scenario === "input-lookup") {
 			expect(fixture.events.filter((event) => event.type === "actor_action").at(-1)?.settlement.matchedPredictions).toEqual([]);
 			expect(fixture.events.filter((event) => event.type === "prediction").at(-1)?.settlement)
@@ -995,13 +997,16 @@ describe("structural speculative runtime", () => {
 
 	it.each([[2, 4096, 2], [1, 4096, 3], [2, 128, 3]])("bounds sealed query results by %i entries and %i bytes", async (entries, bytes, evaluations) => {
 		const ready = candidateSucceeded(), disposed = vi.fn();
-		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => String((args as { offset: number }).offset));
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const learned = entries === 2 && bytes === 4096;
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return String((args as { offset: number }).offset); });
 		const fixture = harness({
 			source: { id: "source", enabled: () => true, propose: ({ startInput }) => startInput.turnID === "first"
 				? plan("source", "inputs", { path: "input", offset: 1, limit: 1 }) : undefined },
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
-			execute: () => ({ ...world("1", { onDispose: disposed,
-				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }) }), reconstruct }),
+			execute: () => { now += 10; return { ...world("1", { onDispose: disposed,
+				validate: async () => { now += 3; return { status: "valid", metrics: zeroValidationMetrics() }; } }), reconstruct }; },
 			onEvent: ready.observe,
 		});
 		try {
@@ -1013,11 +1018,31 @@ describe("structural speculative runtime", () => {
 					await fixture.runtime.startTurn({ sessionID: "session", turnID });
 				}
 				const actor = { ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) };
-				await fixture.runtime.previewActorCall(actor);
+				if (!learned || index > 0) await fixture.runtime.previewActorCall(actor);
 				expect(await fixture.runtime.consume(actor)).toBe(String(offset));
+				if (learned && index === 0) {
+					const scheduler = admission.mock.contexts[0] as SpeculationScheduler<object>, request = admission.mock.calls[0]![0];
+					for (let sample = 0; sample < 4; sample++) {
+						scheduler.observeActorService(request.actorIdentity!, 5);
+						scheduler.observeAdoption(request.adoptionIdentity!, 100);
+					}
+				}
 			}
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(fixture.executions()).toBe(1);
-		} finally { await fixture.runtime.dispose(); }
+			await fixture.runtime.finishTurn({ ...call("second"), terminal: true });
+			expect(fixture.events.find((event) => event.type === "task")?.timing).toMatchObject({
+				toolExecutionMs: 10 + evaluations * 20, authoritativeToolCount: 1 + evaluations,
+				hiddenLatencyMs: learned || bytes === 128 ? 10 : 50,
+			});
+			now += 10;
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "next-task" });
+			expect(await fixture.runtime.consume(call("next-task", { path: "input", offset: 2, limit: 1 }))).toBe("2");
+			await fixture.runtime.finishTurn({ ...call("next-task"), terminal: true });
+			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (bytes === 128 ? 1 : 0));
+			expect(fixture.events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
+				toolExecutionMs: bytes === 128 ? 20 : 0, authoritativeToolCount: bytes === 128 ? 1 : 0, hiddenLatencyMs: 0,
+			});
+		} finally { await fixture.runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
 	});
 
