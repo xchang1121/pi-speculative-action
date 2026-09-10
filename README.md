@@ -226,7 +226,7 @@ tt pi-speculative-action
 
 `fs.run` 继承封存的 Profile 网络策略（默认 `all`），不虚拟时间/随机数，也不提供单次网络收窄。这里只接入固定 stock-tool runner；原生 `grep/find` 的外部配置、预处理器和子进程，以及 Bash，仍须完整进程依赖/效果证明。工作区或 snapshot 内容相等不足以授权这些路线，能力矩阵会阻止无证据的提前执行，保留 Actor。SDK 可协调 Supervisor 持久请求及终态清理，适配器不跨 Pi 进程崩溃保存 request ID。
 
-本机 alpha4 x86_64 已通过 `read/ls/edit` 采纳及七项生命周期检查；新文件 `write` 因私有分支的异步 `realpath` 返回 `EACCES` 仍未通过，失败候选被拒绝后 Actor 恰好执行一次。小文件样本未获净加速。TUI 的 Ready 表示连接与路线准备成功，工具资格仍须执行[真实 Runtime 检查](./bench/README.md#thinkthread-真实-runtime-资格)。
+本机 alpha4 x86_64 已通过 `read/ls/edit` 采纳及七项生命周期检查；新文件 `write` 因异步 `realpath` 返回 `EACCES` 仍失败并回退 Actor 一次。小文本未获净加速；PNG 读取仅有固定时序下的有限收益。TUI 的 Ready 表示连接与路线准备成功，工具资格与性能边界见[真实 Runtime 检查](./bench/README.md#thinkthread-真实-runtime-资格)。
 
 SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可检查、测试、构建和打包，无需兄弟仓或改写 manifest。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 

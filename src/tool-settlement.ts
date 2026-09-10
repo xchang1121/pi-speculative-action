@@ -1,5 +1,4 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { formatThrownValue } from "@earendil-works/pi-ai";
 import type { ActionSemanticsDefinition } from "./action-semantics.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
@@ -10,7 +9,7 @@ export interface ToolSettlement<TDetails = unknown> {
 
 export function toolErrorSettlement(error: unknown): ToolSettlement {
 	return {
-		result: { content: [{ type: "text", text: formatThrownValue(error) }], details: {} },
+		result: { content: [{ type: "text", text: error instanceof Error ? error.message || error.name : String(error) }], details: {} },
 		isError: true,
 	};
 }
