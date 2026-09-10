@@ -12,7 +12,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
-import { EffectCommitFailure } from "../src/effect-transaction.ts";
+import { EffectCommitFailure, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
 import {
 	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
@@ -158,6 +158,7 @@ describe("ThinkThread execution world", () => {
 		);
 
 		expect(fixture.run.mock.calls[0]?.[0]).toMatchObject({ writes: "snapshot" });
+		expect(branch.validateAndCommit).toBeUndefined();
 		expect(branch.resources).toEqual(["generated.txt"]);
 		expect(branch.capturedBytes).toBe(10);
 		const [first, second] = await Promise.all([branch.commit(), branch.commit()]);
@@ -255,17 +256,50 @@ describe("ThinkThread execution world", () => {
 		await world.dispose?.();
 	});
 
-	it("rejects stale snapshot executions at adoption", async () => {
-		const fixture = fakeClient({ verifyStatus: "stale" });
-		const { world, cwd } = await startWorld(fixture);
-		const branch = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
-		await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
-		await expect(branch.commit()).rejects.toMatchObject({
-			resolutionCause: { stage: "freshness", code: "thinkthread_dependency_changed" },
-		});
-		await branch.dispose();
-		await world.dispose?.();
-		expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
+	it("joins read validation and commit without losing direct freshness, retries, or cleanup ownership", async () => {
+		for (const mode of ["direct", "shared", "retry", "dispose"] as const) {
+			const fixture = fakeClient(), { world, cwd } = await startWorld(fixture);
+			const source = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
+			const coordinator = new EffectTransactionCoordinator<typeof source.output>();
+			const branch = mode === "direct" ? source : await coordinator.execute(coordinator.begin({ tool: "read", route: {
+				isolation: "runtime_sandbox", reuse: "shared_result", scope: "runtime", backend: world.id, fingerprint: "test",
+			} }), async () => source);
+			const verify = fixture.verify.getMockImplementation()!;
+			try {
+				if (mode === "retry") {
+					fixture.verify.mockRejectedValueOnce(new Error("disconnected"));
+					await expect(branch.validate?.()).resolves.toMatchObject({ status: "indeterminate" });
+					fixture.verify.mockResolvedValueOnce({ ...await verify(), status: "stale" });
+					await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
+					await expect(branch.commit()).rejects.toThrow("requires successful validation");
+				}
+				if (mode === "dispose") {
+					let enter!: () => void, release!: () => void;
+					const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+					fixture.verify.mockImplementationOnce(async () => { enter(); await gate; return verify(); });
+					const validating = branch.validate!(); await entered;
+					const disposal = branch.dispose();
+					await world.finishTurn("turn"); expect(fixture.snapshotRemove).not.toHaveBeenCalled();
+					release(); await validating; await disposal;
+					await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" });
+				} else {
+					await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
+					if (mode !== "direct") {
+						const results = await Promise.all([branch.commit(), branch.commit()]);
+						expect(results).toEqual([source.output, source.output]);
+						expect(fixture.verify).toHaveBeenCalledTimes(mode === "retry" ? 3 : 1);
+					}
+					fixture.verify.mockResolvedValueOnce({ ...await verify(), status: "stale" });
+					if (mode === "direct") await expect(branch.commit()).rejects.toMatchObject({
+						resolutionCause: { stage: "freshness", code: "thinkthread_dependency_changed" },
+					});
+					else await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
+					expect(fixture.verify).toHaveBeenCalledTimes(mode === "retry" ? 4 : 2);
+				}
+				expect(fixture.apply).not.toHaveBeenCalled();
+			} finally { await branch.dispose(); await world.dispose?.(); }
+			expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
+		}
 	});
 
 	it("can requalify speculation after the runner becomes available", async () => {

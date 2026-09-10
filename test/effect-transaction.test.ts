@@ -30,6 +30,7 @@ describe("EffectTransactionCoordinator", () => {
 				await expect(coordinator.execute(unowned, async () => branch())).rejects.toThrow("another coordinator");
 			const source = branch({
 				validate: async () => { await gate; return { status: "valid", metrics: metrics() }; },
+				validateAndCommit: vi.fn(async () => { throw new Error("exclusive effects cannot commit during validation"); }),
 				commit, dispose,
 			});
 			const transaction = await coordinator.execute(attempt, async () => source);
@@ -46,6 +47,7 @@ describe("EffectTransactionCoordinator", () => {
 			expect(first).toEqual(second);
 			expect(first).toMatchObject(failure ? { status: "rejected", reason: { disposition: disposition ?? "poisoned" } } : { status: "fulfilled", value: "committed" });
 			const state = !failure ? "committed" : disposition === "recoverable" ? "failed" : "poisoned";
+			expect(source.validateAndCommit).not.toHaveBeenCalled();
 			expect([transaction.state, attempt.state]).toEqual([state, state]); expect(commit).toHaveBeenCalledOnce();
 			await transaction.abort(); expect(dispose).toHaveBeenCalledOnce();
 			expect(transaction.state).toBe(state === "failed" ? "aborted" : state);
@@ -65,6 +67,7 @@ describe("EffectTransactionCoordinator", () => {
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
 				validate: async () => { if (phase === "validation") await borrow(); return { status: "valid", metrics: metrics() }; },
+				validateAndCommit: closing === "callback" && phase === "validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined,
 				reconstruct: async () => { await borrow(); return "rebuilt"; },
 				commit: async () => { if (phase === "committing") await borrow(); return "committed"; }, dispose,
 			}));
@@ -157,6 +160,7 @@ describe("EffectTransactionCoordinator", () => {
 			const dispose = vi.fn(function (this: WorldBranch<typeof output>) { expect(this).toBe(source); });
 			const source: WorldBranch<typeof output> = { ...metadata, checkpoint, output, commit, dispose,
 				reconstruct: async function () { expect(this).toBe(source); return expected; },
+				validateAndCommit: captured ? async function (this: WorldBranch<typeof output>) { await commit.call(this); return { status: "valid", metrics: metrics() }; } : undefined,
 				validate: async function () { expect(this).toBe(source); return { status: "valid", metrics: metrics() }; } };
 			const pending = captured ? coordinator.capture(attempt, { seal: () => source, dispose: () => {} }).seal(output)
 				: coordinator.execute(attempt, async () => source);
@@ -172,7 +176,7 @@ describe("EffectTransactionCoordinator", () => {
 			Object.assign(metadata.compatibility, { status: "compatible", executionFingerprint: "late" });
 			Object.assign(source, { backend: "late", checkpoint: undefined, capturedBytes: 99, resources: [], executionMetrics: {},
 				compatibility: { status: "compatible", backend: "late", executionFingerprint: "late" },
-				validate: replaced, reconstruct: replaced, commit: replaced, dispose: replaced });
+				validate: replaced, validateAndCommit: replaced, reconstruct: replaced, commit: replaced, dispose: replaced });
 			expect(transaction).toMatchObject(sealedMetadata); expect(transaction.checkpoint).toBe(checkpoint);
 			expect(Object.isFrozen(checkpoint)).toBe(false);
 			for (const [owner, key] of [[transaction, "commit"], [transaction.resources, "0"], [transaction.executionMetrics, "setupMs"],
@@ -189,11 +193,12 @@ describe("EffectTransactionCoordinator", () => {
 				args: {}, callID: "actor", signal: new AbortController().signal })).toEqual(expected);
 			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 			await transaction.validate!();
+			expect(attempt.state).toBe("validated"); expect(commit).toHaveBeenCalledTimes(Number(captured));
 			const [first, second] = await Promise.all([transaction.commit(), transaction.commit()]);
 			Object.assign(source, { commitMetrics: { durationMs: 2, validationMs: 1, bytesValidated: 1, resourcesValidated: 1, resourcesCommitted: 1 } });
 			expect(transaction.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
 			first.content.push("Actor edit"); (first.details as { value: string[] }).value.push("Actor edit");
-			expect(second).toEqual(expected); expect(commit).toHaveBeenCalledOnce();
+			expect(second).toEqual(expected); expect(commit).toHaveBeenCalledTimes(captured ? 2 : 1);
 			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce(); expect(replaced).not.toHaveBeenCalled();
 		}
 		expect(getter).not.toHaveBeenCalled();

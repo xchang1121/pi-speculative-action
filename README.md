@@ -221,7 +221,7 @@ tt pi-speculative-action
 
 安装器支持 `--agent-posix-package /path/to/sdk.tgz`、`--speculative-action-package /path/to/spec.tgz` 和重复的 `--model provider/model` 授权；校验 SDK 0.1.0、protocol 2 及契约指纹，写入 schema-4 Profile 和 `~/.local/share/pi-speculative-action`。配置位于安装目录的 `config`，项目 `.pi/speculative-action.json` 可覆盖。原生搜索另需 Profile 可访问的 `fd`/`rg`。
 
-- 投机工具使用原版 Pi，同轮共享 BASE，经封存的 `fs.run` 执行，再由 `fs.verify` / `fs.apply` 检查新鲜度与冲突。Actor 变更回退会在结算和启动后继前使 BASE 失效。
+- 投机工具使用原版 Pi，同轮共享 BASE。共享观察首次采纳合并 `fs.verify` 与只读后端提交，后续使用仍逐次验新；写入保留 `fs.apply` 原子冲突检查。Actor 变更回退在结算和启动后继前使 BASE 失效。
 - Actor 的 `read/ls` 仍由宿主资源观察证明完整执行窗口；snapshot/content 相等不足以排除 A→B→A。此路径不使用 SDK/runner，不维护独立思程结果快照，与投机路径共用 `EffectTransaction`。
 
 `fs.run` 继承封存的 Profile 网络策略（默认 `all`），不虚拟时间/随机数，也不提供单次网络收窄。这里只接入固定 stock-tool runner；原生 `grep/find` 的外部配置、预处理器和子进程，以及 Bash，仍须完整进程依赖/效果证明。工作区或 snapshot 内容相等不足以授权这些路线，能力矩阵会阻止无证据的提前执行，保留 Actor。SDK 可协调 Supervisor 持久请求及终态清理，适配器不跨 Pi 进程崩溃保存 request ID。
@@ -232,7 +232,7 @@ SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可�
 
 ## 接入 Runtime 沙箱
 
-Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；因此 `createExecutionWorlds` 扩展执行层级，而不替换安全后备。更底层的 Host API 仍接受显式 `executionWorlds` 列表。World 同时声明 effect guarantee 与必要的工具作用域；没有具体 action 的预热也遵守作用域。Router 在返回 route 前确认后端可用，执行前再次检查层级策略；首选 provider 不可用时在执行前降级，已经执行失败的动作不会盲目换环境重跑。每个成功后端返回同一种 `WorldBranch`，Gateway 将其包装为 `EffectTransaction`，统一管理新鲜度验证、采纳、放弃与提交；载体保留兼容性证据与后端局部清理职责。
+Pi 扩展先注册配置的 runtime provider，再保留原生 Linux 进程世界和 Git 工作区 fallback；`createExecutionWorlds` 扩展执行层级，Host API 也接受显式 `executionWorlds`。World 声明 effect guarantee 与工具作用域，预热同样遵守。Router 在选路和执行前确认可用层级；已执行失败的动作不盲目换环境重跑。后端返回 `WorldBranch`，Gateway 包装为 `EffectTransaction`，统一管理验证、采纳和回收；兼容证据与局部句柄仍由后端负责。可选 `validateAndCommit` 仅供共享观察合并新鲜度证明与不改变 Actor 状态的后端提交，每次仍须重新验证；事务不会提前发布结果，独占分支忽略此接口。
 
 ```ts
 const workspace = new WorkspaceSandboxService();

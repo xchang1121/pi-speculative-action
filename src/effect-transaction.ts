@@ -186,7 +186,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
 		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
-		validate: branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
+		validate: ((shared && branch.validateAndCommit) || branch.validate)?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
 		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;

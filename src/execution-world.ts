@@ -132,6 +132,9 @@ export interface WorldBranch<Output> {
 	readonly commitMetrics?: WorldCommitMetrics;
 	/** Required for shared results; exclusive branches may instead prove conflicts atomically at commit. */
 	readonly validate?: () => Promise<ResourceValidation>;
+	/** Shared observations only: prove freshness and complete the effect-free backend commit together.
+	 * Every call must validate afresh; the coordinator still owns Actor adoption and may call commit again. */
+	readonly validateAndCommit?: () => Promise<ResourceValidation>;
 	/** Re-evaluate a compatible query using only this branch's sealed inputs, without host effects. */
 	readonly reconstruct?: (request: {
 		readonly action: ActionKey;

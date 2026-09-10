@@ -320,6 +320,10 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 		return this.metrics;
 	}
 
+	get validateAndCommit(): WorldBranch<ToolSettlement>["validateAndCommit"] {
+		return this.target ? undefined : this.validateReadCommit;
+	}
+
 	async validate(): Promise<ResourceValidation> {
 		const result = await this.client.fs.verify({
 			snapshotId: this.source.id,
@@ -349,11 +353,32 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 		await Promise.allSettled([this.target?.release(), this.source.release()]);
 	}
 
-	private async commitOnce(): Promise<ToolSettlement> {
+	private async validateReadCommit(): Promise<ResourceValidation> {
+		if (this.commitPromise) {
+			await this.commitPromise;
+			if (this.disposed) throw new Error("ThinkThread branch is disposed");
+			return this.validate();
+		}
+		if (this.disposed) throw new Error("ThinkThread branch is disposed");
+		let validation: ResourceValidation | undefined;
+		const pending = this.commitOnce((proof) => { validation = proof; });
+		this.commitPromise = pending;
+		try { await pending; }
+		catch (error) {
+			// A failed proof did not commit; later validation may retry an indeterminate observation.
+			if (validation?.status === "valid") throw error;
+			if (this.commitPromise === pending) this.commitPromise = undefined;
+			if (!validation) throw error;
+		}
+		return validation!;
+	}
+
+	private async commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
 		const started = performance.now();
 		try {
 			if (!this.target) {
 				const validation = await this.validate();
+				onValidation?.(validation);
 				if (validation.status !== "valid") {
 					throw effectCommitFailure(
 						new Error("ThinkThread speculative observation is stale"),
