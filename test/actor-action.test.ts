@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
-import { ActorCallAttempt } from "../src/actor-call-attempt.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
 
@@ -19,58 +18,55 @@ const actionKey = {
 
 describe("ActorAction", () => {
 	it("owns candidate rejections and one authoritative provider", () => {
-		const action = new ActorAction({ identity, tool: "read", actionKey });
-		const release = vi.fn(), attempt = new ActorCallAttempt<{ readonly id: string }, string>({
-			action, fallback: cause("matching", "no_candidate"), releaseActorAdmission: release,
-		});
-		expect(attempt.rejectCandidate("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
-		expect(attempt.select({ candidate: { id: "fresh" }, match: exact, output: "value",
-			timing: { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3 },
-			toolExecution: { startedAt: 10, completedAt: 50 },
-		})).toBe(true);
-		expect(attempt.settleSelection([{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }], "speculative"))
-			.toEqual({ status: "adopted", candidateID: "fresh" });
-		expect(attempt.settleSelection([], "speculative")).toBeUndefined();
-		const settled = action.settlement;
-
-		expect(settled).toMatchObject({
-			actorAction: identity,
-			matchedPredictions: [{ id: "prediction", source: "pattern" }],
-			rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }],
-			provider: { kind: "speculative", candidateID: "fresh", match: exact },
-		});
-		expect(Object.isFrozen(settled?.provider)).toBe(true);
-		expect(Object.isFrozen(settled?.matchedPredictions)).toBe(true);
-		expect(Object.isFrozen(settled?.rejections[0]?.cause)).toBe(true);
-		expect(
-			action.adopt(
-				"another",
-				exact,
-				{ executionAheadMs: 1, attemptLeadMs: 1, hitLatencyMs: 1 },
-				{ startedAt: 1, completedAt: 2 },
-			),
-		).toBeUndefined();
-		expect(action.settleActor(100, false)).toBeUndefined();
-		attempt.close(); attempt.close();
-		expect(release).toHaveBeenCalledOnce();
+		for (const provider of ["speculative", "preview"] as const) {
+			const release = vi.fn(), action = new ActorAction<{ readonly id: string }, string>({
+				identity, tool: "read", actionKey, fallback: cause("matching", "no_candidate"), releaseActorAdmission: release,
+			});
+			const selection = { candidate: { id: "fresh" }, match: exact, output: "value",
+				timing: { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3 }, toolExecution: { startedAt: 10, completedAt: 50 } };
+			expect(action.rejectCandidate("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
+			expect(action.select({ ...selection, candidate: { id: "stale" } })).toBe(false);
+			expect(action.select(selection)).toBe(true);
+			action.close(); action.close();
+			expect(action.state.status).toBe("selected");
+			expect(action.rejectCandidate("fresh", exact, cause("execution", "late"))).toBe(false);
+			expect(action.setFallback(cause("control", "late"))).toBe(false);
+			expect(action.deferToFallback()).toBeUndefined();
+			expect(action.settleActor(100, false)).toBeUndefined();
+			expect(action.settleSelection([{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }], provider))
+				.toEqual(provider === "preview" ? { status: "rejected", candidateID: "fresh", cause: cause("control", "actor_preview_provider") }
+					: { status: "adopted", candidateID: "fresh" });
+			const settled = action.settlement;
+			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [{ id: "prediction", source: "pattern" }],
+				rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }], provider: { candidateID: "fresh",
+					...(provider === "preview" ? { kind: "actor", origin: "preview", durationMs: 40 } : { kind: "speculative", match: exact }) } });
+			for (const value of [settled?.provider, settled?.matchedPredictions, settled?.rejections[0]?.cause]) {
+				expect(Object.isFrozen(value)).toBe(true);
+			}
+			expect(action.select(selection)).toBe(false);
+			expect(action.settleSelection([], provider)).toBeUndefined();
+			expect(action.settleActor(100, false)).toBeUndefined();
+			action.close();
+			expect(release).toHaveBeenCalledOnce();
+		}
 	});
 
 	it("spans interception and exactly one Actor fallback completion", () => {
-		for (const rejected of [false, true]) {
-			const action = new ActorAction({ identity, tool: "bash" }), release = vi.fn();
-			const attempt = new ActorCallAttempt({ action, fallback: cause("matching", "no_candidate"), releaseActorAdmission: release });
-			if (rejected) {
+		for (const mode of ["empty", "rejected", "interrupted"]) {
+			const release = vi.fn(), action = new ActorAction({ identity, tool: "bash",
+				fallback: cause("matching", "no_candidate"), releaseActorAdmission: release });
+			if (mode !== "empty") {
 				const failure = cause("execution", "tool_failed");
-				expect(attempt.rejectCandidate("failed", exact, failure)).toBe(true);
-				expect(attempt.fallback).toEqual({ cause: failure, candidateID: "failed" });
-				expect(attempt.deferToFallback()).toEqual({ status: "rejected", cause: failure, candidateID: "failed" });
+				expect(mode === "rejected" ? action.rejectCandidate("failed", exact, failure) : action.setFallback(failure, "failed")).toBe(true);
+				expect(action.fallback).toEqual({ cause: failure, candidateID: "failed" });
+				expect(action.deferToFallback()).toEqual({ status: "rejected", cause: failure, candidateID: "failed" });
 			}
-			attempt.close(); attempt.close();
+			action.close(); action.close();
 			expect(release).toHaveBeenCalledOnce();
 			expect(action.state.status).toBe("awaiting_fallback");
-			expect(action.reject("late", exact, cause("execution", "late"))).toBe(false);
+			expect(action.rejectCandidate("late", exact, cause("execution", "late"))).toBe(false);
 			expect(action.settleActor(Number.NaN, true)).toMatchObject({
-				rejections: rejected ? [{ candidateID: "failed" }] : [],
+				rejections: mode === "rejected" ? [{ candidateID: "failed" }] : [],
 				provider: { kind: "actor", durationMs: 0, isError: true },
 			});
 			expect(action.settleActor(1, false)).toBeUndefined();
@@ -79,8 +75,9 @@ describe("ActorAction", () => {
 
 	it("settles isolation-blocked benefit with the same capped timing decomposition", () => {
 		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs, completedAt] of [[80, 80, 40, 1000], [200, 120, 0, undefined]]) {
-			const action = new ActorAction({ identity, tool: "bash", actionKey });
-			expect(action.deferToFallback([], attemptLeadMs)).toBe(true);
+			const action = new ActorAction({ identity, tool: "bash", actionKey,
+				fallback: cause("execution", "isolation_unavailable"), releaseActorAdmission: () => {} });
+			expect(action.deferToFallback([], attemptLeadMs)?.status).toBe("rejected");
 			expect(action.settleActor(120, false, completedAt)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
 				executionBlockedTiming: { attemptLeadMs, executionAheadMs, hitLatencyMs } } });
 		}

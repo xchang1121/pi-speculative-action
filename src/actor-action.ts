@@ -1,17 +1,30 @@
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
-import type {
-	ActorActionIdentity,
-	ActorActionSettlement,
-	ActorHitTiming,
-	CandidateRejection,
-	ExecutionBlockedTiming,
-	PredictionIdentity,
-	ResolutionCause,
+import {
+	cause,
+	type ActorActionIdentity,
+	type ActorActionProvider,
+	type ActorActionSettlement,
+	type ActorHitTiming,
+	type CandidateRejection,
+	type ExecutionBlockedTiming,
+	type PredictionAdoption,
+	type PredictionIdentity,
+	type ResolutionCause,
 } from "./settlement.ts";
 import type { TimelineInterval } from "./task-timing.ts";
 
-export type ActorActionState =
+export interface ActorCandidateSelection<Candidate extends { readonly id: string }, Output> {
+	readonly candidate: Candidate;
+	readonly match: ActionKeyMatch;
+	readonly output: Output;
+	readonly timing: ActorHitTiming;
+	readonly toolExecution: TimelineInterval;
+	readonly projection?: TimelineInterval;
+}
+
+type ActorActionState<Candidate extends { readonly id: string }, Output> =
 	| { readonly status: "matching" }
+	| { readonly status: "selected"; readonly value: ActorCandidateSelection<Candidate, Output> }
 	| {
 			readonly status: "awaiting_fallback";
 			readonly matchedPredictions: readonly PredictionIdentity[];
@@ -19,25 +32,31 @@ export type ActorActionState =
 	  }
 	| { readonly status: "settled"; readonly value: ActorActionSettlement };
 
-/** Exactly-once owner spanning Actor interception and the optional fallback execution. */
-export class ActorAction {
+/** One owner for matching, the committed selection, admission and exactly-once settlement. */
+export class ActorAction<Candidate extends { readonly id: string } = { readonly id: string }, Output = unknown> {
 	readonly identity: ActorActionIdentity;
 	readonly tool: string;
 	readonly actionKey?: ActionKey;
 	private readonly rejections: CandidateRejection[] = [];
-	private stateValue: ActorActionState = Object.freeze({ status: "matching" });
+	private stateValue: ActorActionState<Candidate, Output> = Object.freeze({ status: "matching" });
+	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
+	private releaseActorAdmission?: () => void;
 
 	constructor(input: {
 		readonly identity: ActorActionIdentity;
 		readonly tool: string;
 		readonly actionKey?: ActionKey;
+		readonly fallback: ResolutionCause;
+		readonly releaseActorAdmission: () => void;
 	}) {
 		this.identity = Object.freeze({ ...input.identity });
 		this.tool = input.tool;
 		this.actionKey = input.actionKey;
+		this.fallbackValue = Object.freeze({ cause: input.fallback });
+		this.releaseActorAdmission = input.releaseActorAdmission;
 	}
 
-	get state(): ActorActionState {
+	get state(): ActorActionState<Candidate, Output> {
 		return this.stateValue;
 	}
 
@@ -45,7 +64,21 @@ export class ActorAction {
 		return this.stateValue.status === "settled" ? this.stateValue.value : undefined;
 	}
 
-	reject(candidateID: string, match: ActionKeyMatch, cause: ResolutionCause): boolean {
+	get fallback() {
+		return this.fallbackValue;
+	}
+
+	get selection() {
+		return this.stateValue.status === "selected" ? this.stateValue.value : undefined;
+	}
+
+	setFallback(failure: ResolutionCause, candidateID?: string): boolean {
+		if (this.stateValue.status !== "matching") return false;
+		this.fallbackValue = Object.freeze({ cause: failure, ...(candidateID ? { candidateID } : {}) });
+		return true;
+	}
+
+	rejectCandidate(candidateID: string, match: ActionKeyMatch, failure: ResolutionCause): boolean {
 		if (
 			this.stateValue.status !== "matching" ||
 			this.rejections.some((rejection) => rejection.candidateID === candidateID)
@@ -56,46 +89,56 @@ export class ActorAction {
 			Object.freeze({
 				candidateID,
 				match: Object.freeze({ ...match }),
-				cause: Object.freeze({ ...cause }),
+				cause: Object.freeze({ ...failure }),
 			}),
 		);
+		return this.setFallback(failure, candidateID);
+	}
+
+	select(selection: ActorCandidateSelection<Candidate, Output>): boolean {
+		if (
+			this.stateValue.status !== "matching" ||
+			this.rejections.some((rejection) => rejection.candidateID === selection.candidate.id)
+		) {
+			return false;
+		}
+		this.stateValue = Object.freeze({ status: "selected", value: Object.freeze({ ...selection }) });
 		return true;
 	}
 
-	adopt(
-		candidateID: string,
-		match: ActionKeyMatch,
-		timing: ActorHitTiming,
-		toolExecution: TimelineInterval,
-		matchedPredictions: readonly PredictionIdentity[] = [],
-	): ActorActionSettlement | undefined {
-		if (
-			this.stateValue.status !== "matching" ||
-			this.rejections.some((rejection) => rejection.candidateID === candidateID)
-		) {
-			return undefined;
-		}
-		return this.finish({
-			actorAction: this.identity,
-			tool: this.tool,
-			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
-			matchedPredictions: freezePredictions(matchedPredictions),
-			rejections: Object.freeze([...this.rejections]),
-			provider: Object.freeze({
-				kind: "speculative",
-				candidateID,
-				match: Object.freeze({ ...match }),
-				timing: normalizeTiming(timing),
-				toolExecution: normalizeInterval(toolExecution),
-			}),
-		});
+	settleSelection(
+		matchedPredictions: readonly PredictionIdentity[],
+		provider: "speculative" | "preview",
+	): PredictionAdoption | undefined {
+		if (this.stateValue.status !== "selected") return undefined;
+		const selected = this.stateValue.value, candidateID = selected.candidate.id;
+		const toolExecution = normalizeInterval(selected.toolExecution);
+		this.finish(Object.freeze(provider === "preview" ? {
+			kind: "actor",
+			origin: "preview",
+			candidateID,
+			toolExecution,
+			durationMs: toolExecution.completedAt - toolExecution.startedAt,
+			isError: false,
+		} : {
+			kind: "speculative",
+			candidateID,
+			toolExecution,
+			match: Object.freeze({ ...selected.match }),
+			timing: normalizeTiming(selected.timing),
+		}), freezePredictions(matchedPredictions));
+		return provider === "preview"
+			? { status: "rejected", candidateID, cause: cause("control", "actor_preview_provider") }
+			: { status: "adopted", candidateID };
 	}
 
 	deferToFallback(
 		matchedPredictions: readonly PredictionIdentity[] = [],
 		executionBlockedAttemptLeadMs?: number,
-	): boolean {
-		if (this.stateValue.status !== "matching") return false;
+		fallback?: ResolutionCause,
+	): PredictionAdoption | undefined {
+		if (this.stateValue.status !== "matching") return undefined;
+		if (fallback) this.setFallback(fallback);
 		this.stateValue = Object.freeze({
 			status: "awaiting_fallback",
 			matchedPredictions: freezePredictions(matchedPredictions),
@@ -103,31 +146,18 @@ export class ActorAction {
 				? { executionBlockedAttemptLeadMs: finite(executionBlockedAttemptLeadMs) }
 				: {}),
 		});
-		return true;
+		return { status: "rejected", ...this.fallbackValue };
 	}
 
-	settlePreview(
-		candidateID: string,
-		toolExecution: TimelineInterval,
-		matchedPredictions: readonly PredictionIdentity[] = [],
-	): ActorActionSettlement | undefined {
-		if (this.stateValue.status !== "matching") return undefined;
-		const interval = normalizeInterval(toolExecution);
-		return this.finish({
-			actorAction: this.identity,
-			tool: this.tool,
-			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
-			matchedPredictions: freezePredictions(matchedPredictions),
-			rejections: Object.freeze([...this.rejections]),
-			provider: Object.freeze({
-				kind: "actor",
-				origin: "preview",
-				candidateID,
-				durationMs: Math.max(0, interval.completedAt - interval.startedAt),
-				isError: false,
-				toolExecution: interval,
-			}),
-		});
+	releaseAdmission(): void {
+		const release = this.releaseActorAdmission;
+		this.releaseActorAdmission = undefined;
+		release?.();
+	}
+
+	close(): void {
+		this.deferToFallback();
+		this.releaseAdmission();
 	}
 
 	settleActor(
@@ -142,25 +172,25 @@ export class ActorAction {
 			this.stateValue.executionBlockedAttemptLeadMs === undefined
 				? undefined
 				: normalizeExecutionBlockedTiming(this.stateValue.executionBlockedAttemptLeadMs, duration);
-		return this.finish({
-			actorAction: this.identity,
-			tool: this.tool,
-			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
-			matchedPredictions: this.stateValue.matchedPredictions,
-			rejections: Object.freeze([...this.rejections]),
-			provider: Object.freeze({
-				kind: "actor",
-				origin: "fallback",
-				durationMs: duration,
-				isError,
-				toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),
-				...(executionBlockedTiming ? { executionBlockedTiming } : {}),
-			}),
-		});
+		return this.finish(Object.freeze({
+			kind: "actor",
+			origin: "fallback",
+			durationMs: duration,
+			isError,
+			toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),
+			...(executionBlockedTiming ? { executionBlockedTiming } : {}),
+		}), this.stateValue.matchedPredictions);
 	}
 
-	private finish(value: ActorActionSettlement): ActorActionSettlement {
-		const settlement = Object.freeze(value);
+	private finish(provider: ActorActionProvider, matchedPredictions: readonly PredictionIdentity[]): ActorActionSettlement {
+		const settlement = Object.freeze({
+			actorAction: this.identity,
+			tool: this.tool,
+			provider,
+			matchedPredictions,
+			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
+			rejections: Object.freeze([...this.rejections]),
+		});
 		this.stateValue = Object.freeze({ status: "settled", value: settlement });
 		return settlement;
 	}
