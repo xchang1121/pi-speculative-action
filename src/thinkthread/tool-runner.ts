@@ -1,6 +1,7 @@
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildPiActionKey } from "../action-semantics.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
@@ -8,11 +9,11 @@ import {
 	decodeThinkThreadToolRunnerRequest,
 	encodeThinkThreadToolRunnerResponse,
 	THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES,
-	type ThinkThreadToolRunnerRequestV1,
+	type ThinkThreadToolRunnerRequest,
 } from "./tool-runner-protocol.ts";
 
 export async function runThinkThreadTool(
-	request: ThinkThreadToolRunnerRequestV1,
+	request: ThinkThreadToolRunnerRequest,
 	cwd = process.cwd(),
 ): Promise<ToolSettlement> {
 	const action = buildPiActionKey(request.tool, request.args, cwd);
@@ -24,7 +25,8 @@ export async function runThinkThreadTool(
 	const { createToolDefinition } = await import(new URL("./core/tools/index.js", pi).href);
 	const tool = createToolDefinition(request.tool, cwd, { read: { autoResizeImages: request.autoResizeImages } });
 	try {
-		const result = await tool.execute(request.callID, request.args as never, undefined, undefined, undefined as never);
+		const context = { model: { input: request.modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
+		const result = await tool.execute(request.callID, request.args as never, undefined, undefined, context);
 		return { result, isError: false };
 	} catch (error) {
 		return toolErrorSettlement(error);

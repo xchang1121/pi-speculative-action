@@ -131,7 +131,7 @@ export async function qualifyStockTool(
 		}
 		await reset();
 		const output = wire(await runThinkThreadTool({
-			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: name, args, callID: context.callID, autoResizeImages: true,
+			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: name, args, callID: context.callID, autoResizeImages: true, modelSupportsImages: true,
 		}, cwd));
 		assert.deepEqual(output, baseline, `${name}: local wire runner output differs`);
 		assert.deepEqual(await workspaceState(root), expected, `${name}: local wire runner effects differ`);

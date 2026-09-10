@@ -13,7 +13,7 @@ import {
 	type FsSnapshotId,
 } from "@thinkthread/agent-posix";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "../agent-execution-world.ts";
-import { PI_ACTION_SEMANTICS } from "../action-semantics.ts";
+import { asRecord, type ActionKey, PI_ACTION_SEMANTICS } from "../action-semantics.ts";
 import {
 	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
@@ -87,6 +87,7 @@ export function createThinkThreadExecutionWorld(
 	};
 	const fingerprint = async (request?: ExecutionWorldRequest): Promise<string> => {
 		if (request?.action) toolName(request.action.tool);
+		const settings = runnerSettings(request?.action, autoResizeImages);
 		if (!runnerFingerprint) {
 			const attempt = (options.runnerFingerprint
 				? Promise.resolve(options.runnerFingerprint)
@@ -101,7 +102,7 @@ export function createThinkThreadExecutionWorld(
 			CONTRACT_FINGERPRINT,
 			THINKTHREAD_TOOL_RUNNER_VERSION,
 			await runnerFingerprint,
-			nodePath, autoResizeImages,
+			nodePath, settings.autoResizeImages, settings.modelSupportsImages,
 		].join(":");
 	};
 	const execute = async <Result>(
@@ -196,6 +197,7 @@ async function forkThinkThreadWorld(
 ): Promise<WorldBranch<ToolSettlement>> {
 	const setupStarted = performance.now();
 	const tool = toolName(context.toolName);
+	const settings = runnerSettings(context.action, autoResizeImages, context.cwd);
 	const dependencies = actionDependencies(context);
 	const source = context.parentCheckpoint
 		? world.pool.acquireCheckpoint(context.parentCheckpoint)
@@ -208,7 +210,7 @@ async function forkThinkThreadWorld(
 			tool,
 			callID: context.callID,
 			args: context.args,
-			autoResizeImages,
+			...settings,
 		});
 		const writes: FsRunWrites = PI_ACTION_SEMANTICS.effect(tool) === "observation" ? "deny" : "snapshot";
 		const runParams: FsRunKeyParamsV1 = {
@@ -423,6 +425,20 @@ class ThinkThreadWorldBranch implements WorldBranch<ToolSettlement> {
 			throw error;
 		}
 	}
+}
+
+/** The stock runner may consume only its declared executor contract, including both image options. */
+function runnerSettings(action: ActionKey | undefined, autoResizeImages: boolean, cwd?: string) {
+	if (!action) return { autoResizeImages, modelSupportsImages: true }; // Capability preparation has no invocation yet.
+	const invocation = asRecord(action.executionContext), identity = asRecord(invocation?.identity);
+	if (invocation?.executor !== "pi.filesystem.local.v2" || typeof invocation.filesystem !== "function" ||
+		identity?.executor !== invocation.executor || identity.version !== "0.84.1" || action.semantics ||
+		action.semanticsEpoch !== PI_ACTION_SEMANTICS.definition(action.tool)?.epoch ||
+		typeof identity.cwd !== "string" || !path.isAbsolute(identity.cwd) || (cwd !== undefined && identity.cwd !== cwd) ||
+		typeof identity.autoResizeImages !== "boolean" || typeof identity.modelSupportsImages !== "boolean") {
+		throw new Error("ThinkThread runner requires the bound stock Pi filesystem contract");
+	}
+	return { autoResizeImages: identity.autoResizeImages, modelSupportsImages: identity.modelSupportsImages };
 }
 
 function actionDependencies(context: SpeculativeToolExecutionContext): readonly FsDependency[] {

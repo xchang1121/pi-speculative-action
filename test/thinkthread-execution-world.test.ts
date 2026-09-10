@@ -10,8 +10,10 @@ import {
 	parseThinkThreadId,
 } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
-import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { resolvePiToolInvocation, type PiToolInvocationOptions } from "../src/pi-tool-invocation.ts";
+import { stableValueHash } from "../src/stable-value-hash.ts";
+import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { EffectCommitFailure, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
 import {
 	effectCapabilitiesCover,
@@ -28,12 +30,10 @@ const ownerID = parseThinkThreadId("tt-00000000-0000-4000-8000-000000000001");
 
 describe("ThinkThread execution world", () => {
 	it("binds the stock runner and execution options without inventing a Runtime epoch", async () => {
-		const world = createThinkThreadExecutionWorld({
-			clientFactory: () => fakeClient().client,
-			runnerPath: "/opt/pi-speculative-action/tool-runner.js",
-			runnerFingerprint: "runner-v1",
-		});
-
+		const fixture = fakeClient(), cwd = process.env.THINKTHREAD_FS ?? path.resolve("/workspace");
+		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "runner-v1" });
+		const fallback = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 4096 });
+		const router = new ExecutionWorldRouter([world, fallback]);
 		expect(world.speculation.capabilities).toEqual(expect.arrayContaining([...RESOURCE_OBSERVATION_EFFECTS.capabilities]));
 		expect(effectCapabilitiesCover(world.speculation.capabilities, UNRESTRICTED_PROCESS_EFFECTS)).toBe(false);
 		expect(world.speculation.tools).toEqual(["read", "ls", "write", "edit"]);
@@ -42,6 +42,28 @@ describe("ThinkThread execution world", () => {
 		expect(fingerprint).toContain("runner-v1");
 		const resized = createThinkThreadExecutionWorld({ runnerFingerprint: "runner-v1", autoResizeImages: false });
 		expect(await resized.speculation.fingerprint?.({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS })).not.toBe(fingerprint);
+		const fingerprints = new Set<string | undefined>();
+		try {
+			for (const autoResizeImages of [false, true]) for (const modelSupportsImages of [false, true]) {
+				const input = context("read", { path: "image.png" }, cwd, "read", { autoResizeImages, modelSupportsImages });
+				const request = { action: input.action, effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
+				fingerprints.add(await world.speculation.fingerprint?.(request));
+				const branch = await world.speculation.execute(input);
+				try {
+					const payload = vi.mocked(fixture.client.fs.payloadWrite).mock.calls.at(-1)![0].dataBase64;
+					expect(JSON.parse(Buffer.from(payload, "base64").toString())).toMatchObject({ autoResizeImages, modelSupportsImages });
+				} finally { await branch.dispose(); await world.finishTurn("turn"); }
+				const invocation = input.action.executionContext as ReturnType<typeof resolvePiToolInvocation>;
+				for (const executionContext of [undefined, { ...invocation, executor: "different" },
+					{ ...invocation, identity: { ...(invocation!.identity as object), modelSupportsImages: undefined } }]) {
+					const unqualified = { ...request, action: { ...input.action, executionContext } };
+					await expect(world.speculation.fingerprint?.(unqualified)).rejects.toThrow("bound stock Pi");
+					expect((await router.resolve(unqualified, { cwd }))?.backend).toBe(executionContext ? fallback.id : undefined);
+				}
+				await expect(world.speculation.execute({ ...input, cwd: path.join(cwd, "other") })).rejects.toThrow("bound stock Pi");
+			}
+			expect(fingerprints.size).toBe(4);
+		} finally { await router.dispose(); await resized.dispose?.(); }
 	});
 
 	it.each([false, true])("routes every stock tool through the same capability layers (warmup=%s)", async (warmup) => {
@@ -80,7 +102,7 @@ describe("ThinkThread execution world", () => {
 
 		for (const [tool, args, allLayers, nativeOnly] of cases) {
 			const definition = PI_ACTION_SEMANTICS.definition(tool)!;
-			const action = buildPiActionKey(tool, args, cwd, "schema")!;
+			const action = context(tool, args, cwd, "route").action;
 			const request = { effect: definition.effect, requirements: definition.requirements, tool, action: warmup ? undefined : action };
 			enabled = () => true;
 			expect((await router.resolve(request, { cwd }))?.backend).toBe(allLayers);
@@ -118,7 +140,7 @@ describe("ThinkThread execution world", () => {
 			return router.resolve({
 				effect: definition.effect,
 				requirements: definition.requirements,
-				action: buildPiActionKey(tool, args, cwd, "schema")!,
+				action: context(tool, args, cwd, "route").action,
 			}, { cwd });
 		};
 
@@ -364,8 +386,11 @@ describe("ThinkThread execution world", () => {
 	});
 });
 
-function context(toolName: string, args: unknown, cwd: string, callID: string) {
-	const action = buildPiActionKey(toolName, args, cwd, "schema");
+function context(toolName: string, args: unknown, cwd: string, callID: string, settings: Partial<PiToolInvocationOptions> = {}) {
+	const invocation = ["read", "ls", "write", "edit"].includes(toolName)
+		? resolvePiToolInvocation(toolName, args, { ...settings, cwd, environment: {} }) : undefined;
+	const action = PI_ACTION_SEMANTICS.buildKey(toolName, args, cwd, "schema", invocation
+		? { fingerprint: stableValueHash(invocation.identity), context: invocation } : undefined);
 	if (!action) throw new Error(`could not build ${toolName} action`);
 	return {
 		cwd,
@@ -412,7 +437,7 @@ function fakeClient(
 		state: "open" as const,
 		lifecycle: "available" as const,
 	}));
-	const payloadWrite = vi.fn(async ({ payloadId }: { readonly payloadId: ReturnType<typeof payloadID> }) => ({
+	const payloadWrite = vi.fn(async ({ payloadId }: Parameters<AgentPosixClient["fs"]["payloadWrite"]>[0]) => ({
 		payloadId,
 		expectedBytes: 1,
 		currentBytes: 1,

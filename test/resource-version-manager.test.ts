@@ -9,6 +9,8 @@ import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts"
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
+import { THINKTHREAD_TOOL_RUNNER_VERSION } from "../src/thinkthread/tool-runner-protocol.ts";
 import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -365,6 +367,8 @@ describe("speculative action resource versions", () => {
 				const output = await invocation.filesystem!(token.view!, { args, callID: "speculate", signal: new AbortController().signal });
 				expect(expected.content.some((item) => item.type === "image")).toBe(true);
 				expect(output.result).toEqual(expected);
+				expect(await runThinkThreadTool({ version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: "read", args,
+					callID: "runner", autoResizeImages, modelSupportsImages }, root)).toEqual(output);
 			}
 		} finally { releaseResourceVersion(token); }
 	});

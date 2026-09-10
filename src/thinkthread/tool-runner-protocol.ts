@@ -2,22 +2,23 @@ import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ToolSettlement } from "../tool-settlement.ts";
 
-export const THINKTHREAD_TOOL_RUNNER_VERSION = 1 as const;
-const THINKTHREAD_TOOL_RUNNER_PREFIX = "PI_SPECULATIVE_ACTION_RESULT_V1:";
+export const THINKTHREAD_TOOL_RUNNER_VERSION = 2 as const;
+const THINKTHREAD_TOOL_RUNNER_PREFIX = "PI_SPECULATIVE_ACTION_RESULT_V2:";
 export const THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES = 1024 * 1024;
 
 export const THINKTHREAD_TOOL_NAMES = ["read", "grep", "find", "ls", "write", "edit"] as const;
 export type ThinkThreadToolName = typeof THINKTHREAD_TOOL_NAMES[number];
 
-export interface ThinkThreadToolRunnerRequestV1 {
+export interface ThinkThreadToolRunnerRequest {
 	readonly version: typeof THINKTHREAD_TOOL_RUNNER_VERSION;
 	readonly tool: ThinkThreadToolName;
 	readonly callID: string;
 	readonly args: unknown;
 	readonly autoResizeImages: boolean;
+	readonly modelSupportsImages: boolean;
 }
 
-interface ThinkThreadToolRunnerResponseV1 {
+interface ThinkThreadToolRunnerResponse {
 	readonly version: typeof THINKTHREAD_TOOL_RUNNER_VERSION;
 	readonly settlement: {
 		readonly result: {
@@ -30,7 +31,7 @@ interface ThinkThreadToolRunnerResponseV1 {
 
 const TOOL_NAMES = new Set<string>(THINKTHREAD_TOOL_NAMES);
 
-export function encodeThinkThreadToolRunnerRequest(request: ThinkThreadToolRunnerRequestV1): Uint8Array {
+export function encodeThinkThreadToolRunnerRequest(request: ThinkThreadToolRunnerRequest): Uint8Array {
 	const bytes = new TextEncoder().encode(JSON.stringify(request));
 	if (bytes.byteLength > THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES) {
 		throw new Error("ThinkThread tool runner request exceeds 1 MiB");
@@ -38,7 +39,7 @@ export function encodeThinkThreadToolRunnerRequest(request: ThinkThreadToolRunne
 	return bytes;
 }
 
-export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThreadToolRunnerRequestV1 {
+export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThreadToolRunnerRequest {
 	if (bytes.byteLength > THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES) {
 		throw new Error("ThinkThread tool runner request exceeds 1 MiB");
 	}
@@ -58,8 +59,8 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 	if (typeof record.callID !== "string" || record.callID.length === 0) {
 		throw new Error("ThinkThread tool runner request callID is invalid");
 	}
-	if (typeof record.autoResizeImages !== "boolean") {
-		throw new Error("ThinkThread tool runner request autoResizeImages is invalid");
+	if (typeof record.autoResizeImages !== "boolean" || typeof record.modelSupportsImages !== "boolean") {
+		throw new Error("ThinkThread tool runner request image options are invalid");
 	}
 	return {
 		version: THINKTHREAD_TOOL_RUNNER_VERSION,
@@ -67,11 +68,12 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 		callID: record.callID,
 		args: record.args,
 		autoResizeImages: record.autoResizeImages,
+		modelSupportsImages: record.modelSupportsImages,
 	};
 }
 
 export function encodeThinkThreadToolRunnerResponse(settlement: ToolSettlement): string {
-	const response: ThinkThreadToolRunnerResponseV1 = {
+	const response: ThinkThreadToolRunnerResponse = {
 		version: THINKTHREAD_TOOL_RUNNER_VERSION,
 		settlement: {
 			result: {
