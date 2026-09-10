@@ -1,5 +1,5 @@
 import { createFauxCore, fauxAssistantMessage, fauxToolCall, type UserMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
 
 const prompt: UserMessage = { role: "user", content: "inspect", timestamp: 0 };
@@ -13,32 +13,69 @@ describe("Actor stream previews", () => {
 		expect(result.callCharacter).toBe(result.endCharacter);
 	});
 
-	it("ignores delimiters and completed fields until the full object arrives", () => {
-		const partial = fauxAssistantMessage(fauxToolCall("read", {}, { id: "chunked-read" }), {
-			stopReason: "toolUse",
-		});
+	it("scans each fragment once and waits for strict complete input or the official end", () => {
+		const call = fauxToolCall("custom", {}, { id: "chunked-call" });
+		const partial = fauxAssistantMessage(call, { stopReason: "toolUse" });
 		const tracker = new ActorStreamPreviewTracker();
-		tracker.observe({ type: "toolcall_start", contentIndex: 0, partial });
-
-		expect(
-			tracker.observe({
-				type: "toolcall_delta",
-				contentIndex: 0,
-				delta: '{"path":"src/a,]',
-				partial,
-			}),
-		).toEqual([]);
-		expect(
-			tracker.observe({
-				type: "toolcall_delta",
-				contentIndex: 0,
-				delta: 'b.ts","offset":',
-				partial,
-			}),
-		).toEqual([]);
-		expect(tracker.observe({ type: "toolcall_delta", contentIndex: 0, delta: "200}", partial })).toEqual([
-			{ type: "call", call: { id: "chunked-read", name: "read", arguments: { path: "src/a,]b.ts", offset: 200 } } },
-		]);
+		const delta = (value: string, contentIndex = 0) =>
+			tracker.observe({ type: "toolcall_delta", contentIndex, delta: value, partial });
+		const end = () => tracker.observe({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial });
+		const preview = (args: Record<string, unknown>, id = call.id) =>
+			({ type: "call", call: { id, name: call.name, arguments: args } });
+		for (const input of [{ path: "src/a,]b.ts", offset: 200 },
+			{ nested: [{ braces: '{}[]', escapes: '\\"\\\\\n\u263a', number: -1.2e30 }, null, true] },
+			{ content: 'code = { text: "quoted", path: "C:\\nested" };\n'.repeat(8192) }]) {
+			for (const chunk of [1, 7, 256]) {
+				tracker.clear();
+				expect(tracker.observe({ type: "toolcall_start", contentIndex: 0, partial }))
+					.toEqual([{ type: "tool", tool: call.name }]);
+				const text = ' \n' + JSON.stringify(input), parse = vi.spyOn(JSON, "parse");
+				try {
+					const previews = [];
+					for (let offset = 0; offset < text.length; offset += chunk) {
+						const hints = delta(text.slice(offset, offset + chunk));
+						if (hints.length) expect(offset + chunk).toBeGreaterThanOrEqual(text.length);
+						previews.push(...hints);
+					}
+					expect(previews).toEqual([preview(input)]);
+					expect(delta(' \n' + ' '.repeat(1024))).toEqual([]);
+					expect(end()).toEqual([]);
+					expect(parse).toHaveBeenCalledTimes(1);
+					expect(parse).toHaveBeenCalledWith(text);
+				} finally { parse.mockRestore(); }
+			}
+		}
+		for (const invalid of ['{"x":1,}', '{"x":[1}', '{"x":"unterminated', '[{}]', 'null', '"{}"', '{}junk']) {
+			tracker.clear();
+			tracker.observe({ type: "toolcall_start", contentIndex: 0, partial });
+			const parse = vi.spyOn(JSON, "parse");
+			try {
+				expect(delta(invalid)).toEqual([]);
+				const attempts = parse.mock.calls.length;
+				for (let index = 0; index < 10; index++) expect(delta(' ')).toEqual([]);
+				expect(parse).toHaveBeenCalledTimes(attempts);
+			} finally { parse.mockRestore(); }
+			expect(end()).toEqual([preview({})]);
+		}
+		tracker.clear();
+		call.id = "";
+		call.name = "";
+		expect(delta('{"late":true}')).toEqual([]);
+		call.id = "late-id";
+		call.name = "custom";
+		expect(delta(' \n')).toEqual([{ type: "tool", tool: call.name }, preview({ late: true })]);
+		expect(end()).toEqual([]);
+		tracker.clear();
+		partial.content.push(fauxToolCall("custom", {}, { id: "second-call" }));
+		delta('{"first":');
+		delta('{"second":', 1);
+		expect(delta('2}', 1)).toEqual([preview({ second: 2 }, "second-call")]);
+		expect(delta('1}')).toEqual([preview({ first: 1 })]);
+		tracker.clear();
+		delta('{"abandoned":');
+		tracker.clear();
+		expect(delta('true}')).toEqual([{ type: "tool", tool: call.name }]);
+		expect(end()).toEqual([preview({})]);
 	});
 });
 
