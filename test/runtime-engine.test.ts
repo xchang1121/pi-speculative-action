@@ -886,9 +886,10 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
-		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup"] as const)(
-	"adopts reconstructed input or owned output coverage only after stable evaluation: %s", async (scenario) => {
+	it.each((["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
+		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup"] as const)
+		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
+	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed");
@@ -938,6 +939,13 @@ describe("structural speculative runtime", () => {
 		projection.canShareInFlight = () => true;
 		if (!outputOnly) projection.projectOutput = () => "changed callback";
 		else { evidence.complete = true; evidence.view.text = "changed by producer"; }
+		const preparation = preview ? fixture.runtime.previewActorCall(actor, controller.signal) : Promise.resolve();
+		if (preview) {
+			if (!running && !outputOnly && scenario !== "legacy-miss") await entered.promise;
+			else await preparation;
+			expect(validate).not.toHaveBeenCalled(); expect(commit).not.toHaveBeenCalled();
+			if (["valid", "input-lookup"].includes(scenario)) { release.arrive(); await preparation; }
+		}
 		const consumed = fixture.runtime.consume(actor, controller.signal);
 		try {
 			if (running) {
@@ -974,7 +982,7 @@ describe("structural speculative runtime", () => {
 						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, scenario === "input-lookup" ? "resource.inputs" : "read.range"]) });
 			}
 		} finally {
-			completion.arrive(); release.arrive(); await consumed;
+			completion.arrive(); release.arrive(); await Promise.all([preparation, consumed]);
 			await fixture.runtime.finishTurn({ ...actor, terminal: true });
 			admission.mockRestore(); adoption.mockRestore();
 		}
@@ -1004,10 +1012,62 @@ describe("structural speculative runtime", () => {
 					await fixture.runtime.finishTurn({ ...call("first"), terminal: false });
 					await fixture.runtime.startTurn({ sessionID: "session", turnID });
 				}
-				expect(await fixture.runtime.consume({ ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) })).toBe(String(offset));
+				const actor = { ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) };
+				await fixture.runtime.previewActorCall(actor);
+				expect(await fixture.runtime.consume(actor)).toBe(String(offset));
 			}
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(fixture.executions()).toBe(1);
 		} finally { await fixture.runtime.dispose(); }
+		expect(disposed).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
+	});
+
+	it.each(["input", "executor", "denied", "closing"])("keeps prepared intent non-authoritative through %s", async (phase) => {
+		const ready = candidateSucceeded(), entered = barrier(), release = barrier();
+		const disposed = vi.fn(), committed = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
+		const gateway = new ToolExecutionGateway<unknown, string>([]), actor = vi.fn(async () => "Actor");
+		let executor = "bound", allowed = true;
+		const query = call("turn", { path: "README.md", offset: 10, limit: 1 });
+		const fixture = harness({
+			source: { id: "source", enabled: () => true, propose: () => plan("source", "inputs", { path: "README.md", offset: 1, limit: 1 }) },
+			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
+			authorize: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
+			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
+				...world("1", { executionFingerprint: "bound", onDispose: disposed, onCommit: committed,
+					validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }) }),
+				reconstruct: async ({ args }) => {
+					const offset = (args as { offset: number }).offset;
+					if (offset === 10) { entered.arrive(); await release.promise; }
+					return String(offset);
+				},
+			})),
+			onEvent: ready.observe,
+		});
+		let preparation: Promise<void> | undefined, closing: Promise<void> | undefined;
+		try {
+			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await ready.promise;
+			preparation = fixture.runtime.previewActorCall(query); await entered.promise;
+			expect(committed).not.toHaveBeenCalled();
+			if (phase === "closing") {
+				closing = fixture.runtime.dispose();
+				expect(await Promise.race([closing.then(() => "closed"), new Promise<string>((resolve) => setImmediate(() => resolve("pending")))])).toBe("pending");
+				expect(disposed).not.toHaveBeenCalled();
+			} else {
+				if (phase === "executor") executor = "rebound";
+				if (phase === "denied") allowed = false;
+				const formal = phase === "input" ? { ...query, input: { ...query.input, offset: 20 } } : query;
+				const delivered = gateway.executeAuthoritative({ tool: formal.tool, input: formal.input }, actor, {
+					reuse: () => fixture.runtime.consume(formal), settled: async (result) => {
+						if (result.status === "succeeded") await fixture.runtime.actual({ ...formal, ...result });
+					},
+				});
+				expect(await delivered).toBe(phase === "input" ? "20" : "Actor");
+				expect(actor).toHaveBeenCalledTimes(phase === "input" ? 0 : 1);
+				expect(committed).toHaveBeenCalledTimes(phase === "input" ? 1 : 0);
+			}
+		} finally {
+			release.arrive(); await Promise.all([preparation, closing]);
+			await fixture.runtime.dispose(); await gateway.dispose();
+		}
 		expect(disposed).toHaveBeenCalledOnce(); expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
 	});
 

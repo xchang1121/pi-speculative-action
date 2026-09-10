@@ -904,6 +904,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		readonly attempt: ActorCallAttempt<Candidate, Output>;
 		readonly ranked: readonly RankedCandidate<Output, StartInput, StateData>[];
 		readonly actorArrivedAt: number;
+		readonly preview?: ActorPreviewRecord;
 		readonly signal?: AbortSignal;
 	};
 
@@ -1818,11 +1819,30 @@ export function makeStructuralSpeculativeActionRuntime<
 			runtimeState.candidates.all(state.sessionID).filter(
 				(candidate) => candidate.origin !== "actor_preview" && candidateWorld(candidate) === undefined,
 			),
-		)[0]?.candidate;
+		)[0];
 		if (preferred) {
-			if (record) record.state = { status: "candidate", candidateID: preferred.id, ownership: "existing" };
-			if (preferred.work.execution.status === "queued") {
-				startQueuedCandidates(state.session, preferred);
+			const { candidate, match } = preferred;
+			if (record) record.state = { status: "candidate", candidateID: candidate.id, ownership: "existing" };
+			if (candidate.work.execution.status === "queued") startQueuedCandidates(state.session, candidate);
+			const execution = candidate.work.execution;
+			if (!record || match.kind === "exact" || candidate.route.reuse !== "shared_result" || execution.status !== "succeeded" ||
+				candidate.resultViews?.has(action.key) || candidate.estimatedBytes + action.key.length * 2 + 64 >= cacheByteLimit(state.settings)) return;
+			await new Promise<void>(setImmediate);
+			if (!active() || state.actorPreviews.get(actualCall.id!) !== record) return;
+			const lease = candidate.work.acquire(`preview:${state.key}:${actualCall.id}`);
+			if (!lease) return;
+			try {
+				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
+				const projected = await projectOutput(candidate, action, execution.output.output, match,
+					runtimeState.projectionRules, { action, args: action.input, callID: actualCall.id!,
+						signal: signal ?? state.generation.signal });
+				if (projected.ok) {
+					candidate.projectionMs += projected.durationMs;
+					if (active() && runtimeState.candidates.find(state.sessionID, candidate.id) === candidate &&
+						retainResultView(candidate, action, projected.output, state.settings)) trimResults(state.session, state.settings);
+				}
+			} finally {
+				lease.release();
 			}
 			return;
 		}
@@ -1932,7 +1952,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
-		const { state, actualCall, actualKey, attempt, ranked, actorArrivedAt, signal } = input;
+		const { state, actualCall, actualKey, attempt, ranked, actorArrivedAt, preview, signal } = input;
 		const matchingCandidates = ranked.map(({ candidate }) => candidate);
 		const stopCandidate = (candidate: Candidate): boolean => {
 			const failure = signal?.aborted
@@ -2060,6 +2080,10 @@ export function makeStructuralSpeculativeActionRuntime<
 					continue;
 				}
 
+				// Join only this exact Actor intent; changed arguments or executors cannot inherit its preparation.
+				if (preview?.state.status === "candidate" && preview.state.candidateID === candidate.id &&
+					(await preview.actionKey)?.key === actualKey.key) await waitForCandidate(preview.task, signal);
+				if (stopCandidate(candidate)) break;
 				// Evaluate sealed data first, then prove freshness once immediately before commit.
 				const projection = await projectOutput(
 					candidate,
@@ -2236,6 +2260,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				attempt,
 				ranked,
 				actorArrivedAt,
+				...(preview ? { preview } : {}),
 				...(signal ? { signal } : {}),
 			});
 			const selected = attempt.selection;

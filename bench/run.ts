@@ -358,9 +358,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
 				if (!currentTurnID) continue;
 				if (preview.type === "tool") {
-					await host.previewActorTool({ turnID: currentTurnID, tool: preview.tool }, signal);
+					void host.previewActorTool({ turnID: currentTurnID, tool: preview.tool }, signal).catch(() => {});
 				} else {
-					await host.previewActorCall(
+					void host.previewActorCall(
 						{
 							turnID: currentTurnID,
 							id: preview.call.id,
@@ -369,7 +369,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 							tools,
 						},
 						signal,
-					);
+					).catch(() => {});
 				}
 			}
 		}
