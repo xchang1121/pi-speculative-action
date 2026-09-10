@@ -3,15 +3,14 @@ import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-	type AgentPosixClient,
-	CONTRACT_FINGERPRINT,
-	type FsDependency,
-	type FsRunKeyParamsV1,
-	type FsRunOutputChunkV1,
-	type FsRunV1,
-	type FsRunWrites,
-	type FsSnapshotId,
+import type {
+	AgentPosixClient,
+	FsDependency,
+	FsRunKeyParamsV1,
+	FsRunOutputChunkV1,
+	FsRunV1,
+	FsRunWrites,
+	FsSnapshotId,
 } from "@thinkthread/agent-posix";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "../agent-execution-world.ts";
 import { asRecord, type ActionKey, PI_ACTION_SEMANTICS } from "../action-semantics.ts";
@@ -31,8 +30,7 @@ import { relativeFilesystemPath, slash } from "../path-utils.ts";
 import { ResourceReadView, ResourceVersionManager, resourceDependencies, type ResourceVersionToken } from "../resource-version.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
-import { DurableFsExecutor } from "./durable-fs.ts";
-import { createThinkThreadClient } from "./control-transport.ts";
+import type { DurableFsExecutor } from "./durable-fs.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
 import { type SnapshotLease, ThinkThreadSnapshotPool } from "./snapshot-pool.ts";
 import {
@@ -103,13 +101,13 @@ export function createThinkThreadExecutionWorld(
 			});
 			runnerFingerprint = attempt;
 		}
-		return [
+		return (await Promise.all([
 			"thinkthread-fs-v2", snapshotInputs ? "sealed-inputs" : "runner",
-			CONTRACT_FINGERPRINT,
+			import("@thinkthread/agent-posix").then((sdk) => sdk.CONTRACT_FINGERPRINT),
 			THINKTHREAD_TOOL_RUNNER_VERSION,
-			await runnerFingerprint,
+			runnerFingerprint,
 			nodePath, settings.autoResizeImages, settings.modelSupportsImages,
-		].join(":");
+		])).join(":");
 	};
 	const execute = async <Result>(
 		context: SpeculativeToolExecutionContext,
@@ -185,6 +183,9 @@ async function prepareWorld(cwd: string, clientFactory: (() => AgentPosixClient)
 	if (configuredFs && path.resolve(configuredFs) !== path.resolve(cwd)) {
 		throw new Error(`Pi cwd ${cwd} does not match THINKTHREAD_FS ${configuredFs}`);
 	}
+	const [{ DurableFsExecutor }, { createThinkThreadClient }] = await Promise.all([
+		import("./durable-fs.ts"), import("./control-transport.ts"),
+	]);
 	const client = clientFactory?.() ?? createThinkThreadClient();
 	const self = await client.selfView();
 	if (!self.capabilities.some((capability) => capability.id === "thinkthread.fs.self" && capability.version === 1)) {

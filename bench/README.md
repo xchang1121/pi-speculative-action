@@ -92,7 +92,7 @@ npm run bench:thinkthread-tools
 
 创建夹具前通过 SDK `selfView/fs.stat` 确认 Runtime，环境变量不足为证。对照 Actor、原生 fallback 和生产 Gateway 的 `fs.run/validate/commit`：同 cwd/path 的完整输出、文件内容/模式须相同，采纳前工作区不变。原生工具仅在 Actor 授权后运行，不能替代失败的首选路线；准备、执行、采纳分别计单样本，poisoned 夹具保留且不再写入。
 
-默认 Linux 根快照可对合格普通文件复用 SDK 不可变输入，仍重绑原版 Pi 操作、核对当前访问权限与祖先路径；目录、超限输入、父 checkpoint 和自定义执行器保留 fs.run。
+SDK 在首次准备或指纹检查时加载；缺失 SDK 时注册成功，自检报告不可用，真实 Actor 仍完成一次原生调用。根普通文件使用封存输入与原版 Pi 绑定；其余输入保留 `fs.run`，两者共用请求/响应预算。
 
 TUI 修改须 Apply；开放 helper 读取后，嵌套 ptrace 仍报 `EPERM`，Bash 提前执行不可用，Actor 回退正确。文件路线、wire 和快照检查不授予嵌套 tracing/handoff、Host Checkpoint/restore、ARM64 或完整进程闭包资格。
 
@@ -134,6 +134,8 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 ## 计时与验收规则
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
+
+独立进程计时从 `execFile` 至真实退出，包含所需导入、首次 SDK 初始化、任务、回收与共同摘要；纯 Actor 加载零个投机模块。SDK 状态检查在父进程中执行，避免观察器强制加载 SDK。夹具、oracle、状态与效果检查均在计时外。三轮旋转保留负收益与波动；构造流、API 为零，不等于自然模型、Pi TUI 或冷 OS 缓存性能。
 
 主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，但必须另查开启系统增加的成本，1×不表示低开销。重叠按任务事件中的 Actor 区间与去重权威计算重建，未采用预测和旧缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
 

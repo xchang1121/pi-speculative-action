@@ -217,7 +217,7 @@ PatternAware 多步模式开启后，每个权威 Actor 动作——包括 Actor
 
 ## ThinkThread Profile（Linux）
 
-可选入口 `./thinkthread-extension` 接入 ThinkThread 的 `read`、`ls`、`write`、`edit`；普通源码入口保留默认 provider，不加载可选 SDK。[alpha4](https://gitcode.com/aideveloper/capsule_public) 提供 ARM64/x86_64 Linux RPM；Windows 使用 WSL2，macOS 使用 Orb。先准备 Runtime 和可访问的 Pi、Node，再安装 Profile：
+可选入口 `./thinkthread-extension` 接入 ThinkThread 的 `read`、`ls`、`write`、`edit`；仅注册时不加载 SDK，首次准备或指纹检查才加载。普通源码入口保留默认 provider。[alpha4](https://gitcode.com/aideveloper/capsule_public) 提供 ARM64/x86_64 Linux RPM；Windows 使用 WSL2，macOS 使用 Orb。先准备 Runtime 和可访问的 Pi、Node，再安装 Profile：
 
 ```sh
 ./scripts/install-thinkthread-profile.sh
@@ -234,7 +234,7 @@ tt pi-speculative-action
 
 `fs.run` 继承封存的 Profile 网络策略（默认 `all`），不虚拟时间/随机数，也不提供单次网络收窄；这里只接入固定原版工具 runner。原生 `grep/find` 的外部配置、预处理器和子进程，以及 Bash，仍须完整进程依赖/效果证明，不能凭工作区或 snapshot 内容相等授权。缺少证明时保留 Actor。SDK 协调持久请求及终态清理，适配器不跨 Pi 进程崩溃保存 request ID。
 
-本机 alpha4 x86_64 已通过 `read/ls/edit` 采纳及生命周期检查；新文件 `write` 因异步 `realpath` 返回 `EACCES` 仍失败并回退 Actor 一次。当前冷图像任务减少了 runner 启动成本，仍慢于纯 Actor，不能据此宣称净加速。TUI 的 Ready 表示连接与路线准备成功，工具资格与性能边界见[真实 Runtime 检查](./bench/README.md#thinkthread-真实-runtime-资格)。
+本机 alpha4 x86_64 的 `read/ls/edit` 采纳通过；新文件 `write` 因异步 `realpath` 返回 `EACCES` 仍回退 Actor 一次。SDK 按需加载减少启动和冷回退成本，仍有相对纯 Actor 的额外开销。TUI 的 Ready 表示连接与路线准备成功，资格与性能边界见[真实 Runtime 检查](./bench/README.md#thinkthread-真实-runtime-资格)。
 
 SDK 归档由 lockfile 和安装器共用；干净 checkout 用 `npm ci` 即可检查、测试、构建和打包，无需兄弟仓或改写 manifest。Profile 默认两个 Drafter 请求、八个并发工具执行，可通过 `/speculative-action` 调整。
 
