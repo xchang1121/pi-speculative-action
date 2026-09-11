@@ -289,10 +289,6 @@ function enterActorAdmission<SessionID, Output, StartInput, StateData>(
 	return { ready, release: unlock };
 }
 
-function turnKey<SessionID>(sessionID: SessionID, turnID: string): string {
-	return JSON.stringify([String(sessionID), turnID]);
-}
-
 function outputIsError(value: unknown): boolean {
 	return Boolean(value && typeof value === "object" && (value as { readonly isError?: unknown }).isError === true);
 }
@@ -528,7 +524,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly launchTimers: Map<string, ReturnType<typeof setTimeout>>;
 	readonly sourceSlots: Set<SourceRequestSlot>;
 	readonly sourceTasks: Set<Promise<unknown>>;
-	readonly turns: Set<string>;
+	readonly turns: Map<string, TurnState<SessionID, Output, StartInput, StateData>>;
 	actorAdmissionTail: Promise<void>;
 	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
@@ -545,7 +541,6 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 }
 
 interface TurnState<SessionID, Output, StartInput, StateData> {
-	readonly key: string;
 	readonly session: SessionState<SessionID, Output, StartInput, StateData>;
 	readonly sessionID: SessionID;
 	readonly turnID: string;
@@ -602,7 +597,6 @@ class StructuralRuntimeState<
 	readonly projectionRules: readonly ActionProjectionRule<Output>[];
 	readonly candidates: CandidateStore<SessionID, CandidateRecord<Output, StartInput, StateData>>;
 	readonly sessions = new Map<SessionID, SessionState<SessionID, Output, StartInput, StateData>>();
-	readonly turns = new Map<string, TurnState<SessionID, Output, StartInput, StateData>>();
 	masterEnabled: boolean | undefined;
 
 	private readonly emitEvent: (event: SpeculativeActionEvent<SessionID>) => Promise<void>;
@@ -652,7 +646,7 @@ class StructuralRuntimeState<
 			launchTimers: new Map(),
 			sourceSlots: new Set(),
 			sourceTasks: new Set(),
-			turns: new Set(),
+			turns: new Map(),
 			actorAdmissionTail: Promise.resolve(),
 			planAdmissionTails: new Map(),
 			settings,
@@ -794,12 +788,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		const definitions = adapter.definitions(input);
 		const names = runtimeState.candidateNames(settings);
 		if (!definitions.length) return;
-		const key = turnKey(input.sessionID, input.turnID);
-		const previous = runtimeState.turns.get(key);
-		if (previous) await finishState(previous, false);
 		const session = runtimeState.sessionFor(input.sessionID, settings);
 		await session.lifecycle.run(async () => {
 			if (signal?.aborted || runtimeState.masterDisabled()) return;
+			const previous = session.turns.get(input.turnID);
+			if (previous) await closeTurn(previous);
 			const data = await adapter.stateData(input);
 			if (signal?.aborted || runtimeState.masterDisabled() || session.lifecycle.sealed) return;
 			session.settings = settings;
@@ -807,7 +800,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			const startedAt = performance.now();
 			session.timeline ??= new TaskTimeline(startedAt);
 			const state: Turn = {
-				key,
 				session,
 				sessionID: input.sessionID,
 				turnID: input.turnID,
@@ -825,8 +817,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				actorDecisionStartedAt: startedAt,
 				lifecycle: "active",
 			};
-			runtimeState.turns.set(key, state);
-			session.turns.add(key);
+			session.turns.set(input.turnID, state);
 			await reconcileStores(state);
 			try {
 				await adapter.onTurnStarted?.({
@@ -1304,11 +1295,10 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const pendingActorTurn = (session: Session): Turn | undefined =>
-		[...session.turns]
-			.map((key) => runtimeState.turns.get(key))
+		[...session.turns.values()]
 			.find(
 				(turn) =>
-					turn?.lifecycle === "active" &&
+					turn.lifecycle === "active" &&
 					turn.actorArrivedAt === undefined &&
 					turn.decisionSequence === session.decisionSequence + 1,
 			);
@@ -1574,7 +1564,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
 		signal?: AbortSignal,
 	): Promise<void> => {
-		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
+		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) return;
 		state.actorToolHints.add(input.tool);
 		await Promise.all(
@@ -1582,7 +1572,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				({ node }) => promoteForActor(state.session, node),
 			),
 		);
-		if (signal?.aborted || state.lifecycle !== "active" || runtimeState.turns.get(state.key) !== state) return;
+		if (signal?.aborted || state.lifecycle !== "active" || state.session.turns.get(state.turnID) !== state) return;
 		startQueuedCandidates(state.session);
 	};
 
@@ -1595,7 +1585,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const previewActorCall = (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
-		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
+		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) {
 			return Promise.resolve();
 		}
@@ -1625,7 +1615,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			!signal?.aborted &&
 			record?.state.status !== "cancelled" &&
 			state.lifecycle === "active" &&
-			runtimeState.turns.get(state.key) === state &&
+			state.session.turns.get(state.turnID) === state &&
 			runtimeState.masterEnabled !== false;
 		const action = await (record?.actionKey ?? actorActionKey(input, actualCall));
 		if (!action || !active()) return;
@@ -1645,7 +1635,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				candidate.resultViews?.has(action.key) || candidate.estimatedBytes + action.key.length * 2 + 64 >= cacheByteLimit(state.settings)) return;
 			await new Promise<void>(setImmediate);
 			if (!active() || state.actorPreviews.get(actualCall.id!) !== record) return;
-			const lease = acquireCandidate(state.session, candidate, `preview:${state.key}:${actualCall.id}`);
+			const lease = acquireCandidate(state.session, candidate, `preview:${callKey(state.turnID, actualCall.id!)}`);
 			if (!lease) return;
 			try {
 				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
@@ -1763,7 +1753,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			capture.route.reuse !== "shared_result" ||
 			captureSignal.aborted ||
 			state.lifecycle !== "active" ||
-			runtimeState.turns.get(state.key) !== state ||
+			state.session.turns.get(state.turnID) !== state ||
 			runtimeState.masterEnabled === false ||
 			!state.actorActions.has(actorAction) ||
 			!actorAction.capture(capture)
@@ -1781,7 +1771,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				? cause("control", "actor_aborted")
 				: runtimeState.masterEnabled === false ||
 					state.lifecycle !== "active" ||
-					runtimeState.turns.get(state.key) !== state
+					state.session.turns.get(state.turnID) !== state
 					? cause("control", "disabled")
 					: undefined;
 			if (!failure) return false;
@@ -1975,7 +1965,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<PreparedActorCall<Output> | undefined> => {
 		const actorArrivedAt = performance.now();
-		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
+		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false)
 			return undefined;
 		const actualCall = adapter.actual(input);
@@ -2003,7 +1993,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const sequence = ++state.session.sequence;
 		const admission = enterActorAdmission(state.session);
 		const actualKey = await actorActionKey(input, actualCall);
-		if (state.lifecycle !== "active" || runtimeState.turns.get(state.key) !== state ||
+		if (state.lifecycle !== "active" || state.session.turns.get(state.turnID) !== state ||
 			signal?.aborted || runtimeState.masterDisabled()) {
 			abandonActorPreview(state, preview, cause("control", signal?.aborted ? "actor_aborted" : "disabled"));
 			admission.release();
@@ -2811,8 +2801,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				// Host lifecycle is outside authoritative settlement.
 			}
 		}
-		runtimeState.turns.delete(state.key);
-		state.session.turns.delete(state.key);
+		state.session.turns.delete(state.turnID);
 		clearActorActions(state);
 	};
 
@@ -2826,16 +2815,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const closeSessionState = async (session: Session, mode: SessionClosureMode, turnID: string): Promise<void> => {
+	const closeSessionState = async (session: Session, mode: SessionClosureMode, turnID = ""): Promise<void> => {
 		const terminal = mode === "terminal";
 		if (terminal && !session.timeline && session.turns.size === 0) return;
 		const failure = cause(
 			"control",
 			terminal ? "terminal_turn" : mode === "disposed" ? "session_disposed" : "disabled",
 		);
-		const closures = [...session.turns].flatMap((key) => {
-			const state = runtimeState.turns.get(key);
-			if (!state) return [];
+		const closures = [...session.turns.values()].flatMap((state) => {
 			const closure = beginTurnClosure(state, { failure, terminal, notifyHost: terminal });
 			return closure ? [closure] : [];
 		});
@@ -2848,11 +2835,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		await waitForSourceTasks(session);
 		await session.effects.flush();
 		for (const closure of closures) await completeTurnClosure(closure);
-		for (const key of session.turns) {
-			const state = runtimeState.turns.get(key);
-			if (state) clearActorActions(state);
-			runtimeState.turns.delete(key);
-		}
+		for (const state of session.turns.values()) clearActorActions(state);
 		session.turns.clear();
 
 		for (const candidate of runtimeState.candidates.values(session.id)) {
@@ -2871,31 +2854,26 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!terminal) await session.lifecycle.drain();
 	};
 
-	const finishState = (state: Turn, terminal: boolean): Promise<void> =>
-		state.session.lifecycle.run(async () => {
-			if (terminal) {
-				await closeSessionState(state.session, "terminal", state.turnID);
-				return;
-			}
-			const closure = beginTurnClosure(state, {
-				failure: cause("control", "turn_finished"),
-				terminal: false,
-				notifyHost: true,
-			});
-			if (!closure) return;
-			await state.session.effects.flush();
-			await completeTurnClosure(closure);
+	/** Called only inside the owning session's lifecycle lane, including replacement on start. */
+	const closeTurn = async (state: Turn): Promise<void> => {
+		const closure = beginTurnClosure(state, {
+			failure: cause("control", "turn_finished"),
+			terminal: false,
+			notifyHost: true,
 		});
+		if (!closure) return;
+		await state.session.effects.flush();
+		await completeTurnClosure(closure);
+	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
 		const session = runtimeState.sessions.get(input.sessionID);
 		if (!session) return;
-		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
-		if (state) {
-			await finishState(state, input.terminal === true);
-		} else if (input.terminal === true) {
-			await session.lifecycle.run(() => closeSessionState(session, "terminal", input.turnID));
-		}
+		await session.lifecycle.run(() => {
+			if (input.terminal === true) return closeSessionState(session, "terminal", input.turnID);
+			const state = session.turns.get(input.turnID);
+			return state && closeTurn(state);
+		});
 	};
 
 	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
@@ -2909,14 +2887,14 @@ export function makeStructuralSpeculativeActionRuntime<
 	const disableSession = async (sessionID: SessionID): Promise<void> => {
 		const session = runtimeState.sessions.get(sessionID);
 		if (!session) return;
-		await session.lifecycle.run(() => closeSessionState(session, "disabled", String(sessionID)));
+		await session.lifecycle.run(() => closeSessionState(session, "disabled"));
 	};
 
 	const disposeSession = async (sessionID: SessionID): Promise<void> => {
 		const session = runtimeState.sessions.get(sessionID);
 		if (!session) return;
 		await session.lifecycle.close(async () => {
-			await closeSessionState(session, "disposed", String(sessionID));
+			await closeSessionState(session, "disposed");
 			await session.effects.close();
 			await session.events.close({ drain: false });
 			runtimeState.sessions.delete(sessionID);
@@ -2934,9 +2912,6 @@ export function makeStructuralSpeculativeActionRuntime<
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
 		const selectedSessions =
 			sessionID === undefined ? [...runtimeState.sessions.values()] : maybe(runtimeState.sessions.get(sessionID));
-		const selectedTurns = [...runtimeState.turns.values()].filter(
-			(turn) => sessionID === undefined || turn.sessionID === sessionID,
-		);
 		const candidates =
 			sessionID === undefined
 				? runtimeState.candidates.allValues()
@@ -2944,7 +2919,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
 		const telemetry = selectedSessions.map((session) => session.events.snapshot());
 		return {
-			activeTurns: selectedTurns.length,
+			activeTurns: selectedSessions.reduce((total, session) => total + session.turns.size, 0),
 			exclusiveCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "exclusive").length,
 			sharedCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "shared").length,
 			pendingPredictions: selectedSessions.reduce(

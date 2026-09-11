@@ -24,12 +24,12 @@ import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 
-interface Start {
-	readonly sessionID: string;
+interface Start<SessionID = string> {
+	readonly sessionID: SessionID;
 	readonly turnID: string;
 }
 
-interface Call extends Start {
+interface Call<SessionID = string> extends Start<SessionID> {
 	readonly id?: string;
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
@@ -61,7 +61,7 @@ const MUTATION_ROUTE: SpeculativeExecutionRoute = {
 	fingerprint: "test-world:v1",
 };
 
-type Source = SpeculativePlanSource<string, string, Start, Call, { readonly cwd: string }>;
+type Source<SessionID = string> = SpeculativePlanSource<SessionID, string, Start<SessionID>, Call<SessionID>, { readonly cwd: string }>;
 
 function plan(source: string, proposalID: string, input: Record<string, unknown>) {
 	return {
@@ -122,9 +122,10 @@ function validResource() {
 	return { status: "valid" as const, metrics: zeroValidationMetrics() };
 }
 
-function harness(input: {
-	readonly source: Source;
+function harness<SessionID = string>(input: {
+	readonly source: Source<SessionID>;
 	readonly settings?: () => SpeculativeActionSettings;
+	readonly stateData?: (input: Start<SessionID>) => Promise<{ readonly cwd: string }>;
 	readonly execute?: (
 		tool: string,
 		input: Readonly<Record<string, unknown>>,
@@ -137,9 +138,9 @@ function harness(input: {
 	readonly preflight?: (signal: AbortSignal, candidate: SpeculativeDraftCandidate) => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly authorize?: () => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly projection?: ActionProjectionRule<string>;
-	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
-	readonly onTurnFinished?: (input: { readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
-	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
+	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => void | Promise<void>;
+	readonly onTurnFinished?: (input: { readonly startInput: Start<SessionID>; readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
+	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => void | Promise<void>;
 	readonly actionKey?: (
 		tool: string,
 		args: unknown,
@@ -152,13 +153,13 @@ function harness(input: {
 	) => AuthoritativeResultCapture<string> | undefined | Promise<AuthoritativeResultCapture<string> | undefined>;
 	readonly rejectCandidateOutput?: (output: string) => string | undefined;
 }) {
-	const events: SpeculativeActionEvent<string>[] = [];
+	const events: SpeculativeActionEvent<SessionID>[] = [];
 	let executions = 0;
-	const runtime = makeStructuralSpeculativeActionRuntime<string, string, Start, Call, Call, { readonly cwd: string }>({
+	const runtime = makeStructuralSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
 		sources: [input.source],
 		settings: input.settings ?? (() => settings),
 		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
-		stateData: () => ({ cwd: "/workspace" }),
+		stateData: input.stateData ?? (() => ({ cwd: "/workspace" })),
 		actionKey: input.actionKey ?? ((tool, args) => buildPiActionKey(tool, args, "/workspace")),
 		resolveExecution: ({ tool }) =>
 			input.resolveExecution
@@ -209,7 +210,7 @@ function harness(input: {
 	return { runtime, events, executions: () => executions };
 }
 
-async function runFallback(fixture: ReturnType<typeof harness>, actor: Call, durationMs = 1, output = "actor"): Promise<void> {
+async function runFallback(fixture: ReturnType<typeof harness<string>>, actor: Call, durationMs = 1, output = "actor"): Promise<void> {
 	const prepared = await fixture.runtime.prepareActorCall(actor);
 	expect(prepared).toBeDefined();
 	expect(prepared?.output).toBeUndefined();
@@ -221,6 +222,62 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it.each(["number-string", "objects", "symbols", "strings"])("owns turns and cached results by the actual session identity: %s", async (kind) => {
+		const ids: unknown[] = kind === "number-string" ? [1, "1"] : kind === "objects" ? [{}, {}] :
+			kind === "symbols" ? [Symbol("session"), Symbol("session")] : ["A", "B"];
+		const calls = ids.map((sessionID): Call<unknown> => ({ ...call("same-turn"), sessionID }));
+		const closed: unknown[] = [], disposed: string[] = [];
+		const fixture = harness<unknown>({ source: { id: "none", enabled: () => false, propose: () => undefined },
+			onTurnFinished: ({ startInput }) => { closed.push(startInput.sessionID); },
+			captureAuthoritativeResult: (action) => ({ route: RESOURCE_ROUTE, dispose: () => {},
+				seal: (output) => world(output, { executionFingerprint: action.executionFingerprint, validate: async () => validResource(),
+					onDispose: () => { disposed.push(output); } }) }) });
+		try {
+			for (const [index, actor] of calls.entries()) {
+				await fixture.runtime.startTurn(actor);
+				const prepared = await fixture.runtime.prepareActorCall(actor);
+				expect(prepared).toBeDefined(); expect(prepared?.output).toBeUndefined();
+				await prepared?.settle(500, `session-${index}`);
+			}
+			expect(closed).toEqual([]);
+			expect(calls.map(({ sessionID }) => fixture.runtime.inspect(sessionID).activeTurns)).toEqual([1, 1]);
+			for (const [index, actor] of calls.entries())
+				expect((await fixture.runtime.prepareActorCall(actor))?.output).toBe(`session-${index}`);
+			await fixture.runtime.finishTurn(calls[0]!);
+			expect(calls.map(({ sessionID }) => fixture.runtime.inspect(sessionID).activeTurns)).toEqual([0, 1]);
+			await fixture.runtime.disposeSession(ids[0]);
+			expect(disposed).toEqual(["session-0"]);
+			expect((await fixture.runtime.prepareActorCall(calls[1]!))?.output).toBe("session-1");
+			await fixture.runtime.finishTurn(calls[1]!);
+			expect(closed.map((id) => ids.indexOf(id))).toEqual([0, 1]);
+		} finally { await fixture.runtime.dispose(); }
+		expect(disposed).toEqual(["session-0", "session-1"]);
+	});
+
+	it("serializes replacement with registration and closes the previous generation before launching another", async () => {
+		const calls = [call("same-turn"), call("same-turn")], preparing = barrier(), gate = barrier();
+		const closed: Start[] = [], predicted: Start[] = [], prediction = barrier();
+		const fixture = harness({
+			source: { id: "source", enabled: () => true, propose: ({ startInput }) => {
+				predicted.push(startInput); prediction.arrive(); return undefined;
+			} },
+			stateData: async (input) => { if (input === calls[0]) { preparing.arrive(); await gate.promise; } return { cwd: "/workspace" }; },
+			onTurnFinished: ({ startInput }) => { closed.push(startInput); },
+		});
+		try {
+			const first = fixture.runtime.startTurn(calls[0]!); await preparing.promise;
+			const second = fixture.runtime.startTurn(calls[1]!); gate.arrive();
+			await Promise.all([first, second]);
+			expect(closed.map((input) => calls.findIndex((call) => call === input))).toEqual([0]);
+			await prediction.promise;
+			expect(predicted).toHaveLength(1); expect(predicted[0]).toBe(calls[1]);
+			expect(fixture.runtime.inspect().activeTurns).toBe(1);
+			await fixture.runtime.finishTurn(calls[1]!);
+			expect(closed.map((input) => calls.findIndex((call) => call === input))).toEqual([0, 1]);
+			expect(fixture.runtime.inspect().activeTurns).toBe(0);
+		} finally { gate.arrive(); await fixture.runtime.dispose(); }
+	});
+
 	it.each(["unique", "duplicate", "absent", "same-input"] as const)("keeps result evidence with its execution handle through repeated and late settlement: %s", async (ids) => {
 		for (const order of [[0, 1], [1, 0]]) {
 			const seals: [unknown, string][] = [], disposals: unknown[] = [];
