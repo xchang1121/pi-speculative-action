@@ -33,7 +33,7 @@ type ActorActionState<Candidate extends { readonly id: string }, Output> =
 	  }
 	| { readonly status: "settled"; readonly value: ActorActionSettlement };
 
-/** One owner for matching, the committed selection, admission and exactly-once settlement. */
+/** One owner for matching, the committed selection and exactly-once settlement. */
 export class ActorAction<Candidate extends { readonly id: string } = { readonly id: string }, Output = unknown> {
 	readonly identity: ActorActionIdentity;
 	readonly tool: string;
@@ -41,7 +41,6 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private readonly rejections: CandidateRejection[] = [];
 	private stateValue: ActorActionState<Candidate, Output> = Object.freeze({ status: "matching" });
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
-	private releaseActorAdmission?: () => void;
 	private resultCapture?: AuthoritativeResultCapture<Output>;
 
 	constructor(input: {
@@ -49,13 +48,11 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		readonly tool: string;
 		readonly actionKey?: ActionKey;
 		readonly fallback: ResolutionCause;
-		readonly releaseActorAdmission: () => void;
 	}) {
 		this.identity = Object.freeze({ ...input.identity });
 		this.tool = input.tool;
 		this.actionKey = input.actionKey;
 		this.fallbackValue = Object.freeze({ cause: input.fallback });
-		this.releaseActorAdmission = input.releaseActorAdmission;
 	}
 
 	get state(): ActorActionState<Candidate, Output> {
@@ -161,17 +158,6 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 				: {}),
 		});
 		return { status: "rejected", ...this.fallbackValue };
-	}
-
-	releaseAdmission(): void {
-		const release = this.releaseActorAdmission;
-		this.releaseActorAdmission = undefined;
-		release?.();
-	}
-
-	close(): void {
-		this.deferToFallback();
-		this.releaseAdmission();
 	}
 
 	settleActor(

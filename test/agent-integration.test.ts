@@ -117,14 +117,19 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
-	it("owns each concurrent native call independently of caller IDs and completion order", async () => {
+	it("owns concurrent binding and completion independently of caller IDs", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		await writeFile(path.join(cwd, "other.txt"), "different content");
 		for (const ids of ["unique", "duplicate", "absent"]) for (const order of [[0, 1], [1, 0]]) {
 			const gates = [0, 1].map(() => ({ entered: deferred(), done: deferred() })), feedback: number[] = [];
+			const binding = deferred(), bindingEntered = deferred();
 			const identities: object[] = [], sameIdentity: boolean[] = [];
 			const complete = vi.fn(async () => { throw new Error("unexpected inference"); });
 			const host = createSpeculativeActionHost("session", { cwd, complete, executionWorlds: [],
+				resolveInvocation: async (_tool, input) => {
+					if ((input as { path: string }).path === "notes.txt") { bindingEntered.resolve(); await binding.promise; }
+					return undefined;
+				},
 				getSettings: () => ({ ...settings(), drafterEnabled: false }),
 				patternStore: new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, enabled: false }),
 				onActorActionMaterialized: ({ identity }) => { identities.push(identity); },
@@ -142,8 +147,14 @@ describe("speculative action host", () => {
 							native(index); const output = await tool.execute(String(index), operation.input as never, operation.signal);
 							gates[index]!.entered.resolve(); await gates[index]!.done.promise; return output;
 						}));
-					await gates[index]!.entered.promise;
 				}
+				await bindingEntered.promise;
+				const deadline = deferred<boolean>(), timer = setTimeout(() => deadline.resolve(false), 2000);
+				try {
+					expect(await Promise.race([gates[1]!.entered.promise.then(() => true), deadline.promise])).toBe(true);
+				} finally { clearTimeout(timer); }
+				expect(native.mock.calls).toEqual([[1]]);
+				binding.resolve(); await Promise.all(gates.map(({ entered }) => entered.promise));
 				for (const index of order) {
 					gates[index]!.done.resolve();
 					expect(await results[index]).toEqual(await tool.execute("oracle", inputs[index]!));
@@ -151,8 +162,9 @@ describe("speculative action host", () => {
 				await host.finishTurn("turn-1", true);
 				expect(feedback).toEqual(order.map((index) => index + 1));
 				expect(sameIdentity).toEqual([true, true]);
-				expect(native.mock.calls).toEqual([[0], [1]]); expect(complete).not.toHaveBeenCalled();
+				expect(native.mock.calls).toEqual([[1], [0]]); expect(complete).not.toHaveBeenCalled();
 			} finally {
+				binding.resolve();
 				for (const gate of gates) gate.done.resolve();
 				await Promise.allSettled(results); await host.dispose();
 			}
@@ -418,7 +430,7 @@ describe("speculative action host", () => {
 	});
 
 	it.each([false, true])("only promotes proven host observations, independently of prediction (ThinkThread=%s)", async (thinkthread) => {
-		const cwd = await temporaryWorkspace(path.join(process.cwd(), "bench")), file = path.join(cwd, "notes.txt");
+		const cwd = await temporaryWorkspace(process.env.THINKTHREAD_FS ?? path.join(process.cwd(), "bench")), file = path.join(cwd, "notes.txt");
 		let tools: string[] = [];
 		const tool = createReadTool(cwd);
 		const clientFactory = vi.fn(() => { throw new Error("Actor observation must not initialize the SDK"); });

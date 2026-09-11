@@ -279,17 +279,6 @@ function closeActorPhase<SessionID, Output, StartInput, StateData>(
 	turn.session.timeline?.recordActor(turn.startedAt, turn.actorPhaseCompletedAt);
 }
 
-function enterActorAdmission<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-): { readonly ready: Promise<void>; readonly release: () => void } {
-	const ready = session.actorAdmissionTail;
-	let unlock!: () => void;
-	session.actorAdmissionTail = new Promise<void>((resolve) => {
-		unlock = resolve;
-	});
-	return { ready, release: unlock };
-}
-
 function outputIsError(value: unknown): boolean {
 	return Boolean(value && typeof value === "object" && (value as { readonly isError?: unknown }).isError === true);
 }
@@ -526,7 +515,6 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly sourceSlots: Set<SourceRequestSlot>;
 	readonly sourceTasks: Set<Promise<unknown>>;
 	readonly turns: Map<string, TurnState<SessionID, Output, StartInput, StateData>>;
-	actorAdmissionTail: Promise<void>;
 	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
 	timeline?: TaskTimeline;
@@ -648,7 +636,6 @@ class StructuralRuntimeState<
 			sourceSlots: new Set(),
 			sourceTasks: new Set(),
 			turns: new Map(),
-			actorAdmissionTail: Promise.resolve(),
 			planAdmissionTails: new Map(),
 			settings,
 			sequence: 0,
@@ -1843,7 +1830,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					);
 					startQueuedCandidates(state.session, candidate);
 				}
-				actorAction.releaseAdmission();
 				const authorization = await authorize(
 					state,
 					input.consumeInput,
@@ -1996,12 +1982,10 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 		}
 		const sequence = ++state.session.sequence;
-		const admission = enterActorAdmission(state.session);
 		const actualKey = await actorActionKey(input, actualCall);
 		if (state.lifecycle !== "active" || state.session.turns.get(state.turnID) !== state ||
 			signal?.aborted || runtimeState.masterDisabled()) {
 			abandonActorPreview(state, preview, cause("control", signal?.aborted ? "actor_aborted" : "disabled"));
-			admission.release();
 			return undefined;
 		}
 		const actorAction = new ActorAction<Candidate, Output>({
@@ -2010,7 +1994,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			tool: actualCall.tool,
 			...(actualKey ? { actionKey: actualKey } : {}),
 			fallback: cause("matching", "no_candidate"),
-			releaseActorAdmission: admission.release,
 		});
 		const identity = actorAction.identity;
 		state.actorActions.add(actorAction);
@@ -2034,7 +2017,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 		}
 
-		await admission.ready;
 		try {
 			if (!actualKey) {
 				const failure = cause("matching", "action_not_keyable");
@@ -2113,7 +2095,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			const effect = runtimeState.semantics.effect(actualKey);
 			preemptForActor(state.session, actionResourceProfile(effect), state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
-			actorAction.releaseAdmission();
 			if (adapter.captureAuthoritativeResult && effect === "observation") {
 				const startedAt = performance.now();
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
@@ -2122,7 +2103,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			return Object.freeze(prepared);
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
-			actorAction.close();
+			actorAction.deferToFallback();
 		}
 	};
 
