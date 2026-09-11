@@ -1,10 +1,34 @@
+import { deferred } from "./async.ts";
 import { describe, expect, it } from "vitest";
 import { Worker } from "node:worker_threads";
 import process from "node:process";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import type { ToolFilesystemOperations } from "../src/tool-settlement.ts";
 
 describe("stock Pi invocation identity", () => {
+	it.each(["read", "ls", "write", "edit"] as const)("borrows only the filesystem capabilities needed by %s", async (tool) => {
+		const allowed = { read: ["access", "readFile"], ls: ["exists", "stat", "readdir"],
+			write: ["writeFile", "mkdir"], edit: ["access", "readFile", "writeFile"] }[tool];
+		const written: string[] = [];
+		const operations: ToolFilesystemOperations = {
+			access: async () => {}, readFile: async () => Buffer.from("before\n"),
+			exists: async () => true, stat: async () => ({ isDirectory: () => true }), readdir: async () => [],
+			writeFile: async (_target, value) => { written.push(String(value)); }, mkdir: async () => {},
+		};
+		const view = new Proxy(operations, { get(target, key, receiver) {
+			if (typeof key !== "string" || !allowed.includes(key)) throw new Error(`Capability was not granted: ${String(key)}`);
+			return Reflect.get(target, key, receiver);
+		} });
+		const args = { path: "owned.txt", ...(tool === "write" ? { content: "after" } : {}),
+			...(tool === "edit" ? { edits: [{ oldText: "before", newText: "after" }] } : {}) };
+		const invocation = resolvePiToolInvocation(tool, args, { cwd: process.cwd(), environment: {} })!;
+		const output = await invocation.filesystem!(view, { callID: tool, args, signal: new AbortController().signal });
+		expect(output.isError).toBe(false);
+		expect(output.result.content.length).toBeGreaterThan(0);
+		expect(written).toEqual(tool === "write" ? ["after"] : tool === "edit" ? ["after\n"] : []);
+	});
+
 	it("binds exact execution semantics independently of call arguments and owns filesystem completion", async () => {
 		const options = { cwd: process.cwd(), environment: { PATH: "tools", BENCHMARK: "true" },
 			shellPath: process.execPath, shellCommandPrefix: "set -e" };
@@ -78,10 +102,4 @@ async function verifyFilesystemCompletion(invocation: NonNullable<ReturnType<typ
 		await Promise.all(workers.map(worker => worker.terminate()));
 		await Promise.all(running.map(request => request.output));
 	}
-}
-
-function deferred<Value>() {
-	let resolve!: (value: Value) => void;
-	const promise = new Promise<Value>((done) => { resolve = done; });
-	return { promise, resolve };
 }

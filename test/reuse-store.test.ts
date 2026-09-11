@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { mkdtemp, rm, unlink, utimes } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
 import os from "node:os";
@@ -72,11 +73,10 @@ describe("persistent provenance store", () => {
 		await utimes(artifactPaths[1]!, future, future);
 		const second = completed(secondArtifact, 789, "second");
 		const { readdir, rm: remove } = await vi.importActual<typeof filesystem>("node:fs/promises");
-		let enter!: () => void, resume!: () => void, rejectEntered!: () => void;
 		let armed = true, suspended: Promise<unknown> | undefined;
 		const failure = new Error("maintenance IO failure");
-		const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { resume = resolve; });
-		const failureStarted = new Promise<void>((resolve) => { rejectEntered = resolve; });
+		const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: resume } = deferred();
+		const { promise: failureStarted, resolve: rejectEntered } = deferred();
 		const fail = async () => { await entered; rejectEntered(); throw failure; };
 		const hold = <Value,>(operation: () => Promise<Value>): Promise<Value> => {
 			armed = false; enter(); const task = gate.then(operation); suspended = task; return task;
@@ -101,7 +101,7 @@ describe("persistent provenance store", () => {
 			await entered; collection = collect.mock.results[0]!.value;
 			retirement = Promise.all([gateway.dispose(), gateway.dispose()]).then(() => { closed(); });
 			if (phase !== "held") await failureStarted;
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await nextTurn();
 			expect(await store.get(second.id)).toEqual(second);
 			expect(publish).toHaveBeenCalledOnce(); expect(collect).toHaveBeenCalledOnce();
 			expect(closed).not.toHaveBeenCalled();

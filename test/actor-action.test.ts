@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
@@ -112,10 +113,7 @@ describe("PostSettlementQueue", () => {
 
 describe("BoundedEventQueue", () => {
 	it("bounds stalled observers, preserves order, and resumes after failures", async () => {
-		let release!: () => void;
-		const blocked = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		const { promise: blocked, resolve: release } = deferred();
 		const delivered: number[] = [];
 		const failures = vi.fn();
 		const queue = new BoundedEventQueue<number>(4, async (event) => {

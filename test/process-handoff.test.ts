@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
@@ -193,14 +194,4 @@ function processCertificate(oneShot: boolean) {
 		dependencyCertificate: { complete: true, dependencies: [], taints: oneShot ? ["random"] : [] },
 		result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
 	});
-}
-
-function deferred<T>() {
-	let resolve!: (value: T | PromiseLike<T>) => void;
-	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<T>((accept, fail) => {
-		resolve = accept;
-		reject = fail;
-	});
-	return { promise, resolve, reject };
 }

@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { cause } from "../src/settlement.ts";
 import { runSourceRequest, SourceGeneration } from "../src/source-request.ts";
@@ -30,9 +31,8 @@ describe("source request ownership", () => {
 			for (const mode of ["expired", "queued", "abort", "timeout"] as const) for (const late of
 				(mode === "expired" || mode === "queued" ? ["resolve"] : ["resolve", "reject"])) {
 				const parent = new AbortController(), generation = new SourceGeneration(parent.signal);
-				let release!: (value: string[]) => void, reject!: (error: unknown) => void, enter!: () => void;
-				const producer = new Promise<string[]>((resolve, fail) => { release = resolve; reject = fail; });
-				const entered = new Promise<void>((resolve) => { enter = resolve; });
+				const { promise: producer, resolve: release, reject } = deferred<string[]>();
+				const { promise: entered, resolve: enter } = deferred();
 				const count = vi.fn((value: string[]) => value.length); let signal: AbortSignal | undefined;
 				if (mode === "expired") generation.expire(cause("control", "turn_finished"));
 				const pending = runSourceRequest({ request, generation, timeoutMs: 10, count,

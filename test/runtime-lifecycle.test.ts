@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { RuntimeLifecycleLane } from "../src/runtime-lifecycle.ts";
 
@@ -19,17 +20,14 @@ describe("RuntimeLifecycleLane", () => {
 	});
 
 	it.each([false, true])("seals synchronously and coalesces close and release callers (dispose fails=%s)", async (fails) => {
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		const { promise: gate, resolve: release } = deferred();
 		const close = vi.fn(async () => {
 			await gate;
 		});
 		const late = vi.fn();
 		const lane = new RuntimeLifecycleLane();
-		let finishResource!: () => void, nested: Promise<void> | undefined, reenter = true, closed = false;
-		const resourceGate = new Promise<void>((resolve) => { finishResource = resolve; });
+		let nested: Promise<void> | undefined, reenter = true, closed = false;
+		const { promise: resourceGate, resolve: finishResource } = deferred();
 		const resource = { dispose: vi.fn(async () => {
 			if (reenter) { reenter = false; nested = lane.release(resource); }
 			await resourceGate;
@@ -47,7 +45,7 @@ describe("RuntimeLifecycleLane", () => {
 			expect(afterSeal).toBe(first);
 			expect(late).not.toHaveBeenCalled();
 			release();
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await nextTurn();
 			expect(closed).toBe(false);
 			expect(resource.dispose).toHaveBeenCalledOnce();
 			expect(firstRelease).toBe(secondRelease);

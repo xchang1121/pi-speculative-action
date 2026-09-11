@@ -1,3 +1,4 @@
+import { deferred as barrier } from "./async.ts";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -309,10 +310,4 @@ async function workspace(): Promise<string> {
 	roots.push(cwd);
 	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\nthree\n", "utf8");
 	return cwd;
-}
-
-function barrier() {
-	let resolve!: () => void;
-	const promise = new Promise<void>((done) => { resolve = done; });
-	return { promise, resolve };
 }

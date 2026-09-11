@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -105,9 +106,9 @@ describe("speculative action resource versions", () => {
 			const manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
 			const handle = await fs.open(path.join(root, "value"), "r"), broken = phase === "pending" ? undefined : await fs.open(path.join(root, "broken"), "r");
 			const read = handle.read.bind(handle), failure = new Error("injected read failure");
-			let enter!: () => void, resume!: () => void, fail!: () => void, settled = false;
-			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { resume = resolve; });
-			const failed = new Promise<void>((resolve) => { fail = resolve; });
+			let settled = false;
+			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: resume } = deferred();
+			const { promise: failed, resolve: fail } = deferred();
 			const open = vi.spyOn(fs, "open").mockImplementation(async (file) => file === path.join(root, "value") ? handle : broken!);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (...args: Parameters<typeof handle.read>) => {
 				enter(); await gate; return read(...args);
@@ -131,7 +132,7 @@ describe("speculative action resource versions", () => {
 					await expect(token.view!.readFile(path.join(root, "value"))).rejects.toThrow("disposed");
 				}
 				else await failed;
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect({ settled, released: idle.mock.calls.length, reading: handle.fd >= 0 }, phase).toEqual({ settled: false, released: 0, reading: true });
 				resume();
 				if (token) expect(await pending).toEqual(["rejected", "rejected"]); else expect(await pending).toBe(failure);

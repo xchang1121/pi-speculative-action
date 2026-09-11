@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { createHash } from "node:crypto";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
@@ -594,10 +595,7 @@ describe("self-speculation control plane", () => {
 
 	it("waits for an in-flight sidecar fork before clearing its request", async () => {
 		const requests: CapturedRequest[] = [];
-		let releaseFork!: () => void;
-		const forkGate = new Promise<void>((resolve) => {
-			releaseFork = resolve;
-		});
+		const { promise: forkGate, resolve: releaseFork } = deferred();
 		const coordinator = coordinatorFixture(requests, { forkTransport: "sidecar" }, ["actor-request"], async (request) => {
 			if (request.path === SELF_SPECULATION_DEFAULTS.forkPath) await forkGate;
 		});

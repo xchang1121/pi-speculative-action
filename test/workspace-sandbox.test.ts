@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -45,8 +46,8 @@ describe("workspace-branch ExecutionWorld", () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
 			const root = await temporaryRoot("cancel-prepare"), controller = new AbortController();
-			let entered!: () => void, release!: () => void, workspaces = 0, captures = 0;
-			const started = new Promise<void>((resolve) => { entered = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			let workspaces = 0, captures = 0;
+			const { promise: started, resolve: entered } = deferred(), { promise: gate, resolve: release } = deferred();
 			const capture = ResourceVersionManager.prototype.capture;
 			const observer = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementation(async function (this: ResourceVersionManager, ...args) {
 				captures++;
@@ -545,10 +546,8 @@ describe("workspace-branch ExecutionWorld", () => {
 				output: settlement(after.trim()),
 				changes: [fileTransition(root, "value.txt", "base\n", after)],
 			}));
-
-			let enterBlock!: () => void;
 			let releaseBlock!: () => void;
-			const entered = new Promise<void>((resolve) => (enterBlock = resolve));
+			const { promise: entered, resolve: enterBlock } = deferred();
 			const blocker = withFileMutationQueue(target, () => {
 				enterBlock();
 				return new Promise<void>((resolve) => (releaseBlock = resolve));
@@ -773,8 +772,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(sandbox.prepare(root, { signal: controller.signal })).rejects.toThrow("cancelled");
 			for (const cancelled of [false, true]) {
 				await fs.writeFile(target, "before");
-				let enter!: () => void, unblock!: () => void;
-				const entered = new Promise<void>((resolve) => { enter = resolve; }), release = new Promise<void>((resolve) => { unblock = resolve; });
+				const { promise: entered, resolve: enter } = deferred(), { promise: release, resolve: unblock } = deferred();
 				const abort = new AbortController();
 				let outlet: Parameters<NonNullable<ToolInvocation["filesystem"]>>[0];
 				vi.mocked(writeFile).mockImplementation(async (file, data, options) => {

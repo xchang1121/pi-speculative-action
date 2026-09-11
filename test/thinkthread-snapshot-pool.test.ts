@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { parseFsSnapshotId, parseThinkThreadId } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableFsExecutor } from "../src/thinkthread/durable-fs.ts";
@@ -8,10 +9,7 @@ const scope = { sessionID: "session", turnID: "turn-1" };
 
 describe("ThinkThread snapshot pool", () => {
 	it("does not clear a replacement BASE when an invalidated creation fails", async () => {
-		let rejectFirst!: (error: Error) => void;
-		const firstSnapshot = new Promise<never>((_resolve, reject) => {
-			rejectFirst = reject;
-		});
+		const { promise: firstSnapshot, reject: rejectFirst } = deferred<never>();
 		const snapshotCreate = vi
 			.fn()
 			.mockImplementationOnce(() => firstSnapshot)

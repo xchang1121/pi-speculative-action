@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
@@ -86,9 +87,9 @@ describe("Linux process ExecutionWorld", () => {
 				}
 				expect(commit).toHaveBeenCalledOnce();
 			}
-			let release!: () => void, started!: () => void, closed = false;
-			const entered = new Promise<void>((resolve) => { started = resolve; });
-			const completion = new Promise<void>((resolve) => { release = resolve; });
+			let closed = false;
+			const { promise: entered, resolve: started } = deferred();
+			const { promise: completion, resolve: release } = deferred();
 			const executor = boundary.executor({ execute: async () => {
 				started(); await completion; return { exitCode: 0 };
 			} }, { sourceRoot: root, realShell: "/bin/bash", decide: async () => ({ kind: "continue" }) });
@@ -96,7 +97,7 @@ describe("Linux process ExecutionWorld", () => {
 			await entered;
 			const closing = boundary.close().then(() => { closed = true; });
 			try {
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect(closed, "close must wait for the owned executor and concurrent callers").toBe(false);
 				const concurrent = boundary.close().then(() => { expect(closed).toBe(true); });
 				release();
@@ -112,8 +113,7 @@ describe("Linux process ExecutionWorld", () => {
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");
 		const host = { execute: vi.fn(async () => ({ exitCode: 0 })) };
 		const held = { execute: vi.fn(async () => ({ exitCode: 0 })) }, close = vi.fn(async () => {});
-		let release!: () => void;
-		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const { promise: pending, resolve: release } = deferred();
 		const opening = vi.spyOn(LinuxHeldExecBoundary, "open").mockImplementation(async () => {
 			await pending;
 			return { shellPath: fixture.shellPath, executor: () => held, close } as unknown as LinuxHeldExecBoundary;
@@ -266,10 +266,10 @@ describe("Linux process ExecutionWorld", () => {
 					if (failure === "nested-seal") closeTasks.push(first, close());
 					resolve();
 				}; });
-				let reachCapture!: () => void, releaseCapture!: () => void, captureCleaned!: () => void, traceRoot: string | undefined, socketRemoved = false;
-				const captureStarted = new Promise<void>((resolve) => { reachCapture = resolve; });
-				const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
-				const captureCleanup = new Promise<void>((resolve) => { captureCleaned = resolve; });
+				let traceRoot: string | undefined, socketRemoved = false;
+				const { promise: captureStarted, resolve: reachCapture } = deferred();
+				const { promise: captureGate, resolve: releaseCapture } = deferred();
+				const { promise: captureCleanup, resolve: captureCleaned } = deferred();
 				const reading = vi.spyOn(filesystem, "readFile").mockImplementation((...args) => {
 					if (failure === "nested-seal" && !traceRoot && String(args[0]).includes("/trace-")) {
 						traceRoot = path.dirname(String(args[0])); reachCapture();
@@ -311,8 +311,7 @@ describe("Linux process ExecutionWorld", () => {
 					if (failure === "nested-seal") {
 						await captureStarted;
 						const transport = broker!, closeServer = transport.server.close.bind(transport.server);
-						let reached!: () => void;
-						const serverStopped = new Promise<void>((resolve) => { reached = resolve; });
+						const { promise: serverStopped, resolve: reached } = deferred();
 						const stopping = vi.spyOn(transport.server, "close").mockImplementation((callback) => closeServer((error) => { callback?.(error); reached(); }));
 						restoreServerClose = () => stopping.mockRestore();
 						transport.socket.destroy(); controller.abort();

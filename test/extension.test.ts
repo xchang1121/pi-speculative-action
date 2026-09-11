@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -306,8 +307,7 @@ describe("zero-modification Pi extension", () => {
 	it("publishes applied settings only after the Actor route refresh settles", async () => {
 		type Prepared = Awaited<ReturnType<LinuxProcessReuseBackend["prepareActorReplay"]>>;
 		for (const [state, label] of [["ready", "Ready"], ["degraded", "Limited"], ["unavailable", "Unavailable"]] as const) {
-			let release!: (route: Prepared) => void;
-			const pending = new Promise<Prepared>((resolve) => { release = resolve; });
+			const { promise: pending, resolve: release } = deferred<Prepared>();
 			const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockReturnValue(pending);
 			try {
 				const fixture = await createFixture({ settings: { enabled: false }, defaultExecutionWorlds: true });

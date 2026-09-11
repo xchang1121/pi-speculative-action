@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -541,12 +542,11 @@ describe("PatternAware", () => {
 			expect(second.store).toBe(first.store);
 			expect(predictorOnly.store).toBe(first.store);
 			expect(differentAnalyzer.store).not.toBe(first.store);
-			let resume!: () => void;
-			const gate = new Promise<void>((resolve) => { resume = resolve; }), failure = new Error("flush failed"), completed = vi.fn();
+			const { promise: gate, resolve: resume } = deferred(), failure = new Error("flush failed"), completed = vi.fn();
 			const flush = vi.spyOn(first.store, "flush").mockImplementationOnce(async () => { await gate; if (fails) throw failure; });
 			const released = Promise.allSettled([first.release().finally(completed), first.release().finally(completed)]);
 			try {
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect(completed).not.toHaveBeenCalled(); expect(flush).toHaveBeenCalledOnce();
 			} finally { resume(); await released; flush.mockRestore(); }
 			expect(await released).toEqual(Array(2).fill(fails ? { status: "rejected", reason: failure } : { status: "fulfilled", value: undefined }));

@@ -1,3 +1,4 @@
+import { deferred } from "./async.ts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CandidateJoinRequest,
@@ -294,14 +295,4 @@ function joinDecision(
 		expectedSpeculativeDurationMs: 1,
 		...overrides,
 	});
-}
-
-function deferred<Value>() {
-	let resolve!: (value: Value) => void;
-	let reject!: (reason?: unknown) => void;
-	const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
-		resolve = resolvePromise;
-		reject = rejectPromise;
-	});
-	return { promise, resolve, reject };
 }

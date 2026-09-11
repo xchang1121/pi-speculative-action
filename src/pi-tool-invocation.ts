@@ -27,23 +27,20 @@ export const PI_OPERATION_TOOLS: Readonly<Record<"resources" | "workspace" | "pr
 	process: ["bash"],
 };
 
-export type PiToolDefinition = ReturnType<
-	| typeof createReadToolDefinition | typeof createBashToolDefinition | typeof createEditToolDefinition
-	| typeof createWriteToolDefinition | typeof createGrepToolDefinition | typeof createFindToolDefinition | typeof createLsToolDefinition
->;
+const toolFactories = {
+	read: createReadToolDefinition, bash: createBashToolDefinition, edit: createEditToolDefinition,
+	write: createWriteToolDefinition, grep: createGrepToolDefinition, find: createFindToolDefinition, ls: createLsToolDefinition,
+};
+type PiToolName = keyof typeof toolFactories;
+export type PiToolDefinition = ReturnType<(typeof toolFactories)[PiToolName]>;
+
+function createPiToolDefinition(tool: PiToolName, cwd: string, options: ToolsOptions): PiToolDefinition {
+	return toolFactories[tool](cwd, options[tool] as never);
+}
 
 /** Stock definitions and their public operation seams; shared by Actor and isolated runners. */
 export function createPiToolDefinitions(cwd: string, options: ToolsOptions = {}): Map<string, PiToolDefinition> {
-	const definitions = [
-		createReadToolDefinition(cwd, options.read),
-		createBashToolDefinition(cwd, options.bash),
-		createEditToolDefinition(cwd, options.edit),
-		createWriteToolDefinition(cwd, options.write),
-		createGrepToolDefinition(cwd, options.grep),
-		createFindToolDefinition(cwd, options.find),
-		createLsToolDefinition(cwd, options.ls),
-	];
-	return new Map(definitions.map((definition) => [definition.name, definition]));
+	return new Map((Object.keys(toolFactories) as PiToolName[]).map((tool) => [tool, createPiToolDefinition(tool, cwd, options)]));
 }
 
 export interface PiToolInvocationOptions {
@@ -71,8 +68,7 @@ export function resolvePiToolInvocation(
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
 			filesystem: async (view, request) => {
 				const denied = (): never => { throw new Error("Filesystem operation is not authorized by this execution world"); };
-				const writeFile = view.writeFile ?? denied;
-				const definitions = createPiToolDefinitions(cwd, {
+				const scoped: ToolsOptions = tool === "read" ? {
 					read: { autoResizeImages, operations: {
 						access: view.access, readFile: view.readFile,
 						detectImageMimeType: async (target) => {
@@ -80,15 +76,19 @@ export function resolvePiToolInvocation(
 							return mime.detectSupportedImageMimeType(await view.readFile(target, 4100));
 						},
 					} },
+				} : tool === "ls" ? {
 					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ? (target) => view.stat!(target, "type") : denied, readdir: view.readdir ?? denied } },
-					write: { operations: { writeFile, mkdir: view.mkdir ?? denied } },
-					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile } },
-				});
+				} : tool === "write" ? {
+					write: { operations: { writeFile: view.writeFile ?? denied, mkdir: view.mkdir ?? denied } },
+				} : {
+					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile: view.writeFile ?? denied } },
+				};
+				const definition = createPiToolDefinition(tool as PiToolName, cwd, scoped);
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				// Stock cancellation can reject before its internal operation and image worker finish.
 				const result = await settleFilesystemOperation<ToolSettlement["result"]>(() =>
-					definitions.get(tool)!.execute(request.callID, request.args as never, undefined, undefined, context), request.signal);
+					definition.execute(request.callID, request.args as never, undefined, undefined, context), request.signal);
 				return { result, isError: false };
 			},
 		};

@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -91,8 +92,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					finally { for (const [name, value] of Object.entries(environment)) if (value === undefined) delete process.env[name]; else process.env[name] = value; }
 				})();
 				const { pool, invocations } = await bound;
-				let reached!: () => void, resume!: () => void;
-				const started = new Promise<void>((resolve) => { reached = resolve; }), paused = new Promise<void>((resolve) => { resume = resolve; });
+				const { promise: started, resolve: reached } = deferred(), { promise: paused, resolve: resume } = deferred();
 				try {
 					if (phase === "preparation") {
 						const find = invocations.get("find")!;
@@ -132,7 +132,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					await Promise.race([started, executions]); expect(entered).toBe(2);
 					const retirement = pool.dispose(); expect(pool.dispose()).toBe(retirement);
 					void retirement.then(() => { retired = true; });
-					await new Promise<void>((resolve) => setImmediate(resolve)); expect(retired, phase).toBe(false);
+					await nextTurn(); expect(retired, phase).toBe(false);
 					resume();
 					const results = await executions;
 					expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);

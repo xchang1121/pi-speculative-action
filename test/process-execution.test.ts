@@ -1,10 +1,6 @@
+import { deferred as barrier } from "./async.ts";
 import { describe, expect, test, vi } from "vitest";
 import { ProcessExecutionCoordinator, type PreparedProcessExecutionRoute, type ProcessExecutor } from "../src/process-execution.ts";
-
-function barrier<Value = void>() {
-	let resolve!: (value: Value) => void;
-	return { promise: new Promise<Value>((done) => { resolve = done; }), resolve: (value: Value) => resolve(value) };
-}
 
 describe("ProcessExecutionCoordinator", () => {
 	test.each(["preparing", "executing", "rejected", "thrown"] as const)("owns route retirement while %s", async (phase) => {

@@ -37,8 +37,10 @@ export class RuntimeLifecycleLane {
 	}
 
 	track<Value>(task: Promise<Value>): Promise<Value> {
+		if (this.work.has(task)) return task;
 		this.work.add(task);
-		void task.finally(() => this.work.delete(task)).catch(() => {});
+		const settled = () => { this.work.delete(task); };
+		void task.then(settled, settled);
 		return task;
 	}
 

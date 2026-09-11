@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -248,7 +249,7 @@ describe("speculative action host", () => {
 						return value;
 					});
 					if (phase === "running") {
-						await new Promise<void>((resolve) => setImmediate(resolve));
+						await nextTurn();
 						expect(settled, `${toolName} should join its running candidate`).toBe(false);
 						expect(actorExecution, `${toolName} should not start Actor fallback`).not.toHaveBeenCalled();
 						release();
@@ -348,7 +349,7 @@ describe("speculative action host", () => {
 				await entered.promise;
 				const closed = host.dispose();
 				try {
-					await new Promise<void>((resolve) => setImmediate(resolve));
+					await nextTurn();
 					expect(worldDisposed).not.toHaveBeenCalled();
 				} finally { release.resolve(); await closed; }
 			}
@@ -519,7 +520,7 @@ describe("speculative action host", () => {
 			});
 			try {
 				await host.startTurn(startInput(tool)); await ready.promise;
-				await new Promise<void>((resolve) => setImmediate(resolve)); profile = next;
+				await nextTurn(); profile = next;
 				const args = { value: boundary === "input" ? make(next) : 0 };
 				const output = await host.execute({ turnID: "turn-1", id: "actor", tool: "inspect", args, tools: [tool] }, undefined,
 					(operation) => actor(operation.input as { value: unknown }));
@@ -853,7 +854,7 @@ describe("speculative action host", () => {
 			else {
 				await entered.promise;
 				closing = host.dispose().then(() => { closed = true; });
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect(closed).toBe(false);
 				release.resolve(); await closing;
 			}
@@ -947,12 +948,6 @@ async function patternRebaseFixture() {
 	};
 	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };
-}
-
-function deferred<Value>() {
-	let resolve!: (value: Value | PromiseLike<Value>) => void;
-	const promise = new Promise<Value>((done) => { resolve = done; });
-	return { promise, resolve };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

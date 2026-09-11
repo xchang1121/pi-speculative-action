@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
 	effectCommitFailure,
@@ -18,8 +19,7 @@ const route: SpeculativeExecutionRoute = {
 describe("EffectTransactionCoordinator", () => {
 	it.each(["settled", "pending", "revalidate"])("owns concurrent commit across validation=%s", async (phase) => {
 		for (const disposition of ["success", "recoverable", "poisoned", undefined] as const) {
-			let release!: () => void;
-			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const { promise: gate, resolve: release } = deferred();
 			const failure = disposition === "success" ? undefined : disposition ? effectCommitFailure(new Error("commit failed"), disposition) : new Error("unknown state");
 			const commit = vi.fn(async () => { if (failure) throw failure; return "committed"; }), dispose = vi.fn();
 			const coordinator = new EffectTransactionCoordinator<string>();
@@ -56,9 +56,8 @@ describe("EffectTransactionCoordinator", () => {
 
 	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
 		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
-			let release!: () => void, enter!: () => void;
-			const gate = new Promise<void>((resolve) => { release = resolve; });
-			const entered = new Promise<void>((resolve) => { enter = resolve; });
+			const { promise: gate, resolve: release } = deferred();
+			const { promise: entered, resolve: enter } = deferred();
 			const failure = new Error("borrow failed"), dispose = vi.fn();
 			const borrow = async () => {
 				if (closing === "callback") void transaction.abort();
@@ -80,7 +79,7 @@ describe("EffectTransactionCoordinator", () => {
 			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
 			const late = Promise.allSettled([transaction.validate(), transaction.reconstruct!(request)]);
 			try {
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect(dispose).not.toHaveBeenCalled();
 			} finally { release(); await operations; await aborts; }
 			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" ? "rejected" : "fulfilled");

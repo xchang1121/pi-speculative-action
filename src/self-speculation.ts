@@ -22,49 +22,13 @@ import { nonNegativeNumber, positiveInteger, probability } from "./setting-input
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
-export interface SelfSpeculationSettingsInput {
-	readonly enabled?: boolean;
-	/** Trusted control-plane endpoint exposed by the inference runtime. */
-	readonly endpoint?: string;
-	/** Top-level field carrying the stable request ID in provider payloads. */
-	readonly requestIDField?: string;
-	readonly candidatePath?: string;
-	readonly forkPath?: string;
-	readonly clearPath?: string;
-	readonly timeoutMs?: number;
-	readonly maxCandidates?: number;
-	readonly maxDraftTokens?: number;
-	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
-	readonly actorProfile?: string;
-	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
-	readonly draftFormat?: string;
-	/** Exact target-model boundary preceding a boundary-relative action draft. */
-	readonly draftBoundary?: string;
-	/** Optional environment variable containing a bearer token for the control plane. */
-	readonly apiKeyEnv?: string;
-	readonly forkEnabled?: boolean;
-	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
-	readonly forkActionEnabled?: boolean;
-	/** Minimum SPORK selected-token top-1 probability required for action execution. */
-	readonly forkActionMinConfidence?: number;
-	readonly forkTransport?: SelfSpeculationForkTransport;
-	readonly forkMaxTokens?: number;
-	readonly forkTemperature?: number;
-	readonly forkDecoder?: string;
-	readonly forkForcedPrefix?: string;
-	/** Require a capable engine to expose token logprobs to its SPORK fork. */
-	readonly requireLogprobs?: boolean;
-	readonly forkGateEnabled?: boolean;
-	readonly forkGateMinSamples?: number;
-	readonly forkGateWindowSize?: number;
-	readonly forkGateMinNetBenefitMs?: number;
-	readonly forkGateProbeInterval?: number;
-	readonly forkGateFailureThreshold?: number;
-}
+export interface SelfSpeculationSettingsInput extends Partial<SelfSpeculationSettings> {}
 
 export interface SelfSpeculationSettings {
 	readonly enabled: boolean;
+	/** Trusted control-plane endpoint exposed by the inference runtime. */
 	readonly endpoint: string;
+	/** Top-level field carrying the stable request ID in provider payloads. */
 	readonly requestIDField: string;
 	readonly candidatePath: string;
 	readonly forkPath: string;
@@ -72,18 +36,25 @@ export interface SelfSpeculationSettings {
 	readonly timeoutMs: number;
 	readonly maxCandidates: number;
 	readonly maxDraftTokens: number;
+	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
 	readonly actorProfile: string;
+	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
 	readonly draftFormat: string;
+	/** Exact target-model boundary preceding a boundary-relative action draft. */
 	readonly draftBoundary: string;
+	/** Optional environment variable containing a bearer token for the control plane. */
 	readonly apiKeyEnv?: string;
 	readonly forkEnabled: boolean;
+	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
 	readonly forkActionEnabled: boolean;
+	/** Minimum SPORK selected-token top-1 probability required for action execution. */
 	readonly forkActionMinConfidence: number;
 	readonly forkTransport: SelfSpeculationForkTransport;
 	readonly forkMaxTokens: number;
 	readonly forkTemperature: number;
 	readonly forkDecoder: string;
 	readonly forkForcedPrefix: string;
+	/** Require a capable engine to expose token logprobs to its SPORK fork. */
 	readonly requireLogprobs: boolean;
 	readonly forkGateEnabled: boolean;
 	readonly forkGateMinSamples: number;

@@ -1,3 +1,4 @@
+import { deferred, barrier, nextTurn } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR, type ActionKey } from "../src/action-semantics.ts";
@@ -494,11 +495,11 @@ describe("structural speculative runtime", () => {
 				closing = (mode === "disposed" || mode === "unwrapped" ? fixture.runtime.dispose() : mode === "disabled"
 					? fixture.runtime.settingsChanged({ ...settings, enabled: false })
 					: fixture.runtime.finishTurn({ ...call("turn-2"), terminal: true })).then(() => { closed = true; });
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				if (mode !== "terminal") expect(closed).toBe(false);
 			}
-			validationGate.arrive(); await new Promise<void>((resolve) => setImmediate(resolve));
-			bindingGate.arrive(); await closing; await new Promise<void>((resolve) => setImmediate(resolve));
+			validationGate.arrive(); await nextTurn();
+			bindingGate.arrive(); await closing; await nextTurn();
 			if (refreshes) await refreshed.promise;
 			expect(executed).toEqual(["README.md", ...(refreshes ? [mode === "replaced" ? "replacement.ts" : "README.md"] : [])]);
 			if (refreshes) {
@@ -567,9 +568,9 @@ describe("structural speculative runtime", () => {
 					.then(() => { expect(released, `${phase}: lifecycle returned before cleanup`).toBe(true); });
 				const outcome = Promise.allSettled([closing]);
 				if (phase === "running" || sourceWork) await cancelled.promise;
-				if (phase === "sealing") await new Promise<void>((resolve) => setImmediate(resolve));
+				if (phase === "sealing") await nextTurn();
 				finish.arrive(); await releasing.promise;
-				await new Promise<void>((resolve) => setImmediate(resolve)); // Let the close continuation run; no elapsed-time race.
+				await nextTurn(); // Let the close continuation run; no elapsed-time race.
 				release.arrive();
 				expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]); await observed;
 				expect(cleanup).toHaveBeenCalledOnce(); expect(fixture.executions()).toBe(executions);
@@ -771,7 +772,7 @@ describe("structural speculative runtime", () => {
 				await fixture.runtime.finishTurn({ ...done, terminal: true });
 			}
 			if (mode === "future") await succeeded.promise;
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await nextTurn();
 			expect(fixture.executions()).toBe(mode === "future" ? 1 : 0);
 			expect(fixture.runtime.inspect().sharedCandidates).toBe(mode === "future" ? 1 : 0);
 			if (mode === "future") {
@@ -816,9 +817,9 @@ describe("structural speculative runtime", () => {
 				if (mode === "running") await targetStarted.promise;
 				if (mode === "queued") await targetQueued.promise;
 				if (speculative) {
-					await stop.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+					await stop.promise; await nextTurn();
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
-					stopped.arrive(); await cleanup.promise; await new Promise<void>((resolve) => setImmediate(resolve));
+					stopped.arrive(); await cleanup.promise; await nextTurn();
 					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
 					released.arrive(); await targetStarted.promise;
 				}
@@ -1073,7 +1074,7 @@ describe("structural speculative runtime", () => {
 			consuming = fixture.runtime.consume(call("turn")); await entered.promise;
 			if (phase !== "poisoned") closing = phase === "disposed" ? fixture.runtime.dispose()
 				: fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await nextTurn();
 			release.arrive();
 			if (phase === "poisoned") await expect(consuming).rejects.toBe(poisoned);
 			else expect(await consuming).toBe("speculative");
@@ -1243,7 +1244,7 @@ describe("structural speculative runtime", () => {
 			executor = "actor";
 			const actorCall = { ...previewCall, input: { path: formalPath } };
 			const consumed = settlePreview === "next-event"
-				? new Promise<void>(setImmediate).then(() => fixture.runtime.consume(actorCall)) : fixture.runtime.consume(actorCall);
+				? nextTurn().then(() => fixture.runtime.consume(actorCall)) : fixture.runtime.consume(actorCall);
 			gate.arrive(); await preview;
 			expect(await consumed).toBeUndefined();
 			expect(captured?.executionFingerprint).toBe("actor");
@@ -1449,7 +1450,7 @@ describe("structural speculative runtime", () => {
 		try {
 			await fixture.runtime.startTurn({ sessionID: "session", turnID });
 			await routeChecked.promise;
-			await new Promise<void>(setImmediate);
+			await nextTurn();
 			expect(fixture.runtime.inspect()).toMatchObject({
 				exclusiveCandidates: 0, sharedCandidates: 0, executionBlockedPlanActions: actionCount,
 			});
@@ -1632,7 +1633,7 @@ describe("structural speculative runtime", () => {
 					await runFallback(fixture, unrelated);
 				}
 			}
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await nextTurn();
 			expect(continuations).toEqual(["execution_succeeded", ...(phase === "retry" ? ["actor_adopted"] : [])]);
 			expect(executed).toEqual(["parent.ts", ...(retained ? [`${nextChild}.ts`] : phase === "replaced" ? ["replacement.ts"] : [])]);
 			if (retained) {
@@ -1776,7 +1777,7 @@ describe("structural speculative runtime", () => {
 					const replacement = call("parent", { path: "replace.ts" });
 					await runFallback(fixture, replacement); await parentBinding.promise;
 				} else if (mode === "adopted") expect(await fixture.runtime.consume(parentCall)).toBe(expectedParent);
-				holdReuse = false; if (!claimed) validationGate.arrive(); await new Promise<void>(setImmediate);
+				holdReuse = false; if (!claimed) validationGate.arrive(); await nextTurn();
 				expect(aliasOutputs).toEqual(mode === "replaced" ? [] : ["child:parent-0"]);
 				if (mode === "replaced") {
 					parentGate.arrive(); await parentReady.promise; await replacementChild.promise;
@@ -1798,7 +1799,7 @@ describe("structural speculative runtime", () => {
 			}
 			expect(await childConsumption).toBe(mode === "cancelled" ? undefined : `child:${expectedParent}`);
 			expect(workspaceVersion).toBe(mode === "cancelled" ? 1 : 2);
-			await new Promise<void>(setImmediate);
+			await nextTurn();
 			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(1);
 			parentGate.arrive();
 			await fixture.runtime.finishTurn({ ...childCall, terminal: true });
@@ -1856,22 +1857,6 @@ function isWorldBranch(value: unknown): value is WorldBranch<string> {
 	return Boolean(
 		value && typeof value === "object" && typeof (value as Partial<WorldBranch<string>>).commit === "function",
 	);
-}
-
-function deferred<Value = void>() {
-	let resolve!: (value: Value | PromiseLike<Value>) => void;
-	const promise = new Promise<Value>((done) => (resolve = done));
-	return { promise, resolve };
-}
-
-function barrier(expected = 1) {
-	const done = deferred<void>();
-	return {
-		promise: done.promise,
-		arrive: () => {
-			if (expected > 0 && --expected === 0) done.resolve();
-		},
-	};
 }
 
 function candidateSucceeded(expected = 1, actionFragment?: string) {

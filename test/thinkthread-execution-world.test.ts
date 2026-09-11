@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -298,8 +299,7 @@ describe("ThinkThread execution world", () => {
 					await expect(branch.commit()).rejects.toThrow("requires successful validation");
 				}
 				if (mode === "dispose" || mode === "direct-dispose") {
-					let enter!: () => void, release!: () => void;
-					const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+					const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: release } = deferred();
 					fixture.verify.mockImplementationOnce(async () => { enter(); await gate; return verify(); });
 					const validating = branch.validate!(); await entered;
 					const disposal = branch.dispose();
@@ -361,10 +361,8 @@ describe("ThinkThread execution world", () => {
 
 	it.each(["abort", "dispose"])("drains a late BASE after %s without starting the runner", async (operation) => {
 		const fixture = fakeClient();
-		let enter!: () => void;
-		let release!: (snapshot: ReturnType<typeof snapshotView>) => void;
-		const entered = new Promise<void>((resolve) => { enter = resolve; });
-		const snapshot = new Promise<ReturnType<typeof snapshotView>>((resolve) => { release = resolve; });
+		const { promise: entered, resolve: enter } = deferred();
+		const { promise: snapshot, resolve: release } = deferred<ReturnType<typeof snapshotView>>();
 		fixture.snapshotCreate.mockImplementationOnce(() => { enter(); return snapshot; });
 		const { world, cwd } = await startWorld(fixture);
 		const controller = new AbortController();
@@ -400,8 +398,7 @@ async function verifySnapshotInputs() {
 		for (const mode of ["complete", "malformed", "stale", "changed", "large", "runner", "node", "fingerprint", "cancel"]) {
 			await writeFile(file, bytes);
 			const fixture = fakeClient({ verifyStatus: mode === "stale" ? "stale" : "matched" });
-			let enter!: () => void, release!: () => void;
-			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: release } = deferred();
 			const snapshotPread = vi.fn(async ({ offset = 0, length = 65536 }) => {
 				if (mode === "cancel") { enter(); await gate; }
 				if (mode === "changed") await writeFile(file, "changed\n");
@@ -425,7 +422,7 @@ async function verifySnapshotInputs() {
 					const rejected = expect(executing).rejects.toThrow(); await entered;
 					controller.abort(); let disposed = false;
 					const disposal = world.dispose!().then(() => { disposed = true; });
-					await new Promise<void>((resolve) => setImmediate(resolve));
+					await nextTurn();
 					expect(disposed).toBe(false); expect(fixture.snapshotRemove).not.toHaveBeenCalled();
 					release(); await rejected; await disposal;
 				} else if (["malformed", "stale", "changed"].includes(mode)) await expect(executing).rejects.toThrow();

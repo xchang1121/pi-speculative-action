@@ -1,3 +1,4 @@
+import { deferred, nextTurn } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -13,8 +14,8 @@ type TestWorld = ExecutionWorld<TestContext, string>;
 describe("ToolExecutionGateway", () => {
 	it("seals one admission lifetime and drains Actor, preparation and world work before disposal", async () => {
 		for (const phase of ["actor", "actor_failed", "prepare", "fork", "fork_failed", "seal_failed", "capture", "diagnostics"]) {
-			let enter!: () => void, release!: () => void, probing = false;
-			const entered = new Promise<void>((resolve) => { enter = resolve; }), gate = new Promise<void>((resolve) => { release = resolve; });
+			let probing = false;
+			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: release } = deferred();
 			const dispose = vi.fn(), failure = new Error("admitted execution failed");
 			const borrow = async () => { enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (phase.endsWith("failed")) throw failure; };
 			const world: TestWorld = { id: "workspace", scope: "fallback", isolation: "workspace_branch", dispose,
@@ -42,7 +43,7 @@ describe("ToolExecutionGateway", () => {
 			const outcome = Promise.allSettled([pending]); await entered;
 			const retirement = Promise.all([gateway.dispose(), gateway.dispose()]);
 			try {
-				await new Promise<void>((resolve) => setImmediate(resolve));
+				await nextTurn();
 				expect(dispose, phase).not.toHaveBeenCalled();
 				await expect(gateway.executeAuthoritative(operation, async () => "late Actor")).rejects.toThrow("closed");
 				await expect(gateway.resolve(requirement, preparation)).rejects.toThrow("closed");
