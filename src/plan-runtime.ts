@@ -391,6 +391,11 @@ export class PlanRuntime {
 		return this.select((node) => node.opportunity.state.status !== "settled");
 	}
 
+	consumers(candidateID: string): readonly PredictionPlanRuntimeNode[] {
+		return this.select((node) => node.opportunity.state.status !== "settled" &&
+			node.execution.status === "attached" && node.execution.candidateID === candidateID);
+	}
+
 	due(settledDecisionSeq: number): readonly PredictionPlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status === "pending" && node.latestDecisionSeq <= settledDecisionSeq);
 	}

@@ -575,10 +575,6 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	readonly draftTokens: number;
 	readonly totalDraftTokens: number;
 	expectedDurationMs: number;
-	expectedDecisionSeq: number;
-	criticalPathMs: number;
-	priorityMs: number;
-	background: boolean;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
 	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval }>;
@@ -630,6 +626,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	sourceRequestSequence: number;
 	pendingSourceRequests: number;
 	pendingAdmissions: number;
+	pendingLaunch?: Promise<void>;
 }
 
 interface TurnState<SessionID, Output, StartInput, StateData> {
@@ -810,9 +807,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		session: Session,
 		context: Pick<Candidate["owner"], "startInput" | "data" | "settings">,
 		draft: SpeculativeDraftCandidate,
-		input: Pick<Candidate, "origin" | "key" | "route" | "attemptStartedAt" | "expectedDecisionSeq" |
-			"expectedDurationMs" | "criticalPathMs" | "priorityMs"> & Partial<Pick<Candidate,
-			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "background" | "estimatedBytes" | "projectionCoverage">>,
+		input: Pick<Candidate, "origin" | "key" | "route" | "attemptStartedAt" | "expectedDurationMs"> & Partial<Pick<Candidate,
+			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "estimatedBytes" | "projectionCoverage">>,
 	): Candidate => {
 		const sequence = ++session.candidateSequence;
 		return {
@@ -824,7 +820,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			predictionLatencyMs: 0,
 			draftTokens: 0,
 			totalDraftTokens: session.tokenTotal,
-			background: false,
 			estimatedBytes: 0,
 			projectionCoverage: [],
 			validationMs: 0,
@@ -1506,10 +1501,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				draftTokens: context.draftTokens,
 				totalDraftTokens: context.totalDraftTokens,
 				expectedDurationMs: scheduled.expectedDurationMs,
-				expectedDecisionSeq: node.expectedDecisionSeq,
-				criticalPathMs: scheduled.criticalPathMs,
-				priorityMs: scheduled.priorityMs,
-				background: scheduled.background,
 			});
 		}, () => {
 			const current = session.plan.get(node.proposalID, node.action.id);
@@ -1526,73 +1517,81 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const attachNode = (session: Session, node: PlanRuntimeNode, candidate: Candidate): void => {
 		if (!session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work)) return;
-		const scheduled = session.scheduler.evaluate(forecastsForCandidate(session, candidate, node));
+		const forecasts = forecastsForCandidate(session, candidate);
+		const scheduled = session.scheduler.refresh(candidate, forecasts) ?? session.scheduler.evaluate(forecasts);
 		candidate.expectedDurationMs = Math.max(candidate.expectedDurationMs, scheduled.expectedDurationMs);
-		candidate.expectedDecisionSeq = Math.min(candidate.expectedDecisionSeq, node.expectedDecisionSeq);
-		candidate.criticalPathMs = Math.max(candidate.criticalPathMs, scheduled.criticalPathMs);
-		candidate.priorityMs = Math.max(candidate.priorityMs, scheduled.priorityMs);
-		candidate.background = scheduled.background;
 		const execution = candidate.work.execution;
 		if (execution.status === "succeeded") {
 			queueContinuation(session, node, candidate, execution.output.output, "execution_succeeded");
 			return;
 		}
-		if (execution.status === "queued" || execution.status === "running") {
-			session.scheduler.refresh(candidate, forecastsForCandidate(session, candidate, node));
-		}
 		if (execution.status === "queued") startQueuedCandidates(session);
 	};
 
+	/** Coalesce producer requests behind the current Actor events; a concrete Actor intent stays immediate. */
 	const startQueuedCandidates = (session: Session, preferred?: Candidate): void => {
+		if (session.lifecycle.sealed) return;
+		if (preferred) return launchCandidateBatch(session, preferred);
+		if (session.pendingLaunch || !runtimeState.candidates.pending(session.id).some((candidate) => candidate.work.execution.status === "queued")) return;
+		session.pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
+			session.pendingLaunch = undefined;
+			if (!session.lifecycle.sealed && !runtimeState.masterDisabled()) launchCandidateBatch(session);
+		}));
+	};
+
+	const launchCandidateBatch = (session: Session, preferred?: Candidate): void => {
 		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
-		const queued = runtimeState.candidates
-			.pending(session.id)
+		const queued = (preferred ? [preferred] : runtimeState.candidates.pending(session.id))
 			.filter(
 				(candidate) =>
 					candidate.work.execution.status === "queued" &&
 					(!actorToolHints?.size || actorToolHints.has(candidate.key.tool)),
 			)
+			.flatMap((candidate) => {
+				const forecasts = forecastsForCandidate(session, candidate);
+				if (!forecasts.length) {
+					retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
+					return [];
+				}
+				return [{ candidate, forecasts, work: session.scheduler.evaluate(forecasts) }];
+			})
 			.sort(
 				(left, right) =>
-					Number(right === preferred) - Number(left === preferred) ||
-					Number(!reservationAvailable(right.work.reservation)) -
-						Number(!reservationAvailable(left.work.reservation)) ||
-					Number(left.background) - Number(right.background) ||
-					left.expectedDecisionSeq - right.expectedDecisionSeq ||
-					right.priorityMs - left.priorityMs ||
-					right.criticalPathMs - left.criticalPathMs ||
-					right.expectedDurationMs - left.expectedDurationMs ||
-					left.createdAt - right.createdAt,
+					Number(!reservationAvailable(right.candidate.work.reservation)) -
+						Number(!reservationAvailable(left.candidate.work.reservation)) ||
+					Number(left.work.background) - Number(right.work.background) ||
+					left.work.decisionBatchesUntilCall - right.work.decisionBatchesUntilCall ||
+					right.work.priorityMs - left.work.priorityMs ||
+					right.work.criticalPathMs - left.work.criticalPathMs ||
+					right.work.expectedDurationMs - left.work.expectedDurationMs ||
+					left.candidate.createdAt - right.candidate.createdAt,
 			);
-		for (const candidate of queued) {
+		for (const { candidate, forecasts, work } of queued) {
 			if (candidate.work.execution.status !== "queued") continue;
-			let admission = session.scheduler.admit(
+			const admission = session.scheduler.admit(
 				candidate,
-				forecastsForCandidate(session, candidate),
+				forecasts,
 				concurrentLimit(session.settings),
 				reservationAvailable(candidate.work.reservation) ? "producer" : "actor",
+				work,
 			);
-			if (!admission.admitted && admission.reason === "budget_exhausted" && !candidate.background) {
+			if (!admission.admitted && admission.reason === "budget_exhausted" && !work.background) {
 				for (const victim of session.scheduler.preemptFor(
 					admission.work.resource,
 					concurrentLimit(session.settings),
-					(victim) =>
-						victim.work.execution.status === "running" &&
-						reservationAvailable(victim.work.reservation) &&
-						(victim.background ||
-							candidate.expectedDecisionSeq < victim.expectedDecisionSeq ||
-							(candidate.expectedDecisionSeq === victim.expectedDecisionSeq &&
-								candidate.priorityMs > victim.priorityMs)),
+					(victim) => {
+						if (victim.work.execution.status !== "running" || !reservationAvailable(victim.work.reservation)) return false;
+						const other = session.scheduler.evaluate(forecastsForCandidate(session, victim));
+						return other.background || work.decisionBatchesUntilCall < other.decisionBatchesUntilCall ||
+							(work.decisionBatchesUntilCall === other.decisionBatchesUntilCall && work.priorityMs > other.priorityMs);
+					},
 				)) {
 					cancelCandidate(session, victim, cause("admission", "scheduler_preempted"), false);
 				}
-				admission = session.scheduler.admit(
-					candidate,
-					forecastsForCandidate(session, candidate),
-					concurrentLimit(session.settings),
-				);
+				// Only executor completion, after cleanup, can admit the next batch.
 			}
 			if (!admission.admitted) continue;
+			candidate.expectedDurationMs = work.expectedDurationMs;
 			const startedAt = performance.now();
 			if (!candidate.work.start(startedAt)) continue;
 			queueCandidateEvent(session, candidate);
@@ -1637,10 +1636,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			runtimeState.candidates.settle(session.id, candidate, candidate.work.reservation.kind === "shared");
 			queueCandidateContinuations(
 				session,
-				nodesForCandidate(session, candidate.id).filter((node) => {
-					const status = session.plan.get(node.proposalID, node.action.id)?.predictionState.status;
-					return status === "pending" || status === "matching";
-				}),
+				session.plan.consumers(candidate.id),
 				candidate,
 				output,
 				"execution_succeeded",
@@ -1797,9 +1793,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				route,
 				attemptStartedAt,
 				expectedDurationMs: scheduled.expectedDurationMs,
-				expectedDecisionSeq: state.decisionSequence,
-				criticalPathMs: scheduled.criticalPathMs,
-				priorityMs: scheduled.priorityMs,
 			});
 		}, active, (candidate, created) => {
 			attachActorPreview(record, candidate, created ? "preview" : "existing");
@@ -1819,10 +1812,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		const candidate = runtimeState.candidates.get(state.sessionID, current.candidateID);
 		if (!candidate) return;
 		candidate.previews?.delete(record);
-		if (candidate.origin === "actor_preview" && !candidate.actorAdopted && !candidate.previews?.size &&
-			reservationAvailable(candidate.work.reservation) &&
-			!nodesForCandidate(state.session, candidate.id).some((node) => node.predictionState.status !== "settled"))
-			discardCandidate(state.session, candidate, failure, false);
+		retireUndemandedCandidate(state.session, candidate, failure);
+	};
+
+	/** Results may outlive their consumers; work that has not started still needs an owner. */
+	const retireUndemandedCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
+		if (!reservationAvailable(candidate.work.reservation) || candidate.previews?.size || session.plan.consumers(candidate.id).length) return;
+		if (candidate.work.execution.status === "queued" || candidate.work.reservation.kind === "exclusive" ||
+			(candidate.origin === "actor_preview" && !candidate.actorAdopted)) discardCandidate(session, candidate, failure, false);
 	};
 
 	const beginAuthoritativeResultCapture = async (
@@ -2257,9 +2254,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				route: capture.route,
 				attemptStartedAt: toolExecution.startedAt,
 				expectedDurationMs: durationMs,
-				expectedDecisionSeq: state.decisionSequence,
-				criticalPathMs: durationMs,
-				priorityMs: durationMs,
 				estimatedBytes: estimateValueBytes(output) + branch.capturedBytes,
 				projectionCoverage: captureCoverage(action, output, runtimeState.projectionRules),
 			});
@@ -2464,13 +2458,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		releaseActionContext(session, node.identity.id, adopted);
 		if ("candidateID" in node.execution && node.execution.candidateID) {
 			const candidate = runtimeState.candidates.get(session.id, node.execution.candidateID);
-			if (
-				candidate?.work.reservation.kind === "exclusive" &&
-				reservationAvailable(candidate.work.reservation) &&
-				!nodesForCandidate(session, candidate.id).some((item) => item.predictionState.status !== "settled")
-			) {
-				discardCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
-			}
+			if (candidate) retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
 		}
 	};
 
@@ -2591,11 +2579,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		else releaseActionContext(session, retired.node.identity.id);
 	};
 
-	const nodesForCandidate = (session: Session, candidateID: string): readonly PlanRuntimeNode[] =>
-		session.plan
-			.values()
-			.filter((node) => "candidateID" in node.execution && node.execution.candidateID === candidateID);
-
 	const descendsFrom = (candidate: Candidate, ancestor: Candidate): boolean => {
 		for (let parent = candidate.worldParent; parent; parent = parent.worldParent) {
 			if (parent === ancestor) return true;
@@ -2634,17 +2617,11 @@ export function makeStructuralSpeculativeActionRuntime<
 	const forecastsForCandidate = (
 		session: Session,
 		candidate: Candidate,
-		additional?: PlanRuntimeNode,
 	): readonly PredictionForecast[] => {
-		const nodes = nodesForCandidate(session, candidate.id);
-		const unique =
-			additional && !nodes.some((node) => node.prediction.id === additional.prediction.id)
-				? [...nodes, additional]
-				: nodes;
+		const nodes = session.plan.consumers(candidate.id);
 		const actorPhase = actorPhaseFor(session);
-		if (unique.length) {
-			return unique.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
-		}
+		if (nodes.length) return nodes.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
+		if (!candidate.previews?.size && reservationAvailable(candidate.work.reservation)) return [];
 		return [
 			{
 				tool: candidate.key.tool,
@@ -2652,10 +2629,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				executionFingerprint: candidate.key.executionFingerprint,
 				actionKeyHash: candidate.key.hash,
 				expectedDurationMs: candidate.expectedDurationMs,
-				decisionBatchesUntilCall: Math.max(0, candidate.expectedDecisionSeq - session.decisionSequence),
+				decisionBatchesUntilCall: 0,
 				...(actorPhase ? { actorPhase } : {}),
-				criticalPathMs: candidate.criticalPathMs,
-				background: candidate.background,
 			},
 		];
 	};

@@ -165,8 +165,9 @@ export class SpeculationScheduler<Job extends object> {
 		forecasts: readonly PredictionForecast[],
 		capacity: number | SpeculativeResourceBudget,
 		role: "producer" | "actor" = "producer",
+		/** Ranking may supply its estimate from the same synchronous admission pass. */
+		work: ScheduledWork = this.evaluate(forecasts),
 	): SchedulerAdmission {
-		const work = this.evaluate(forecasts);
 		const budget = normalizeBudget(capacity);
 		if (role === "producer") {
 			if (forecasts.length && !forecasts.some((forecast) => this.canLaunch(forecast, work.expectedDurationMs)))

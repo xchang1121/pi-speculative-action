@@ -515,7 +515,7 @@ describe("speculative action host", () => {
 				getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 0, tools: ["inspect"] }),
 				draftModel: model("draft"), complete: async () => assistant([{ type: "toolCall", id: "draft", name: "inspect", arguments: { value: 0 } }], "toolUse"),
 				resolveInvocation, preflight: () => true, executionWorlds: [mockRuntimeWorld(execute, disposed)],
-				onEvent: (event) => { if (event.type === "source_request" || event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+				onEvent: (event) => { if (shape === "plain" ? event.type === "candidate" && event.state.status === "succeeded" : event.type === "source_request") ready.resolve(); },
 			});
 			try {
 				await host.startTurn(startInput(tool)); await ready.promise;
