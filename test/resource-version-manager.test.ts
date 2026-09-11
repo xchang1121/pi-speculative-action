@@ -1,6 +1,7 @@
 import { deferred, nextTurn } from "./async.ts";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -22,6 +23,7 @@ import {
 
 const roots: string[] = [];
 const execFileAsync = promisify(execFile);
+const isDataOpen = (flags: unknown) => typeof flags !== "number" || !(flags & 0x200000); // Linux O_PATH has no I/O authority.
 
 afterEach(async () => {
 	closeResourceVersionManagers();
@@ -41,6 +43,19 @@ describe("speculative action resource versions", () => {
 				const value = change === "entries" ? root : file, view = token.view!;
 				const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
 				for (const capture of watch ? inputs : inputs.reverse()) await capture();
+				const evidence = [view.bytes, [...token.observations]];
+				const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat"), resolved = vi.spyOn(fs, "realpath");
+				try {
+					expect(await view.exists(value)).toBe(true);
+					for (const fields of [undefined, "type", "entry"] as const) {
+						const info = await view.stat(value, fields);
+						expect(info.isDirectory()).toBe(change === "entries");
+						expect(info.size).toBe(change !== "entries" && !fields ? 1 : undefined);
+					}
+					if (change !== "entries") await view.access(value);
+					expect([opened.mock.calls.length, stat.mock.calls.length, resolved.mock.calls.length, view.bytes, [...token.observations]])
+						.toEqual([0, 0, 0, ...evidence]);
+				} finally { opened.mockRestore(); stat.mockRestore(); resolved.mockRestore(); }
 				expect(change === "entries" ? await view.readdir(root) : (await view.readFile(file)).toString()).toEqual(change === "entries" ? ["value.txt"] : "A");
 			}
 			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
@@ -76,7 +91,7 @@ describe("speculative action resource versions", () => {
 		for (const [budget, paths] of [[0, dependencies], [payload.length, dependencies.slice(0, 1)]] as const) {
 			const opened = vi.spyOn(fs, "open");
 			const observed = await manager.capture(paths, budget);
-			expect(opened).toHaveBeenCalledOnce(); opened.mockRestore();
+			expect(opened.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(1); opened.mockRestore();
 			expect(observed.view).toBeUndefined(); // No partial input authority after either payload or metadata exhaustion.
 			expect((await manager.validate(observed)).expired).toBe(false);
 			observed.release();
@@ -109,7 +124,9 @@ describe("speculative action resource versions", () => {
 			let settled = false;
 			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: resume } = deferred();
 			const { promise: failed, resolve: fail } = deferred();
-			const open = vi.spyOn(fs, "open").mockImplementation(async (file) => file === path.join(root, "value") ? handle : broken!);
+			const nativeOpen = fs.open.bind(fs);
+			const open = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => !isDataOpen(flags) ? nativeOpen(file, flags, mode)
+				: await fs.realpath(file) === path.join(root, "value") ? handle : broken!);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (...args: Parameters<typeof handle.read>) => {
 				enter(); await gate; return read(...args);
 			}) as typeof handle.read);
@@ -137,7 +154,7 @@ describe("speculative action resource versions", () => {
 				resume();
 				if (token) expect(await pending).toEqual(["rejected", "rejected"]); else expect(await pending).toBe(failure);
 				await release;
-				expect([handle.fd, broken?.fd ?? -1, idle.mock.calls.length, open.mock.calls.length]).toEqual([-1, -1, 1, token ? 1 : 2]);
+				expect([handle.fd, broken?.fd ?? -1, idle.mock.calls.length, open.mock.calls.filter(([, flags]) => isDataOpen(flags)).length]).toEqual([-1, -1, 1, token ? 1 : 2]);
 			} finally { resume(); await pending; await token?.release(); await Promise.all([handle.close(), broken?.close()]); open.mockRestore(); manager.close(); }
 		}
 	});
@@ -229,20 +246,22 @@ describe("speculative action resource versions", () => {
 	});
 
 	test.for([["empty", "short"], ["admission"], ["grow", "shrink"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
-		const lstat = fs.lstat.bind(fs);
 		if (process.platform === "win32" && changes.includes("replace")) return skip("Windows denies replacement of the open destination");
 		for (const change of changes) for (const retain of [false, true]) {
 			const payload = Buffer.from(change === "empty" ? "" : "initial contents");
 			const root = await workspace({ value: payload }), file = path.join(root, "value");
-			const handle = await fs.open(file, "r"), read = handle.read.bind(handle);
-			const open = vi.spyOn(fs, "open").mockImplementationOnce(async () => {
+			const nativeOpen = fs.open.bind(fs), handle = await nativeOpen(file, "r"), read = handle.read.bind(handle), stat = handle.stat.bind(handle);
+			let inspections = 0;
+			const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				if (!isDataOpen(flags)) return nativeOpen(target, flags, mode);
 				if (change === "admission") await fs.appendFile(file, "more");
 				return handle;
 			});
-			const inspect = vi.spyOn(fs, "lstat").mockImplementationOnce(lstat).mockImplementationOnce((async (...args: Parameters<typeof fs.lstat>) => {
-				if (change === "seal") await fs.appendFile(file, "more"); // After the final fstat, before the path proof.
-				return lstat(...args);
-			}) as typeof fs.lstat);
+			vi.spyOn(handle, "stat").mockImplementation((async (...args: Parameters<typeof handle.stat>) => {
+				const result = await stat(...args);
+				if (++inspections === 2 && change === "seal") await fs.appendFile(file, "more"); // After final fstat, before path proof.
+				return result;
+			}) as typeof handle.stat);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (buffer: Buffer) => {
 				if (change === "grow") await fs.appendFile(file, "more");
 				if (change === "shrink") await fs.truncate(file, 1);
@@ -257,7 +276,7 @@ describe("speculative action resource versions", () => {
 				} else await expect(capture).rejects.toThrow("file_changed_during_capture");
 				if (change === "admission") expect(handle.read).not.toHaveBeenCalled();
 				expect(handle.fd).toBe(-1);
-			} finally { open.mockRestore(); inspect.mockRestore(); }
+			} finally { open.mockRestore(); }
 		}
 	});
 
@@ -276,11 +295,24 @@ describe("speculative action resource versions", () => {
 			const actual = await resolvePiToolInvocation(name, args, { cwd: root, environment: {} })!.filesystem!(token.view!,
 				{ args, callID: "spec", signal: new AbortController().signal });
 			token.view!.assertComplete();
-			expect(await token.view!.stat(alias, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(alias) });
+			expect(await token.view!.stat(alias, "entry")).toMatchObject({ type: "symlink", link: await fs.readlink(alias),
+				realPath: path.join(await fs.realpath(root), "alias") });
 			expect(await token.view!.stat(directory ? path.join(alias, "value.txt") : target, "entry")).toMatchObject({ type: "file", realPath: await fs.realpath(content) });
 			const expected = await native.execute("actor", args);
 			expect(actual.result.content).toEqual(expected.content);
 			expect(Object.entries(actual.result.details ?? {})).toEqual(Object.entries(expected.details ?? {}));
+			for (const entryFirst of [false, true]) {
+				const lazy = await manager.capture(undefined, 8192), view = lazy.view!;
+				try {
+					if (entryFirst) await view.stat(alias, "entry");
+					if (directory) await view.readdir(alias); else await view.readFile(alias);
+					const count = lazy.observations.size;
+					expect((await view.stat(alias, "entry")).realPath).toBe(path.join(await fs.realpath(root), "alias"));
+					expect((await view.stat(alias, "type")).realPath).toBe(await fs.realpath(directory ? tree : target));
+					expect(lazy.observations.size).toBe(count);
+					view.seal(); expect((await manager.validate(lazy)).expired).toBe(false);
+				} finally { await lazy.release(); }
+			}
 			const leaf = directory ? path.join(alias, "value.txt") : alias, parked = path.join(root, "parked");
 			const observed = await manager.capture([{ path: leaf, scope: "content" }]);
 			await fs.rename(link, parked);
@@ -307,6 +339,7 @@ describe("speculative action resource versions", () => {
 					metadata.view!.seal();
 					expect(await manager.validate(metadata)).toMatchObject({ expired: false, filesRead: 0, bytesRead: 0 });
 					await expect(metadata.view!.evaluate((view) => view.readFile(escape))).rejects.toThrow("resource_access_unproven");
+					if (destination === escape) await expect(manager.capture([{ path: escape, scope: "content" }])).rejects.toThrow("resource_symlink_cycle");
 					await fs.rm(escape); await fs.symlink(path.join(root, "changed"), escape, type);
 					expect((await manager.validate(metadata)).expired).toBe(true);
 					expect(opened).not.toHaveBeenCalled();
@@ -330,8 +363,35 @@ describe("speculative action resource versions", () => {
 				await expect(captureStableFile(target)).rejects.toThrow("not_regular_file");
 				await expect(manager.capture([{ path: target, scope: "content" }])).rejects.toThrow("unsupported_resource_type:");
 			}
-			expect(open).not.toHaveBeenCalled();
+			expect(open.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(0);
 		} finally { open.mockRestore(); manager.close(); }
+	});
+
+	test.runIf(process.platform === "linux")("rejects a replaced FIFO without admitting a writer", async () => {
+		for (const phase of ["binding", "data", "opened"]) {
+			const root = await workspace({ value: "A" }), file = path.join(root, "value"), nativeOpen = fs.open.bind(fs);
+			let replaced = false, admitted = false;
+			const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+			const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				const replace = !replaced && (phase === "binding" ? target === file : isDataOpen(flags));
+				if (replace && phase !== "opened") { await fs.unlink(file); await execFileAsync("mkfifo", [file]); }
+				const descriptor = await nativeOpen(target, flags, mode); handles.push(descriptor);
+				if (replace) {
+					replaced = true;
+					if (phase === "opened") { await fs.unlink(file); await execFileAsync("mkfifo", [file]); }
+					try {
+						const writer = await nativeOpen(file, constants.O_WRONLY | constants.O_NONBLOCK);
+						admitted = true; await writer.close();
+					} catch (error) { expect((error as NodeJS.ErrnoException).code).toBe("ENXIO"); }
+				}
+				return descriptor;
+			});
+			try {
+				await expect(captureStableFile(file)).rejects.toThrow();
+				expect({ replaced, admitted, closed: handles.every((handle) => handle.fd === -1) }, phase)
+					.toEqual({ replaced: true, admitted: false, closed: true });
+			} finally { open.mockRestore(); }
+		}
 	});
 
 	test.each([

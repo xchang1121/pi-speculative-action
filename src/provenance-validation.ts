@@ -25,41 +25,26 @@ export interface ProvenanceValidationContext {
 	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
 
-export type ProvenanceValidation =
+export type DynamicDependencyValidation = (
 	| {
 			readonly status: "valid";
-			readonly strongKey: Sha256Digest;
 			readonly dependencies: readonly DynamicDependency[];
-			readonly filesRead: number;
-			readonly bytesRead: number;
-			readonly durationMs: number;
 	  }
 	| {
 			readonly status: "stale";
 			readonly changed: readonly string[];
 			/** Current evidence, when the original observation shape could still be captured. */
 			readonly dependencies: readonly DynamicDependency[];
-			readonly filesRead: number;
-			readonly bytesRead: number;
-			readonly durationMs: number;
 	  }
 	| {
 			readonly status: "indeterminate";
 			readonly reason: string;
-			readonly filesRead: number;
-			readonly bytesRead: number;
-			readonly durationMs: number;
-	  };
-
-export type DynamicDependencyValidation =
-	| {
-			readonly status: "valid";
-			readonly dependencies: readonly DynamicDependency[];
-			readonly filesRead: number;
-			readonly bytesRead: number;
-			readonly durationMs: number;
 	  }
-	| Extract<ProvenanceValidation, { readonly status: "stale" | "indeterminate" }>;
+) & { readonly filesRead: number; readonly bytesRead: number; readonly durationMs: number };
+
+export type ProvenanceValidation =
+	| (Extract<DynamicDependencyValidation, { status: "valid" }> & { readonly strongKey: Sha256Digest })
+	| Exclude<DynamicDependencyValidation, { status: "valid" }>;
 
 export async function validateProcessCertificate(
 	certificate: ProcessProvenanceCertificate,

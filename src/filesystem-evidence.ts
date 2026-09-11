@@ -51,17 +51,23 @@ export async function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
+	observed?: Pick<StableFileCapture, "stat" | "realPath">,
 ): Promise<StableFileCapture> {
-	const before = await fs.lstat(target, { bigint: true });
-	if (!before.isFile()) throw new Error("not_regular_file");
-	const beforePath = await fs.realpath(target);
-	// Known special files never reach open; NONBLOCK limits FIFO races, not device-open side effects.
-	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+	// Linux O_PATH pins the inode without opening a raced-in FIFO or device for I/O.
+	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
+		? await fs.open(target, 0x200000 | constants.O_NOFOLLOW) : undefined;
+	let handle: import("node:fs/promises").FileHandle | undefined;
 	try {
-		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+		const before = binding ? await binding.stat({ bigint: true }) : observed?.stat ?? await fs.lstat(target, { bigint: true });
+		if (!before.isFile()) throw new Error("not_regular_file");
+		if (observed && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
+		const beforePath = observed?.realPath ?? await fs.realpath(target);
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
 			throw new Error(`file_too_large:${before.size}`);
 		}
+		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
+			constants.O_RDONLY | (binding ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
 
 		const hash = createHash("sha256");
 		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
@@ -90,7 +96,7 @@ export async function captureStableFile(
 		return { hash: hash.digest("hex"), bytesRead, realPath: afterPath, stat: after,
 			...(content ? { content } : {}) };
 	} finally {
-		await handle.close();
+		try { await handle?.close(); } finally { await binding?.close(); }
 	}
 }
 

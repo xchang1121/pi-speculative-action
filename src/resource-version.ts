@@ -143,15 +143,23 @@ export class ResourceReadView {
 	private async get(target: string, scope: ResourceDependency["scope"]) {
 		this.assertComplete();
 		if (this.load && !this.sealed) {
-			const pending = (this.pending ?? Promise.resolve()).then(() => { this.assertComplete(); return this.load!({ path: target, scope }); });
+			const pending = (this.pending ?? Promise.resolve()).then(() => {
+				const entry = this.entry(target, scope !== "entry");
+				// Existing input evidence also owns the metadata derivable from those bytes or names.
+				if (entry && (scope === "entry" || scope === "type" ||
+					(scope === "stat" && (entry.type !== "file" || entry.size !== undefined || entry.content !== undefined)) ||
+					(scope === "names" && entry.type === "directory" && entry.entries !== undefined) ||
+					(scope === "content" && entry.type === "file" && entry.content !== undefined))) return;
+				return this.load!({ path: target, scope });
+			});
 			this.pending = pending;
 			try { await pending; }
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		return this.entry(target, scope !== "entry");
+		return this.entry(target, scope !== "entry") ?? this.unproven(target);
 	}
-	private entry(target: string, follow = true): CapturedResource {
+	private entry(target: string, follow = true): CapturedResource | undefined {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
 		const visited = new Set<string>();
@@ -166,7 +174,6 @@ export class ResourceReadView {
 			if (alias?.type !== "alias") break;
 			current = filesystemPathKey(path.resolve(alias.target, path.relative(parent, current)));
 		}
-		return this.unproven(target);
 	}
 	private unproven(target: string): never {
 		throw (this.failure ??= new Error(`resource_access_unproven:${target}`));
@@ -545,7 +552,7 @@ async function fingerprintPath(
 			filesRead: 0,
 		};
 	}
-	const realTarget = scope === "entry" && info.isSymbolicLink()
+	const realTarget = info.isSymbolicLink()
 		? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
 		: await fingerprintIO(() => fs.realpath(target));
 	assertInside(realRoot, realTarget);
@@ -558,7 +565,7 @@ async function fingerprintPath(
 			throw new Error(`resource_symlink_changed:${target}`);
 		}
 		const source = path.resolve(path.dirname(target), link);
-		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, ancestors, view, descend);
+		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, new Set(ancestors).add(identity), view, descend);
 		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link, realPath: realTarget });
 		return {
 			value: {
@@ -581,7 +588,7 @@ async function fingerprintPath(
 	if (info.isFile()) {
 		// Reserve before yielding: concurrent captures cannot each spend the entire token budget.
 		const retain = view?.reserve(Number(info.size)) ?? false;
-		const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain));
+		const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
 		assertInside(realRoot, content.realPath);
 		view?.capture(target, { type: "file", content: content.content, realPath: content.realPath });
 		return {
