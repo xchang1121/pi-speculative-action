@@ -25,17 +25,9 @@ afterEach(async () => {
 
 describe("PatternAware", () => {
 	test("late-binds a target input from authoritative structured output paths", () => {
-		const context = [
-			event({
-				sessionID: "one",
-				tool: "grep",
-				input: { pattern: "TODO" },
-				outputPaths: ["src/a.ts"],
-			}),
-		];
-		const bindings = inferBindings(context, { filePath: "src/a.ts", offset: 1 });
-
-		expect(applyBindings(bindings, context)).toEqual({ filePath: "src/a.ts", offset: 1 });
+		const paths = ["src/a.ts"], target = { filePath: "src/a.ts", offset: 1 };
+		const context = [event({ sessionID: "one", tool: "grep", input: { pattern: "TODO" }, outputPaths: paths })];
+		const bindings = inferBindings(context, target);
 		expect(bindings['["filePath"]']).toEqual({
 			type: "event",
 			relativeEvent: -1,
@@ -43,6 +35,15 @@ describe("PatternAware", () => {
 			path: [0],
 		});
 		expect(bindings['["offset"]']).toEqual({ type: "constant", value: 1 });
+		for (const [filePath, offset] of [["src/a.ts", 1], ["src/b.ts", 2]] as const) {
+			paths[0] = filePath;
+			Object.assign(target, { filePath, offset });
+			Object.assign(bindings['["offset"]']!, { value: offset });
+			expect(applyBindings(bindings, context)).toEqual(target);
+			expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
+		}
+		Object.assign(bindings['["filePath"]']!, { relativeEvent: -2 });
+		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
 	});
 
 	test("keeps learned path joins idempotent when search outputs are already anchored", () => {
@@ -72,6 +73,8 @@ describe("PatternAware", () => {
 		};
 
 		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
+		target.edits[0]!.newText = "changed";
+		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
 	});
 
 	test("derives adjacent paths and commands through bounded path templates", () => {
@@ -85,27 +88,13 @@ describe("PatternAware", () => {
 			command: "bun test services/alpha/config.test.ts",
 			workdir: "services/alpha",
 		});
-		let inputReads = 0;
-		const nextEvent = event({ sessionID: "two", tool: "read", input: { filePath: "services/beta/config.ts" } });
-		const next = [
-			new Proxy(nextEvent, {
-				get(target, property, receiver) {
-					if (property === "input") inputReads++;
-					return Reflect.get(target, property, receiver);
-				},
-			}),
-		];
-		expect(applyBindings(bindings, next)).toEqual({
-			command: "bun test services/beta/config.test.ts",
-			workdir: "services/beta",
-		});
-		const readsAfterFirstApplication = inputReads;
-		expect(readsAfterFirstApplication).toBeGreaterThan(0);
-		expect(applyBindings(bindings, next)).toEqual({
-			command: "bun test services/beta/config.test.ts",
-			workdir: "services/beta",
-		});
-		expect(inputReads).toBe(readsAfterFirstApplication);
+		const next = [event({ sessionID: "two", tool: "read", input: { filePath: "services/beta/config.ts" } })];
+		for (const name of ["beta", "beta", "gamma"]) {
+			next[0]!.input.filePath = `services/${name}/config.ts`;
+			expect(applyBindings(bindings, next)).toEqual({
+				command: `bun test services/${name}/config.test.ts`, workdir: `services/${name}`,
+			});
+		}
 		expect(
 			inferBindings([event({ sessionID: "path", tool: "read", input: { filePath: "/workspace/repo" } })], {
 				filePath: "repo/src/a.ts",
@@ -516,8 +505,21 @@ describe("PatternAware", () => {
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
 		expect(persisted.pools).toEqual([]);
 		expect(persisted.patterns[0].feedback).toEqual({ ...valid.feedback, issued: valid.feedback.issued + 1 });
-		store.observe(input({ sessionID: "restored", tool: "grep", input: {} }));
-		expect(store.predict("restored")).toContainEqual(expect.objectContaining({ patternID: valid.id, input: restoredInput }));
+		const observed = input({ sessionID: "restored", tool: "grep", input: { query: "original" }, outputPaths: ["a.ts"] });
+		store.observe(observed);
+		observed.input.query = "changed";
+		const recent = store.recent("restored");
+		expect(recent[0]!.input).toEqual({ query: "original" });
+		Object.assign(recent[0]!.outputPaths!, { 0: "changed.ts" });
+		expect(store.recent("restored")[0]!.outputPaths).toEqual(["a.ts"]);
+		const prediction = store.predict("restored").find((item) => item.patternID === valid.id)!;
+		expect(prediction.input).toEqual(restoredInput);
+		Object.assign(prediction.input.fields!, { external: 1 });
+		expect(store.predict("restored").find((item) => item.patternID === valid.id)!.input).toEqual(restoredInput);
+		expect(store.registerValidatedPattern(valid)).toBe(true);
+		const registered = store.snapshot();
+		for (const record of [valid.gapCounts, valid.feedback.unobserved, valid.feedback.rejectedAfterMatch]) Object.assign(record, { external: 7 });
+		expect(store.snapshot()).toEqual(registered);
 		await store.flush();
 	});
 
@@ -1198,40 +1200,30 @@ describe("PatternAware", () => {
 		expect(matches.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 2]);
 	});
 
-	test("unlocks a multi-step frontier from speculative structured outputs", () => {
+	test.each([false, true])("unlocks and retains a multi-step frontier (LLM boundaries=%s)", (turnBoundaries) => {
 		const store = new PatternAwareStore(settings());
-		trainFrontier(store, "one", "src/a.ts", "tests/alpha.test.ts");
-		trainFrontier(store, "two", "src/b.ts", "tests/beta.test.ts");
+		trainFrontier(store, "one", "src/a.ts", "tests/alpha.test.ts", turnBoundaries);
+		trainFrontier(store, "two", "src/b.ts", "tests/beta.test.ts", turnBoundaries);
+		if (turnBoundaries) store.observeTurn();
 
 		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
 		const read = store.predict("probe").find((item) => item.tool === "read");
 		expect(read?.depth).toBe(1);
+		const captured = structuredClone(read!.continuation.history);
+		store.observe(input({ sessionID: "probe", tool: "inspect", input: { later: true }, learnTarget: false }));
+		expect(read!.continuation.history).toEqual(captured);
 
-		const lsp = store
-			.continue(
-				read!.continuation,
-				input({
-					sessionID: "probe",
-					tool: "read",
-					input: { filePath: "src/c.ts" },
-					output: { nextPath: "tests/gamma.test.ts" },
-				}),
-			)
-			.find((item) => item.tool === "lsp");
+		const lsp = store.continue(read!.continuation, input({
+			sessionID: "probe", tool: "read", input: { filePath: "src/c.ts" },
+			output: { nextPath: "tests/gamma.test.ts" },
+		})).find((item) => item.tool === "lsp");
 		expect(lsp?.input).toEqual({ operation: "diagnostics", filePath: "tests/gamma.test.ts" });
 		expect(lsp?.depth).toBe(2);
 
-		const bash = store
-			.continue(
-				lsp!.continuation,
-				input({
-					sessionID: "probe",
-					tool: "lsp",
-					input: lsp!.input,
-					output: { command: "bun test tests/gamma.test.ts" },
-				}),
-			)
-			.find((item) => item.tool === "bash");
+		const bash = store.continue(lsp!.continuation, input({
+			sessionID: "probe", tool: "lsp", input: lsp!.input,
+			output: { command: "bun test tests/gamma.test.ts" },
+		})).find((item) => item.tool === "bash");
 		expect(bash?.input).toEqual({ command: "bun test tests/gamma.test.ts" });
 		expect(bash?.depth).toBe(3);
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
@@ -1304,55 +1296,6 @@ describe("PatternAware", () => {
 		);
 		expect(new Set(motif.map((candidate) => candidate.patternID)).size).toBe(3);
 		expect(unfold(train(4, 2), "bounded")).toHaveLength(2);
-	});
-
-	test("keeps LLM turn boundaries transparent to multi-step continuation", () => {
-		const store = new PatternAwareStore(settings());
-		for (const [sessionID, sourcePath, testPath] of [
-			["one", "src/a.ts", "tests/a.test.ts"],
-			["two", "src/b.ts", "tests/b.test.ts"],
-		] as const) {
-			store.observeTurn();
-			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }));
-			store.observeTurn();
-			store.observeTurn();
-			store.observe(
-				input({
-					sessionID,
-					tool: "read",
-					input: { filePath: sourcePath },
-					output: { nextPath: testPath },
-				}),
-			);
-			store.observeTurn();
-			store.observeTurn();
-			store.observe(
-				input({
-					sessionID,
-					tool: "lsp",
-					input: { operation: "diagnostics", filePath: testPath },
-				}),
-			);
-		}
-
-		store.observeTurn();
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
-		const read = store.predict("probe").find((item) => item.tool === "read");
-		const lsp = store
-			.continue(
-				read!.continuation,
-				input({
-					sessionID: "probe",
-					tool: "read",
-					input: { filePath: "src/c.ts" },
-					output: { nextPath: "tests/c.test.ts" },
-				}),
-			)
-			.find((item) => item.tool === "lsp");
-
-		expect(read?.depth).toBe(1);
-		expect(lsp?.depth).toBe(2);
-		expect(lsp?.input).toEqual({ operation: "diagnostics", filePath: "tests/c.test.ts" });
 	});
 
 	test.each([
@@ -1516,25 +1459,30 @@ function trainJoinedRead(store: PatternAwareStore, sessionID: string, root: stri
 	store.observe(input({ sessionID, tool: "read", input: { filePath: `${root}/${name}` } }));
 }
 
-function trainFrontier(store: PatternAwareStore, sessionID: string, sourcePath: string, testPath: string) {
-	store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }));
-	store.observe(
+function trainFrontier(store: PatternAwareStore, sessionID: string, sourcePath: string, testPath: string, turnBoundaries = false) {
+	const events = [
+		input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }),
 		input({
 			sessionID,
 			tool: "read",
 			input: { filePath: sourcePath },
 			output: { nextPath: testPath },
 		}),
-	);
-	store.observe(
 		input({
 			sessionID,
 			tool: "lsp",
 			input: { operation: "diagnostics", filePath: testPath },
 			output: { command: `bun test ${testPath}` },
 		}),
-	);
-	store.observe(input({ sessionID, tool: "bash", input: { command: `bun test ${testPath}` } }));
+		input({ sessionID, tool: "bash", input: { command: `bun test ${testPath}` } }),
+	];
+	for (const [index, event] of events.entries()) {
+		if (turnBoundaries) {
+			store.observeTurn();
+			if (index > 0) store.observeTurn();
+		}
+		store.observe(event);
+	}
 }
 
 function trainResultReads(
