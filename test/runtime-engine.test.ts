@@ -691,7 +691,8 @@ describe("structural speculative runtime", () => {
 
 	it.each(["same", "alternate", "stale-before", "stale-after", "incompatible", "indeterminate", "exclusive", "denied"] as const)(
 		"recalls sealed Actor observations with compatibility, freshness and authorization: %s", async (mode) => {
-		let version = 1, captures = 0, seals = 0;
+		let version = 1, captures = 0, seals = 0, now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const recalled = barrier(), outputs: string[] = [];
 		const reusable = ["same", "alternate", "stale-after", "denied"].includes(mode);
 		const fallback = mode === "stale-after" || mode === "denied";
@@ -704,8 +705,9 @@ describe("structural speculative runtime", () => {
 				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } },
 			resolveExecution: () => mode === "exclusive" ? MUTATION_ROUTE : mode === "same" ? RESOURCE_ROUTE
 				: { ...RESOURCE_ROUTE, isolation: "runtime_sandbox", scope: "runtime", backend: "alternate", fingerprint: "alternate:v1" },
-			execute: () => world(`fresh:${version}`, { executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
-				validate: async () => (validResource()) }),
+			execute: () => { now += 6; return world(`fresh:${version}`, {
+				executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
+				validate: async () => (validResource()) }); },
 			authorize: () => ({ ok: mode !== "denied", reason: "permission_changed" }),
 			captureAuthoritativeResult: (action) => {
 				captures++; const captured = version;
@@ -720,8 +722,11 @@ describe("structural speculative runtime", () => {
 		try {
 			const first = call("first"), second = call("second");
 			await fixture.runtime.startTurn(first);
-			await runFallback(fixture, first, 4, "actor:1");
+			const original = await fixture.runtime.prepareActorCall(first);
+			expect(original?.output).toBeUndefined(); now += 4;
+			await original?.settle(4, "actor:1");
 			await fixture.runtime.finishTurn({ ...first, terminal: false });
+			now += 2;
 			if (mode === "stale-before") version++;
 			await fixture.runtime.startTurn(second); await recalled.promise;
 			expect(fixture.executions()).toBe(reusable ? 0 : 1);
@@ -730,11 +735,16 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.previewActorCall(second);
 			const prepared = await fixture.runtime.prepareActorCall(second);
 			expect(prepared?.output).toBe(fallback ? undefined : outputs[0]);
-			if (fallback) await prepared?.settle(2, "actor:2");
+			if (fallback) { now += 2; await prepared?.settle(2, "actor:2"); }
+			else expect((await fixture.runtime.prepareActorCall(second))?.output).toBe(mode === "exclusive" ? "actor:1" : outputs[0]);
 			expect(captures).toBe(fallback ? 2 : 1); expect(seals).toBe(captures);
 			await fixture.runtime.finishTurn({ ...second, terminal: true });
 			expect(fixture.events.filter((event) => event.type === "prediction")).toHaveLength(1);
-		} finally { await fixture.runtime.dispose(); }
+			expect(fixture.events.find((event) => event.type === "task")?.timing).toMatchObject({
+				authoritativeToolCount: reusable && !fallback ? 1 : 2,
+				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
+			});
+		} finally { await fixture.runtime.dispose(); clock.mockRestore(); }
 	});
 
 	it("expires both pending and admitting next-action requests when the Actor intent arrives", async () => {
@@ -1372,6 +1382,12 @@ describe("structural speculative runtime", () => {
 			} else expect((await fixture.runtime.prepareActorCall(actor))?.output).toBe("shared observation");
 			if (dual || mode === "prediction-first") expect((await fixture.runtime.prepareActorCall(second))?.output).toBe("shared observation");
 			await fixture.runtime.finishTurn({ ...actor, terminal: mode !== "prediction-first" });
+			if ((dual && mode !== "cancel-owner") || mode === "prediction-first") {
+				const providers = fixture.events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
+				expect(providers).toHaveLength(2);
+				expect(providers[1]!.toolExecution).toBe(providers[0]!.toolExecution);
+				if (dual) expect(fixture.events.find((event) => event.type === "task")?.timing.authoritativeToolCount).toBe(1);
+			}
 			if (mode === "parallel-predictions") {
 				expect(settlements).toHaveLength(8);
 				expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(new Set([actor.id]));

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 import { CandidateExecution } from "../src/candidate-execution.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import type { PlanAction, PlanProposal } from "../src/plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
@@ -144,7 +145,7 @@ describe("PlanRuntime", () => {
 			expect(queued.execution).toEqual({ status: "queued", candidateID: "candidate" });
 			execution.start(0);
 			expect(plan.launchable()).toEqual([]);
-			if (status === "succeeded") execution.succeed("output", 1, 1);
+			if (status === "succeeded") execution.succeed("output", new TimelineInterval(0, 1), 1);
 			else execution[status === "failed" ? "fail" : "cancel"](cause("execution", "tool_failed"), 1, 1);
 			const runnable = ["settled", ...(status === "succeeded" ? ["succeeded"] : [])];
 			expect(ids(plan.matchable(1))).toEqual(["parent"]);
@@ -243,7 +244,7 @@ describe("PlanRuntime", () => {
 		const child = action("child", { dependsOn: [dependency, dependency, { actionID: second }] });
 		plan.apply(proposal([action(first), action(second), child, action("leaf", { dependsOn: [{ actionID: "child" }] })]), 0);
 		const key = buildPiActionKey("read", child.input, "/workspace")!, execution = new CandidateExecution<string>("shared");
-		plan.bindActionKey("plan", "child", key); execution.start(0); execution.succeed("output", 1, 1);
+		plan.bindActionKey("plan", "child", key); execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
 		for (const id of [first, second, "child"]) plan.attachExecution("plan", id, id, execution);
 		const original = plan.get("plan", "child")!, leaf = plan.get("plan", "leaf")!.identity;
 		expect(original.action.dependsOn![0]).not.toBe(original.action.dependsOn![1]);
@@ -273,7 +274,7 @@ describe("PlanRuntime", () => {
 		] : []), action(root, { input: { path: "old.ts" } }), action("independent")];
 		plan.apply(proposal(actions), 0);
 		const independent = plan.get("plan", "independent")!.identity, execution = new CandidateExecution<string>("shared");
-		execution.start(0); execution.succeed("parent-output", 1, 1);
+		execution.start(0); execution.succeed("parent-output", new TimelineInterval(0, 1), 1);
 		for (const id of mode === "ancestor" ? ["parent", "middle", "independent"] : ["independent"])
 			plan.attachExecution("plan", id, `${id}-candidate`, execution);
 		const actor = { id: "actor", sequence: 4, turnID: "turn" } as const;

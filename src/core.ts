@@ -160,7 +160,7 @@ export {
 	type ValidationMetrics,
 	zeroValidationMetrics,
 } from "./settlement.ts";
-export { measureSpeculativeTask, type SpeculativeTaskTiming, type TimelineInterval } from "./task-timing.ts";
+export { measureSpeculativeTask, TaskTimeline, TimelineInterval, type SpeculativeTaskTiming } from "./task-timing.ts";
 export {
 	emptySpeculativeTraceSummary,
 	reduceSpeculativeTrace,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CandidateExecution } from "../src/candidate-execution.ts";
 import { cause } from "../src/settlement.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 
 describe("CandidateExecution", () => {
 	it.each(["shared", "exclusive"] as const)("owns idempotent %s lease transitions", (kind) => {
@@ -13,7 +14,7 @@ describe("CandidateExecution", () => {
 		expect(candidate.acquire("actor")).toBeUndefined();
 		expect(adopted.adopt()).toBe(kind === "shared");
 		candidate.start(1);
-		candidate.succeed("ok", 2, 1);
+		candidate.succeed("ok", new TimelineInterval(1, 2), 1);
 		if (kind === "exclusive") expect(adopted.adopt()).toBe(true);
 		expect(adopted).toMatchObject({ state: kind === "exclusive" ? "consumed" : "released", active: false });
 		expect(adopted.release()).toBe(false);
@@ -26,18 +27,20 @@ describe("CandidateExecution", () => {
 
 		expect(candidate.start(10)).toBe(true);
 		expect(candidate.reserve("turn-a")).toBe(true);
-		expect(candidate.succeed("result", 25, 15)).toBe(true);
+		const toolExecution = new TimelineInterval(10, 25);
+		expect(candidate.succeed("result", toolExecution, 15)).toBe(true);
 		expect(candidate.consume("turn-a")).toBe(true);
 
 		expect(candidate.execution).toEqual({
 			status: "succeeded",
 			output: "result",
-			startedAt: 10,
-			completedAt: 25,
+			toolExecution,
 			executionMs: 15,
 		});
 		expect(candidate.reservation).toEqual({ kind: "exclusive", status: "consumed" });
 		expect(Object.isFrozen(candidate.execution)).toBe(true);
+		expect(candidate.execution.status === "succeeded" && candidate.execution.toolExecution).toBe(toolExecution);
+		expect(Reflect.set(toolExecution, "completedAt", 100)).toBe(false);
 		expect(Object.isFrozen(candidate.reservation)).toBe(true);
 		await expect(candidate.completion).resolves.toEqual(candidate.execution);
 	});
@@ -66,14 +69,14 @@ describe("CandidateExecution", () => {
 		expect(cancelled.start(3)).toBe(true);
 		expect(cancelled.cancel(cancellation, 7, 4)).toBe(true);
 		expect(cancelled.controller.signal.aborted).toBe(true);
-		expect(cancelled.succeed("late", 9, 6)).toBe(false);
+		expect(cancelled.succeed("late", new TimelineInterval(3, 9), 6)).toBe(false);
 		await expect(cancelled.completion).resolves.toMatchObject({ status: "cancelled", cause: cancellation });
 	});
 
 	it("tracks every shared Actor join so scheduled work cannot be preempted underneath it", () => {
 		const candidate = new CandidateExecution<string>("shared");
 		candidate.start(0);
-		candidate.succeed("shared", 1, 1);
+		candidate.succeed("shared", new TimelineInterval(0, 1), 1);
 
 		expect(candidate.reserve("turn-a")).toBe(true);
 		expect(candidate.reserve("turn-b")).toBe(true);

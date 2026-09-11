@@ -1,4 +1,5 @@
 import type { ResolutionCause } from "./settlement.ts";
+import { TimelineInterval } from "./task-timing.ts";
 
 export type CandidateExecutionState<Output> =
 	| { readonly status: "queued" }
@@ -6,8 +7,7 @@ export type CandidateExecutionState<Output> =
 	| {
 			readonly status: "succeeded";
 			readonly output: Output;
-			readonly startedAt: number;
-			readonly completedAt: number;
+			readonly toolExecution: TimelineInterval;
 			readonly executionMs: number;
 	  }
 	| {
@@ -76,13 +76,12 @@ export class CandidateExecution<Output> {
 		return true;
 	}
 
-	succeed(output: Output, completedAt: number, executionMs: number): boolean {
+	succeed(output: Output, toolExecution: TimelineInterval, executionMs: number): boolean {
 		if (this.executionValue.status !== "running") return false;
 		const settlement: CandidateExecutionSettlement<Output> = Object.freeze({
 			status: "succeeded",
 			output,
-			startedAt: this.executionValue.startedAt,
-			completedAt: metric(completedAt),
+			toolExecution: TimelineInterval.from(toolExecution),
 			executionMs: metric(executionMs),
 		});
 		this.executionValue = settlement;

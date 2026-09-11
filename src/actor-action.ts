@@ -12,7 +12,7 @@ import {
 	type PredictionIdentity,
 	type ResolutionCause,
 } from "./settlement.ts";
-import type { TimelineInterval } from "./task-timing.ts";
+import { TimelineInterval } from "./task-timing.ts";
 
 export interface ActorCandidateSelection<Candidate extends { readonly id: string }, Output> {
 	readonly candidate: Candidate;
@@ -126,7 +126,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	): PredictionAdoption | undefined {
 		if (this.stateValue.status !== "selected") return undefined;
 		const selected = this.stateValue.value, candidateID = selected.candidate.id;
-		const toolExecution = normalizeInterval(selected.toolExecution);
+		const toolExecution = TimelineInterval.from(selected.toolExecution);
 		this.finish(Object.freeze(provider === "preview" ? {
 			kind: "actor",
 			origin: "preview",
@@ -191,7 +191,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			origin: "fallback",
 			durationMs: duration,
 			isError,
-			toolExecution: Object.freeze({ startedAt: Math.max(0, completed - duration), completedAt: completed }),
+			toolExecution: new TimelineInterval(completed - duration, completed),
 			...(executionBlockedTiming ? { executionBlockedTiming } : {}),
 		}), this.stateValue.matchedPredictions);
 	}
@@ -208,11 +208,6 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		this.stateValue = Object.freeze({ status: "settled", value: settlement });
 		return settlement;
 	}
-}
-
-function normalizeInterval(interval: TimelineInterval): TimelineInterval {
-	const startedAt = finite(interval.startedAt);
-	return Object.freeze({ startedAt, completedAt: Math.max(startedAt, finite(interval.completedAt)) });
 }
 
 function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {

@@ -57,7 +57,7 @@ import type {
 } from "./settlement.ts";
 import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
-import { measureSpeculativeTask, type TimelineInterval } from "./task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 
 interface TurnInput<SessionID> {
 	readonly sessionID: SessionID;
@@ -257,7 +257,7 @@ async function projectOutput<Output, StartInput, StateData>(
 		})) : undefined;
 		if (projected === undefined) projected = await reconstruct?.(request);
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
-		const execution = Object.freeze({ startedAt, completedAt: performance.now() });
+		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
 		return { ok: true, output: projected, execution };
 	} catch (error) {
@@ -275,7 +275,7 @@ function closeActorPhase<SessionID, Output, StartInput, StateData>(
 ): void {
 	if (turn.actorPhaseCompletedAt !== undefined) return;
 	turn.actorPhaseCompletedAt = Math.max(turn.startedAt, completedAt);
-	turn.session.actorPhaseIntervals.push({ startedAt: turn.startedAt, completedAt: turn.actorPhaseCompletedAt });
+	turn.session.timeline?.recordActor(turn.startedAt, turn.actorPhaseCompletedAt);
 }
 
 function enterActorAdmission<SessionID, Output, StartInput, StateData>(
@@ -335,8 +335,7 @@ function candidateExecutionProjection<Output, StartInput, StateData>(
 	if (state.status === "succeeded") {
 		return {
 			status: "succeeded",
-			startedAt: state.startedAt,
-			completedAt: state.completedAt,
+			...state.toolExecution,
 			executionMs: state.executionMs,
 		};
 	}
@@ -530,12 +529,10 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly sourceSlots: Set<SourceRequestSlot>;
 	readonly sourceTasks: Set<Promise<unknown>>;
 	readonly turns: Set<string>;
-	readonly actorPhaseIntervals: TimelineInterval[];
-	readonly authoritativeToolIntervals: Map<string | object, TimelineInterval>;
 	actorAdmissionTail: Promise<void>;
 	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
-	taskStartedAt?: number;
+	timeline?: TaskTimeline;
 	lastActorArrivedAt?: number;
 	sequence: number;
 	decisionSequence: number;
@@ -656,8 +653,6 @@ class StructuralRuntimeState<
 			sourceSlots: new Set(),
 			sourceTasks: new Set(),
 			turns: new Set(),
-			actorPhaseIntervals: [],
-			authoritativeToolIntervals: new Map(),
 			actorAdmissionTail: Promise.resolve(),
 			planAdmissionTails: new Map(),
 			settings,
@@ -810,11 +805,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.settings = settings;
 			const generation = new SourceGeneration(signal);
 			const startedAt = performance.now();
-			if (session.taskStartedAt === undefined) {
-				session.taskStartedAt = startedAt;
-				session.actorPhaseIntervals.length = 0;
-				session.authoritativeToolIntervals.clear();
-			}
+			session.timeline ??= new TaskTimeline(startedAt);
 			const state: Turn = {
 				key,
 				session,
@@ -1541,7 +1532,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, runtimeState.projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
 			const completedAt = performance.now();
-			if (!candidate.work.succeed(branch, completedAt, completedAt - startedAt)) {
+			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt), completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
 				return;
 			}
@@ -1966,12 +1957,12 @@ export function makeStructuralSpeculativeActionRuntime<
 					match: choice.match,
 					output,
 					timing: {
-						executionAheadMs: Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.startedAt)),
+						executionAheadMs: Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.toolExecution.startedAt)),
 						attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
 						hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
 						...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
 					},
-					toolExecution: { startedAt: execution.startedAt, completedAt: execution.completedAt },
+					toolExecution: execution.toolExecution,
 					...(projection.execution ? { projection: projection.execution } : {}),
 				});
 				break;
@@ -2181,7 +2172,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				projectionCoverage: captureCoverage(action, output, runtimeState.projectionRules),
 			});
 			candidate.work.start(toolExecution.startedAt);
-			if (!candidate.work.succeed(branch, toolExecution.completedAt, durationMs)) return;
+			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
 			runtimeState.candidates.settle(state.sessionID, candidate);
@@ -2236,9 +2227,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		state.session.authoritativeToolIntervals.set(settlement.provider.kind === "speculative"
-			? settlement.provider.candidateID : settlement.actorAction, settlement.provider.toolExecution);
-		if (selection?.projection) state.session.authoritativeToolIntervals.set(selection.projection, selection.projection);
+		state.session.timeline?.recordTool(settlement.provider.toolExecution);
+		if (selection?.projection) state.session.timeline?.recordTool(selection.projection);
 		const key = actorAction.actionKey;
 		const settledCandidate =
 			selection?.candidate ??
@@ -2777,10 +2767,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const resetTaskTimeline = (session: Session): void => {
-		session.taskStartedAt = undefined;
+		session.timeline = undefined;
 		session.lastActorArrivedAt = undefined;
-		session.actorPhaseIntervals.length = 0;
-		session.authoritativeToolIntervals.clear();
 	};
 
 	const beginTurnClosure = (
@@ -2840,7 +2828,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const closeSessionState = async (session: Session, mode: SessionClosureMode, turnID: string): Promise<void> => {
 		const terminal = mode === "terminal";
-		if (terminal && session.taskStartedAt === undefined && session.turns.size === 0) return;
+		if (terminal && !session.timeline && session.turns.size === 0) return;
 		const failure = cause(
 			"control",
 			terminal ? "terminal_turn" : mode === "disposed" ? "session_disposed" : "disabled",
@@ -3006,14 +2994,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const queueTaskEvent = (session: Session, turnID: string, completedAt: number): void => {
-		const startedAt = session.taskStartedAt;
-		if (startedAt === undefined) return;
-		const timing = measureSpeculativeTask({
-			startedAt,
-			completedAt,
-			actorPhases: session.actorPhaseIntervals,
-			authoritativeTools: [...session.authoritativeToolIntervals.values()],
-		});
+		if (!session.timeline) return;
+		const timing = session.timeline.measure(completedAt);
 		resetTaskTimeline(session);
 		const event: SpeculativeActionEvent<SessionID> = {
 			type: "task",
