@@ -532,8 +532,10 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.startTurn({ sessionID: "session", turnID: "retained" });
 		expect((await fixture.runtime.prepareActorCall(call("retained")))?.output).toBe("learned");
 		await fixture.runtime.finishTurn({ ...call("retained"), terminal: true });
-		expect(fixture.events.find((event) => event.type === "actor_action" && event.turnID === "retained"))
-			.toMatchObject({ settlement: { provider: { kind: "speculative", timing: { expectedActorMs: 100 } } } });
+		const event = fixture.events.find((event) => event.type === "actor_action" && event.turnID === "retained");
+		const retained = event?.type === "actor_action" ? event.settlement.provider : undefined;
+		expect(retained?.kind).toBe("speculative");
+		if (retained?.kind === "speculative") expect(retained.timing.expectedActorMs).toBeGreaterThanOrEqual(100);
 	});
 
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "late-generation"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
@@ -1056,6 +1058,42 @@ describe("structural speculative runtime", () => {
 			expect(fixture.events.filter((event) => event.type === "prediction").at(-1)?.settlement)
 				.toMatchObject({ observation: "observed", match: { matched: false } });
 		}
+	});
+
+	it.each([0, 40])("calibrates loss and recovery per Actor call across competing cached results with %ims capture", async (captureMs) => {
+		let now = 1, cost = 20;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const fixture = harness({ source: { id: "none", enabled: () => false, propose: () => undefined },
+			captureAuthoritativeResult: (action) => {
+				now += captureMs / 2;
+				return { route: RESOURCE_ROUTE, dispose: () => {}, seal: (output) => {
+					now += captureMs / 2;
+					return world(output, { executionFingerprint: action.executionFingerprint,
+						validate: async () => { now += cost; return validResource(); } });
+				} };
+			} });
+		const run = async (prefix: string, count: number) => {
+			const reused: boolean[] = [];
+			for (let index = 0; index < count; index++) {
+				const actor = call(`${prefix}-${index}`); await fixture.runtime.startTurn(actor);
+				const prepared = await fixture.runtime.prepareActorCall(actor); expect(prepared).toBeDefined();
+				reused.push(prepared?.output !== undefined);
+				if (prepared?.output === undefined) { now += 2; await prepared?.settle(2, "actor"); }
+				else expect(prepared.output).toBe("actor");
+				await fixture.runtime.finishTurn(actor);
+			}
+			return reused;
+		};
+		try {
+			if (captureMs) expect((await run("capture-cost", 12)).slice(1).every(Boolean)).toBe(true);
+			cost += captureMs;
+			const loss = await run("loss", 32);
+			if (!captureMs) expect(loss.slice(0, 5)).toEqual([false, true, true, true, true]);
+			expect(loss.slice(-8).filter((reused) => !reused).length).toBeGreaterThanOrEqual(4);
+			expect(loss.slice(-8).some(Boolean)).toBe(true);
+			cost = 1;
+			expect((await run("recovery", 256)).slice(-8).every(Boolean)).toBe(true);
+		} finally { await fixture.runtime.dispose(); clock.mockRestore(); }
 	});
 
 	it.each([[2, 4096, 2], [1, 4096, 3], [2, 128, 3]])("bounds sealed query results by %i entries and %i bytes", async (entries, bytes, evaluations) => {

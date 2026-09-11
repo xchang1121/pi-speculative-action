@@ -305,14 +305,15 @@ export class SpeculationScheduler<Job extends object> {
 		};
 
 		if (request.state === "succeeded") {
-			// Sparse or wider-class fallback samples must not veto ready work. Sunk lookup costs cancel.
+			// Repeated loss must sample the alternative; cached hits cannot grow Actor evidence.
 			if (
 				actor?.exact && adoption?.exact &&
-				Math.min(actor.samples, adoption.samples) >= DEFAULT_BENEFIT_GATE_POLICY.minSamples &&
+				adoption.samples >= DEFAULT_BENEFIT_GATE_POLICY.minSamples &&
 				expectedNetBenefitMs !== undefined &&
 				expectedNetBenefitMs < 0
 			) {
-				return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
+				const allowed = adoption.window.allowProbe();
+				return { allowed, reason: allowed ? "ready" : "fallback_faster", waitBudgetMs: 0, ...base };
 			}
 			return { allowed: true, reason: "ready", waitBudgetMs: 0, ...base };
 		}
@@ -446,7 +447,7 @@ export class SpeculationScheduler<Job extends object> {
 	): TimingEstimate | undefined {
 		for (const [index, key] of timingKeys(identity).entries()) {
 			const window = windows.get(key), value = window?.estimate(quantile, selection);
-			if (value !== undefined) return { value, samples: window!.count, exact: Boolean(identity.actionKeyHash) && index === 0 };
+			if (value !== undefined) return { value, samples: window!.count, window: window!, exact: Boolean(identity.actionKeyHash) && index === 0 };
 		}
 		return undefined;
 	}
@@ -455,11 +456,13 @@ export class SpeculationScheduler<Job extends object> {
 interface TimingEstimate {
 	readonly value: number;
 	readonly samples: number;
+	readonly window: SampleWindow;
 	readonly exact: boolean;
 }
 
 class SampleWindow {
 	private readonly values: number[] = [];
+	private suppressedSinceProbe = 0;
 
 	get count(): number {
 		return this.values.length;
@@ -468,8 +471,16 @@ class SampleWindow {
 	observe(value: number): void {
 		const normalized = finite(value);
 		if (normalized <= 0) return;
+		this.suppressedSinceProbe = 0;
 		this.values.push(normalized);
 		if (this.values.length > 64) this.values.shift();
+	}
+
+	/** The same bounded evidence owns recovery, including decisions made before a probe settles. */
+	allowProbe(): boolean {
+		if (++this.suppressedSinceProbe < DEFAULT_BENEFIT_GATE_POLICY.probeInterval) return false;
+		this.suppressedSinceProbe = 0;
+		return true;
 	}
 
 	quantile(value: number, fallback: number): number {

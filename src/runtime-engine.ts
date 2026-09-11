@@ -40,6 +40,7 @@ import type {
 	SpeculativeRuntimeInspection,
 } from "./runtime-contracts.ts";
 import {
+	type CandidateJoinDecision,
 	type PredictionForecast,
 	type ServiceTimingIdentity,
 	SpeculationScheduler,
@@ -1766,6 +1767,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
 		const { state, actualCall, actualKey, actorAction, ranked, actorArrivedAt, preview, signal } = input;
 		const matchingCandidates = ranked.map(({ candidate }) => candidate);
+		const readyJoins = new Map<string, CandidateJoinDecision>();
 		const stopCandidate = (candidate: Candidate): boolean => {
 			const failure = signal?.aborted
 				? cause("control", "actor_aborted")
@@ -1790,7 +1792,9 @@ export function makeStructuralSpeculativeActionRuntime<
 					choice.match.kind === "exact" ? "exact" : choice.match.projector,
 					...(candidate.resultViews?.has(actualKey.key) ? ["retained"] : [])]),
 			};
-			const join = state.session.scheduler.assessCandidateJoin({
+			// Equivalent ready choices share this Actor decision, including its recovery probe.
+			const readyKey = executionAtDecision.status === "succeeded" ? JSON.stringify(adoptionIdentity) : undefined;
+			const join = (readyKey ? readyJoins.get(readyKey) : undefined) ?? state.session.scheduler.assessCandidateJoin({
 				identity: actionTimingIdentity(candidate.key),
 				actorIdentity, adoptionIdentity,
 				state:
@@ -1804,6 +1808,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					? { elapsedMs: Math.max(0, performance.now() - executionAtDecision.startedAt) }
 					: {}),
 			});
+			if (readyKey) readyJoins.set(readyKey, join);
 			if (!join.allowed) {
 				actorAction.rejectCandidate(
 					candidate.id,
@@ -2010,9 +2015,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		const identity = actorAction.identity;
 		state.actorActions.add(actorAction);
 		state.actorObservation ??= actualKey ? identity : null;
+		let capturePreparationMs = 0;
 		const prepared: { output?: Output; settle: PreparedActorCall<Output>["settle"] } = {
 			settle: (durationMs, output) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, durationMs, output)),
+				settleActorCall(state, input, actualCall, actorAction, durationMs, output, capturePreparationMs)),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -2109,7 +2115,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			actorAction.releaseAdmission();
 			if (adapter.captureAuthoritativeResult && effect === "observation") {
+				const startedAt = performance.now();
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
+				capturePreparationMs = Math.max(0, performance.now() - startedAt);
 			}
 			return Object.freeze(prepared);
 		} finally {
@@ -2181,9 +2189,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		actualCall: ActualToolCall,
 		actorAction: ActorAction<Candidate, Output>,
 		duration: number,
-		output?: Output,
+		output: Output | undefined,
+		capturePreparationMs: number,
 	): Promise<void> => {
 		if (!state.actorActions.delete(actorAction)) return;
+		const settlementStartedAt = performance.now();
 		const capture = actorAction.takeCapture();
 		const durationMs = finiteMetric(duration);
 		if (!actorAction.settleActor(durationMs, outputIsError(output), performance.now())) {
@@ -2191,7 +2201,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			return;
 		}
 		const key = actorAction.actionKey;
-		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key), durationMs);
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output);
@@ -2205,6 +2214,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		} else if (capture) {
 			state.session.lifecycle.release(capture);
 		}
+		// Compare complete alternatives; optional capture waits belong to the native path.
+		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key),
+			durationMs + capturePreparationMs + Math.max(0, performance.now() - settlementStartedAt));
 	};
 
 	const queueActorSettlement = (

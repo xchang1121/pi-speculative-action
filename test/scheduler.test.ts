@@ -187,6 +187,22 @@ describe("SpeculationScheduler", () => {
 				expectedRemainingMs: state === "running" ? speculativeMs : 0, expectedNetBenefitMs: netMs });
 			if (allowed) expect(decision.waitBudgetMs).toBeGreaterThan(speculativeMs);
 		}
+		const cold = new SpeculationScheduler<object>();
+		cold.observeActorService(identity, 30);
+		const run = (cost: number, count: number) => Array.from({ length: count }, () => {
+			const decision = joinDecision(cold, identity, { state: "succeeded" });
+			if (decision.allowed) cold.observeAdoption(identity, cost);
+			else cold.observeActorService(identity, 30);
+			return decision;
+		});
+		const loss = run(70, 32);
+		expect(loss.slice(0, 4).every((decision) => decision.allowed)).toBe(true);
+		expect(loss.slice(-8).filter((decision) => !decision.allowed).length).toBeGreaterThanOrEqual(4);
+		expect(loss.at(-1)!.actorSamples).toBeGreaterThan(1);
+		const overlapping = Array.from({ length: 12 }, () => joinDecision(cold, identity, { state: "succeeded" }));
+		expect(overlapping.filter((decision) => decision.allowed).length).toBeGreaterThan(0);
+		expect(overlapping.filter((decision) => decision.allowed).length).toBeLessThanOrEqual(3);
+		expect(run(1, 256).slice(-8).every((decision) => decision.allowed)).toBe(true);
 	});
 
 	it.each(["loss", "hidden", "slow-producer", "unknown-clock", "other-action", "no-forecast", "actor"] as const)("aligns producer launch with the expected Actor decision: %s", (mode) => {
