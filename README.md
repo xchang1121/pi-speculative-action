@@ -6,12 +6,12 @@ Pi 独立插件通过 Drafter、Actor probe 与 PatternAware 预测工具调用�
 
 ## 架构
 
-Runtime 分为四个相互独立的层次：
+Runtime 分为四层：
 
 1. **投机源**：模型 Drafter、Actor probe 与历史模式预测只产生与执行方式无关的 `PlanAction`。
 2. **动作身份**：参数准备一次，封存 `K(a)` 与执行器绑定。键包含语义、schema、参数和资源名称，动态版本另属执行证据。仅自有、递归冻结的无损纯数据树可携带身份；无法证明时保留 Actor 原调用和错误语义。新查询由原执行器在封存输入上求值。
 3. **执行路由**：动作语义只声明可观察效果，由唯一的 `ExecutionWorldRouter` 选择并准备隔离能力。所选路由刻意不进入 `K(a)`。
-4. **调度与结算**：候选 ID 唯一拥有执行，预测、预览与封存 Actor 结果共用索引。Scheduler 共用启动与采纳收益判定管理资源，`EffectTransaction` 验证与提交，`ActorAction` 认领并结算；已选中结果不能再转回退。
+4. **调度与结算**：候选共用索引，Scheduler 判定收益，`EffectTransaction` 验证提交。`host.execute` 通过 `prepareActorCall` 返回的执行专属句柄结算，`ActorAction` 独占证据；已选中结果不能回退。轮次只保留未结算调用，ID 与完成顺序不参与结果归属。
 
 执行路线具有固定优先级：
 

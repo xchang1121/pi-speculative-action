@@ -11,12 +11,13 @@ describe("ThinkThread profile lifecycle", () => {
 		const actorFallbackSettled = vi.fn(async () => undefined);
 		const finishTurn = vi.fn(async () => undefined);
 		const wrapped = withThinkThreadProfileLifecycle(host, { actorFallbackSettled, finishTurn } as unknown as ThinkThreadExecutionWorld);
-		const actual = vi.spyOn(host.runtime, "actual");
+		const settle = vi.fn(async () => undefined);
 		const result = { content: [], details: {} };
 		const failure = new Error("Actor failed after writing");
 		const executor = vi.fn(async () => { if (mode === "failed") throw failure; return result; });
 		const tool = mode === "hit" || mode === "failed" ? "write" : mode;
-		if (mode === "hit") vi.spyOn(host.runtime, "consume").mockResolvedValueOnce({ result, isError: false });
+		vi.spyOn(host.runtime, "prepareActorCall").mockResolvedValueOnce({ settle,
+			...(mode === "hit" ? { output: { result, isError: false } } : {}) });
 		if (mode === "failed") actorFallbackSettled.mockRejectedValueOnce(new Error("BASE cleanup failed"));
 		try {
 			const pending = wrapped.execute({ turnID: "turn", tool, args: {}, tools: [] }, undefined, executor);
@@ -25,21 +26,20 @@ describe("ThinkThread profile lifecycle", () => {
 			expect(executor).toHaveBeenCalledTimes(mode === "hit" ? 0 : 1);
 			const mutated = mode !== "read" && mode !== "hit";
 			expect(actorFallbackSettled).toHaveBeenCalledTimes(mutated ? 1 : 0);
-			if (mutated) expect(actorFallbackSettled.mock.invocationCallOrder[0]).toBeLessThan(actual.mock.invocationCallOrder[0]!);
+			expect(settle).toHaveBeenCalledTimes(mode === "hit" ? 0 : 1);
+			if (mutated) expect(actorFallbackSettled.mock.invocationCallOrder[0]).toBeLessThan(settle.mock.invocationCallOrder[0]!);
 			await wrapped.finishTurn("turn");
 			expect(finishTurn).toHaveBeenCalledWith("turn");
 		} finally { await wrapped.dispose(); }
 	});
 
-	it("cleans the pool on failed host settlement and preserves the legacy actual outlet", async () => {
+	it("cleans the pool when finishing the host turn fails", async () => {
 		const host = createSpeculativeActionHost("session", { cwd: "/workspace", complete: vi.fn() });
 		const actorFallbackSettled = vi.fn(async () => undefined);
 		const finishTurn = vi.fn(async () => undefined);
 		const wrapped = withThinkThreadProfileLifecycle(host, { actorFallbackSettled, finishTurn } as unknown as ThinkThreadExecutionWorld);
 		const failure = new Error("settlement failed");
 		try {
-			for (const tool of ["read", "write"]) await wrapped.actual({ turnID: "turn", tool, args: {}, tools: [], durationMs: 1, output: { result: { content: [], details: {} }, isError: false } });
-			expect(actorFallbackSettled).toHaveBeenCalledOnce();
 			vi.spyOn(host, "finishTurn").mockRejectedValueOnce(failure);
 			await expect(wrapped.finishTurn("turn")).rejects.toBe(failure);
 			expect(finishTurn).toHaveBeenCalledWith("turn");

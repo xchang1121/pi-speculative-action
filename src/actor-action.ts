@@ -1,4 +1,5 @@
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
+import type { AuthoritativeResultCapture } from "./runtime-contracts.ts";
 import {
 	cause,
 	type ActorActionIdentity,
@@ -41,6 +42,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private stateValue: ActorActionState<Candidate, Output> = Object.freeze({ status: "matching" });
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
 	private releaseActorAdmission?: () => void;
+	private resultCapture?: AuthoritativeResultCapture<Output>;
 
 	constructor(input: {
 		readonly identity: ActorActionIdentity;
@@ -70,6 +72,18 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 
 	get selection() {
 		return this.stateValue.status === "selected" ? this.stateValue.value : undefined;
+	}
+
+	capture(capture: AuthoritativeResultCapture<Output>): boolean {
+		if (this.stateValue.status !== "awaiting_fallback" || this.resultCapture) return false;
+		this.resultCapture = capture;
+		return true;
+	}
+
+	takeCapture(): AuthoritativeResultCapture<Output> | undefined {
+		const capture = this.resultCapture;
+		this.resultCapture = undefined;
+		return capture;
 	}
 
 	setFallback(failure: ResolutionCause, candidateID?: string): boolean {

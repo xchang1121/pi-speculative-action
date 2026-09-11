@@ -51,14 +51,10 @@ export function withThinkThreadProfileLifecycle(
 			try {
 				return await executor(operation);
 			} finally {
-				// Runs only on an Actor miss, before runtime.actual can launch successor actions.
+				// Runs only on an Actor miss, before its bound settlement can launch successor actions.
 				await invalidateAfterActorMutation(operation.tool);
 			}
 		}),
-		actual: async (...args: Parameters<SpeculativeActionHost["actual"]>) => {
-			await invalidateAfterActorMutation(args[0].tool);
-			await host.actual(...args);
-		},
 		finishTurn: async (...args: Parameters<SpeculativeActionHost["finishTurn"]>) => {
 			const [turnID] = args;
 			try {

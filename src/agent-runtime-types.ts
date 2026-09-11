@@ -1,6 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import type { SpeculativePlanSource } from "./runtime.ts";
+import type { ActualToolCall, SpeculativePlanSource } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
@@ -24,11 +24,9 @@ export interface AgentStartInput {
 	readonly tools: readonly AgentTool[];
 }
 
-export interface AgentConsumeInput {
+export interface AgentConsumeInput extends Omit<ActualToolCall, "input"> {
 	readonly sessionID: string;
 	readonly turnID: string;
-	readonly id?: string;
-	readonly tool: string;
 	readonly args: unknown;
 	readonly tools: readonly AgentTool[];
 	readonly terminal?: boolean;

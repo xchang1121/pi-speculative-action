@@ -13,7 +13,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CreateSpeculativeActionHostOptions, SpeculativeActionHost } from "../src/agent-integration.ts";
+import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
@@ -30,18 +30,19 @@ import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
 import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
-import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
-import { toolErrorSettlement } from "../src/tool-settlement.ts";
+import type { ToolSettlement } from "../src/tool-settlement.ts";
 
 const roots: string[] = [];
+const hosts: SpeculativeActionHost[] = [];
 
 afterEach(async () => {
+	await Promise.all(hosts.splice(0).map((host) => host.dispose()));
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe("zero-modification Pi extension", () => {
 	it("registers stock overrides, previews the stream without claiming it, then adopts once", async () => {
-		const fixture = await createFixture({ consume: async () => ({ result: textResult("cached"), isError: false }) });
+		const fixture = await createFixture({ reuse: { result: textResult("cached"), isError: false } });
 		await fixture.emit("session_start", {}, fixture.context);
 		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 		const read = fixture.tools.get("read")!;
@@ -91,11 +92,11 @@ describe("zero-modification Pi extension", () => {
 			},
 			undefined,
 		);
-		expect(fixture.host.consume).not.toHaveBeenCalled();
+		expect(fixture.host.runtime.prepareActorCall).not.toHaveBeenCalled();
 		const result = await read.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
 		expect(result.content).toEqual([{ type: "text", text: "cached" }]);
-		expect(fixture.host.consume).toHaveBeenCalledOnce();
-		expect(fixture.host.actual).not.toHaveBeenCalled();
+		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledOnce();
+		expect(fixture.settle).not.toHaveBeenCalled();
 	});
 
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
@@ -117,8 +118,8 @@ describe("zero-modification Pi extension", () => {
 			fixture.context,
 		);
 		expect(result?.content).toEqual([{ type: "text", text: "custom read" }]);
-		expect(fixture.host.consume).not.toHaveBeenCalled();
-		expect(fixture.host.actual).not.toHaveBeenCalled();
+		expect(fixture.host.runtime.prepareActorCall).not.toHaveBeenCalled();
+		expect(fixture.settle).not.toHaveBeenCalled();
 
 		await fixture.commands.get("speculative-action")?.handler("status", fixture.context as ExtensionCommandContext);
 		expect(fixture.ui.notify).toHaveBeenLastCalledWith(
@@ -127,11 +128,11 @@ describe("zero-modification Pi extension", () => {
 		);
 	});
 
-	it("records the stock Actor result without letting cache or telemetry failures replace it", async () => {
+	it.each(["cache", "telemetry"])("preserves the stock Actor result when %s fails", async (mode) => {
 		const fixture = await createFixture();
 		await writeFile(path.join(fixture.cwd, "notes.txt"), "authoritative", "utf8");
-		vi.mocked(fixture.host.consume).mockRejectedValue(new Error("cache failed"));
-		vi.mocked(fixture.host.actual).mockRejectedValue(new Error("telemetry failed"));
+		if (mode === "cache") vi.mocked(fixture.host.runtime.prepareActorCall).mockRejectedValue(new Error("cache failed"));
+		else fixture.settle.mockRejectedValue(new Error("telemetry failed"));
 		vi.mocked(fixture.host.finishTurn).mockRejectedValue(new Error("cleanup failed"));
 		await fixture.emit("session_start", {}, fixture.context);
 		await fixture.emit("context", { messages: [] }, fixture.context);
@@ -142,9 +143,11 @@ describe("zero-modification Pi extension", () => {
 		await expect(fixture.emit("turn_end", {}, fixture.context)).resolves.toBeUndefined();
 
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
-		expect(fixture.host.actual).toHaveBeenCalledWith(expect.objectContaining({
-			tool: "read", args: { path: "notes.txt" }, output: expect.objectContaining({ isError: false }),
-		}));
+		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledWith(expect.objectContaining({
+			tool: "read", args: { path: "notes.txt" },
+		}), undefined);
+		if (mode === "cache") expect(fixture.settle).not.toHaveBeenCalled();
+		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(Number), { result, isError: false });
 	});
 
 	it("binds only prepared searches, quietly retains native Actor otherwise, and retires on refresh or disable", async () => {
@@ -424,7 +427,7 @@ describe("zero-modification Pi extension", () => {
 });
 
 interface FixtureOptions {
-	readonly consume?: SpeculativeActionHost["consume"];
+	readonly reuse?: ToolSettlement;
 	readonly defaultExecutionWorlds?: boolean;
 	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	readonly overriddenTools?: readonly string[];
@@ -460,7 +463,13 @@ async function createFixture(options: FixtureOptions = {}) {
 	>();
 	let hostOptions: CreateSpeculativeActionHostOptions | undefined;
 	const resolveInvocation: NonNullable<CreateSpeculativeActionHostOptions["resolveInvocation"]> = (tool, input) => hostOptions?.resolveInvocation?.(tool, input);
-	const host = mockHost(options.consume, resolveInvocation);
+	const host = createSpeculativeActionHost("session", { cwd, complete: vi.fn(), resolveInvocation, executionWorlds: [] });
+	hosts.push(host);
+	const settle = vi.fn(async (_durationMs: number, _output?: ToolSettlement) => undefined);
+	vi.spyOn(host.runtime, "prepareActorCall").mockResolvedValue({ settle, ...(options.reuse ? { output: options.reuse } : {}) });
+	vi.spyOn(host.runtime, "settingsChanged").mockResolvedValue();
+	for (const method of ["startTurn", "previewActorTool", "previewActorCall", "finishTurn"] as const) vi.spyOn(host, method).mockResolvedValue();
+	vi.spyOn(host, "executionWorldDiagnostics").mockImplementation(async () => portableDiagnostics());
 	const ui = {
 		select: async (_title: string, _options: string[]) => undefined as string | undefined,
 		confirm: async (_title: string, _message?: string) => false,
@@ -517,7 +526,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, eventContext);
 	};
 	return {
-		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host,
+		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle,
 		executionWorlds: () => hostOptions?.executionWorlds ?? [],
 		executionWorldEnabled: (backend: string) => hostOptions?.speculativeExecutionWorldEnabled?.(backend),
 		hostSettings: async () => hostOptions?.getSettings?.(), resolveInvocation, store, tools, ui,
@@ -540,50 +549,6 @@ function driveSettingsMenus(
 
 function sourceInfo(path: string, source = "test"): SourceInfo {
 	return { path, source, scope: "temporary", origin: "top-level" };
-}
-
-function mockHost(consume: SpeculativeActionHost["consume"] = async () => undefined,
-	resolveInvocation: NonNullable<CreateSpeculativeActionHostOptions["resolveInvocation"]>): SpeculativeActionHost {
-	const consumeMock = vi.fn(consume);
-	const actual = vi.fn();
-	const gateway = new ToolExecutionGateway([]);
-	const host: SpeculativeActionHost = {
-		sessionID: "session",
-		executionWorldDiagnostics: vi.fn(async () => portableDiagnostics()),
-		runtime: {
-			settingsChanged: vi.fn(),
-			inspect: () => ({
-				activeTurns: 0,
-				exclusiveCandidates: 0,
-				sharedCandidates: 0,
-				pendingPredictions: 0,
-				deferredPlanActions: 0,
-				activePlanActions: 0,
-				executionBlockedPlanActions: 0,
-				blockedPlanActions: 0,
-			}),
-		} as unknown as SpeculativeActionHost["runtime"],
-		startTurn: vi.fn(),
-		previewActorTool: vi.fn(),
-		previewActorCall: vi.fn(),
-		consume: consumeMock,
-		execute: vi.fn(async (input, signal, executor) => {
-			const invocation = await resolveInvocation(input.tool, input.args);
-			return gateway.executeAuthoritative({ tool: input.tool, input: input.args,
-				...(input.id ? { callID: input.id } : {}), ...(signal ? { signal } : {}), ...(invocation ? { invocation } : {}),
-			}, executor, input.turnID ? {
-				reuse: async () => (await consumeMock({ ...input, turnID: input.turnID! }, signal))?.result,
-				settled: async (settlement) => actual({ ...input, turnID: input.turnID!, durationMs: settlement.durationMs,
-					output: settlement.status === "succeeded" ? { result: settlement.output, isError: false } : toolErrorSettlement(settlement.error),
-				}),
-			} : {});
-		}),
-		actual,
-		finishTurn: vi.fn(),
-		drafterGateSnapshot: () => ({ skippedBatches: 0, samples: 0 }),
-		dispose: vi.fn(() => gateway.dispose()),
-	};
-	return host;
 }
 
 function portableDiagnostics(

@@ -190,6 +190,12 @@ export interface SpeculativePlanSource<
 	readonly flush?: () => MaybePromise<void>;
 }
 
+export interface ActualToolCall {
+	readonly id?: string;
+	readonly tool: string;
+	readonly input: unknown;
+}
+
 export interface SpeculativeActionRuntimeAdapter<
 	SessionID,
 	Output,
@@ -232,7 +238,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly callID: string;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<AuthoritativeResultCapture<Output> | undefined>;
-	readonly actual: (input: ConsumeInput) => { readonly id?: string; readonly tool: string; readonly input: unknown };
+	readonly actual: (input: ConsumeInput) => ActualToolCall;
 	readonly preflightCandidate: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;
@@ -314,6 +320,12 @@ export interface SpeculativeRuntimeInspection {
 	readonly oldestTelemetryEventMs: number;
 }
 
+/** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
+export interface PreparedActorCall<Output> {
+	readonly output?: Output;
+	readonly settle: (durationMs: number, output?: Output) => Promise<void>;
+}
+
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
 	/** Streamed Actor tool identity: prioritize complete predictions for that tool without matching them. */
@@ -323,8 +335,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	) => Promise<void>;
 	/** Complete streamed Actor intent: prioritize matching work or start an isolated preview; never commit it. */
 	readonly previewActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<void>;
-	readonly consume: (input: ConsumeInput, signal?: AbortSignal) => Promise<Output | undefined>;
-	readonly actual: (input: ConsumeInput & { readonly durationMs: number; readonly output?: Output }) => Promise<void>;
+	readonly prepareActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<PreparedActorCall<Output> | undefined>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
 	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
 	readonly releaseSession: (sessionID: SessionID) => Promise<void>;

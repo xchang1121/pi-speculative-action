@@ -26,7 +26,9 @@ import { cloneSharedData } from "./stable-json.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import type {
 	AdoptedAction,
+	ActualToolCall,
 	AuthoritativeResultCapture,
+	PreparedActorCall,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionRuntimeAdapter,
@@ -263,81 +265,6 @@ async function projectOutput<Output, StartInput, StateData>(
 	}
 }
 
-function registerActorAction<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	callID: string | undefined,
-	action: ActorAction,
-): void {
-	if (callID) session.actorCalls.set(callKey(action.identity.turnID, callID), action);
-	else session.anonymousActorCalls.push(action);
-}
-
-function takeActorAction<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	turnID: string,
-	call: ActualToolCall,
-): ActorAction | undefined {
-	if (call.id) {
-		const key = callKey(turnID, call.id);
-		const action = session.actorCalls.get(key);
-		session.actorCalls.delete(key);
-		return action;
-	}
-	const index = session.anonymousActorCalls.findIndex(
-		(action) =>
-			action.identity.turnID === turnID && action.tool === call.tool && action.state.status === "awaiting_fallback",
-	);
-	return index < 0 ? undefined : session.anonymousActorCalls.splice(index, 1)[0];
-}
-
-function forgetActorAction<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	callID: string | undefined,
-	action: ActorAction,
-): void {
-	disposeActorCapture(session, action);
-	if (callID) {
-		session.actorCalls.delete(callKey(action.identity.turnID, callID));
-		return;
-	}
-	const index = session.anonymousActorCalls.indexOf(action);
-	if (index >= 0) session.anonymousActorCalls.splice(index, 1);
-}
-
-function clearActorActions<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	turnID?: string,
-): void {
-	if (turnID === undefined) {
-		for (const capture of session.authoritativeResultCaptures.values()) session.lifecycle.release(capture);
-		session.authoritativeResultCaptures.clear();
-		session.actorCalls.clear();
-		session.anonymousActorCalls.length = 0;
-		return;
-	}
-	for (const [key, action] of session.actorCalls) {
-		if (action.identity.turnID !== turnID) continue;
-		disposeActorCapture(session, action);
-		session.actorCalls.delete(key);
-	}
-	for (let index = session.anonymousActorCalls.length - 1; index >= 0; index--) {
-		const action = session.anonymousActorCalls[index];
-		if (action?.identity.turnID !== turnID) continue;
-		disposeActorCapture(session, action);
-		session.anonymousActorCalls.splice(index, 1);
-	}
-}
-
-function disposeActorCapture<SessionID, Output, StartInput, StateData>(
-	session: SessionState<SessionID, Output, StartInput, StateData>,
-	action: ActorAction,
-): void {
-	const capture = session.authoritativeResultCaptures.get(action);
-	if (!capture) return;
-	session.authoritativeResultCaptures.delete(action);
-	session.lifecycle.release(capture);
-}
-
 function callKey(turnID: string, callID: string): string {
 	return JSON.stringify([turnID, callID]);
 }
@@ -507,12 +434,6 @@ function errorDetail(error: unknown): string {
 	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
-interface ActualToolCall {
-	readonly id?: string;
-	readonly tool: string;
-	readonly input: unknown;
-}
-
 interface PlanActionContext<StartInput, StateData> {
 	readonly identity: PlanActionIdentity;
 	readonly opportunity: PredictionOpportunity;
@@ -608,9 +529,6 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly launchTimers: Map<string, ReturnType<typeof setTimeout>>;
 	readonly sourceSlots: Set<SourceRequestSlot>;
 	readonly sourceTasks: Set<Promise<unknown>>;
-	readonly actorCalls: Map<string, ActorAction>;
-	readonly anonymousActorCalls: ActorAction[];
-	readonly authoritativeResultCaptures: Map<ActorAction, AuthoritativeResultCapture<Output>>;
 	readonly turns: Set<string>;
 	readonly actorPhaseIntervals: TimelineInterval[];
 	readonly authoritativeToolIntervals: Map<string | object, TimelineInterval>;
@@ -642,7 +560,8 @@ interface TurnState<SessionID, Output, StartInput, StateData> {
 	readonly candidateNames: readonly string[];
 	readonly generation: SourceGeneration;
 	readonly decisionSequence: number;
-	readonly actorActions: ActorAction[];
+	readonly actorActions: Set<ActorAction<CandidateRecord<Output, StartInput, StateData>, Output>>;
+	actorObservation?: ActorActionIdentity | null;
 	readonly actorToolHints: Set<string>;
 	readonly actorPreviews: Map<string, ActorPreviewRecord>;
 	actorDecisionStartedAt: number;
@@ -736,9 +655,6 @@ class StructuralRuntimeState<
 			launchTimers: new Map(),
 			sourceSlots: new Set(),
 			sourceTasks: new Set(),
-			actorCalls: new Map(),
-			anonymousActorCalls: [],
-			authoritativeResultCaptures: new Map(),
 			turns: new Set(),
 			actorPhaseIntervals: [],
 			authoritativeToolIntervals: new Map(),
@@ -912,7 +828,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				candidateNames: names,
 				generation,
 				decisionSequence: session.decisionSequence + 1,
-				actorActions: [],
+				actorActions: new Set(),
 				actorToolHints: new Set(),
 				actorPreviews: new Map(),
 				actorDecisionStartedAt: startedAt,
@@ -1692,7 +1608,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) {
 			return Promise.resolve();
 		}
-		const actualCall = adapter.actual(input) as ActualToolCall;
+		const actualCall = adapter.actual(input);
 		if (!actualCall.id) return state.session.lifecycle.track(promoteActorCall(state, input, actualCall, undefined, signal));
 		const existing = state.actorPreviews.get(actualCall.id);
 		if (existing) return existing.task;
@@ -1826,11 +1742,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		state: Turn,
 		input: ConsumeInput,
 		actualCall: ActualToolCall,
-		actorAction: ActorAction,
+		actorAction: ActorAction<Candidate, Output>,
 		action: ActionKey,
 		signal?: AbortSignal,
 	): Promise<void> => {
-		if (!adapter.captureAuthoritativeResult) return;
+		if (!adapter.captureAuthoritativeResult || !state.actorActions.has(actorAction)) return;
 		const concrete = asConcreteInput(actualCall.input);
 		if (!concrete) return;
 		const captureSignal = signal ?? state.generation.signal;
@@ -1857,13 +1773,13 @@ export function makeStructuralSpeculativeActionRuntime<
 			captureSignal.aborted ||
 			state.lifecycle !== "active" ||
 			runtimeState.turns.get(state.key) !== state ||
-			runtimeState.masterEnabled === false
+			runtimeState.masterEnabled === false ||
+			!state.actorActions.has(actorAction) ||
+			!actorAction.capture(capture)
 		) {
 			state.session.lifecycle.release(capture);
 			return;
 		}
-		disposeActorCapture(state.session, actorAction);
-		state.session.authoritativeResultCaptures.set(actorAction, capture);
 	};
 
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
@@ -2066,12 +1982,12 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const consume = async (input: ConsumeInput, signal?: AbortSignal): Promise<Output | undefined> => {
+	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<PreparedActorCall<Output> | undefined> => {
 		const actorArrivedAt = performance.now();
 		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
 		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false)
 			return undefined;
-		const actualCall = adapter.actual(input) as ActualToolCall;
+		const actualCall = adapter.actual(input);
 		let preview = actualCall.id ? state.actorPreviews.get(actualCall.id) : undefined;
 		if (actualCall.id) state.actorPreviews.delete(actualCall.id);
 		if (preview?.state.status === "pending") {
@@ -2094,23 +2010,29 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 		}
 		const sequence = ++state.session.sequence;
-		const identity: ActorActionIdentity = {
-			id: actualCall.id ?? JSON.stringify([input.turnID, sequence]),
-			sequence,
-			decisionSequence: state.decisionSequence,
-			turnID: input.turnID,
-		};
 		const admission = enterActorAdmission(state.session);
 		const actualKey = await actorActionKey(input, actualCall);
+		if (state.lifecycle !== "active" || runtimeState.turns.get(state.key) !== state ||
+			signal?.aborted || runtimeState.masterDisabled()) {
+			abandonActorPreview(state, preview, cause("control", signal?.aborted ? "actor_aborted" : "disabled"));
+			admission.release();
+			return undefined;
+		}
 		const actorAction = new ActorAction<Candidate, Output>({
-			identity,
+			identity: { id: actualCall.id ?? JSON.stringify([input.turnID, sequence]), sequence,
+				decisionSequence: state.decisionSequence, turnID: input.turnID },
 			tool: actualCall.tool,
 			...(actualKey ? { actionKey: actualKey } : {}),
 			fallback: cause("matching", "no_candidate"),
 			releaseActorAdmission: admission.release,
 		});
-		registerActorAction(state.session, actualCall.id, actorAction);
-		state.actorActions.push(actorAction);
+		const identity = actorAction.identity;
+		state.actorActions.add(actorAction);
+		state.actorObservation ??= actualKey ? identity : null;
+		const prepared: { output?: Output; settle: PreparedActorCall<Output>["settle"] } = {
+			settle: (durationMs, output) => state.session.lifecycle.track(
+				settleActorCall(state, input, actualCall, actorAction, durationMs, output)),
+		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
 			state.session.effects.enqueue(() =>
@@ -2133,7 +2055,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				actorAction.deferToFallback([], undefined, failure);
 				preemptForActor(state.session, { class: "global", units: 1 }, state.settings);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
-				return undefined;
+				return Object.freeze(prepared);
 			}
 
 			const matchingPredictions: ClaimedPrediction[] = predictionMatches(
@@ -2174,8 +2096,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				const previewed = preview?.state.status === "candidate" && preview.state.ownership === "preview" &&
 					preview.state.candidateID === selected.candidate.id;
 				const adoption = actorAction.settleSelection(predictionIdentities, previewed ? "preview" : "speculative");
-				if (!adoption) return undefined;
-				forgetActorAction(state.session, actualCall.id, actorAction);
+				if (!adoption) return Object.freeze(prepared);
+				state.actorActions.delete(actorAction);
 				reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
 				if (!previewed) queueCandidateContinuations(
 					state.session,
@@ -2191,7 +2113,8 @@ export function makeStructuralSpeculativeActionRuntime<
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
-				return selected.output;
+				prepared.output = selected.output;
+				return Object.freeze(prepared);
 			}
 
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
@@ -2207,7 +2130,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (adapter.captureAuthoritativeResult && effect === "observation") {
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
 			}
-			return undefined;
+			return Object.freeze(prepared);
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
 			actorAction.close();
@@ -2271,18 +2194,18 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 	};
 
-	const actual = async (
-		input: ConsumeInput & { readonly durationMs: number; readonly output?: Output },
+	const settleActorCall = async (
+		state: Turn,
+		input: ConsumeInput,
+		actualCall: ActualToolCall,
+		actorAction: ActorAction<Candidate, Output>,
+		duration: number,
+		output?: Output,
 	): Promise<void> => {
-		const state = runtimeState.turns.get(turnKey(input.sessionID, input.turnID));
-		if (!state) return;
-		const actualCall = adapter.actual(input) as ActualToolCall;
-		const actorAction = takeActorAction(state.session, input.turnID, actualCall);
-		if (!actorAction) return;
-		const capture = state.session.authoritativeResultCaptures.get(actorAction);
-		state.session.authoritativeResultCaptures.delete(actorAction);
-		const durationMs = finiteMetric(input.durationMs);
-		if (!actorAction.settleActor(durationMs, outputIsError(input.output), performance.now())) {
+		if (!state.actorActions.delete(actorAction)) return;
+		const capture = actorAction.takeCapture();
+		const durationMs = finiteMetric(duration);
+		if (!actorAction.settleActor(durationMs, outputIsError(output), performance.now())) {
 			state.session.lifecycle.release(capture);
 			return;
 		}
@@ -2290,11 +2213,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key), durationMs);
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
-		queueActorSettlement(state, input, actualCall, actorAction, input.output);
-		if (capture && key && input.output !== undefined && !outputIsError(input.output)) {
+		queueActorSettlement(state, input, actualCall, actorAction, output);
+		if (capture && key && output !== undefined && !outputIsError(output)) {
 			const provider = actorAction.settlement?.provider;
 			if (provider?.kind === "actor") {
-				await promoteAuthoritativeResult(state, key, input.output, durationMs, provider.toolExecution, capture);
+				await promoteAuthoritativeResult(state, key, output, durationMs, provider.toolExecution, capture);
 			} else {
 				state.session.lifecycle.release(capture);
 			}
@@ -2307,7 +2230,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		state: Turn,
 		input: ConsumeInput,
 		actualCall: ActualToolCall,
-		actorAction: ActorAction,
+		actorAction: ActorAction<Candidate, Output>,
 		output: Output | undefined,
 		selection?: ActorCandidateSelection<Candidate, Output>,
 	): void => {
@@ -2398,16 +2321,16 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const settlePredictionFrontier = (state: Turn): void => {
-		if (!state.actorActions.length) return;
+		const observation = state.actorObservation;
+		if (observation === undefined) return;
 		state.session.decisionSequence = Math.max(state.session.decisionSequence, state.decisionSequence);
-		const observation = state.actorActions.find((action) => action.actionKey);
 		for (const node of state.session.plan.due(state.decisionSequence)) {
 			if (node.predictionState.status !== "pending") continue;
 			if (!observation) {
 				settleUnobserved(state.session, node, cause("matching", "actor_action_not_keyable"));
 				continue;
 			}
-			const settlement = state.session.plan.miss(node.proposalID, node.action.id, observation.identity);
+			const settlement = state.session.plan.miss(node.proposalID, node.action.id, observation);
 			if (settlement) predictionSettled(state.session, node, settlement);
 		}
 		dispatchReady(state.session);
@@ -2877,6 +2800,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		return { state, completedAt, terminal: input.terminal, notifyHost: input.notifyHost };
 	};
 
+	const clearActorActions = (state: Turn): void => {
+		for (const action of state.actorActions) {
+			const capture = action.takeCapture();
+			if (capture) state.session.lifecycle.release(capture);
+		}
+		state.actorActions.clear();
+	};
+
 	const completeTurnClosure = async (closure: TurnClosure): Promise<void> => {
 		const { state } = closure;
 		state.lifecycle = "finished";
@@ -2894,7 +2825,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		runtimeState.turns.delete(state.key);
 		state.session.turns.delete(state.key);
-		clearActorActions(state.session, state.turnID);
+		clearActorActions(state);
 	};
 
 	const flushSources = async (): Promise<void> => {
@@ -2929,7 +2860,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		await waitForSourceTasks(session);
 		await session.effects.flush();
 		for (const closure of closures) await completeTurnClosure(closure);
-		for (const key of session.turns) runtimeState.turns.delete(key);
+		for (const key of session.turns) {
+			const state = runtimeState.turns.get(key);
+			if (state) clearActorActions(state);
+			runtimeState.turns.delete(key);
+		}
 		session.turns.clear();
 
 		for (const candidate of runtimeState.candidates.values(session.id)) {
@@ -2945,7 +2880,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		await session.effects.flush();
 		if (terminal || mode === "disposed") await flushSources();
 		pruneActionContexts(session);
-		clearActorActions(session);
 		if (!terminal) await session.lifecycle.drain();
 	};
 
@@ -3135,12 +3069,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		startTurn,
 		previewActorTool,
 		previewActorCall,
-		consume: (input, signal) => {
-			const task = consume(input, signal);
-			return runtimeState.sessions.get(input.sessionID)?.lifecycle.track(task) ?? task;
-		},
-		actual: (input) => {
-			const task = actual(input);
+		prepareActorCall: (input, signal) => {
+			const task = prepareActorCall(input, signal);
 			return runtimeState.sessions.get(input.sessionID)?.lifecycle.track(task) ?? task;
 		},
 		finishTurn,

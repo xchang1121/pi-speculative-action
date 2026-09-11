@@ -38,6 +38,7 @@ import type {
 	MaterializedActorAction,
 	MaterializedSpeculativeCandidate,
 	PredictionFeedback,
+	PreparedActorCall,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionSettings,
@@ -184,19 +185,12 @@ export interface SpeculativeActionHost {
 	) => Promise<void>;
 	/** Raw streamed arguments; preparation is provisional and never binds the final Actor call. */
 	readonly previewActorCall: (input: Omit<AgentConsumeInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
-	readonly consume: (
-		input: Omit<AgentConsumeInput, "sessionID">,
-		signal?: AbortSignal,
-	) => Promise<ToolSettlement | undefined>;
 	/** One tool outlet: reuse lookup, Actor fallback, timing, and settlement reporting. */
 	readonly execute: (
 		input: SpeculativeToolExecutionInput,
 		signal: AbortSignal | undefined,
 		executor: (operation: ToolOperation) => Promise<AgentToolResult<unknown>>,
 	) => Promise<AgentToolResult<unknown>>;
-	readonly actual: (
-		input: Omit<AgentConsumeInput, "sessionID"> & { readonly durationMs: number; readonly output?: ToolSettlement },
-	) => Promise<void>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
 	readonly drafterGateSnapshot: () => ActionDrafterGateSnapshot;
 	readonly dispose: () => Promise<void>;
@@ -417,7 +411,6 @@ export function createSpeculativeActionHost(
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
-		consume: (input, signal) => runtime.consume({ ...input, sessionID }, signal),
 		execute: (input, signal, executor) => {
 			const operation: ToolOperation = {
 				tool: input.tool,
@@ -426,7 +419,7 @@ export function createSpeculativeActionHost(
 				...(signal ? { signal } : {}),
 			};
 			let binding: Promise<ToolOperation> | undefined;
-			// One invocation owns its binding; resolve inside consume so Actor arrival includes binding cost.
+			// One invocation owns its binding; prepare after Actor arrival so timing includes binding cost.
 			const bind = () => binding ??= (async () => {
 				const tool = input.tools.find((tool) => tool.name === input.tool);
 				return Object.freeze({ ...operation, ...await resolveBinding(operation.tool, operation.input,
@@ -434,6 +427,7 @@ export function createSpeculativeActionHost(
 			})();
 			const actorCall = input.turnID
 				? {
+						sessionID,
 						[ACTOR_OPERATION]: bind,
 						turnID: input.turnID,
 						id: input.id,
@@ -442,26 +436,24 @@ export function createSpeculativeActionHost(
 						tools: input.tools,
 					}
 				: undefined;
+			let prepared: PreparedActorCall<ToolSettlement> | undefined;
 			return executionGateway.executeAuthoritative(operation, () => bind().then(executor), {
 				...(actorCall
 					? {
-							reuse: async () => (await runtime.consume({ ...actorCall, sessionID }, signal))?.result,
+							reuse: async () => {
+								prepared = await runtime.prepareActorCall(actorCall, signal);
+								return prepared?.output?.result;
+							},
 							settled: async (settlement) => {
-								await runtime.actual({
-									...actorCall,
-									sessionID,
-									durationMs: settlement.durationMs,
-									output:
-										settlement.status === "succeeded"
+								await prepared?.settle(settlement.durationMs,
+									settlement.status === "succeeded"
 											? { result: settlement.output, isError: false }
-											: toolErrorSettlement(settlement.error),
-								});
+											: toolErrorSettlement(settlement.error));
 							},
 						}
 					: {}),
 			});
 		},
-		actual: (input) => runtime.actual({ ...input, sessionID }),
 		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });

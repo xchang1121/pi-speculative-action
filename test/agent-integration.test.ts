@@ -117,6 +117,48 @@ afterEach(async () => {
 });
 
 describe("speculative action host", () => {
+	it("owns each concurrent native call independently of caller IDs and completion order", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		await writeFile(path.join(cwd, "other.txt"), "different content");
+		for (const ids of ["unique", "duplicate", "absent"]) for (const order of [[0, 1], [1, 0]]) {
+			const gates = [0, 1].map(() => ({ entered: deferred(), done: deferred() })), feedback: number[] = [];
+			const identities: object[] = [], sameIdentity: boolean[] = [];
+			const complete = vi.fn(async () => { throw new Error("unexpected inference"); });
+			const host = createSpeculativeActionHost("session", { cwd, complete, executionWorlds: [],
+				getSettings: () => ({ ...settings(), drafterEnabled: false }),
+				patternStore: new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, enabled: false }),
+				onActorActionMaterialized: ({ identity }) => { identities.push(identity); },
+				onActorActionSettled: ({ settlement }) => {
+					feedback.push(settlement.actorAction.sequence);
+					sameIdentity.push(identities.includes(settlement.actorAction) && Object.isFrozen(settlement.actorAction));
+				} });
+			const inputs = ["notes.txt", "other.txt"].map((path) => ({ path })), native = vi.fn();
+			const results: ReturnType<typeof host.execute>[] = [];
+			try {
+				await host.startTurn(startInput(tool));
+				for (const [index, args] of inputs.entries()) {
+					results.push(host.execute({ turnID: "turn-1", id: ids === "unique" ? String(index) : ids === "duplicate" ? "same" : undefined,
+						tool: "read", args, tools: [tool] }, undefined, async (operation) => {
+							native(index); const output = await tool.execute(String(index), operation.input as never, operation.signal);
+							gates[index]!.entered.resolve(); await gates[index]!.done.promise; return output;
+						}));
+					await gates[index]!.entered.promise;
+				}
+				for (const index of order) {
+					gates[index]!.done.resolve();
+					expect(await results[index]).toEqual(await tool.execute("oracle", inputs[index]!));
+				}
+				await host.finishTurn("turn-1", true);
+				expect(feedback).toEqual(order.map((index) => index + 1));
+				expect(sameIdentity).toEqual([true, true]);
+				expect(native.mock.calls).toEqual([[0], [1]]); expect(complete).not.toHaveBeenCalled();
+			} finally {
+				for (const gate of gates) gate.done.resolve();
+				await Promise.allSettled(results); await host.dispose();
+			}
+		}
+	});
+
 	it("prepares active requests and charges late Drafter continuations to their original observation", async () => {
 		let now = 0;
 		const prepareExecution = vi.fn();
@@ -607,13 +649,10 @@ describe("speculative action host", () => {
 			expect(fingerprint).not.toHaveBeenCalled();
 			if (origin === "drafter") { await ready.promise; expect(fingerprint).toHaveBeenCalled(); }
 			else expect(materialized).toHaveLength(0);
-			const adopted = await host.consume(call);
-			if (origin === "drafter") expect(adopted).toBeDefined();
-			else {
-				expect(adopted).toBeUndefined();
-				await host.actual({ ...call, durationMs: 12,
-					output: { result: await grepTool.execute(call.id, call.args), isError: false } });
-			}
+			const execute = vi.fn(() => grepTool.execute(call.id, call.args));
+			const result = await host.execute(call, undefined, execute);
+			expect(result.content).toEqual((await grepTool.execute("oracle", call.args)).content);
+			expect(execute).toHaveBeenCalledTimes(origin === "drafter" ? 0 : 1);
 			await waitFor(() => materialized.some((candidate) => candidate.source === "pattern_aware" && candidate.tool === "read"));
 			expect(materialized).toContainEqual(expect.objectContaining({
 				sessionID: "probe", turnID: call.turnID, expectedDecisionSequence: 2, latestDecisionSequence: 2,
@@ -747,14 +786,14 @@ describe("speculative action host", () => {
 		);
 		expect(new Set(forkBatch.map((candidate) => candidate.proposalID)).size).toBe(1);
 		expect(forkBatch.map((candidate) => candidate.actionID)).toEqual(["0:fork", "1:fork"]);
-		const hit = await host.consume({
+		const hit = await host.execute({
 			turnID: "fork-hit",
 			id: "actor-hit",
 			tool: "read",
 			args: { path: "notes.txt" },
 			tools: [tool],
-		});
-		expect(hit?.result.content).toEqual([{ type: "text", text: "notes.txt" }]);
+		}, undefined, async () => { throw new Error("Unexpected Actor fallback"); });
+		expect(hit.content).toEqual([{ type: "text", text: "notes.txt" }]);
 		await waitFor(() => events.some((event) => event.type === "actor_action" && event.turnID === "fork-hit"));
 		const adopted = events.find((event) => event.type === "actor_action" && event.turnID === "fork-hit");
 		expect(adopted).toMatchObject({ candidate: { source: "self-speculation" } });
@@ -773,24 +812,15 @@ describe("speculative action host", () => {
 				(event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded",
 			),
 		);
-		expect(
-			await host.consume({
-				turnID: "fork-miss",
-				id: "actor-miss",
-				tool: "read",
-				args: { path: "actor-miss.txt" },
-				tools: [tool],
-			}),
-		).toBeUndefined();
-		await host.actual({
+		const missed = vi.fn(async () => ({ content: [{ type: "text" as const, text: "actor-miss.txt" }], details: {} }));
+		expect((await host.execute({
 			turnID: "fork-miss",
 			id: "actor-miss",
 			tool: "read",
 			args: { path: "actor-miss.txt" },
 			tools: [tool],
-			durationMs: 80,
-			output: { result: { content: [{ type: "text", text: "actor-miss.txt" }], details: {} }, isError: false },
-		});
+		}, undefined, missed)).content).toEqual([{ type: "text", text: "actor-miss.txt" }]);
+		expect(missed).toHaveBeenCalledOnce();
 		await finishTurn("fork-miss");
 
 		forkPath = "notes.txt";
