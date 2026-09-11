@@ -194,7 +194,7 @@ fork 有两种传输方式：
 
 D3 默认上限为 28 个 draft token，可显式配置，并再次受推理引擎硬上限约束；token 验收和动作侧收益分别计量。
 
-JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 都能配置常用的 endpoint、Bearer token 环境变量名、候选/token 上限、fork 门控策略、Actor 模型 Profile、tool-call 格式、decoder、温度和专家级语法覆盖。`actorProfile` 决定最终按什么协议为 Actor 格式化和编码 D3 candidate，默认是 `auto`。显式 Actor Profile 优先于 `draftFormat` 格式覆盖；候选始终按 Actor 的格式和 tokenizer 编码。边界与强制前缀默认都是 `auto`，由推理适配器从同一种模型格式派生 CoT 闭合、对齐到工具名的 probe 前缀、解析 framing 和 D3 边界；显式覆盖时必须仍属于该格式。控制路由能够改变推理执行，应只放在可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不会保存 token 值。
+JSON 文件还接受 `requestIDField` 和三条控制路由；JSON 与 TUI 均可配置端点、Bearer token 环境变量、候选/token 上限、fork 门控、Actor Profile、tool-call 格式、decoder、温度和语法覆盖。`actorProfile` 默认 `tagged_json`，保留旧版 provider v1 payload 和 `draftFormat`；显式选择 `auto` 或模型专用 Profile 才使用 v2，专用 Profile 优先于格式覆盖。候选始终按 Actor 的格式与 tokenizer 编码。边界和强制前缀默认 `auto`，由推理适配器从同一模型格式派生 CoT 闭合、工具名前缀、解析 framing 和 D3 边界，显式覆盖也须属于该格式。控制路由应位于可信网络或受认证代理之后；`apiKeyEnv` 只读取指定环境变量，不保存 token 值。
 
 对于 Qwen3.5 系列（包括 Qwen3.8 部署别名），如果 Actor provider 使用模型原生的
 `tools=` chat template，应把 `actorProfile` 设为 `qwen35_xml`。只有 Actor 请求本身也通过配套

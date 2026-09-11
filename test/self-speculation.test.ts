@@ -49,6 +49,10 @@ describe("self-speculation control plane", () => {
 			actorProfile: "qwen35_xml",
 			draftFormat: "auto",
 		});
+		expect(normalizeSelfSpeculationSettings({})).toMatchObject({
+			actorProfile: "tagged_json",
+			draftFormat: "auto",
+		});
 	});
 
 	it.each([false, true])("buffers an ordered Actor bundle while preserving predicted identity (covering=%s)", async (covering) => {
@@ -81,9 +85,9 @@ describe("self-speculation control plane", () => {
 			version: 2,
 			request_id: "actor-request",
 			max_draft_tokens: SELF_SPECULATION_DEFAULTS.maxDraftTokens,
-			actor_profile: "auto",
+			format: "tagged_json",
 		});
-		expect(bundle?.body).not.toHaveProperty("format");
+		expect(bundle?.body).not.toHaveProperty("actor_profile");
 		expect(bundle?.body).not.toHaveProperty("boundary");
 		expect(bundle?.body.candidates).toEqual(covering ? ["predicted-a", "predicted-b"].map((key) => expect.objectContaining({
 			id: actionIdentity(key),
@@ -121,9 +125,9 @@ describe("self-speculation control plane", () => {
 		expect(actor.request_id).toBe("actor-request");
 		expect(actor.self_speculation).toEqual(
 			expect.objectContaining({
-				version: 2,
+				version: 1,
 				fork: true,
-				actor_profile: "auto",
+				draft_format: "tagged_json",
 				d2: {
 					confidence_metric: "minimum_tool_name_probability",
 					confidence_threshold: 0.9,
@@ -134,7 +138,7 @@ describe("self-speculation control plane", () => {
 		);
 		expect(actor.self_speculation).not.toHaveProperty("role");
 		expect(actor.self_speculation).not.toHaveProperty("draft_profile");
-		expect(actor.self_speculation).not.toHaveProperty("draft_format");
+		expect(actor.self_speculation).not.toHaveProperty("actor_profile");
 		expect(actor.self_speculation).not.toHaveProperty("draft_boundary");
 		expect(actor.self_speculation).not.toHaveProperty("fork_forced_prefix");
 		expect(secondActor).toEqual({ model: "actor-retry" });
@@ -196,6 +200,30 @@ describe("self-speculation control plane", () => {
 			resolvedActorProfile: "qwen35_xml",
 			profileResolutionSource: "explicit",
 		});
+	});
+
+	it("uses Profile v2 only when automatic model resolution is selected", async () => {
+		const requests: CapturedRequest[] = [];
+		const coordinator = coordinatorFixture(
+			requests,
+			{ actorProfile: "auto", forkEnabled: false },
+			["actor-request"],
+		);
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.addCandidate(candidate("drafter", "key-a", "unused", "read", { path: "a.txt" }, 0.9));
+		const actor = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, any>;
+		await coordinator.dispose();
+
+		expect(actor.self_speculation).toMatchObject({
+			version: 2,
+			actor_profile: "auto",
+		});
+		expect(actor.self_speculation).not.toHaveProperty("draft_format");
+		const candidateRequest = requests.find(
+			(request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath,
+		);
+		expect(candidateRequest?.body.actor_profile).toBe("auto");
+		expect(candidateRequest?.body).not.toHaveProperty("format");
 	});
 
 	it("records clear-time target verification without confusing registration receipts", async () => {
@@ -443,10 +471,11 @@ describe("self-speculation control plane", () => {
 				chunk_count: 1,
 			},
 			options: {
-				actor_profile: "auto",
+				draft_format: "tagged_json",
 				decoder: "auto",
 			},
 		});
+		expect(forks[0]?.body.options).not.toHaveProperty("actor_profile");
 		expect(forks[0]?.body.options).not.toHaveProperty("forced_prefix");
 		expect(forks[0]?.body.options).not.toHaveProperty("draft_boundary");
 		expect(coordinator.snapshot()).toEqual(
