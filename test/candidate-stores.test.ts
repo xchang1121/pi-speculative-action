@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { type ActionKey, actionKeyCovers, buildPiActionKey } from "../src/action-semantics.ts";
-import { ActionStore, ResultCache, speculativeCacheValue } from "../src/candidate-stores.ts";
+import { CandidateStore, speculativeCacheValue } from "../src/candidate-stores.ts";
 
 interface Entry {
 	readonly id: string;
@@ -9,7 +9,7 @@ interface Entry {
 	readonly estimatedBytes: number;
 }
 
-describe("ActionStore", () => {
+describe("CandidateStore", () => {
 	it.each(["id", "partition", "project"] as const)("owns %s while keeping projection reuse and retirement coherent", (field) => {
 		let partitionAvailable = true;
 		let partitionCalls = 0;
@@ -29,15 +29,20 @@ describe("ActionStore", () => {
 				return READ_RANGE_ACTION_KEY_PROJECTOR.project(speculative, actor);
 			},
 		};
-		const store = new ActionStore<string, Entry>([projector]);
+		const store = new CandidateStore<string, Entry>([projector]);
 		const broad = entry("broad", "a.ts", 1, 200);
 		const tight = entry("tight", "a.ts", 80, 60);
 		const requested = entry("requested", "a.ts", 100, 10);
-		store.insertOrGetCompatible("one", broad);
-		store.insertOrGetCompatible("one", tight);
+		store.getOrCreate("one", broad.key, () => broad);
+		store.getOrCreate("one", tight.key, () => tight);
+		const registeredPartitions = partitionCalls;
+		store.settle("one", broad);
+		expect(partitionCalls).toBe(registeredPartitions);
+		expect(store.pending("one")).toEqual([tight]);
+		expect(store.get("one", broad.id)).toBe(broad);
 		Object.assign(projector, { [field]: field === "id" ? "changed" : () => undefined });
 
-		const compatible = store.insertOrGetCompatible("one", requested, (existing) =>
+		const compatible = store.getOrCreate("one", requested.key, () => requested, (existing) =>
 			actionKeyCovers(existing.key, requested.key, [READ_RANGE_ACTION_KEY_PROJECTOR]),
 		);
 		expect(compatible).toMatchObject({
@@ -45,7 +50,7 @@ describe("ActionStore", () => {
 			inserted: false,
 			match: { kind: "projected", projector: "read.range" },
 		});
-		expect(store.insertOrGetCompatible("one", entry("duplicate", "a.ts", 80, 60))).toMatchObject({
+		expect(store.getOrCreate("one", tight.key, () => entry("duplicate", "a.ts", 80, 60))).toMatchObject({
 			entry: tight,
 			inserted: false,
 			match: { kind: "exact" },
@@ -77,7 +82,7 @@ describe("ActionStore", () => {
 			expect(store.delete("one", broad)).toBe(true);
 		}
 		const replacement = entry("replacement", "a.ts", 100, 10);
-		const inserted = store.insertOrGetCompatible("one", replacement, (existing) => {
+		const inserted = store.getOrCreate("one", replacement.key, () => replacement, (existing) => {
 			store.delete("one", existing);
 			return true;
 		});
@@ -96,24 +101,27 @@ describe("ActionStore", () => {
 	});
 
 	it("keeps distinct exact owners when their execution contexts cannot be reused", () => {
-		const store = new ActionStore<string, Entry>([], true);
+		const store = new CandidateStore<string, Entry>([]);
 		const root = entry("root", "same.ts");
 		const derived = entry("derived", "same.ts");
-		expect(store.insertOrGetCompatible("session", root).inserted).toBe(true);
-		const separate = store.insertOrGetCompatible("session", derived, () => false, () => false);
+		expect(store.getOrCreate("session", root.key, () => root).inserted).toBe(true);
+		store.settle("session", root, false);
+		expect(store.pending("session")).toEqual([]);
+		expect(store.cached("session")).toEqual([]);
+		const separate = store.getOrCreate("session", derived.key, () => derived, () => false);
 		expect(separate.inserted).toBe(true);
 		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["derived", "root"]);
 		expect(store.touch("session", root)).toBe(true);
 		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["root", "derived"]);
 		expect(store.delete("session", root)).toBe(true);
-		expect(store.getExact("session", derived.key)).toBe(derived);
+		expect(store.lookup("session", derived.key)[0]?.entry).toBe(derived);
 		const retireExact = (existing: Entry) => store.delete("session", existing);
 		const next = entry("next", "same.ts");
-		expect(store.insertOrGetCompatible("session", next, () => false, retireExact))
+		expect(store.getOrCreate("session", next.key, () => next, retireExact))
 			.toMatchObject({ entry: next, inserted: true });
-		expect(store.getExact("session", next.key)).toBe(next);
+		expect(store.get("session", next.id)).toBe(next);
 		const nested = entry("nested", "same.ts");
-		expect(store.insertOrGetCompatible("session", nested, () => false, (existing) => {
+		expect(store.getOrCreate("session", nested.key, () => nested, (existing) => {
 			retireExact(existing);
 			store.insert("session", nested);
 			return false;
@@ -122,11 +130,11 @@ describe("ActionStore", () => {
 	});
 });
 
-describe("ResultCache", () => {
+describe("candidate retention", () => {
 	it("retains scoped freshness and reuse evidence through bounded cache pressure", () => {
 		for (const copies of [1, 170]) {
 			let scores = 0;
-			const cache = new ResultCache<string, Entry>([], (item) => {
+			const cache = new CandidateStore<string, Entry>([], (item) => {
 				scores++;
 				return item.id.startsWith("valuable") ? 100 : item.id.startsWith("shared") ? 1 : Number.NaN;
 			});
@@ -134,14 +142,14 @@ describe("ResultCache", () => {
 				entry(`${name}:${index}`, `${name}-${index}.ts`, 1, 20, 8));
 			const shared = group("shared"), valuable = group("valuable"), worthless = group("worthless");
 			for (const item of shared) {
-				cache.insert("one", item);
-				cache.insert("two", item);
+				cache.settle("one", item);
+				cache.settle("two", item);
 				cache.recordActorHit("one", item);
 				const evidence = cache.evidenceOf("one", item);
-				expect(cache.insert("one", item)).toBe(item);
+				cache.settle("one", item);
 				expect(cache.evidenceOf("one", item)).toEqual(evidence);
 			}
-			for (const item of valuable) cache.insert("one", item);
+			for (const item of valuable) cache.settle("one", item);
 			const limits = { maxEntries: 2 * copies, maxBytes: 16 * copies, hotFraction: 0.5 };
 			for (const item of valuable) {
 				const last = item === valuable.at(-1);
@@ -154,7 +162,7 @@ describe("ResultCache", () => {
 			] as const) {
 				for (const item of entries) expect(cache.evidenceOf(scope, item)).toMatchObject({ segment, actorHits });
 			}
-			for (const item of worthless) cache.insert("one", item);
+			for (const item of worthless) cache.settle("one", item);
 			const trim = (expected: Entry[], budget = limits, canEvict?: (item: Entry) => boolean) => {
 				scores = 0;
 				const count = cache.values("one").length;
@@ -167,7 +175,7 @@ describe("ResultCache", () => {
 			trim([worthless[0]!]);
 			trim(shared, { ...limits, maxEntries: copies, maxBytes: 8 * copies });
 			const older = valuable[0]!, fresh = { ...older, id: "fresh" };
-			cache.insert("one", fresh);
+			cache.settle("one", fresh);
 			expect(cache.lookup("one", fresh.key).map((item) => item.entry)).toEqual([fresh, older]);
 			for (const item of [older, fresh]) expect(cache.evidenceOf("one", item)).toBeDefined();
 			expect(cache.delete("one", fresh)).toBe(true);

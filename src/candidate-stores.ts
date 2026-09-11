@@ -1,189 +1,236 @@
 import {
-	type ActionKey,
-	type ActionKeyMatch,
-	type ActionKeyProjector,
-	actionKeyMatch,
-	actionKeyProjectionPartitions,
-	ownActionKeyProjector,
-	type ProjectedActionKeyMatch,
+	type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
+	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector,
 } from "./action-semantics.ts";
 
-export interface ActionStoreEntry {
+export interface CandidateStoreEntry {
+	readonly id: string;
 	readonly key: ActionKey;
-}
-
-export interface SizedActionStoreEntry extends ActionStoreEntry {
 	readonly estimatedBytes: number;
 }
 
-export interface ActionStoreLookup<Entry> {
+export interface CandidateLookup<Entry> {
 	readonly entry: Entry;
 	readonly match: ActionKeyMatch;
 }
 
-export interface ActionStoreInsertResult<Entry> extends ActionStoreLookup<Entry> {
-	readonly inserted: boolean;
-}
-
-interface IndexedActionStoreLookup<Entry> extends ActionStoreLookup<Entry> {
-	readonly indexed: IndexedEntry<Entry>;
-}
-
 interface IndexedEntry<Entry> {
-	readonly memberships: ReadonlyArray<readonly [Map<string, Set<Entry>>, string]>;
+	readonly entry: Entry;
+	readonly memberships: ReadonlyArray<readonly [Map<string, Set<IndexedEntry<Entry>>>, string]>;
 	recency: number;
+	result?: ResultCacheEvidence;
 }
 
 interface IndexedScope<Entry> {
-	readonly entries: Map<Entry, IndexedEntry<Entry>>;
-	readonly exact: Map<string, Set<Entry>>;
-	readonly partitions: Map<string, Set<Entry>>;
+	readonly entries: Map<string, IndexedEntry<Entry>>;
+	readonly pending: Set<IndexedEntry<Entry>>;
+	readonly exact: Map<string, Set<IndexedEntry<Entry>>>;
+	readonly partitions: Map<string, Set<IndexedEntry<Entry>>>;
 }
 
-/** Scoped action identity, projection lookup, recency, and bounded storage. */
-export class ActionStore<Scope, Entry extends ActionStoreEntry> {
-	private readonly scopesByID = new Map<Scope, IndexedScope<Entry>>();
+/** One registration survives execution, settlement and cache retention. Keys identify reuse, IDs own work. */
+export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
+	private readonly scopes = new Map<Scope, IndexedScope<Entry>>();
 	private readonly projectors: readonly ActionKeyProjector[];
-	private readonly allowDuplicateExact: boolean;
+	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
+	private readonly now: () => number;
 	private sequence = 0;
 
-	constructor(projectors: readonly ActionKeyProjector[] = [], allowDuplicateExact = false) {
+	constructor(
+		projectors: readonly ActionKeyProjector[] = [],
+		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
+		now: () => number = Date.now,
+	) {
 		this.projectors = projectors.map(ownActionKeyProjector);
-		this.allowDuplicateExact = allowDuplicateExact;
+		this.score = score;
+		this.now = now;
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
-		if (this.has(scope, entry)) return entry;
-		const existing = this.getExact(scope, entry.key);
-		if (existing && !this.allowDuplicateExact) return existing;
-		return this.add(scope, entry, actionKeyProjectionPartitions(entry.key, this.projectors));
+		return this.get(scope, entry.id) ?? this.add(scope, entry, actionKeyProjectionPartitions(entry.key, this.projectors));
 	}
 
-	insertOrGetCompatible(
+	getOrCreate(
 		scope: Scope,
-		entry: Entry,
-		canReuseProjected: (existing: Entry, match: ProjectedActionKeyMatch) => boolean = () => false,
-		canReuseExact: (existing: Entry) => boolean = () => true,
-	): ActionStoreInsertResult<Entry> {
-		const state = this.scopesByID.get(scope);
-		const exact = [...(state?.exact.get(entry.key.key) ?? [])].reverse();
-		for (const existing of exact) {
-			const indexed = state!.entries.get(existing);
-			if (!indexed) continue;
-			if ((!this.allowDuplicateExact || canReuseExact(existing)) && state!.entries.get(existing) === indexed) {
-				return { entry: existing, match: { kind: "exact", distance: 0 }, inserted: false };
-			}
+		key: ActionKey,
+		create: () => Entry,
+		canReuse: (existing: Entry, match: ActionKeyMatch) => boolean = (_entry, match) => match.kind === "exact",
+	): CandidateLookup<Entry> & { readonly inserted: boolean } {
+		const exact = [...(this.scopes.get(scope)?.exact.get(key.key) ?? [])].reverse();
+		for (const indexed of exact) {
+			if (this.record(scope, indexed.entry) !== indexed) continue;
+			if (canReuse(indexed.entry, { kind: "exact", distance: 0 }) && this.record(scope, indexed.entry) === indexed)
+				return { entry: indexed.entry, match: { kind: "exact", distance: 0 }, inserted: false };
 		}
-		const partitions = actionKeyProjectionPartitions(entry.key, this.projectors);
-		for (const { entry: existing, match, indexed } of this.lookupRecords(scope, entry.key, partitions)) {
-			if (match.kind === "exact" || this.scopesByID.get(scope)?.entries.get(existing) !== indexed) continue;
-			if (!canReuseProjected(existing, match) || this.scopesByID.get(scope)?.entries.get(existing) !== indexed) continue;
+		const partitions = actionKeyProjectionPartitions(key, this.projectors);
+		for (const { entry: existing, match, indexed } of this.lookupRecords(scope, key, partitions)) {
+			if ((match.kind === "exact" && exact.includes(indexed)) || this.record(scope, existing) !== indexed ||
+				!canReuse(existing, match) || this.record(scope, existing) !== indexed) continue;
 			return { entry: existing, match, inserted: false };
 		}
+		const entry = create();
 		const existing = this.add(scope, entry, partitions);
 		return { entry: existing ?? entry, match: { kind: "exact", distance: 0 }, inserted: !existing };
 	}
 
-	getExact(scope: Scope, action: ActionKey): Entry | undefined {
-		return last(this.scopesByID.get(scope)?.exact.get(action.key));
+	get(scope: Scope, id: string): Entry | undefined {
+		return this.scopes.get(scope)?.entries.get(id)?.entry;
 	}
 
 	has(scope: Scope, entry: Entry): boolean {
-		return this.scopesByID.get(scope)?.entries.has(entry) === true;
+		return this.get(scope, entry.id) === entry;
 	}
 
-	lookup(scope: Scope, action: ActionKey): readonly ActionStoreLookup<Entry>[] {
-		if (!this.scopesByID.has(scope)) return [];
-		return this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors)).map(
-			({ entry, match }) => ({ entry, match }),
-		);
+	lookup(scope: Scope, action: ActionKey, requireCoverage?: (entry: Entry) => boolean): readonly CandidateLookup<Entry>[] {
+		return this.scopes.has(scope)
+			? this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage).map(({ entry, match }) => ({ entry, match }))
+			: [];
 	}
 
 	touch(scope: Scope, entry: Entry): boolean {
-		const state = this.scopesByID.get(scope);
-		const indexed = state?.entries.get(entry);
-		if (!state || !indexed) return false;
-		state.entries.delete(entry);
+		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
+		if (!indexed || !state) return false;
+		state.entries.delete(entry.id);
 		indexed.recency = this.sequence++;
-		state.entries.set(entry, indexed);
+		state.entries.set(entry.id, indexed);
 		const exact = state.exact.get(indexed.memberships[0]![1])!;
-		exact.delete(entry);
-		exact.add(entry);
+		exact.delete(indexed);
+		exact.add(indexed);
 		return true;
 	}
 
 	delete(scope: Scope, entry: Entry): boolean {
-		const state = this.scopesByID.get(scope);
-		const indexed = state?.entries.get(entry);
-		if (!state || !indexed) return false;
-		state.entries.delete(entry);
+		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
+		if (!indexed || !state) return false;
+		state.entries.delete(entry.id);
+		state.pending.delete(indexed);
 		for (const [index, key] of indexed.memberships) {
 			const members = index.get(key)!;
-			members.delete(entry);
-			if (members.size === 0) index.delete(key);
+			members.delete(indexed);
+			if (!members.size) index.delete(key);
 		}
-		if (state.entries.size === 0) this.scopesByID.delete(scope);
+		if (!state.entries.size) this.scopes.delete(scope);
 		return true;
 	}
 
-	values(scope: Scope): readonly Entry[] {
-		return [...(this.scopesByID.get(scope)?.entries.keys() ?? [])];
+	values(scope: Scope): Entry[] {
+		return [...(this.scopes.get(scope)?.entries.values() ?? [])].map(({ entry }) => entry);
 	}
 
-	allValues(): readonly Entry[] {
-		return [...this.scopesByID.values()].flatMap((state) => [...state.entries.keys()]);
+	allValues(): Entry[] {
+		return [...this.scopes.keys()].flatMap((scope) => this.values(scope));
 	}
 
-	private lookupRecords(
-		scope: Scope,
-		action: ActionKey,
-		partitions: readonly string[],
-	): readonly IndexedActionStoreLookup<Entry>[] {
-		const state = this.scopesByID.get(scope);
+	pending(scope: Scope): Entry[] {
+		return [...(this.scopes.get(scope)?.pending ?? [])].map(({ entry }) => entry);
+	}
+
+	/** Retention adds evidence to the existing owner; it neither reinserts nor changes identity. */
+	settle(scope: Scope, entry: Entry, shared = true): void {
+		this.insert(scope, entry);
+		const indexed = this.record(scope, entry);
+		if (!indexed) return;
+		this.scopes.get(scope)!.pending.delete(indexed);
+		if (shared) indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
+	}
+
+	cached(scope: Scope): Entry[] {
+		return [...(this.scopes.get(scope)?.entries.values() ?? [])].filter(({ result }) => result).map(({ entry }) => entry);
+	}
+
+	evidenceOf(scope: Scope, entry: Entry): ResultCacheEvidence | undefined {
+		const evidence = this.record(scope, entry)?.result;
+		return evidence ? { ...evidence } : undefined;
+	}
+
+	recordActorHit(scope: Scope, entry: Entry, limits?: ResultCacheLimits): readonly Entry[] {
+		const indexed = this.record(scope, entry);
+		if (!indexed?.result) return [];
+		indexed.result = { ...indexed.result, segment: "hot", actorHits: indexed.result.actorHits + 1, lastActorHitAt: this.now() };
+		this.touch(scope, entry);
+		if (!limits) return [];
+		const fraction = finiteFraction(limits.hotFraction ?? 0.8), capacity = finiteLimit(limits.maxEntries);
+		return this.retireExcess(scope, this.cached(scope).filter((item) => this.record(scope, item)!.result!.segment === "hot"), {
+			maxEntries: !capacity || !fraction ? 0 : Math.max(1, Math.floor(capacity * fraction)),
+			maxBytes: Math.floor(finiteLimit(limits.maxBytes) * fraction),
+		}, (record) => { record.result = { ...record.result!, segment: "cold" }; });
+	}
+
+	snapshot(scope: Scope): ResultCacheSnapshot {
+		const snapshot = { coldEntries: 0, hotEntries: 0, coldBytes: 0, hotBytes: 0 };
+		for (const { entry, result } of this.scopes.get(scope)?.entries.values() ?? []) {
+			if (result) { snapshot[result.segment === "hot" ? "hotEntries" : "coldEntries"]++;
+				snapshot[result.segment === "hot" ? "hotBytes" : "coldBytes"] += entryBytes(entry); }
+		}
+		return snapshot;
+	}
+
+	trim(scope: Scope, limits: ResultCacheLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
+		return this.retireExcess(scope, this.cached(scope), limits, ({ entry }) => { this.delete(scope, entry); }, canEvict);
+	}
+
+	private record(scope: Scope, entry: Entry): IndexedEntry<Entry> | undefined {
+		const record = this.scopes.get(scope)?.entries.get(entry.id);
+		return record?.entry === entry ? record : undefined;
+	}
+
+	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean) {
+		const state = this.scopes.get(scope);
 		if (!state) return [];
-		const candidates = new Set<Entry>();
-		for (const exact of state.exact.get(action.key) ?? []) candidates.add(exact);
-		for (const key of partitions) {
-			for (const entry of state.partitions.get(key) ?? []) candidates.add(entry);
+		const candidates = new Set(state.exact.get(action.key));
+		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
+		const ranked: (CandidateLookup<Entry> & { readonly indexed: IndexedEntry<Entry> })[] = [];
+		for (const indexed of candidates) {
+			if (this.record(scope, indexed.entry) !== indexed) continue;
+			const match = actionKeyMatch(indexed.entry.key, action, this.projectors, requireCoverage?.(indexed.entry) ?? false);
+			if (match) ranked.push({ entry: indexed.entry, match, indexed });
 		}
-		const ranked: IndexedActionStoreLookup<Entry>[] = [];
-		for (const entry of candidates) {
-			const indexed = state.entries.get(entry);
-			if (!indexed) continue;
-			const match = actionKeyMatch(entry.key, action, this.projectors);
-			if (match) ranked.push({ entry, match, indexed });
-		}
-		// A later provider callback can retire an already-ranked registration, including delete/reinsert of the same entry.
-		return ranked
-			.filter(({ entry, indexed }) => state.entries.get(entry) === indexed)
-			.sort((left, right) =>
-				left.match.distance - right.match.distance || right.indexed.recency - left.indexed.recency,
-			);
+		// Provider callbacks may retire or replace a registration, even with the same object and ID.
+		return ranked.filter(({ entry, indexed }) => this.record(scope, entry) === indexed)
+			.sort((left, right) => left.match.distance - right.match.distance || right.indexed.recency - left.indexed.recency);
 	}
 
 	private add(scope: Scope, entry: Entry, partitions: readonly string[]): Entry | undefined {
-		// Resolve the current scope only after provider callbacks; they may have retired or replaced it.
-		const state: IndexedScope<Entry> = this.scopesByID.get(scope) ?? {
-			entries: new Map(),
-			exact: new Map(),
-			partitions: new Map(),
-		};
-		const existing = this.allowDuplicateExact
-			? (state.entries.has(entry) ? entry : undefined)
-			: last(state.exact.get(entry.key.key));
-		if (existing) return existing;
-		const memberships = [
-			[state.exact, entry.key.key] as const,
-			...partitions.map((key) => [state.partitions, key] as const),
-		];
-		state.entries.set(entry, { memberships, recency: this.sequence++ });
+		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), pending: new Set(), exact: new Map(), partitions: new Map() };
+		const existing = state.entries.get(entry.id);
+		if (existing) return existing.entry;
+		const memberships = [[state.exact, entry.key.key] as const, ...partitions.map((key) => [state.partitions, key] as const)];
+		const indexed: IndexedEntry<Entry> = { entry, memberships, recency: this.sequence++ };
+		state.entries.set(entry.id, indexed);
+		state.pending.add(indexed);
 		for (const [index, key] of memberships) {
-			const members = index.get(key) ?? new Set<Entry>();
-			members.add(entry);
+			const members = index.get(key) ?? new Set();
+			members.add(indexed);
 			index.set(key, members);
 		}
-		this.scopesByID.set(scope, state);
+		this.scopes.set(scope, state);
 		return undefined;
+	}
+
+	/** Rank once; protected results still occupy the budget, and callbacks cannot retire a replacement. */
+	private retireExcess(
+		scope: Scope, entries: readonly Entry[], limits: ResultCacheLimits,
+		retire: (record: IndexedEntry<Entry>) => void, canRetire: (entry: Entry) => boolean = () => true,
+	): Entry[] {
+		let count = entries.length, bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+		const maxEntries = finiteLimit(limits.maxEntries), maxBytes = finiteLimit(limits.maxBytes);
+		const withinBudget = () => count <= maxEntries && bytes <= maxBytes;
+		if (withinBudget()) return [];
+		const now = this.now(), ranked = [];
+		for (const entry of entries) {
+			const indexed = this.record(scope, entry), evidence = indexed?.result;
+			if (evidence && canRetire(entry)) ranked.push({
+				entry, indexed, evidence, hot: Number(evidence.segment === "hot"), value: finiteValue(this.score(entry, { ...evidence }, now)),
+			});
+		}
+		ranked.sort((left, right) => left.hot - right.hot || left.value - right.value);
+		const retired: Entry[] = [];
+		for (const { entry, indexed, evidence } of ranked) {
+			if (withinBudget()) break;
+			if (!canRetire(entry) || this.record(scope, entry) !== indexed || indexed?.result !== evidence) continue;
+			retired.push(entry); count--; bytes -= entryBytes(entry); retire(indexed);
+		}
+		return retired;
 	}
 }
 
@@ -233,158 +280,11 @@ export interface ResultCacheEvidence {
 	readonly lastActorHitAt?: number;
 }
 
-export interface ResultCacheLookup<Entry> extends ActionStoreLookup<Entry> {
-	readonly evidence: ResultCacheEvidence;
-}
-
 export interface ResultCacheSnapshot {
 	readonly coldEntries: number;
 	readonly hotEntries: number;
 	readonly coldBytes: number;
 	readonly hotBytes: number;
-}
-
-/** Completed shareable results. Exact freshness generations may coexist until validation or retention retires them. */
-export class ResultCache<Scope, Entry extends SizedActionStoreEntry> {
-	private readonly index: ActionStore<Scope, Entry>;
-	private readonly metadata = new Map<Scope, Map<Entry, ResultCacheEvidence>>();
-	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
-	private readonly now: () => number;
-
-	constructor(
-		projectors: readonly ActionKeyProjector[] = [],
-		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
-		now: () => number = Date.now,
-	) {
-		this.index = new ActionStore(projectors, true);
-		this.score = score;
-		this.now = now;
-	}
-
-	insert(scope: Scope, entry: Entry): Entry | undefined {
-		const existing = this.index.insert(scope, entry);
-		if (!existing) {
-			const metadata = this.metadata.get(scope) ?? new Map<Entry, ResultCacheEvidence>();
-			metadata.set(entry, { segment: "cold", insertedAt: this.now(), actorHits: 0 });
-			this.metadata.set(scope, metadata);
-		}
-		return existing;
-	}
-
-	lookup(scope: Scope, action: ActionKey): readonly ResultCacheLookup<Entry>[] {
-		return this.index.lookup(scope, action).map((item) => ({
-			entry: item.entry,
-			match: item.match,
-			evidence: this.evidenceOf(scope, item.entry)!,
-		}));
-	}
-
-	recordActorHit(scope: Scope, entry: Entry, limits?: ResultCacheLimits): readonly Entry[] {
-		const current = this.evidenceOf(scope, entry);
-		if (!current) return [];
-		const now = this.now();
-		this.metadata.get(scope)!.set(entry, {
-			...current,
-			segment: "hot",
-			actorHits: current.actorHits + 1,
-			lastActorHitAt: now,
-		});
-		this.index.touch(scope, entry);
-		return limits ? this.rebalanceHot(scope, limits) : [];
-	}
-
-	evidenceOf(scope: Scope, entry: Entry): ResultCacheEvidence | undefined {
-		if (!this.index.has(scope, entry)) return undefined;
-		const evidence = this.metadata.get(scope)?.get(entry);
-		return evidence ? { ...evidence } : undefined;
-	}
-
-	segmentOf(scope: Scope, entry: Entry): ResultCacheSegment | undefined {
-		return this.evidenceOf(scope, entry)?.segment;
-	}
-
-	delete(scope: Scope, entry: Entry): boolean {
-		if (!this.index.delete(scope, entry)) return false;
-		const metadata = this.metadata.get(scope);
-		metadata?.delete(entry);
-		if (metadata?.size === 0) this.metadata.delete(scope);
-		return true;
-	}
-
-	values(scope: Scope): readonly Entry[] {
-		return this.index.values(scope);
-	}
-
-	allValues(): readonly Entry[] {
-		return this.index.allValues();
-	}
-
-	snapshot(scope: Scope): ResultCacheSnapshot {
-		let coldEntries = 0;
-		let hotEntries = 0;
-		let coldBytes = 0;
-		let hotBytes = 0;
-		for (const entry of this.index.values(scope)) {
-			const bytes = entryBytes(entry);
-			if (this.segmentOf(scope, entry) === "hot") {
-				hotEntries++;
-				hotBytes += bytes;
-			} else {
-				coldEntries++;
-				coldBytes += bytes;
-			}
-		}
-		return { coldEntries, hotEntries, coldBytes, hotBytes };
-	}
-
-	trim(scope: Scope, limits: ResultCacheLimits, canEvict: (entry: Entry) => boolean = () => true): Entry[] {
-		return this.retireExcess(scope, this.index.values(scope), limits, (entry) => this.delete(scope, entry), canEvict);
-	}
-
-	private rebalanceHot(scope: Scope, limits: ResultCacheLimits): readonly Entry[] {
-		const fraction = finiteFraction(limits.hotFraction ?? 0.8);
-		const entryCapacity = finiteLimit(limits.maxEntries);
-		const byteCapacity = finiteLimit(limits.maxBytes);
-		const hotEntryLimit =
-			entryCapacity === 0 || fraction === 0 ? 0 : Math.max(1, Math.floor(entryCapacity * fraction));
-		const hotByteLimit = Math.floor(byteCapacity * fraction);
-		return this.retireExcess(scope,
-			this.index.values(scope).filter((entry) => this.segmentOf(scope, entry) === "hot"),
-			{ maxEntries: hotEntryLimit, maxBytes: hotByteLimit },
-			(entry) => this.metadata.get(scope)!.set(entry, { ...this.evidenceOf(scope, entry)!, segment: "cold" }));
-	}
-
-	/** Rank once at one observation time; protected entries still occupy the shared budget. */
-	private retireExcess(
-		scope: Scope,
-		entries: readonly Entry[],
-		limits: ResultCacheLimits,
-		retire: (entry: Entry) => void,
-		canRetire: (entry: Entry) => boolean = () => true,
-	): Entry[] {
-		let count = entries.length, bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
-		const maxEntries = finiteLimit(limits.maxEntries), maxBytes = finiteLimit(limits.maxBytes);
-		const withinBudget = () => count <= maxEntries && bytes <= maxBytes;
-		if (withinBudget()) return [];
-		const now = this.now(), ranked = [];
-		for (const entry of entries) {
-			const evidence = this.metadata.get(scope)?.get(entry);
-			if (evidence && canRetire(entry)) ranked.push({
-				entry, evidence, hot: Number(evidence.segment === "hot"), value: finiteValue(this.score(entry, { ...evidence }, now)),
-			});
-		}
-		ranked.sort((left, right) => left.hot - right.hot || left.value - right.value);
-		const retired: Entry[] = [];
-		for (const { entry, evidence } of ranked) {
-			if (withinBudget()) break;
-			if (!canRetire(entry) || this.metadata.get(scope)?.get(entry) !== evidence) continue;
-			retired.push(entry);
-			count--;
-			bytes -= entryBytes(entry);
-			retire(entry);
-		}
-		return retired;
-	}
 }
 
 function finiteLimit(value: number): number {
@@ -399,12 +299,6 @@ function finiteValue(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-function entryBytes(entry: SizedActionStoreEntry): number {
+function entryBytes(entry: CandidateStoreEntry): number {
 	return Number.isFinite(entry.estimatedBytes) ? Math.max(0, entry.estimatedBytes) : 0;
-}
-
-function last<T>(values: Iterable<T> | undefined): T | undefined {
-	let result: T | undefined;
-	for (const value of values ?? []) result = value;
-	return result;
 }

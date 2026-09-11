@@ -188,6 +188,26 @@ describe("SpeculationScheduler", () => {
 		}
 	});
 
+	it.each(["loss", "hidden", "slow-producer", "unknown-clock", "other-action", "no-forecast", "actor"] as const)("aligns producer launch with the expected Actor decision: %s", (mode) => {
+		const scheduler = new SpeculationScheduler<object>(), job = {};
+		const identity = { tool: "read", executionFingerprint: "reader", actionKeyHash: "image" };
+		for (const duration of [1000, 2000]) scheduler.observeActorService(identity, duration);
+		if (mode === "slow-producer") for (const duration of [1000, 1500, 4000]) scheduler.observeSpeculativeService(identity, duration);
+		if (mode !== "unknown-clock") scheduler.observeActorTiming(100, 1100);
+		const hidden = mode === "hidden" || mode === "slow-producer", blocked = mode === "loss" || mode === "slow-producer";
+		const request = forecast({ ...identity, expectedDurationMs: mode === "no-forecast" ? undefined : 1500,
+			actionKeyHash: mode === "other-action" ? "unmeasured" : identity.actionKeyHash,
+			actorPhase: { kind: hidden ? "cycle" : "decision", elapsedMs: 0 }, decisionBatchesUntilCall: hidden ? 2 : 1 });
+		const admission = scheduler.admit(job, [request], 1, mode === "actor" ? "actor" : "producer");
+		expect(admission.admitted).toBe(!blocked);
+		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual(blocked ? [] : [job]);
+		if (mode === "loss") {
+			expect(admission).toMatchObject({ reason: "not_profitable" });
+			expect(joinDecision(scheduler, identity, { state: "running", expectedSpeculativeDurationMs: 1500, elapsedMs: 100 }).allowed).toBe(false);
+			expect(scheduler.admit(job, [request, { ...request, decisionBatchesUntilCall: 3 }], 1).admitted).toBe(true);
+		}
+	});
+
 	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
 		const scheduler = new SpeculationScheduler<object>({
 			candidateJoinPolicy: { warmupWaitMs: 17 },

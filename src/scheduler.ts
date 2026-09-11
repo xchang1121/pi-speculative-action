@@ -128,7 +128,7 @@ export type SchedulerAdmission =
 	| {
 			readonly admitted: false;
 			readonly work: ScheduledWork;
-			readonly reason: "budget_exhausted";
+			readonly reason: "budget_exhausted" | "not_profitable";
 	  };
 
 export type WorldCompatibilityDecision =
@@ -168,8 +168,11 @@ export class SpeculationScheduler<Job extends object> {
 	): SchedulerAdmission {
 		const work = this.evaluate(forecasts);
 		const budget = normalizeBudget(capacity);
-		if (role === "producer" && !fits([...this.entries.values()], work.resource, budget)) {
-			return { admitted: false, work, reason: "budget_exhausted" };
+		if (role === "producer") {
+			if (forecasts.length && !forecasts.some((forecast) => this.canLaunch(forecast, work.expectedDurationMs)))
+				return { admitted: false, work, reason: "not_profitable" };
+			if (!fits([...this.entries.values()], work.resource, budget))
+				return { admitted: false, work, reason: "budget_exhausted" };
 		}
 		this.entries.set(job, { job, work, sequence: this.sequence++ });
 		return { admitted: true, work };
@@ -370,6 +373,19 @@ export class SpeculationScheduler<Job extends object> {
 					: finite(forecast.expectedLatencyBenefitMs) * runwayScale,
 			background: forecast.background === true,
 		};
+	}
+
+	/** With exact Actor evidence and an explicit forecast, avoid launching work its consumer would reject. */
+	private canLaunch(forecast: PredictionForecast, expectedDurationMs: number): boolean {
+		const runway = this.actorRunway(forecast);
+		if (runway === undefined || forecast.expectedDurationMs === undefined || !forecast.actionKeyHash ||
+			!this.actorServiceTimes.get(timingKeys(forecast)[0]!)?.count) return true;
+		return this.assessCandidateJoin({
+			identity: forecast,
+			state: "running",
+			expectedSpeculativeDurationMs: expectedDurationMs,
+			elapsedMs: runway,
+		}).allowed;
 	}
 
 	private actorRunway(forecast: PredictionForecast, fallbackDurationMs?: number): number | undefined {

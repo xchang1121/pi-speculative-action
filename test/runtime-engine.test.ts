@@ -116,6 +116,10 @@ function childPlanUpdate(
 	};
 }
 
+function validResource() {
+	return { status: "valid" as const, metrics: zeroValidationMetrics() };
+}
+
 function harness(input: {
 	readonly source: Source;
 	readonly settings?: () => SpeculativeActionSettings;
@@ -129,7 +133,7 @@ function harness(input: {
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly preflight?: (signal: AbortSignal, candidate: SpeculativeDraftCandidate) => CandidatePreflight | Promise<CandidatePreflight>;
-	readonly authorize?: () => CandidatePreflight;
+	readonly authorize?: () => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly projection?: ActionProjectionRule<string>;
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
 	readonly onTurnFinished?: (input: { readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
@@ -193,7 +197,7 @@ function harness(input: {
 												cause: cause("freshness", "resource_changed"),
 												metrics: zeroValidationMetrics(),
 											}
-										: { status: "valid" as const, metrics: zeroValidationMetrics() },
+										: validResource(),
 						}
 					: {}),
 			});
@@ -340,7 +344,7 @@ describe("structural speculative runtime", () => {
 		const captureStarted = barrier();
 		const validate = vi.fn((version: unknown) =>
 			version
-				? { status: "valid" as const, metrics: zeroValidationMetrics() }
+				? validResource()
 				: {
 						status: "indeterminate" as const,
 						cause: cause("freshness", "resource_version_missing"),
@@ -425,17 +429,21 @@ describe("structural speculative runtime", () => {
 			.toMatchObject({ settlement: { provider: { kind: "speculative", timing: { expectedActorMs: 100 } } } });
 	});
 
-	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
+	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "late-generation"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
 		const ready = candidateSucceeded(), refreshed = candidateSucceeded(2);
-		const validating = barrier(), validationGate = barrier(), binding = barrier(), bindingGate = barrier();
+		const late = mode === "late-generation", validating = barrier(late ? 2 : 1), validationGate = barrier(), secondValidation = barrier();
+		const binding = barrier(), bindingGate = barrier(), continued = barrier(2), outputs: string[] = [];
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const executed: string[] = [];
-		let configured = settings;
-		const refreshes = mode === "refresh" || mode === "replaced" || mode === "evicted";
+		let configured = settings, validations = 0;
+		const refreshes = late || mode === "refresh" || mode === "replaced" || mode === "evicted";
 		const source: Source = {
 			id: "source",
 			enabled: () => true,
-			propose: ({ startInput }) => startInput.turnID === "turn-3" ? undefined : plan("source", startInput.turnID, { path: "README.md" }),
+			propose: ({ startInput }) => startInput.turnID === "turn-3" ? undefined : (late && startInput.turnID === "turn-2"
+				? ["first", "second"] : [startInput.turnID]).map((id) => plan("source", id, { path: "README.md" })),
+			continueOn: ["execution_succeeded"],
+			continue: ({ output }) => { if (output !== "generation:1") { outputs.push(output); continued.arrive(); } return undefined; },
 			observe: ({ concrete }) => mode === "replaced" && concrete.path === "replace.ts"
 				? { proposalID: "turn-2", source: "source", revision: 1,
 					upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }] } : undefined,
@@ -452,13 +460,13 @@ describe("structural speculative runtime", () => {
 				const branch = world(`generation:${generation}`, {
 					executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint,
 					validate: async () => {
-						if (generation === 1) { validating.arrive(); await validationGate.promise; }
+						if (generation === 1) { const gate = late && validations++ > 0 ? secondValidation : validationGate; validating.arrive(); await gate.promise; }
 						return generation === 1 && mode !== "replaced" && mode !== "evicted"
 							? { status: "indeterminate", cause: cause("freshness", "validation_failed"), metrics: zeroValidationMetrics() }
-							: { status: "valid", metrics: zeroValidationMetrics() };
+							: validResource();
 					}, onDispose: cleanup,
 				});
-				return mode === "unwrapped" ? branch : coordinator.execute(coordinator.begin({ tool, route: RESOURCE_ROUTE }), async () => branch);
+				return late || mode === "unwrapped" ? branch : coordinator.execute(coordinator.begin({ tool, route: RESOURCE_ROUTE }), async () => branch);
 			},
 			onEvent: (event) => { ready.observe(event); refreshed.observe(event); },
 		});
@@ -470,7 +478,10 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.actual({ ...unrelated, durationMs: 1, output: "actor" });
 			await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
 			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" }); await validating.promise;
-			if (mode === "replaced") {
+			if (late) {
+				validationGate.arrive(); await refreshed.promise; secondValidation.arrive(); await continued.promise;
+				expect(outputs).toEqual(["generation:2", "generation:2"]);
+			} else if (mode === "replaced") {
 				const replacement = call("turn-2", { path: "replace.ts" });
 				expect(await fixture.runtime.consume(replacement)).toBeUndefined();
 				await fixture.runtime.actual({ ...replacement, durationMs: 1, output: "actor" }); await binding.promise;
@@ -495,10 +506,10 @@ describe("structural speculative runtime", () => {
 					await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: false });
 					await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
 				}
-				expect(await fixture.runtime.consume(call(mode === "refresh" ? "turn-2" : "turn-3",
+				expect(await fixture.runtime.consume(call(late || mode === "refresh" ? "turn-2" : "turn-3",
 					{ path: mode === "replaced" ? "replacement.ts" : "README.md" }))).toBe("generation:2");
 			}
-		} finally { validationGate.arrive(); bindingGate.arrive(); await closing; await fixture.runtime.dispose(); }
+		} finally { validationGate.arrive(); secondValidation.arrive(); bindingGate.arrive(); await closing; await fixture.runtime.dispose(); }
 		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 
@@ -567,48 +578,6 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("runs eight independent producers concurrently and deduplicates only by K(a)", async () => {
-		const gate = barrier();
-		const proposalsEntered = barrier(8);
-		const predictionsSettled = barrier(8);
-		const candidateReady = candidateSucceeded();
-		let entered = 0;
-		const settlements: PredictionSettlement[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			proposalCount: () => 8,
-			propose: async ({ proposalIndex }) => {
-				entered++;
-				proposalsEntered.arrive();
-				await gate.promise;
-				return plan("source", `proposal:${proposalIndex}`, { path: "README.md" });
-			},
-			onSettled: ({ settlement }) => {
-				settlements.push(settlement);
-				predictionsSettled.arrive();
-			},
-		};
-		const fixture = harness({
-			source,
-			onEvent: candidateReady.observe,
-		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		expect(entered).toBe(0);
-		await proposalsEntered.promise;
-		gate.arrive();
-		await candidateReady.promise;
-
-		expect(await fixture.runtime.consume(call("turn"))).toBe("speculative");
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
-		await predictionsSettled.promise;
-		expect(fixture.executions()).toBe(1);
-		expect(settlements).toHaveLength(8);
-		expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(
-			new Set(["call:turn"]),
-		);
-	});
-
 	it("races proposals only after one valid binding and ignores cancelled materialization", async () => {
 		for (const mode of ["empty", "invalid", "throw", "late"] as const) {
 			const entered = barrier(3), first = barrier(), winner = barrier(), binding = barrier();
@@ -671,124 +640,52 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("does not deduplicate equal K(a) work across different execution routes", async () => {
-		const candidatesReady = candidateSucceeded(2);
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => [
-				plan("source", "route-a", { path: "README.md" }),
-				plan("source", "route-b", { path: "README.md" }),
-			],
-		};
-		let routeSequence = 0;
+	it.each(["same", "alternate", "stale-before", "stale-after", "incompatible", "indeterminate", "exclusive", "denied"] as const)(
+		"recalls sealed Actor observations with compatibility, freshness and authorization: %s", async (mode) => {
+		let version = 1, captures = 0, seals = 0;
+		const recalled = barrier(), outputs: string[] = [];
+		const reusable = ["same", "alternate", "stale-after", "denied"].includes(mode);
+		const fallback = mode === "stale-after" || mode === "denied";
+		const validate = (captured: unknown): ResourceValidation => captured === version
+			? validResource()
+			: { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() };
 		const fixture = harness({
-			source,
-			resolveExecution: () => {
-				const id = `route-${++routeSequence}`;
-				return { ...RESOURCE_ROUTE, backend: id, fingerprint: id };
-			},
-			onEvent: candidatesReady.observe,
-		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await candidatesReady.promise;
-		expect(fixture.runtime.inspect().sharedCandidates).toBe(2);
-		expect(fixture.executions()).toBe(2);
-		expect(routeSequence).toBe(2);
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
-	});
-
-	it("counts shared Actor work once without substituting a different producer query", async () => {
-		const candidateReady = candidateSucceeded();
-		const secondReady = candidateSucceeded(2);
-		let offset = 1;
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", `shared-timing:${offset}`, { path: "README.md", offset }),
-		};
-		const fixture = harness({
-			source,
-			execute: (_tool, args) => args.offset === 2 ? "different query" : "shared",
-			onEvent: (event) => { candidateReady.observe(event); secondReady.observe(event); },
-		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-		await candidateReady.promise;
-
-		expect(await fixture.runtime.consume(call("turn"))).toBe("shared");
-		expect(await fixture.runtime.consume({ ...call("turn"), id: "call:repeat" })).toBe("shared");
-		await fixture.runtime.finishTurn({ ...call("turn"), terminal: false });
-
-		const actorEvents = fixture.events.filter((event) => event.type === "actor_action");
-		expect(actorEvents).toHaveLength(2);
-		const candidateIDs = actorEvents.flatMap((event) =>
-			event.settlement.provider.kind === "speculative" ? [event.settlement.provider.candidateID] : [],
-		);
-		expect(candidateIDs).toHaveLength(2);
-		expect(new Set(candidateIDs).size).toBe(1);
-		offset = 2;
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "second" });
-		await secondReady.promise;
-		expect(await fixture.runtime.consume(call("second", { path: "README.md", offset }))).toBe("different query");
-		expect(fixture.executions()).toBe(2);
-		await fixture.runtime.finishTurn({ ...call("second"), terminal: true });
-		expect(fixture.events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
-	});
-
-	it("promotes an authoritative observation into the shared cache without a second execution", async () => {
-		let resourceVersion = 1;
-		let captures = 0;
-		let seals = 0;
-		const source: Source = { id: "disabled", enabled: () => false, propose: () => undefined };
-		const fixture = harness({
-			source,
+			source: { id: "source", enabled: () => true, continueOn: ["execution_succeeded"],
+				propose: ({ startInput }) => startInput.turnID === "second" ? plan("source", "recall", { path: "README.md" }) : undefined,
+				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } },
+			resolveExecution: () => mode === "exclusive" ? MUTATION_ROUTE : mode === "same" ? RESOURCE_ROUTE
+				: { ...RESOURCE_ROUTE, isolation: "runtime_sandbox", scope: "runtime", backend: "alternate", fingerprint: "alternate:v1" },
+			execute: () => world(`fresh:${version}`, { executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
+				validate: async () => (validResource()) }),
+			authorize: () => ({ ok: mode !== "denied", reason: "permission_changed" }),
 			captureAuthoritativeResult: (action) => {
-				captures++;
-				const capturedVersion = resourceVersion;
-				return {
-					route: RESOURCE_ROUTE,
-					seal: async (output) => {
-						seals++;
-						return world(output, {
-							executionFingerprint: action.executionFingerprint,
-							validate: async () =>
-								capturedVersion === resourceVersion
-									? { status: "valid", metrics: zeroValidationMetrics() }
-									: {
-											status: "stale",
-											cause: cause("freshness", "resource_changed"),
-											metrics: zeroValidationMetrics(),
-										},
-						});
-					},
-					dispose: () => {},
-				};
+				captures++; const captured = version;
+				return { route: RESOURCE_ROUTE, dispose: () => {}, seal: async (output) => {
+					seals++;
+					const branch = world(output, { executionFingerprint: mode === "incompatible" ? "different-actor" : action.executionFingerprint,
+						validate: async () => validate(captured) });
+					return mode === "indeterminate" ? { ...branch, compatibility: { status: "indeterminate", backend: "test", code: "unknown" } } : branch;
+				} };
 			},
 		});
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-1" });
-		const first = call("actor-result-1");
-		expect(await fixture.runtime.consume(first)).toBeUndefined();
-		await fixture.runtime.actual({ ...first, durationMs: 4, output: "actor:1" });
-		await fixture.runtime.finishTurn({ ...first, terminal: false });
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-2" });
-		const second = call("actor-result-2");
-		await fixture.runtime.previewActorCall(second);
-		expect(fixture.executions()).toBe(0);
-		expect(await fixture.runtime.consume(second)).toBe("actor:1");
-		expect(captures).toBe(1);
-		await fixture.runtime.finishTurn({ ...second, terminal: false });
-
-		resourceVersion++;
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "actor-result-3" });
-		const third = call("actor-result-3");
-		expect(await fixture.runtime.consume(third)).toBeUndefined();
-		expect(captures).toBe(2);
-		await fixture.runtime.actual({ ...third, durationMs: 2, output: "actor:2" });
-		expect(seals).toBe(2);
-		await fixture.runtime.finishTurn({ ...third, terminal: true });
+		try {
+			const first = call("first"), second = call("second");
+			await fixture.runtime.startTurn(first);
+			expect(await fixture.runtime.consume(first)).toBeUndefined();
+			await fixture.runtime.actual({ ...first, durationMs: 4, output: "actor:1" });
+			await fixture.runtime.finishTurn({ ...first, terminal: false });
+			if (mode === "stale-before") version++;
+			await fixture.runtime.startTurn(second); await recalled.promise;
+			expect(fixture.executions()).toBe(reusable ? 0 : 1);
+			expect(outputs).toEqual([reusable ? "actor:1" : `fresh:${version}`]);
+			if (mode === "stale-after") version++;
+			await fixture.runtime.previewActorCall(second);
+			expect(await fixture.runtime.consume(second)).toBe(fallback ? undefined : outputs[0]);
+			if (fallback) await fixture.runtime.actual({ ...second, durationMs: 2, output: "actor:2" });
+			expect(captures).toBe(fallback ? 2 : 1); expect(seals).toBe(captures);
+			await fixture.runtime.finishTurn({ ...second, terminal: true });
+			expect(fixture.events.filter((event) => event.type === "prediction")).toHaveLength(1);
+		} finally { await fixture.runtime.dispose(); }
 	});
 
 	it("expires both pending and admitting next-action requests when the Actor intent arrives", async () => {
@@ -904,7 +801,7 @@ describe("structural speculative runtime", () => {
 		let changed = false;
 		const validate = vi.fn(async (): Promise<ResourceValidation> => changed
 			? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
-			: { status: "valid", metrics: zeroValidationMetrics() });
+			: validResource());
 		const actor = call("turn", { path: "README.md", offset: ["running-outside", "input-lookup"].includes(scenario) ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
 		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
 		const projection = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
@@ -1009,7 +906,7 @@ describe("structural speculative runtime", () => {
 				? plan("source", "inputs", { path: "input", offset: 1, limit: 1 }) : undefined },
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
 			execute: () => { now += 10; return { ...world("1", { onDispose: disposed,
-				validate: async () => { now += 3; return { status: "valid", metrics: zeroValidationMetrics() }; } }), reconstruct }; },
+				validate: async () => { now += 3; return validResource(); } }), reconstruct }; },
 			onEvent: ready.observe,
 		});
 		try {
@@ -1061,7 +958,7 @@ describe("structural speculative runtime", () => {
 			authorize: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
 			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
 				...world("1", { executionFingerprint: "bound", onDispose: disposed, onCommit: committed,
-					validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }) }),
+					validate: async () => (validResource()) }),
 				reconstruct: async ({ args }) => {
 					const offset = (args as { offset: number }).offset;
 					if (offset === 10) { entered.arrive(); await release.promise; }
@@ -1120,7 +1017,7 @@ describe("structural speculative runtime", () => {
 			source,
 			execute: (tool, concrete) => coordinator.execute(coordinator.begin({ tool, callID: "claimed", route: RESOURCE_ROUTE }), async () => ({
 				...world("speculative", { executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint }),
-				validate: async () => ({ status: "valid", metrics: zeroValidationMetrics() }),
+				validate: async () => (validResource()),
 				commit, dispose: cleanup,
 			})),
 			onEvent: candidateReady.observe,
@@ -1166,7 +1063,7 @@ describe("structural speculative runtime", () => {
 					compatibility: incompatible
 						? { status: indeterminate ? "indeterminate" as const : "incompatible" as const, backend: "test", code: indeterminate ? "attestation_missing" : "sealed_incompatible" }
 						: { status: "compatible" as const, backend: "test", executionFingerprint: fingerprint },
-					validate: async () => ({ status: "valid" as const, metrics: zeroValidationMetrics() }), commit, dispose };
+					validate: async () => (validResource()), commit, dispose };
 				const transaction = await transactions.execute(transactions.begin({ tool, callID: actor.id,
 					route: indeterminate ? RESOURCE_ROUTE : MUTATION_ROUTE }), async () => source);
 				Object.assign(source.compatibility, { status: "compatible", executionFingerprint: fingerprint });
@@ -1241,7 +1138,7 @@ describe("structural speculative runtime", () => {
 				const captured = version, output = `future:${++executions}`;
 				started.arrive(); if (phase === "running" && executions === 1) await gate.promise;
 				return world(output, { onCommit: commits, validate: phase === "sealed unproven" ? undefined : async () => captured === version
-					? { status: "valid", metrics: zeroValidationMetrics() }
+					? validResource()
 					: { status: "stale", cause: cause("freshness", "changed"), metrics: zeroValidationMetrics() } });
 			},
 		});
@@ -1313,129 +1210,172 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("promotes a streamed Actor intent without claiming or committing its prediction", async () => {
+	it.each(["parallel-predictions", "different-routes", "late-prediction", "preview-first", "two-previews", "cancel-owner", "prediction-first", "future-prediction"] as const)(
+		"coalesces candidate admission across producer entrances: %s", async (mode) => {
+		const dual = mode === "two-previews" || mode === "cancel-owner", distinct = mode === "different-routes";
+		const sourceCount = dual ? 0 : distinct ? 2 : mode === "parallel-predictions" ? 8 : 1;
+		const offered = barrier(), admitted = barrier(), admissionGate = barrier(), continued = barrier(sourceCount);
+		const proposed = barrier(sourceCount), keyed = barrier(sourceCount), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
+		const ready = candidateSucceeded(distinct ? 2 : 1), nextReady = candidateSucceeded(2), disposed = vi.fn();
 		const settlements: PredictionSettlement[] = [];
-		const planKeyed = barrier();
-		const executionStarted = barrier();
-		const candidateReady = candidateSucceeded();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => ({
-				id: "future",
-				source: "source",
-				revision: 0,
-				actions: [
-					{
-						id: "next",
-						type: "tool_call",
-						tool: "read",
-						input: { path: "future.ts" },
-						horizon: 3,
-						expectedDurationMs: 10,
-					},
-				],
-			}),
-			onSettled: ({ settlement }) => {
-				settlements.push(settlement);
-			},
-		};
+		let admissions = 0, proposals = 0, routes = 0;
 		const fixture = harness({
-			source,
-			onCandidateMaterialized: () => planKeyed.arrive(),
-			execute: () => {
-				executionStarted.arrive();
-				return "future";
+			source: { id: "source", enabled: () => !dual, proposalCount: () => sourceCount, continueOn: ["execution_succeeded"],
+				propose: async ({ startInput, proposalIndex }) => {
+					proposals++; proposed.arrive(); await offered.promise;
+					const proposal = plan("source", `${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
+					return mode === "future-prediction" ? { ...proposal, actions: proposal.actions.map((action) => ({ ...action, horizon: 3, expectedDurationMs: 10 })) } : proposal;
+				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } },
+			preflight: async (_signal, draft) => {
+				if (draft.source === "actor_preview" && (mode === "late-prediction" || dual)) {
+					if (++admissions === (dual ? 2 : 1)) admitted.arrive(); await admissionGate.promise;
+				}
+				return { ok: true };
 			},
-			onEvent: candidateReady.observe,
+			resolveExecution: () => distinct ? { ...RESOURCE_ROUTE, backend: `route-${++routes}`, fingerprint: `route-${routes}` } : RESOURCE_ROUTE,
+			execute: async (tool, concrete) => {
+				executing.arrive(); if (distinct) await executionGate.promise;
+				return world(concrete.offset === 2 ? "different query" : "shared observation", {
+					executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint,
+					validate: async () => (validResource()), onDispose: disposed });
+			},
+			onCandidateMaterialized: () => keyed.arrive(), onEvent: (event) => { ready.observe(event); nextReady.observe(event); },
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "streaming-intent" });
-		await planKeyed.promise;
-		expect(fixture.runtime.inspect().deferredPlanActions).toBe(1);
-		expect(fixture.executions()).toBe(0);
-
-		const actorCall = call("streaming-intent", { path: "future.ts" });
-		await fixture.runtime.previewActorCall(actorCall);
-		await Promise.all([executionStarted.promise, candidateReady.promise]);
-		expect(settlements).toEqual([]);
-		expect(fixture.events.some((event) => event.type === "actor_action")).toBe(false);
-		expect(await fixture.runtime.consume(actorCall)).toBe("future");
-		await fixture.runtime.finishTurn({ ...actorCall, terminal: true });
-		expect(settlements).toHaveLength(1);
-		expect(settlements[0]).toMatchObject({
-			match: { matched: true, adoption: { status: "adopted" } },
-		});
+		const actor = call("turn"), second = { ...actor, id: "independent-observation" };
+		try {
+			await fixture.runtime.startTurn(actor);
+			if (mode === "parallel-predictions" || distinct) {
+				if (!distinct) expect(proposals).toBe(0);
+				await proposed.promise; offered.arrive();
+				if (distinct) { await executing.promise; executionGate.arrive(); }
+				await continued.promise;
+			} else {
+				if (mode === "prediction-first") { offered.arrive(); await continued.promise; }
+				if (mode === "future-prediction") { offered.arrive(); await keyed.promise; expect(fixture.runtime.inspect().deferredPlanActions).toBe(1); expect(fixture.executions()).toBe(0); }
+				const previews = [fixture.runtime.previewActorCall(actor)];
+				if (dual) previews.push(fixture.runtime.previewActorCall(second));
+				if (mode === "late-prediction" || dual) {
+					await admitted.promise;
+					if (!dual) { offered.arrive(); await continued.promise; }
+					admissionGate.arrive();
+				}
+				await Promise.all(previews);
+			}
+			await ready.promise;
+			if (mode === "preview-first") { offered.arrive(); await continued.promise; }
+			expect(fixture.executions()).toBe(distinct ? 2 : 1);
+			if (distinct) { expect(fixture.runtime.inspect().sharedCandidates).toBe(2); expect(routes).toBe(2); }
+			expect(settlements).toEqual([]); expect(fixture.events.some((event) => event.type === "actor_action")).toBe(false);
+			if (mode === "cancel-owner") {
+				const changed = { ...actor, input: { path: "different.ts" } };
+				expect(await fixture.runtime.consume(changed)).toBeUndefined();
+				await fixture.runtime.actual({ ...changed, durationMs: 1, output: "different observation" });
+			} else expect(await fixture.runtime.consume(actor)).toBe("shared observation");
+			if (dual || mode === "prediction-first") expect(await fixture.runtime.consume(second)).toBe("shared observation");
+			await fixture.runtime.finishTurn({ ...actor, terminal: mode !== "prediction-first" });
+			if (mode === "parallel-predictions") {
+				expect(settlements).toHaveLength(8);
+				expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(new Set([actor.id]));
+			}
+			if (mode === "future-prediction") expect(settlements).toEqual([expect.objectContaining({ match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) })]);
+			if (mode === "prediction-first") {
+				const providers = fixture.events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
+				expect(providers).toHaveLength(2); expect(providers.every((provider) => provider.kind === "speculative")).toBe(true);
+				expect(new Set(providers.map((provider) => "candidateID" in provider && provider.candidateID)).size).toBe(1);
+				const range = call("range", { path: "README.md", offset: 2 });
+				await fixture.runtime.startTurn(range); await nextReady.promise;
+				expect(await fixture.runtime.consume(range)).toBe("different query");
+				await fixture.runtime.finishTurn({ ...range, terminal: true });
+				expect(fixture.events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
+			}
+			expect(fixture.executions()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
+		} finally { offered.arrive(); admissionGate.arrive(); executionGate.arrive(); await fixture.runtime.dispose(); }
+		expect(disposed).toHaveBeenCalledTimes(fixture.executions());
 	});
 
-	it("discards unconsumed previews, joins in-flight intent, and requires isolation", async () => {
-		let committed = 0;
-		let disposed = 0;
-		const slow = barrier();
-		const firstExecutionStarted = barrier();
-		const slowExecutionStarted = barrier();
+	it.each(["binding", "selection"] as const)("does not acquire a retired result after Actor %s waits", async (phase) => {
+		const entered = barrier(), gate = barrier(), ready = candidateSucceeded(), refreshed = candidateSucceeded(2), disposed = barrier(), commit = vi.fn();
+		let configured = settings, executions = 0, authorizations = 0, allowOld = false;
+		const fixture = harness({
+			source: { id: "source", enabled: () => true,
+				propose: ({ startInput }) => startInput.turnID.startsWith("producer") ? plan("source", startInput.turnID, { path: "README.md" }) : undefined },
+			settings: () => configured,
+			actionKey: async (tool, args, context) => {
+				if (phase === "binding" && context.type === "consume") { entered.arrive(); await gate.promise; }
+				return buildPiActionKey(tool, args, "/workspace");
+			},
+			authorize: async () => {
+				if (phase === "selection" && authorizations++ === 0) { entered.arrive(); await gate.promise; return { ok: false, reason: "first_rejected" }; }
+				return { ok: true };
+			},
+			execute: () => {
+				const generation = ++executions;
+				return world(`observation:${generation}`, {
+					executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
+					validate: async () => phase === "selection" && generation === 1 && !allowOld
+						? { status: "indeterminate", cause: cause("freshness", "unproven"), metrics: zeroValidationMetrics() }
+						: validResource(), onCommit: commit, onDispose: disposed.arrive });
+			},
+			onEvent: (event) => { ready.observe(event); refreshed.observe(event); },
+		});
+		try {
+			let actor = call("producer:1");
+			await fixture.runtime.startTurn(actor); await ready.promise;
+			if (phase === "selection") {
+				const other = { ...actor, input: { path: "other.ts" } };
+				expect(await fixture.runtime.consume(other)).toBeUndefined();
+				await fixture.runtime.actual({ ...other, durationMs: 1, output: "other" });
+				await fixture.runtime.finishTurn({ ...other, terminal: false });
+				actor = call("producer:2"); await fixture.runtime.startTurn(actor); await refreshed.promise; allowOld = true;
+			}
+			const consumed = fixture.runtime.consume(actor); await entered.promise;
+			configured = { ...settings, resourceCacheMaxBytes: 1 };
+			await fixture.runtime.startTurn(call("pressure")); await disposed.promise;
+			gate.arrive(); expect(await consumed).toBeUndefined(); expect(commit).not.toHaveBeenCalled();
+		} finally { gate.arrive(); await fixture.runtime.dispose(); }
+	});
+
+	it.each(["expiry", "inflight", "independent"] as const)("owns isolated preview execution through %s", async (mode) => {
+		let effects = 0, native = 0;
+		const started = barrier(), gate = barrier(), ready = candidateSucceeded(), disposed = vi.fn(), independent = mode === "independent";
+		const actor: Call = { ...call(mode), tool: independent ? "bash" : "write",
+			input: independent ? { command: "increment-counter" } : { path: "preview.txt", content: mode } };
+		const second = { ...actor, id: "second-effect" };
 		const fixture = harness({
 			source: { id: "disabled", enabled: () => false, propose: () => undefined },
-			execute: (tool, input) => {
-				if (input.content === "slow") {
-					slowExecutionStarted.arrive();
-					return slow.promise.then(() =>
-							world(`${tool}:${String(input.path)}`, {
-								checkpoint: { backend: "test", id: "slow", lineage: "slow", depth: 0 },
-								resources: ["."],
-								onCommit: () => committed++,
-								onDispose: () => disposed++,
-							}),
-						);
-				}
-				firstExecutionStarted.arrive();
-				return world(`${tool}:${String(input.path)}`, {
-					checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 },
-					resources: ["."],
-					onCommit: () => committed++,
-					onDispose: () => disposed++,
-				});
+			resolveExecution: (tool) => independent || tool === "write" ? MUTATION_ROUTE : undefined,
+			execute: async () => {
+				started.arrive(); await gate.promise;
+				return world("count:1", {
+					executionFingerprint: buildPiActionKey(actor.tool, actor.input, "/workspace")!.executionFingerprint,
+					checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 }, resources: ["."],
+					onCommit: () => effects++, onDispose: disposed });
 			},
+			onEvent: ready.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "aborted-preview" });
-		const writeCall: Call = {
-			sessionID: "session",
-			turnID: "aborted-preview",
-			id: "write-preview",
-			tool: "write",
-			input: { path: "preview.txt", content: "preview" },
-		};
-		await fixture.runtime.previewActorCall(writeCall);
-		await firstExecutionStarted.promise;
-		await fixture.runtime.previewActorCall({
-			...writeCall,
-			id: "bash-preview",
-			tool: "bash",
-			input: { command: "echo preview" },
-		});
-		expect(fixture.executions()).toBe(1);
-		expect(committed).toBe(0);
-
-		await fixture.runtime.finishTurn({ ...writeCall, terminal: false });
-		expect(committed).toBe(0);
-		expect(disposed).toBe(1);
-		expect(fixture.runtime.inspect("session").exclusiveCandidates).toBe(0);
-
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "incomplete-preview" });
-		const slowCall: Call = {
-			...writeCall,
-			turnID: "incomplete-preview",
-			id: "slow-preview",
-			input: { path: "slow.txt", content: "slow" },
-		};
-		await fixture.runtime.previewActorCall(slowCall);
-		await slowExecutionStarted.promise;
-		const consumed = fixture.runtime.consume(slowCall);
-		expect(fixture.executions()).toBe(2);
-		slow.arrive();
-		expect(await consumed).toBe("write:slow.txt");
-		expect(fixture.executions()).toBe(2);
-		expect(committed).toBe(1);
-		await fixture.runtime.finishTurn({ ...slowCall, terminal: true });
+		try {
+			await fixture.runtime.startTurn(actor);
+			const previews = [fixture.runtime.previewActorCall(actor)];
+			if (independent) previews.push(fixture.runtime.previewActorCall(second));
+			await Promise.all(previews); await started.promise;
+			if (!independent) await fixture.runtime.previewActorCall({ ...actor, id: "unsupported", tool: "bash", input: { command: "echo preview" } });
+			if (mode === "expiry") {
+				gate.arrive(); await ready.promise; await fixture.runtime.finishTurn({ ...actor, terminal: false });
+				expect(effects).toBe(0); expect(disposed).toHaveBeenCalledOnce();
+				expect(fixture.runtime.inspect("session").exclusiveCandidates).toBe(0);
+			} else {
+				const consumed = fixture.runtime.consume(actor); expect(fixture.executions()).toBe(1); gate.arrive();
+				expect(await consumed).toBe("count:1"); expect(effects).toBe(1);
+				if (independent) {
+					expect(await fixture.runtime.consume(second)).toBeUndefined();
+					native++; await fixture.runtime.actual({ ...second, durationMs: 1, output: `count:${++effects}` });
+					expect({ effects, native }).toEqual({ effects: 2, native: 1 });
+				}
+				await fixture.runtime.finishTurn({ ...actor, terminal: true });
+			}
+			expect(fixture.executions()).toBe(1);
+		} finally { gate.arrive(); await fixture.runtime.dispose(); }
+		expect(disposed).toHaveBeenCalledTimes(1);
 	});
 
 	it.each(["exact", "future", "due"] as const)("selects one captured prediction relation per plan without isolation: %s", async (mode) => {
@@ -1774,7 +1714,7 @@ describe("structural speculative runtime", () => {
 					onDispose: () => cleanup(output),
 					validate: async () => {
 						if (holdReuse && output === "child:parent-0") { validationStarted.arrive(); await validationGate.promise; }
-						return { status: "valid", metrics: zeroValidationMetrics() };
+						return validResource();
 					},
 				}));
 			},
