@@ -910,7 +910,7 @@ describe("speculative action host", () => {
 		await coordinator.dispose();
 	}, 5_000);
 
-	it.each(["context", "model", "options", "empty", "invalid", "rejected"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
+	it.each(["tools", "context", "model", "options", "empty", "invalid", "rejected"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
 		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
 		const rejected = phase === "invalid" || phase === "rejected", warms = phase === "empty" || rejected;
@@ -927,13 +927,14 @@ describe("speculative action host", () => {
 			if (phase === "options") { entered.resolve(); await release.promise; }
 			return {};
 		});
+		const draftModel = vi.fn(async () => {
+			if (phase === "model") { entered.resolve(); await release.promise; }
+			return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
+		});
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: settings,
-			draftModel: async () => {
-				if (phase === "model") { entered.resolve(); await release.promise; }
-				return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
-			},
+			getSettings: () => ({ ...settings(), tools: [phase === "tools" ? "bash" : "read"] }),
+			draftModel,
 			getDraftOptions,
 			complete,
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
@@ -946,7 +947,7 @@ describe("speculative action host", () => {
 				...startInput(tool),
 				context: { systemPrompt: "x".repeat(128), messages: [], tools: [tool] },
 			});
-			if (phase === "context") await settled.promise;
+			if (phase === "context" || phase === "tools") await settled.promise;
 			else {
 				await entered.promise;
 				if (warms) {
@@ -960,9 +961,10 @@ describe("speculative action host", () => {
 			}
 			expect(complete).toHaveBeenCalledTimes(warms ? 1 : 0);
 			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 2 : warms ? 1 : 0);
-			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" ? 0 : 1);
+			expect(draftModel).toHaveBeenCalledTimes(phase === "tools" ? 0 : 1);
+			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" || phase === "tools" ? 0 : 1);
 		} finally { release.resolve(); await closing; await host.dispose(); }
-		if (phase === "context" || warms) return;
+		if (phase === "context" || phase === "tools" || warms) return;
 
 		const sharing = deferred(), resume = deferred(), owners = [new AbortController(), new AbortController()];
 		const waitStage = async (stage: string) => { if (stage === phase) { sharing.resolve(); await resume.promise; } };

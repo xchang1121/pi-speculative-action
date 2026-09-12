@@ -167,6 +167,8 @@ export function createDrafterPlanSource(input: {
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
+				const tools = new Set(candidateNames.filter((name) => data.tools.has(name)));
+				if (!tools.size) return undefined;
 				batch = new DrafterPreparation(async (signal) => {
 					const model = (
 						typeof input.draftModel === "function"
@@ -196,7 +198,7 @@ export function createDrafterPlanSource(input: {
 						context: startInput.context,
 						options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning },
 						utility,
-						tools: new Set(candidateNames.filter((name) => data.tools.has(name))),
+						tools,
 					};
 				});
 				batches.set(batchKey, batch);
