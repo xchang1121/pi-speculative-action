@@ -544,6 +544,7 @@ export class PatternAwareStore {
 				pathProbability: parentConfirmed ? 1 : continuation.pathProbability,
 			},
 			predictionSettings,
+			parentConfirmed,
 		);
 	}
 
@@ -552,6 +553,7 @@ export class PatternAwareStore {
 		schemaHashes: Readonly<Record<string, string>>,
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
+		authoritative = true,
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const predictiveHistory = history;
@@ -667,13 +669,14 @@ export class PatternAwareStore {
 				expectedLatencyBenefitMs,
 			};
 		});
-		for (const recurrent of this.recurrentPredictions(
+		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
+		for (const recurrent of authoritative ? this.recurrentPredictions(
 			activeSessionID,
 			schemaHashes,
 			estimatePpm,
 			continuation,
 			settings,
-		)) {
+		) : []) {
 			const index = predictions.findIndex((prediction) => prediction.actionIdentity === recurrent.actionIdentity);
 			if (index < 0) {
 				predictions.push(recurrent);

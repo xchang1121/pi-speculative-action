@@ -1155,7 +1155,7 @@ describe("PatternAware", () => {
 		}
 	});
 
-	test("bounds background exact-action samples by the configured per-tool beam", () => {
+	test.each([false, true])("bounds recurrent action samples and requires Actor evidence to unfold them: %s", (confirmed) => {
 		const store = new PatternAwareStore(
 			settings({ beamWidth: 2, maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
 			undefined,
@@ -1176,6 +1176,10 @@ describe("PatternAware", () => {
 		const sampled = recurrent.filter((candidate) => candidate.background);
 		expect(sampled).toHaveLength(2);
 		expect(new Set(sampled.map((candidate) => candidate.tool))).toEqual(new Set(["bash", "read"]));
+		const parent = recurrent[0]!;
+		const next = store.continue(parent.continuation,
+			input({ sessionID, tool: parent.tool, input: parent.input }), {}, confirmed);
+		expect(next.some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(confirmed);
 	});
 
 
