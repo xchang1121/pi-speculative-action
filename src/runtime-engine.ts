@@ -115,6 +115,12 @@ function cacheLimits(settings: SpeculativeActionSettings) {
 	return { maxEntries: cacheEntryLimit(settings), maxBytes: cacheByteLimit(settings), hotFraction: 0.8 };
 }
 
+function definedFields<T, K extends keyof T>(value: T, keys: readonly K[]): Partial<Pick<T, K>> {
+	const result: Partial<Pick<T, K>> = {};
+	for (const key of keys) if (value[key] !== undefined) result[key] = value[key];
+	return result;
+}
+
 function forecastFor(
 	node: PlanRuntimeNode,
 	route: SpeculativeExecutionRoute,
@@ -153,20 +159,10 @@ function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 		actionID: node.action.id,
 		feedback: node.action.feedback,
 		...(node.action.dependsOn ? { dependsOn: node.action.dependsOn } : {}),
-		...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
-		...(node.action.latestHorizon !== undefined ? { latestHorizon: node.action.latestHorizon } : {}),
-		...(node.action.empiricalProbability !== undefined
-			? { empiricalProbability: node.action.empiricalProbability }
-			: {}),
-		...(node.action.conditionalProbability !== undefined
-			? { conditionalProbability: node.action.conditionalProbability }
-			: {}),
-		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
-		...(node.action.expectedLatencyBenefitMs !== undefined
-			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
-			: {}),
-		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
-		...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
+		...definedFields(node.action, [
+			"horizon", "latestHorizon", "empiricalProbability", "conditionalProbability",
+			"expectedDurationMs", "expectedLatencyBenefitMs", "resourceDemand", "depth",
+		]),
 	};
 }
 
@@ -1199,20 +1195,10 @@ export function makeStructuralSpeculativeActionRuntime<
 					input: structuredClone(concrete),
 					predictedAction,
 					executionAction: predictedAction,
-					...(node.action.depth !== undefined ? { depth: node.action.depth } : {}),
-					...(node.action.horizon !== undefined ? { horizon: node.action.horizon } : {}),
-					...(node.action.conditionalProbability !== undefined
-						? { conditionalProbability: node.action.conditionalProbability }
-						: {}),
-					...(node.action.empiricalProbability !== undefined
-						? { empiricalProbability: node.action.empiricalProbability }
-						: {}),
-					...(node.action.expectedLatencyBenefitMs !== undefined
-						? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
-						: {}),
-					...(node.action.expectedDurationMs !== undefined
-						? { expectedDurationMs: node.action.expectedDurationMs }
-						: {}),
+					...definedFields(node.action, [
+						"depth", "horizon", "conditionalProbability", "empiricalProbability",
+						"expectedLatencyBenefitMs", "expectedDurationMs",
+					]),
 				}),
 			);
 		}
