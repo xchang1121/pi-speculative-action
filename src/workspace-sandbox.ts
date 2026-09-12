@@ -11,7 +11,6 @@ import type {
 	WorldBranch,
 	WorldCheckpoint,
 	WorldCommitMetrics,
-	WorldCompatibilityEvidence,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
 import { advanceFilesystemClock, assertNoSymlinkPath, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
@@ -582,35 +581,27 @@ const SANDBOX_AUTHOR_ENVIRONMENT = {
 	GIT_COMMITTER_EMAIL: "speculative-action@localhost",
 } as const;
 
-class GitWorldCheckpoint implements WorldCheckpoint {
-	readonly backend = "git_worktree" as const;
-	readonly id = randomUUID();
-	readonly lineage: string;
-	readonly depth: number;
+interface WorkspaceCheckpoint {
+	readonly token: WorldCheckpoint;
 	readonly sourceRoot: string;
-	readonly parent?: GitWorldCheckpoint;
+	readonly parent?: WorkspaceCheckpoint;
 	readonly changes: readonly SandboxWorkspaceChange[];
-
-	constructor(sourceRoot: string, parent: GitWorldCheckpoint | undefined, changes: readonly SandboxWorkspaceChange[]) {
-		this.sourceRoot = path.resolve(sourceRoot);
-		this.lineage = parent?.lineage ?? this.id;
-		this.depth = (parent?.depth ?? -1) + 1;
-		this.parent = parent;
-		this.changes = changes;
-	}
 }
+
+// Checkpoints expose identity only; their owned bytes stay inside this backend.
+const workspaceCheckpoints = new WeakMap<WorldCheckpoint, WorkspaceCheckpoint>();
 
 function resolveWorkspaceCheckpoint(
 	checkpoint: WorldCheckpoint | undefined,
 	sourceRoot: string,
-): GitWorldCheckpoint | undefined {
+): WorkspaceCheckpoint | undefined {
 	if (checkpoint === undefined) return undefined;
-	if (!(checkpoint instanceof GitWorldCheckpoint))
-		throw new Error("Execution world checkpoint belongs to another backend.");
-	if (filesystemPathKey(checkpoint.sourceRoot) !== filesystemPathKey(sourceRoot)) {
+	const owned = workspaceCheckpoints.get(checkpoint);
+	if (!owned) throw new Error("Execution world checkpoint belongs to another backend.");
+	if (filesystemPathKey(owned.sourceRoot) !== filesystemPathKey(sourceRoot)) {
 		throw new Error("Execution world checkpoint belongs to another workspace.");
 	}
-	return checkpoint;
+	return owned;
 }
 
 export interface QualifiedWorkspaceSandboxDriver {
@@ -668,7 +659,7 @@ export class WorkspaceSandboxService {
 
 	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
 		assertWorkspaceSandboxOpen(this.state);
-		return (await commitSandboxExecution(this.state, delta)).output;
+		return (await commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) })).output;
 	}
 
 	closePools(roots?: readonly string[]): Promise<void> {
@@ -774,61 +765,32 @@ function createWorkspaceSandboxFor(
 	};
 }
 
-class GitWorldBranch implements WorldBranch<ToolSettlement> {
-	readonly backend = "git_worktree" as const;
-	readonly checkpoint: GitWorldCheckpoint;
-	readonly output: ToolSettlement;
-	readonly resources: readonly string[];
-	readonly capturedBytes: number;
-	readonly executionMetrics: WorkspaceExecutionSnapshot["executionMetrics"];
-	readonly compatibility: WorldCompatibilityEvidence;
-	readonly validate?: () => Promise<ResourceValidation>;
-	private readonly changes: readonly SandboxWorkspaceChange[];
-	private readonly owner: WorkspaceSandboxState;
-	private commitMetricsValue?: WorldCommitMetrics;
-	private commitPromise?: Promise<ToolSettlement>;
-
-	constructor(
-		snapshot: WorkspaceExecutionSnapshot,
-		sourceRoot: string,
-		executionFingerprint: string,
-		owner: WorkspaceSandboxState,
-		parent?: GitWorldCheckpoint,
-		validate?: () => Promise<ResourceValidation>,
-	) {
-		this.output = snapshot.output;
-		this.changes = Object.freeze([...snapshot.changes]);
-		this.checkpoint = new GitWorldCheckpoint(sourceRoot, parent, this.changes);
-		this.resources = Object.freeze([...new Set(this.changes.filter((change) => !change.validationOnly).map((change) => change.resource))]);
-		this.capturedBytes = this.changes.reduce((total, change) => total + sandboxChangeBytes(change), 0);
-		this.executionMetrics = Object.freeze({ ...snapshot.executionMetrics });
-		this.owner = owner;
-		this.compatibility = Object.freeze({
-			status: "compatible" as const,
-			backend: this.backend,
-			executionFingerprint,
-		});
-		this.validate = validate;
-	}
-
-	get commitMetrics(): WorldCommitMetrics | undefined {
-		return this.commitMetricsValue;
-	}
-
-	readonly commit = (): Promise<ToolSettlement> => {
-		if (this.commitPromise) return this.commitPromise;
-		this.commitPromise = commitSandboxExecution(this.owner, { output: this.output, changes: this.changes }).then(
-			({ output, metrics }) => {
-				this.commitMetricsValue = metrics;
-				return output;
-			},
-		);
-		return this.commitPromise;
+function workspaceBranch(
+	snapshot: WorkspaceExecutionSnapshot,
+	sourceRoot: string,
+	executionFingerprint: string,
+	owner: WorkspaceSandboxState,
+	parent?: WorkspaceCheckpoint,
+	validate?: () => Promise<ResourceValidation>,
+): WorldBranch<ToolSettlement> {
+	const { changes } = snapshot, backend = "git_worktree", id = randomUUID();
+	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
+	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
+	let commitMetrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	return {
+		backend, checkpoint, output: snapshot.output, validate,
+		resources: Object.freeze([...new Set(changes.filter((change) => !change.validationOnly).map((change) => change.resource))]),
+		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
+		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
+		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
+		get commitMetrics() { return commitMetrics; },
+		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot).then(({ output, metrics }) => {
+			commitMetrics = metrics;
+			return output;
+		}),
+		// The private worktree was removed during fork; no filesystem handles remain.
+		dispose() {},
 	};
-
-	dispose(): void {
-		// The private worktree is sealed and removed during fork; this branch owns only immutable bytes.
-	}
 }
 
 async function commitSandboxExecution(
@@ -837,7 +799,7 @@ async function commitSandboxExecution(
 ): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldCommitMetrics }> {
 	assertWorkspaceSandboxOpen(state);
 	const started = performance.now();
-	const changes = deduplicateChanges(execution.changes);
+	const { changes } = execution;
 	const commit = withCommitLocks(
 		commitLockTargets(changes),
 		async () => {
@@ -990,7 +952,7 @@ async function forkSandboxWorkspaceFor(
 			const result = await options.execute(workspace);
 			const captureStarted = performance.now();
 			const captured = "output" in result ? result : { output: result, changes: await collectSandboxChanges(workspace) };
-			const changes = deduplicateChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
+			const changes = ownSandboxChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
 			return {
 				output: captured.output,
 				changes,
@@ -1003,7 +965,7 @@ async function forkSandboxWorkspaceFor(
 		},
 		parent,
 	);
-	return new GitWorldBranch(
+	return workspaceBranch(
 		snapshot,
 		sourceRoot,
 		options.action.executionFingerprint,
@@ -1769,7 +1731,7 @@ async function withPrivateSandboxWorkspace<T>(
 	driver: Exclude<WorkspaceSandboxDriver, "auto">,
 	overlayOptions: LinuxOverlayfsOptions,
 	run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
-	checkpoint?: GitWorldCheckpoint,
+	checkpoint?: WorkspaceCheckpoint,
 ): Promise<T> {
 	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions);
 	try {
@@ -1780,9 +1742,9 @@ async function withPrivateSandboxWorkspace<T>(
 	}
 }
 
-async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpoint: GitWorldCheckpoint): Promise<void> {
-	const lineage: GitWorldCheckpoint[] = [];
-	for (let current: GitWorldCheckpoint | undefined = checkpoint; current; current = current.parent) {
+async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpoint: WorkspaceCheckpoint): Promise<void> {
+	const lineage: WorkspaceCheckpoint[] = [];
+	for (let current: WorkspaceCheckpoint | undefined = checkpoint; current; current = current.parent) {
 		lineage.push(current);
 	}
 	for (const ancestor of lineage.reverse()) {
@@ -2195,7 +2157,8 @@ function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number 
 	return !change || change.kind === "directory" ? 0 : (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0);
 }
 
-function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
+/** Take ownership once, before cleanup or commit locks can yield to a retained caller reference. */
+function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
 	const result = new Map<string, SandboxWorkspaceChange>();
 	for (const change of changes) {
 		const key = filesystemPathKey(change.target);
@@ -2230,7 +2193,12 @@ function deduplicateChanges(changes: readonly SandboxWorkspaceChange[]): Sandbox
 		}
 		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
 	}
-	return [...result.values()].sort((left, right) =>
+	return [...result.values()].map((change): SandboxWorkspaceChange => {
+		const target = { root: path.resolve(change.root), target: path.resolve(change.target) };
+		return change.kind === "directory"
+			? { ...change, ...target, before: change.before && { ...change.before }, after: change.after && { ...change.after } }
+			: { ...change, ...target, before: change.before && Buffer.from(change.before), after: change.after && Buffer.from(change.after) };
+	}).sort((left, right) =>
 		filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target)),
 	);
 }
