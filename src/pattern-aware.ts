@@ -1693,20 +1693,15 @@ class PatternBindingAnalysis {
 				}
 				continue;
 			}
-			const next: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [];
-			for (const variant of variants) {
-				for (const value of values) {
-					const input = withPath(variant.input, targetPath, value.value);
-					const candidate = {
-						input: input ?? variant.input,
-						missing: [...variant.missing],
-						probability: variant.probability * value.probability,
-					};
-					if (!input) candidate.missing.push(targetPath);
-					next.push(candidate);
-				}
-			}
-			variants = next.sort((left, right) => right.probability - left.probability).slice(0, limit);
+			const ranked = variants.flatMap((variant) => values.map((value) => ({
+				variant, value: value.value, probability: variant.probability * value.probability,
+			})));
+			variants = ranked.sort((left, right) => right.probability - left.probability).slice(0, limit)
+				.map(({ variant, value, probability }) => {
+					const input = withPath(variant.input, targetPath, value);
+					return { input: input ?? variant.input, probability,
+						missing: input ? [...variant.missing] : [...variant.missing, targetPath] };
+				});
 		}
 		return variants;
 	}
