@@ -16,7 +16,7 @@ import {
 	projectPatternAwareObservation,
 } from "../src/pattern-aware.ts";
 import { patternSessionBudgets, PatternSessionRegistry } from "../src/pattern-session-state.ts";
-import type { PredictionSettlement, ResolutionStage } from "../src/settlement.ts";
+import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
 const temporary: string[] = [];
 
@@ -1606,59 +1606,6 @@ function patternFeedback(
 		sequence: 1,
 		...overrides,
 	};
-}
-
-type PredictionSettlementBody<Settlement> = Settlement extends unknown ? Omit<Settlement, "prediction"> : never;
-
-function predictionSettlement(settlement: PredictionSettlementBody<PredictionSettlement>): PredictionSettlement {
-	return {
-		prediction: {
-			id: "prediction",
-			source: "pattern_aware",
-			proposalID: "proposal",
-			actionID: "action",
-		},
-		...settlement,
-	} as PredictionSettlement;
-}
-
-function unobservedSettlement(stage: ResolutionStage, code: string): PredictionSettlement {
-	return predictionSettlement({ observation: "unobserved", cause: { stage, code } });
-}
-
-function unmatchedSettlement(): PredictionSettlement {
-	return predictionSettlement({
-		observation: "observed",
-		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
-		match: { matched: false },
-	});
-}
-
-function rejectedSettlement(stage: ResolutionStage, code: string): PredictionSettlement {
-	return predictionSettlement({
-		observation: "observed",
-		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
-		match: {
-			matched: true,
-			relation: { kind: "exact", distance: 0 },
-			adoption: { status: "rejected", candidateID: "candidate", cause: { stage, code } },
-		},
-	});
-}
-
-function adoptedSettlement(): PredictionSettlement {
-	return predictionSettlement({
-		observation: "observed",
-		actorAction: { id: "actor", sequence: 1, turnID: "turn" },
-		match: {
-			matched: true,
-			relation: { kind: "exact", distance: 0 },
-			adoption: {
-				status: "adopted",
-				candidateID: "candidate",
-			},
-		},
-	});
 }
 
 function input(

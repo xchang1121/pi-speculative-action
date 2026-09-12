@@ -6,6 +6,7 @@ import {
 	reduceSpeculativeTrace,
 	summarizeSpeculativeTrace,
 } from "../src/trace-summary.ts";
+import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
 describe("speculative trace reduction", () => {
 	test("keeps source, prediction, execution, and Actor outcomes orthogonal in live and replayed metrics", () => {
@@ -63,7 +64,6 @@ describe("speculative trace reduction", () => {
 function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 	const base = { sessionID: "session", turnID: "turn", timestamp: 1, cache: cache() };
 	const actorAction = { id: "actor", sequence: 1, turnID: "turn" };
-	const prediction = { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" };
 	const exact = { kind: "exact" as const, distance: 0 as const };
 	const projected = { kind: "projected" as const, projector: "read.range", distance: 40 };
 	return [
@@ -99,48 +99,12 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 				settlement: { status: "timeout", cause: { stage: "source", code: "timeout" } },
 			},
 		},
-		{
-			...base,
-			type: "prediction",
-			settlement: { prediction, observation: "unobserved", cause: { stage: "source", code: "timeout" } },
-		},
-		{
-			...base,
-			type: "prediction",
-			settlement: { prediction, observation: "observed", actorAction, match: { matched: false } },
-		},
-		{
-			...base,
-			type: "prediction",
-			settlement: {
-				prediction,
-				observation: "observed",
-				actorAction,
-				match: {
-					matched: true,
-					relation: exact,
-					adoption: {
-						status: "rejected",
-						candidateID: "candidate",
-						cause: { stage: "freshness", code: "resource_changed" },
-					},
-				},
-			},
-		},
-		{
-			...base,
-			type: "prediction",
-			settlement: {
-				prediction,
-				observation: "observed",
-				actorAction,
-				match: {
-					matched: true,
-					relation: exact,
-					adoption: { status: "adopted", candidateID: "candidate" },
-				},
-			},
-		},
+		...[
+			unobservedSettlement("source", "timeout"),
+			unmatchedSettlement(),
+			rejectedSettlement("freshness", "resource_changed"),
+			adoptedSettlement(),
+		].map((settlement) => ({ ...base, type: "prediction" as const, settlement })),
 		{ ...base, type: "candidate", candidate: candidate("one"), state: { status: "running", startedAt: 0 } },
 		{
 			...base,

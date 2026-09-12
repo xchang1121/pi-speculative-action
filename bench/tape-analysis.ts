@@ -30,126 +30,11 @@ interface TapeToolCall {
 	readonly arguments: unknown;
 }
 
-interface TapeOpportunity {
-	readonly actorSequence: number;
-	readonly actorAction: TapeToolCall;
-	readonly actorDecodeMs: number;
-	readonly drafterSequences: readonly number[];
-	readonly drafterRequestCount: number;
-	readonly candidateCount: number;
-	readonly uniqueCandidateCount: number;
-	readonly duplicateCandidateCount: number;
-	readonly exactHit: boolean;
-	readonly exactReadyBeforeActor: boolean;
-	readonly earliestExactReadyMs?: number;
-	readonly exactLeadMs: number;
-	readonly drafterServiceMs: number;
-}
-
-export interface TapeAnalysis {
-	readonly actorModel: string;
-	readonly drafterModel: string;
-	readonly completedExchanges: number;
-	readonly incompleteExchanges: number;
-	readonly opportunities: readonly TapeOpportunity[];
-	readonly summary: {
-		readonly opportunities: number;
-		readonly exactHits: number;
-		readonly hitRate: number;
-		readonly exactReadyBeforeActor: number;
-		readonly earlyHitRate: number;
-		readonly candidateCount: number;
-		readonly uniqueCandidateCount: number;
-		readonly duplicateCandidateCount: number;
-		readonly uniqueYield: number;
-		readonly actorDecodeMs: number;
-		readonly drafterServiceMs: number;
-		readonly exactLeadMs: number;
-	};
-}
-
-export interface TapeForkGateAnalysis {
-	readonly decisions: number;
-	readonly allowed: number;
-	readonly skipped: number;
-	readonly requestReduction: number;
-	readonly exactHitsAvailable: number;
-	readonly exactHitsRetained: number;
-	readonly forkCostMs: number;
-	readonly gatedForkCostMs: number;
-	readonly forkCostReduction: number;
-	readonly netBenefitMs: number;
-	readonly gatedNetBenefitMs: number;
-}
-
-export interface TapeReprobeAnalysis {
-	readonly decisions: number;
-	readonly actorActionTurns: number;
-	readonly d1ExactHits: number;
-	readonly d1Misses: number;
-	readonly boundedReprobes: number;
-	readonly secondProbeRecoveredHits: number;
-	readonly anyLaterRecoveredHits: number;
-	readonly additionalForkCostMs: number;
-	readonly snapshotReprobeTurns: number;
-	readonly snapshotReprobeActionTurns: number;
-	readonly snapshotReprobeRunwayMs: number;
-}
-
-interface TapeDrafterWidthPoint {
-	readonly width: number;
-	readonly actorTurns: number;
-	readonly opportunities: number;
-	readonly exactHits: number;
-	readonly marginalExactHits: number;
-	readonly hitRate: number;
-	readonly exactReadyBeforeActor: number;
-	readonly earlyHitRate: number;
-	readonly drafterRequests: number;
-	readonly requestReductionFromAvailable: number;
-	readonly drafterServiceMs: number;
-	readonly serviceReductionFromAvailable: number;
-	readonly drafterCompletionSpanMs: number;
-	readonly candidateCount: number;
-	readonly uniqueCandidateCount: number;
-	readonly duplicateCandidateCount: number;
-	readonly uniqueYield: number;
-	readonly exactLeadMs: number;
-}
-
-export interface TapeDrafterWidthAnalysis {
-	readonly actorTurns: number;
-	readonly opportunities: number;
-	readonly availableDrafterRequests: number;
-	readonly availableDrafterServiceMs: number;
-	readonly points: readonly TapeDrafterWidthPoint[];
-}
-
-export interface TapeDrafterRaceAnalysis {
-	readonly width: number;
-	readonly actorTurns: number;
-	readonly opportunities: number;
-	readonly winnerTurns: number;
-	readonly noWinnerTurns: number;
-	readonly selectedDrafterRequests: number;
-	readonly abortableDrafterRequests: number;
-	readonly abortableRequestRate: number;
-	readonly fullDrafterServiceMs: number;
-	readonly racedDrafterServiceMs: number;
-	readonly residualServiceSavedMs: number;
-	readonly serviceReduction: number;
-	readonly fullCandidateCount: number;
-	readonly fullUniqueCandidateCount: number;
-	readonly racedCandidateCount: number;
-	readonly racedUniqueCandidateCount: number;
-	readonly fullExactHits: number;
-	readonly racedExactHits: number;
-	readonly laterRecoveredExactHits: number;
-	readonly fullExactReadyBeforeActor: number;
-	readonly racedExactReadyBeforeActor: number;
-	readonly fullExactLeadMs: number;
-	readonly racedExactLeadMs: number;
-}
+export type TapeAnalysis = ReturnType<typeof analyzeTape>;
+export type TapeForkGateAnalysis = ReturnType<typeof analyzeTapeForkGate>;
+export type TapeReprobeAnalysis = ReturnType<typeof analyzeTapeReprobe>;
+export type TapeDrafterWidthAnalysis = ReturnType<typeof analyzeTapeDrafterWidth>;
+export type TapeDrafterRaceAnalysis = ReturnType<typeof analyzeTapeDrafterRace>;
 
 interface ParsedExchange {
 	readonly sequence: number;
@@ -161,7 +46,7 @@ interface ParsedExchange {
 	readonly toolDeltaMs: readonly number[];
 }
 
-export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string): TapeAnalysis {
+export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string) {
 	const { completed, actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
 	const opportunities = actors
 		.flatMap((actor) =>
@@ -178,7 +63,7 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 		drafterModel,
 		completedExchanges: completed.length,
 		incompleteExchanges: tape.exchanges.length - completed.length,
-		opportunities,
+		opportunities: opportunities as Readonly<typeof opportunities>,
 		summary: {
 			opportunities: opportunities.length,
 			exactHits,
@@ -193,7 +78,7 @@ export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: str
 			drafterServiceMs: sum(opportunities, (value) => value.drafterServiceMs),
 			exactLeadMs: sum(opportunities, (value) => value.exactLeadMs),
 		},
-	};
+	} as const;
 }
 
 /** Simulate the rolling policy using decode lead as a proxy, not measured Actor savings. */
@@ -202,7 +87,7 @@ export function analyzeTapeForkGate(
 	actorModel: string,
 	drafterModel: string,
 	policy: BenefitGatePolicy,
-): TapeForkGateAnalysis {
+) {
 	const { actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
 	const gate = new BenefitGate();
 	let decisions = 0;
@@ -247,7 +132,7 @@ export function analyzeTapeForkGate(
 		forkCostReduction: ratio(forkCostMs - gatedForkCostMs, forkCostMs),
 		netBenefitMs,
 		gatedNetBenefitMs,
-	};
+	} as const;
 }
 
 /** Measure whether one D2 retry could recover a D1 miss and whether Actor stream runway exists. */
@@ -255,7 +140,7 @@ export function analyzeTapeReprobe(
 	tape: LlmTape,
 	actorModel: string,
 	drafterModel: string,
-): TapeReprobeAnalysis {
+) {
 	const { actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
 	let decisions = 0;
 	let actorActionTurns = 0;
@@ -305,7 +190,7 @@ export function analyzeTapeReprobe(
 		snapshotReprobeTurns,
 		snapshotReprobeActionTurns,
 		snapshotReprobeRunwayMs,
-	};
+	} as const;
 }
 
 /**
@@ -319,7 +204,7 @@ export function analyzeTapeDrafterWidth(
 	actorModel: string,
 	drafterModel: string,
 	widths: readonly number[],
-): TapeDrafterWidthAnalysis {
+) {
 	const selectedWidths = [...new Set(widths.filter((width) => Number.isSafeInteger(width) && width > 0))].sort(
 		(left, right) => left - right,
 	);
@@ -329,7 +214,7 @@ export function analyzeTapeDrafterWidth(
 	const available = summarizeCandidates(turns);
 	const actionOpportunities = sum(turns, ({ actor }) => actor.calls.length);
 	let previousExactHits = 0;
-	const points = selectedWidths.map((width): TapeDrafterWidthPoint => {
+	const points = selectedWidths.map((width) => {
 		const metrics = summarizeCandidates(turns.map(({ actor, drafters }) => ({ actor, drafters: drafters.slice(0, width) })));
 		const point = {
 			width,
@@ -343,7 +228,7 @@ export function analyzeTapeDrafterWidth(
 			serviceReductionFromAvailable: ratio(available.drafterServiceMs - metrics.drafterServiceMs, available.drafterServiceMs),
 			duplicateCandidateCount: metrics.candidateCount - metrics.uniqueCandidateCount,
 			uniqueYield: ratio(metrics.uniqueCandidateCount, metrics.candidateCount),
-		};
+		} as const;
 		previousExactHits = metrics.exactHits;
 		return point;
 	});
@@ -352,8 +237,8 @@ export function analyzeTapeDrafterWidth(
 		opportunities: actionOpportunities,
 		availableDrafterRequests: available.drafterRequests,
 		availableDrafterServiceMs: available.drafterServiceMs,
-		points,
-	};
+		points: points as Readonly<typeof points>,
+	} as const;
 }
 
 /**
@@ -367,7 +252,7 @@ export function analyzeTapeDrafterRace(
 	actorModel: string,
 	drafterModel: string,
 	width: number,
-): TapeDrafterRaceAnalysis {
+) {
 	if (!Number.isSafeInteger(width) || width <= 0) throw new Error("A positive integer Drafter race width is required");
 	const turns = drafterTurns(tape, actorModel, drafterModel)
 		.map(({ actor, drafters }) => ({ actor, drafters: drafters.slice(0, width) }));
@@ -409,7 +294,7 @@ export function analyzeTapeDrafterRace(
 		racedExactReadyBeforeActor: raced.exactReadyBeforeActor,
 		fullExactLeadMs: full.exactLeadMs,
 		racedExactLeadMs: raced.exactLeadMs,
-	};
+	} as const;
 }
 
 interface DrafterTurn {
@@ -483,7 +368,7 @@ function opportunity(
 	actor: ParsedExchange,
 	actorAction: TapeToolCall,
 	drafters: readonly ParsedExchange[],
-): TapeOpportunity {
+) {
 	const candidates = drafters.flatMap((exchange) => exchange.calls);
 	const unique = new Map(candidates.map((candidate) => [actionIdentity(candidate), candidate]));
 	const actorIdentity = actionIdentity(actorAction);
@@ -496,7 +381,7 @@ function opportunity(
 		actorSequence: actor.sequence,
 		actorAction,
 		actorDecodeMs: actor.endedAtMs,
-		drafterSequences: drafters.map((exchange) => exchange.sequence),
+		drafterSequences: drafters.map((exchange) => exchange.sequence) as readonly number[],
 		drafterRequestCount: drafters.length,
 		candidateCount: candidates.length,
 		uniqueCandidateCount: unique.size,
@@ -506,7 +391,7 @@ function opportunity(
 		...(earliestExactReadyMs === undefined ? {} : { earliestExactReadyMs }),
 		exactLeadMs,
 		drafterServiceMs: sum(drafters, (exchange) => exchange.endedAtMs),
-	};
+	} as const;
 }
 
 function decodeToolCalls(events: readonly DecodedSseEvent[]): readonly TapeToolCall[] {
