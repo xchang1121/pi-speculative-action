@@ -350,6 +350,70 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	}, 15_000);
 
+	test.for(["trace", "transaction"] as const)("drains both capture owners when %s sealing fails", { timeout: 15_000 }, async (failure, { skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-");
+		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
+		const entered = deferred(), failed = deferred(), gate = deferred();
+		const error = new Error(`injected ${failure} capture failure`);
+		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
+		let restoreTransactions: (() => void) | undefined;
+		const open = fixture.backend.open.bind(fixture.backend);
+		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+			const begin = input.workspace.transactions.begin;
+			const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
+				const capture = await begin();
+				return { abort: capture.abort, finish: async () => {
+					if (failure === "trace") { entered.resolve(); await gate.promise; return capture.finish(); }
+					await entered.promise; await capture.abort(); failed.resolve(); throw error;
+				} };
+			});
+			restoreTransactions = () => recording.mockRestore();
+			return open(input);
+		});
+		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
+			if (String(args[0]).includes("/trace-")) {
+				traceRoot = path.dirname(String(args[0]));
+				if (failure === "trace") { await entered.promise; failed.resolve(); throw error; }
+				entered.resolve(); await gate.promise;
+			}
+			return readTrace(...args);
+		});
+		const removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
+			if (String(args[0]) === traceRoot && !released) cleanupBeforeRelease = true;
+			return removeFile(...args);
+		});
+		const spawning = vi.mocked(childProcess.spawn).mockImplementation((...args) => {
+			if (JSON.stringify(args[1]).includes("/trace-")) executions++;
+			return spawn(...args);
+		});
+		let running: ReturnType<typeof forkReusableBash> | undefined;
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") return skip(status.detail);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			running = forkReusableBash(fixture, { command: "/usr/bin/printf capture-once", label: failure,
+				actionNamespace: "capture-owners.v1", executionFingerprint });
+			void running.then(() => { returned = true; }, () => { returned = true; });
+			await failed.promise; await nextTurn();
+			expect({ cleanupBeforeRelease, returned }, "a failed capture must drain its pending sibling").toEqual({ cleanupBeforeRelease: false, returned: false });
+			released = true; gate.resolve();
+			const branch = await running;
+			await expect(stat(traceRoot!)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(branch.output.result.content).toEqual([{ type: "text", text: "capture-once" }]);
+			expect({ executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
+			const validation = await branch.validate?.();
+			expect(validation?.status).toBe("indeterminate");
+			expect(JSON.stringify(validation)).toContain(`nested_capture:${error.message}`);
+		} finally {
+			released = true; gate.resolve();
+			await running?.then((branch) => branch.dispose(), () => undefined);
+			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore();
+			await fixture.dispose();
+		}
+	});
+
 	test("defers native initialization and preserves opaque process output without path rewriting", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
 		const storeRoot = path.join(root, "store");

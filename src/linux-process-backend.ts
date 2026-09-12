@@ -1075,12 +1075,17 @@ export class LinuxProcessReuseBackend {
 			const observedProcessMs = Math.max(0, performance.now() - processStarted);
 			try {
 				transactionFinishing = true;
-				const [delta, observation] = await Promise.all([
+				const captures = [
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 					}),
-				]);
+				] as const;
+				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
+					// Both captures own live workspace/trace resources until they settle.
+					await Promise.allSettled(captures);
+					throw error;
+				});
 				if (observation.incompleteReasons.length) {
 					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
 					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
