@@ -439,15 +439,15 @@ interface PlanActionContext<StartInput, StateData> {
 	executionRoute?: SpeculativeExecutionRoute;
 }
 
-/** One producer request from the bounded budget for a future Actor decision. */
+/** One producer request and its admitted actions share a cancellation lifetime and decision budget. */
 interface SourceRequestSlot {
 	readonly source: string;
 	readonly targetDecisionSequence: number;
 	readonly requestKind: SourceRequestKind;
 	readonly expiresAtTarget: boolean;
-	readonly generations: Set<SourceGeneration>;
+	readonly generation: SourceGeneration;
 	readonly owners: Set<string>;
-	pendingRequests: number;
+	pending: boolean;
 	active: boolean;
 }
 
@@ -835,6 +835,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		limit: number,
 		requestKind: SourceRequestKind,
 		expiresAtTarget = true,
+		parent?: AbortSignal,
 	): SourceRequestSlot | undefined => {
 		const used = [...session.sourceSlots].filter(
 			(slot) => slot.active && slot.source === source && slot.targetDecisionSequence === targetDecisionSequence,
@@ -845,9 +846,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			targetDecisionSequence,
 			requestKind,
 			expiresAtTarget,
-			generations: new Set(),
+			generation: new SourceGeneration(parent),
 			owners: new Set(),
-			pendingRequests: 0,
+			pending: true,
 			active: true,
 		};
 		session.sourceSlots.add(slot);
@@ -858,22 +859,17 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!slot.active) return;
 		slot.active = false;
 		session.sourceSlots.delete(slot);
-		for (const generation of slot.generations) generation.expire(failure);
-		slot.generations.clear();
+		slot.generation.expire(failure);
 	};
 
 	const releaseUnusedSourceSlot = (session: Session, slot: SourceRequestSlot): void => {
-		if (slot.pendingRequests === 0 && slot.owners.size === 0) {
+		if (!slot.pending && slot.owners.size === 0) {
 			releaseSourceSlot(session, slot, cause("control", "source_slot_unused"));
 		}
 	};
 
-	const retainSourceRequest = (slot: SourceRequestSlot): void => {
-		slot.pendingRequests++;
-	};
-
 	const releaseSourceRequest = (session: Session, slot: SourceRequestSlot): void => {
-		slot.pendingRequests = Math.max(0, slot.pendingRequests - 1);
+		slot.pending = false;
 		releaseUnusedSourceSlot(session, slot);
 	};
 
@@ -932,11 +928,10 @@ export function makeStructuralSpeculativeActionRuntime<
 					count,
 					"proposal",
 					source.requestLifetime === "actor_decision",
+					state.generation.signal,
 				);
 				if (!slot) break;
-				const generation = new SourceGeneration(state.generation.signal);
-				slot.generations.add(generation);
-				retainSourceRequest(slot);
+				const generation = slot.generation;
 				state.session.pendingSourceRequests++;
 				const pending = runSourceRequest({
 					request: {
@@ -973,7 +968,6 @@ export function makeStructuralSpeculativeActionRuntime<
 						state.turnID,
 						source,
 						slot,
-						generation,
 						request,
 					),
 				);
@@ -987,7 +981,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		turnID: string,
 		source: Source,
 		slot: SourceRequestSlot,
-		generation: SourceGeneration,
 		request: SourceRequestResult<PlanUpdate | readonly PlanUpdate[] | undefined>,
 	): Promise<void> => {
 		const session = scope.session;
@@ -1004,7 +997,6 @@ export function makeStructuralSpeculativeActionRuntime<
 			}
 			await admitUpdates(scope, source, request.value, request);
 		} finally {
-			slot.generations.delete(generation);
 			releaseSourceRequest(session, slot);
 		}
 	};
@@ -2411,14 +2403,12 @@ export function makeStructuralSpeculativeActionRuntime<
 				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit, "continuation");
 				if (!slot) return;
 				context.continuationSlots.add(slot);
-				retainSourceRequest(slot);
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) {
 					releaseSourceRequest(session, slot);
 					return;
 				}
-				const generation = new SourceGeneration();
-				slot.generations.add(generation);
+				const generation = slot.generation;
 				session.pendingSourceRequests++;
 				const request = await runSourceRequest({
 					request: {
@@ -2459,7 +2449,6 @@ export function makeStructuralSpeculativeActionRuntime<
 					context.startInput.turnID,
 					source,
 					slot,
-					generation,
 					request,
 				);
 			})

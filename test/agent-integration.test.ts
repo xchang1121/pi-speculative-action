@@ -909,16 +909,18 @@ describe("speculative action host", () => {
 		await coordinator.dispose();
 	}, 5_000);
 
-	it.each(["context", "model", "options", "empty"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
+	it.each(["context", "model", "options", "empty", "invalid", "rejected"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
 		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
+		const rejected = phase === "invalid" || phase === "rejected", warms = phase === "empty" || rejected;
 		const complete = vi.fn(async () => {
-			if (phase === "empty") { await entered.promise; return assistant([], "stop"); }
-			return drafterCall({ path: "notes.txt" });
+			if (warms) await entered.promise;
+			if (phase === "empty") return assistant([], "stop");
+			return drafterCall(phase === "invalid" ? {} : { path: "notes.txt" });
 		});
 		const tool = createReadTool(cwd);
 		const world = toolRuntimeWorld(), prepare = vi.fn(async (_input: { signal?: AbortSignal }) => {
-			if (phase === "empty") { entered.resolve(); await release.promise; }
+			if (warms && prepare.mock.calls.length === 1) { entered.resolve(); await release.promise; }
 		});
 		const getDraftOptions = vi.fn(async () => {
 			if (phase === "options") { entered.resolve(); await release.promise; }
@@ -934,8 +936,8 @@ describe("speculative action host", () => {
 			getDraftOptions,
 			complete,
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
-			preflight: () => true,
-			onEvent: (event) => { if (event.type === "source_request") settled.resolve(); },
+			preflight: () => phase !== "rejected",
+			onEvent: (event) => { if (event.type === (rejected ? "prediction" : "source_request")) settled.resolve(); },
 		});
 		let closing: Promise<void> | undefined, closed = false;
 		try {
@@ -946,20 +948,20 @@ describe("speculative action host", () => {
 			if (phase === "context") await settled.promise;
 			else {
 				await entered.promise;
-				if (phase === "empty") {
-					await settled.promise;
-					expect(prepare.mock.calls[0]![0].signal?.aborted, "empty results retire preparation before Actor arrival").toBe(true);
+				if (warms) {
+					await settled.promise; await nextTurn();
+					expect(prepare.mock.calls[0]![0].signal?.aborted, "unusable results retire preparation before Actor arrival").toBe(true);
 				}
 				closing = host.dispose().then(() => { closed = true; });
 				await nextTurn();
 				expect(closed).toBe(false);
 				release.resolve(); await closing;
 			}
-			expect(complete).toHaveBeenCalledTimes(phase === "empty" ? 1 : 0);
-			expect(prepare).toHaveBeenCalledTimes(phase === "empty" ? 1 : 0);
+			expect(complete).toHaveBeenCalledTimes(warms ? 1 : 0);
+			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 2 : warms ? 1 : 0);
 			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" ? 0 : 1);
 		} finally { release.resolve(); await closing; await host.dispose(); }
-		if (phase === "context" || phase === "empty") return;
+		if (phase === "context" || warms) return;
 
 		const sharing = deferred(), resume = deferred(), owners = [new AbortController(), new AbortController()];
 		const waitStage = async (stage: string) => { if (stage === phase) { sharing.resolve(); await resume.promise; } };

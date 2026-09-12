@@ -688,7 +688,7 @@ describe("structural speculative runtime", () => {
 	it("races proposals only after one valid binding and ignores cancelled materialization", async () => {
 		for (const mode of ["empty", "invalid", "throw", "late"] as const) {
 			const entered = barrier(3), first = barrier(), winner = barrier(), binding = barrier();
-			const ready = candidateSucceeded(), aborted: number[] = [], materialized: string[] = [];
+			const ready = candidateSucceeded(), aborted: number[] = [], materialized: string[] = [], abortReasons: string[] = [];
 			const key = vi.fn(async (tool: string, args: unknown) => {
 				if ((args as { path: string }).path === "first.ts") {
 					if (mode === "late") await binding.promise;
@@ -702,7 +702,7 @@ describe("structural speculative runtime", () => {
 					id: "source", enabled: () => true, proposalCount: () => 3,
 					concurrentProposalPolicy: () => "first_produced",
 					propose: async ({ proposalIndex, signal }) => {
-						signal.addEventListener("abort", () => aborted.push(proposalIndex), { once: true });
+						signal.addEventListener("abort", () => { aborted.push(proposalIndex); abortReasons[proposalIndex] = signal.reason.code; }, { once: true });
 						entered.arrive();
 						await entered.promise;
 						if (proposalIndex === 0) return mode === "empty" ? undefined : plan("source", "first", { path: "first.ts" });
@@ -722,8 +722,9 @@ describe("structural speculative runtime", () => {
 			});
 			try {
 				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
-				await first.promise;
-				expect(aborted, mode).toEqual([]);
+				await first.promise; await nextTurn();
+				expect(aborted, mode).toEqual(mode === "late" ? [] : [0]);
+				if (mode !== "late") expect(abortReasons[0]).toBe("source_slot_unused");
 				winner.arrive();
 				await ready.promise;
 				expect(aborted, mode).toContain(2);
