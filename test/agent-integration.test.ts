@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
 import { createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
@@ -167,6 +167,35 @@ describe("speculative action host", () => {
 				binding.resolve();
 				for (const gate of gates) gate.done.resolve();
 				await Promise.allSettled(results); await host.dispose();
+			}
+		}
+	});
+
+	it("keeps explicit Drafter reasoning through continuations without inheriting Actor reasoning or token limits", async () => {
+		const tool = createReadTool(await temporaryWorkspace());
+		for (const requested of [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+			for (const supported of [true, false]) {
+				const options: SimpleStreamOptions = Object.freeze({ reasoning: requested === "off" ? undefined : requested ?? "high", maxTokens: 1 });
+				const received: SimpleStreamOptions[] = [];
+				const controller = createDrafterPlanSource({ sessionID: "session",
+					draftModel: { ...model("draft"), reasoning: supported, thinkingLevelMap: { xhigh: "high", max: "max" } },
+					...(requested === undefined ? {} : { getDraftOptions: () => options }),
+					complete: async (_model, _context, request) => { received.push(request!); return drafterCall({ path: "notes.txt" }); },
+				});
+				const request = { startInput: { ...startInput(tool), sessionID: "session", actorOptions: options },
+					data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+					settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterMaxTokens: 128 } },
+					definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
+				try {
+					const proposal = await controller.source.propose(request);
+					if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
+					await controller.source.continue!({ ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
+						tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
+						feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" });
+					const reasoning: ThinkingLevel | undefined = supported && requested !== "off" ? requested : undefined;
+					expect(received).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
+					expect(options.maxTokens).toBe(1);
+				} finally { controller.finishSession(); }
 			}
 		}
 	});

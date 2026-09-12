@@ -129,10 +129,13 @@ export function createDrafterPlanSource(input: {
 								})
 							: startInput.actorOptions;
 					}
+					// Inherit transport options, while the Drafter owns its reasoning and output budget.
+					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
+					const reasoning = clampThinkingLevel(model, input.getDraftOptions ? requestedReasoning ?? "off" : "off");
 					return {
 						model,
 						context: startInput.context,
-						options: configuredDraftOptions ?? {},
+						options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning },
 						utility,
 					};
 				})();
@@ -141,14 +144,12 @@ export function createDrafterPlanSource(input: {
 			const prepared = await batch;
 			if (!prepared.utility.allowed || signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
-			const reasoning = clampThinkingLevel(prepared.model, "off");
-			const { maxTokens: _actorMaxTokens, ...requestOptions } = prepared.options;
-			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "required" } = {
-				...requestOptions,
+			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
+				...prepared.options,
 				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
 				...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
-				toolChoice: "required",
-				reasoning: reasoning === "off" ? undefined : reasoning,
+				// Thinking providers can reject forced tool calls; preserve their normal tool decision.
+				toolChoice: prepared.options.reasoning ? "auto" : "required",
 				deferred: false,
 				sessionId: prepared.options.sessionId ?? input.sessionID,
 				cacheRetention: prepared.options.cacheRetention ?? "short",
