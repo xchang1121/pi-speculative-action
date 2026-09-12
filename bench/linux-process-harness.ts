@@ -99,7 +99,7 @@ export async function createLinuxProcessBenchmark(
 		backend,
 		world,
 		workspaceSandbox,
-		tool,
+		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
 		dispose: async () => {
 			if (disposed) return;
 			disposed = true;
