@@ -962,7 +962,7 @@ describe("speculative action host", () => {
 			expect(complete).toHaveBeenCalledTimes(warms ? 1 : 0);
 			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 2 : warms ? 1 : 0);
 			expect(draftModel).toHaveBeenCalledTimes(phase === "tools" ? 0 : 1);
-			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" || phase === "tools" ? 0 : 1);
+			expect(getDraftOptions).toHaveBeenCalledTimes(["model", "tools", "context"].includes(phase) ? 0 : 1);
 		} finally { release.resolve(); await closing; await host.dispose(); }
 		if (phase === "context" || phase === "tools" || warms) return;
 
