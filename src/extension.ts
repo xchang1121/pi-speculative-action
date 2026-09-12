@@ -182,40 +182,7 @@ type ExecutionRoutesSnapshot = {
 export type SpeculativeSettingsStore = Pick<SpeculativeActionSettingsStore,
 	"scope" | "load" | "effective" | "editable" | "setEffective" | "clear" | "setScope" | "flush">;
 
-interface SpeculativeActionController {
-	readonly settings: () => EffectiveSpeculativeActionSettings;
-	readonly editableSettings: () => EffectiveSpeculativeActionSettings;
-	readonly settingsScope: () => SpeculativeSettingsScope;
-	readonly setSettingsScope: (scope: SpeculativeSettingsScope) => void;
-	readonly metrics: () => SpeculativeActionMetrics;
-	readonly registeredTools: () => ReadonlySet<string>;
-	readonly toolCapabilities: () => ReadonlyMap<string, ToolCapabilityRow>;
-	readonly toolConflicts: () => ReadonlyMap<string, string>;
-	readonly recentEvents: () => readonly string[];
-	readonly refreshExecutionDiagnostics: (refresh?: boolean) => Promise<void>;
-	readonly executionRoutes: () => ExecutionRoutesSnapshot;
-	readonly maintainExecutionStorage: (operation: "gc" | "clear") => Promise<{ text: string; failed: boolean }>;
-	readonly setSettings: (settings: SpeculativeActionPackageSettings | undefined) => Promise<void>;
-	readonly attachUI: (ui: ExtensionUIContext) => void;
-	readonly detachUI: () => void;
-	readonly startTurn: (messages: AgentMessage[], context: ExtensionContext) => Promise<void>;
-	readonly previewActorTool: (tool: string, signal?: AbortSignal) => void;
-	readonly previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => void;
-	readonly decorateActorPayload: (payload: unknown) => unknown;
-	readonly observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) => void;
-	readonly selfSpeculationSnapshot: () => SelfSpeculationCoordinatorSnapshot;
-	readonly finishTurn: (terminal?: boolean) => Promise<void>;
-	readonly execute: (
-		tool: string,
-		callID: string,
-		input: unknown,
-		signal: AbortSignal | undefined,
-		onUpdate: AgentToolUpdateCallback<unknown> | undefined,
-		context: ExtensionContext,
-	) => Promise<AgentToolResult<unknown>>;
-	readonly statusText: () => string;
-	readonly dispose: () => Promise<void>;
-}
+type SpeculativeActionController = Readonly<Awaited<ReturnType<typeof installController>>>;
 
 export interface SpeculativeActionExtensionDependencies {
 	readonly createExecutionWorlds?: (
@@ -358,7 +325,7 @@ async function installController(
 	dependencies: SpeculativeActionExtensionDependencies,
 	wrapperSources: Map<string, string>,
 	providerRequest: AsyncLocalStorage<"drafter">,
-): Promise<SpeculativeActionController> {
+) {
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
 	let currentTurnID: string | undefined;
@@ -565,19 +532,19 @@ async function installController(
 		renderFooter();
 	};
 
-	const controller: SpeculativeActionController = {
+	const controller = {
 		settings,
 		editableSettings: () => normalizeSpeculativeActionSettings(settingsStore.editable()),
 		settingsScope: () => settingsStore.scope,
-		setSettingsScope: (scope) => settingsStore.setScope(scope),
+		setSettingsScope: (scope: SpeculativeSettingsScope) => settingsStore.setScope(scope),
 		metrics: visibleMetrics,
-		registeredTools: () => new Set(baseDefinitions.keys()),
+		registeredTools: (): ReadonlySet<string> => new Set(baseDefinitions.keys()),
 		toolCapabilities,
-		toolConflicts: () => new Map(toolConflicts),
-		recentEvents: () => [...recentEvents],
+		toolConflicts: (): ReadonlyMap<string, string> => new Map(toolConflicts),
+		recentEvents: (): readonly string[] => [...recentEvents],
 		refreshExecutionDiagnostics,
 		executionRoutes,
-		maintainExecutionStorage: async (operation) => {
+		maintainExecutionStorage: async (operation: "gc" | "clear") => {
 			const controls = executionWorlds.flatMap((world) => (world.storage ? [world.storage] : []));
 			if (!controls.length) return { text: "No execution world exposes persistent storage.", failed: true };
 			let entries = 0, artifacts = 0, bytes = 0, failed = 0;
@@ -594,7 +561,7 @@ async function installController(
 			await recoverSpeculation(() => refreshExecutionDiagnostics(true));
 			return { text: `Reusable command history ${operation === "gc" ? "reclaimed" : "cleared"}: ${entries} entries, ${artifacts} artifacts, ${formatBytes(bytes)}${failed ? `; ${failed} execution worlds failed` : ""}.`, failed: failed > 0 };
 		},
-		setSettings: async (value) => {
+		setSettings: async (value: SpeculativeActionPackageSettings | undefined) => {
 			const previous = currentSettings;
 			if (value)
 				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
@@ -609,7 +576,7 @@ async function installController(
 				previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
 			));
 		},
-		attachUI: (nextUI) => {
+		attachUI: (nextUI: ExtensionUIContext) => {
 			ui = nextUI;
 			renderFooter();
 		},
@@ -617,7 +584,7 @@ async function installController(
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
 		},
-		startTurn: async (messages, nextContext) => {
+		startTurn: async (messages: AgentMessage[], nextContext: ExtensionContext) => {
 			latestContext = nextContext;
 			const model = nextContext.model;
 			if (!model) return;
@@ -648,20 +615,20 @@ async function installController(
 				// Speculation is optional; the actor request remains authoritative.
 			}
 		},
-		previewActorCall: (tool, callID, input, signal) => {
+		previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
 			if (!turnID || !baseDefinitions.has(tool)) return;
 			void recoverSpeculation(() =>
 				host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
 			);
 		},
-		previewActorTool: (tool, signal) => {
+		previewActorTool: (tool: string, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
 			if (!turnID || !baseDefinitions.has(tool)) return;
 			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
 		},
-		decorateActorPayload: (payload) => selfSpeculation.decorateActorPayload(payload),
-		observeActorOutput: (event) => selfSpeculation.observeActorOutput(event),
+		decorateActorPayload: (payload: unknown) => selfSpeculation.decorateActorPayload(payload),
+		observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) => selfSpeculation.observeActorOutput(event),
 		selfSpeculationSnapshot: () => selfSpeculation.snapshot(),
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);
@@ -675,7 +642,8 @@ async function installController(
 			else selfSpeculation.endTurn();
 			if (terminal) lastTurnID = undefined;
 		},
-		execute: async (tool, callID, input, signal, onUpdate, nextContext) => {
+		execute: async (tool: string, callID: string, input: unknown, signal: AbortSignal | undefined,
+			onUpdate: AgentToolUpdateCallback<unknown> | undefined, nextContext: ExtensionContext): Promise<AgentToolResult<unknown>> => {
 			latestContext = nextContext;
 			const definition = baseDefinitions.get(tool);
 			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
@@ -714,7 +682,7 @@ async function installController(
 				}
 			}
 		},
-	};
+	} as const;
 	for (const definition of baseDefinitions.values())
 		pi.registerTool(speculativeToolDefinition(definition, controller));
 	const registeredTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));

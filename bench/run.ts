@@ -42,42 +42,14 @@ interface DatasetRow {
 	readonly PASS_TO_PASS: readonly string[];
 }
 
-interface PreparedTask {
-	readonly row: DatasetRow;
-	readonly runDirectory: string;
-	readonly workspace: string;
-}
+type PreparedTask = Readonly<Awaited<ReturnType<typeof prepareTask>>>;
 
 interface ToolCounters {
 	readonly executions: Record<string, number>;
 	readonly serviceMs: Record<string, number>;
 }
 
-interface BenchmarkOptions {
-	readonly instance: string;
-	readonly label: string;
-	readonly actor: Model<Api>;
-	readonly actorMaxTokens: number;
-	readonly actorTemperature: number;
-	readonly drafter: Model<Api>;
-	readonly drafterMaxDepth: number;
-	readonly candidateLimit: number;
-	readonly drafterMaxTokens?: number;
-	readonly drafterDeterministicCandidates: number;
-	readonly drafterTemperatureMin: number;
-	readonly drafterTemperatureMax: number;
-	readonly maxConcurrentActions: number;
-	readonly maxTurns: number;
-	readonly timeoutMs: number;
-	readonly repoCache: string;
-	readonly runRoot: string;
-	readonly output?: string;
-	readonly patternState?: string;
-	readonly drafterEnabled: boolean;
-	readonly speculationEnabled: boolean;
-	readonly patternAware: boolean;
-	readonly prepareOnly: boolean;
-}
+type BenchmarkOptions = Readonly<typeof options>;
 
 interface CommandResult {
 	readonly stdout: string;
@@ -119,7 +91,7 @@ const { values } = parseArgs({
 const instance = required(values.instance, "--instance");
 const repoCache = path.resolve(values["repo-cache"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-cache"));
 const runRoot = path.resolve(values["run-root"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-runs"));
-const options: BenchmarkOptions = {
+const options = {
 	instance,
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
@@ -148,7 +120,7 @@ const options: BenchmarkOptions = {
 	speculationEnabled: !values["speculation-disabled"],
 	patternAware: values["pattern-aware"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
-};
+} as const;
 if (options.drafterTemperatureMin > options.drafterTemperatureMax) {
 	throw new Error("--drafter-temperature-min must not exceed --drafter-temperature-max");
 }
@@ -169,7 +141,7 @@ if (options.prepareOnly) {
 	process.stdout.write(`${JSON.stringify({ output, ...result.summary }, null, 2)}\n`);
 }
 
-async function prepareTask(input: BenchmarkOptions): Promise<PreparedTask> {
+async function prepareTask(input: BenchmarkOptions) {
 	const row = await datasetRow(input.instance);
 	await Promise.all([mkdir(input.repoCache, { recursive: true }), mkdir(input.runRoot, { recursive: true })]);
 	const cache = path.join(input.repoCache, `${safeName(row.repo)}.git`);
