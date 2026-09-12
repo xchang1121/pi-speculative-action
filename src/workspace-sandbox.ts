@@ -168,8 +168,7 @@ interface PooledGitRepository {
 	readonly git: ReturnType<typeof bindGit>;
 	readonly index: ReturnType<typeof bindGit>;
 	readonly versions: ResourceVersionManager;
-	commit?: string;
-	version?: ResourceVersionToken;
+	baseline?: { readonly commit: string; readonly tree: string; readonly version: ResourceVersionToken };
 	active: number;
 	readonly idleWaiters: Set<() => void>;
 	lock: Promise<void>;
@@ -1326,29 +1325,29 @@ async function acquireSandboxBaseline(
 ): Promise<string> {
 	return withRepositoryLock(repository, async () => {
 		throwIfAborted(signal);
-		if (repository.commit && repository.version) {
+		const baseline = repository.baseline;
+		if (baseline) {
 			const [current, indexed] = await Promise.all([
-				repository.versions.validate(repository.version),
+				repository.versions.validate(baseline.version),
 				sandboxIndexChanges(repository),
 			]);
-			if (!current.expired && indexed.length === 0) return repository.commit;
+			if (!current.expired && indexed.length === 0) return baseline.commit;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			throwIfAborted(signal);
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
-			let retained = false;
 			try {
 				throwIfAborted(signal);
-				const changes = repository.version ? repository.versions.changesSince(repository.version) : undefined;
-				const indexed = repository.commit ? await sandboxIndexChanges(repository) : [];
+				const changes = baseline ? repository.versions.changesSince(baseline.version) : undefined;
+				const indexed = baseline ? await sandboxIndexChanges(repository) : [];
 				const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
 				const changedPathspecs =
-					repository.commit && changes && !changes.uncertain
+					changes && !changes.uncertain
 						? incrementalPathspecs(repository.sourceRoot, changedPaths)
 						: undefined;
-				if (repository.commit && changedPathspecs) {
+				if (baseline && changedPathspecs) {
 					// Preserve matching entries' stat data without touching the source workspace.
-					await repository.index(["read-tree", "-m", "-i", repository.commit]);
+					await repository.index(["read-tree", "-m", "-i", baseline.commit]);
 					if (changedPathspecs.length) {
 						await stageSandboxPaths(repository, changedPathspecs);
 					}
@@ -1358,28 +1357,18 @@ async function acquireSandboxBaseline(
 				}
 				throwIfAborted(signal);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
-				if (repository.commit) {
-					const previousTree = (await repository.git(["show", "-s", "--format=%T", repository.commit])).toString("utf8").trim();
-					if (tree === previousTree) {
-						if ((await repository.versions.validate(version)).expired) continue;
-						replaceSandboxVersion(repository, version);
-						retained = true;
-						return repository.commit;
-					}
-				}
-				const commit = (await repository.git(
-					["commit-tree", tree, ...(repository.commit ? ["-p", repository.commit] : []), "-m", "speculative baseline"],
+				const commit = tree === baseline?.tree ? baseline.commit : (await repository.git(
+					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
 					{ environment: authorEnvironment },
 				)).toString("utf8").trim();
 				if ((await repository.versions.validate(version)).expired) continue;
 				throwIfAborted(signal);
-				await repository.git(["update-ref", "refs/heads/baseline", commit]);
-				repository.commit = commit;
-				replaceSandboxVersion(repository, version);
-				retained = true;
+				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
+				repository.baseline = { commit, tree, version };
+				baseline?.version.release();
 				return commit;
 			} finally {
-				if (!retained) version.release();
+				if (repository.baseline?.version !== version) version.release();
 			}
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
@@ -1609,8 +1598,8 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 				const workspace = await prepared.catch(() => undefined);
 				if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
 			}
-			repository.version?.release();
-			repository.version = undefined;
+			repository.baseline?.version.release();
+			repository.baseline = undefined;
 			repository.versions.close();
 			await rm(repository.parent, { recursive: true, force: true }).catch(() => undefined);
 		})();
@@ -1630,8 +1619,8 @@ function quarantineSandboxRepository(repository: PooledGitRepository): void {
 		clearTimeout(repository.idleTimer);
 		repository.idleTimer = undefined;
 	}
-	repository.version?.release();
-	repository.version = undefined;
+	repository.baseline?.version.release();
+	repository.baseline = undefined;
 	repository.versions.close();
 	releaseSandboxRepository(repository);
 }
@@ -1671,8 +1660,8 @@ async function closeWorkspaceSandboxPoolsNow(
 			const workspace = await prepared.catch(() => undefined);
 			if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
 		}
-		repository.version?.release();
-		repository.version = undefined;
+		repository.baseline?.version.release();
+		repository.baseline = undefined;
 		repository.versions.close();
 		await rm(repository.parent, { recursive: true, force: true });
 	}
@@ -1684,12 +1673,6 @@ async function waitForSandboxRepositoryIdle(repository: PooledGitRepository): Pr
 		repository.idleWaiters.add(resolve);
 		if (repository.active === 0 && repository.idleWaiters.delete(resolve)) resolve();
 	});
-}
-
-function replaceSandboxVersion(repository: PooledGitRepository, next: ResourceVersionToken): void {
-	const previous = repository.version;
-	repository.version = next;
-	if (previous !== next) previous?.release();
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

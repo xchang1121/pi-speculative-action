@@ -636,7 +636,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		await writeFile(path.join(root, "steady.txt"), "stable\n");
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		try {
-			for (const baseline of ["base\n", "changed\n"]) {
+			for (const baseline of ["base\n", "changed\n", "changed\n"]) {
 				await writeFile(path.join(root, "value.txt"), baseline);
 				await sandbox.prepare(root, { driver: "git" });
 				const count = captures.mock.calls.length;
