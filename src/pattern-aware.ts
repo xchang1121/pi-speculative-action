@@ -396,25 +396,16 @@ export class PatternAwareStore {
 	}
 
 	observe(input: PatternAwareEventInput) {
-		this.observeEvents([input]);
+		if (this.settings.enabled) this.observeEvents(structuredClone([input]));
 	}
 
 	observeBatch(inputs: ReadonlyArray<PatternAwareEventInput>) {
-		const first = inputs[0];
-		if (!first) return;
-		if (inputs.some((input) => input.sessionID !== first.sessionID || input.turnID !== first.turnID)) {
-			throw new Error("PatternAware batch actions must belong to one provider turn");
-		}
-		const ordered = inputs
-			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
-			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
-			.map((item) => item.input);
-		this.observeEvents(ordered, first.turnID);
+		const batch = ownBatch(inputs);
+		this.observeEvents(batch, batch[0]?.turnID);
 	}
 
 	private observeEvents(inputs: ReadonlyArray<PatternAwareEventInput>, batchID?: string) {
 		if (!this.settings.enabled) return;
-		inputs = structuredClone(inputs);
 		const first = inputs[0];
 		if (!first) return;
 		const events = inputs.map(
@@ -428,16 +419,16 @@ export class PatternAwareStore {
 		if (evicted) this.finishSessionState(evicted);
 		const history = session.history;
 		this.resolvePendingBatch(session, events);
-		const prior = history;
+		let contextTokens: string[] | undefined;
 		for (const event of events) {
 			if (event.learnTarget !== false) {
 				this.sequenceModel.observe(
-					prior.map((item) => signatureToken(signature(item))),
+					contextTokens ??= history.map((item) => signatureToken(signature(item))),
 					event.tool,
 					event.sequence,
 					this.settings.decayHalfLifeEvents,
 				);
-				this.learn(prior, event);
+				this.learn(history, event);
 				this.observeRecurrentAction(session, event);
 			}
 		}
@@ -505,18 +496,7 @@ export class PatternAwareStore {
 		predictionSettings: PatternAwareSettings = this.settings,
 	) {
 		if (!predictionSettings.enabled || !inputs.length) return [];
-		inputs = structuredClone(inputs);
-		if (inputs.some((input) => input.sessionID !== sessionID)) {
-			throw new Error("PatternAware hypothetical actions must belong to the active session");
-		}
-		const turnID = inputs[0]!.turnID;
-		if (inputs.some((input) => input.turnID !== turnID)) {
-			throw new Error("PatternAware hypothetical actions must belong to one provider turn");
-		}
-		const ordered = inputs
-			.map((input, index) => ({ input, index, key: canonicalBatchActionKey(input) }))
-			.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
-			.map((item) => item.input);
+		const ordered = ownBatch(inputs, sessionID), turnID = ordered[0]!.turnID;
 		const history = [...(this.sessions.get(sessionID)?.history ?? [])];
 		const sequence = history.at(-1)?.sequence ?? this.clock;
 		history.push(
@@ -2410,13 +2390,19 @@ function weightedGaps(pattern: MutablePattern, settings: PatternAwareSettings, c
 		.sort(([left], [right]) => left - right);
 }
 
-function canonicalBatchActionKey(input: PatternAwareEventInput) {
-	return stableStringify({
-		tool: input.tool,
-		outcome: input.outcome,
-		...(input.operation ? { operation: input.operation } : {}),
-		input: input.input,
-	});
+function ownBatch(inputs: ReadonlyArray<PatternAwareEventInput>, sessionID?: string) {
+	inputs = structuredClone(inputs);
+	sessionID ??= inputs[0]?.sessionID;
+	if (inputs.some((input) => input.sessionID !== sessionID || input.turnID !== inputs[0]!.turnID)) {
+		throw new Error("PatternAware batch actions must belong to one session and provider turn");
+	}
+	return inputs
+		.map((input, index) => ({ input, index, key: stableStringify({
+			tool: input.tool, outcome: input.outcome,
+			...(input.operation ? { operation: input.operation } : {}), input: input.input,
+		}) }))
+		.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+		.map((item) => item.input);
 }
 
 function persistedEventIdentity(event: PatternAwareEvent) {

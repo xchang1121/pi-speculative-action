@@ -36,15 +36,18 @@ async function run(module, events) {
   let observeMs = 0, predictMs = 0, predictions = 0;
   const started = performance.now();
   for (const event of events) {
-    let phase = performance.now(); store.observe(event); observeMs += performance.now() - phase;
-    phase = performance.now(); const frontier = store.predict(event.sessionID); predictMs += performance.now() - phase;
+    const batch = [event].flat();
+    let phase = performance.now();
+    if (Array.isArray(event)) store.observeBatch(event); else store.observe(event);
+    observeMs += performance.now() - phase;
+    phase = performance.now(); const frontier = store.predict(batch[0].sessionID); predictMs += performance.now() - phase;
     predictions += frontier.length; traces.push(frontier);
   }
   const state = store.snapshot();
-  for (const sessionID of new Set(events.map(event => event.sessionID))) store.finishSession(sessionID);
+  for (const sessionID of new Set(events.flat().map(event => event.sessionID))) store.finishSession(sessionID);
   await store.flush();
   return { evidence: { traces, state }, elapsedMs: performance.now() - started, observeMs, predictMs,
-    events: events.length, patterns: state.length, predictions };
+    events: events.flat().length, batches: events.length, patterns: state.length, predictions };
 }
 const fixtures = traceFile ? { recorded: JSON.parse(fs.readFileSync(traceFile, 'utf8')) } : Object.fromEntries([0, 96, 512].map(width => [width, fixture(width)]));
 const rows = [], evidence = [];

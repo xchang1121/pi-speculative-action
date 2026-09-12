@@ -189,10 +189,14 @@ describe("PatternAware", () => {
 			store.finishSession(sessionID);
 		}
 
-		store.observeBatch([...scanBatch("probe", "src/c.ts")].reverse());
+		const batch = scanBatch("probe", "src/c.ts").reverse();
+		const preview = store.predictAfterBatch("probe", batch).find((item) => item.tool === "read");
+		store.observeBatch(batch);
+		for (const input of batch) (input.outputPaths as string[])?.splice(0);
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 
 		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
+		expect(preview?.input).toEqual(candidate?.input);
 		expect(candidate?.dependencies).toContainEqual(
 			expect.objectContaining({
 				targetPath: ["filePath"],

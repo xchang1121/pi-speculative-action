@@ -6,6 +6,7 @@
 
 ### 动作身份与预测
 
+- refactor: PatternAware 的观察与假设批次共用自有输入、批次校验和稳定排序，同批学习只生成一次历史 token；历史基准支持显式批次，并保持扁平事件的原有顺序语义。
 - fix: Drafter 保留同一响应的完整工具批次；结果在占用 continuation 额度前收集，全部成功执行后按原顺序续推一次，后继依赖整批父动作。重复回调不重复请求，混入未启用工具或重复调用 ID 的批次不发布；模型基准按整批计调用、按请求计 usage。
 - perf: PatternAware 在同一后缀节点共用历史和输出形状，匹配直接返回所属模式；学习和裁剪使用连续批次起点，省去逐事件索引、重复展开和过滤。PPM 上下文仅在需要估计时构造，模式顺序、输出形状通配和批次因果边界保持一致。
 - fix: Drafter 在批次边界独立确定 thinking effort 和输出预算；尊重 `getDraftOptions` 的显式 effort，续轮沿用。thinking 请求使用 `tool_choice: auto`，避免 DeepSeek 拒绝强制工具调用；默认仍不继承 Actor 的思考强度或 token 上限。
