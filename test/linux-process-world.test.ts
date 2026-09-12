@@ -24,6 +24,7 @@ import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import {
 	createLinuxProcessBenchmark,
+	executeReusableBash,
 	forkReusableBash,
 	prepareLinuxProcessReuse,
 } from "../bench/linux-process-harness.ts";
@@ -378,6 +379,21 @@ describe("Linux process ExecutionWorld", () => {
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				expect(branch.commitMetrics).toBeDefined();
 				expect(ownership.claimChild()).toBe(false);
+				const entered = deferred(), released = deferred();
+				const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+				const execute = vi.spyOn(world.speculation, "execute").mockResolvedValue(branch);
+				const dispose = vi.spyOn(branch, "dispose").mockImplementation(() => { entered.resolve(); return released.promise; });
+				let delivered = false;
+				const measured = executeReusableBash({ backend, world, workspace: root, environment: {}, shellPath: invocation.process!.shell,
+					tool: createBashTool(root) }, { label: "cleanup", command: "opaque", actionNamespace: "", executionFingerprint: "fake-process" })
+					.then(result => { delivered = true; return result; });
+				try {
+					await Promise.race([entered.promise, measured]); await nextTurn(); expect(delivered).toBe(false);
+					clock.mockReturnValue(100); released.resolve();
+					expect((await measured).measurement.totalMs).toBe(100);
+				} finally {
+					released.resolve(); await measured.catch(() => undefined); clock.mockRestore(); execute.mockRestore(); dispose.mockRestore();
+				}
 			}
 			finally { await branch.dispose(); }
 			expect(close).toHaveBeenCalledOnce();

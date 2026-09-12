@@ -3,6 +3,7 @@ import path from "node:path";
 import {
 	argument,
 	assert,
+	benchmarkWriteAllC,
 	commitBenchmarkFixture,
 	compileBenchmarkHelper,
 	createLinuxProcessBenchmark,
@@ -14,11 +15,10 @@ import {
 	median,
 	numericMetrics,
 	prepareLinuxProcessReuse,
-	subtractMetrics,
-	type NumericMetrics,
 	workspaceDriverArgument,
 	writeBenchmarkReport,
 } from "./linux-process-harness.ts";
+import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 
 const INPUT_BYTES = 32 * 1024 * 1024;
 const MEASURED_RUNS = 3;
@@ -30,14 +30,7 @@ const HELPER_SOURCE = String.raw`
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int write_all(int fd, const unsigned char *data, size_t length) {
-  while (length > 0) {
-    ssize_t written = write(fd, data, length);
-    if (written < 0) { if (errno == EINTR) continue; return -1; }
-    data += written; length -= (size_t)written;
-  }
-  return 0;
-}
+${benchmarkWriteAllC("unsigned char")}
 
 static int make_parents(const char *target) {
   char buffer[4096];
@@ -78,16 +71,6 @@ int main(int argc, char **argv) {
 }
 `;
 
-interface MeasuredRun {
-	readonly label: string;
-	readonly totalMs: number;
-	readonly forkMs: number;
-	readonly validationMs: number;
-	readonly commitMs: number;
-	readonly resources: readonly string[];
-	readonly metricDelta: NumericMetrics;
-}
-
 const mode = argument("--mode") ?? "reuse";
 if (mode !== "reuse" && mode !== "direct") throw new Error("--mode must be reuse or direct");
 const transformRounds = integerArgument("--rounds", 96, 0, 4_096);
@@ -117,7 +100,7 @@ try {
 	}
 	const expectedDigest = await fileDigest(artifact);
 
-	const runs: MeasuredRun[] = [];
+	const runs: Awaited<ReturnType<typeof runTask>>[] = [];
 	for (let index = 0; index < MEASURED_RUNS; index++) {
 		await rm(outputDirectory, { recursive: true, force: true });
 		const run = await runTask(
@@ -161,7 +144,7 @@ try {
 	};
 	await writeBenchmarkReport(result, outputPath);
 
-	async function runTask(label: string, command: string): Promise<MeasuredRun> {
+	async function runTask(label: string, command: string) {
 		if (!reusePreparation) {
 			const execution = await executeDirectBash(fixture, { label, command });
 			return {
@@ -171,7 +154,7 @@ try {
 				validationMs: 0,
 				commitMs: 0,
 				resources: [],
-				metricDelta: {},
+				metricDelta: emptyWorldReuseMetrics(),
 			};
 		}
 		const execution = await executeReusableBash(fixture, {
@@ -180,18 +163,7 @@ try {
 			actionNamespace: "pi-topology-reuse-benchmark.v1",
 			executionFingerprint: reusePreparation.executionFingerprint,
 		});
-		return {
-			label,
-			totalMs: execution.totalMs,
-			forkMs: execution.forkMs,
-			validationMs: execution.validationMs,
-			commitMs: execution.commitMs,
-			resources: execution.resources,
-			metricDelta: subtractMetrics(
-				numericMetrics(execution.metricsBefore),
-				numericMetrics(execution.metricsAfter),
-			),
-		};
+		return { label, ...execution.measurement, resources: execution.resources };
 	}
 } finally {
 	await fixture.dispose();

@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
-import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
 	LinuxProcessReuseBackend,
@@ -19,6 +18,16 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 
 export type NumericMetrics = Readonly<Record<string, number>>;
+export function benchmarkWriteAllC(type: "char" | "unsigned char" = "char"): string {
+	return String.raw`static int write_all(int fd, const ${type} *data, size_t length) {
+  while (length > 0) {
+    ssize_t written = write(fd, data, length);
+    if (written < 0) { if (errno == EINTR) continue; return -1; }
+    data += written; length -= (size_t)written;
+  }
+  return 0;
+}`;
+}
 const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
 	readonly state: "ready";
@@ -26,31 +35,19 @@ type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
 	readonly straceBinary: string;
 };
 
-export interface LinuxProcessBenchmark {
-	readonly root: string;
-	readonly workspace: string;
-	readonly storeRoot: string;
-	readonly shellPath: string;
-	readonly environment: Readonly<Record<string, string>>;
-	readonly coordinator: ProcessExecutionCoordinator;
-	readonly backend: LinuxProcessReuseBackend;
-	readonly workspaceSandbox: WorkspaceSandboxService;
-	readonly world: SpeculativeAgentExecutionWorld;
-	readonly tool: AgentTool;
-	readonly dispose: () => Promise<void>;
-}
+export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
 
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
-): Promise<LinuxProcessBenchmark> {
+) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 	const root = await mkdtemp(path.join(os.tmpdir(), rootPrefix));
 	const workspace = path.join(root, "workspace");
 	const storeRoot = path.join(root, "process-reuse");
 	await mkdir(workspace);
 	const shellPath = "/bin/bash";
-	const environment = Object.freeze({
+	const environment: Readonly<Record<string, string>> = Object.freeze({
 		PATH: `${workspace}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
 		HOME: os.homedir(),
 		SHELL: shellPath,
@@ -84,7 +81,7 @@ export async function createLinuxProcessBenchmark(
 		storeRoot,
 		...(workspaceDriver ? { driver: workspaceDriver } : {}),
 	});
-	const tool = createBashTool(workspace, {
+	const tool: AgentTool = createBashTool(workspace, {
 		operations: coordinator.operations,
 		shellPath,
 		exposeSessionEnvironment: false,
@@ -144,15 +141,14 @@ export async function prepareLinuxProcessReuse(
 }
 
 export async function executeReusableBash(
-	fixture: LinuxProcessBenchmark,
+	fixture: Pick<LinuxProcessBenchmark, "backend" | "world" | "tool" | "workspace" | "environment" | "shellPath">,
 	input: ReusableBashInput,
 ) {
 	const metricsBefore = fixture.backend.metrics();
 	const started = performance.now();
-	const forkStarted = performance.now();
 	const branch = await forkReusableBash(fixture, input);
-	const forkMs = performance.now() - forkStarted;
-	try {
+	const forkMs = performance.now() - started;
+	const result = await (async () => {
 		if (branch.output.isError) throw new Error(textOutput(branch.output.result));
 		const validationStarted = performance.now();
 		const validation = await branch.validate?.();
@@ -162,18 +158,13 @@ export async function executeReusableBash(
 		const committed = await branch.commit();
 		const commitMs = performance.now() - commitStarted;
 		return {
-			forkMs,
-			validationMs,
-			commitMs,
-			totalMs: performance.now() - started,
+			measurement: { forkMs, validationMs, commitMs },
 			output: committed,
 			resources: Object.freeze([...branch.resources]),
-			metricsBefore,
-			metricsAfter: fixture.backend.metrics(),
 		};
-	} finally {
-		branch.dispose();
-	}
+	})().finally(() => branch.dispose());
+	return { ...result, measurement: { ...result.measurement, totalMs: performance.now() - started,
+		metricDelta: metricDelta(metricsBefore, fixture.backend.metrics()) } };
 }
 
 export interface ReusableBashInput {
@@ -184,7 +175,7 @@ export interface ReusableBashInput {
 	readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
 }
 
-export async function forkReusableBash(fixture: LinuxProcessBenchmark, input: ReusableBashInput) {
+export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "environment" | "shellPath">, input: ReusableBashInput) {
 	const args = { command: input.command };
 	const invocation = resolvePiToolInvocation("bash", args, {
 		cwd: fixture.workspace,
@@ -281,14 +272,10 @@ function commandOutput(executable: string, args: readonly string[], cwd?: string
 	});
 }
 
-export function fileDigest(target: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const hash = createHash("sha256");
-		const stream = createReadStream(target);
-		stream.on("data", (chunk) => hash.update(chunk));
-		stream.once("error", reject);
-		stream.once("end", () => resolve(hash.digest("hex")));
-	});
+export async function fileDigest(target: string): Promise<string> {
+	const hash = createHash("sha256");
+	for await (const chunk of createReadStream(target)) hash.update(chunk);
+	return hash.digest("hex");
 }
 
 export function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {
@@ -301,7 +288,7 @@ export function textOutput(result: { readonly content: readonly { readonly type:
 
 export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProcessReuseMetrics): LinuxProcessReuseMetrics {
 	return {
-		...subtractMetrics(numericMetrics(before), numericMetrics(after)),
+		...Object.fromEntries(Object.entries(numericMetrics(after)).map(([name, value]) => [name, value - (Reflect.get(before, name) ?? 0)])),
 		...(after.lastError !== before.lastError && after.lastError ? { lastError: after.lastError } : {}),
 	} as LinuxProcessReuseMetrics;
 }
@@ -310,10 +297,6 @@ export function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetric
 	return Object.fromEntries(
 		Object.entries(metrics).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
 	);
-}
-
-export function subtractMetrics(before: NumericMetrics, after: NumericMetrics): NumericMetrics {
-	return Object.fromEntries(Object.entries(after).map(([name, value]) => [name, value - (before[name] ?? 0)]));
 }
 
 export function median(values: readonly number[]): number {

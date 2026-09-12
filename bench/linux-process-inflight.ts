@@ -17,7 +17,6 @@ import {
 	writeBenchmarkReport,
 } from "./linux-process-harness.ts";
 
-if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const outputPath = argument("--output");
 const fixture = await createLinuxProcessBenchmark("pi-process-inflight-");
 const command = "printf 'pid:%s\\n' \"$$\"; /usr/bin/sleep 4; printf 'complete\\n'";
