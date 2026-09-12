@@ -282,11 +282,11 @@ describe("ThinkThread execution world", () => {
 	});
 
 	it("joins read validation and commit without losing direct freshness, retries, or cleanup ownership", async () => {
-		for (const mode of ["direct", "shared", "retry", "dispose", "direct-dispose"] as const) {
+		for (const mode of ["direct", "shared", "retry", "dispose", "direct-dispose", "direct-overlap"] as const) {
 			const fixture = fakeClient(), { world, cwd } = await startWorld(fixture);
 			const source = await world.speculation.execute(context("read", { path: "notes.txt" }, cwd, "read"));
 			const coordinator = new EffectTransactionCoordinator<typeof source.output>();
-			const branch = mode === "direct" || mode === "direct-dispose" ? source : await coordinator.execute(coordinator.begin({ tool: "read", route: {
+			const branch = mode.startsWith("direct") ? source : await coordinator.execute(coordinator.begin({ tool: "read", route: {
 				isolation: "runtime_sandbox", reuse: "shared_result", scope: "runtime", backend: world.id, fingerprint: "test",
 			} }), async () => source);
 			const verify = fixture.verify.getMockImplementation()!;
@@ -298,7 +298,18 @@ describe("ThinkThread execution world", () => {
 					await expect(branch.validate?.()).resolves.toMatchObject({ status: "stale" });
 					await expect(branch.commit()).rejects.toThrow("requires successful validation");
 				}
-				if (mode === "dispose" || mode === "direct-dispose") {
+				if (mode === "direct-overlap") {
+					await branch.commit();
+					const entered = deferred(), gate = deferred(); let changed = false;
+					fixture.verify.mockImplementation(async () => {
+						const result = { ...await verify(), status: changed ? "stale" as const : "matched" as const };
+						entered.resolve(); await gate.promise; return result;
+					});
+					const first = branch.validate!(); await entered.promise; changed = true;
+					const second = branch.validate!(); gate.resolve();
+					expect((await Promise.all([first, second])).map(proof => proof.status)).toEqual(["valid", "stale"]);
+					expect(fixture.verify).toHaveBeenCalledTimes(3);
+				} else if (mode === "dispose" || mode === "direct-dispose") {
 					const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: release } = deferred();
 					fixture.verify.mockImplementationOnce(async () => { enter(); await gate; return verify(); });
 					const validating = branch.validate!(); await entered;
@@ -430,7 +441,7 @@ async function verifySnapshotInputs() {
 					branch = await executing;
 					if (mode === "complete") {
 						const expected = { result: await createReadTool(cwd).execute("read", { path: relative }), isError: false };
-						const first = branch.validate!(), second = branch.validate!(); expect(first).toBe(second); await first;
+						const first = branch.validate!(), second = branch.validate!(); await Promise.all([first, second]);
 						await expect(branch.commit()).resolves.toEqual(expected);
 					} else expect(snapshotPread).not.toHaveBeenCalled();
 				}

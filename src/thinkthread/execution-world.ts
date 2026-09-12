@@ -322,7 +322,9 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 	};
 	const validate = (): Promise<ResourceValidation> => {
 		if (disposed) return Promise.reject(new Error("ThinkThread branch is disposed"));
-		return validating ??= validateOnce().finally(() => { validating = undefined; });
+		const pending = Promise.resolve(validating).then(validateOnce, validateOnce);
+		validating = pending;
+		return pending.finally(() => { if (validating === pending) validating = undefined; });
 	};
 	async function commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
 		const started = performance.now();

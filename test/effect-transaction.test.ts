@@ -54,6 +54,46 @@ describe("EffectTransactionCoordinator", () => {
 		}
 	});
 
+	it.each(["sealed", "reserved", "committed"] as const)("owns each validation window across %s adoption", async (phase) => {
+		for (const reuse of ["shared_result", "exclusive_branch"] as const) for (const changed of [false, true]) {
+			const entered = deferred(), gate = deferred();
+			let version = "A", hold = false;
+			const commit = vi.fn(async () => "sealed"), dispose = vi.fn();
+			const validate = vi.fn(async () => {
+				const captured = version;
+				if (hold) { hold = false; entered.resolve(); await gate.promise; }
+				return captured === "A" ? { status: "valid" as const, metrics: metrics() }
+					: { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: metrics() };
+			});
+			const coordinator = new EffectTransactionCoordinator<string>();
+			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse } }),
+				async () => branch({ validate, commit, dispose }));
+			if (phase === "committed") { await transaction.validate(); await transaction.commit(); }
+			hold = true;
+			const first = transaction.validate(); await entered.promise;
+			if (changed) version = "B";
+			const second = transaction.validate();
+			const adoption = phase === "reserved" ? Promise.allSettled([transaction.commit(), transaction.commit()]) : undefined;
+			const late = phase === "reserved" ? transaction.validate() : undefined;
+			gate.resolve();
+			try {
+				expect((await first).status).toBe("valid");
+				expect((await second).status).toBe(changed ? "stale" : "valid");
+				if (adoption) {
+					const [one, two] = await adoption;
+					expect(one).toEqual(two);
+					expect(one).toMatchObject(changed ? { status: "rejected", reason: { disposition: "recoverable", resolutionCause: { code: "changed" } } }
+						: { status: "fulfilled", value: "sealed" });
+					expect((await late)?.status).toBe(changed ? "indeterminate" : "valid");
+				} else if (phase === "sealed" && changed) await expect(transaction.commit()).rejects.toThrow("requires successful validation");
+				else await expect(transaction.commit()).resolves.toBe("sealed");
+				expect(validate).toHaveBeenCalledTimes(2 + Number(phase === "committed" || (phase === "reserved" && !changed)));
+				expect(commit).toHaveBeenCalledTimes(Number(phase === "committed" || !changed));
+			} finally { gate.resolve(); await Promise.allSettled([first, second, adoption, late]); await transaction.dispose(); }
+			expect(dispose).toHaveBeenCalledOnce();
+		}
+	});
+
 	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
 		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
 			const { promise: gate, resolve: release } = deferred();
@@ -74,7 +114,7 @@ describe("EffectTransactionCoordinator", () => {
 			if (phase === "committing" || phase === "committed") await transaction.validate();
 			if (phase === "committed") await transaction.commit();
 			const invoke = () => phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
-			const operations = Promise.allSettled(Array.from({ length: closing === "external" && ["reconstruction", "committed"].includes(phase) ? 2 : 1 }, invoke));
+			const operations = Promise.allSettled(Array.from({ length: closing === "external" && phase !== "committing" ? 2 : 1 }, invoke));
 			await entered;
 			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
 			const late = Promise.allSettled([transaction.validate(), transaction.reconstruct!(request)]);

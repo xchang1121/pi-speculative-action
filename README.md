@@ -253,7 +253,7 @@ const host = createSpeculativeActionHost(sessionID, {
 try { await host.dispose(); } finally { await workspace.dispose(); }
 ```
 
-Router 在选路与执行前检查能力，优先采用合格 Runtime，再检查本地后备；缺少安全路线则以 `execution:isolation_unavailable` 回退 Actor，已经执行失败的动作不换环境重跑。解析、准备、fork 与 dispose 共用 Router。后端返回 `WorldBranch`，Gateway 以 `EffectTransaction` 管理验证、采纳和回收；后端持有兼容证据与局部句柄。可选 `validateAndCommit` 仅供共享观察合并验新与无效果提交，每次仍需验新，独占分支忽略该接口。持久证书按内容和生产者契约隔离在 `<agent-dir>/speculative-action/process-reuse`，可以随时删除。
+Router 在选路、执行前查能力，依次选择 Runtime、本地后备；无安全路线以 `execution:isolation_unavailable` 回退 Actor，执行失败不换环境重跑。后端返回 `WorldBranch` 并持有证据与句柄；Gateway 的 `EffectTransaction` 管理验新、采纳和回收。每次验新排队取得新证明，提交预留后的验证等待提交完成。`validateAndCommit` 仅供共享观察合并验新与无效果提交，独占分支忽略它。持久证书按内容及生产者契约保存在 `<agent-dir>/speculative-action/process-reuse`，可随时删除。
 
 ## 计时口径
 

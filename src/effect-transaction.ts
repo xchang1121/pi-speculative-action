@@ -225,12 +225,11 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			if (cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
 				return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
 			}
-			if (validationPromise) return validationPromise;
-			const preserveCommitted = attempt.stateValue === "committed";
-			attempt.stateValue = preserveCommitted ? "committed" : "validating";
-			const pending = Promise.resolve().then(async () => {
+			// Each request owns a fresh proof after its predecessors, never their earlier observation.
+			const pending = Promise.resolve(validationPromise).then(async () => {
+				if (["sealed", "validated"].includes(attempt.stateValue)) attempt.stateValue = "validating";
 				validation = await validateWorldBranch(sealed, attempt.descriptor.route.reuse);
-				if (!preserveCommitted && attempt.stateValue === "validating") {
+				if (attempt.stateValue === "validating") {
 					attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";
 				}
 				return validation;
@@ -247,12 +246,13 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			}
 			// Reserve the entire validation → commit operation before yielding, not just its effect.
 			commitPromise = (async () => {
-				await validationPromise;
-				if (validation?.status !== "valid" || attempt.stateValue !== "validated") {
-					throw new Error(`effect transaction ${attempt.id} cannot commit from ${attempt.stateValue}`);
-				}
-				attempt.stateValue = "committing";
 				try {
+					await validationPromise;
+					if (validation?.status !== "valid" || attempt.stateValue !== "validated") {
+						throw effectCommitFailure(new Error(`effect transaction ${attempt.id} cannot commit from ${attempt.stateValue}`),
+							"recoverable", undefined, validation?.status !== "valid" ? validation?.cause : undefined);
+					}
+					attempt.stateValue = "committing";
 					const output = await sealed.commit();
 					attempt.stateValue = "committed";
 					return shared ? sealed.output : output;
