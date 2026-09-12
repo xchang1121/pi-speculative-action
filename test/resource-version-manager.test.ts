@@ -302,13 +302,15 @@ describe("speculative action resource versions", () => {
 
 	test.for(["file", "directory"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
 		if (kind === "file" && process.platform === "win32") return skip("file symlinks require Windows privileges");
-		const directory = kind === "directory", root = await workspace({ [directory ? "tree/value.txt" : "value.txt"]: "before" }), outside = await workspace({ "value.txt": "external" });
-		const target = path.join(root, "value.txt"), alias = path.join(root, "alias"), link = path.join(root, "input");
-		const tree = path.join(root, "tree"), content = directory ? path.join(tree, "value.txt") : target;
+		const directory = kind === "directory", root = await workspace({ [directory ? ".git/value.txt" : ".git"]: "before" }), outside = await workspace({ "value.txt": "external" });
+		const target = path.join(root, ".git"), alias = path.join(root, "alias"), link = path.join(root, "input");
+		const content = directory ? path.join(target, "value.txt") : target;
 		const type = directory ? process.platform === "win32" ? "junction" : "dir" : "file";
-		await fs.symlink(directory ? tree : target, link, type); await fs.symlink(link, alias, type);
+		await fs.symlink(target, link, type); await fs.symlink(link, alias, type);
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture([{ path: alias, scope: directory ? "tree_content" : "content" }], 8192);
+		const snapshot = new ResourceVersionManager(root, { watch: false, snapshotExcludes: [".git"] });
+		const baseline = await snapshot.capture([{ path: ".", scope: "tree_content" }]);
 		try {
 			const name = directory ? "ls" : "read", args = { path: alias };
 			const native = directory ? createLsTool(root) : createReadTool(root);
@@ -328,7 +330,7 @@ describe("speculative action resource versions", () => {
 					if (directory) await view.readdir(alias); else await view.readFile(alias);
 					const count = lazy.observations.size;
 					expect((await view.stat(alias, "entry")).realPath).toBe(path.join(await fs.realpath(root), "alias"));
-					expect((await view.stat(alias, "type")).realPath).toBe(await fs.realpath(directory ? tree : target));
+					expect((await view.stat(alias, "type")).realPath).toBe(await fs.realpath(target));
 					expect(lazy.observations.size).toBe(count);
 					view.seal(); expect((await manager.validate(lazy)).expired).toBe(false);
 				} finally { await lazy.release(); }
@@ -344,7 +346,9 @@ describe("speculative action resource versions", () => {
 				expect(await fs.readFile(leaf, "utf8")).toBe("before");
 				expect((await manager.seal(observed)).expired).toBe(true); // Restoring the SAME junction can preserve Windows inode/ctime.
 			} finally { observed.release(); }
+			expect((await snapshot.validate(baseline)).expired).toBe(false);
 			await fs.writeFile(content, "after!");
+			expect((await snapshot.validate(baseline)).expired).toBe(true); // Visible aliases retain their excluded targets' evidence.
 			expect((await token.view!.readFile(directory ? path.join(alias, "value.txt") : alias)).toString()).toBe("before");
 			expect(await manager.validate(token)).toMatchObject({ expired: true, mode: "exact", bytesRead: 6 });
 			const escape = path.join(root, "escape");
@@ -366,7 +370,7 @@ describe("speculative action resource versions", () => {
 				} finally { opened.mockRestore(); metadata.release(); }
 			}
 			await expect(token.view!.exists(path.join(alias, "unproven"))).rejects.toThrow("resource_access_unproven");
-		} finally { token.release(); manager.close(); }
+		} finally { token.release(); manager.close(); baseline.release(); snapshot.close(); }
 	});
 
 	test("rejects known non-regular paths before opening a data descriptor", async () => {
@@ -420,13 +424,23 @@ describe("speculative action resource versions", () => {
 		{ scope: "stat" as const, stale: ["content", "kind"] },
 		{ scope: "entries" as const, stale: ["entry", "kind"] },
 		{ scope: "tree_entries" as const, stale: ["entry", "deep", "kind"] },
-		{ scope: "tree_content" as const, stale: ["content", "entry", "deep", "kind"] },
-	])("validates exactly the declared $scope, without guessing configuration paths", async ({ scope, stale }) => {
+		{ scope: "tree_content" as const, stale: ["content", "entry", "deep", "kind", "config", "metadata", "nested_metadata"] },
+		{ scope: "tree_content" as const, stale: ["content", "entry", "deep", "kind", "config"], snapshotExcludes: [".git"] },
+	])("validates exactly $scope with snapshot exclusions $snapshotExcludes", async ({ scope, stale, snapshotExcludes }) => {
 		for (const [change, relative] of Object.entries({ content: "src/value.ts", entry: "src/added.ts",
-			deep: "src/nested/added.ts", outside: ".gitignore", kind: "src/value.ts" })) {
-			const root = await workspace({ "src/value.ts": "one\n", "src/nested/existing.ts": "" });
-			const manager = new ResourceVersionManager(root, { watch: false });
-			const token = await manager.capture([{ path: ["entry", "type", "stat"].includes(scope) ? "src/value.ts" : "src", scope }], 4096);
+			deep: "src/nested/added.ts", outside: ".gitignore", kind: "src/value.ts", config: "src/.gitignore",
+			metadata: "src/.git/config", nested_metadata: "src/nested/.git/config" })) {
+			const root = await workspace({ "src/value.ts": "one\n", "src/nested/existing.ts": "", "src/.gitignore": "",
+				"src/.git/config": "metadata", "src/nested/.git/config": "nested metadata" });
+			const excludes = [...snapshotExcludes ?? []];
+			const manager = new ResourceVersionManager(root, { watch: false, snapshotExcludes: excludes });
+			excludes.length = 0; // Caller mutation cannot change a manager's proof boundary.
+			const dependencies = [{ path: ["entry", "type", "stat"].includes(scope) ? "src/value.ts" : "src", scope }];
+			const token = await manager.capture(dependencies, snapshotExcludes ? undefined : 4096);
+			if (snapshotExcludes && change === "content") {
+				await expect(manager.capture(dependencies, 4096)).rejects.toThrow("resource_filtered_snapshot_not_readable");
+				expect((await manager.seal(token)).expired).toBe(true);
+			}
 			if (["entry", "type"].includes(scope)) await expect(token.view!.evaluate((view) => view.stat(path.join(root, "src/value.ts")))).rejects.toThrow("unproven");
 			if (change === "kind") { await fs.rm(path.join(root, relative)); await fs.mkdir(path.join(root, relative)); }
 			else await fs.writeFile(path.join(root, relative), "changed\n");

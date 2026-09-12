@@ -611,7 +611,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(stat(path.join(outside, "out.txt"))).rejects.toThrow();
 	});
 
-	it("does not modify an existing repository's index or branch", async () => {
+	it("isolates repository metadata and reuses baselines when only excluded metadata changes", async () => {
 		const root = await temporaryRoot("git");
 		await runProgram("git", ["init"], root);
 		await runProgram("git", ["config", "user.email", "test@example.com"], root);
@@ -623,6 +623,13 @@ describe("workspace-branch ExecutionWorld", () => {
 		await runProgram("git", ["add", "staged.txt"], root);
 		const beforeStatus = await runProgram("git", ["status", "--short"], root);
 		const beforeBranch = await runProgram("git", ["branch", "--show-current"], root);
+		await sandbox.prepare(root, { driver: "git" });
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		try {
+			await writeFile(path.join(root, ".git", "audit-cache"), "metadata changed\n");
+			await sandbox.prepare(root, { driver: "git" });
+			expect(captures).not.toHaveBeenCalled();
+		} finally { captures.mockRestore(); }
 		const args = { path: "created.txt", content: "speculative\n" };
 		await sandbox.createExecutionWorld().speculation.execute(context(root, "write", writeTool, args));
 

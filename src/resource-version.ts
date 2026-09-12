@@ -199,11 +199,17 @@ export class ResourceVersionManager {
 	private ready: Promise<void> = Promise.resolve();
 	private open = true;
 	readonly root: string;
-	private readonly options: { readonly watch?: boolean; readonly onIdle?: () => void };
+	private readonly snapshotExcludes: ReadonlySet<string>;
+	private readonly onIdle?: () => void;
 
-	constructor(root: string, options: { readonly watch?: boolean; readonly onIdle?: () => void } = {}) {
+	constructor(root: string, options: {
+		readonly watch?: boolean; readonly onIdle?: () => void;
+		/** Private snapshot entries only; filtered tokens cannot authorize input views or host execution windows. */
+		readonly snapshotExcludes?: readonly string[];
+	} = {}) {
 		this.root = root;
-		this.options = options;
+		this.snapshotExcludes = new Set(options.snapshotExcludes);
+		this.onIdle = options.onIdle;
 		if (options.watch === false) return;
 		try {
 			this.watcher = watch(root, { recursive: true }, (event, filename) => {
@@ -225,6 +231,7 @@ export class ResourceVersionManager {
 	async capture(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
+		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
 		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>(), preciseContent: string[] = [];
 		const releases = [this.acquireReference()];
 		let view: ResourceReadView | undefined;
@@ -251,7 +258,7 @@ export class ResourceVersionManager {
 				}
 				const precise = this.reliable ? this.acquirePreciseWatches(normalized) : undefined;
 				if (precise) { releases.push(precise.release); preciseContent.push(...precise.paths); }
-				for (const observation of await fingerprintDependencies(normalized, physicalRoot, view)) observations.set(dependencyKey(observation), observation);
+				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view)) observations.set(dependencyKey(observation), observation);
 			};
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
 			if (dependencies) await capture(dependencies);
@@ -282,6 +289,7 @@ export class ResourceVersionManager {
 			return validation(started, true, "resource_version_owner_changed", "exact");
 		try {
 			if (sealing) token.view?.seal(); else token.view?.assertComplete(true);
+			if (sealing && this.snapshotExcludes.size) throw new Error("resource_filtered_snapshot_not_observable");
 			// Host windows need eager binding evidence; Windows can restore a junction without changing its stamps.
 			if (sealing && (process.platform === "win32" || !token.observations.has(`binding:${filesystemPathKey(this.root)}`))) throw new Error("resource_path_binding_window_unprovable");
 			if (!token.observations.size) throw new Error("resource_dependencies_unproven");
@@ -289,7 +297,7 @@ export class ResourceVersionManager {
 			if (sealing) await watcherTurn();
 			const watcherFailure = this.invalidation(token, sealing);
 			if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
-			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot);
+			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot, this.snapshotExcludes);
 			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
 			if (lateFailure) return validation(started, true, lateFailure, "watcher");
@@ -401,7 +409,7 @@ export class ResourceVersionManager {
 
 	private checkIdle() {
 		if (this.references || this.preciseWatches.size) return;
-		this.options.onIdle?.();
+		this.onIdle?.();
 	}
 }
 
@@ -503,11 +511,11 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	return true;
 }
 
-async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, view?: ResourceReadView) {
-	const nearestExisting = missingResourceResolver(realRoot);
+async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView) {
+	const context = { realRoot, excludes, view, nearestExisting: missingResourceResolver(realRoot) };
 	return mapFingerprints(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
-		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), nearestExisting, view);
+		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, context);
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 	});
 }
@@ -533,15 +541,21 @@ type FingerprintResult = {
 	readonly filesRead: number;
 };
 
+type FingerprintContext = {
+	readonly realRoot: string;
+	readonly excludes: ReadonlySet<string>;
+	readonly nearestExisting: (target: string) => Promise<string>;
+	readonly view?: ResourceReadView;
+};
+
 async function fingerprintPath(
 	target: string,
 	scope: ResourceDependency["scope"],
-	realRoot: string,
-	ancestors: ReadonlySet<string>,
-	nearestExisting: (target: string) => Promise<string>,
-	view?: ResourceReadView,
+	context: FingerprintContext,
+	ancestors: ReadonlySet<string> = new Set(),
 	descend = true,
 ): Promise<FingerprintResult> {
+	const { realRoot, excludes, nearestExisting, view } = context;
 	let info: import("node:fs").BigIntStats;
 	try {
 		info = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
@@ -568,7 +582,7 @@ async function fingerprintPath(
 			throw new Error(`resource_symlink_changed:${target}`);
 		}
 		const source = path.resolve(path.dirname(target), link);
-		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, new Set(ancestors).add(identity), nearestExisting, view, descend);
+		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, context, new Set(ancestors).add(identity), descend);
 		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link, realPath: realTarget });
 		return {
 			value: {
@@ -611,10 +625,10 @@ async function fingerprintPath(
 		throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 	}
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
-	const selected = [...entries].sort((left, right) => left.name.localeCompare(right.name));
+	const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 	const descendants = new Set(ancestors).add(identity);
-	const children = scope === "names" ? [] : await mapFingerprints(selected, async (entry) => {
-		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, nearestExisting, view, scope !== "entries");
+	const children = scope === "names" ? [] : await mapFingerprints([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
+		const child = await fingerprintPath(path.join(target, entry.name), scope, context, descendants, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
 	const [afterEntries, after] = await Promise.all([
@@ -628,13 +642,13 @@ async function fingerprintPath(
 	) {
 		throw new Error(`resource_directory_changed:${target}`);
 	}
-	view?.capture(target, { type: "directory", entries: entries.map((entry) => entry.name), realPath: realTarget });
+	view?.capture(target, { type: "directory", entries: selected.map((entry) => entry.name), realPath: realTarget });
 	return {
 		value: {
 			type: "directory",
 			mode: Number(after.mode),
 			resolved: identity,
-			order: entries.map((entry) => entry.name),
+			order: selected.map((entry) => entry.name),
 			children: children.map((child) => ({ name: child.name, value: child.value })),
 		},
 		stamp: digest([statStamp(after), children.map((child) => [child.name, child.stamp])]),

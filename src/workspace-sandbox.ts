@@ -1305,7 +1305,7 @@ async function createSandboxRepository(
 			gitBinary,
 			git,
 			index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
-			versions: new ResourceVersionManager(sourceRoot),
+			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES }),
 			active: 0,
 			idleWaiters: new Set(),
 			lock: Promise.resolve(),
