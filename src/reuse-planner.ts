@@ -30,6 +30,8 @@ export interface ProcessReuseRequest {
 	readonly validation?: ProvenanceValidationContext;
 	/** Optional host policy for accepting proof produced under a different execution authority. */
 	readonly acceptProducer?: (proof: ProcessProducerProof) => boolean;
+	/** Already attempted certificate identities; skipping them grants no replay authority. */
+	readonly excludedCertificates?: ReadonlySet<Sha256Digest>;
 	/** Same-scope handoff candidates; accepted taints are never written into persistent history. */
 	readonly live?: {
 		readonly certificate: ProcessProvenanceCertificate | readonly ProcessProvenanceCertificate[];
@@ -110,7 +112,7 @@ export class ProcessReusePlanner {
 			...(request.validation?.acceptedTaints ?? []),
 			...(live.length ? request.live!.acceptedTaints : []),
 		])];
-		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey);
+		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.excludedCertificates);
 		candidateCertificates = certificates.length;
 		if (!certificates.length) {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };

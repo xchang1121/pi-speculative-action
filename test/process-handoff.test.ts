@@ -7,6 +7,7 @@ import {
 	sealProcessCertificate,
 	sha256Digest as digest,
 	type ProcessProvenanceCertificate,
+	type Sha256Digest,
 } from "../src/provenance-certificate.ts";
 
 const SCOPE = { sessionID: "session", turnID: "turn" };
@@ -14,12 +15,15 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
-	it("finds a candidate completed after persistent lookup began", async () => {
-		const fixture = await producer();
+	it("excludes attempted disk copies and still finds a candidate completed during history lookup", async () => {
+		const previous = await producer();
+		await previous.publish();
+		const fixture = await producer(false, previous.registry, 1);
 		const lookupStarted = deferred<void>();
 		const releaseLookup = deferred<void>();
-		const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[]) => {
-			if (live) return livePlan(live);
+		const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[], excluded?: ReadonlySet<Sha256Digest>) => {
+			if (live) return live[0] === fixture.certificate ? livePlan(live) : undefined;
+			expect(excluded).toEqual(new Set([previous.certificate.id]));
 			lookupStarted.resolve();
 			await releaseLookup.promise;
 			return undefined;
@@ -31,7 +35,8 @@ describe("ProcessHandoffRegistry", () => {
 		releaseLookup.resolve();
 
 		await expect(actor).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate }, joined: false });
-		expect(lookup).toHaveBeenCalledTimes(2);
+		expect(lookup).toHaveBeenCalledTimes(3);
+		await expect(acquireActor(previous)).resolves.toMatchObject({ kind: "hit", plan: { certificate: previous.certificate } });
 	});
 
 	it("publishes memory before noncreating or failed persistence outcomes", async () => {
@@ -136,7 +141,7 @@ describe("ProcessHandoffRegistry", () => {
 		await fixture.publish();
 		releaseWait.resolve();
 		await expect(sameScope).resolves.toMatchObject({ kind: "hit", joined: true });
-		expect(lookup.mock.calls).toEqual([[], [[fixture.certificate]]]);
+		expect(lookup.mock.calls).toEqual([[undefined, new Set()], [[fixture.certificate]]]);
 	});
 
 	it("returns an Actor miss when the running-join deadline wins", async () => {

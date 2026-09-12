@@ -221,7 +221,7 @@ export class ProvenanceCertificateStore {
 		return certificate;
 	}
 
-	async findByWeakKey(weakKey: Sha256Digest): Promise<readonly ProcessProvenanceCertificate[]> {
+	async findByWeakKey(weakKey: Sha256Digest, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
 		let names: string[];
 		try {
 			names = await readdir(this.weakIndexDirectory(weakKey));
@@ -233,8 +233,10 @@ export class ProvenanceCertificateStore {
 		for (const name of names) {
 			const match = /^([0-9a-f]{64})\.ref$/.exec(name);
 			if (!match) continue;
+			const id: Sha256Digest = `sha256:${match[1]}`;
+			if (excludedCertificates?.has(id)) continue;
 			const reference = path.join(this.weakIndexDirectory(weakKey), name);
-			const certificate = await this.get(`sha256:${match[1]}` as Sha256Digest);
+			const certificate = await this.get(id);
 			if (certificate?.weakKey === weakKey) certificates.push(certificate);
 			else await rm(reference, { force: true });
 		}

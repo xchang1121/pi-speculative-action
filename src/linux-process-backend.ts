@@ -87,7 +87,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
@@ -797,7 +797,7 @@ export class LinuxProcessReuseBackend {
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
 			weakKey,
-			(live) => this.plan(weakKey, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live),
+			(live, excluded) => this.plan(weakKey, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
 			session.signal,
 			session.scope,
 			{ ownership: session.ownership },
@@ -814,7 +814,7 @@ export class LinuxProcessReuseBackend {
 
 	private async acquireProcessResult(
 		weakKey: Sha256Digest,
-		lookup: (live?: readonly ProcessProvenanceCertificate[]) => Promise<CompletedProcessPlan | undefined>,
+		lookup: ProcessHandoffLookup<CompletedProcessPlan>,
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership },
@@ -860,10 +860,12 @@ export class LinuxProcessReuseBackend {
 		acceptProducer: (producer: ProcessProducerProof) => boolean,
 		session?: ActiveSession,
 		live?: readonly ProcessProvenanceCertificate[],
+		excludedCertificates?: ReadonlySet<Sha256Digest>,
 	): Promise<CompletedProcessPlan | undefined> {
 		const plan = await this.planner.plan({
 			weakKey,
 			acceptProducer,
+			excludedCertificates,
 			contract: {
 				sink: "buffered",
 				orderedJournal: true,
@@ -954,7 +956,7 @@ export class LinuxProcessReuseBackend {
 				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(
 				weakKey,
-				(live) => this.plan(weakKey, projection, accepted, undefined, live),
+				(live, excluded) => this.plan(weakKey, projection, accepted, undefined, live, excluded),
 				process.signal,
 				scope,
 				{ timing },

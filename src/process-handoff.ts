@@ -46,10 +46,15 @@ export type ProcessHandoffAcquisition<Plan> =
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
 
+export type ProcessHandoffLookup<Plan> = (
+	candidates?: readonly ProcessProvenanceCertificate[],
+	excludedCertificates?: ReadonlySet<Sha256Digest>,
+) => Promise<Plan | undefined>;
+
 interface AcquireBase<Plan> {
 	readonly key: Sha256Digest;
 	readonly scope?: ExecutionScope;
-	readonly lookup: (candidates?: readonly ProcessProvenanceCertificate[]) => Promise<Plan | undefined>;
+	readonly lookup: ProcessHandoffLookup<Plan>;
 }
 
 type AcquireOptions<Plan> = AcquireBase<Plan> & (
@@ -77,7 +82,7 @@ export class ProcessHandoffRegistry {
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		let joined = false, historyChecked = false;
-		const considered = new Set<HandoffRecord>();
+		const considered = new Map<HandoffRecord, Sha256Digest>();
 		while (true) {
 			const records = this.byKey.get(options.key) ?? [];
 			const completed = [...records].reverse().flatMap((record) => {
@@ -89,7 +94,7 @@ export class ProcessHandoffRegistry {
 			if (completed.length) {
 				const plan = await options.lookup(completed.map(({ candidate }) => candidate));
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-				for (const { record } of selected ? [selected] : completed) considered.add(record);
+				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
 				if (plan && selected && selected.record.state === selected.state &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
 					selected.record.state = { status: "claimed" };
@@ -99,7 +104,8 @@ export class ProcessHandoffRegistry {
 				continue;
 			}
 			if (!historyChecked) {
-				const plan = await options.lookup();
+				// A failed live attempt also rules out its immutable disk copy for this acquisition.
+				const plan = await options.lookup(undefined, new Set(considered.values()));
 				if (plan) return { kind: "hit", plan, joined };
 				historyChecked = true;
 				continue; // A candidate may have completed while history was being read.

@@ -7,7 +7,9 @@ import {
 	processWeakKey,
 	sealProcessCertificate,
 	sha256Digest,
+	type ProcessProvenanceCertificate,
 } from "../src/provenance-certificate.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { captureFileDependency } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner } from "../src/reuse-planner.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -168,7 +170,7 @@ describe("ProcessReusePlanner", () => {
 			expect(await planner.plan({ ...request, weakKey: unrelatedKey, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
 				kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 },
 			});
-			expect(find).toHaveBeenCalledOnce(); expect(find).toHaveBeenCalledWith(unrelatedKey);
+			expect(find).toHaveBeenCalledOnce(); expect(find).toHaveBeenCalledWith(unrelatedKey, undefined);
 			await writeFile(fixture.input, "changed");
 			expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
 				kind: "miss", reasons: ["dependency_changed"],
@@ -177,88 +179,86 @@ describe("ProcessReusePlanner", () => {
 		} finally { freezing.mockRestore(); find.mockRestore(); }
 	});
 
-	it.each(["l2", "live"])("captures one dynamic pathset once across several %s input states", async (source) => {
-		const root = await temporaryRoot();
-		const input = path.join(root, "input.txt");
-		const store = new ProvenanceCertificateStore(path.join(root, "cache"));
-		const prototype = processPrototype();
-		const certificates = [];
-		for (const [index, value] of ["one", "two", "three"].entries()) {
-			await writeFile(input, value);
-			const dependency = await captureFileDependency(input, "/workspace/input.txt");
-			const output = await store.artifacts.put(`result:${value}`);
-			const certificate = sealProcessCertificate({
-				prototype,
-				producer: PRODUCER,
-				dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints: [] },
-				result: {
-					replayProfile: "buffered_noninteractive",
-					journal: [{ sequence: 0, kind: "output", fd: 1, data: output }],
-					exit: { kind: "code", code: 0 },
-				},
-				createdAt: index + 1,
-			});
-			certificates.unshift(certificate);
-			await store.put(certificate);
-		}
+	it.each(["l2", "live", "handoff"])("validates batched input states without rereading attempted disk copies (%s)", async (source) => {
+		const { input, store, prototype, certificates } = await fixtureWithCertificate(false, [], ["one", "two", "three"]);
 		await writeFile(input, "one");
 
-		const plan = await new ProcessReusePlanner({ store }).plan({
+		const request = {
 			weakKey: processWeakKey(prototype),
 			contract: contract(),
 			validation: { resolvePath: () => input },
-			...(source === "live" ? { live: { certificate: certificates, acceptedTaints: [] } } : {}),
-		});
+		};
+		const planner = new ProcessReusePlanner({ store }), get = vi.spyOn(store, "get");
+		const lookup = async (live?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<ProcessProvenanceCertificate["id"]>) => {
+			const plan = await planner.plan({ ...request, excludedCertificates,
+				...(live ? { live: { certificate: live, acceptedTaints: [] } } : {}) });
+			return plan.kind === "completed_replay" ? plan : undefined;
+		};
+		const registry = new ProcessHandoffRegistry(3), scope = { sessionID: "test", turnID: "test" };
+		if (source === "handoff") for (const certificate of certificates.slice(0, 2)) {
+			const work = await registry.acquire({ key: request.weakKey, scope, role: "producer",
+				ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
+			if (work.kind !== "work") throw new Error("expected work");
+			await registry.publish(request.weakKey, work.work, certificate, async () => false);
+		}
+		const acquire = () => registry.acquire({ key: request.weakKey, scope, role: "actor", lookup, waitForRunning: async () => "miss" });
+		const acquired = source === "handoff" ? await acquire() : undefined;
+		const plan = source === "handoff" ? acquired?.kind === "hit" ? acquired.plan : undefined
+			: await lookup(source === "live" ? certificates : undefined);
 
 		expect(plan).toMatchObject({
 			kind: "completed_replay",
-			source, certificate: { id: certificates[2]!.id },
+			source: source === "live" ? "live" : "l2", certificate: { id: certificates[2]!.id },
 			lookup: {
-				candidateCertificates: 3,
-				eligibleCertificates: 3,
+				candidateCertificates: source === "handoff" ? 1 : 3,
+				eligibleCertificates: source === "handoff" ? 1 : 3,
 				pathsetsValidated: 1,
 				filesRead: 1,
 				bytesRead: 3,
 			},
 		});
+		expect(get).toHaveBeenCalledTimes(source === "live" ? 0 : source === "handoff" ? 1 : 3);
+		if (source === "handoff") {
+			await writeFile(input, "changed");
+			expect(await acquire()).toMatchObject({ kind: "miss" });
+			await writeFile(input, "three");
+			expect(await acquire()).toMatchObject({ kind: "hit", plan: { source: "live", certificate: { id: certificates[0]!.id } } });
+		}
 	});
 });
 
 async function fixtureWithCertificate(
 	withFileEffect = false,
 	taints: readonly ("confinement_observation")[] = [],
+	versions = ["input"],
 ) {
 	const root = await temporaryRoot();
 	const input = path.join(root, "input.txt");
-	await writeFile(input, "input");
-	const dependency = await captureFileDependency(input, "/workspace/input.txt");
 	const store = new ProvenanceCertificateStore(path.join(root, "cache"));
-	const output = await store.artifacts.put("stdout");
 	const artifact = await store.artifacts.put("artifact");
 	const prototype = processPrototype();
-	const certificate = sealProcessCertificate({
-		prototype,
-		producer: PRODUCER,
-		dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints },
-		result: {
-			replayProfile: "buffered_noninteractive",
-			journal: [
-				{ sequence: 0, kind: "output", fd: 1, data: output },
-				...(withFileEffect
-					? [{
-							sequence: 1,
-							kind: "workspace" as const,
-							path: "/workspace/out.bin",
-							before: { kind: "absent" as const },
-							after: { kind: "file" as const, data: artifact, mode: 0o644 },
-						}]
-					: []),
-			],
-			exit: { kind: "code", code: 0 },
-		},
-	});
-	await store.put(certificate);
-	return { certificate, input, prototype, weakKey: processWeakKey(prototype), root, store };
+	const certificates = [];
+	for (const [index, value] of versions.entries()) {
+		await writeFile(input, value);
+		const dependency = await captureFileDependency(input, "/workspace/input.txt");
+		const output = await store.artifacts.put(versions.length > 1 ? `result:${value}` : "stdout");
+		const certificate = sealProcessCertificate({
+			prototype, producer: PRODUCER, createdAt: index + 1,
+			dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints },
+			result: {
+				replayProfile: "buffered_noninteractive",
+				journal: [
+					{ sequence: 0, kind: "output", fd: 1, data: output },
+					...(withFileEffect ? [{ sequence: 1, kind: "workspace" as const, path: "/workspace/out.bin",
+						before: { kind: "absent" as const }, after: { kind: "file" as const, data: artifact, mode: 0o644 } }] : []),
+				],
+				exit: { kind: "code", code: 0 },
+			},
+		});
+		certificates.unshift(certificate);
+		await store.put(certificate);
+	}
+	return { certificate: certificates[0]!, certificates, input, prototype, weakKey: processWeakKey(prototype), root, store };
 }
 
 function processPrototype() {

@@ -49,7 +49,11 @@ describe("persistent provenance store", () => {
 		const reopened = new ProvenanceCertificateStore(root);
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
 		expect(await reopened.get(certificate.id)).toEqual(certificate);
+		const get = vi.spyOn(reopened, "get");
+		expect(await reopened.findByWeakKey(certificate.weakKey, new Set([certificate.id]))).toEqual([]);
+		expect(get).not.toHaveBeenCalled();
 		expect(await reopened.findByWeakKey(certificate.weakKey)).toEqual([certificate]);
+		expect(get).toHaveBeenCalledOnce(); get.mockRestore();
 		const cachedStats = await reopened.stats();
 		expect(cachedStats).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
 		expect(await reopened.stats()).toBe(cachedStats);
