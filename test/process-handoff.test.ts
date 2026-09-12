@@ -1,9 +1,9 @@
 import { deferred } from "./async.ts";
+import { processPrototype } from "./process-fixture.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
-	createExecPrototype,
 	sealProcessCertificate,
 	sha256Digest as digest,
 	type ProcessProvenanceCertificate,
@@ -183,18 +183,10 @@ function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = li
 
 function processCertificate(oneShot: boolean, code: number) {
 	return sealProcessCertificate({
-		prototype: createExecPrototype({
+		prototype: processPrototype({
 			executablePath: "/usr/bin/tool",
-			executableDigest: digest("tool"),
-			argv: ["tool"],
-			logicalCwd: "/workspace",
 			environment: {},
-			umask: 0o22,
 			processContextDigest: digest("context"),
-			stdin: { type: "closed", eof: true },
-			fileDescriptorTableComplete: true,
-			inheritedFDs: [],
-			platformFingerprint: "linux",
 		}),
 		producer: {
 			observer: { provider: "test", fingerprint: digest("observer") },

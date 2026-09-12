@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { EffectCommitFailure } from "../src/effect-transaction.ts";
@@ -20,6 +21,7 @@ import {
 	prepareLinuxProcessReuse,
 	textOutput,
 	type LinuxProcessBenchmark,
+	waitUntil,
 	writeBenchmarkReport,
 } from "./linux-process-harness.ts";
 
@@ -174,29 +176,25 @@ int main(int argc, char **argv) {
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
 		await commitBenchmarkFixture(fixture.workspace, "Pi Held Exec Benchmark");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		const produce = (label: string, command: string) => forkReusableBash(fixture, {
+			label, command, actionNamespace: "pi-held-exec-production.v1", executionFingerprint,
+		});
+		async function withProducer<Value>(label: string, command: string,
+			inspect: (branch: Awaited<ReturnType<typeof produce>>) => Value | Promise<Value>) {
+			const branch = await produce(label, command);
+			try { return await inspect(branch); } finally { await branch.dispose(); }
+		}
 		const actorCommand = "printf 'actor-parent\\n'; worker result.txt";
 		const direct = await executeDirectBash(fixture, { label: "held-direct", command: actorCommand });
 		const expectedOutput = textOutput(direct.output);
 		const expectedResult = await readFile(path.join(fixture.workspace, "result.txt"));
 		await rm(path.join(fixture.workspace, "result.txt"));
-		const branch = await forkReusableBash(fixture, {
-			label: "held-producer",
-			command: ": speculative-parent; worker result.txt",
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		try {
+		await withProducer("held-producer", ": speculative-parent; worker result.txt", async (branch) => {
 			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)} ${JSON.stringify(fixture.backend.metrics())}`);
 			assert(fixture.backend.metrics().published > 0, `speculative child did not publish a reusable certificate: ${JSON.stringify(fixture.backend.metrics())}`);
-		} finally {
-			await branch.dispose();
-		}
+		});
 		const actor = await heldActor(fixture, replayBackend);
-		const beforeHit = replayBackend.actorMetrics();
-		const hitStarted = performance.now();
-		const hit = await actor.execute("held-hit", { command: actorCommand }, new AbortController().signal);
-		const hitMs = performance.now() - hitStarted;
-		const hitMetrics = metricDelta(beforeHit, replayBackend.actorMetrics());
+		const { output: hit, totalMs: hitMs, metrics: hitMetrics } = await measureActor(replayBackend, actor, "held-hit", actorCommand);
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(
@@ -207,116 +205,64 @@ int main(int argc, char **argv) {
 		const joiningActor = await heldActor(fixture, fixture.backend);
 
 		const cwdProducerBefore = fixture.backend.metrics();
-		const cwdBranch = await forkReusableBash(fixture, {
-			label: "held-cwd-producer",
-			command: "/bin/pwd",
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		let cwdHits = -1;
-		try {
+		const cwdHits = await withProducer("held-cwd-producer", "/bin/pwd", async (cwdBranch) => {
 			const cwdProduced = metricDelta(cwdProducerBefore, fixture.backend.metrics());
 			assert(textOutput(cwdBranch.output.result) === `${fixture.workspace}\n`, "speculative child observed a private cwd");
-			const cwdBefore = fixture.backend.actorMetrics();
-			const cwdActor = await joiningActor.execute(
-				"held-cwd-actor",
-				{ command: "printf 'actor-cwd\\n'; /bin/pwd" },
-				new AbortController().signal,
-			);
-			const cwdMetrics = metricDelta(cwdBefore, fixture.backend.actorMetrics());
-			cwdHits = cwdMetrics.hits;
+			const { output: cwdActor, metrics: cwdMetrics } = await measureActor(
+				fixture.backend, joiningActor, "held-cwd-actor", "printf 'actor-cwd\\n'; /bin/pwd");
 			assert(textOutput(cwdActor) === `actor-cwd\n${fixture.workspace}\n`, "transferred child observed a non-Actor cwd");
 			assert(
 				cwdMetrics.hits === 1,
 				`absolute PATH alias was not transferred: producer=${JSON.stringify(cwdProduced)} actor=${JSON.stringify(cwdMetrics)}`,
 			);
-		} finally {
-			await cwdBranch.dispose();
-		}
+			return cwdMetrics.hits;
+		});
 
 		const securityBefore = fixture.backend.metrics();
-		const securityBranch = await forkReusableBash(fixture, {
-			label: "held-security-producer",
-			command: ": speculative-security; worker unused probe",
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		try {
+		await withProducer("held-security-producer", ": speculative-security; worker unused probe", async (securityBranch) => {
 			assert(textOutput(securityBranch.output.result).includes("nnp:1"), "producer confinement probe was not active");
 			const produced = metricDelta(securityBefore, fixture.backend.metrics());
 			assert(produced.tainted === 1 && produced.published === 1,
 				`confinement evidence was not retained: ${JSON.stringify(produced)}; validation=${JSON.stringify(await securityBranch.validate?.())}`);
-		} finally {
-			await securityBranch.dispose();
-		}
-		const securityActorBefore = replayBackend.actorMetrics();
-		const securityActor = await actor.execute(
-			"held-security-actor",
-			{ command: ": actor-security; worker unused probe" },
-			new AbortController().signal,
-		);
-		const securityMetrics = metricDelta(securityActorBefore, replayBackend.actorMetrics());
+		});
+		const { output: securityActor, metrics: securityMetrics } = await measureActor(
+			replayBackend, actor, "held-security-actor", ": actor-security; worker unused probe");
 		assert(textOutput(securityActor).includes("nnp:0"), "Actor did not retain its native security context");
 		assert(
 			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
 			`confinement-sensitive result was reused: ${JSON.stringify(securityMetrics)}`,
 		);
 
-		const inodeBranch = await forkReusableBash(fixture, {
-			label: "held-inode-producer",
-			command: ": speculative-inode; worker unused inode",
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		const inodeBefore = replayBackend.actorMetrics();
-		const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
-			.toString(16).padStart(16, "0");
-		let inodeHits = -1;
-		try {
-			const inodeActor = await actor.execute(
-				"held-inode-actor",
-				{ command: ": actor-inode; worker unused inode" },
-				new AbortController().signal,
-			);
-			const inodeMetrics = metricDelta(inodeBefore, replayBackend.actorMetrics());
-			inodeHits = inodeMetrics.hits;
+		const metadataMismatch = await withProducer("held-inode-producer", ": speculative-inode; worker unused inode", async (inodeBranch) => {
+			const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
+				.toString(16).padStart(16, "0");
+			const { output: inodeActor, metrics: inodeMetrics } = await measureActor(
+				replayBackend, actor, "held-inode-actor", ": actor-inode; worker unused inode");
 			assert(
 				textOutput(inodeActor).trim() === expectedInode,
 				`Actor observed speculative inode metadata: expected ${expectedInode}, got ${JSON.stringify(textOutput(inodeActor).trim())}; ${JSON.stringify(inodeMetrics)}`,
 			);
 			assert(inodeMetrics.hits === 0 && inodeMetrics.misses >= 1, "non-equivalent inode metadata was reused");
-		} finally {
-			await inodeBranch.dispose();
-		}
+			return { speculativeDiffers: textOutput(inodeBranch.output.result).trim() !== expectedInode,
+				actorMatchedSource: true, hits: inodeMetrics.hits };
+		});
 
 		await Promise.all([
 			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
 		const joinBefore = fixture.backend.metrics();
-		const joiningTask = forkReusableBash(fixture, {
-			label: "held-joining-producer",
-			command: ": speculative-join; worker joined.txt",
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
+		const joiningTask = produce("held-joining-producer", ": speculative-join; worker joined.txt");
 		let joiningBranch: Awaited<typeof joiningTask> | undefined;
 		let joiningOutput: Awaited<ReturnType<typeof actor.execute>> | undefined;
 		let joinMetrics: LinuxProcessReuseMetrics | undefined;
 		let joiningMs = 0;
 		const leadMs = 400;
 		try {
-			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses);
+			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses, 5_000, 5);
 			await delay(leadMs);
-			const actorBefore = fixture.backend.actorMetrics();
-			const joiningStarted = performance.now();
-			joiningOutput = await joiningActor.execute(
-				"held-joining",
-				{ command: "printf 'actor-join\\n'; worker joined.txt" },
-				new AbortController().signal,
-			);
-			joiningMs = performance.now() - joiningStarted;
-			joinMetrics = metricDelta(actorBefore, fixture.backend.actorMetrics());
+			({ output: joiningOutput, totalMs: joiningMs, metrics: joinMetrics } = await measureActor(
+				fixture.backend, joiningActor, "held-joining", "printf 'actor-join\\n'; worker joined.txt"));
 			joiningBranch = await joiningTask;
 			assert(!joiningBranch.output.isError, `joining producer failed: ${textOutput(joiningBranch.output.result)}`);
 		} finally {
@@ -331,33 +277,19 @@ int main(int argc, char **argv) {
 				joinMetrics.actorTimedHits === 0 && joinMetrics.actorBaselineMs === 0 && joinMetrics.reusedProcessMs > 0,
 			`Uncalibrated Actor did not join its child exactly once: ${JSON.stringify(joinMetrics)}`,
 		);
-		const beforeMiss = fixture.backend.actorMetrics();
-		const missStarted = performance.now();
-		const miss = await joiningActor.execute("held-stale", { command: actorCommand }, new AbortController().signal);
-		const missMs = performance.now() - missStarted;
-		const missMetrics = metricDelta(beforeMiss, fixture.backend.actorMetrics());
+		const { output: miss, totalMs: missMs, metrics: missMetrics } = await measureActor(fixture.backend, joiningActor, "held-stale", actorCommand);
 		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const completedChild = "worker completed.txt volatile";
 		const completedBefore = fixture.backend.metrics();
-		const completedBranch = await forkReusableBash(fixture, {
-			label: "held-completed-producer",
-			command: `: speculative-completed; ${completedChild}`,
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		try {
+		await withProducer("held-completed-producer", `: speculative-completed; ${completedChild}`, async (completedBranch) => {
 			assert(!completedBranch.output.isError, `completed producer failed: ${textOutput(completedBranch.output.result)}`);
 			const completedProduced = metricDelta(completedBefore, fixture.backend.metrics());
-			assert(completedProduced.tainted === 1 && completedProduced.published === 0, "completed child did not remain ephemeral");
-			const actorBefore = fixture.backend.actorMetrics();
-			const completedActor = await joiningActor.execute(
-				"held-completed",
-				{ command: `printf 'actor-completed\n'; ${completedChild}` },
-				new AbortController().signal,
-			);
-			const completedMetrics = metricDelta(actorBefore, fixture.backend.actorMetrics());
+			assert(completedProduced.tainted === 1 && completedProduced.published === 0,
+				`completed child did not remain ephemeral: ${JSON.stringify(completedProduced)}`);
+			const { output: completedActor, metrics: completedMetrics } = await measureActor(
+				fixture.backend, joiningActor, "held-completed", `printf 'actor-completed\n'; ${completedChild}`);
 			assert(textOutput(completedActor).includes("actor-completed\nworker:v2"), "completed child transfer changed Actor output");
 			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:v2\n", "completed child transfer changed its effect");
 			assert(completedMetrics.hits === 1 && completedMetrics.joinedHits === 0 && completedMetrics.sameTurnHits === 1,
@@ -365,25 +297,16 @@ int main(int argc, char **argv) {
 			assert(await completedBranch.commit().then(() => false, (error) =>
 				error instanceof EffectCommitFailure && error.disposition === "recoverable" && error.message.includes("partially consumed")),
 				"enclosing branch retained adoption authority after its one-shot child was consumed");
-		} finally {
-			await completedBranch.dispose();
-		}
+		});
 		const lateChild = "worker late.txt volatile";
 		const lateBefore = fixture.backend.metrics();
-		const lateTask = forkReusableBash(fixture, {
-			label: "held-late-producer",
-			command: `: speculative-late; ${lateChild}`,
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
+		const lateTask = produce("held-late-producer", `: speculative-late; ${lateChild}`);
 		let lateBranch: Awaited<typeof lateTask> | undefined;
 		try {
-			await waitUntil(() => fixture.backend.metrics().misses > lateBefore.misses);
+			await waitUntil(() => fixture.backend.metrics().misses > lateBefore.misses, 5_000, 5);
 			const laterActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: "later" }));
 			const rejectCrossTurn = async (callID: string) => {
-				const before = fixture.backend.actorMetrics();
-				const output = await laterActor.execute(callID, { command: lateChild }, new AbortController().signal);
-				const metrics = metricDelta(before, fixture.backend.actorMetrics());
+				const { output, metrics } = await measureActor(fixture.backend, laterActor, callID, lateChild);
 				assert(textOutput(output).includes("worker:v2") && metrics.hits === 0 && metrics.joinedHits === 0 && metrics.misses >= 1,
 					`${callID} crossed its turn boundary: ${JSON.stringify(metrics)}`);
 			};
@@ -399,13 +322,7 @@ int main(int argc, char **argv) {
 
 		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'date +%s >/dev/null; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
 		const descriptorProducerBefore = fixture.backend.metrics();
-		const descriptorBranch = await forkReusableBash(fixture, {
-			label: "held-descriptor-producer",
-			command: descriptorCommand,
-			actionNamespace: "pi-held-exec-production.v1",
-			executionFingerprint,
-		});
-		try {
+		await withProducer("held-descriptor-producer", descriptorCommand, async (descriptorBranch) => {
 			assert(
 				!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok",
 				`native descriptor bypass changed output: ${JSON.stringify(descriptorBranch.output)}`,
@@ -418,18 +335,15 @@ int main(int argc, char **argv) {
 			);
 			const produced = metricDelta(descriptorProducerBefore, fixture.backend.metrics());
 			assert(produced.wholeCommandPublished === 0, "descriptor command unexpectedly entered persistent history");
-			const descriptorBefore = fixture.backend.actorMetrics();
-			const descriptorActor = await fixture.tool.execute("held-descriptor-actor", { command: descriptorCommand }, new AbortController().signal);
-			const descriptorMetrics = metricDelta(descriptorBefore, fixture.backend.actorMetrics());
+			const { output: descriptorActor, metrics: descriptorMetrics } = await measureActor(
+				fixture.backend, fixture.tool, "held-descriptor-actor", descriptorCommand);
 			assert(textOutput(descriptorActor) === "descriptor-ok", "completed descriptor transfer changed output");
 			assert((await readFile(path.join(fixture.workspace, "descriptor.txt"))).toString() === "descriptor", "completed descriptor transfer changed its effect");
 			assert(
 				descriptorMetrics.wholeCommandHits === 0 && descriptorMetrics.wholeCommandMisses >= 1,
 				`descriptor metadata did not force Actor execution: ${JSON.stringify(descriptorMetrics)}`,
 			);
-		} finally {
-			await descriptorBranch.dispose();
-		}
+		});
 		return {
 			directMs: direct.totalMs,
 			completed: {
@@ -460,16 +374,18 @@ int main(int argc, char **argv) {
 				hits: securityMetrics.hits,
 				rejection: securityMetrics.lastError,
 			},
-			metadataMismatch: {
-				speculativeDiffers: textOutput(inodeBranch.output.result).trim() !== expectedInode,
-				actorMatchedSource: true,
-				hits: inodeHits,
-			},
+			metadataMismatch,
 		};
 	} finally {
 		await replayBackend.dispose();
 		await fixture.dispose();
 	}
+}
+
+async function measureActor(backend: LinuxProcessReuseBackend, actor: LinuxProcessBenchmark["tool"], callID: string, command: string) {
+	const before = backend.actorMetrics(), started = performance.now();
+	const output = await actor.execute(callID, { command }, new AbortController().signal);
+	return { output, totalMs: performance.now() - started, metrics: metricDelta(before, backend.actorMetrics()) };
 }
 
 async function heldActor(
@@ -494,18 +410,6 @@ async function heldActor(
 		exposeSessionEnvironment: false,
 		spawnHook: (context) => ({ ...context, env: { ...fixture.environment } }),
 	});
-}
-
-async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = performance.now() + timeoutMs;
-	while (!predicate()) {
-		if (performance.now() >= deadline) throw new Error("timed out waiting for speculative child execution");
-		await delay(5);
-	}
-}
-
-function delay(milliseconds: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function run([executable, ...args]: Command, cwd?: string): Promise<Outcome> {

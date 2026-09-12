@@ -14,6 +14,7 @@ import {
 	metricDelta,
 	prepareLinuxProcessReuse,
 	textOutput,
+	waitUntil,
 	writeBenchmarkReport,
 } from "./linux-process-harness.ts";
 
@@ -113,12 +114,4 @@ try {
 } finally {
 	await host.dispose();
 	await fixture.dispose();
-}
-
-async function waitUntil(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
-	const deadline = performance.now() + timeoutMs;
-	while (!condition()) {
-		if (performance.now() >= deadline) throw new Error("timed out waiting for speculative process state");
-		await delay(10);
-	}
 }

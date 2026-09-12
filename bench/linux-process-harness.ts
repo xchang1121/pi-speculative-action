@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -329,4 +330,12 @@ export function workspaceDriverArgument(value: string | undefined): WorkspaceSan
 
 export function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
+}
+
+export async function waitUntil(condition: () => boolean, timeoutMs = 10_000, intervalMs = 10): Promise<void> {
+	const deadline = performance.now() + timeoutMs;
+	while (!condition()) {
+		if (performance.now() >= deadline) throw new Error("timed out waiting for speculative process state");
+		await delay(intervalMs);
+	}
 }

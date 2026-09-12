@@ -1,15 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
+import { mkdir } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { resolvePatternWorkspaceIdentity } from "../src/workspace-identity.ts";
 
-const roots: string[] = [];
+const { create: temporaryDirectory, dispose } = temporaryDirectories("pi-pattern-identity-");
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(dispose);
 
 describe("PatternAware workspace identity", () => {
 	test("retains path scoping outside a Git repository", async () => {
@@ -37,9 +35,3 @@ describe("PatternAware workspace identity", () => {
 		expect(first).not.toContain("example.test");
 	});
 });
-
-async function temporaryDirectory(): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-pattern-identity-"));
-	roots.push(root);
-	return root;
-}

@@ -1,4 +1,5 @@
 import { deferred, nextTurn } from "./async.ts";
+import { temporaryDirectories } from "./filesystem.ts";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -21,13 +22,13 @@ import {
 	resourceDependencies,
 } from "../src/resource-version.ts";
 
-const roots: string[] = [];
+const directories = temporaryDirectories("pi-resource-version-", path.join(process.cwd(), "test"));
 const execFileAsync = promisify(execFile);
 const isDataOpen = (flags: unknown) => typeof flags !== "number" || !(flags & 0x200000); // Linux O_PATH has no I/O authority.
 
 afterEach(async () => {
 	closeResourceVersionManagers();
-	await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+	await directories.dispose();
 });
 
 describe("speculative action resource versions", () => {
@@ -475,8 +476,7 @@ function action(tool: "read" | "ls", resources: ReadonlyArray<string>) {
 }
 
 async function workspace(files: Readonly<Record<string, string | Buffer>> = {}) {
-	const root = await fs.mkdtemp(path.join(process.cwd(), "test", "pi-resource-version-"));
-	roots.push(root);
+	const root = await directories.create();
 	await Promise.all(Object.entries(files).map(async ([name, content]) => {
 		await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
 		await fs.writeFile(path.join(root, name), content);

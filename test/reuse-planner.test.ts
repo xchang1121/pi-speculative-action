@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
+import { processPrototype as basePrototype, SPECULATIVE_PRODUCER as PRODUCER } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	createExecPrototype,
 	processWeakKey,
 	sealProcessCertificate,
 	sha256Digest,
@@ -14,28 +14,14 @@ import { captureFileDependency } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner } from "../src/reuse-planner.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 
-const roots: string[] = [];
-const PRODUCER = {
-	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
-	execution: {
-		authority: "speculative" as const,
-		confinement: { provider: "test", fingerprint: sha256Digest("confinement-v1") },
-	},
-};
+const { create: temporaryRoot, dispose } = temporaryDirectories("pi-reuse-planner-");
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(dispose);
 
 describe("ProcessReusePlanner", () => {
 	it("reuses the same nested exec across different parent commands after strong validation", async () => {
 		const fixture = await fixtureWithCertificate();
-		const planner = new ProcessReusePlanner({ store: fixture.store });
-		const request = {
-			weakKey: fixture.weakKey,
-			contract: contract(),
-			validation: { resolvePath: () => fixture.input },
-		};
+		const { planner, request } = fixture;
 		for (const weakKey of [undefined, "invalid", "sha256:ABC", 123]) {
 			await expect(planner.plan({ ...request, weakKey: weakKey as never })).rejects.toThrow("invalid process weak key");
 		}
@@ -90,24 +76,13 @@ describe("ProcessReusePlanner", () => {
 
 	it("lets the execution authority reject an otherwise matching producer proof", async () => {
 		const fixture = await fixtureWithCertificate();
-		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
-			weakKey: fixture.weakKey,
-			contract: contract(),
-			validation: { resolvePath: () => fixture.input },
-			acceptProducer: () => false,
-		});
+		const plan = await fixture.planner.plan({ ...fixture.request, acceptProducer: () => false });
 
 		expect(plan).toMatchObject({ kind: "miss", reasons: ["producer_guarantee_incompatible"] });
 	});
 
 	it("reuses confinement observations only when the consumer proves the same domain", async () => {
-		const fixture = await fixtureWithCertificate(false, ["confinement_observation"]);
-		const planner = new ProcessReusePlanner({ store: fixture.store });
-		const request = {
-			weakKey: fixture.weakKey,
-			contract: contract(),
-			validation: { resolvePath: () => fixture.input },
-		};
+		const { planner, request } = await fixtureWithCertificate(false, ["confinement_observation"]);
 		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["certificate_tainted"] });
 		expect(await planner.plan({
 			...request,
@@ -118,11 +93,7 @@ describe("ProcessReusePlanner", () => {
 	it("loads each result artifact once into a verified closure before replay", async () => {
 		const fixture = await fixtureWithCertificate(true);
 		const get = vi.spyOn(fixture.store.artifacts, "get");
-		const plan = await new ProcessReusePlanner({ store: fixture.store }).plan({
-			weakKey: fixture.weakKey,
-			contract: contract(),
-			validation: { resolvePath: () => fixture.input },
-		});
+		const plan = await fixture.planner.plan(fixture.request);
 		expect(plan).toMatchObject({
 			kind: "completed_replay",
 			lookup: { artifactsLoaded: 2, artifactBytesRead: 14 },
@@ -150,13 +121,8 @@ describe("ProcessReusePlanner", () => {
 			dependencyCertificate: { ...fixture.certificate.dependencyCertificate, taints: ["clock"] },
 			result: fixture.certificate.result,
 		});
-		const planner = new ProcessReusePlanner({ store: fixture.store });
+		const { planner, request } = fixture;
 		const unrelatedKey = processWeakKey({ ...fixture.prototype, argvDigest: sha256Digest("unrelated argv") });
-		const request = {
-			weakKey: fixture.weakKey,
-			contract: contract(),
-			validation: { resolvePath: () => fixture.input },
-		};
 
 		const freezing = vi.spyOn(Object, "freeze");
 		try {
@@ -180,15 +146,10 @@ describe("ProcessReusePlanner", () => {
 	});
 
 	it.each(["l2", "live", "handoff"])("validates batched input states without rereading attempted disk copies (%s)", async (source) => {
-		const { input, store, prototype, certificates } = await fixtureWithCertificate(false, [], ["one", "two", "three"]);
+		const { input, store, request, planner, certificates } = await fixtureWithCertificate(false, [], ["one", "two", "three"]);
 		await writeFile(input, "one");
 
-		const request = {
-			weakKey: processWeakKey(prototype),
-			contract: contract(),
-			validation: { resolvePath: () => input },
-		};
-		const planner = new ProcessReusePlanner({ store }), get = vi.spyOn(store, "get");
+		const get = vi.spyOn(store, "get");
 		const lookup = async (live?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<ProcessProvenanceCertificate["id"]>) => {
 			const plan = await planner.plan({ ...request, excludedCertificates,
 				...(live ? { live: { certificate: live, acceptedTaints: [] } } : {}) });
@@ -258,22 +219,16 @@ async function fixtureWithCertificate(
 		certificates.unshift(certificate);
 		await store.put(certificate);
 	}
-	return { certificate: certificates[0]!, certificates, input, prototype, weakKey: processWeakKey(prototype), root, store };
+	const request = { weakKey: processWeakKey(prototype), contract: contract(), validation: { resolvePath: () => input } };
+	return { certificate: certificates[0]!, certificates, input, prototype, store, request, planner: new ProcessReusePlanner({ store }) };
 }
 
 function processPrototype() {
-	const digest = (value: string) => sha256Digest(value);
-	return createExecPrototype({
+	return basePrototype({
 		executablePath: "/usr/bin/compiler",
-		executableDigest: digest("compiler"),
+		executableDigest: sha256Digest("compiler"),
 		argv: ["compiler", "input.txt"],
-		logicalCwd: "/workspace",
 		environment: { LANG: "C", PATH: "/usr/bin" },
-		umask: 0o22,
-		processContextDigest: digest("process-context"),
-		stdin: { type: "closed", eof: true },
-		fileDescriptorTableComplete: true,
-		inheritedFDs: [],
 		platformFingerprint: "linux-x64",
 	});
 }
@@ -284,10 +239,4 @@ function contract() {
 		orderedJournal: true,
 		transactionalEffects: true,
 	};
-}
-
-async function temporaryRoot(): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-reuse-planner-"));
-	roots.push(root);
-	return root;
 }

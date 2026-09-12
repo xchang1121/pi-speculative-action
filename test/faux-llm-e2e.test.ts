@@ -1,6 +1,6 @@
 import { deferred as barrier } from "./async.ts";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { Agent, type AgentMessage, type AgentTool, type AgentToolResult } from "@earendil-works/pi-agent-core";
 import { createFauxCore, type FauxContentBlock, type FauxResponseStep, fauxAssistantMessage, fauxThinking, fauxToolCall, type Message } from "@earendil-works/pi-ai";
@@ -15,13 +15,11 @@ import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
-const roots: string[] = [];
+const directories = temporaryDirectories("pi-spec-faux-e2e-");
 const readSchema = Type.Object({ path: Type.String() });
 const bashSchema = Type.Object({ command: Type.String() });
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(directories.dispose);
 
 describe("faux LLM speculative action end to end", () => {
 	it("keeps adopting fragmented Actor and Drafter streams without uncensored Actor samples", async () => {
@@ -306,8 +304,7 @@ function patternStore(cwd: string, settings: PatternAwareSettings): PatternAware
 }
 
 async function workspace(): Promise<string> {
-	const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-spec-faux-e2e-"));
-	roots.push(cwd);
+	const cwd = await directories.create();
 	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\nthree\n", "utf8");
 	return cwd;
 }

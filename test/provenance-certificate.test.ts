@@ -1,5 +1,6 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
+import { processPrototype, SPECULATIVE_PRODUCER as PRODUCER } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
@@ -24,18 +25,9 @@ import {
 	validateProcessCertificate,
 } from "../src/provenance-validation.ts";
 
-const roots: string[] = [];
-const PRODUCER = {
-	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
-	execution: {
-		authority: "speculative" as const,
-		confinement: { provider: "test", fingerprint: sha256Digest("confinement-v1") },
-	},
-};
+const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(dispose);
 
 describe("process provenance certificates", () => {
 	it("validates positive, directory, negative, symlink, executable, and DSO evidence", async () => {
@@ -371,24 +363,11 @@ describe("process provenance certificates", () => {
 });
 
 function prototype(environment: Readonly<Record<string, string | undefined>> = { MODE: "build" }) {
-	const digest = (value: string) => sha256Digest(value);
-	return createExecPrototype({
+	return processPrototype({
 		executablePath: "/workspace/tool",
-		executableDigest: digest("executable"),
+		executableDigest: sha256Digest("executable"),
 		argv: ["tool", "--compile"],
-		logicalCwd: "/workspace",
 		environment,
-		umask: 0o22,
-		processContextDigest: digest("process-context"),
-		stdin: { type: "closed", eof: true },
-		fileDescriptorTableComplete: true,
-		inheritedFDs: [],
 		platformFingerprint: "linux-x64:kernel",
 	});
-}
-
-async function workspace(): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-provenance-"));
-	roots.push(root);
-	return root;
 }

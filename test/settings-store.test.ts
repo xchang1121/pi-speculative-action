@@ -1,14 +1,12 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SpeculativeActionSettingsStore } from "../src/settings-store.ts";
 
-const roots: string[] = [];
+const directories = temporaryDirectories("pi-spec-settings-");
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(directories.dispose);
 
 describe("extension-owned speculative settings", () => {
 	it("persists only the project overlay while preserving global inheritance", async () => {
@@ -76,8 +74,7 @@ describe("extension-owned speculative settings", () => {
 });
 
 async function fixture() {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-spec-settings-"));
-	roots.push(root);
+	const root = await directories.create();
 	const agent = path.join(root, "agent");
 	const cwd = path.join(root, "workspace");
 	await Promise.all([mkdir(agent, { recursive: true }), mkdir(cwd, { recursive: true })]);

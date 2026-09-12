@@ -1,6 +1,7 @@
 import { deferred } from "./async.ts";
+import { testModel } from "./model.ts";
 import { createHash } from "node:crypto";
-import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "../src/runtime.ts";
@@ -825,19 +826,8 @@ function action(key: string, hash: string, tool: string, input: Record<string, u
 	};
 }
 
-function model(): Model<Api> {
-	return {
-		id: "actor-model",
-		name: "Actor",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "http://localhost:8000/v1",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8_192,
-		maxTokens: 1_024,
-	};
+function model() {
+	return testModel("actor-model", { name: "Actor", baseUrl: "http://localhost:8000/v1", maxTokens: 1_024 });
 }
 
 function context(): Context {

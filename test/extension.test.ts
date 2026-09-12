@@ -1,9 +1,9 @@
 import { deferred } from "./async.ts";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
+import { testModel } from "./model.ts";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
 
 import {
 	type ExtensionAPI,
@@ -32,12 +32,12 @@ import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 
-const roots: string[] = [];
+const directories = temporaryDirectories("pi-spec-extension-");
 const hosts: SpeculativeActionHost[] = [];
 
 afterEach(async () => {
 	await Promise.all(hosts.splice(0).map((host) => host.dispose()));
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+	await directories.dispose();
 });
 
 describe("zero-modification Pi extension", () => {
@@ -435,8 +435,7 @@ interface FixtureOptions {
 }
 
 async function createFixture(options: FixtureOptions = {}) {
-	const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-spec-extension-"));
-	roots.push(cwd);
+	const cwd = await directories.create();
 	const handlers = new Map<string, Array<(event: never, context: ExtensionContext) => unknown>>();
 	const tools = new Map<string, ToolDefinition>();
 	const baseTools = piTools.createPiToolDefinitions(cwd);
@@ -482,10 +481,10 @@ async function createFixture(options: FixtureOptions = {}) {
 		mode: "tui",
 		hasUI: true,
 		ui,
-		model: testModel(),
+		model: testModel("mock"),
 		modelRegistry: {
 			complete: vi.fn(),
-			getAvailable: () => [testModel()],
+			getAvailable: () => [testModel("mock")],
 		},
 		sessionManager: { getSessionId: () => "session", getSessionFile: () => undefined },
 		isProjectTrusted: () => true,
@@ -601,19 +600,4 @@ function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabl
 
 function textResult(text: string): AgentToolResult<unknown> {
 	return { content: [{ type: "text", text }], details: {} };
-}
-
-function testModel(id = "mock"): Model<"openai-responses"> {
-	return {
-		id,
-		name: id,
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
 }

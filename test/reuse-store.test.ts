@@ -1,11 +1,11 @@
 import { deferred, nextTurn } from "./async.ts";
-import { mkdtemp, rm, unlink, utimes } from "node:fs/promises";
+import { unlink, utimes } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
+import { processPrototype } from "./process-fixture.ts";
 import * as filesystem from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	createExecPrototype,
 	digestObject,
 	parseProcessCertificate,
 	sealProcessCertificate,
@@ -16,15 +16,13 @@ import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 
-const roots: string[] = [];
+const { create: temporaryRoot, dispose } = temporaryDirectories("pi-reuse-store-");
 const PRODUCER = {
 	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
 	execution: { authority: "actor" as const },
 };
 
-afterEach(async () => {
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(dispose);
 
 describe("persistent provenance store", () => {
 	it.each(["held", "scan_failure", "delete_failure"] as const)("drains admitted publication and every maintenance sibling (%s)", async (phase) => {
@@ -145,7 +143,7 @@ describe("persistent provenance store", () => {
 		const store = new ProvenanceCertificateStore(root);
 		const missing = { digest: sha256Digest("missing"), size: 7 };
 		const certificate = sealProcessCertificate({
-			prototype: prototype(),
+			prototype: processPrototype(),
 			producer: PRODUCER,
 			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 			result: {
@@ -233,7 +231,7 @@ function completed(
 	observedProcessMs?: number,
 ) {
 	return sealProcessCertificate({
-		prototype: prototype(mode),
+		prototype: processPrototype({ environment: { MODE: mode } }),
 		producer: PRODUCER,
 		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 		result: {
@@ -244,27 +242,4 @@ function completed(
 		},
 		createdAt,
 	});
-}
-
-function prototype(mode = "test") {
-	const digest = (value: string) => sha256Digest(value);
-	return createExecPrototype({
-		executablePath: "/bin/tool",
-		executableDigest: digest("tool"),
-		argv: ["tool"],
-		logicalCwd: "/workspace",
-		environment: { MODE: mode },
-		umask: 0o22,
-		processContextDigest: digest("process-context"),
-		stdin: { type: "closed", eof: true },
-		fileDescriptorTableComplete: true,
-		inheritedFDs: [],
-		platformFingerprint: "linux",
-	});
-}
-
-async function temporaryRoot(): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-reuse-store-"));
-	roots.push(root);
-	return root;
 }

@@ -1,9 +1,10 @@
 import { deferred, nextTurn } from "./async.ts";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { writeFile } from "node:fs/promises";
+import { temporaryDirectories } from "./filesystem.ts";
+import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AssistantMessage, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
 import { createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
@@ -25,7 +26,7 @@ import {
 	SelfSpeculationCoordinator,
 } from "../src/self-speculation.ts";
 
-const roots: string[] = [];
+const directories = temporaryDirectories("pi-spec-host-");
 const readSchema = Type.Object({
 	path: Type.String(),
 	offset: Type.Optional(Type.Number()),
@@ -43,21 +44,6 @@ const mockToolCalls = [
 	["write", { path: "generated.txt", content: "ready" }],
 	["edit", { path: "notes.txt", edits: [{ oldText: "one", newText: "ready" }] }],
 ] as const;
-
-function model(id = "actor"): Model<"openai-responses"> {
-	return {
-		id,
-		name: id,
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
 
 function assistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
 	return {
@@ -104,16 +90,15 @@ function startInput(tool: AgentTool, turnID = "turn-1") {
 	};
 }
 
-async function temporaryWorkspace(base = os.tmpdir()): Promise<string> {
-	const root = await mkdtemp(path.join(base, "pi-spec-host-"));
-	roots.push(root);
+async function temporaryWorkspace(base?: string): Promise<string> {
+	const root = await directories.create(base);
 	await writeFile(path.join(root, "notes.txt"), "one\ntwo\nthree\nfour", "utf8");
 	return root;
 }
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+	await directories.dispose();
 });
 
 describe("speculative action host", () => {
