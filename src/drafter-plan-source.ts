@@ -49,6 +49,31 @@ interface DrafterPlanFeedback extends DrafterBatch {
 	claimed: boolean;
 }
 
+/** Shared preparation belongs to all live proposals, until the batch retires. */
+class DrafterPreparation {
+	private readonly controller = new AbortController();
+	private readonly owners = new Map<AbortSignal, () => void>();
+	readonly signal = this.controller.signal;
+	readonly ready: Promise<DrafterBatch | undefined>;
+
+	constructor(prepare: (signal: AbortSignal) => Promise<DrafterBatch | undefined>) {
+		this.ready = Promise.resolve().then(() => this.signal.aborted ? undefined : prepare(this.signal));
+	}
+
+	retain(signal: AbortSignal): void {
+		if (signal.aborted || this.signal.aborted || this.owners.has(signal)) return;
+		const release = () => { this.owners.delete(signal); if (!this.owners.size) this.dispose(); };
+		this.owners.set(signal, release);
+		signal.addEventListener("abort", release, { once: true });
+	}
+
+	dispose(): void {
+		this.controller.abort();
+		for (const [signal, release] of this.owners) signal.removeEventListener("abort", release);
+		this.owners.clear();
+	}
+}
+
 export interface DrafterPlanSourceController {
 	readonly source: AgentPlanSource;
 	readonly snapshot: () => DrafterUtilityGateSnapshot;
@@ -63,8 +88,15 @@ export function createDrafterPlanSource(input: {
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
 }): DrafterPlanSourceController {
-	const batches = new Map<string, Promise<DrafterBatch>>();
+	const batches = new Map<string, DrafterPreparation>();
 	const gate = new DrafterUtilityGate();
+	const finishBatch = (key: string) => {
+		const batch = batches.get(key);
+		batches.delete(key);
+		batch?.dispose();
+		// Model/auth failures are already represented by source request events.
+		void batch?.ready.then((value) => { if (value) gate.finish(value.utility); }).catch(() => {});
+	};
 	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, prefix: string,
 		depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
 		signal.throwIfAborted();
@@ -122,14 +154,16 @@ export function createDrafterPlanSource(input: {
 			signal,
 			settings,
 		}): Promise<PlanProposal | undefined> => {
+			if (signal.aborted) return undefined;
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
-				batch = (async () => {
+				batch = new DrafterPreparation(async (signal) => {
 					const model = (
 						typeof input.draftModel === "function"
 							? await input.draftModel(startInput.actorModel)
 							: input.draftModel) ?? startInput.actorModel;
+					if (signal.aborted) return undefined;
 					const utility = gate.start(
 						JSON.stringify([model.provider, model.api, model.baseUrl, model.id]),
 						settings.sourceConfig?.drafterGateEnabled !== false,
@@ -144,6 +178,7 @@ export function createDrafterPlanSource(input: {
 								})
 							: startInput.actorOptions
 						: undefined;
+					if (signal.aborted) return undefined;
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, input.getDraftOptions ? requestedReasoning ?? "off" : "off");
@@ -154,11 +189,13 @@ export function createDrafterPlanSource(input: {
 						utility,
 						tools: new Set(candidateNames.filter((name) => data.tools.has(name))),
 					};
-				})();
+				});
 				batches.set(batchKey, batch);
 			}
-			const prepared = await batch;
-			if (!prepared.utility.allowed || signal.aborted) return undefined;
+			batch.retain(signal);
+			signal = AbortSignal.any([signal, batch.signal]);
+			const prepared = await batch.ready;
+			if (!prepared?.utility.allowed || signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
 				...prepared.options,
@@ -171,7 +208,7 @@ export function createDrafterPlanSource(input: {
 				cacheRetention: prepared.options.cacheRetention ?? "short",
 			};
 			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
-			if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, signal);
+			if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
 			const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
 			return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 		},
@@ -195,12 +232,7 @@ export function createDrafterPlanSource(input: {
 	return {
 		source,
 		snapshot: () => gate.snapshot(),
-		finishTurn: (sessionID, turnID) => {
-			const key = agentBatchKey(sessionID, turnID), batch = batches.get(key);
-			batches.delete(key);
-			// Model/auth failures are already represented by source request events.
-			void batch?.then((value) => gate.finish(value.utility)).catch(() => {});
-		},
+		finishTurn: (sessionID, turnID) => finishBatch(agentBatchKey(sessionID, turnID)),
 		actorActionSettled: async (feedback) => {
 			const { settlement } = feedback;
 			const owner = asDrafterPlanFeedback(feedback.candidateFeedback);
@@ -214,7 +246,7 @@ export function createDrafterPlanSource(input: {
 			gate.creditAdoption(owner.utility, settlement.provider.timing);
 		},
 		finishSession: () => {
-			batches.clear();
+			for (const key of batches.keys()) finishBatch(key);
 			gate.reset();
 		},
 	};

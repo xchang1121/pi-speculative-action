@@ -907,6 +907,10 @@ describe("speculative action host", () => {
 		const complete = vi.fn(async () => drafterCall({ path: "notes.txt" }));
 		const tool = createReadTool(cwd);
 		const world = toolRuntimeWorld(), prepare = vi.fn(async () => {});
+		const getDraftOptions = vi.fn(async () => {
+			if (phase === "options") { entered.resolve(); await release.promise; }
+			return {};
+		});
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: settings,
@@ -914,10 +918,7 @@ describe("speculative action host", () => {
 				if (phase === "model") { entered.resolve(); await release.promise; }
 				return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
 			},
-			getDraftOptions: async () => {
-				if (phase === "options") { entered.resolve(); await release.promise; }
-				return {};
-			},
+			getDraftOptions,
 			complete,
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
 			preflight: () => true,
@@ -939,7 +940,42 @@ describe("speculative action host", () => {
 			}
 			expect(complete).not.toHaveBeenCalled();
 			expect(prepare).not.toHaveBeenCalled();
+			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" ? 0 : 1);
 		} finally { release.resolve(); await closing; await host.dispose(); }
+		if (phase === "context") return;
+
+		const sharing = deferred(), resume = deferred(), owners = [new AbortController(), new AbortController()];
+		const waitStage = async (stage: string) => { if (stage === phase) { sharing.resolve(); await resume.promise; } };
+		const selectModel = vi.fn(async () => { await waitStage("model"); return model("draft"); });
+		const options = vi.fn(async ({ signal }: { signal: AbortSignal }) => {
+			await waitStage("options"); signal.throwIfAborted(); return {};
+		});
+		const prepareExecution = vi.fn(), shared = createDrafterPlanSource({ sessionID: "shared", draftModel: selectModel, getDraftOptions: options, complete });
+		const propose = (owner: AbortController, proposalIndex: number, turnID = "turn-1") => shared.source.propose({
+			startInput: { ...startInput(tool, turnID), sessionID: "shared" },
+			settings: { ...settings(2), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
+			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution }, definitions: [], candidateNames: ["read"],
+			proposalIndex, proposalCount: owners.length, signal: owner.signal,
+		});
+		const proposals = owners.map((owner, index) => propose(owner, index));
+		try {
+			await sharing.promise; owners[0]!.abort();
+			if (phase === "options") expect(options.mock.calls[0]![0].signal.aborted).toBe(false);
+			resume.resolve();
+			const [cancelled, surviving] = await Promise.all(proposals);
+			expect(cancelled).toBeUndefined(); expect(surviving).toMatchObject({ actions: [{ tool: "read" }] });
+			expect(selectModel).toHaveBeenCalledOnce(); expect(options).toHaveBeenCalledOnce(); expect(complete).toHaveBeenCalledOnce();
+			shared.finishTurn("shared", "turn-1");
+			expect(options.mock.calls[0]![0].signal.aborted).toBe(true);
+			const later = [new AbortController(), new AbortController()];
+			await Promise.all(later.map((owner, index) => propose(owner, index, "turn-2")));
+			const warming = prepareExecution.mock.calls.at(-1)![1] as AbortSignal;
+			expect(prepareExecution).toHaveBeenCalledTimes(2);
+			later[0]!.abort(); expect(warming.aborted).toBe(false);
+			later[1]!.abort(); expect(warming.aborted).toBe(true);
+		} finally {
+			resume.resolve(); owners.forEach(owner => owner.abort()); shared.finishSession(); await Promise.allSettled(proposals);
+		}
 	});
 
 });
