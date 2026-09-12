@@ -1539,9 +1539,10 @@ async function captureDependencies(
 		dependencies.set(identity, dependency);
 	};
 
+	const interposed = new Set(session.interposition.executables.map(([target]) => path.resolve(target)));
 	for (const item of observed) {
 		const observedPath = path.resolve(item.path);
-		if (isInterposedLauncher(session, observedPath)) continue;
+		if (interposed.has(observedPath)) continue;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {
 			taints.add("escaped_sandbox");
 			incompleteReasons.add(`denied:${observedPath}`);
@@ -1619,11 +1620,6 @@ async function captureDependencies(
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
-
-function isInterposedLauncher(session: ActiveSession, target: string): boolean {
-	const normalized = path.resolve(target);
-	return session.interposition.executables.some(([intercepted]) => path.resolve(intercepted) === normalized);
-}
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
 	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot)
