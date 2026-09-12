@@ -479,6 +479,7 @@ export class LinuxProcessReuseBackend {
 			sourceRoot,
 			workspaceRoot: input.workspace.sandboxRoot,
 			workspaceExcludes: input.workspace.observationExcludes,
+			signal: input.signal,
 			token,
 			socketPath,
 			dispatcherBinary: ready.dispatcher,
@@ -490,6 +491,7 @@ export class LinuxProcessReuseBackend {
 				ready.strace,
 			],
 		});
+		throwIfAborted(input.signal);
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
@@ -1788,6 +1790,7 @@ async function createProcessInterposition(input: {
 	readonly sourceRoot: string;
 	readonly workspaceRoot: string;
 	readonly workspaceExcludes: readonly string[];
+	readonly signal?: AbortSignal;
 	readonly token: string;
 	readonly socketPath: string;
 	readonly dispatcherBinary: string;
@@ -1804,6 +1807,7 @@ async function createProcessInterposition(input: {
 	const directories: InterposedDirectory[] = [];
 	const seenTargets = new Set<string>();
 	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
+		throwIfAborted(input.signal);
 		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
 		const logicalDirectory = path.resolve(rawDirectory);
 		if (seenTargets.has(logicalDirectory)) continue;
@@ -1827,6 +1831,7 @@ async function createProcessInterposition(input: {
 		});
 	}
 	const configurationPath = path.join(root, "configuration.json");
+	throwIfAborted(input.signal);
 	const configuration = {
 		version: 2,
 		socketPath: input.socketPath,
@@ -1848,6 +1853,7 @@ async function createProcessInterposition(input: {
 	const dependencies: DynamicDependency[] = [];
 	const dependencySources = new Set<string>();
 	for (const directory of directories) {
+		throwIfAborted(input.signal);
 		await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
 		await writeFile(
 			path.join(directory.view, ".pi-spec-dispatch-v1"),
@@ -1861,32 +1867,36 @@ async function createProcessInterposition(input: {
 			continue;
 		}
 		// Bound independent entry preparation; every probe and link settles before evidence capture.
-		for (let start = 0; start < entries.length; start += 16) await Promise.all(entries.slice(start, start + 16).map(async (name) => {
-			if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) return;
-			const sourceEntry = path.join(directory.source, name);
-			const viewEntry = path.join(directory.view, name);
-			try {
-				const resolved = await realpath(sourceEntry);
-				const resolvedStat = await lstat(resolved);
-				let executable = resolvedStat.isFile() && !excluded.has(resolved);
-				if (executable) {
-					try {
-						await access(sourceEntry, fsConstants.X_OK);
-					} catch {
-						executable = false;
+		for (let start = 0; start < entries.length; start += 16) {
+			throwIfAborted(input.signal);
+			await Promise.all(entries.slice(start, start + 16).map(async (name) => {
+				if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) return;
+				const sourceEntry = path.join(directory.source, name);
+				const viewEntry = path.join(directory.view, name);
+				try {
+					const resolved = await realpath(sourceEntry);
+					const resolvedStat = await lstat(resolved);
+					let executable = resolvedStat.isFile() && !excluded.has(resolved);
+					if (executable) {
+						try {
+							await access(sourceEntry, fsConstants.X_OK);
+						} catch {
+							executable = false;
+						}
 					}
+					if (executable) {
+						await link(launcher, viewEntry);
+						const intercepted = path.join(directory.target, name);
+						executables.push([intercepted, path.join(directory.shadow, name)]);
+						executables.push([viewEntry, path.join(directory.shadow, name)]);
+						execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
+					}
+				} catch {
+					// An entry that cannot be proved executable remains visible through its original directory.
 				}
-				if (executable) {
-					await link(launcher, viewEntry);
-					const intercepted = path.join(directory.target, name);
-					executables.push([intercepted, path.join(directory.shadow, name)]);
-					executables.push([viewEntry, path.join(directory.shadow, name)]);
-					execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
-				}
-			} catch {
-				// An entry that cannot be proved executable remains visible through its original directory.
-			}
-		}));
+			}));
+		}
+		throwIfAborted(input.signal);
 		if (!dependencySources.has(directory.source)) {
 			dependencySources.add(directory.source);
 			dependencies.push(

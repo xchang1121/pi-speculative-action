@@ -414,6 +414,53 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
+	test("cancels PATH preparation after draining admitted entry probes", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-process-interposition-cancel-");
+		const { realpath: resolvePath } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const controller = new AbortController(), entered = deferred(), gate = deferred();
+		let activeRoot: string | undefined, held = false, returned = false, probesAfterAbort = 0;
+		const open = fixture.backend.open.bind(fixture.backend);
+		const opening = vi.spyOn(fixture.backend, "open").mockImplementation((input) => {
+			activeRoot = input.workspace.sandboxRoot; return open(input);
+		});
+		const resolving = vi.spyOn(filesystem, "realpath").mockImplementation((...args) => {
+			const target = String(args[0]);
+			if (path.dirname(target) === activeRoot && path.basename(target).startsWith("probe-")) {
+				if (controller.signal.aborted) probesAfterAbort++;
+				if (!held) { held = true; entered.resolve(); return gate.promise.then(() => resolvePath(...args)); }
+			}
+			return resolvePath(...args);
+		});
+		const listening = vi.spyOn(net.Server.prototype, "listen");
+		let running: ReturnType<typeof forkReusableBash> | undefined;
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") return skip(status.detail);
+			for (let index = 0; index < 33; index++) {
+				const target = path.join(fixture.workspace, `probe-${index}`);
+				await writeFile(target, "#!/bin/sh\nexit 0\n"); await chmod(target, 0o755);
+			}
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const args = { command: ":" };
+			const context = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
+			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "cancel-interposition", { fingerprint: executionFingerprint, context })!;
+			running = fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
+				callID: "cancel-interposition", signal: controller.signal });
+			void running.then(() => { returned = true; }, () => { returned = true; });
+			await Promise.race([entered.promise, running]); controller.abort(); await nextTurn();
+			expect({ returned, owned: existsSync(activeRoot!) }).toEqual({ returned: false, owned: true });
+			gate.resolve(); await expect(running).rejects.toThrow();
+			const brokerStarted = listening.mock.calls.some(([address]) => typeof address === "string" && path.basename(address).startsWith("broker-"));
+			const afterAbort = { probesAfterAbort, brokerStarted };
+			expect(afterAbort, `cancelled preparation cannot continue: ${JSON.stringify(afterAbort)}`).toEqual({ probesAfterAbort: 0, brokerStarted: false });
+			await expect(stat(activeRoot!)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			gate.resolve(); await running?.then((branch) => branch.dispose(), () => undefined);
+			opening.mockRestore(); resolving.mockRestore(); listening.mockRestore(); await fixture.dispose();
+		}
+	}, 15_000);
+
 	test("defers native initialization and preserves opaque process output without path rewriting", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
 		const storeRoot = path.join(root, "store");
