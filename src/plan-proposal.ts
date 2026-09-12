@@ -52,10 +52,4 @@ export interface PlanDelta {
 
 export type PlanUpdate = PlanProposal | PlanDelta;
 
-export interface MaterializedPlan {
-	readonly id: string;
-	readonly source: string;
-	readonly revision: number;
-	readonly actions: readonly PlanAction[];
-	readonly draftTokens: number;
-}
+export interface MaterializedPlan extends Required<PlanProposal> {}

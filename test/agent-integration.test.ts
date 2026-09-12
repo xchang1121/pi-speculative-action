@@ -1,3 +1,4 @@
+import { textResult } from "./result.ts";
 import { deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { writeFile } from "node:fs/promises";
@@ -288,7 +289,7 @@ describe("speculative action host", () => {
 				const speculativeExecution = vi.fn(async () => {
 					started.resolve();
 					await gate;
-					return { content: [{ type: "text" as const, text: expected }], details: {} };
+					return textResult(expected);
 				});
 				const actorExecution = vi.fn(async () => speculativeExecution());
 				const permissions: Array<{ args: unknown; action: { input: unknown } }> = [];
@@ -534,7 +535,7 @@ describe("speculative action host", () => {
 			const descriptor = structuredClone(metadata);
 			const problem = new Error("selected executor unavailable");
 			const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
-			const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "built" }], details: {} }));
+			const actor = vi.fn(async () => textResult("built"));
 			const settled = vi.fn();
 			const resolveInvocation = vi.fn(async () => {
 				const invocation = { executor: profile, identity: metadata, process: metadata };
@@ -599,7 +600,7 @@ describe("speculative action host", () => {
 		for (const [shape, make, inspect] of shapes) for (const boundary of ["input", "identity", "process"] as const) for (const next of [0, 1]) {
 			let profile = 0;
 			const ready = deferred<void>(), disposed = vi.fn();
-			const result = (value: number) => ({ content: [{ type: "text" as const, text: String(value) }], details: {} });
+			const result = (value: number) => textResult(String(value));
 			const actor = vi.fn(async (input: { value: unknown }) => result(boundary === "input" ? inspect(input.value) : profile));
 			const tool: AgentTool<typeof mockToolSchema> = { name: "inspect", label: "inspect", description: "Pure fixture inspection",
 				parameters: mockToolSchema, prepareArguments: (input) => { const { value } = input as { value: number }; return { value: boundary === "input" ? make(value) : value }; },
@@ -636,12 +637,12 @@ describe("speculative action host", () => {
 		(phase === "running" ? ["suffix", "preflight", "missing", "recheck"] : ["suffix", "preflight", "recheck"]).map((mode) => [phase, mode])))
 	("keeps %s Bash on exactly one Actor fallback when %s rejects reuse", async (phase, mode) => {
 		const cwd = await temporaryWorkspace(), started = deferred<void>(), finish = deferred<void>(), completed = deferred<void>();
-		const actor = vi.fn(async () => ({ content: [{ type: "text" as const, text: "tail arguments: -n 2" }], details: {} }));
+		const actor = vi.fn(async () => textResult("tail arguments: -n 2"));
 		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor };
 		const dispose = vi.fn();
 		const sandbox = mockRuntimeWorld(async () => {
 			started.resolve(); await finish.promise;
-			return { result: { content: [{ type: "text", text: "tail arguments: -n 3" }], details: {} }, isError: false };
+			return { result: textResult("tail arguments: -n 3"), isError: false };
 		}, dispose);
 		let allowed = mode !== "preflight";
 		const preflight = vi.fn(({ signal }: { signal: AbortSignal }) => {
@@ -782,7 +783,7 @@ describe("speculative action host", () => {
 			parameters: readSchema,
 			execute: async (_id, input) => {
 				await new Promise((resolve) => setTimeout(resolve, 80));
-				return { content: [{ type: "text", text: input.path }], details: {} };
+				return textResult(input.path);
 			},
 		};
 		const host = createSpeculativeActionHost("session", {
@@ -869,7 +870,7 @@ describe("speculative action host", () => {
 				(event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded",
 			),
 		);
-		const missed = vi.fn(async () => ({ content: [{ type: "text" as const, text: "actor-miss.txt" }], details: {} }));
+		const missed = vi.fn(async () => textResult("actor-miss.txt"));
 		expect((await host.execute({
 			turnID: "fork-miss",
 			id: "actor-miss",
@@ -1074,14 +1075,14 @@ async function patternRebaseFixture() {
 		label: "grep",
 		description: "grep",
 		parameters: grepSchema,
-		execute: async () => ({ content: [{ type: "text", text: "notes.txt:1:one" }], details: {} }),
+		execute: async () => textResult("notes.txt:1:one"),
 	};
 	const readTool: AgentTool<typeof readSchema> = {
 		name: "read",
 		label: "read",
 		description: "read",
 		parameters: readSchema,
-		execute: async () => ({ content: [{ type: "text", text: "one" }], details: {} }),
+		execute: async () => textResult("one"),
 	};
 	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };

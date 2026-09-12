@@ -1,9 +1,9 @@
+import { textResult } from "./result.ts";
 import { deferred } from "./async.ts";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel } from "./model.ts";
 import path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import {
 	type ExtensionAPI,
@@ -154,7 +154,7 @@ describe("zero-modification Pi extension", () => {
 		const fixture = await createFixture({ settings: { searchExecution: "captured" } });
 		vi.stubEnv("PI_CODING_AGENT_DIR", fixture.cwd);
 		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockRejectedValue(new Error("Requalify Pi's installed minimatch"));
-		const native = vi.fn(async () => ({ content: [{ type: "text" as const, text: "native find" }], details: {} })); fixture.baseTools.get("find")!.execute = native;
+		const native = vi.fn(async () => textResult("native find")); fixture.baseTools.get("find")!.execute = native;
 		const definitions = vi.spyOn(piTools, "createPiToolDefinitions").mockReturnValue(fixture.baseTools);
 		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
 		try {
@@ -596,8 +596,4 @@ function memorySettingsStore(initial: SpeculativeActionPackageSettings = { enabl
 		},
 		flush: async () => undefined,
 	};
-}
-
-function textResult(text: string): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details: {} };
 }

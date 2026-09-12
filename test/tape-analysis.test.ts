@@ -322,9 +322,7 @@ function content(value: string): string {
 }
 
 function call(name: string, argumentsDelta: string): string {
-	return `data: ${JSON.stringify({
-		choices: [{ delta: { tool_calls: [{ index: 0, function: { name, arguments: argumentsDelta } }] } }],
-	})}\n\ndata: [DONE]\n\n`;
+	return calls([name, argumentsDelta]);
 }
 
 function calls(...entries: readonly (readonly [name: string, argumentsDelta: string])[]): string {

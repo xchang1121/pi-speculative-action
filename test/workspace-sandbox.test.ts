@@ -1,5 +1,5 @@
 import { deferred } from "./async.ts";
-import { execFile } from "node:child_process";
+import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -865,15 +865,6 @@ async function temporaryRoot(label: string): Promise<string> {
 	return root;
 }
 
-function runProgram(executable: string, args: readonly string[], cwd?: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8", cwd }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable} failed: ${stderr || error.message}`, { cause: error }));
-			else resolve(stdout);
-		});
-	});
-}
-
 async function fuseOverlayMountTargets(): Promise<string[]> {
 	if (process.platform !== "linux") return [];
 	const mountInfo = await readFile("/proc/self/mountinfo", "utf8");
@@ -901,8 +892,4 @@ async function completesWithin(operation: Promise<void>, timeoutMs: number): Pro
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
-}
-
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'\\''`)}'`;
 }

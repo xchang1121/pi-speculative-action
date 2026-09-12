@@ -1,3 +1,4 @@
+import { textResult } from "./result.ts";
 import { deferred as barrier } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { readFile, writeFile } from "node:fs/promises";
@@ -286,10 +287,6 @@ function fileRead(cwd: string, before?: (file: string) => Promise<void>): AgentT
 			return textResult(await readFile(path.join(cwd, args.path), "utf8"));
 		},
 	};
-}
-
-function textResult(text: string): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details: {} };
 }
 
 function drafterSettings(): SpeculativeAgentSettingsInput {

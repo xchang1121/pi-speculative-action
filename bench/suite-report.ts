@@ -35,16 +35,7 @@ export interface PairedLatencyObservation {
 	readonly treatmentMs: number;
 }
 
-export interface PairedLatencyStatistics {
-	readonly pairs: number;
-	readonly clusters: number;
-	readonly ratioOfMeans: number;
-	readonly ratioOfMeansCI95?: readonly [number, number];
-	readonly baselineMeanMs: number;
-	readonly treatmentMeanMs: number;
-	readonly meanDifferenceMs: number;
-	readonly meanDifferenceCI95?: readonly [number, number];
-}
+export type PairedLatencyStatistics = ReturnType<typeof pairedLatencyStatistics>;
 
 export function summarizeSuite(
 	runs: readonly SuiteBenchmarkRun[],
@@ -93,7 +84,7 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 export function pairedLatencyStatistics(
 	observations: readonly PairedLatencyObservation[],
 	options: SuiteStatisticsOptions = {},
-): PairedLatencyStatistics {
+) {
 	if (!observations.length) throw new Error("paired latency statistics require at least one observation");
 	for (const observation of observations) {
 		if (
@@ -137,7 +128,7 @@ export function pairedLatencyStatistics(
 		...(differences.length
 			? { meanDifferenceCI95: [quantile(differences, 0.025), quantile(differences, 0.975)] as const }
 			: {}),
-	};
+	} as const;
 }
 
 function pooled(runs: readonly SuiteBenchmarkRun[], options: Required<SuiteStatisticsOptions>) {

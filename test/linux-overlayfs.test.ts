@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { runProgram as output, shellQuote } from "./command.ts";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -137,16 +137,3 @@ describe("Linux OverlayFS workspace substrate", () => {
 		}
 	});
 });
-
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function output(executable: string, args: readonly string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8" }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable} failed: ${stderr || error.message}`, { cause: error }));
-			else resolve(stdout);
-		});
-	});
-}
