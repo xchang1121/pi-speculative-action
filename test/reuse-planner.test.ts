@@ -177,12 +177,12 @@ describe("ProcessReusePlanner", () => {
 		} finally { freezing.mockRestore(); find.mockRestore(); }
 	});
 
-	it("captures one dynamic pathset once when matching several historical input states", async () => {
+	it.each(["l2", "live"])("captures one dynamic pathset once across several %s input states", async (source) => {
 		const root = await temporaryRoot();
 		const input = path.join(root, "input.txt");
 		const store = new ProvenanceCertificateStore(path.join(root, "cache"));
 		const prototype = processPrototype();
-		let oldestID: string | undefined;
+		const certificates = [];
 		for (const [index, value] of ["one", "two", "three"].entries()) {
 			await writeFile(input, value);
 			const dependency = await captureFileDependency(input, "/workspace/input.txt");
@@ -198,7 +198,7 @@ describe("ProcessReusePlanner", () => {
 				},
 				createdAt: index + 1,
 			});
-			oldestID ??= certificate.id;
+			certificates.unshift(certificate);
 			await store.put(certificate);
 		}
 		await writeFile(input, "one");
@@ -207,11 +207,12 @@ describe("ProcessReusePlanner", () => {
 			weakKey: processWeakKey(prototype),
 			contract: contract(),
 			validation: { resolvePath: () => input },
+			...(source === "live" ? { live: { certificate: certificates, acceptedTaints: [] } } : {}),
 		});
 
 		expect(plan).toMatchObject({
 			kind: "completed_replay",
-			certificate: { id: oldestID },
+			source, certificate: { id: certificates[2]!.id },
 			lookup: {
 				candidateCertificates: 3,
 				eligibleCertificates: 3,

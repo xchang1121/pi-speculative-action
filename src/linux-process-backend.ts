@@ -814,7 +814,7 @@ export class LinuxProcessReuseBackend {
 
 	private async acquireProcessResult(
 		weakKey: Sha256Digest,
-		lookup: (live?: ProcessProvenanceCertificate) => Promise<CompletedProcessPlan | undefined>,
+		lookup: (live?: readonly ProcessProvenanceCertificate[]) => Promise<CompletedProcessPlan | undefined>,
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership },
@@ -859,7 +859,7 @@ export class LinuxProcessReuseBackend {
 		projection: ExecutionPathProjection,
 		acceptProducer: (producer: ProcessProducerProof) => boolean,
 		session?: ActiveSession,
-		live?: ProcessProvenanceCertificate,
+		live?: readonly ProcessProvenanceCertificate[],
 	): Promise<CompletedProcessPlan | undefined> {
 		const plan = await this.planner.plan({
 			weakKey,

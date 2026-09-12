@@ -30,9 +30,9 @@ export interface ProcessReuseRequest {
 	readonly validation?: ProvenanceValidationContext;
 	/** Optional host policy for accepting proof produced under a different execution authority. */
 	readonly acceptProducer?: (proof: ProcessProducerProof) => boolean;
-	/** One already-reserved running result; accepted taints are never written into persistent history. */
+	/** Same-scope handoff candidates; accepted taints are never written into persistent history. */
 	readonly live?: {
-		readonly certificate: ProcessProvenanceCertificate;
+		readonly certificate: ProcessProvenanceCertificate | readonly ProcessProvenanceCertificate[];
 		readonly acceptedTaints: readonly ProvenanceTaint[];
 	};
 }
@@ -105,12 +105,12 @@ export class ProcessReusePlanner {
 			});
 		const weakKey = request.weakKey;
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
-		const live = request.live?.certificate.weakKey === weakKey ? request.live : undefined;
+		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
 		const acceptedTaints = [...new Set([
 			...(request.validation?.acceptedTaints ?? []),
-			...(live?.acceptedTaints ?? []),
+			...(live.length ? request.live!.acceptedTaints : []),
 		])];
-		const certificates = live ? [live.certificate] : await this.store.findByWeakKey(weakKey);
+		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey);
 		candidateCertificates = certificates.length;
 		if (!certificates.length) {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
@@ -183,7 +183,7 @@ export class ProcessReusePlanner {
 				artifactBytesRead += artifacts.bytes;
 				return {
 					kind: "completed_replay",
-					source: live ? "live" : "l2",
+					source: live.length ? "live" : "l2",
 					weakKey,
 					certificate,
 					validation,

@@ -49,7 +49,7 @@ export type ProcessHandoffAcquisition<Plan> =
 interface AcquireBase<Plan> {
 	readonly key: Sha256Digest;
 	readonly scope?: ExecutionScope;
-	readonly lookup: (candidate?: ProcessProvenanceCertificate) => Promise<Plan | undefined>;
+	readonly lookup: (candidates?: readonly ProcessProvenanceCertificate[]) => Promise<Plan | undefined>;
 }
 
 type AcquireOptions<Plan> = AcquireBase<Plan> & (
@@ -75,22 +75,28 @@ export class ProcessHandoffRegistry {
 		this.trim();
 	}
 
-	async acquire<Plan>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
+	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		let joined = false, historyChecked = false;
 		const considered = new Set<HandoffRecord>();
 		while (true) {
 			const records = this.byKey.get(options.key) ?? [];
-			for (const record of [...records].reverse()) {
+			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
-				if (state.status !== "completed" || !state.candidate || considered.has(record) || !sameScope(record.scope, options.scope)) continue;
-				considered.add(record);
-				const candidate = state.candidate, oneShot = candidate.dependencyCertificate.taints.length > 0;
-				if (oneShot && record.ownership.wholeClaimed) continue;
-				const plan = await options.lookup(candidate);
-				if (!plan || record.state !== state || (oneShot && !record.ownership.claimChild())) continue;
-				record.state = { status: "claimed" };
-				this.remove(options.key, record);
-				return { kind: "hit", plan, joined };
+				if (state.status !== "completed" || !state.candidate || considered.has(record) || !sameScope(record.scope, options.scope)) return [];
+				const oneShot = state.candidate.dependencyCertificate.taints.length > 0;
+				return oneShot && record.ownership.wholeClaimed ? [] : [{ record, state, candidate: state.candidate, oneShot }];
+			});
+			if (completed.length) {
+				const plan = await options.lookup(completed.map(({ candidate }) => candidate));
+				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
+				for (const { record } of selected ? [selected] : completed) considered.add(record);
+				if (plan && selected && selected.record.state === selected.state &&
+					(!selected.oneShot || selected.record.ownership.claimChild())) {
+					selected.record.state = { status: "claimed" };
+					this.remove(options.key, selected.record);
+					return { kind: "hit", plan, joined };
+				}
+				continue;
 			}
 			if (!historyChecked) {
 				const plan = await options.lookup();
