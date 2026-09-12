@@ -4,6 +4,7 @@
 
 ### 动作身份与预测
 
+- perf: PatternAware 在同一后缀节点共用历史和输出形状，匹配直接返回所属模式；学习和裁剪使用连续批次起点，省去逐事件索引、重复展开和过滤。PPM 上下文仅在需要估计时构造，模式顺序、输出形状通配和批次因果边界保持一致。
 - fix: Drafter 在批次边界独立确定 thinking effort 和输出预算；尊重 `getDraftOptions` 的显式 effort，续轮沿用。thinking 请求使用 `tool_choice: auto`，避免 DeepSeek 拒绝强制工具调用；默认仍不继承 Actor 的思考强度或 token 上限。
 - Drafter、Actor probe 和 PatternAware 共用计划、调度与结算。参数准备一次，仅自有无损纯数据树可生成 K(a)；不支持的值保留 Actor 原调用及错误语义。新鲜度另行证明，预测命中仍要求请求覆盖。
 - 计划先捕获不可变输入、再按修订准入；父语义变化重绑后代，Actor 借用保留结算权。查询先筛节点，再读取当前依赖状态。

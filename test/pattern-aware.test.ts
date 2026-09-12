@@ -1001,8 +1001,16 @@ describe("PatternAware", () => {
 		expect(store.predict("probe-after-four")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
-		store.observe(input({ sessionID: "wrong-output", tool: "inspect", input: {}, output: { kind: "text" } }));
-		expect(store.predict("wrong-output").find((item) => item.tool === "read")).toBeUndefined();
+		for (const [sessionID, overrides, matches] of [
+			["wrong-output", { output: { kind: "text" } }, false],
+			["unknown-output", { output: {} }, true],
+			["wrong-tool", { tool: "other" }, false],
+			["wrong-outcome", { outcome: "failure" as const }, false],
+			["wrong-operation", { operation: "other" }, false],
+		] as const) {
+			store.observe(input({ sessionID, tool: "inspect", input: {}, ...overrides }));
+			expect(store.predict(sessionID).some((item) => item.tool === "read"), sessionID).toBe(matches);
+		}
 	});
 
 	test("learns a reusable read range from varying actor windows", () => {

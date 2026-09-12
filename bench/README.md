@@ -28,6 +28,14 @@ ThinkThread 要在真实 Profile 的 `THINKTHREAD_FS` 根目录运行并通过�
 
 `--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O；嵌套时长不能相加，性能结论使用不插桩的运行。`--resource-baseline`、`--workspace-baseline`、`--handoff-baseline` 接受对应旧构建模块的绝对路径，用于同一驱动下的相邻对照。结果文件必须不存在。
 
+## PatternAware 历史与绑定
+
+```sh
+node bench/pattern-latency.mjs . /absolute/output/pattern.json /absolute/old-pattern-aware.js
+```
+
+旧模块须来自同一依赖版本的构建；省略时只测当前版本。默认比较搜索结果宽度 0、96、512 的三组历史，每组五轮交替顺序，逐项核对预测前沿和最终学习状态。可追加真实 `PatternAwareEventInput[]` JSON 路径，重放该历史，仍不发 API。计时包含学习、预测、快照和结算，单列 observe/predict；它是组件对照。
+
 ## 受控搜索资格
 
 先完成 `npm run build`，再按需要选择低负载命令：

@@ -251,7 +251,7 @@ type PatternPool = {
 
 type TrieNode = {
 	readonly children: Map<string, TrieNode>;
-	readonly patterns: Set<string>;
+	readonly patterns: Set<MutablePattern>;
 };
 
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
@@ -278,7 +278,7 @@ const PERSISTENCE_VERSION = 18;
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
 
-	insert(pattern: Pick<MutablePattern, "id" | "context">) {
+	insert(pattern: MutablePattern) {
 		let node = this.root;
 		for (let index = pattern.context.length - 1; index >= 0; index--) {
 			const token = trieToken(pattern.context[index]!);
@@ -286,20 +286,25 @@ class PredictiveContextTrie {
 			node.children.set(token, child);
 			node = child;
 		}
-		node.patterns.add(pattern.id);
+		node.patterns.add(pattern);
 	}
 
-	matching(history: ReadonlyArray<PatternAwareEvent>) {
-		const result = new Set<string>();
+	*matching(history: ReadonlyArray<PatternAwareEvent>) {
 		let node = this.root;
 		for (let index = history.length - 1; index >= 0; index--) {
 			const token = trieToken(signature(history[index]!));
 			const child = node.children.get(token);
 			if (!child) break;
-			for (const patternID of child.patterns) result.add(patternID);
 			node = child;
+			if (!node.patterns.size) continue;
+			const context = history.slice(index);
+			// Trie edges already match tool/outcome/operation; output shapes retain wildcard semantics.
+			const shapes = context.map((event) => signature(event).outputShape);
+			for (const pattern of node.patterns) {
+				if (pattern.context.every((expected, offset) => expected.outputShape === undefined ||
+					shapes[offset] === undefined || shapes[offset] === expected.outputShape)) yield { pattern, context };
+			}
 		}
-		return result;
 	}
 }
 
@@ -571,7 +576,6 @@ export class PatternAwareStore {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const predictiveHistory = history;
 		const activeSessionID = predictiveHistory.at(-1)?.sessionID;
-		const sequenceContext = predictiveHistory.map((event) => signatureToken(signature(event)));
 		const result: PatternAwareCandidate[] = [];
 		const groups = new Map<
 			string,
@@ -582,9 +586,9 @@ export class PatternAwareStore {
 			}>
 		>();
 		this.ensureIndex();
-		for (const patternID of this.trie.matching(predictiveHistory)) {
-			const pattern = this.patterns.get(patternID);
-			if (!pattern || continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
+		for (const { pattern, context } of this.trie.matching(predictiveHistory)) {
+			const patternID = pattern.id;
+			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
 				continue;
 			const supportingSessions = this.patternSupportSessions.get(patternID);
 			if (
@@ -596,8 +600,6 @@ export class PatternAwareStore {
 			)
 				continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
-			if (!matchesSuffix(predictiveHistory, pattern.context)) continue;
-			const context = predictiveHistory.slice(-pattern.context.length);
 			for (const applied of this.bindingAnalysis.applyBindingsPartialWeightedVariants(pattern.bindings, context)) {
 				if (applied.missing.length) continue;
 				const action = this.resolveActionKey(
@@ -623,7 +625,8 @@ export class PatternAwareStore {
 		}
 		let ppmEstimates: ReadonlyMap<string, PpmProbabilityEstimate> | undefined;
 		const estimatePpm = (tool: string) => (ppmEstimates ??=
-			this.sequenceModel.distribution(sequenceContext, this.clock, settings.decayHalfLifeEvents)).get(tool);
+			this.sequenceModel.distribution(history.map((event) => signatureToken(signature(event))),
+				this.clock, settings.decayHalfLifeEvents)).get(tool);
 		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
@@ -957,15 +960,16 @@ export class PatternAwareStore {
 	}
 
 	private learn(history: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent) {
-		const batches = actionBatches(history);
+		const batches = actionBatchStarts(history);
 		const maxGap = Math.min(this.settings.maxFutureGap, Math.max(0, batches.length - 1));
 		for (let gap = 0; gap <= maxGap; gap++) {
 			const contextEnd = batches.length - gap;
+			const end = batches[contextEnd] ?? history.length;
 			const maxLength = Math.min(this.settings.maxContextLength, contextEnd);
 			for (let length = 1; length <= maxLength; length++) {
-				const context = batches.slice(contextEnd - length, contextEnd).flat();
-				if (context.length > this.settings.maxContextLength) break;
-				this.learnOccurrence(context, target, gap);
+				const start = batches[contextEnd - length]!;
+				if (end - start > this.settings.maxContextLength) break;
+				this.learnOccurrence(history.slice(start, end), target, gap);
 			}
 		}
 	}
@@ -1234,13 +1238,10 @@ export class PatternAwareStore {
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
 		this.ensureIndex();
-		for (const patternID of this.trie.matching(history)) {
-			const pattern = this.patterns.get(patternID);
-			if (!pattern) continue;
-			if (!structurallyEligible(pattern, this.settings) || !matchesSuffix(history, pattern.context)) continue;
+		for (const { pattern, context } of this.trie.matching(history)) {
+			if (!structurallyEligible(pattern, this.settings)) continue;
 			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence))
 				continue;
-			const context = history.slice(-pattern.context.length);
 			pending.push({
 				patternID: pattern.id,
 				triggerSequence,
@@ -1265,10 +1266,9 @@ export class PatternAwareStore {
 
 	private trimSessionHistory(history: PatternAwareEvent[]) {
 		const limit = this.settings.maxContextLength + this.settings.maxFutureGap + 1;
-		const batches = indexedActionBatches(history);
+		const batches = actionBatchStarts(history);
 		if (batches.length <= limit) return;
-		const keep = new Set(batches.slice(-limit).flat());
-		history.splice(0, history.length, ...history.filter((_, index) => keep.has(index)));
+		history.splice(0, batches[batches.length - limit]!);
 	}
 
 	private trimPools() {
@@ -2410,11 +2410,6 @@ function weightedGaps(pattern: MutablePattern, settings: PatternAwareSettings, c
 		.sort(([left], [right]) => left - right);
 }
 
-function matchesSuffix(history: ReadonlyArray<PatternAwareEvent>, context: ReadonlyArray<PatternAwareEventSignature>) {
-	if (!context.length || history.length < context.length) return false;
-	return sameSignatures(history.slice(-context.length).map(signature), context);
-}
-
 function canonicalBatchActionKey(input: PatternAwareEventInput) {
 	return stableStringify({
 		tool: input.tool,
@@ -2435,19 +2430,11 @@ function persistedEventIdentity(event: PatternAwareEvent) {
 	});
 }
 
-function actionBatches(history: ReadonlyArray<PatternAwareEvent>) {
-	return indexedActionBatches(history).map((batch) => batch.map((index) => history[index]!));
-}
-
-function indexedActionBatches(history: ReadonlyArray<PatternAwareEvent>) {
-	const batches: number[][] = [];
+function actionBatchStarts(history: ReadonlyArray<PatternAwareEvent>) {
+	const batches: number[] = [];
 	let activeBatchID: string | undefined;
 	for (const [index, event] of history.entries()) {
-		if (event.batchID && event.batchID === activeBatchID) {
-			batches.at(-1)!.push(index);
-			continue;
-		}
-		batches.push([index]);
+		if (!event.batchID || event.batchID !== activeBatchID) batches.push(index);
 		activeBatchID = event.batchID;
 	}
 	return batches;
@@ -2467,24 +2454,6 @@ function signature(event: PatternAwareEvent): PatternAwareEventSignature {
 	};
 	signatureCache.set(event, value);
 	return value;
-}
-
-function sameSignatures(
-	left: ReadonlyArray<PatternAwareEventSignature>,
-	right: ReadonlyArray<PatternAwareEventSignature>,
-) {
-	if (left.length !== right.length) return false;
-	return left.every((item, index) => {
-		const expected = right[index]!;
-		return (
-			item.tool === expected.tool &&
-			item.outcome === expected.outcome &&
-			item.operation === expected.operation &&
-			(expected.outputShape === undefined ||
-				item.outputShape === undefined ||
-				item.outputShape === expected.outputShape)
-		);
-	});
 }
 
 function signatureToken(value: PatternAwareEventSignature) {
