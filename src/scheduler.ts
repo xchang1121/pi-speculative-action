@@ -233,11 +233,10 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
-		if (forecast.dependenciesResolved) return 0;
-		const decisionBatchesUntilCall = sequence(forecast.decisionBatchesUntilCall);
-		if (decisionBatchesUntilCall <= 1) return 0;
+		if (forecast.dependenciesResolved || sequence(forecast.decisionBatchesUntilCall) <= 1) return 0;
 		const duration = this.duration(forecast, 0.9);
-		const availableMs = this.actorRunway(forecast, duration) ?? 0;
+		if (duration === undefined) return 0;
+		const availableMs = this.actorRunway(forecast, forecast.actorPhase ?? { kind: "cycle", elapsedMs: 0 }) ?? 0;
 		return Math.max(0, availableMs - duration - finite(safetyMarginMs));
 	}
 
@@ -354,7 +353,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private evaluateOne(forecast: PredictionForecast): ScheduledWork {
-		const expectedDurationMs = this.duration(forecast);
+		const expectedDurationMs = this.duration(forecast) ?? 1;
 		const baseResource = resourceProfile(forecast.execution);
 		const resource = {
 			class: baseResource.class,
@@ -390,20 +389,10 @@ export class SpeculationScheduler<Job extends object> {
 		}).allowed;
 	}
 
-	private actorRunway(forecast: PredictionForecast, fallbackDurationMs?: number): number | undefined {
-		const phase =
-			forecast.actorPhase ??
-			(fallbackDurationMs === undefined ? undefined : { kind: "cycle" as const, elapsedMs: 0 });
+	private actorRunway(forecast: PredictionForecast, phase = forecast.actorPhase): number | undefined {
 		if (!phase) return undefined;
-		const fallbackCycleMs = fallbackDurationMs === undefined ? undefined : Math.max(50, fallbackDurationMs * 2);
-		const cycleMs =
-			fallbackCycleMs === undefined
-				? this.actorCycles.estimate(0.25)
-				: this.actorCycles.quantile(0.25, fallbackCycleMs);
-		const decisionMs =
-			fallbackCycleMs === undefined
-				? this.actorDecisionDurations.estimate(0.25)
-				: this.actorDecisionDurations.quantile(0.25, cycleMs ?? fallbackCycleMs);
+		const cycleMs = this.actorCycles.estimate(0.25);
+		const decisionMs = this.actorDecisionDurations.estimate(0.25);
 		const decisions = sequence(forecast.decisionBatchesUntilCall);
 		if (phase.kind === "decision") {
 			if (decisionMs === undefined) return undefined;
@@ -415,8 +404,7 @@ export class SpeculationScheduler<Job extends object> {
 		return decisions === 1 ? decisionMs : undefined;
 	}
 
-	private duration(forecast: PredictionForecast, quantile = 0.5): number {
-		const actionDuration = positive(forecast.expectedDurationMs, 1);
+	private duration(forecast: PredictionForecast, quantile = 0.5): number | undefined {
 		const observed = this.timingEstimate(
 			this.speculativeServiceTimes,
 			forecast,
@@ -424,7 +412,7 @@ export class SpeculationScheduler<Job extends object> {
 		)?.value;
 		// A source's action-specific estimate remains a lower bound. Wider timing classes can
 		// conservatively raise scheduling cost, but must not make an explicitly long action look short.
-		return Math.max(actionDuration, observed ?? 0);
+		return Math.max(finite(forecast.expectedDurationMs), observed ?? 0) || undefined;
 	}
 
 	private observeTiming(
@@ -481,10 +469,6 @@ class SampleWindow {
 		if (++this.suppressedSinceProbe < DEFAULT_BENEFIT_GATE_POLICY.probeInterval) return false;
 		this.suppressedSinceProbe = 0;
 		return true;
-	}
-
-	quantile(value: number, fallback: number): number {
-		return this.estimate(value) ?? positive(fallback, 1);
 	}
 
 	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {

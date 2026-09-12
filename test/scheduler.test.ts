@@ -66,12 +66,18 @@ describe("SpeculationScheduler", () => {
 		expect(duplicate).toEqual(one);
 	});
 
-	it("separates the current Actor decision from later tool cycles", () => {
+	it("defers future work only from observed Actor timing and known service cost", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		scheduler.observeActorTiming(40, 80);
-		scheduler.observeActorTiming(50, 100);
-		scheduler.observeActorTiming(60, 120);
-		scheduler.observeActorTiming(70, 200);
+		const future = forecast({ tool: "bash", execution: "runtime_sandbox", decisionBatchesUntilCall: 2,
+			actorPhase: { kind: "decision", elapsedMs: 20 } });
+		for (const expectedDurationMs of [undefined, 0, -1, NaN, Infinity, 500])
+			expect(scheduler.launchDelay({ ...future, expectedDurationMs })).toBe(0);
+		for (const [decision, cycle] of [[40, 80], [50, 100], [60, 120], [70, 200]])
+			scheduler.observeActorTiming(decision!, cycle);
+		for (const expectedDurationMs of [undefined, 0, -1, NaN, Infinity])
+			expect(scheduler.launchDelay({ ...future, expectedDurationMs })).toBe(0);
+		scheduler.observeSpeculativeService(future, 30);
+		expect(scheduler.launchDelay({ ...future, expectedDurationMs: undefined })).toBe(60);
 		for (const duration of [20, 40, 60, 100]) scheduler.observeSpeculativeService({ tool: "read" }, duration);
 		for (const [phase, expected] of [
 			[{ actorPhase: { kind: "decision", elapsedMs: 20 }, expectedDurationMs: 40 }, 110],
@@ -80,11 +86,7 @@ describe("SpeculationScheduler", () => {
 		] as const) expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, ...phase }), 10)).toBe(expected);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 3, dependenciesResolved: true }), 10)).toBe(0);
 		expect(scheduler.launchDelay(forecast({ decisionBatchesUntilCall: 1 }))).toBe(0);
-		const actionSpecific = forecast({
-			expectedDurationMs: 500,
-			decisionBatchesUntilCall: 3,
-			actorPhase: { kind: "decision", elapsedMs: 20 },
-		});
+		const actionSpecific = { ...future, expectedDurationMs: 500 };
 		expect(scheduler.evaluate([actionSpecific]).expectedDurationMs).toBe(500);
 		expect(scheduler.launchDelay(actionSpecific, 10)).toBe(0);
 	});
