@@ -26,7 +26,7 @@ node bench/adoption-latency.mjs . /absolute/output/child-preemption.json 2 runni
 
 ThinkThread 要在真实 Profile 的 `THINKTHREAD_FS` 根目录运行并通过控制连接检查，使用 `--backend=thinkthread` 和 `read,ls,write,edit,native-find,native-grep,bash`；输出路径也须由 Profile 允许写入。使用生产默认封存输入/runner 路线。write 的 EACCES 回退、edit 的既有权限/身份缺口和不支持的进程路线照实报告；内容/mode 比较不能授予完整写入资格。
 
-`--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O；嵌套时长不能相加，性能结论使用不插桩的运行。`--resource-baseline`、`--workspace-baseline`、`--handoff-baseline` 接受对应旧构建模块的绝对路径，用于同一驱动下的相邻对照。结果文件必须不存在。
+`--profile` 临时插桩分段调用，`--fs-profile` 进一步统计 I/O。`producerSpans` 记录准备及生产调用，`spans` 记录 Actor 调用；broker 和 held-exec socket 回调分别归各自所有者。running 模式的生产记录会延续到 Actor 到达之后，不能把这些时长当成到达前的准备时间，也不能相加嵌套或重叠时长。性能结论使用不插桩的运行。`--resource-baseline`、`--workspace-baseline`、`--handoff-baseline` 接受对应旧构建模块的绝对路径，用于同一驱动下的相邻对照。结果文件必须不存在。
 
 ## PatternAware 历史与绑定
 

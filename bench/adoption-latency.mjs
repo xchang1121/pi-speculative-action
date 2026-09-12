@@ -18,11 +18,12 @@ assert.ok(['ready', 'running'].includes(mode)); assert.ok(repeats > 0);
 await assert.rejects(fs.access(reportPath), { code: 'ENOENT' });
 process.env.PI_OFFLINE = '1';
 const active = new AsyncLocalStorage();
-let currentActorTrace;
+const inTrace = (trace, run) => profiled ? active.run(trace, run) : run();
+let currentActorTrace, currentProducerTrace;
 globalThis.__adoptionTrace = (name, operation) => {
-  // The held-exec server is created before Actor arrival; bridge its callback into this Actor's diagnostic scope.
-  if (!active.getStore() && name === 'decideHeldExec' && currentActorTrace)
-    return active.run(currentActorTrace, () => globalThis.__adoptionTrace(name, operation));
+  // Socket callbacks re-enter the scope that owns their Actor or producer operation.
+  const owner = name === 'decideHeldExec' ? currentActorTrace : name === 'handleWireRequest' ? currentProducerTrace : undefined;
+  if (owner && active.getStore() !== owner) return active.run(owner, () => globalThis.__adoptionTrace(name, operation));
   const trace = active.getStore();
   if (!trace) return operation();
   const begin = performance.now(), entry = { name, startMs: begin - trace.begin };
@@ -69,9 +70,12 @@ if (profiled) {
     'waitForCandidate', 'projectOutput', 'validateCandidate', 'reconcileAdoptedCandidate', 'queueCandidateContinuations',
     'confirmPredictions', 'queueActorSettlement', 'fingerprintDependencies', 'fingerprintBinding', 'fingerprintPath',
     'assertCommitTarget', 'readRegularState', 'createParentDirectories', 'readSandboxDirectoryState',
-    'decideHeldExec', 'acquireProcessResult', 'plan', 'lookup', 'findByWeakKey', 'validateDynamicDependencyCertificate', 'replayFilesystemEffects']);
+    'decideHeldExec', 'acquireProcessResult', 'plan', 'lookup', 'findByWeakKey', 'validateDynamicDependencyCertificate', 'replayFilesystemEffects',
+    'acquireSandboxRepository', 'acquireSandboxBaseline', 'ensurePreparedSandbox', 'takePreparedSandbox', 'attachSandboxWorkspace',
+    'createPrivateSandboxWorkspace', 'createGitWorkspaceTransactionDriver', 'collectSandboxChanges', 'cleanupPrivateSandboxWorkspace',
+    'createProcessInterposition', 'probeExecutionContext', 'runSpawn', 'observeStrace', 'captureDependencies', 'sealSessionEvidence', 'handleWireRequest']);
   const files = new Set(['runtime-engine.js', 'agent-integration.js', 'resource-version.js', 'workspace-sandbox.js',
-    'linux-process-backend.js', 'process-handoff.js', 'reuse-planner.js', 'provenance-validation.js']);
+    'linux-process-world.js', 'linux-process-backend.js', 'process-handoff.js', 'reuse-planner.js', 'provenance-validation.js']);
   hooks = registerHooks({ load(url, context, nextLoad) {
     const result = nextLoad(url, context);
     if (!url.startsWith(pathToFileURL(path.join(repo, 'dist') + path.sep).href) || !files.has(path.basename(fileURLToPath(url)))) return result;
@@ -215,6 +219,8 @@ int main(void) {
         const expectedState = await state(root);
         await reset();
         const preparationBegin = performance.now();
+        const producerTrace = { begin: preparationBegin, spans: [] };
+        currentProducerTrace = producerTrace;
         const terminal = Promise.withResolvers(), entered = Promise.withResolvers(), released = Promise.withResolvers();
         const hold = async signal => {
           const abort = () => released.reject(signal.reason);
@@ -241,9 +247,9 @@ int main(void) {
           }
           const originalExecutor = processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath: '/bin/bash' }));
           const routeOptions = { sourceRoot: cwd, invocation: request => bind({ command: request.command })?.process };
-          const route = child ? await processBackend.prepareActorReplay(originalExecutor, { ...routeOptions,
+          const route = child ? await inTrace(producerTrace, () => processBackend.prepareActorReplay(originalExecutor, { ...routeOptions,
             held: { realShell: '/bin/bash', executor: shellPath => processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath })),
-              scope: () => ({ sessionID: `adoption-${selected}-${index}`, turnID: 'turn' }) } }, true) : undefined;
+              scope: () => ({ sessionID: `adoption-${selected}-${index}`, turnID: 'turn' }) } }, true)) : undefined;
           if (route) assert.equal(route.state, 'ready', route.detail);
           coordinator = new processApi.ProcessExecutionCoordinator(route?.executor ?? processBackend.completedReplayExecutor(originalExecutor, routeOptions));
           tool = processApi.createBashTool(cwd, { operations: coordinator.operations, shellPath: '/bin/bash', exposeSessionEnvironment: false,
@@ -278,8 +284,8 @@ int main(void) {
           } });
         const turnID = 'turn', tools = [tool];
         try {
-          await host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools,
-            context: { systemPrompt: 'Isolated adoption fixture; no model API.', messages: [], tools } });
+          await inTrace(producerTrace, () => host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools,
+            context: { systemPrompt: 'Isolated adoption fixture; no model API.', messages: [], tools } }));
           if (eligible) await deadline(mode === 'ready' ? terminal.promise : Promise.race([entered.promise, terminal.promise]));
           const preparationMs = performance.now() - preparationBegin;
           assert.deepEqual(await state(root), baselineState, 'Speculative writes leaked before Actor adoption');
@@ -289,7 +295,7 @@ int main(void) {
               return operation.invocation?.authoritative ? (await operation.invocation.authoritative({ args: operation.input, callID: operation.callID, signal: operation.signal })).result
                 : tool.execute(operation.callID, operation.input, operation.signal); });
           currentActorTrace = trace;
-          const result = await deadline(profiled ? active.run(trace, run) : run()).finally(() => { currentActorTrace = undefined; });
+          const result = await deadline(inTrace(trace, run)).finally(() => { currentActorTrace = undefined; });
           const returnedAt = performance.now(), adoptionMs = returnedAt - trace.begin, resultReadyAt = child ? childReadyAt : readyAt;
           await host.finishTurn(turnID);
           assert.deepEqual(wire(result), wire(expected), 'Actor output differs from the native oracle');
@@ -303,12 +309,13 @@ int main(void) {
             provider: settlement.provider, rejections: settlement.rejections,
             terminal: terminalState?.status ?? terminalState?.cause?.code,
             ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}),
-            ...(profiled ? { spans: trace.spans } : {}) });
+            ...(profiled ? { spans: trace.spans, producerSpans: producerTrace.spans } : {}) });
         } catch (error) {
           trials.push({ index, producerCalls, fallbackCalls, terminal: terminalState, error: { name: error.name, message: error.message },
-            ...(trace ? { spans: trace.spans } : {}), ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}) });
+            ...(trace ? { spans: trace.spans } : {}), ...(profiled ? { producerSpans: producerTrace.spans } : {}),
+            ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}) });
           throw error;
-        } finally { released.resolve(); try { await host.dispose(); } finally { await coordinator?.dispose(); await workspace.dispose(); } }
+        } finally { released.resolve(); try { await host.dispose(); } finally { await coordinator?.dispose(); await workspace.dispose(); currentProducerTrace = undefined; } }
       }
     } finally { await profile?.pool.dispose(); }
     const hit = trial => child ? trial.actorProcessMetrics.hits > 0 : trial.outcome !== 'actor';
