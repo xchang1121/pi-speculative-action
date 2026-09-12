@@ -8,7 +8,7 @@ import {
 	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -31,18 +31,15 @@ export const STOCK_TOOL_CASES = [
 	["edit", { path: "notes.txt", edits: [{ oldText: "beta", newText: "gamma" }] }],
 ] as const;
 
-/** Owns one fixture and compares all routes at the same cwd/path, without output path rewriting.
- * A supplied primary world is also owned/disposed here. Omission tests only the local wire runner.
- */
+/** Compare the local wire runner and applicable fallback at the same cwd/path. */
 export async function qualifyStockTool(
 	name: ThinkThreadToolName,
 	input: (typeof STOCK_TOOL_CASES)[number][1],
-	primary?: { readonly cwd: string; readonly world: SpeculativeAgentExecutionWorld },
 ) {
-	const fixtureParent = path.resolve(primary?.cwd ?? os.tmpdir());
+	const fixtureParent = path.resolve(os.tmpdir());
 	const root = await mkdtemp(path.join(fixtureParent, "pi-tool-qualification-"));
 	assert.equal(path.dirname(root), fixtureParent);
-	const cwd = primary?.cwd ?? root;
+	const cwd = root;
 	const args = { ...input, path: slash(path.join(path.relative(cwd, root), input.path)) };
 	const invocation = resolvePiToolInvocation(name, args, { cwd, environment: {} });
 	const action = PI_ACTION_SEMANTICS.buildKey(name, args, cwd, "", invocation
@@ -62,12 +59,9 @@ export async function qualifyStockTool(
 	const context = { cwd, tool, toolName: name, args, action, callID: `qualify-${name}`, signal: new AbortController().signal,
 		executionScope: { sessionID: root, turnID: name } };
 	const operation = { tool: name, input: args, action, callID: context.callID };
-	let primaryEnabled = false;
 	const workspaceSandbox = new WorkspaceSandboxService(), fallback = workspaceSandbox.createExecutionWorld({ driver: "git" });
 	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_OPERATION_TOOLS.resources, maxBytes: () => 1024 * 1024 });
-	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([
-		...(primary ? [primary.world] : []), fallback, resources,
-	], (id) => id !== primary?.world.id || primaryEnabled);
+	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([fallback, resources]);
 	const actor = async (): Promise<ToolSettlement> => {
 		try {
 			return { result: await tool.execute(context.callID, args), isError: false };
@@ -84,58 +78,39 @@ export async function qualifyStockTool(
 	try {
 		await reset();
 		const initial = await workspaceState(root);
-		const baselineStarted = performance.now();
 		const actorOutput = await actor();
-		const actorBaselineMs = performance.now() - baselineStarted;
 		const baseline = wire(actorOutput);
 		assert.equal(baseline.isError, false, `${name}: Actor baseline failed`);
 		const expected = await workspaceState(root);
-		const executeRoute = async (requirePrimary: boolean) => {
+		const executeRoute = async () => {
 			await reset();
-			primaryEnabled = requirePrimary;
-			const preparedAt = performance.now();
 			const route = await gateway.resolve({ operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
-			const preparationMs = performance.now() - preparedAt;
-			if (requirePrimary) assert.equal(route?.backend, primary?.world.id, `${name}: primary fell back; not a Runtime pass`);
-			else assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : invocation?.filesystem ? resources.id : undefined,
+			assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : invocation?.filesystem ? resources.id : undefined,
 				`${name}: native route differs from its stock fallback`);
-			const started = performance.now();
 			let output: ToolSettlement;
-			let executionMs: number;
-			let adoptionMs: number | null = null;
 			if (!route) {
 				output = await actor();
-				executionMs = performance.now() - started;
 			} else {
 				const branch = await gateway.executeSpeculative(operation, route, {
 					...context, action: { ...action, executionFingerprint: route.fingerprint },
 				});
-				executionMs = performance.now() - started;
 				try {
 					assert.deepEqual(await workspaceState(root), initial, `${name}: speculative effects leaked before adoption`);
-					const arrived = performance.now();
 					assert.equal((await branch.validate()).status, "valid", `${name}: fresh candidate rejected`);
 					output = await branch.commit();
-					adoptionMs = performance.now() - arrived;
 				} finally { await branch.dispose(); }
 			}
 			assert.deepEqual(wire(output), baseline, `${name}: output differs`);
 			assert.deepEqual(await workspaceState(root), expected, `${name}: adopted file effects differ`);
-			return { route: route?.backend ?? "Actor only", preparationMs, executionMs, adoptionMs,
-				actorReadyAdoptionSpeedup: adoptionMs === null ? null : actorBaselineMs / adoptionMs };
 		};
-		const native = await executeRoute(false);
-		if (primary) {
-			const isolated = await executeRoute(true);
-			return { tool: name, evidence: "Runtime execution and adoption", actorBaselineMs, native, isolated };
-		}
+		await executeRoute();
 		await reset();
 		const output = wire(await runThinkThreadTool({
 			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: name, args, callID: context.callID, autoResizeImages: true, modelSupportsImages: true,
 		}, cwd));
 		assert.deepEqual(output, baseline, `${name}: local wire runner output differs`);
 		assert.deepEqual(await workspaceState(root), expected, `${name}: local wire runner effects differ`);
-		return { tool: name, evidence: "Local wire runner only", actorBaselineMs, native };
+		return { evidence: "Local wire runner only" };
 	} catch (error) {
 		poisoned = isPoisonedEffectCommit(error);
 		if (poisoned) console.error(`Indeterminate adoption: retain fixture without further writes at ${root}`);

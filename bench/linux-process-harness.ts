@@ -329,20 +329,6 @@ export function argument(name: string): string | undefined {
 	return value;
 }
 
-export function requiredArgument(name: string): string {
-	const value = argument(name);
-	if (value === undefined) throw new Error(`${name} is required`);
-	return value;
-}
-
-export function numberArgument(name: string, fallback: number): number {
-	const raw = argument(name);
-	if (raw === undefined) return fallback;
-	const value = Number(raw);
-	if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a non-negative number`);
-	return value;
-}
-
 export function integerArgument(name: string, fallback: number, minimum: number, maximum: number): number {
 	const raw = argument(name);
 	if (raw === undefined) return fallback;
