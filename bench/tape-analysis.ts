@@ -162,13 +162,8 @@ interface ParsedExchange {
 }
 
 export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string): TapeAnalysis {
-	const { completed, parsed } = parseTape(tape);
-	const draftersByContext = groupBy(
-		parsed.filter((exchange) => exchange.model === drafterModel),
-		(exchange) => exchange.contextKey,
-	);
-	const opportunities = parsed
-		.filter((exchange) => exchange.model === actorModel)
+	const { completed, actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
+	const opportunities = actors
 		.flatMap((actor) =>
 			actor.calls.map((actorAction) =>
 				opportunity(actor, actorAction, draftersByContext.get(actor.contextKey) ?? []),
@@ -208,11 +203,7 @@ export function analyzeTapeForkGate(
 	drafterModel: string,
 	policy: BenefitGatePolicy,
 ): TapeForkGateAnalysis {
-	const { parsed } = parseTape(tape);
-	const draftersByContext = groupBy(
-		parsed.filter((exchange) => exchange.model === drafterModel),
-		(exchange) => exchange.contextKey,
-	);
+	const { actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
 	const gate = new BenefitGate();
 	let decisions = 0;
 	let allowed = 0;
@@ -222,7 +213,7 @@ export function analyzeTapeForkGate(
 	let gatedForkCostMs = 0;
 	let netBenefitMs = 0;
 	let gatedNetBenefitMs = 0;
-	for (const actor of parsed.filter((exchange) => exchange.model === actorModel)) {
+	for (const actor of actors) {
 		const proxy = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
 			(left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence,
 		)[0];
@@ -265,11 +256,7 @@ export function analyzeTapeReprobe(
 	actorModel: string,
 	drafterModel: string,
 ): TapeReprobeAnalysis {
-	const { parsed } = parseTape(tape);
-	const draftersByContext = groupBy(
-		parsed.filter((exchange) => exchange.model === drafterModel),
-		(exchange) => exchange.contextKey,
-	);
+	const { actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
 	let decisions = 0;
 	let actorActionTurns = 0;
 	let d1ExactHits = 0;
@@ -280,7 +267,7 @@ export function analyzeTapeReprobe(
 	let snapshotReprobeTurns = 0;
 	let snapshotReprobeActionTurns = 0;
 	let snapshotReprobeRunwayMs = 0;
-	for (const actor of parsed.filter((exchange) => exchange.model === actorModel)) {
+	for (const actor of actors) {
 		const drafters = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
 			(left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence,
 		);
@@ -338,101 +325,42 @@ export function analyzeTapeDrafterWidth(
 	);
 	if (!selectedWidths.length) throw new Error("At least one positive integer Drafter width is required");
 
-	const { parsed } = parseTape(tape);
-	const draftersByContext = groupBy(
-		parsed.filter((exchange) => exchange.model === drafterModel),
-		(exchange) => exchange.contextKey,
-	);
-	const turns = parsed
-		.filter((exchange) => exchange.model === actorModel && exchange.calls.length > 0)
-		.flatMap((actor) => {
-			const drafters = [...(draftersByContext.get(actor.contextKey) ?? [])].sort(
-				(left, right) => left.sequence - right.sequence,
-			);
-			return drafters.length ? [{ actor, drafters }] : [];
-		});
-	const availableDrafterRequests = sum(turns, ({ drafters }) => drafters.length);
-	const availableDrafterServiceMs = sum(turns, ({ drafters }) =>
-		sum(drafters, (exchange) => exchange.endedAtMs),
-	);
+	const turns = drafterTurns(tape, actorModel, drafterModel);
+	const available = summarizeCandidates(turns);
 	const actionOpportunities = sum(turns, ({ actor }) => actor.calls.length);
 	let previousExactHits = 0;
 	const points = selectedWidths.map((width): TapeDrafterWidthPoint => {
-		let exactHits = 0;
-		let exactReadyBeforeActor = 0;
-		let drafterRequests = 0;
-		let drafterServiceMs = 0;
-		let drafterCompletionSpanMs = 0;
-		let candidateCount = 0;
-		let uniqueCandidateCount = 0;
-		let exactLeadMs = 0;
-		for (const { actor, drafters } of turns) {
-			const selected = drafters.slice(0, width);
-			const candidates = selected.flatMap((exchange) => exchange.calls);
-			const identities = new Set(candidates.map(actionIdentity));
-			drafterRequests += selected.length;
-			drafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
-			drafterCompletionSpanMs += Math.max(...selected.map((exchange) => exchange.endedAtMs));
-			candidateCount += candidates.length;
-			uniqueCandidateCount += identities.size;
-			for (const actual of actor.calls) {
-				const actualIdentity = actionIdentity(actual);
-				if (!identities.has(actualIdentity)) continue;
-				exactHits++;
-				const exactReadyMs = Math.min(
-					...selected
-						.filter((exchange) => exchange.calls.some((candidate) => actionIdentity(candidate) === actualIdentity))
-						.map((exchange) => exchange.endedAtMs),
-				);
-				const leadMs = Math.max(0, actor.endedAtMs - exactReadyMs);
-				if (leadMs > 0) exactReadyBeforeActor++;
-				exactLeadMs += leadMs;
-			}
-		}
+		const metrics = summarizeCandidates(turns.map(({ actor, drafters }) => ({ actor, drafters: drafters.slice(0, width) })));
 		const point = {
 			width,
 			actorTurns: turns.length,
 			opportunities: actionOpportunities,
-			exactHits,
-			marginalExactHits: exactHits - previousExactHits,
-			hitRate: ratio(exactHits, actionOpportunities),
-			exactReadyBeforeActor,
-			earlyHitRate: ratio(exactReadyBeforeActor, actionOpportunities),
-			drafterRequests,
-			requestReductionFromAvailable: ratio(availableDrafterRequests - drafterRequests, availableDrafterRequests),
-			drafterServiceMs,
-			serviceReductionFromAvailable: ratio(
-				availableDrafterServiceMs - drafterServiceMs,
-				availableDrafterServiceMs,
-			),
-			drafterCompletionSpanMs,
-			candidateCount,
-			uniqueCandidateCount,
-			duplicateCandidateCount: candidateCount - uniqueCandidateCount,
-			uniqueYield: ratio(uniqueCandidateCount, candidateCount),
-			exactLeadMs,
+			...metrics,
+			marginalExactHits: metrics.exactHits - previousExactHits,
+			hitRate: ratio(metrics.exactHits, actionOpportunities),
+			earlyHitRate: ratio(metrics.exactReadyBeforeActor, actionOpportunities),
+			requestReductionFromAvailable: ratio(available.drafterRequests - metrics.drafterRequests, available.drafterRequests),
+			serviceReductionFromAvailable: ratio(available.drafterServiceMs - metrics.drafterServiceMs, available.drafterServiceMs),
+			duplicateCandidateCount: metrics.candidateCount - metrics.uniqueCandidateCount,
+			uniqueYield: ratio(metrics.uniqueCandidateCount, metrics.candidateCount),
 		};
-		previousExactHits = exactHits;
+		previousExactHits = metrics.exactHits;
 		return point;
 	});
 	return {
 		actorTurns: turns.length,
 		opportunities: actionOpportunities,
-		availableDrafterRequests,
-		availableDrafterServiceMs,
+		availableDrafterRequests: available.drafterRequests,
+		availableDrafterServiceMs: available.drafterServiceMs,
 		points,
 	};
 }
 
 /**
- * Replay a hedged Drafter race at a fixed dispatch width.
- *
- * The first completed response containing a decodable K(a) wins. Responses
- * without a tool call do not cancel peers. All requests are assumed to launch
- * together, so only service after the winner completes is counterfactually
- * removable. Candidate and request costs are charged once per Actor turn;
- * exact coverage remains action-scoped. Each response contributes only its
- * first K(a), matching the production Drafter source.
+ * Replay a hedged Drafter race at a fixed dispatch width. The first completed
+ * response containing tools wins as a whole batch; empty responses do not cancel
+ * peers. Requests launch together, so only service after the winner completes is
+ * counterfactually removable. Costs are per request and coverage is per action.
  */
 export function analyzeTapeDrafterRace(
 	tape: LlmTape,
@@ -441,137 +369,114 @@ export function analyzeTapeDrafterRace(
 	width: number,
 ): TapeDrafterRaceAnalysis {
 	if (!Number.isSafeInteger(width) || width <= 0) throw new Error("A positive integer Drafter race width is required");
-
-	const { parsed } = parseTape(tape);
-	const draftersByContext = groupBy(
-		parsed.filter((exchange) => exchange.model === drafterModel),
-		(exchange) => exchange.contextKey,
-	);
-	const turns = parsed
-		.filter((exchange) => exchange.model === actorModel && exchange.calls.length > 0)
-		.flatMap((actor) => {
-			const selected = [...(draftersByContext.get(actor.contextKey) ?? [])]
-				.sort((left, right) => left.sequence - right.sequence)
-				.slice(0, width);
-			return selected.length ? [{ actor, selected }] : [];
-		});
-
+	const turns = drafterTurns(tape, actorModel, drafterModel)
+		.map(({ actor, drafters }) => ({ actor, drafters: drafters.slice(0, width) }));
 	let winnerTurns = 0;
-	let selectedDrafterRequests = 0;
 	let abortableDrafterRequests = 0;
-	let fullDrafterServiceMs = 0;
 	let racedDrafterServiceMs = 0;
-	let fullCandidateCount = 0;
-	let fullUniqueCandidateCount = 0;
-	let racedCandidateCount = 0;
-	let racedUniqueCandidateCount = 0;
-	let fullExactHits = 0;
-	let racedExactHits = 0;
-	let laterRecoveredExactHits = 0;
-	let fullExactReadyBeforeActor = 0;
-	let racedExactReadyBeforeActor = 0;
-	let fullExactLeadMs = 0;
-	let racedExactLeadMs = 0;
-
-	for (const { actor, selected } of turns) {
-		const winner = selected
-			.filter((exchange) => exchange.calls.length > 0)
+	const winners = turns.map(({ actor, drafters }) => {
+		const winner = drafters.filter(exchange => exchange.calls.length > 0)
 			.sort((left, right) => left.endedAtMs - right.endedAtMs || left.sequence - right.sequence)[0];
-		const fullCandidates = selected.flatMap((exchange) => exchange.calls.slice(0, 1));
-		const racedCandidates = winner?.calls.slice(0, 1) ?? [];
-		const fullIdentities = new Set(fullCandidates.map(actionIdentity));
-		const racedIdentities = new Set(racedCandidates.map(actionIdentity));
-
-		selectedDrafterRequests += selected.length;
-		fullDrafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
-		fullCandidateCount += fullCandidates.length;
-		fullUniqueCandidateCount += fullIdentities.size;
-		racedCandidateCount += racedCandidates.length;
-		racedUniqueCandidateCount += racedIdentities.size;
-		if (winner) {
-			winnerTurns++;
-			racedDrafterServiceMs += sum(selected, (exchange) => Math.min(exchange.endedAtMs, winner.endedAtMs));
-			abortableDrafterRequests += selected.filter((exchange) => exchange.endedAtMs > winner.endedAtMs).length;
-		} else {
-			racedDrafterServiceMs += sum(selected, (exchange) => exchange.endedAtMs);
-		}
-
-		for (const actual of actor.calls) {
-			const identity = actionIdentity(actual);
-			const fullHit = fullIdentities.has(identity);
-			const racedHit = racedIdentities.has(identity);
-			if (fullHit) {
-				fullExactHits++;
-				const readyMs = Math.min(
-					...selected
-						.filter((exchange) => exchange.calls[0] && actionIdentity(exchange.calls[0]) === identity)
-						.map((exchange) => exchange.endedAtMs),
-				);
-				const leadMs = Math.max(0, actor.endedAtMs - readyMs);
-				if (leadMs > 0) fullExactReadyBeforeActor++;
-				fullExactLeadMs += leadMs;
-			}
-			if (racedHit && winner) {
-				racedExactHits++;
-				const leadMs = Math.max(0, actor.endedAtMs - winner.endedAtMs);
-				if (leadMs > 0) racedExactReadyBeforeActor++;
-				racedExactLeadMs += leadMs;
-			} else if (fullHit) {
-				laterRecoveredExactHits++;
-			}
-		}
-	}
-
-	const residualServiceSavedMs = fullDrafterServiceMs - racedDrafterServiceMs;
+		if (winner) winnerTurns++;
+		const boundary = winner?.endedAtMs ?? Infinity;
+		racedDrafterServiceMs += sum(drafters, exchange => Math.min(exchange.endedAtMs, boundary));
+		abortableDrafterRequests += drafters.filter(exchange => exchange.endedAtMs > boundary).length;
+		return { actor, drafters: winner ? [winner] : [] };
+	});
+	const full = summarizeCandidates(turns), raced = summarizeCandidates(winners);
+	const residualServiceSavedMs = full.drafterServiceMs - racedDrafterServiceMs;
 	return {
 		width,
 		actorTurns: turns.length,
 		opportunities: sum(turns, ({ actor }) => actor.calls.length),
 		winnerTurns,
 		noWinnerTurns: turns.length - winnerTurns,
-		selectedDrafterRequests,
+		selectedDrafterRequests: full.drafterRequests,
 		abortableDrafterRequests,
-		abortableRequestRate: ratio(abortableDrafterRequests, selectedDrafterRequests),
-		fullDrafterServiceMs,
+		abortableRequestRate: ratio(abortableDrafterRequests, full.drafterRequests),
+		fullDrafterServiceMs: full.drafterServiceMs,
 		racedDrafterServiceMs,
 		residualServiceSavedMs,
-		serviceReduction: ratio(residualServiceSavedMs, fullDrafterServiceMs),
-		fullCandidateCount,
-		fullUniqueCandidateCount,
-		racedCandidateCount,
-		racedUniqueCandidateCount,
-		fullExactHits,
-		racedExactHits,
-		laterRecoveredExactHits,
-		fullExactReadyBeforeActor,
-		racedExactReadyBeforeActor,
-		fullExactLeadMs,
-		racedExactLeadMs,
+		serviceReduction: ratio(residualServiceSavedMs, full.drafterServiceMs),
+		fullCandidateCount: full.candidateCount,
+		fullUniqueCandidateCount: full.uniqueCandidateCount,
+		racedCandidateCount: raced.candidateCount,
+		racedUniqueCandidateCount: raced.uniqueCandidateCount,
+		fullExactHits: full.exactHits,
+		racedExactHits: raced.exactHits,
+		laterRecoveredExactHits: full.exactHits - raced.exactHits,
+		fullExactReadyBeforeActor: full.exactReadyBeforeActor,
+		racedExactReadyBeforeActor: raced.exactReadyBeforeActor,
+		fullExactLeadMs: full.exactLeadMs,
+		racedExactLeadMs: raced.exactLeadMs,
 	};
 }
 
-function parseTape(tape: LlmTape): { readonly completed: readonly TapeExchange[]; readonly parsed: readonly ParsedExchange[] } {
-	const completed = tape.exchanges.filter((exchange) => exchange.response?.completed === true);
-	const parsed = completed.flatMap((exchange) => {
-		const body = record(exchange.request.descriptor.body);
-		const model = string(body?.model);
-		const endedAtMs = finiteMetric(exchange.response?.endedAtMs);
-		if (!model || endedAtMs === undefined) return [];
-		const chunks = exchange.response?.chunks ?? [];
-		const stream = decodeStreamShape(chunks);
-		return [
-			{
-				sequence: exchange.sequence,
-				model,
-				contextKey: stableStringify(body?.messages ?? []),
-				endedAtMs,
-				calls: decodeToolCalls(chunks),
-				snapshotDeltaMs: stream.snapshotDeltaMs,
-				toolDeltaMs: stream.toolDeltaMs,
-			},
-		];
+interface DrafterTurn {
+	readonly actor: ParsedExchange;
+	readonly drafters: readonly ParsedExchange[];
+}
+
+function drafterTurns(tape: LlmTape, actorModel: string, drafterModel: string): DrafterTurn[] {
+	const { actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
+	for (const drafters of draftersByContext.values()) drafters.sort((left, right) => left.sequence - right.sequence);
+	return actors.filter(exchange => exchange.calls.length > 0).flatMap(actor => {
+		const drafters = draftersByContext.get(actor.contextKey) ?? [];
+		return drafters.length ? [{ actor, drafters }] : [];
 	});
-	return { completed, parsed };
+}
+
+/** Index the earliest whole response per action; duplicates consume candidates but not extra coverage. */
+function summarizeCandidates(turns: readonly DrafterTurn[]) {
+	const metrics = {
+		exactHits: 0, exactReadyBeforeActor: 0, exactLeadMs: 0,
+		drafterRequests: 0, drafterServiceMs: 0, drafterCompletionSpanMs: 0,
+		candidateCount: 0, uniqueCandidateCount: 0,
+	};
+	for (const { actor, drafters } of turns) {
+		const ready = new Map<string, number>();
+		for (const drafter of drafters) for (const call of drafter.calls) {
+			const identity = actionIdentity(call);
+			ready.set(identity, Math.min(ready.get(identity) ?? Infinity, drafter.endedAtMs));
+			metrics.candidateCount++;
+		}
+		metrics.drafterRequests += drafters.length;
+		metrics.drafterServiceMs += sum(drafters, exchange => exchange.endedAtMs);
+		metrics.drafterCompletionSpanMs += Math.max(0, ...drafters.map(exchange => exchange.endedAtMs));
+		metrics.uniqueCandidateCount += ready.size;
+		for (const actual of actor.calls) {
+			const atMs = ready.get(actionIdentity(actual));
+			if (atMs === undefined) continue;
+			metrics.exactHits++;
+			const lead = Math.max(0, actor.endedAtMs - atMs);
+			if (lead > 0) metrics.exactReadyBeforeActor++;
+			metrics.exactLeadMs += lead;
+		}
+	}
+	return metrics;
+}
+
+function pairTape(tape: LlmTape, actorModel: string, drafterModel: string) {
+	const completed = tape.exchanges.filter((exchange) => exchange.response?.completed === true);
+	const actors: ParsedExchange[] = [], draftersByContext = new Map<string, ParsedExchange[]>();
+	for (const exchange of completed) {
+		const body = record(exchange.request.descriptor.body);
+		const model = string(body?.model), endedAtMs = finiteMetric(exchange.response?.endedAtMs);
+		if (!model || endedAtMs === undefined) continue;
+		const events = decodeSseEvents(exchange.response?.chunks ?? []);
+		const parsed = {
+			sequence: exchange.sequence, model, endedAtMs,
+			contextKey: stableStringify(body?.messages ?? []),
+			calls: decodeToolCalls(events), ...decodeStreamShape(events),
+		};
+		if (model === actorModel) actors.push(parsed);
+		if (model === drafterModel) {
+			const drafters = draftersByContext.get(parsed.contextKey) ?? [];
+			drafters.push(parsed);
+			draftersByContext.set(parsed.contextKey, drafters);
+		}
+	}
+	return { completed, actors, draftersByContext };
 }
 
 function opportunity(
@@ -604,9 +509,9 @@ function opportunity(
 	};
 }
 
-function decodeToolCalls(chunks: readonly TapeChunk[]): readonly TapeToolCall[] {
+function decodeToolCalls(events: readonly DecodedSseEvent[]): readonly TapeToolCall[] {
 	const calls = new Map<number, { name: string; arguments: string }>();
-	for (const event of decodeSseEvents(chunks)) {
+	for (const event of events) {
 		const root = event.value;
 		const choice = record(array(root?.choices)[0]);
 		const delta = record(choice?.delta) ?? record(choice?.message);
@@ -632,13 +537,13 @@ function decodeToolCalls(chunks: readonly TapeChunk[]): readonly TapeToolCall[] 
 		});
 }
 
-function decodeStreamShape(chunks: readonly TapeChunk[]): {
+function decodeStreamShape(events: readonly DecodedSseEvent[]): {
 	readonly snapshotDeltaMs: readonly number[];
 	readonly toolDeltaMs: readonly number[];
 } {
 	const snapshotDeltaMs: number[] = [];
 	const toolDeltaMs: number[] = [];
-	for (const event of decodeSseEvents(chunks)) {
+	for (const event of events) {
 		if (event.atMs === undefined) continue;
 		const choice = record(array(event.value.choices)[0]);
 		const delta = record(choice?.delta) ?? record(choice?.message);
@@ -690,17 +595,6 @@ function appendDecodedSseEvent(target: DecodedSseEvent[], block: string, atMs: n
 
 function actionIdentity(call: TapeToolCall): string {
 	return stableStringify({ tool: call.name, input: call.arguments });
-}
-
-function groupBy<Value>(values: readonly Value[], key: (value: Value) => string): Map<string, Value[]> {
-	const grouped = new Map<string, Value[]>();
-	for (const value of values) {
-		const selected = key(value);
-		const bucket = grouped.get(selected) ?? [];
-		bucket.push(value);
-		grouped.set(selected, bucket);
-	}
-	return grouped;
 }
 
 function sum<Value>(values: readonly Value[], value: (item: Value) => number): number {

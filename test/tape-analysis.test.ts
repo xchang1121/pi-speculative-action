@@ -213,13 +213,15 @@ describe("LLM tape action analysis", () => {
 		);
 	});
 
-	it("races the dispatch-selected Drafters and charges only residual service after a valid winner", () => {
+	it.each([false, true])("races whole response batches and charges only residual service (batch=%s)", (batch) => {
 		const messages = [{ role: "user", content: "decision" }];
 		const tape: LlmTape = {
 			exchanges: [
 				exchange(0, "actor", messages, 100, [calls(["read", '{"path":"slow"}'], ["write", '{"path":"fast"}'])]),
 				exchange(1, "draft", messages, 80, [call("read", '{"path":"slow"}')]),
-				exchange(2, "draft", messages, 10, [call("write", '{"path":"fast"}')]),
+				exchange(2, "draft", messages, 10, [batch
+					? calls(["write", '{"path":"fast"}'], ["read", '{"path":"slow"}'], ["write", '{"path":"fast"}'])
+					: call("write", '{"path":"fast"}')]),
 				// Faster completion is outside width=2 and must not enter the race.
 				exchange(3, "draft", messages, 1, [call("read", '{"path":"slow"}')]),
 			],
@@ -238,17 +240,17 @@ describe("LLM tape action analysis", () => {
 			racedDrafterServiceMs: 20,
 			residualServiceSavedMs: 70,
 			serviceReduction: 70 / 90,
-			fullCandidateCount: 2,
+			fullCandidateCount: batch ? 4 : 2,
 			fullUniqueCandidateCount: 2,
-			racedCandidateCount: 1,
-			racedUniqueCandidateCount: 1,
+			racedCandidateCount: batch ? 3 : 1,
+			racedUniqueCandidateCount: batch ? 2 : 1,
 			fullExactHits: 2,
-			racedExactHits: 1,
-			laterRecoveredExactHits: 1,
+			racedExactHits: batch ? 2 : 1,
+			laterRecoveredExactHits: batch ? 0 : 1,
 			fullExactReadyBeforeActor: 2,
-			racedExactReadyBeforeActor: 1,
-			fullExactLeadMs: 110,
-			racedExactLeadMs: 90,
+			racedExactReadyBeforeActor: batch ? 2 : 1,
+			fullExactLeadMs: batch ? 180 : 110,
+			racedExactLeadMs: batch ? 180 : 90,
 		});
 	});
 
