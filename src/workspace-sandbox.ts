@@ -866,9 +866,13 @@ async function commitSandboxExecution(
 						// Native writes are authoritative from their first possible effect, including mkdir.
 						applied.push(change);
 						await createParentDirectories(change.root, change.target, createdDirectories);
-						const descriptor = descriptors.get(change) ?? await open(change.target, "wx", 0o666);
-						descriptors.set(change, descriptor);
-						await descriptor.truncate(0);
+						let descriptor = descriptors.get(change);
+						if (descriptor) await descriptor.truncate(0);
+						else {
+							// Exclusive creation already gives an empty file; only existing files need truncation.
+							descriptor = await open(change.target, "wx", 0o666);
+							descriptors.set(change, descriptor);
+						}
 						await descriptor.writeFile(change.after!);
 						resourcesCommitted++;
 						continue;

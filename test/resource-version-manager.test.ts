@@ -83,6 +83,26 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
+	test.each([true, false])("rechecks shared missing ancestors on every adoption (watch=%s)", async (watch) => {
+		const root = await workspace({ "value.txt": "A" }), parent = path.join(root, "missing");
+		const manager = new ResourceVersionManager(root, { watch });
+		const paths = Array.from({ length: 24 }, (_, index) => path.join(parent, `input-${index}.txt`));
+		const token = await manager.capture(paths.map((path) => ({ path, scope: "content" })), 65536);
+		try {
+			expect((await manager.validate(token)).expired).toBe(false);
+			await fs.mkdir(parent);
+			expect((await manager.validate(token)).expired).toBe(false); // Every requested file is still absent.
+			await fs.writeFile(paths[17]!, "new input");
+			expect((await manager.validate(token)).expired).toBe(true);
+			await fs.rm(paths[17]!);
+			expect((await manager.validate(token)).expired).toBe(false);
+			await fs.rmdir(parent);
+			await fs.writeFile(parent, "not a directory");
+			const nativeError = await fs.lstat(paths[0]!).then(() => undefined, (error: NodeJS.ErrnoException) => error.code);
+			expect((await manager.validate(token)).expired).toBe(nativeError !== "ENOENT"); // Preserve the platform's missing-path error.
+		} finally { await token.release(); manager.close(); }
+	});
+
 	test("owns bounded immutable inputs and never converts unproven access into absence", async () => {
 		const payload = Buffer.concat([Buffer.alloc(1024 * 1024, 65), Buffer.alloc(1024 * 1024, 66), Buffer.from("end")]);
 		const root = await workspace({ "value.txt": payload }), file = path.join(root, "value.txt");

@@ -285,11 +285,12 @@ export class ResourceVersionManager {
 			// Host windows need eager binding evidence; Windows can restore a junction without changing its stamps.
 			if (sealing && (process.platform === "win32" || !token.observations.has(`binding:${filesystemPathKey(this.root)}`))) throw new Error("resource_path_binding_window_unprovable");
 			if (!token.observations.size) throw new Error("resource_dependencies_unproven");
-			await watcherTurn();
+			// Watcher delivery fences host execution windows; future adoption uses the exact fingerprints below.
+			if (sealing) await watcherTurn();
 			const watcherFailure = this.invalidation(token, sealing);
 			if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
 			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot);
-			await watcherTurn();
+			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
 			if (lateFailure) return validation(started, true, lateFailure, "watcher");
 			const expired = !current.length || current.some((entry) => {
@@ -503,9 +504,10 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 }
 
 async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, view?: ResourceReadView) {
+	const nearestExisting = missingResourceResolver(realRoot);
 	return mapFingerprints(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
-		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), view);
+		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, realRoot, new Set(), nearestExisting, view);
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 	});
 }
@@ -536,6 +538,7 @@ async function fingerprintPath(
 	scope: ResourceDependency["scope"],
 	realRoot: string,
 	ancestors: ReadonlySet<string>,
+	nearestExisting: (target: string) => Promise<string>,
 	view?: ResourceReadView,
 	descend = true,
 ): Promise<FingerprintResult> {
@@ -547,7 +550,7 @@ async function fingerprintPath(
 		view?.capture(target, { type: "missing" });
 		return {
 			value: { exists: false, error: errorCode(error) },
-			stamp: digest([filesystemPathKey(target), await nearestExistingInside(realRoot, target)]),
+			stamp: digest([filesystemPathKey(target), await nearestExisting(target)]),
 			bytesRead: 0,
 			filesRead: 0,
 		};
@@ -565,7 +568,7 @@ async function fingerprintPath(
 			throw new Error(`resource_symlink_changed:${target}`);
 		}
 		const source = path.resolve(path.dirname(target), link);
-		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, new Set(ancestors).add(identity), view, descend);
+		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, realRoot, new Set(ancestors).add(identity), nearestExisting, view, descend);
 		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link, realPath: realTarget });
 		return {
 			value: {
@@ -611,7 +614,7 @@ async function fingerprintPath(
 	const selected = [...entries].sort((left, right) => left.name.localeCompare(right.name));
 	const descendants = new Set(ancestors).add(identity);
 	const children = scope === "names" ? [] : await mapFingerprints(selected, async (entry) => {
-		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, view, scope !== "entries");
+		const child = await fingerprintPath(path.join(target, entry.name), scope, realRoot, descendants, nearestExisting, view, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
 	const [afterEntries, after] = await Promise.all([
@@ -672,23 +675,32 @@ function specialFileType(value: import("node:fs").Stats | import("node:fs").BigI
 	return value.isBlockDevice() ? "block_device" : "other";
 }
 
-async function nearestExistingInside(realRoot: string, target: string): Promise<string> {
-	let current = path.resolve(target);
-	for (;;) {
-		try {
-			const [real, stat] = await Promise.all([
-				fingerprintIO(() => fs.realpath(current)),
-				fingerprintIO(() => fs.lstat(current, { bigint: true })),
-			]);
-			assertInside(realRoot, real);
-			return digest([filesystemPathKey(real), statStamp(stat)]);
-		} catch (error) {
-			if (!missingResource(error)) throw error;
-		}
-		const parent = path.dirname(current);
-		if (parent === current) throw new Error(`resource_path_unresolved:${target}`);
-		current = parent;
-	}
+function missingResourceResolver(realRoot: string): (target: string) => Promise<string> {
+	// Negative queries commonly share ancestors. Join only concurrent reads in this proof batch;
+	// settled observations are never cached for another query or Actor validation.
+	const pending = new Map<string, Promise<string>>();
+	const resolve = (target: string): Promise<string> => {
+		const current = path.resolve(target), existing = pending.get(current);
+		if (existing) return existing;
+		const task = (async () => {
+			try {
+				const [real, stat] = await Promise.all([
+					fingerprintIO(() => fs.realpath(current)),
+					fingerprintIO(() => fs.lstat(current, { bigint: true })),
+				]);
+				assertInside(realRoot, real);
+				return digest([filesystemPathKey(real), statStamp(stat)]);
+			} catch (error) {
+				if (!missingResource(error)) throw error;
+			}
+			const parent = path.dirname(current);
+			if (parent === current) throw new Error(`resource_path_unresolved:${target}`);
+			return resolve(parent);
+		})().finally(() => pending.delete(current));
+		pending.set(current, task);
+		return task;
+	};
+	return resolve;
 }
 
 function statStamp(stat: import("node:fs").BigIntStats): string {
