@@ -786,6 +786,7 @@ export class LinuxProcessReuseBackend {
 		const request = materializeDispatcherRequest(session, received);
 		if (!request) throw new Error("dispatcher cwd is unmapped");
 		this.add(session, "requests");
+		const requestID = session.metrics.requests;
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
 		const eligibility = await eligibleRequest(session, request, ready.executionContext);
@@ -808,7 +809,7 @@ export class LinuxProcessReuseBackend {
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work);
+			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID);
 		} finally {
 			this.handoffs.complete(weakKey, acquired.work);
 		}
@@ -1038,6 +1039,7 @@ export class LinuxProcessReuseBackend {
 		weakKey: Sha256Digest,
 		outputRoute: OutputRoute,
 		work: ProcessHandoff,
+		requestID: number,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -1045,6 +1047,11 @@ export class LinuxProcessReuseBackend {
 		let traceRoot: string | undefined;
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
+		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
+		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
+			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
+			executable: prototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
+		})}`;
 		try {
 			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 			const tracePrefix = path.join(traceRoot, "process");
@@ -1085,7 +1092,8 @@ export class LinuxProcessReuseBackend {
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
 					// Both captures own live workspace/trace resources until they settle.
-					await Promise.allSettled(captures);
+					stage = (await Promise.allSettled(captures)).flatMap((result, index) =>
+						result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
 					throw error;
 				});
 				if (observation.incompleteReasons.length) {
@@ -1093,11 +1101,14 @@ export class LinuxProcessReuseBackend {
 					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
 				}
 				if (!delta.complete) {
+					stage = "transaction_capture";
 					this.setError(session, `transaction:${delta.reason}`);
 					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
 				}
 				const { before, after } = delta;
+				stage = "workspace_effects";
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
+				stage = "dependencies";
 				const evidence = await captureDependencies(
 					session,
 					transactionDependencySource(before, delta.changes),
@@ -1113,6 +1124,17 @@ export class LinuxProcessReuseBackend {
 				if (!before.complete || !after.complete || !observation.complete) {
 					taints.add("trace_incomplete");
 				}
+				dependencyCertificate = {
+					complete:
+						before.complete &&
+						after.complete &&
+						observation.complete &&
+						effects.complete &&
+						evidence.complete,
+					dependencies: evidence.dependencies,
+					taints: [...taints],
+				};
+				stage = "artifacts";
 				const journal: OrderedEffectEvent[] = [];
 				let sequence = 0;
 				const changes = new Map(delta.changes.map((change) => [path.normalize(change.relativePath), change]));
@@ -1137,16 +1159,7 @@ export class LinuxProcessReuseBackend {
 					const data = await this.store.artifacts.put(event.data);
 					journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data });
 				}
-				const dependencyCertificate: DynamicDependencyCertificate = {
-					complete:
-						before.complete &&
-						after.complete &&
-						observation.complete &&
-						effects.complete &&
-						evidence.complete,
-					dependencies: evidence.dependencies,
-					taints: [...taints],
-				};
+				stage = "certificate";
 				const exit = exitOutcome(outcome);
 				const certificate = sealProcessCertificate({
 					prototype,
@@ -1154,28 +1167,34 @@ export class LinuxProcessReuseBackend {
 					dependencyCertificate,
 					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
 				});
+				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				this.rememberScope(certificate.id, session.scope);
-				if (await this.handoffs.publish(
-					weakKey,
-					work,
-					certificate,
-					() => this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
-						// Optional history storage cannot invalidate already sealed execution evidence.
-						this.setError(session, `nested_publish:${errorMessage(error)}`);
-						return false;
-					}),
-				)) {
-					this.add(session, "published");
-				}
 				if (taints.size) {
 					this.add(session, "tainted");
 					this.setError(session, `tainted:${[...taints].join(",")}`);
 				}
+				stage = "handoff_registration";
+				if (await this.handoffs.publish(
+					weakKey,
+					work,
+					certificate,
+					() => {
+						stage = "history_publication";
+						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+							// Optional history storage cannot invalidate already sealed execution evidence.
+							this.setError(session, `nested_publish:${failureDetail(error)}`);
+							return false;
+						});
+					},
+				)) {
+					this.add(session, "published");
+				}
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
-				this.setError(session, `post_execution_capture:${errorMessage(error)}`);
-				session.incompleteReasons.add(`nested_capture:${errorMessage(error)}`);
+				const detail = failureDetail(error);
+				this.setError(session, `post_execution_capture:${detail}`);
+				session.incompleteReasons.add(`nested_capture:${detail}`);
 			}
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };

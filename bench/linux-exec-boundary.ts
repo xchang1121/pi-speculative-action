@@ -11,6 +11,7 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import {
 	argument,
 	assert,
+	BENCHMARK_SCOPE,
 	commitBenchmarkFixture,
 	compileBenchmarkHelper,
 	createLinuxProcessBenchmark,
@@ -182,7 +183,27 @@ int main(int argc, char **argv) {
 		async function withProducer<Value>(label: string, command: string,
 			inspect: (branch: Awaited<ReturnType<typeof produce>>) => Value | Promise<Value>) {
 			const branch = await produce(label, command);
-			try { return await inspect(branch); } finally { await branch.dispose(); }
+			try {
+				return await inspect(branch);
+			} catch (error) {
+				// Capture evidence while the branch is still owned; a failed run has no success report.
+				const [validation, storage] = await Promise.all([
+					branch.validate?.().catch((reason: unknown) => ({ error: String(reason) })),
+					fixture.backend.store.stats().catch((reason: unknown) => ({ error: String(reason) })),
+				]);
+				await writeBenchmarkReport({
+					schemaVersion: 1, status: "failed", label, command, scope: BENCHMARK_SCOPE,
+					error: error instanceof Error ? error.stack : String(error),
+					output: branch.output, execution: branch.executionMetrics,
+					producerAndActor: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(),
+					validation, storage,
+				}, output ? `${output}.failure.json` : undefined).catch((reason: unknown) => {
+					process.stderr.write(`Could not save process failure evidence: ${String(reason)}\n`);
+				});
+				throw error;
+			} finally {
+				await branch.dispose();
+			}
 		}
 		const actorCommand = "printf 'actor-parent\\n'; worker result.txt";
 		const direct = await executeDirectBash(fixture, { label: "held-direct", command: actorCommand });

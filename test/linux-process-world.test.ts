@@ -361,9 +361,11 @@ describe("Linux process ExecutionWorld", () => {
 		const entered = deferred(), failed = deferred(), gate = deferred();
 		const error = new Error(`injected ${failure} capture failure`);
 		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
+		let processContext = {};
 		let restoreTransactions: (() => void) | undefined;
 		const open = fixture.backend.open.bind(fixture.backend);
 		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+			processContext = { workspace: input.workspace.sandboxRoot, scope: input.scope };
 			const begin = input.workspace.transactions.begin;
 			const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
 				const capture = await begin();
@@ -422,10 +424,17 @@ describe("Linux process ExecutionWorld", () => {
 			await expect(stat(traceRoot!)).rejects.toMatchObject({ code: "ENOENT" });
 			expect(branch.output.result.content).toEqual([{ type: "text", text: "capture-once" }]);
 			expect({ executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
+			const lastError = branch.executionMetrics.reuse?.lastError ?? "";
+			expect(lastError).toContain(error.message);
+			const detail = JSON.parse(lastError.split("; process=")[1]!);
+			expect(detail).toMatchObject({ ...processContext, requestID: 1,
+				stage: failure === "publication" ? "history_publication" : `${failure}_capture` });
+			expect(detail.weakKey).toMatch(/^sha256:[a-f0-9]{64}$/);
 			const validation = await branch.validate?.();
 			if (failure === "publication") {
 				await expect(validateDynamicDependencyCertificate(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
-				expect(branch.executionMetrics.reuse?.lastError).toBe(`nested_publish:${error.message}`);
+				expect(lastError).toContain(`nested_publish:${error.message}`);
+				expect(detail).toMatchObject({ certificateID: publishing.mock.calls[0]![0].id, complete: true, taints: [] });
 				// The parent's independent directory identity proof must still reject this private root.
 				expect(validation).toMatchObject({ status: "stale", cause: { code: "process_dependency_changed", detail: fixture.workspace } });
 				expect((await fixture.backend.store.stats()).certificates).toBe(0);

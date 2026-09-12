@@ -29,7 +29,7 @@ export function benchmarkWriteAllC(type: "char" | "unsigned char" = "char"): str
   return 0;
 }`;
 }
-const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
+export const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
 	readonly state: "ready";
 	readonly sandlockBinary: string;
