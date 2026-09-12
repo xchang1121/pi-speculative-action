@@ -1,4 +1,5 @@
 import { deferred, nextTurn } from "./async.ts";
+import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -93,14 +94,5 @@ describe("ToolExecutionGateway", () => {
 });
 
 function branch(backend: string, output: string) {
-	return {
-		output,
-		backend,
-		resources: [],
-		capturedBytes: 0,
-		executionMetrics: {},
-		compatibility: { status: "compatible" as const, backend, executionFingerprint: `${backend}:v1` },
-		commit: async () => output,
-		dispose: () => {},
-	};
+	return testBranch(output, { backend, executionFingerprint: `${backend}:v1` });
 }

@@ -1,4 +1,5 @@
 import { deferred, barrier, nextTurn } from "./async.ts";
+import { testBranch as world } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR, type ActionKey } from "../src/action-semantics.ts";
@@ -6,8 +7,6 @@ import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect
 import {
 	type SpeculativeExecutionRoute,
 	type WorldBranch,
-	type WorldCheckpoint,
-	type WorldExecutionMetrics,
 } from "../src/execution-world.ts";
 import type {
 	AuthoritativeResultCapture,
@@ -1989,40 +1988,6 @@ describe("structural speculative runtime", () => {
 		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 });
-
-function world(
-	output: string,
-	options: {
-		readonly backend?: string;
-		readonly checkpoint?: WorldCheckpoint;
-		readonly executionMetrics?: WorldExecutionMetrics;
-		readonly resources?: readonly string[];
-		readonly onCommit?: () => void;
-		readonly onDispose?: () => void;
-		readonly executionFingerprint?: string;
-		readonly validate?: () => Promise<ResourceValidation>;
-	} = {},
-): WorldBranch<string> {
-	return {
-		output,
-		backend: options.backend ?? "test",
-		...(options.checkpoint ? { checkpoint: options.checkpoint } : {}),
-		resources: options.resources ?? [],
-		capturedBytes: 0,
-		executionMetrics: options.executionMetrics ?? {},
-		compatibility: {
-			status: "compatible" as const,
-			backend: options.backend ?? "test",
-			executionFingerprint: options.executionFingerprint ?? "",
-		},
-		...(options.validate ? { validate: options.validate } : {}),
-		commit: async () => {
-			options.onCommit?.();
-			return output;
-		},
-		dispose: () => options.onDispose?.(),
-	};
-}
 
 function isWorldBranch(value: unknown): value is WorldBranch<string> {
 	return Boolean(

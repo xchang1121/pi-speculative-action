@@ -1,4 +1,5 @@
 import { deferred, nextTurn } from "./async.ts";
+import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
 	effectCommitFailure,
@@ -248,14 +249,7 @@ describe("EffectTransactionCoordinator", () => {
 function branch(overrides: Partial<WorldBranch<string>> = {}): WorldBranch<string> {
 	const output = overrides.output ?? "sealed";
 	return {
-		output,
-		backend: "test",
-		resources: [],
-		capturedBytes: 0,
-		executionMetrics: {},
-		compatibility: { status: "compatible", backend: "test", executionFingerprint: "executor" },
-		commit: async () => output,
-		dispose: () => {},
+		...testBranch(output, { executionFingerprint: "executor" }),
 		...overrides,
 	};
 }

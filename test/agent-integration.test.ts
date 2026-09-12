@@ -1,4 +1,5 @@
 import { deferred, nextTurn } from "./async.ts";
+import { testBranch } from "./branch.ts";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel as model } from "./model.ts";
@@ -1022,21 +1023,11 @@ function mockRuntimeWorld(
 			fingerprint: () => "runtime:v1",
 			execute: async (context) => {
 				const output = await execute(context);
-				return {
-					output,
+				return testBranch(output, {
 					backend: "runtime",
-					resources: [],
-					capturedBytes: 0,
-					executionMetrics: {},
-					compatibility: {
-						status: "compatible",
-						backend: "runtime",
-						 executionFingerprint: context.action.executionFingerprint,
-					},
+					executionFingerprint: context.action.executionFingerprint,
 					validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }), // Fixed fixture inputs.
-					commit: async () => output,
-					dispose: () => {},
-				};
+				});
 			},
 		},
 		...(dispose ? { dispose } : {}),

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { testBranch } from "./branch.ts";
 import {
 	buildPiActionKey,
 	KEYABLE_TOOLS,
@@ -167,7 +168,7 @@ describe("ExecutionWorldRouter", () => {
 
 	it("keeps an observation-only world off the speculative route", async () => {
 		const capture = vi.fn(async () => ({
-			seal: async (output: string) => worldBranch("observe", output),
+			seal: async (output: string) => testBranch(output, { backend: "observe", executionFingerprint: "executor" }),
 			dispose: () => {},
 		}));
 		const observationOnly: BaseTestWorld = {
@@ -200,7 +201,7 @@ describe("ExecutionWorldRouter", () => {
 			observation: {
 				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 				tools: ["grep"],
-				capture: async () => ({ seal: async (output) => worldBranch("scoped", output), dispose: () => {} }),
+				capture: async () => ({ seal: async (output) => testBranch(output, { backend: "scoped", executionFingerprint: "executor" }), dispose: () => {} }),
 			},
 		};
 		const router = new ExecutionWorldRouter([scoped]);
@@ -320,21 +321,8 @@ function world(
 		speculation: {
 			capabilities,
 			fingerprint: () => `${id}:v1`,
-			execute: async ({ value }: { readonly value: string }) => worldBranch(id, value),
+			execute: async ({ value }: { readonly value: string }) => testBranch(value, { backend: id, executionFingerprint: "executor" }),
 		},
 		dispose,
 	} as TestWorld;
-}
-
-function worldBranch(id: string, output: string) {
-	return {
-		output,
-		backend: id,
-		resources: [],
-		capturedBytes: 0,
-		executionMetrics: {},
-		compatibility: { status: "compatible" as const, backend: id, executionFingerprint: "executor" },
-		commit: async () => output,
-		dispose: () => {},
-	};
 }

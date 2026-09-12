@@ -1,4 +1,5 @@
 import { deferred as barrier } from "./async.ts";
+import { testBranch } from "./branch.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
@@ -265,11 +266,9 @@ function fauxRuntimeWorld(): SpeculativeAgentExecutionWorld {
 			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 			execute: async (context) => {
 				const output = { result: await context.tool.execute(context.callID, context.args as never, context.signal), isError: false };
-				return { output, backend: "faux_runtime", resources: [], capturedBytes: 0, executionMetrics: {},
-					compatibility: { status: "compatible", backend: "faux_runtime", executionFingerprint: context.action.executionFingerprint },
+				return testBranch(output, { backend: "faux_runtime", executionFingerprint: context.action.executionFingerprint,
 					validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }), // Scripted fixture inputs stay immutable.
-					commit: async () => output, dispose: () => {},
-				};
+				});
 			},
 		},
 	};
