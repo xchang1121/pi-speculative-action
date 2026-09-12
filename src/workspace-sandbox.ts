@@ -1347,7 +1347,8 @@ async function acquireSandboxBaseline(
 						? incrementalPathspecs(repository.sourceRoot, changedPaths)
 						: undefined;
 				if (repository.commit && changedPathspecs) {
-					await repository.index(["read-tree", repository.commit]);
+					// Preserve matching entries' stat data without touching the source workspace.
+					await repository.index(["read-tree", "-m", "-i", repository.commit]);
 					if (changedPathspecs.length) {
 						await stageSandboxPaths(repository, changedPathspecs);
 					}

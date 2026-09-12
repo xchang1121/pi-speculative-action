@@ -631,24 +631,28 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
 	});
 
-	it("keeps parallel private workspaces isolated and cleans them after use", async () => {
+	it("reuses unchanged baselines after mutations and isolates and cleans parallel workspaces", async () => {
 		const root = await temporaryRoot("parallel");
-		await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
-		const values = await Promise.all(
-			["first\n", "second\n"].map((content) =>
-				sandbox.withWorkspace(root, async (workspace) => {
-					await writeFile(path.join(workspace.sandboxRoot, "value.txt"), content, "utf8");
-					return {
-						root: workspace.sandboxRoot,
-						content: await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8"),
-					};
-				}),
-			),
-		);
-		expect(new Set(values.map((value) => value.root)).size).toBe(2);
-		expect(values.map((value) => value.content).sort()).toEqual(["first\n", "second\n"]);
-		expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("base\n");
-		for (const value of values) await expect(stat(value.root)).rejects.toThrow();
+		await writeFile(path.join(root, "steady.txt"), "stable\n");
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		try {
+			for (const baseline of ["base\n", "changed\n"]) {
+				await writeFile(path.join(root, "value.txt"), baseline);
+				await sandbox.prepare(root, { driver: "git" });
+				const count = captures.mock.calls.length;
+				const roots = await Promise.all(["first\n", "second\n"].map((content) =>
+					sandbox.withWorkspace(root, async ({ sandboxRoot }) => {
+						expect(await readFile(path.join(sandboxRoot, "value.txt"), "utf8")).toBe(baseline);
+						await writeFile(path.join(sandboxRoot, "value.txt"), content);
+						expect(await readFile(path.join(sandboxRoot, "value.txt"), "utf8")).toBe(content);
+						return sandboxRoot;
+					})));
+				expect(captures.mock.calls.length).toBe(count);
+				expect(new Set(roots).size).toBe(2);
+				expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe(baseline);
+				for (const workspace of roots) await expect(stat(workspace)).rejects.toThrow();
+			}
+		} finally { captures.mockRestore(); }
 	});
 
 	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
