@@ -2390,9 +2390,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		const source = context ? runtimeState.sourcesByID.get(context.identity.source) : undefined;
 		if (!context || !source?.continue) return;
 		if (source.multiStepEnabled?.(context.settings, context.feedback) === false) return;
-		if (source.continueOn && !source.continueOn.includes(trigger)) return;
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
+		try {
+			const filter = source.continueOn;
+			if (filter && !(typeof filter === "function"
+				? filter({ actionID: node.action.id, feedback: context.feedback, output, trigger })
+				: filter.includes(trigger))) return;
+		} catch { return; } // Producer feedback cannot alter completed execution.
 		const parentDecisionSequence =
 			current.predictionState.status === "matching"
 				? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq)

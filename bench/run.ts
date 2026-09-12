@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "node:util";
 import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type Api, type Model } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { getModels, getProviders, streamSimple } from "@earendil-works/pi-ai/compat";
 import {
 	createBashTool,
@@ -218,21 +218,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const workspaceSandbox = new WorkspaceSandboxService(), sandbox = workspaceSandbox.createExecutionWorld();
 	const resolveInvocation = (tool: string, args: unknown) =>
 		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
-	let drafterCost = 0;
-	let drafterTokens = 0;
-	let drafterInputTokens = 0;
-	let drafterOutputTokens = 0;
-	let drafterCacheReadTokens = 0;
-	let drafterCacheWriteTokens = 0;
 	const drafterStopReasons: Record<string, number> = {};
 	const drafterToolCalls: Record<string, number> = {};
 	const drafterNoToolStopReasons: Record<string, number> = {};
 	const drafterPredictionTrace: Array<{
 		readonly requestSessionID?: string;
 		readonly stopReason: string;
-		readonly outputTokens: number;
-		readonly tool?: string;
-		readonly input?: unknown;
+		readonly usage: AssistantMessage["usage"];
+		readonly calls: readonly { readonly tool: string; readonly input: unknown }[];
 	}> = [];
 	const settings: SpeculativeAgentSettingsInput = {
 		enabled: input.speculationEnabled,
@@ -256,25 +249,16 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		getDraftOptions: ({ signal }) => ({ signal }),
 		complete: async (draftModel, context, streamOptions) => {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
-			drafterStopReasons[message.stopReason] = (drafterStopReasons[message.stopReason] ?? 0) + 1;
-			const call = message.content.find((item) => item.type === "toolCall");
+			increment(drafterStopReasons, message.stopReason);
+			const calls = message.content.filter((item) => item.type === "toolCall");
 			drafterPredictionTrace.push({
 				...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
 				stopReason: message.stopReason,
-				outputTokens: message.usage.output,
-				...(call ? { tool: call.name, input: call.arguments } : {}),
+				usage: message.usage,
+				calls: calls.map((call) => ({ tool: call.name, input: call.arguments })),
 			});
-			if (call) drafterToolCalls[call.name] = (drafterToolCalls[call.name] ?? 0) + 1;
-			else {
-				drafterNoToolStopReasons[message.stopReason] =
-					(drafterNoToolStopReasons[message.stopReason] ?? 0) + 1;
-			}
-			drafterCost += message.usage.cost.total;
-			drafterTokens += message.usage.totalTokens;
-			drafterInputTokens += message.usage.input;
-			drafterOutputTokens += message.usage.output;
-			drafterCacheReadTokens += message.usage.cacheRead;
-			drafterCacheWriteTokens += message.usage.cacheWrite;
+			for (const call of calls) increment(drafterToolCalls, call.name);
+			if (!calls.length) increment(drafterNoToolStopReasons, message.stopReason);
 			return message;
 		},
 		preflight: () => true,
@@ -489,28 +473,17 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			continue;
 		}
 		increment(speculativeHitProvidersBySource, event.candidate?.source ?? "cache");
-		speculativeHitsByTool[tool] = (speculativeHitsByTool[tool] ?? 0) + 1;
+		increment(speculativeHitsByTool, tool);
 		increment(speculativeHitsByDepth, String(event.candidate?.depth ?? 0));
 		const relation = provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`;
-		speculativeHitsByRelation[relation] = (speculativeHitsByRelation[relation] ?? 0) + 1;
+		increment(speculativeHitsByRelation, relation);
 	}
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
 	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
 	const nonToolMs = Math.max(0, serializedCounterfactualMs - summary.toolExecutionMs);
-	const actorUsage = agent.state.messages
-		.filter((message) => message.role === "assistant")
-		.reduce(
-			(current, message) => ({
-				cost: current.cost + message.usage.cost.total,
-				tokens: current.tokens + message.usage.totalTokens,
-				inputTokens: current.inputTokens + message.usage.input,
-				outputTokens: current.outputTokens + message.usage.output,
-				cacheReadTokens: current.cacheReadTokens + message.usage.cacheRead,
-				cacheWriteTokens: current.cacheWriteTokens + message.usage.cacheWrite,
-			}),
-			{ cost: 0, tokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
-		);
+	const actorUsage = summarizeUsage(agent.state.messages.filter((message) => message.role === "assistant"));
+	const drafterUsage = summarizeUsage(drafterPredictionTrace);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -559,6 +532,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			workspace: task.workspace,
 		},
 		summary: {
+			...summary,
 			actualEndToEndMs,
 			setupMs: agentStartedAt - taskStartedAt,
 			agentPromptMs: agentCompletedAt - agentStartedAt,
@@ -566,63 +540,36 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			serializedCounterfactualMs,
 			nonToolMs,
 			authoritativeToolMs: summary.toolExecutionMs,
-			hiddenLatencyMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			actorActions: toolIntentMs.length,
 			actorActionsByTool,
-			speculativeHits: summary.speculativeHits,
 			speculativeHitsByDepth,
 			speculativeHitsByTool,
 			speculativeHitsByRelation,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : toolIntentMs.length,
-			actorPreviews: summary.actorPreviews,
 			actorPreviewsByTool,
 			actorFallbacksByTool,
 			hitRate: toolIntentMs.length ? summary.speculativeHits / toolIntentMs.length : 0,
-			sourceRequests: summary.sourceRequests,
 			sourceRequestKinds,
 			sourceRequestsBySource,
-			sourceOutcomes: summary.sourceOutcomes,
-			predictionsSettled: summary.predictionsSettled,
-			predictionsObserved: summary.predictionsObserved,
-			predictionsMatched: summary.predictionsMatched,
-			predictionsAdopted: summary.predictionsAdopted,
-			predictionPrecision: summary.predictionPrecision,
-			adoptionYield: summary.adoptionYield,
 			predictionsBySource,
-			predictionUnobserved: summary.predictionUnobserved,
-			predictionRejectedAfterMatch: summary.predictionRejectedAfterMatch,
-			executionAheadMs: summary.executionAheadMs,
-			hitLatencyMs: summary.hitLatencyMs,
-			executionBlockedActorActions: summary.executionBlockedActorActions,
-			executionBlockedAttemptLeadMs: summary.executionBlockedAttemptLeadMs,
-			executionBlockedPotentialHiddenLatencyMs: summary.executionBlockedPotentialHiddenLatencyMs,
-			executionBlockedPotentialHitLatencyMs: summary.executionBlockedPotentialHitLatencyMs,
-			speculativeExecutionMs: summary.speculativeExecutionMs,
-			actorExecutionMs: summary.actorExecutionMs,
-			candidateStarted: summary.candidateStarted,
 			candidateStartsBySource,
 			candidateStartsByTool,
 			candidateStartsByDepth,
-			candidateSucceeded: summary.candidateSucceeded,
-			candidateFailed: summary.candidateFailed,
-			candidateCancelled: summary.candidateCancelled,
-			candidateTerminalCauses: summary.candidateTerminalCauses,
-			actorCandidateRejections: summary.actorCandidateRejections,
 			speculativeHitProvidersBySource,
 			actorActionMatchesByPredictionSource,
 			actorCost: actorUsage.cost,
-			drafterCost,
+			drafterCost: drafterUsage.cost,
 			actorTokens: actorUsage.tokens,
-			drafterTokens,
+			drafterTokens: drafterUsage.tokens,
 			actorInputTokens: actorUsage.inputTokens,
 			actorOutputTokens: actorUsage.outputTokens,
 			actorCacheReadTokens: actorUsage.cacheReadTokens,
 			actorCacheWriteTokens: actorUsage.cacheWriteTokens,
-			drafterInputTokens,
-			drafterOutputTokens,
-			drafterCacheReadTokens,
-			drafterCacheWriteTokens,
+			drafterInputTokens: drafterUsage.inputTokens,
+			drafterOutputTokens: drafterUsage.outputTokens,
+			drafterCacheReadTokens: drafterUsage.cacheReadTokens,
+			drafterCacheWriteTokens: drafterUsage.cacheWriteTokens,
 			drafterStopReasons,
 			drafterToolCalls,
 			drafterNoToolStopReasons,
@@ -655,6 +602,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			actorActions: actorActionTrace,
 		},
 	};
+}
+
+function summarizeUsage(messages: readonly { readonly usage: AssistantMessage["usage"] }[]) {
+	return messages.reduce((total, { usage }) => ({ cost: total.cost + usage.cost.total,
+		tokens: total.tokens + usage.totalTokens, inputTokens: total.inputTokens + usage.input,
+		outputTokens: total.outputTokens + usage.output, cacheReadTokens: total.cacheReadTokens + usage.cacheRead,
+		cacheWriteTokens: total.cacheWriteTokens + usage.cacheWrite,
+	}), { cost: 0, tokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
 }
 
 function benchmarkShellEnvironment(): Record<string, string> {

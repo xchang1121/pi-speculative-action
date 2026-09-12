@@ -31,19 +31,22 @@ import {
 } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type { ActorActionFeedback } from "./runtime.ts";
-import type { ToolSettlement } from "./tool-settlement.ts";
 
 interface DrafterBatch {
 	readonly model: Model<Api>;
 	readonly context: Context;
 	readonly options: SimpleStreamOptions;
 	readonly utility: DrafterUtilityBatch;
+	readonly tools: ReadonlySet<string>;
 }
 
 interface DrafterPlanFeedback extends DrafterBatch {
 	readonly kind: "drafter_plan";
 	readonly message: AssistantMessage;
 	readonly depth: number;
+	readonly calls: ReadonlyMap<string, AgentToolCall>;
+	readonly results: Map<string, ToolResultMessage>;
+	claimed: boolean;
 }
 
 export interface DrafterPlanSourceController {
@@ -62,7 +65,8 @@ export function createDrafterPlanSource(input: {
 }): DrafterPlanSourceController {
 	const batches = new Map<string, Promise<DrafterBatch>>();
 	const gate = new DrafterUtilityGate();
-	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal): Promise<AssistantMessage> => {
+	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, prefix: string,
+		depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
 		signal.throwIfAborted();
 		gate.requestStarted(batch.utility);
 		const startedAt = performance.now();
@@ -71,7 +75,15 @@ export function createDrafterPlanSource(input: {
 			const message = await input.complete(batch.model, batch.context, { ...batch.options, signal });
 			if (message.stopReason === "error" || message.stopReason === "aborted")
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-			return message;
+			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
+			if (!calls.length || calls.some((call) => !batch.tools.has(call.name)) ||
+				new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
+			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
+				calls: new Map(calls.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: false };
+			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
+				id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
+				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
+			})), draftTokens: calculateContextTokens(message.usage) };
 		} catch (error) {
 			failed = !signal.aborted;
 			throw error;
@@ -91,7 +103,13 @@ export function createDrafterPlanSource(input: {
 			const previous = asDrafterPlanFeedback(feedback);
 			return previous !== undefined && previous.depth < maxDepth;
 		},
-		continueOn: ["execution_succeeded"],
+		continueOn: ({ trigger, actionID, feedback, output }) => {
+			const previous = asDrafterPlanFeedback(feedback), call = previous?.calls.get(actionID);
+			if (trigger !== "execution_succeeded" || !previous || !call || previous.claimed || previous.results.has(actionID)) return false;
+			previous.results.set(actionID, { ...output.result, role: "toolResult", toolCallId: call.id,
+				toolName: call.name, isError: output.isError, timestamp: Date.now() });
+			return previous.results.size === previous.calls.size;
+		},
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		concurrentProposalPolicy: (settings) =>
 			clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit) === 2 ? "first_produced" : "all",
@@ -104,31 +122,28 @@ export function createDrafterPlanSource(input: {
 			signal,
 			settings,
 		}): Promise<PlanProposal | undefined> => {
-			const proposalID = `drafter:${startInput.turnID}:${proposalIndex}`;
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
 				batch = (async () => {
-					const configuredDraftModel =
+					const model = (
 						typeof input.draftModel === "function"
 							? await input.draftModel(startInput.actorModel)
-							: input.draftModel;
-					const model = configuredDraftModel ?? startInput.actorModel;
+							: input.draftModel) ?? startInput.actorModel;
 					const utility = gate.start(
-						drafterModelKey(model),
+						JSON.stringify([model.provider, model.api, model.baseUrl, model.id]),
 						settings.sourceConfig?.drafterGateEnabled !== false,
 					);
-					let configuredDraftOptions: SimpleStreamOptions | undefined;
-					if (utility.allowed) {
-						configuredDraftOptions = input.getDraftOptions
+					const configuredDraftOptions = utility.allowed
+						? input.getDraftOptions
 							? await input.getDraftOptions({
 									actorModel: startInput.actorModel,
 									draftModel: model,
 									actorOptions: startInput.actorOptions,
 									signal,
 								})
-							: startInput.actorOptions;
-					}
+							: startInput.actorOptions
+						: undefined;
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, input.getDraftOptions ? requestedReasoning ?? "off" : "off");
@@ -137,6 +152,7 @@ export function createDrafterPlanSource(input: {
 						context: startInput.context,
 						options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning },
 						utility,
+						tools: new Set(candidateNames.filter((name) => data.tools.has(name))),
 					};
 				})();
 				batches.set(batchKey, batch);
@@ -156,49 +172,23 @@ export function createDrafterPlanSource(input: {
 			};
 			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
 			if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, signal);
-			const request = { ...prepared, options: draftOptions };
-			const message = await completeDraft(request, signal);
-			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			if (!call) return undefined;
-			if (!data.tools.has(call.name) || !candidateNames.includes(call.name)) return undefined;
-			const feedback = drafterFeedback(request, message, call, 0);
-			return {
-				id: proposalID,
-				source: "drafter",
-				revision: 0,
-				actions: [drafterPlanAction(`${proposalIndex}:${call.id}`, call, feedback)],
-				draftTokens: calculateContextTokens(message.usage),
-			};
+			const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
+			return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 		},
-		continue: async ({ proposalID, actionID, revision, feedback, output, signal }) => {
+		continue: async ({ proposalID, revision, feedback, signal }) => {
 			const previous = asDrafterPlanFeedback(feedback);
-			if (!previous || signal.aborted) return undefined;
-			const previousCall = previous.message.content.find(
-				(item): item is AgentToolCall => item.type === "toolCall",
-			);
-			if (!previousCall) return undefined;
+			if (!previous || signal.aborted || previous.claimed || previous.results.size !== previous.calls.size) return undefined;
+			previous.claimed = true;
 			const context: Context = {
 				...previous.context,
-				messages: [...previous.context.messages, previous.message, drafterToolResult(previousCall, output)],
+				messages: [...previous.context.messages, previous.message,
+					...[...previous.calls.keys()].map((id) => previous.results.get(id)!)],
 			};
-			const continuationOptions = { ...previous.options, toolChoice: "auto" as const };
-			if (!drafterContextFits(previous.model, context, continuationOptions.maxTokens)) return undefined;
-			const request = { ...previous, context, options: continuationOptions };
-			const message = await completeDraft(request, signal);
-			const call = message.content.find((item): item is AgentToolCall => item.type === "toolCall");
-			if (!call) return undefined;
-			const next = drafterFeedback(request, message, call, previous.depth + 1);
-			return {
-				proposalID,
-				source: "drafter",
-				revision,
-				upsert: [
-					drafterPlanAction(`${actionID}/rollout:${next.depth}:${call.id}`, call, next, [
-						{ actionID, condition: "execution_succeeded" },
-					]),
-				],
-				draftTokens: calculateContextTokens(message.usage),
-			};
+			const options = { ...previous.options, toolChoice: "auto" as const };
+			if (!drafterContextFits(previous.model, context, options.maxTokens)) return undefined;
+			const draft = await completeDraft({ ...previous, context, options }, signal, `rollout:${revision}`, previous.depth + 1,
+				[...previous.calls.keys()].map((actionID) => ({ actionID, condition: "execution_succeeded" })));
+			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions, draftTokens: draft.draftTokens };
 		},
 	};
 
@@ -206,14 +196,10 @@ export function createDrafterPlanSource(input: {
 		source,
 		snapshot: () => gate.snapshot(),
 		finishTurn: (sessionID, turnID) => {
-			const batch = batches.get(agentBatchKey(sessionID, turnID));
-			batches.delete(agentBatchKey(sessionID, turnID));
-			if (!batch) return;
-			void batch
-				.then((value) => gate.finish(value.utility))
-				.catch(() => {
-					// Model/auth resolution failures are already represented by source request events.
-				});
+			const key = agentBatchKey(sessionID, turnID), batch = batches.get(key);
+			batches.delete(key);
+			// Model/auth failures are already represented by source request events.
+			void batch?.then((value) => gate.finish(value.utility)).catch(() => {});
 		},
 		actorActionSettled: async (feedback) => {
 			const { settlement } = feedback;
@@ -245,55 +231,8 @@ function drafterContextFits(model: Model<Api>, context: Context, maxTokens: numb
 	return estimate.tokens + staticPrompt + output <= model.contextWindow;
 }
 
-function drafterModelKey(model: Model<Api>): string {
-	return JSON.stringify([model.provider, model.api, model.baseUrl, model.id]);
-}
-
 function asDrafterPlanFeedback(value: unknown): DrafterPlanFeedback | undefined {
 	return value && typeof value === "object" && (value as { kind?: unknown }).kind === "drafter_plan"
 		? (value as DrafterPlanFeedback)
 		: undefined;
-}
-
-function drafterPlanAction(
-	id: string,
-	call: AgentToolCall,
-	feedback: DrafterPlanFeedback,
-	dependsOn?: PlanAction["dependsOn"],
-): PlanAction {
-	return {
-		id,
-		type: "tool_call",
-		tool: call.name,
-		input: call.arguments,
-		diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
-		depth: feedback.depth,
-		feedback,
-		...(dependsOn?.length ? { dependsOn } : {}),
-	};
-}
-
-function drafterFeedback(
-	batch: DrafterBatch,
-	message: AssistantMessage,
-	call: AgentToolCall,
-	depth: number,
-): DrafterPlanFeedback {
-	return {
-		...batch,
-		kind: "drafter_plan",
-		message: { ...message, content: message.content.filter((item) => item.type !== "toolCall" || item === call) },
-		depth,
-	};
-}
-
-function drafterToolResult(call: AgentToolCall, output: ToolSettlement): ToolResultMessage {
-	return {
-		...output.result,
-		role: "toolResult",
-		toolCallId: call.id,
-		toolName: call.name,
-		isError: output.isError,
-		timestamp: Date.now(),
-	};
 }

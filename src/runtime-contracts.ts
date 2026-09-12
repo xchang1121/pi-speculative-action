@@ -162,8 +162,13 @@ export interface SpeculativePlanSource<
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
-	/** Restrict continuation callbacks without coupling Runtime scheduling to a concrete source. */
-	readonly continueOn?: readonly ("execution_succeeded" | "actor_adopted")[];
+	/** Collect/filter execution feedback before a continuation consumes request capacity. */
+	readonly continueOn?: readonly ("execution_succeeded" | "actor_adopted")[] | ((input: {
+		readonly actionID: string;
+		readonly feedback: unknown;
+		readonly output: Output;
+		readonly trigger: "execution_succeeded" | "actor_adopted";
+	}) => boolean);
 	readonly observe?: (input: {
 		readonly startInput: StartInput;
 		readonly data: StateData;

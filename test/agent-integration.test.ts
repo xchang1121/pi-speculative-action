@@ -171,31 +171,42 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it("keeps explicit Drafter reasoning through continuations without inheriting Actor reasoning or token limits", async () => {
-		const tool = createReadTool(await temporaryWorkspace());
+	it("continues complete Drafter batches once within one request slot, preserving reasoning and ordered results", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		const message = assistant([{ type: "thinking", thinking: "fixture reasoning", thinkingSignature: "signature" },
+			...[1, 2, 3].map((offset) => ({ type: "toolCall" as const, id: `call-${offset}`, name: "read", arguments: { path: "notes.txt", offset, limit: 1 } }))], "toolUse");
 		for (const requested of [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
 			for (const supported of [true, false]) {
 				const options: SimpleStreamOptions = Object.freeze({ reasoning: requested === "off" ? undefined : requested ?? "high", maxTokens: 1 });
-				const received: SimpleStreamOptions[] = [];
-				const controller = createDrafterPlanSource({ sessionID: "session",
+				const finished = [deferred(), deferred(), deferred()], order: number[] = [], events: SpeculativeActionEvent<string>[] = [];
+				const complete = vi.fn<Parameters<typeof createDrafterPlanSource>[0]["complete"]>(async () => message);
+				const host = createSpeculativeActionHost("session", { cwd, complete, preflight: () => true,
 					draftModel: { ...model("draft"), reasoning: supported, thinkingLevelMap: { xhigh: "high", max: "max" } },
 					...(requested === undefined ? {} : { getDraftOptions: () => options }),
-					complete: async (_model, _context, request) => { received.push(request!); return drafterCall({ path: "notes.txt" }); },
+					getSettings: () => ({ ...settings(), drafterMaxTokens: 128, drafterMaxDepth: 1, maxConcurrentActions: supported ? 1 : 3 }),
+					onEvent: (event) => { events.push(event); },
+					executionWorlds: [mockRuntimeWorld(async (context) => {
+						const offset = Number((context.args as { offset: number }).offset);
+						if (!supported && offset < 3) await finished[offset]!.promise;
+						const result = await tool.execute(context.callID, context.args as never);
+						order.push(offset); finished[offset - 1]!.resolve(); return { result, isError: false };
+					})],
 				});
-				const request = { startInput: { ...startInput(tool), sessionID: "session", actorOptions: options },
-					data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-					settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterMaxTokens: 128 } },
-					definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
 				try {
-					const proposal = await controller.source.propose(request);
-					if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
-					await controller.source.continue!({ ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
-						tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
-						feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" });
+					await host.startTurn({ ...startInput(tool), actorOptions: options });
+					await waitFor(() => complete.mock.calls.length === 2);
+					expect(order).toEqual(supported ? [1, 2, 3] : [3, 2, 1]);
+					const requests = complete.mock.calls;
+					expect(requests[1]![1].messages[0]).toEqual(message);
+					expect(requests[1]![1].messages.slice(1)).toMatchObject(await Promise.all([1, 2, 3].map(async (offset) => ({
+						...await tool.execute("oracle", { path: "notes.txt", offset, limit: 1 }), role: "toolResult", toolCallId: `call-${offset}`, isError: false }))));
 					const reasoning: ThinkingLevel | undefined = supported && requested !== "off" ? requested : undefined;
-					expect(received).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
+					expect(requests.map((request) => request[2])).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
+					await host.finishTurn("turn-1", true);
+					expect(complete).toHaveBeenCalledTimes(2);
+					expect(events.filter((event) => event.type === "source_request" && event.request.request.kind === "continuation")).toHaveLength(1);
 					expect(options.maxTokens).toBe(1);
-				} finally { controller.finishSession(); }
+				} finally { for (const gate of finished) gate.resolve(); await host.dispose(); }
 			}
 		}
 	});
@@ -205,9 +216,10 @@ describe("speculative action host", () => {
 		const prepareExecution = vi.fn();
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		const tool = createReadTool(await temporaryWorkspace());
+		let reply = drafterCall({ path: "notes.txt" });
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => {
 			now += 100;
-			return drafterCall({ path: "notes.txt" });
+			return reply;
 		} });
 		const request = { startInput: { ...startInput(tool), sessionID: "session" },
 			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution },
@@ -218,9 +230,14 @@ describe("speculative action host", () => {
 		controller.finishTurn("session", "turn-1");
 		await Promise.resolve();
 		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -100 });
-		await controller.source.continue!({ ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
+		const continuation = { ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
 			tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
-			feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" });
+			feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" as const };
+		if (typeof controller.source.continueOn !== "function") throw new Error("missing batch admission");
+		expect(controller.source.continueOn({ ...continuation, trigger: "actor_adopted" })).toBe(false);
+		expect(controller.source.continueOn(continuation)).toBe(true);
+		await Promise.all([controller.source.continue!(continuation), controller.source.continue!(continuation)]);
+		expect(controller.source.continueOn(continuation)).toBe(false);
 		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -200 });
 		expect(prepareExecution).toHaveBeenCalledOnce();
 		for (let turn = 2; turn <= 5; turn++) {
@@ -234,6 +251,12 @@ describe("speculative action host", () => {
 		expect(controller.snapshot().skippedBatches).toBe(1);
 		controller.finishSession();
 		expect(controller.snapshot().samples).toBe(0);
+		const valid = reply.content[0]!;
+		for (const content of [[], [valid, valid], [valid, { type: "toolCall" as const, id: "disabled", name: "bash", arguments: {} }]]) {
+			reply = assistant(content, "toolUse");
+			expect(await controller.source.propose(request)).toBeUndefined();
+			controller.finishSession();
+		}
 		const fork = createActorForkPlanSource();
 		for (const phase of ["request-first", "runtime-first", "skipped", "aborted", "settled", "finished"]) {
 			const prepareExecution = vi.fn(), signal = new AbortController();

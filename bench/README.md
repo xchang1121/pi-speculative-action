@@ -135,6 +135,8 @@ npm run bench:tape -- \
 
 报告区分原始/唯一 K(a)、重复请求、精确命中、Actor 完成前就绪、解码领先及 Drafter 总服务时间，并按派发顺序对宽度 1、2、3、8 对照。请求成本按 Actor 决策计一次，动作覆盖单独计量，不能让并行工具重复放大请求费用。
 
+Drafter 的一个响应可提供一批工具预测；整批结果按响应顺序反馈，只占一次后续模型请求。`run.ts` 的 `drafterPredictions` 保存完整 `calls` 与每次请求的 `usage`，不再只记录第一项。
+
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。
 
 先在环境中提供 `DEEPSEEK_API_KEY`，再显式运行需要模型/网络的阶段：

@@ -1415,7 +1415,7 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["parallel-predictions", "different-routes", "late-prediction", "preview-first", "two-previews", "cancel-owner", "prediction-first", "future-prediction"] as const)(
+	it.each(["parallel-predictions", "different-routes", "late-prediction", "preview-first", "two-previews", "cancel-owner", "prediction-first", "future-prediction", "feedback-skip", "feedback-error"] as const)(
 		"coalesces candidate admission across producer entrances: %s", async (mode) => {
 		const dual = mode === "two-previews" || mode === "cancel-owner", distinct = mode === "different-routes";
 		const sourceCount = dual ? 0 : distinct ? 2 : mode === "parallel-predictions" ? 8 : 1;
@@ -1423,9 +1423,11 @@ describe("structural speculative runtime", () => {
 		const proposed = barrier(sourceCount), keyed = barrier(sourceCount), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
 		const ready = candidateSucceeded(distinct ? 2 : 1), nextReady = candidateSucceeded(2), disposed = vi.fn();
 		const settlements: PredictionSettlement[] = [];
+		const filtered = mode.startsWith("feedback-");
 		let admissions = 0, proposals = 0, routes = 0;
 		const fixture = harness({
-			source: { id: "source", enabled: () => !dual, proposalCount: () => sourceCount, continueOn: ["execution_succeeded"],
+			source: { id: "source", enabled: () => !dual, proposalCount: () => sourceCount,
+				continueOn: filtered ? () => { continued.arrive(); if (mode === "feedback-error") throw new Error("feedback failure"); return false; } : ["execution_succeeded"],
 				propose: async ({ startInput, proposalIndex }) => {
 					proposals++; proposed.arrive(); await offered.promise;
 					const proposal = plan("source", `${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
@@ -1455,7 +1457,7 @@ describe("structural speculative runtime", () => {
 				if (distinct) { await executing.promise; executionGate.arrive(); }
 				await continued.promise;
 			} else {
-				if (mode === "prediction-first") { offered.arrive(); await continued.promise; }
+				if (mode === "prediction-first" || filtered) { offered.arrive(); await continued.promise; }
 				if (mode === "future-prediction") { offered.arrive(); await keyed.promise; expect(fixture.runtime.inspect().deferredPlanActions).toBe(1); expect(fixture.executions()).toBe(0); }
 				const previews = [fixture.runtime.previewActorCall(actor)];
 				if (dual) previews.push(fixture.runtime.previewActorCall(second));
@@ -1477,6 +1479,7 @@ describe("structural speculative runtime", () => {
 			} else expect((await fixture.runtime.prepareActorCall(actor))?.output).toBe("shared observation");
 			if (dual || mode === "prediction-first") expect((await fixture.runtime.prepareActorCall(second))?.output).toBe("shared observation");
 			await fixture.runtime.finishTurn({ ...actor, terminal: mode !== "prediction-first" });
+			if (filtered) expect(fixture.events.filter((event) => event.type === "source_request" && event.request.request.kind === "continuation")).toEqual([]);
 			if ((dual && mode !== "cancel-owner") || mode === "prediction-first") {
 				const providers = fixture.events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
 				expect(providers).toHaveLength(2);
