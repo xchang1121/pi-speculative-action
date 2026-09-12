@@ -65,6 +65,38 @@ describe("ProcessHandoffRegistry", () => {
 		}
 	});
 
+	it.each(["clear", "trim", "dispose"] as const)("revokes a completed handoff during validation on %s", async (operation) => {
+		const fixture = await producer(true), entered = deferred(), release = deferred();
+		await fixture.publish();
+		const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[]) => {
+			if (!live) return undefined;
+			entered.resolve(); await release.promise; return livePlan(live);
+		});
+		const actor = acquireActor(fixture, lookup);
+		await entered.promise;
+		if (operation === "clear") fixture.registry.clearCompleted();
+		else if (operation === "trim") fixture.registry.configure(0);
+		else fixture.registry.dispose();
+		release.resolve();
+		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
+		await expect(fixture.ownership.commit(async () => "whole")).resolves.toBe("whole");
+		expect(lookup.mock.calls.length).toBe(operation === "dispose" ? 1 : 2);
+	});
+
+	it("revokes pending and later history lookups on disposal", async () => {
+		const fixture = await producer(), entered = deferred(), release = deferred();
+		const lookup = vi.fn(async () => {
+			entered.resolve(); await release.promise; return { certificate: fixture.certificate };
+		});
+		const actor = acquireActor(fixture, lookup);
+		await entered.promise;
+		fixture.registry.dispose(); release.resolve();
+		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
+		await expect(acquireActor(fixture, lookup)).resolves.toEqual({ kind: "miss", joined: false });
+		expect(lookup).toHaveBeenCalledTimes(1);
+		await expect(fixture.work.completion).resolves.toBeUndefined();
+	});
+
 	it("arbitrates whole and child ownership across validation and commit, retaining repeatable results", async () => {
 		for (const oneShot of [true, false]) for (const wholeFirst of [true, false]) {
 			const fixture = await producer(oneShot);

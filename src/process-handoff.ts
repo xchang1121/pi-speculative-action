@@ -84,6 +84,7 @@ export class ProcessHandoffRegistry {
 		let joined = false, historyChecked = false;
 		const considered = new Map<HandoffRecord, Sha256Digest>();
 		while (true) {
+			if (this.disposed) return { kind: "miss", joined };
 			const records = this.byKey.get(options.key) ?? [];
 			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
@@ -95,7 +96,7 @@ export class ProcessHandoffRegistry {
 				const plan = await options.lookup(completed.map(({ candidate }) => candidate));
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
-				if (plan && selected && selected.record.state === selected.state &&
+				if (plan && selected && selected.record.state === selected.state && this.byKey.get(options.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
 					selected.record.state = { status: "claimed" };
 					this.remove(options.key, selected.record);
@@ -106,7 +107,7 @@ export class ProcessHandoffRegistry {
 			if (!historyChecked) {
 				// A failed live attempt also rules out its immutable disk copy for this acquisition.
 				const plan = await options.lookup(undefined, new Set(considered.values()));
-				if (plan) return { kind: "hit", plan, joined };
+				if (plan && !this.disposed) return { kind: "hit", plan, joined };
 				historyChecked = true;
 				continue; // A candidate may have completed while history was being read.
 			}
