@@ -1,16 +1,17 @@
 import { deferred } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
+import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	createExecPrototype,
 	sealProcessCertificate,
-	sha256Digest,
+	sha256Digest as digest,
 	type ProcessProvenanceCertificate,
 } from "../src/provenance-certificate.ts";
 
 const SCOPE = { sessionID: "session", turnID: "turn" };
 const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
+const livePlan = async (live?: ProcessProvenanceCertificate) => live?.id;
 
 describe("ProcessHandoffRegistry", () => {
 	it("finds a candidate completed after persistent lookup began", async () => {
@@ -44,8 +45,10 @@ describe("ProcessHandoffRegistry", () => {
 			});
 			await persistenceStarted.promise;
 
-			const actor = await acquireActor(fixture);
+			const lookup = vi.fn(livePlan);
+			const actor = await acquireActor(fixture, lookup);
 			expect(actor).toMatchObject({ kind: "hit", plan: fixture.certificate.id });
+			expect(lookup.mock.calls).toEqual([[fixture.certificate]]);
 
 			if (failure) {
 				persistence.reject(failure);
@@ -106,42 +109,27 @@ describe("ProcessHandoffRegistry", () => {
 			return "completed" as const;
 		});
 
-		await expect(fixture.registry.acquire({
-			key: fixture.key,
-			scope: OTHER_SCOPE,
-			role: "actor",
-			lookup: async () => undefined,
-			waitForRunning,
-		})).resolves.toEqual({ kind: "miss", joined: false });
+		await expect(acquireActor(fixture, async () => undefined, waitForRunning, OTHER_SCOPE))
+			.resolves.toEqual({ kind: "miss", joined: false });
 		expect(waitForRunning).not.toHaveBeenCalled();
 
-		const sameScope = fixture.registry.acquire({
-			key: fixture.key,
-			scope: SCOPE,
-			role: "actor",
-			lookup: async (live) => live?.id,
-			waitForRunning,
-		});
+		const lookup = vi.fn(livePlan);
+		const sameScope = acquireActor(fixture, lookup, waitForRunning);
 		await waitEntered.promise;
 		await fixture.registry.publish(fixture.key, fixture.work, fixture.certificate, async () => false);
 		releaseWait.resolve();
 		await expect(sameScope).resolves.toMatchObject({ kind: "hit", joined: true });
+		expect(lookup.mock.calls).toEqual([[], [fixture.certificate]]);
 	});
 
 	it("returns an Actor miss when the running-join deadline wins", async () => {
 		const fixture = await producer();
 		const waitEntered = deferred<void>();
 		const deadline = deferred<void>();
-		const actor = fixture.registry.acquire({
-			key: fixture.key,
-			scope: SCOPE,
-			role: "actor",
-			lookup: async (live) => live?.id,
-			waitForRunning: async () => {
-				waitEntered.resolve();
-				await deadline.promise;
-				return "miss";
-			},
+		const actor = acquireActor(fixture, undefined, async () => {
+			waitEntered.resolve();
+			await deadline.promise;
+			return "miss";
 		});
 		await waitEntered.promise;
 
@@ -166,13 +154,12 @@ async function producer(oneShot = false) {
 	return { certificate, key, registry, ownership, work: acquired.work };
 }
 
-function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = async (live?: ProcessProvenanceCertificate) => live?.id) {
-	return fixture.registry.acquire({ key: fixture.key, scope: SCOPE, role: "actor", lookup,
-		waitForRunning: async (running) => { await running.completion; return "completed"; } });
+function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = livePlan,
+	waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss"> = running => running.completion.then(() => "completed"), scope = SCOPE) {
+	return fixture.registry.acquire({ key: fixture.key, scope, role: "actor", lookup, waitForRunning });
 }
 
 function processCertificate(oneShot: boolean) {
-	const digest = (value: string) => sha256Digest(value);
 	return sealProcessCertificate({
 		prototype: createExecPrototype({
 			executablePath: "/usr/bin/tool",

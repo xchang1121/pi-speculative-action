@@ -33,7 +33,7 @@ export interface ProcessHandoff {
 type HandoffState =
 	| { readonly status: "running" }
 	| { readonly status: "completed"; readonly candidate?: ProcessProvenanceCertificate }
-	| { readonly status: "claimed"; readonly candidate: ProcessProvenanceCertificate };
+	| { readonly status: "claimed" };
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
@@ -76,26 +76,33 @@ export class ProcessHandoffRegistry {
 	}
 
 	async acquire<Plan>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
-		let joined = false;
+		let joined = false, historyChecked = false;
+		const considered = new Set<HandoffRecord>();
 		while (true) {
-			const persisted = await options.lookup();
-			if (persisted) return { kind: "hit", plan: persisted, joined };
 			const records = this.byKey.get(options.key) ?? [];
 			for (const record of [...records].reverse()) {
-				if (record.state.status !== "completed" || !record.state.candidate || !sameScope(record.scope, options.scope)) continue;
-				const candidate = record.state.candidate, oneShot = candidate.dependencyCertificate.taints.length > 0;
+				const state = record.state;
+				if (state.status !== "completed" || !state.candidate || considered.has(record) || !sameScope(record.scope, options.scope)) continue;
+				considered.add(record);
+				const candidate = state.candidate, oneShot = candidate.dependencyCertificate.taints.length > 0;
 				if (oneShot && record.ownership.wholeClaimed) continue;
 				const plan = await options.lookup(candidate);
-				if (!plan || record.state.status !== "completed" || record.state.candidate !== candidate ||
-					(oneShot && !record.ownership.claimChild())) continue;
-				record.state = { status: "claimed", candidate };
+				if (!plan || record.state !== state || (oneShot && !record.ownership.claimChild())) continue;
+				record.state = { status: "claimed" };
 				this.remove(options.key, record);
 				return { kind: "hit", plan, joined };
+			}
+			if (!historyChecked) {
+				const plan = await options.lookup();
+				if (plan) return { kind: "hit", plan, joined };
+				historyChecked = true;
+				continue; // A candidate may have completed while history was being read.
 			}
 			if (options.role === "producer") return { kind: "work", work: this.reserve(options.key, options.ownership, options.scope), joined };
 			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope));
 			if (!running || (await options.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
 			joined = true;
+			historyChecked = false;
 		}
 	}
 
@@ -121,11 +128,7 @@ export class ProcessHandoffRegistry {
 	}
 
 	clearCompleted(): void {
-		for (const [key, records] of this.byKey) {
-			const retained = records.filter((record) => record.state.status === "running");
-			if (retained.length) this.byKey.set(key, retained);
-			else this.byKey.delete(key);
-		}
+		this.trim(0);
 	}
 
 	dispose(): void {
@@ -139,9 +142,7 @@ export class ProcessHandoffRegistry {
 	private reserve(key: Sha256Digest, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): ProcessHandoff {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
-		const completion = new Promise<void>((resolve) => {
-			settle = resolve;
-		});
+		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const record: HandoffRecord = {
 			completion,
 			scope,
@@ -162,8 +163,8 @@ export class ProcessHandoffRegistry {
 		else this.byKey.delete(key);
 	}
 
-	private trim(): void {
-		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status === "completed").length - this.maxCompleted;
+	private trim(limit = this.maxCompleted): void {
+		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status === "completed").length - limit;
 		if (excess <= 0) return;
 		for (const [key, records] of this.byKey) {
 			const retained = records.filter((record) => record.state.status === "running" || excess-- <= 0);
