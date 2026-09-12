@@ -153,7 +153,9 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 
 独立进程从 `execFile` 计至真实退出，包含导入、首次 SDK 初始化、任务、回收与共同摘要；纯 Actor 不加载投机模块。夹具、oracle 和对称的 SDK 状态检查在父进程计时外执行。顺序提前平衡，保留全部负收益、原生回退与波动。构造流、API 为零，不等于自然模型、Pi TUI 或冷 OS 缓存性能。
 
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`，分子为 `actualEndToEndMs + hiddenLatencyMs = nonToolMs + authoritativeToolMs`。完整开销保留，无重叠为 1×；纯 Actor 耗时不能代入分子，1×不表示低开销。重叠按 Actor 区间与实际权威计算重建：原生结果转缓存、预览及多次采纳共用计算身份，只计一次；独立计算即使端点相同仍分别计数，查询转换与重算另计。未采用预测和旧任务缓存不计入，不能一般性地累加 `executionAheadMs`。多轮分别求和分子、分母，再相除。
+采纳的主指标是完整 `Host.execute` 到结果返回的时长。候选已完成时直接测量；运行中候选分别报告接入时间、剩余执行时间和完成后的交付时间。准备能否隐藏取决于实际 Actor/Drafter 重叠，不能把启动和剩余执行混入替换开销，也不能把内部 `hitLatencyMs` 当成完整返回时间。
+
+端到端净加速使用相同任务的独立关闭/开启对照：`disabledMs / enabledMs`，两侧都包含各自初始化和回收。`serializedCounterfactualMs / actualEndToEndMs` 只描述同次轨迹的重叠；它为 1×不表示低开销，大于 1×也不证明比关闭投机快。计算身份去重，未采用预测和旧任务缓存不计入，不能累加所有 `executionAheadMs` 代替重叠。
 
 1. 固定任务、初态、模型、候选数和超时，独立测量开/关投机，计入失败、争用与清理。
 2. 要求 `git diff --check` 通过并保留完成信息，比较完整时长、命中、重叠、工具工作量与模型成本。
@@ -161,7 +163,7 @@ API key 只从环境读取，不写入产物或交给基准 shell 子进程。�
 4. `patchCandidate` 只是筛选，不是正确性结论；仍须由数据集工具链/容器执行 `FAIL_TO_PASS`、`PASS_TO_PASS`。
 5. 性能收益须重复验证，且结果、权限和回收不退化；安全修正单独说明必要性，负收益行仍保留。
 
-套件串行运行，失败即停止，结果汇入 `suite-result.json`。加速比使用串行总时长之和除以端到端时长之和，标明分子来自本次轨迹；95% bootstrap 按任务聚类，不拆散同任务重复，p95 使用最近秩。独立对照可另用 `pairedLatencyStatistics` 汇总。
+套件串行运行，失败即停止，结果汇入 `suite-result.json`。分别汇总独立对照和同轨迹重叠，标明分子来源；95% bootstrap 按任务聚类，不拆散同任务重复，p95 使用最近秩。独立对照使用 `pairedLatencyStatistics`。
 
 汇总命中率为总命中/总 Actor 动作。未通过 `patchCandidate` 的运行保留失败原因，但不纳入汇总延迟和命中率，仍不能据此代替官方正确性评分。
 
