@@ -139,29 +139,6 @@ npm run bench:tape -- \
 
 Drafter 的一个响应可提供一批工具预测；整批结果按响应顺序反馈，只占一次后续模型请求。`run.ts` 的 `drafterPredictions` 保存完整 `calls` 与每次请求的 `usage`，不再只记录第一项。
 
-模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。
-
-先在环境中提供 `DEEPSEEK_API_KEY`，再显式运行需要模型/网络的阶段：
-
-```sh
-npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
-npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative --candidate-limit 2
-```
-
-PowerShell 可以用隐藏输入设置密钥，完成后移除环境项：
-
-```powershell
-$env:DEEPSEEK_API_KEY = Read-Host -MaskInput "DeepSeek API 密钥"
-npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
-Remove-Item Env:DEEPSEEK_API_KEY
-```
-
-API key 只从环境读取，不写入产物或交给基准 shell 子进程。工作区与 JSON 默认位于系统临时目录，`--output-root` 可显式选定位置。`--prepare-only` 只检查数据集与新 checkout，不发模型请求。
-
-默认预算为 128 轮；`turnLimitReached=true` 表示未完成。`--speculation-disabled` 关闭投机，`--drafter-disabled` 仅关闭 Drafter。`--drafter-max-depth N` 默认 1、0 为单步；后继沿用下一决策额度。`--drafter-disabled --pattern-aware --pattern-state <目录>` 隔离历史模式实验；显式状态目录共享逻辑仓库身份与学习结果，不共享工作区文件，省略时各次运行隔离。
-
-模型 runner 使用生产 Host.execute、Git 事务和 TUI 同样绑定的 read/ls 封存输入路线。移除只延迟 Actor 回调的人工 `--latency` 档位；工具按实际耗时执行。原工具回调、Actor 预览和投机采纳分别计数。Native grep/find 和 Bash 保留 Actor，提前执行资格使用前述独立入口。
-
 ## 计时与验收规则
 
 `actualEndToEndMs` 从工具/Host 初始化前计至终态结算、Host 与工作区回收完成；`setupMs`、`agentPromptMs`、`teardownMs` 构成这一总时长。数据集下载、checkout 和最终补丁检查在计时外。Drafter 根请求直接接收 Actor 即将提交的完整上下文，不自行重建首轮消息。
