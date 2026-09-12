@@ -164,6 +164,7 @@ export function createDrafterPlanSource(input: {
 			settings,
 		}): Promise<PlanProposal | undefined> => {
 			if (signal.aborted) return undefined;
+			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
@@ -179,16 +180,15 @@ export function createDrafterPlanSource(input: {
 						JSON.stringify([model.provider, model.api, model.baseUrl, model.id]),
 						settings.sourceConfig?.drafterGateEnabled !== false,
 					);
-					const configuredDraftOptions = utility.allowed
-						? input.getDraftOptions
-							? await input.getDraftOptions({
-									actorModel: startInput.actorModel,
-									draftModel: model,
-									actorOptions: startInput.actorOptions,
-									signal,
-								})
-							: startInput.actorOptions
-						: undefined;
+					if (!utility.allowed || !drafterContextFits(model, startInput.context, drafter.drafterMaxTokens)) return undefined;
+					const configuredDraftOptions = input.getDraftOptions
+						? await input.getDraftOptions({
+							actorModel: startInput.actorModel,
+							draftModel: model,
+							actorOptions: startInput.actorOptions,
+							signal,
+						})
+						: startInput.actorOptions;
 					if (signal.aborted) return undefined;
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
@@ -204,8 +204,6 @@ export function createDrafterPlanSource(input: {
 				batches.set(batchKey, batch);
 			}
 			return batch.propose(signal, async (prepared, signal) => {
-				if (!prepared.utility.allowed) return undefined;
-				const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 				const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
 					...prepared.options,
 					temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
@@ -216,7 +214,6 @@ export function createDrafterPlanSource(input: {
 					sessionId: prepared.options.sessionId ?? input.sessionID,
 					cacheRetention: prepared.options.cacheRetention ?? "short",
 				};
-				if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
 				if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
 				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
