@@ -100,13 +100,20 @@ describe("workspace-branch ExecutionWorld", () => {
 		const firstWorld = first.createExecutionWorld({ driver: "git" });
 		const firstSibling = first.createExecutionWorld({ driver: "git" });
 		const secondWorld = second.createExecutionWorld({ driver: "git" });
+		const signal = new AbortController().signal, validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
 		try {
 			await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
 			await Promise.all([
-				firstWorld.speculation.prepare?.({ cwd: root }),
-				firstSibling.speculation.prepare?.({ cwd: root }),
-				secondWorld.speculation.prepare?.({ cwd: root }),
+				firstWorld.speculation.prepare?.({ cwd: root, signal }),
+				firstSibling.speculation.prepare?.({ cwd: root, signal }),
+				secondWorld.speculation.prepare?.({ cwd: root, signal }),
 			]);
+			expect(validations).toHaveBeenCalledTimes(2); // Shared warm-up inside one service; separate owners retain separate evidence.
+			const failure = new Error("baseline validation failed");
+			validations.mockRejectedValueOnce(failure);
+			await expect(firstWorld.speculation.prepare?.({ cwd: root, signal })).rejects.toBe(failure);
+			await firstSibling.speculation.prepare?.({ cwd: root, signal });
+			expect(validations).toHaveBeenCalledTimes(4); // Failure retires the shared work; the same live generation can retry.
 			const abandoned = await firstWorld.speculation.execute(
 				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
 			);
@@ -121,6 +128,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await branch.commit();
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		} finally {
+			validations.mockRestore();
 			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
 			await rm(root, { recursive: true, force: true });
 		}
@@ -641,11 +649,11 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("reuses unchanged baselines after mutations and isolates and cleans parallel workspaces", async () => {
 		const root = await temporaryRoot("parallel");
 		await writeFile(path.join(root, "steady.txt"), "stable\n");
-		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		const signal = new AbortController().signal, captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		try {
 			for (const baseline of ["base\n", "changed\n", "changed\n"]) {
 				await writeFile(path.join(root, "value.txt"), baseline);
-				await sandbox.prepare(root, { driver: "git" });
+				await sandbox.prepare(root, { driver: "git", signal });
 				const count = captures.mock.calls.length;
 				const roots = await Promise.all(["first\n", "second\n"].map((content) =>
 					sandbox.withWorkspace(root, async ({ sandboxRoot }) => {

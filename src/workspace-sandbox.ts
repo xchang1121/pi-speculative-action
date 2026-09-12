@@ -168,6 +168,7 @@ interface PooledGitRepository {
 	readonly git: ReturnType<typeof bindGit>;
 	readonly index: ReturnType<typeof bindGit>;
 	readonly versions: ResourceVersionManager;
+	readonly baselinePreparations: WeakMap<AbortSignal, Promise<string>>;
 	baseline?: { readonly commit: string; readonly tree: string; readonly version: ResourceVersionToken };
 	active: number;
 	readonly idleWaiters: Set<() => void>;
@@ -994,7 +995,18 @@ async function prepareSandboxWorkspaceFor(
 			options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" as const } : options;
 		const resolved = await resolveWorkspaceDriver(state, concreteOptions, sourceRoot, repository);
 		throwIfAborted(options.signal);
-		const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT, options.signal);
+		// Only overlapping warm-ups from one generation share evidence work; actual forks always revalidate.
+		let preparing = options.signal && repository.baselinePreparations.get(options.signal);
+		if (!preparing) {
+			preparing = acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT, options.signal);
+			if (options.signal) {
+				const signal = options.signal;
+				repository.baselinePreparations.set(signal, preparing);
+				const settled = () => { repository.baselinePreparations.delete(signal); };
+				void preparing.then(settled, settled);
+			}
+		}
+		const commit = await preparing;
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -1306,6 +1318,7 @@ async function createSandboxRepository(
 			git,
 			index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
 			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES }),
+			baselinePreparations: new WeakMap(),
 			active: 0,
 			idleWaiters: new Set(),
 			lock: Promise.resolve(),
