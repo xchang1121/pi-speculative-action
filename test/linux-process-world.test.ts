@@ -16,6 +16,7 @@ import { LinuxHeldExecBoundary } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership } from "../src/process-handoff.ts";
+import { validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
@@ -23,6 +24,8 @@ import { SpeculationScheduler } from "../src/scheduler.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import {
+	commitBenchmarkFixture,
+	compileBenchmarkHelper,
 	createLinuxProcessBenchmark,
 	executeReusableBash,
 	forkReusableBash,
@@ -350,7 +353,7 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	}, 15_000);
 
-	test.for(["trace", "transaction"] as const)("drains both capture owners when %s sealing fails", { timeout: 15_000 }, async (failure, { skip }) => {
+	test.for(["trace", "transaction", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-");
 		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
@@ -364,6 +367,7 @@ describe("Linux process ExecutionWorld", () => {
 			const begin = input.workspace.transactions.begin;
 			const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
 				const capture = await begin();
+				if (failure === "publication") return capture;
 				return { abort: capture.abort, finish: async () => {
 					if (failure === "trace") { entered.resolve(); await gate.promise; return capture.finish(); }
 					await entered.promise; await capture.abort(); failed.resolve(); throw error;
@@ -375,6 +379,7 @@ describe("Linux process ExecutionWorld", () => {
 		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
 			if (String(args[0]).includes("/trace-")) {
 				traceRoot = path.dirname(String(args[0]));
+				if (failure === "publication") return readTrace(...args);
 				if (failure === "trace") { await entered.promise; failed.resolve(); throw error; }
 				entered.resolve(); await gate.promise;
 			}
@@ -388,15 +393,29 @@ describe("Linux process ExecutionWorld", () => {
 			if (JSON.stringify(args[1]).includes("/trace-")) executions++;
 			return spawn(...args);
 		});
+		const put = fixture.backend.store.put.bind(fixture.backend.store);
+		let publicationFailed = false;
+		const publishing = vi.spyOn(fixture.backend.store, "put").mockImplementation(async (certificate) => {
+			if (failure === "publication" && !publicationFailed) {
+				publicationFailed = true; failed.resolve(); await gate.promise; throw error;
+			}
+			return put(certificate);
+		});
 		let running: ReturnType<typeof forkReusableBash> | undefined;
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
+			if (failure === "publication") {
+				await writeFile(path.join(fixture.workspace, "emit.c"), '#include <unistd.h>\nint main(void) { return write(1, "capture-once", 12) == 12 ? 0 : 1; }\n');
+				await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit" });
+				await commitBenchmarkFixture(fixture.workspace, "Process publication failure");
+			}
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			running = forkReusableBash(fixture, { command: "/usr/bin/printf capture-once", label: failure,
+			running = forkReusableBash(fixture, { command: failure === "publication" ? "emit" : "/usr/bin/printf capture-once", label: failure,
 				actionNamespace: "capture-owners.v1", executionFingerprint });
 			void running.then(() => { returned = true; }, () => { returned = true; });
-			await failed.promise; await nextTurn();
+			await Promise.race([failed.promise, running.then(() => { throw new Error(`failure injection was not reached: ${JSON.stringify(fixture.backend.metrics())}`); })]);
+			await nextTurn();
 			expect({ cleanupBeforeRelease, returned }, "a failed capture must drain its pending sibling").toEqual({ cleanupBeforeRelease: false, returned: false });
 			released = true; gate.resolve();
 			const branch = await running;
@@ -404,12 +423,20 @@ describe("Linux process ExecutionWorld", () => {
 			expect(branch.output.result.content).toEqual([{ type: "text", text: "capture-once" }]);
 			expect({ executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
 			const validation = await branch.validate?.();
-			expect(validation?.status).toBe("indeterminate");
-			expect(JSON.stringify(validation)).toContain(`nested_capture:${error.message}`);
+			if (failure === "publication") {
+				await expect(validateDynamicDependencyCertificate(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
+				expect(branch.executionMetrics.reuse?.lastError).toBe(`nested_publish:${error.message}`);
+				// The parent's independent directory identity proof must still reject this private root.
+				expect(validation).toMatchObject({ status: "stale", cause: { code: "process_dependency_changed", detail: fixture.workspace } });
+				expect((await fixture.backend.store.stats()).certificates).toBe(0);
+			} else {
+				expect(validation?.status).toBe("indeterminate");
+				expect(JSON.stringify(validation)).toContain(`nested_capture:${error.message}`);
+			}
 		} finally {
 			released = true; gate.resolve();
 			await running?.then((branch) => branch.dispose(), () => undefined);
-			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore();
+			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
 			await fixture.dispose();
 		}
 	});

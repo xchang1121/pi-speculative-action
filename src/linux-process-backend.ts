@@ -1160,7 +1160,11 @@ export class LinuxProcessReuseBackend {
 					weakKey,
 					work,
 					certificate,
-					() => this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS),
+					() => this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+						// Optional history storage cannot invalidate already sealed execution evidence.
+						this.setError(session, `nested_publish:${errorMessage(error)}`);
+						return false;
+					}),
 				)) {
 					this.add(session, "published");
 				}
