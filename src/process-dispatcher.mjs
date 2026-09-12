@@ -66,7 +66,7 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 }
 
 async function fallback(explicitExecutable) {
-	const unresolved = explicitExecutable ?? invokedPath ?? resolveExecutable(invoked, environment.PATH ?? "");
+	const unresolved = explicitExecutable ?? invokedPath;
 	const executable = escapeExecutable(unresolved);
 	if (!executable) {
 		process.stderr.write(`${invoked}: command not found\n`);
@@ -215,21 +215,6 @@ function exchange(request) {
 			}
 		});
 	});
-}
-
-function resolveExecutable(name, pathValue) {
-	if (!name || name.includes("/")) return undefined;
-	for (const directory of pathValue.split(":")) {
-		if (!directory) continue;
-		const candidate = path.join(directory, name);
-		try {
-			fs.accessSync(candidate, fs.constants.X_OK);
-			if (fs.statSync(candidate).isFile()) return candidate;
-		} catch {
-			// Continue PATH lookup.
-		}
-	}
-	return undefined;
 }
 
 function readDescriptorTarget(fd) {
