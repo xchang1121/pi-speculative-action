@@ -52,7 +52,7 @@ interface DrafterPlanFeedback extends DrafterBatch {
 /** Shared preparation belongs to all live proposals, until the batch retires. */
 class DrafterPreparation {
 	private readonly controller = new AbortController();
-	private readonly owners = new Map<AbortSignal, () => void>();
+	private readonly owners = new Set<() => void>();
 	readonly signal = this.controller.signal;
 	readonly ready: Promise<DrafterBatch | undefined>;
 
@@ -60,17 +60,26 @@ class DrafterPreparation {
 		this.ready = Promise.resolve().then(() => this.signal.aborted ? undefined : prepare(this.signal));
 	}
 
-	retain(signal: AbortSignal): void {
-		if (signal.aborted || this.signal.aborted || this.owners.has(signal)) return;
-		const release = () => { this.owners.delete(signal); if (!this.owners.size) this.dispose(); };
-		this.owners.set(signal, release);
+	async propose(signal: AbortSignal, produce: (batch: DrafterBatch, signal: AbortSignal) => Promise<PlanProposal | undefined>): Promise<PlanProposal | undefined> {
+		if (signal.aborted || this.signal.aborted) return undefined;
+		const release = () => {
+			signal.removeEventListener("abort", release);
+			if (this.owners.delete(release) && !this.owners.size) this.dispose();
+		};
+		this.owners.add(release);
 		signal.addEventListener("abort", release, { once: true });
+		let proposal: PlanProposal | undefined;
+		try {
+			const batch = await this.ready, requestSignal = AbortSignal.any([signal, this.signal]);
+			if (batch && !requestSignal.aborted) proposal = await produce(batch, requestSignal);
+			return proposal;
+		} finally { if (!proposal) release(); }
 	}
 
 	dispose(): void {
+		if (this.signal.aborted) return;
 		this.controller.abort();
-		for (const [signal, release] of this.owners) signal.removeEventListener("abort", release);
-		this.owners.clear();
+		for (const release of this.owners) release();
 	}
 }
 
@@ -192,25 +201,24 @@ export function createDrafterPlanSource(input: {
 				});
 				batches.set(batchKey, batch);
 			}
-			batch.retain(signal);
-			signal = AbortSignal.any([signal, batch.signal]);
-			const prepared = await batch.ready;
-			if (!prepared?.utility.allowed || signal.aborted) return undefined;
-			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
-			const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
-				...prepared.options,
-				temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
-				...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
-				// Thinking providers can reject forced tool calls; preserve their normal tool decision.
-				toolChoice: prepared.options.reasoning ? "auto" : "required",
-				deferred: false,
-				sessionId: prepared.options.sessionId ?? input.sessionID,
-				cacheRetention: prepared.options.cacheRetention ?? "short",
-			};
-			if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
-			if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
-			const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
-			return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
+			return batch.propose(signal, async (prepared, signal) => {
+				if (!prepared.utility.allowed) return undefined;
+				const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
+				const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
+					...prepared.options,
+					temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
+					...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
+					// Thinking providers can reject forced tool calls; preserve their normal tool decision.
+					toolChoice: prepared.options.reasoning ? "auto" : "required",
+					deferred: false,
+					sessionId: prepared.options.sessionId ?? input.sessionID,
+					cacheRetention: prepared.options.cacheRetention ?? "short",
+				};
+				if (!drafterContextFits(prepared.model, prepared.context, draftOptions.maxTokens)) return undefined;
+				if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
+				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
+				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
+			});
 		},
 		continue: async ({ proposalID, revision, feedback, signal }) => {
 			const previous = asDrafterPlanFeedback(feedback);

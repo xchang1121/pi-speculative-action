@@ -237,9 +237,16 @@ describe("speculative action host", () => {
 		controller.finishSession();
 		expect(controller.snapshot().samples).toBe(0);
 		const valid = reply.content[0]!;
-		for (const content of [[], [valid, valid], [valid, { type: "toolCall" as const, id: "disabled", name: "bash", arguments: {} }]]) {
-			reply = assistant(content, "toolUse");
-			expect(await controller.source.propose(request)).toBeUndefined();
+		for (const [content, stopReason] of [
+			[[], "stop"], [[valid, valid], "toolUse"],
+			[[valid, { type: "toolCall", id: "disabled", name: "bash", arguments: {} }], "toolUse"],
+			[[], "error"], [[], "aborted"],
+		] as const) {
+			reply = assistant([...content], stopReason);
+			const proposal = controller.source.propose(request);
+			if (stopReason === "error" || stopReason === "aborted") await expect(proposal).rejects.toThrow(`Drafter stopped with ${stopReason}`);
+			else expect(await proposal).toBeUndefined();
+			expect((prepareExecution.mock.calls.at(-1)![1] as AbortSignal).aborted, "a batch with no usable proposals must retire its warm-up").toBe(true);
 			controller.finishSession();
 		}
 		const fork = createActorForkPlanSource();
@@ -901,12 +908,17 @@ describe("speculative action host", () => {
 		await coordinator.dispose();
 	}, 5_000);
 
-	it.each(["context", "model", "options"] as const)("skips an ineligible Drafter after %s preparation without changing Actor history", async (phase) => {
+	it.each(["context", "model", "options", "empty"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
 		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
-		const complete = vi.fn(async () => drafterCall({ path: "notes.txt" }));
+		const complete = vi.fn(async () => {
+			if (phase === "empty") { await entered.promise; return assistant([], "stop"); }
+			return drafterCall({ path: "notes.txt" });
+		});
 		const tool = createReadTool(cwd);
-		const world = toolRuntimeWorld(), prepare = vi.fn(async () => {});
+		const world = toolRuntimeWorld(), prepare = vi.fn(async (_input: { signal?: AbortSignal }) => {
+			if (phase === "empty") { entered.resolve(); await release.promise; }
+		});
 		const getDraftOptions = vi.fn(async () => {
 			if (phase === "options") { entered.resolve(); await release.promise; }
 			return {};
@@ -933,16 +945,20 @@ describe("speculative action host", () => {
 			if (phase === "context") await settled.promise;
 			else {
 				await entered.promise;
+				if (phase === "empty") {
+					await settled.promise;
+					expect(prepare.mock.calls[0]![0].signal?.aborted, "empty results retire preparation before Actor arrival").toBe(true);
+				}
 				closing = host.dispose().then(() => { closed = true; });
 				await nextTurn();
 				expect(closed).toBe(false);
 				release.resolve(); await closing;
 			}
-			expect(complete).not.toHaveBeenCalled();
-			expect(prepare).not.toHaveBeenCalled();
+			expect(complete).toHaveBeenCalledTimes(phase === "empty" ? 1 : 0);
+			expect(prepare).toHaveBeenCalledTimes(phase === "empty" ? 1 : 0);
 			expect(getDraftOptions).toHaveBeenCalledTimes(phase === "model" ? 0 : 1);
 		} finally { release.resolve(); await closing; await host.dispose(); }
-		if (phase === "context") return;
+		if (phase === "context" || phase === "empty") return;
 
 		const sharing = deferred(), resume = deferred(), owners = [new AbortController(), new AbortController()];
 		const waitStage = async (stage: string) => { if (stage === phase) { sharing.resolve(); await resume.promise; } };
@@ -973,6 +989,19 @@ describe("speculative action host", () => {
 			expect(prepareExecution).toHaveBeenCalledTimes(2);
 			later[0]!.abort(); expect(warming.aborted).toBe(false);
 			later[1]!.abort(); expect(warming.aborted).toBe(true);
+			const pending = deferred(), finish = deferred(), peer = new AbortController();
+			const peers = [peer, phase === "model" ? peer : new AbortController()];
+			complete.mockImplementationOnce(async () => assistant([], "stop"));
+			complete.mockImplementationOnce(async () => { pending.resolve(); await finish.promise; return drafterCall({ path: "notes.txt" }); });
+			const next = peers.map((owner, index) => propose(owner, index, "turn-3"));
+			try {
+				await pending.promise; expect(await next[0]).toBeUndefined();
+				const warming = prepareExecution.mock.calls.at(-1)![1] as AbortSignal;
+				expect(warming.aborted, "an empty response cannot retire its live peer").toBe(false);
+				finish.resolve(); expect(await next[1]).toMatchObject({ actions: [{ tool: "read" }] });
+				expect(warming.aborted).toBe(false);
+				shared.finishTurn("shared", "turn-3"); expect(warming.aborted).toBe(true);
+			} finally { finish.resolve(); peers.forEach(owner => owner.abort()); await Promise.allSettled(next); }
 		} finally {
 			resume.resolve(); owners.forEach(owner => owner.abort()); shared.finishSession(); await Promise.allSettled(proposals);
 		}
