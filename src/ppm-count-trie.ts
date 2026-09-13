@@ -143,39 +143,13 @@ export class PpmCountTrie {
 	}
 
 	snapshot(maxContexts = Number.POSITIVE_INFINITY): readonly PpmCountTrieRow[] {
-		const rows: Array<PpmCountTrieRow & { readonly total: number }> = [];
-		const visit = (current: CountNode, reverseContext: readonly string[]): void => {
-			if (current.total > 0) {
-				rows.push({
-					context: [...reverseContext].reverse(),
-					counts: Object.fromEntries(
-						[...current.targets.entries()]
-							.sort(([left], [right]) => left.localeCompare(right))
-							.map(([target, value]) => [target, value.count]),
-					),
-					lastSeen: current.lastSeen,
-					total: current.total,
-				});
-			}
-			for (const [token, child] of [...current.children.entries()].sort(([left], [right]) =>
-				left.localeCompare(right),
-			)) {
-				visit(child, [...reverseContext, token]);
-			}
-		};
-		visit(this.root, []);
-		const root = rows.find((row) => row.context.length === 0);
-		const descendants = rows
-			.filter((row) => row.context.length > 0)
-			.sort(
-				(left, right) =>
-					right.total - left.total ||
-					right.context.length - left.context.length ||
-					right.lastSeen - left.lastSeen ||
-					contextKey(left.context).localeCompare(contextKey(right.context)),
-			);
 		const limit = Number.isFinite(maxContexts) ? Math.max(1, Math.floor(maxContexts)) : Number.POSITIVE_INFINITY;
-		return [...(root ? [root] : []), ...descendants].slice(0, limit).map(({ total: _, ...row }) => row);
+		return this.rankedContexts().slice(0, limit).map(({ node, context }) => ({
+			context,
+			counts: Object.fromEntries([...node.targets].sort(([left], [right]) => left.localeCompare(right))
+				.map(([target, value]) => [target, value.count])),
+			lastSeen: node.lastSeen,
+		}));
 	}
 
 	restore(rows: readonly unknown[]): void {
@@ -204,28 +178,7 @@ export class PpmCountTrie {
 			this.restore(this.snapshot(limit));
 			return;
 		}
-		const descendants: Array<{
-			readonly node: CountNode;
-			readonly depth: number;
-			readonly key: string;
-		}> = [];
-		const collect = (current: CountNode, reverseContext: readonly string[]): void => {
-			if (current !== this.root && current.total > 0) {
-				const context = [...reverseContext].reverse();
-				descendants.push({ node: current, depth: context.length, key: contextKey(context) });
-			}
-			for (const [token, child] of current.children) collect(child, [...reverseContext, token]);
-		};
-		collect(this.root, []);
-		descendants.sort(
-			(left, right) =>
-				right.node.total - left.node.total ||
-				right.depth - left.depth ||
-				right.node.lastSeen - left.node.lastSeen ||
-				left.key.localeCompare(right.key),
-		);
-		const retainedCount = Math.max(0, limit - Number(this.root.total > 0));
-		const discarded = new Set(descendants.slice(retainedCount).map((item) => item.node));
+		const discarded = new Set(this.rankedContexts().slice(limit).map((item) => item.node));
 		const prune = (current: CountNode): void => {
 			if (discarded.has(current)) {
 				current.targets.clear();
@@ -250,6 +203,23 @@ export class PpmCountTrie {
 		};
 		prune(this.root);
 		this.populatedContexts -= discarded.size;
+	}
+
+	/** Both retention and persistence select the same ordered evidence before copying target counts. */
+	private rankedContexts() {
+		const rows: Array<{ node: CountNode; context: readonly string[]; key: string }> = [];
+		const collect = (current: CountNode, reverseContext: readonly string[]): void => {
+			if (current.total > 0) {
+				const context = [...reverseContext].reverse();
+				rows.push({ node: current, context, key: contextKey(context) });
+			}
+			for (const [token, child] of current.children) collect(child, [...reverseContext, token]);
+		};
+		collect(this.root, []);
+		return rows.sort((left, right) =>
+			Number(right.node === this.root) - Number(left.node === this.root) ||
+			right.node.total - left.node.total || right.context.length - left.context.length ||
+			right.node.lastSeen - left.node.lastSeen || left.key.localeCompare(right.key));
 	}
 
 	private increment(current: CountNode, target: string, count: number, lastSeen: number, halfLife: number): void {
