@@ -174,7 +174,7 @@ interface PooledGitRepository {
 	active: number;
 	readonly idleWaiters: Set<() => void>;
 	lock: Promise<void>;
-	prepared?: Promise<PreparedGitWorkspace>;
+	prepared?: { readonly commit: string; readonly workspace: Promise<PreparedGitWorkspace> };
 	readonly overlayBaselines: Map<string, Promise<SharedOverlayBaseline>>;
 	autoDriverDecision?: AutoWorkspaceDriverDecision;
 	/** Unsafe live-mount storage is detached from allocation and retained for OS-level recovery. */
@@ -1442,22 +1442,16 @@ function batchPathspecs(pathspecs: readonly string[]): string[][] {
 
 async function ensurePreparedSandbox(repository: PooledGitRepository, commit: string, signal?: AbortSignal): Promise<void> {
 	const existing = repository.prepared;
-	if (existing) {
-		const prepared = await existing;
-		throwIfAborted(signal);
-		if (prepared.commit === commit) return;
-		if (repository.prepared === existing) repository.prepared = undefined;
-		await discardPreparedSandbox(repository, prepared);
-	}
-	if (repository.prepared) {
-		await repository.prepared;
+	if (existing?.commit === commit) {
+		await existing.workspace;
 		return;
 	}
+	const stale = await takePreparedSandbox(repository);
+	if (stale) await discardPreparedSandbox(repository, stale);
 	throwIfAborted(signal);
-	const pending = attachSandboxWorkspace(repository, commit);
-	repository.prepared = pending;
+	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, commit) };
 	try {
-		await pending;
+		await pending.workspace;
 	} catch (error) {
 		if (repository.prepared === pending) repository.prepared = undefined;
 		throw error;
@@ -1466,14 +1460,15 @@ async function ensurePreparedSandbox(repository: PooledGitRepository, commit: st
 
 async function takePreparedSandbox(
 	repository: PooledGitRepository,
-	commit: string,
+	commit?: string,
 ): Promise<PreparedGitWorkspace | undefined> {
 	const pending = repository.prepared;
 	if (!pending) return undefined;
+	// Claim the slot before waiting: execution, replacement and shutdown cannot retire the same workspace.
 	repository.prepared = undefined;
 	try {
-		const prepared = await pending;
-		if (prepared.commit === commit) return prepared;
+		const prepared = await pending.workspace;
+		if (commit === undefined || prepared.commit === commit) return prepared;
 		await discardPreparedSandbox(repository, prepared);
 	} catch {
 		// A failed or stale warm-up falls back to a fresh per-action workspace.
@@ -1666,12 +1661,8 @@ function closeSandboxRepository(repository: PooledGitRepository): Promise<void> 
 		await waitForSandboxRepositoryIdle(repository);
 		if (repository.quarantined) return;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
-		const prepared = repository.prepared;
-		repository.prepared = undefined;
-		if (prepared) {
-			const workspace = await prepared.catch(() => undefined);
-			if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
-		}
+		const prepared = await takePreparedSandbox(repository);
+		if (prepared) await discardPreparedSandbox(repository, prepared).catch(() => undefined);
 		repository.baseline?.version.release();
 		repository.baseline = undefined;
 		repository.versions.close();
