@@ -1,4 +1,4 @@
-import { deferred } from "./async.ts";
+import { deferred, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -35,7 +35,7 @@ const temporaryRoots = new Set<string>();
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
-	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), writeFile: vi.fn(fs.writeFile) };
+	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
 });
 
 afterEach(async () => {
@@ -93,14 +93,23 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("keeps pool and lock ownership inside an explicit service lifecycle", async () => {
+	it.each(["explicit", "idle", "idle-replaced"])("owns %s pool retirement through service disposal", async (retirement) => {
 		const root = await temporaryRoot("service-lifecycle");
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const first = new WorkspaceSandboxService();
 		const second = new WorkspaceSandboxService();
 		const firstWorld = first.createExecutionWorld({ driver: "git" });
 		const firstSibling = first.createExecutionWorld({ driver: "git" });
 		const secondWorld = second.createExecutionWorld({ driver: "git" });
 		const signal = new AbortController().signal, validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
+		const entered = deferred(), release = deferred(), schedule = globalThis.setTimeout;
+		let expire: (() => void) | undefined, pool: string | undefined, closed = false;
+		const removals = new Map<string, number>();
+		const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, ms, ...args) => {
+			const timer = schedule(callback, ms, ...args);
+			if (ms === 5 * 60 * 1000) expire = () => { clearTimeout(timer); callback(...args); };
+			return timer;
+		});
 		try {
 			await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
 			await Promise.all([
@@ -118,8 +127,25 @@ describe("workspace-branch ExecutionWorld", () => {
 				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
 			);
 
-			await Promise.all([firstWorld.dispose?.(), firstSibling.dispose?.()]);
-			await first.dispose();
+			vi.mocked(rm).mockImplementation(async (target, options) => {
+				if (path.dirname(String(target)) === path.resolve(os.tmpdir()) && path.basename(String(target)).startsWith("pi-speculative-action-pool-")) {
+					pool = String(target); removals.set(pool, (removals.get(pool) ?? 0) + 1);
+					entered.resolve(); await release.promise;
+				}
+				return fs.rm(target, options);
+			});
+			if (retirement !== "explicit") {
+				expect(expire).toBeDefined(); expire!(); await entered.promise;
+			}
+			if (retirement === "idle-replaced") await first.prepare(root, { driver: "git" });
+			const closing = Promise.all([firstWorld.dispose?.(), firstSibling.dispose?.(), first.dispose()]).then(() => { closed = true; });
+			await entered.promise;
+			await nextTurn();
+			expect(closed).toBe(false);
+			expect((await stat(pool!)).isDirectory()).toBe(true);
+			release.resolve(); await closing;
+			expect([...removals.values()]).toEqual(retirement === "idle-replaced" ? [1, 1] : [1]);
+			for (const directory of removals.keys()) await expect(stat(directory)).rejects.toThrow();
 			await expect(first.prepare(root, { driver: "git" })).rejects.toThrow("service is disposed");
 			await expect(abandoned.commit()).rejects.toThrow("service is disposed");
 
@@ -128,6 +154,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await branch.commit();
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		} finally {
+			release.resolve(); timers.mockRestore(); vi.mocked(rm).mockImplementation(fs.rm);
 			validations.mockRestore();
 			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
 			await rm(root, { recursive: true, force: true });

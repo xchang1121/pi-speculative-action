@@ -180,6 +180,7 @@ interface PooledGitRepository {
 	quarantined: boolean;
 	registration?: Promise<PooledGitRepository>;
 	idleTimer?: ReturnType<typeof setTimeout>;
+	disposal?: Promise<void>;
 }
 
 interface PreparedGitWorkspace {
@@ -1600,22 +1601,13 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 		for (const resolve of repository.idleWaiters) resolve();
 		repository.idleWaiters.clear();
 	}
-	if (repository.quarantined || repository.active > 0 || repository.idleTimer) return;
+	if (repository.quarantined || repository.disposal || repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
 		if (repository.active > 0) return;
-		repository.owner.repositories.delete(`${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`);
-		const prepared = repository.prepared;
-		repository.prepared = undefined;
-		void (async () => {
-			if (prepared) {
-				const workspace = await prepared.catch(() => undefined);
-				if (workspace) await discardPreparedSandbox(repository, workspace).catch(() => undefined);
-			}
-			repository.baseline?.version.release();
-			repository.baseline = undefined;
-			repository.versions.close();
-			await rm(repository.parent, { recursive: true, force: true }).catch(() => undefined);
-		})();
+		const { owner } = repository, key = `${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
+		if (owner.repositories.get(key) === repository.registration) owner.repositories.delete(key);
+		// Detach this generation now, but keep its asynchronous retirement inside the service lifecycle.
+		void queueWorkspaceCleanup(owner, () => closeSandboxRepository(repository)).catch(() => undefined);
 	}, SANDBOX_REPOSITORY_IDLE_MS);
 	repository.idleTimer.unref?.();
 }
@@ -1642,12 +1634,13 @@ function closeWorkspaceSandboxPoolsFor(
 	state: WorkspaceSandboxState,
 	roots?: readonly string[],
 ): Promise<void> {
-	const close = state.cleanupTail.then(
-		() => closeWorkspaceSandboxPoolsNow(state, roots),
-		() => closeWorkspaceSandboxPoolsNow(state, roots),
-	);
-	state.cleanupTail = close.catch(() => undefined);
-	return close;
+	return queueWorkspaceCleanup(state, () => closeWorkspaceSandboxPoolsNow(state, roots));
+}
+
+function queueWorkspaceCleanup(state: WorkspaceSandboxState, close: () => Promise<void>): Promise<void> {
+	const pending = state.cleanupTail.then(close, close);
+	state.cleanupTail = pending.catch(() => undefined);
+	return pending;
 }
 
 async function closeWorkspaceSandboxPoolsNow(
@@ -1663,9 +1656,14 @@ async function closeWorkspaceSandboxPoolsNow(
 	for (const [key, item] of pending) {
 		if (state.repositories.get(key) === item) state.repositories.delete(key);
 		const repository = await item.catch(() => undefined);
-		if (!repository) continue;
+		if (repository) await closeSandboxRepository(repository);
+	}
+}
+
+function closeSandboxRepository(repository: PooledGitRepository): Promise<void> {
+	return repository.disposal ??= (async () => {
 		await waitForSandboxRepositoryIdle(repository);
-		if (repository.quarantined) continue;
+		if (repository.quarantined) return;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
 		const prepared = repository.prepared;
 		repository.prepared = undefined;
@@ -1677,7 +1675,7 @@ async function closeWorkspaceSandboxPoolsNow(
 		repository.baseline = undefined;
 		repository.versions.close();
 		await rm(repository.parent, { recursive: true, force: true });
-	}
+	})();
 }
 
 async function waitForSandboxRepositoryIdle(repository: PooledGitRepository): Promise<void> {
