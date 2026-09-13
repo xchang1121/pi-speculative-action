@@ -1,3 +1,4 @@
+import { benchmarkTraceReport } from "./trace-report.ts";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -357,99 +358,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		taskCompletedAt = performance.now();
 	}
 	const summary = summarizeSpeculativeTrace(events);
-	const sourceRequestKinds: Record<string, number> = {};
-	const sourceRequestsBySource: Record<string, number> = {};
-	const predictionsBySource: Record<
-		string,
-		{ settled: number; observed: number; matched: number; adopted: number }
-	> = {};
-	const candidateStartsBySource: Record<string, number> = {};
-	const candidateStartsByTool: Record<string, number> = {};
-	const candidateStartsByDepth: Record<string, number> = {};
-	const speculativeHitsByDepth: Record<string, number> = {};
-	const speculativeHitsByTool: Record<string, number> = {};
-	const actorFallbacksByTool: Record<string, number> = input.speculationEnabled ? {} : { ...actorActionsByTool };
-	const actorPreviewsByTool: Record<string, number> = {};
-	const speculativeHitsByRelation: Record<string, number> = {};
-	const speculativeHitProvidersBySource: Record<string, number> = {};
-	const actorActionMatchesByPredictionSource: Record<string, number> = {};
-	const candidateStartTrace: Array<{
-		readonly turnID: string;
-		readonly source: string;
-		readonly tool: string;
-		readonly depth: number;
-		readonly action: string;
-	}> = [];
-	const actorActionTrace: Array<{
-		readonly turnID: string;
-		readonly sequence: number;
-		readonly tool: string;
-		readonly action: string;
-		readonly provider: "actor" | "speculative";
-		readonly matchedPredictionSources: readonly string[];
-		readonly candidateSource?: string;
-		readonly predictedAction?: string;
-	}> = [];
-	for (const event of events) {
-		if (event.type === "source_request") {
-			increment(sourceRequestKinds, event.request.request.kind);
-			increment(sourceRequestsBySource, event.request.request.source);
-			continue;
-		}
-		if (event.type === "prediction") {
-			const source = event.settlement.prediction.source;
-			const counters = (predictionsBySource[source] ??= { settled: 0, observed: 0, matched: 0, adopted: 0 });
-			counters.settled++;
-			if (event.settlement.observation === "unobserved") continue;
-			counters.observed++;
-			if (!event.settlement.match.matched) continue;
-			counters.matched++;
-			if (event.settlement.match.adoption.status === "adopted") counters.adopted++;
-			continue;
-		}
-		if (event.type === "candidate") {
-			if (event.state.status !== "running") continue;
-			increment(candidateStartsBySource, event.candidate.source);
-			increment(candidateStartsByTool, event.candidate.tool);
-			increment(candidateStartsByDepth, String(event.candidate.depth));
-			candidateStartTrace.push({
-				turnID: event.turnID,
-				source: event.candidate.source,
-				tool: event.candidate.tool,
-				depth: event.candidate.depth,
-				action: event.candidate.predictedAction,
-			});
-			continue;
-		}
-		if (event.type !== "actor_action") continue;
-		const { provider, tool } = event.settlement;
-		const matchedPredictionSources = [
-			...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source)),
-		];
-		for (const source of matchedPredictionSources) {
-			increment(actorActionMatchesByPredictionSource, source);
-		}
-		actorActionTrace.push({
-			turnID: event.turnID,
-			sequence: event.settlement.actorAction.sequence,
-			tool,
-			action: event.actualAction,
-			provider: provider.kind,
-			matchedPredictionSources,
-			...(event.candidate
-				? { candidateSource: event.candidate.source, predictedAction: event.candidate.predictedAction }
-				: {}),
-		});
-		if (provider.kind === "actor") {
-			increment(provider.origin === "preview" ? actorPreviewsByTool : actorFallbacksByTool, tool);
-			continue;
-		}
-		increment(speculativeHitProvidersBySource, event.candidate?.source ?? "cache");
-		increment(speculativeHitsByTool, tool);
-		increment(speculativeHitsByDepth, String(event.candidate?.depth ?? 0));
-		const relation = provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`;
-		increment(speculativeHitsByRelation, relation);
-	}
+	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
 	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
@@ -505,6 +414,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		summary: {
 			...summary,
+			...dimensions,
 			actualEndToEndMs,
 			setupMs: agentStartedAt - taskStartedAt,
 			agentPromptMs: agentCompletedAt - agentStartedAt,
@@ -515,21 +425,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			actorActions: toolIntentMs.length,
 			actorActionsByTool,
-			speculativeHitsByDepth,
-			speculativeHitsByTool,
-			speculativeHitsByRelation,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : toolIntentMs.length,
-			actorPreviewsByTool,
-			actorFallbacksByTool,
 			hitRate: toolIntentMs.length ? summary.speculativeHits / toolIntentMs.length : 0,
-			sourceRequestKinds,
-			sourceRequestsBySource,
-			predictionsBySource,
-			candidateStartsBySource,
-			candidateStartsByTool,
-			candidateStartsByDepth,
-			speculativeHitProvidersBySource,
-			actorActionMatchesByPredictionSource,
 			actorCost: actorUsage.cost,
 			drafterCost: drafterUsage.cost,
 			actorTokens: actorUsage.tokens,
