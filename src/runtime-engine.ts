@@ -420,6 +420,7 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	readonly totalDraftTokens: number;
 	draft: SpeculativeDraftCandidate;
 	readonly admissionSignal: AbortSignal;
+	readonly admissionController: AbortController;
 	readonly sourceSlot?: SourceRequestSlot;
 	readonly continuationSlots: Set<SourceRequestSlot>;
 	readonly continuationTriggers: Set<"execution_succeeded" | "actor_adopted">;
@@ -1023,6 +1024,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!node || node.predictionState.status !== "pending") continue;
 			const issued = !session.actionContexts.has(node.identity.id);
 			if (issued) {
+				const admissionController = new AbortController();
 				scope.slot?.owners.add(node.identity.id);
 				session.actionContexts.set(node.identity.id, {
 					identity: node.identity,
@@ -1036,7 +1038,8 @@ export function makeStructuralSpeculativeActionRuntime<
 					draftTokens,
 					totalDraftTokens: session.tokenTotal,
 					draft: planActionDraft(node),
-					admissionSignal: scope.signal,
+					admissionSignal: AbortSignal.any([scope.signal, admissionController.signal]),
+					admissionController,
 					...(scope.slot ? { sourceSlot: scope.slot } : {}),
 					continuationTriggers: new Set(),
 					continuationSlots: new Set(),
@@ -1201,6 +1204,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = session.actionContexts.get(id);
 		if (!context) return;
 		session.actionContexts.delete(id);
+		context.admissionController.abort(cause("control", "prediction_retired"));
 		if (context.sourceSlot) {
 			context.sourceSlot.owners.delete(id);
 			releaseUnusedSourceSlot(session, context.sourceSlot);
