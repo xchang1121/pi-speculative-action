@@ -12,7 +12,7 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
-import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore } from "../src/pattern-aware.ts";
+import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore, projectPatternAwareObservation } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -120,30 +120,31 @@ describe("faux LLM speculative action end to end", () => {
 	it.each(["actor", "peer"] as const)("binds a dynamic next step from an %s batch without premature learning", async (origin) => {
 		const cwd = await workspace(), ready = barrier();
 		let historyBeforeChild: ReturnType<PatternAwareStore["recent"]> | undefined;
-		const searchInput = (file: string) => ({ path: "discover/" + file });
-		const files = ["a.txt", "b.txt", "c.txt", "d.txt", "target.txt"];
-		await Promise.all(files.map((file) => writeFile(path.join(cwd, file), file, "utf8")));
+		const searchInput = { path: "." }, target = "./a-held.txt";
+		const ranked = (paths: string[]) => ({ ...textResult(paths.join("\n")), details: undefined });
+		const files = ["./z-a.txt", "./z-b.txt", "./z-c.txt", "./z-d.txt", target];
+		await Promise.all([...files, "./a-unused.txt", "./z-unused.txt"].map((file) => writeFile(path.join(cwd, file), file, "utf8")));
 		const settings = { ...PATTERN_AWARE_DEFAULTS, maxFutureGap: 0, minOccurrences: 2 };
 		const store = patternStore(cwd, settings);
 		for (const [index, file] of files.slice(0, 4).entries()) {
 			const sessionID = "atomic-training-" + index;
-			store.observe({ sessionID, turnID: sessionID + ":ls", tool: "ls", input: searchInput(file),
-				output: { values: [file] }, outcome: "success", durationMs: 1 });
+			store.observe({ sessionID, turnID: sessionID + ":ls", tool: "ls", input: searchInput,
+				...projectPatternAwareObservation(ranked([file, "./a-unused.txt"])), outcome: "success", durationMs: 1 });
 			store.observe({ sessionID, turnID: sessionID + ":read", tool: "read", input: { path: file }, outcome: "success", durationMs: 120 });
 			store.finishSession(sessionID);
 		}
 		const discover: AgentTool<typeof readSchema> = {
-			name: "ls", label: "discover", description: "Return a fixture's workspace path", parameters: readSchema,
-			execute: async (_id, args) => textResult(args.path.split("/").at(-1)!),
+			name: "ls", label: "discover", description: "Return ranked workspace paths", parameters: readSchema,
+			execute: async () => ranked([target, "./z-unused.txt"]),
 		};
-		const parent = fauxToolCall("ls", searchInput("target.txt"));
+		const parent = fauxToolCall("ls", searchInput);
 		const result = await runAgent({
 			cwd, sessionID: "atomic-output", patternStore: store,
 			settings: { ...drafterSettings(), drafterEnabled: origin === "peer", drafterMaxDepth: 0,
 				patternAware: settings, tools: ["ls", "read"] },
 			tools: [discover, fileRead(cwd)],
 			actorTurns: [turn(parent, origin === "peer" ? ready.promise : undefined),
-				turn(fauxToolCall("read", { path: "target.txt" }), ready.promise), turn("done")],
+				turn(fauxToolCall("read", { path: target }), ready.promise), turn("done")],
 			draftTurns: [turn(parent), turn("no tool"), turn("no tool")],
 			onEvent: (event) => {
 				if (event.type === "candidate" && event.candidate.tool === "read" && event.state.status === "succeeded") {
@@ -155,7 +156,7 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: origin === "peer" ? 2 : 1, actorFallbacks: origin === "peer" ? 0 : 1 });
 		expect(result.executions).toEqual({ ls: 1, read: 1 });
 		expect(result.actorFallbacks).toEqual(origin === "peer" ? [] : ["ls"]);
-		expect(result.outputs.at(-1)).toEqual(textResult("target.txt"));
+		expect(result.outputs).toEqual([ranked([target, "./z-unused.txt"]), textResult(target)]);
 		const adopted = result.events.flatMap((event) => event.type === "prediction" && event.settlement.observation === "observed" &&
 			event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.prediction.source] : []);
 		expect(adopted).toEqual(origin === "peer" ? ["drafter", "pattern_aware"] : ["pattern_aware"]);

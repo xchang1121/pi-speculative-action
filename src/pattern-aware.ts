@@ -253,7 +253,7 @@ const MAX_PATH_SOURCES = 24;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
-const PERSISTENCE_VERSION = 18;
+const PERSISTENCE_VERSION = 19;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -2027,7 +2027,7 @@ function structuredOutput(value: unknown): unknown {
 					.map((line) => line.trim())
 					.filter((line) => line.length >= 3 && !/\s/.test(line));
 			}),
-		).sort();
+		);
 		return values.length ? { values } : undefined;
 	}
 	return value;

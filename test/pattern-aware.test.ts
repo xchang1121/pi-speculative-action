@@ -447,7 +447,7 @@ describe("PatternAware", () => {
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
-		expect(persisted.version).toBe(18);
+		expect(persisted.version).toBe(19);
 		expect(persisted.events.length).toBeGreaterThan(0);
 		expect(
 			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
@@ -480,7 +480,7 @@ describe("PatternAware", () => {
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
 		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
-		await fs.writeFile(file, JSON.stringify({ version: 18,
+		await fs.writeFile(file, JSON.stringify({ version: 19,
 			patterns: [valid,
 				{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
 				{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
@@ -576,7 +576,7 @@ describe("PatternAware", () => {
 		);
 		await fs.writeFile(
 			file,
-			JSON.stringify({ version: 18, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
+			JSON.stringify({ version: 19, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
 		);
 
 		const store = patternStore({ maxContextLength: 1 }, file);
@@ -632,7 +632,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(18);
+		expect(persisted.version).toBe(19);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -1388,7 +1388,7 @@ describe("PatternAware", () => {
 				details: undefined,
 			},
 			[],
-			{ output: { values: ["abc1234", "tests/value.test.ts::case"] } },
+			{ output: { values: ["tests/value.test.ts::case", "abc1234"] } },
 		],
 	] as const)("projects %s without parsing display text", (_name, output, paths, expected) => {
 		expect(projectPatternAwareObservation(output, paths)).toEqual(expected);
