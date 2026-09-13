@@ -27,7 +27,7 @@ afterEach(async () => {
 describe("PatternAware", () => {
 	test("late-binds a target input from authoritative structured output paths", () => {
 		const paths = ["src/a.ts"], target = { filePath: "src/a.ts", offset: 1 };
-		const context = [event({ sessionID: "one", tool: "grep", input: { pattern: "TODO" }, outputPaths: paths })];
+		const context = [event("one", "grep", { pattern: "TODO" }, { outputPaths: paths })];
 		const bindings = inferBindings(context, target);
 		expect(bindings['["filePath"]']).toEqual({
 			type: "event",
@@ -58,7 +58,7 @@ describe("PatternAware", () => {
 		};
 		const replay = (root: string, output: string) =>
 			applyBindings(bindings, [
-				event({ sessionID: "join", tool: "grep", input: { path: root }, outputPaths: [output] }),
+				event("join", "grep", { path: root }, { outputPaths: [output] }),
 			]);
 
 		expect(replay("src/file.ts", "file.ts")).toEqual({ path: "src/file.ts" });
@@ -67,7 +67,7 @@ describe("PatternAware", () => {
 	});
 
 	test("merges bindings that share nested object and array paths", () => {
-		const context = [event({ sessionID: "one", tool: "seed", input: { oldText: "before" } })];
+		const context = [event("one", "seed", { oldText: "before" })];
 		const target = {
 			range: { start: 1, end: 2 },
 			edits: [{ oldText: "before", newText: "after" }],
@@ -79,7 +79,7 @@ describe("PatternAware", () => {
 	});
 
 	test("derives adjacent paths and commands through bounded path templates", () => {
-		const context = [event({ sessionID: "one", tool: "read", input: { filePath: "services/alpha/config.ts" } })];
+		const context = [event("one", "read", { filePath: "services/alpha/config.ts" })];
 		const bindings = inferBindings(context, {
 			command: "bun test services/alpha/config.test.ts",
 			workdir: "services/alpha",
@@ -89,7 +89,7 @@ describe("PatternAware", () => {
 			command: "bun test services/alpha/config.test.ts",
 			workdir: "services/alpha",
 		});
-		const next = [event({ sessionID: "two", tool: "read", input: { filePath: "services/beta/config.ts" } })];
+		const next = [event("two", "read", { filePath: "services/beta/config.ts" })];
 		for (const name of ["beta", "beta", "gamma"]) {
 			next[0]!.input.filePath = `services/${name}/config.ts`;
 			expect(applyBindings(bindings, next)).toEqual({
@@ -97,7 +97,7 @@ describe("PatternAware", () => {
 			});
 		}
 		expect(
-			inferBindings([event({ sessionID: "path", tool: "read", input: { filePath: "/workspace/repo" } })], {
+			inferBindings([event("path", "read", { filePath: "/workspace/repo" })], {
 				filePath: "repo/src/a.ts",
 			})['["filePath"]'],
 		).toEqual({ type: "constant", value: "repo/src/a.ts" });
@@ -105,11 +105,7 @@ describe("PatternAware", () => {
 
 	test("does not treat an opaque shell command as a filesystem path template", () => {
 		const context = [
-			event({
-				sessionID: "one",
-				tool: "bash",
-				input: { command: '& "C:\\Users\\dev\\.bun\\bin\\bun.exe" test services/delta/config.test.ts' },
-			}),
+			event("one", "bash", { command: '& "C:\\Users\\dev\\.bun\\bin\\bun.exe" test services/delta/config.test.ts' }),
 		];
 		const target = { command: '& "C:\\Users\\dev\\.bun\\bin\\bun.exe" test services/epsilon/config.test.ts' };
 		const bindings = inferBindings(context, target);
@@ -117,14 +113,14 @@ describe("PatternAware", () => {
 		expect(bindings['["command"]']).toEqual({ type: "constant", value: target.command });
 		expect(
 			applyBindings(bindings, [
-				event({ sessionID: "two", tool: "bash", input: { command: "bun test services/gamma/config.test.ts" } }),
+				event("two", "bash", { command: "bun test services/gamma/config.test.ts" }),
 			]),
 		).toEqual(target);
 	});
 
 	test("interpolates one non-path value without inventing case, multi-source, short, or path semantics", () => {
 		const context = [
-			event({ sessionID: "one", tool: "inspect", input: { left: "Alpha", right: "Beta", short: "xy" } }),
+			event("one", "inspect", { left: "Alpha", right: "Beta", short: "xy" }),
 		];
 		const target = {
 			normalized: "alpha",
@@ -144,23 +140,20 @@ describe("PatternAware", () => {
 		});
 		expect(
 			applyBindings(bindings, [
-				event({ sessionID: "two", tool: "inspect", input: { left: "Gamma", right: "Delta", short: "zz" } }),
+				event("two", "inspect", { left: "Gamma", right: "Delta", short: "zz" }),
 			]),
 		).toEqual({ ...target, command: "run Gamma now", joined: "Gamma:Beta" });
 	});
 
 	test("rebases predictions over an authoritative provider batch without learning it early", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
 		const before = store.recent("probe");
 
 		const candidates = store.predictAfterBatch("probe", [
-			input({
-				sessionID: "probe",
+			input("probe", "grep", { pattern: "TODO" }, {
 				turnID: "probe:scan",
-				tool: "grep",
-				input: { pattern: "TODO" },
 				outputPaths: ["src/c.ts"],
 			}),
 		]);
@@ -173,19 +166,19 @@ describe("PatternAware", () => {
 			}),
 		);
 		expect(store.recent("probe")).toEqual(before);
-		expect(store.predictAfterBatch("missing-payload", [input({ sessionID: "missing-payload", tool: "grep", input: { pattern: "TODO" } })])
+		expect(store.predictAfterBatch("missing-payload", [input("missing-payload", "grep", { pattern: "TODO" })])
 			.find((item) => item.tool === "read")).toBeUndefined();
 	});
 
 	test("learns provider batches canonically without inventing sibling causality", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		for (const [sessionID, filePath, reverse] of [
 			["one", "src/a.ts", false],
 			["two", "src/b.ts", true],
 		] as const) {
 			const batch = scanBatch(sessionID, filePath);
 			store.observeBatch(reverse ? [...batch].reverse() : batch);
-			store.observeBatch([input({ sessionID, turnID: `${sessionID}:read`, tool: "read", input: { filePath } })]);
+			store.observeBatch([input(sessionID, "read", { filePath }, { turnID: `${sessionID}:read`, })]);
 			store.finishSession(sessionID);
 		}
 
@@ -216,7 +209,7 @@ describe("PatternAware", () => {
 		["co-occurring", () => ["find", "grep"] as const, 1],
 		["alternative", (index: number) => [index % 2 === 0 ? "find" : "grep"] as const, 0.5],
 	] as const)("calibrates %s batch members as marginal events", (_name, targets, expected) => {
-		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
 		for (let index = 0; index < 8; index++) {
 			observeBatchTransition(
 				store,
@@ -227,7 +220,7 @@ describe("PatternAware", () => {
 		const probabilities = (() => {
 			const sessionID = "probe";
 			store.observeBatch([
-				input({ sessionID, turnID: `${sessionID}:context`, tool: "inspect", input: { scope: "src" } }),
+				input(sessionID, "inspect", { scope: "src" }, { turnID: `${sessionID}:context`, }),
 			]);
 			return new Map(
 				store.predict(sessionID).map((candidate) => [candidate.tool, candidate.conditionalProbability]),
@@ -240,38 +233,36 @@ describe("PatternAware", () => {
 	});
 
 	test("counts repeated same-tool batch members once while sample windows slide", () => {
-		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
 		for (let index = 0; index < 16; index++)
 			observeBatchTransition(
 				store,
 				`same-tool-${index}`,
 				["one.ts", "two.ts"].map((filePath) => ({ tool: "read", input: { filePath } })),
 			);
-		store.observeBatch([input({ sessionID: "probe", turnID: "probe:context", tool: "inspect", input: {} })]);
+		store.observeBatch([input("probe", "inspect", {}, { turnID: "probe:context", })]);
 		const reads = store.predict("probe").filter((candidate) => candidate.tool === "read");
 		expect(reads).toHaveLength(2);
 		expect(reads.every((candidate) => candidate.conditionalProbability > 0.9)).toBe(true);
 	});
 
 	test("learns mappers per gap and merges equivalent actions only at prediction", () => {
-		const store = new PatternAwareStore(
-			settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2, futureGapCoverage: 0.9 }),
-		);
+		const store = patternStore({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2, futureGapCoverage: 0.9 });
 		for (const [sessionID, filePath] of [
 			["immediate-a", "src/a.ts"],
 			["immediate-b", "src/b.ts"],
 		] as const) {
-			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+			store.observe(input(sessionID, "grep", {}, { outputPaths: [filePath] }));
+			store.observe(input(sessionID, "read", { filePath }));
 			store.finishSession(sessionID);
 		}
 		for (const [sessionID, filePath] of [
 			["delayed-a", "src/c.ts"],
 			["delayed-b", "src/d.ts"],
 		] as const) {
-			store.observe(input({ sessionID, tool: "grep", input: {}, outputPaths: [filePath] }));
-			store.observe(input({ sessionID, tool: "bash", input: { command: "pwd" } }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+			store.observe(input(sessionID, "grep", {}, { outputPaths: [filePath] }));
+			store.observe(input(sessionID, "bash", { command: "pwd" }));
+			store.observe(input(sessionID, "read", { filePath }));
 			store.finishSession(sessionID);
 		}
 
@@ -280,7 +271,7 @@ describe("PatternAware", () => {
 			.filter((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
 		expect(patterns.map((pattern) => pattern.gapCounts)).toEqual([{ "0": 2 }, { "1": 2 }]);
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input("probe", "grep", {}, { outputPaths: ["src/c.ts"] }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
 		expect(candidate).toMatchObject({ horizon: 1, latestHorizon: 1 });
@@ -293,8 +284,8 @@ describe("PatternAware", () => {
 		const pattern = acceptPattern(store, { "0": 9, "5": 1 });
 		acceptPattern(immediate, { "0": 10 });
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
-		immediate.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		store.observe(input("probe", "grep", { pattern: "TODO" }));
+		immediate.observe(input("probe", "grep", { pattern: "TODO" }));
 
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		const immediateCandidate = immediate.predict("probe").find((item) => item.tool === "read");
@@ -305,9 +296,9 @@ describe("PatternAware", () => {
 		expect(immediateCandidate).toMatchObject({ horizon: 0, latestHorizon: 0 });
 		expect(candidate?.conditionalProbability).toBe(immediateCandidate?.conditionalProbability);
 		for (let gap = 0; gap < 5; gap++) {
-			store.observe(input({ sessionID: "probe", tool: "bash", input: { command: `step-${gap}` } }));
+			store.observe(input("probe", "bash", { command: `step-${gap}` }));
 		}
-		store.observe(input({ sessionID: "probe", tool: "read", input: { path: "README.md" } }));
+		store.observe(input("probe", "read", { path: "README.md" }));
 		expect(store.snapshot().find((item) => item.id === pattern.id)).toMatchObject({
 			historicalOpportunities: pattern.historicalOpportunities + 1,
 			historicalMatches: pattern.historicalMatches + 1,
@@ -315,9 +306,9 @@ describe("PatternAware", () => {
 	});
 
 	test("derives orthogonal feedback only from authoritative prediction settlements", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 2, decayHalfLifeEvents: 1 }));
+		const store = patternStore({ minOccurrences: 2, decayHalfLifeEvents: 1 });
 		acceptPattern(store, { "0": 10 }, { id: "attributed" });
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		store.observe(input("probe", "grep", { pattern: "TODO" }));
 		const beforeUnobserved = store.predict("probe").find((item) => item.patternID === "attributed");
 		for (let index = 0; index < 4; index++) store.issued("attributed");
 		store.settled("attributed", unobservedSettlement("source", "timeout"));
@@ -351,7 +342,7 @@ describe("PatternAware", () => {
 			},
 		});
 		for (let index = 0; index < 4; index++)
-			store.observe(input({ sessionID: `decay-${index}`, tool: "lsp", input: { operation: "symbols" } }));
+			store.observe(input(`decay-${index}`, "lsp", { operation: "symbols" }));
 		expect(
 			store.predict("probe").find((item) => item.patternID === "attributed")!.adoptionProbability,
 		).toBeGreaterThan(pattern!.adoptionProbability);
@@ -360,9 +351,9 @@ describe("PatternAware", () => {
 	});
 
 	test("discounts old mismatch evidence so fresh matches recover after drift", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 2, decayHalfLifeEvents: 2 }));
+		const store = patternStore({ minOccurrences: 2, decayHalfLifeEvents: 2 });
 		acceptPattern(store, { "0": 10 }, { id: "drift" });
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		store.observe(input("probe", "grep", { pattern: "TODO" }));
 		for (let index = 0; index < 2; index++) {
 			store.issued("drift");
 			store.settled("drift", unmatchedSettlement());
@@ -387,13 +378,11 @@ describe("PatternAware", () => {
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
-		const store = new PatternAwareStore(
-			settings({
+		const store = patternStore({
 				maxFutureGap: 8,
 				futureGapCoverage: 0.9,
 				decayHalfLifeEvents: 10,
-			}),
-		);
+			});
 		acceptPattern(store, { "0": 1000, "3": 10 }, {
 			gapLastSeen: { "0": 0, "3": 1000 },
 			lastSeenSequence: 1000,
@@ -403,17 +392,17 @@ describe("PatternAware", () => {
 			historicalMatches: 1010,
 		});
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" } }));
+		store.observe(input("probe", "grep", { pattern: "TODO" }));
 
 		expect(store.predict("probe").find((item) => item.tool === "read")?.horizon).toBe(3);
 	});
 
 	test("does not promote multiple gap views of one target into repeated support", () => {
-		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2 }));
-		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "a" }, outputPaths: ["src"] }));
-		store.observe(input({ sessionID: "one", tool: "grep", input: { pattern: "b" }, outputPaths: ["src/a.ts"] }));
-		store.observe(input({ sessionID: "one", tool: "read", input: { filePath: "src/a.ts" } }));
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "TODO" }, outputPaths: ["src/b.ts"] }));
+		const store = patternStore({ maxContextLength: 1, maxFutureGap: 1, minOccurrences: 2 });
+		store.observe(input("one", "grep", { pattern: "a" }, { outputPaths: ["src"] }));
+		store.observe(input("one", "grep", { pattern: "b" }, { outputPaths: ["src/a.ts"] }));
+		store.observe(input("one", "read", { filePath: "src/a.ts" }));
+		store.observe(input("probe", "grep", { pattern: "TODO" }, { outputPaths: ["src/b.ts"] }));
 
 		expect(store.snapshot().filter((item) => item.targetTool === "read")).toEqual([
 			expect.objectContaining({ occurrences: 1, gapCounts: { "0": 1 } }),
@@ -424,10 +413,10 @@ describe("PatternAware", () => {
 	});
 
 	test("continues only schema-compatible learned targets", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainGrepRead(store, "one", "src/a.ts", "read-v1");
 		trainGrepRead(store, "two", "src/b.ts", "read-v1");
-		store.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input("three", "grep", {}, { outputPaths: ["src/c.ts"] }));
 
 		expect(store.predict("three", { read: "read-v2" }).filter((item) => item.tool === "read")).toHaveLength(0);
 		expect(store.predict("three", { read: "read-v1" })).toContainEqual(
@@ -442,7 +431,7 @@ describe("PatternAware", () => {
 
 	test("persists a deduplicated learning table and rebuilds its opportunity index", async () => {
 		const file = await patternFile("learning-table");
-		const first = new PatternAwareStore(settings(), file);
+		const first = patternStore({}, file);
 		await first.load();
 		trainGrepRead(first, "one", "src/a.ts");
 		trainGrepRead(first, "two", "src/b.ts");
@@ -463,18 +452,18 @@ describe("PatternAware", () => {
 		for (const version of [persisted.version - 1, persisted.version + 1]) {
 			const unsupported = JSON.stringify({ ...persisted, version });
 			await fs.writeFile(file, unsupported);
-			const ignored = new PatternAwareStore(settings(), file);
+			const ignored = patternStore({}, file);
 			await ignored.load(); await ignored.flush();
 			expect(ignored.snapshot()).toEqual([]);
 			expect(await fs.readFile(file, "utf8")).toBe(unsupported);
 		}
 		await fs.writeFile(file, raw);
-		const second = new PatternAwareStore(settings(), file);
+		const second = patternStore({}, file);
 		await second.load();
-		second.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		second.observe(input("three", "grep", {}, { outputPaths: ["src/c.ts"] }));
 
 		expect(second.predict("three").some((item) => item.tool === "read")).toBe(true);
-		second.observe(input({ sessionID: "three", tool: "read", input: { filePath: "src/c.ts" } }));
+		second.observe(input("three", "read", { filePath: "src/c.ts" }));
 		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
@@ -493,11 +482,11 @@ describe("PatternAware", () => {
 					({ ...valid, id: `bad-feedback-${key}-${index}`, feedback: { ...valid.feedback, [key]: value } }))),
 				...(["rejectedAfterMatch", "unobserved"] as const).map((key) => ({ ...valid, id: `bad-feedback-${key}`, feedback: { ...valid.feedback, [key]: { invalid: -1 } } })),
 			],
-			events: [event({ sessionID: "one", tool: "grep", input: {} }), { sequence: 2 }, event({ sessionID: "one", tool: "read", input: restoredInput })],
+			events: [event("one", "grep"), { sequence: 2 }, event("one", "read", restoredInput)],
 			pools: [1, 99, 2].map((target) => ({ key: `bad-sample-${target}`, context: [{ tool: "grep", outcome: "success" }],
 				targetTool: "read", gap: 0, samples: [{ context: [0], target, gap: target === 2 ? 1 : 0 }] })), sequenceCounts: [],
 		}));
-		const store = new PatternAwareStore(settings({ minOccurrences: 1 }), file);
+		const store = patternStore({ minOccurrences: 1 }, file);
 		await expect(store.load()).resolves.toBeUndefined();
 		const expected = store.snapshot(), exposed = store.snapshot()[0]!;
 		expect(expected.map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
@@ -510,7 +499,7 @@ describe("PatternAware", () => {
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
 		expect(persisted.pools).toEqual([]);
 		expect(persisted.patterns[0].feedback).toEqual({ ...valid.feedback, issued: valid.feedback.issued + 1 });
-		const observed = input({ sessionID: "restored", tool: "grep", input: { query: "original" }, outputPaths: ["a.ts"] });
+		const observed = input("restored", "grep", { query: "original" }, { outputPaths: ["a.ts"] });
 		store.observe(observed);
 		observed.input.query = "changed";
 		const recent = store.recent("restored");
@@ -583,16 +572,16 @@ describe("PatternAware", () => {
 			JSON.stringify({ version: 18, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
 		);
 
-		const store = new PatternAwareStore(settings({ maxContextLength: 1 }), file);
+		const store = patternStore({ maxContextLength: 1 }, file);
 		await store.load();
 		expect(store.snapshot()).toEqual([]);
 		expect(store.registerValidatedPattern(long)).toBe(false);
 		for (const sessionID of ["learn-a", "learn-b"]) {
 			store.observeBatch([
-				input({ sessionID, tool: "grep", input: { pattern: "TODO" } }),
-				input({ sessionID, tool: "read", input: { filePath: "src/a.ts" } }),
+				input(sessionID, "grep", { pattern: "TODO" }),
+				input(sessionID, "read", { filePath: "src/a.ts" }),
 			]);
-			store.observe(input({ sessionID, tool: "write", input: { filePath: "src/a.ts" } }));
+			store.observe(input(sessionID, "write", { filePath: "src/a.ts" }));
 			store.finishSession(sessionID);
 		}
 		expect(store.snapshot()).toEqual([]);
@@ -600,7 +589,7 @@ describe("PatternAware", () => {
 
 	test("transfers data-flow patterns across processes before global support", async () => {
 		const file = await patternFile("pool");
-		const first = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		const first = patternStore({ minOccurrences: 2 }, file);
 		await first.load();
 		trainGrepRead(first, "one", "src/a.ts");
 		first.finishSession("one");
@@ -610,12 +599,12 @@ describe("PatternAware", () => {
 		expect(persisted.patterns).toEqual([expect.objectContaining({ targetTool: "read", occurrences: 1 })]);
 		expect(persisted.pools.length).toBeGreaterThan(0);
 
-		const second = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		const second = patternStore({ minOccurrences: 2 }, file);
 		await second.load();
-		second.observe(input({ sessionID: "two", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }));
+		second.observe(input("two", "grep", {}, { outputPaths: ["src/b.ts"] }));
 		const candidates = second.predict("two");
 		expect(candidates).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/b.ts" } }));
-		second.observe(input({ sessionID: "two", tool: "read", input: { filePath: "src/b.ts" } }));
+		second.observe(input("two", "read", { filePath: "src/b.ts" }));
 
 		expect(second.snapshot().some((item) => item.targetTool === "read")).toBe(true);
 	});
@@ -626,12 +615,12 @@ describe("PatternAware", () => {
 		const first = new PatternAwareStore(configured, file);
 		await first.load();
 		for (let index = 0; index < 4; index++) {
-			first.observe(input({ sessionID: `read-${index}`, tool: "grep", input: {} }));
-			first.observe(input({ sessionID: `read-${index}`, tool: "read", input: { path: "README.md" } }));
+			first.observe(input(`read-${index}`, "grep"));
+			first.observe(input(`read-${index}`, "read", { path: "README.md" }));
 		}
 		for (let index = 0; index < 2; index++) {
-			first.observe(input({ sessionID: `bash-${index}`, tool: "grep", input: {} }));
-			first.observe(input({ sessionID: `bash-${index}`, tool: "bash", input: { command: "npm test" } }));
+			first.observe(input(`bash-${index}`, "grep"));
+			first.observe(input(`bash-${index}`, "bash", { command: "npm test" }));
 		}
 		await first.flush();
 
@@ -640,7 +629,7 @@ describe("PatternAware", () => {
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
-		restored.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
+		restored.observe(input("probe", "grep"));
 
 		expect(restored.predict("probe")).toEqual([
 			expect.objectContaining({ tool: "read", input: { path: "README.md" } }),
@@ -648,28 +637,28 @@ describe("PatternAware", () => {
 	});
 
 	test("keeps constant patterns task-local until independently supported", async () => {
-		const local = new PatternAwareStore(settings({ minOccurrences: 2 }));
-		local.observe(input({ sessionID: "local", tool: "inspect", input: {} }));
-		local.observe(input({ sessionID: "local", tool: "read", input: { filePath: "README.md" } }));
-		local.observe(input({ sessionID: "local", tool: "inspect", input: {} }));
+		const local = patternStore({ minOccurrences: 2 });
+		local.observe(input("local", "inspect"));
+		local.observe(input("local", "read", { filePath: "README.md" }));
+		local.observe(input("local", "inspect"));
 		expect(local.predict("local")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
 
 		const file = await patternFile("constant-pool");
 		const train = async (sessionID: string) => {
-			const store = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+			const store = patternStore({ minOccurrences: 2 }, file);
 			await store.load();
-			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			store.observe(input(sessionID, "inspect", {}, { output: { kind: "path" } }));
+			store.observe(input(sessionID, "read", { filePath: "README.md" }));
 			store.finishSession(sessionID);
 			await store.flush();
 		};
 
 		await train("one");
-		const isolated = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		const isolated = patternStore({ minOccurrences: 2 }, file);
 		await isolated.load();
-		isolated.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+		isolated.observe(input("probe", "inspect", {}, { output: { kind: "path" } }));
 		expect(isolated.predict("probe").some((candidate) => candidate.tool === "read")).toBe(false);
 		isolated.finishSession("probe");
 		await isolated.flush();
@@ -677,9 +666,9 @@ describe("PatternAware", () => {
 			await train(sessionID);
 		}
 
-		const restored = new PatternAwareStore(settings({ minOccurrences: 2 }), file);
+		const restored = patternStore({ minOccurrences: 2 }, file);
 		await restored.load();
-		restored.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+		restored.observe(input("probe", "inspect", {}, { output: { kind: "path" } }));
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
 
 		expect(restored.predict("probe")).toContainEqual(
@@ -705,14 +694,14 @@ describe("PatternAware", () => {
 	});
 
 	test("probes an adjacent transition once and preserves feedback until configured promotion", () => {
-		const store = new PatternAwareStore(settings({ minOccurrences: 3 }));
+		const store = patternStore({ minOccurrences: 3 });
 		trainGrepRead(store, "one", "src/a.ts");
 		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
 			occurrences: 1,
 			feedback: { issued: 0 },
 		});
 
-		store.observe(input({ sessionID: "two", tool: "grep", input: {}, outputPaths: ["src/b.ts"] }));
+		store.observe(input("two", "grep", {}, { outputPaths: ["src/b.ts"] }));
 		const candidate = store.predict("two").find((item) => item.tool === "read")!;
 		expect(candidate.input).toEqual({ filePath: "src/b.ts" });
 		expect(candidate.background).toBe(true);
@@ -720,15 +709,15 @@ describe("PatternAware", () => {
 		store.settled(candidate.patternID, adoptedSettlement());
 		expect(store.predict("two").filter((item) => item.tool === "read")).toHaveLength(0);
 
-		store.observe(input({ sessionID: "two", tool: "read", input: { filePath: "src/b.ts" } }));
+		store.observe(input("two", "read", { filePath: "src/b.ts" }));
 		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
 			occurrences: 2,
 			feedback: { issued: 1, matched: 1, adopted: 1 },
 		});
-		store.observe(input({ sessionID: "three", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input("three", "grep", {}, { outputPaths: ["src/c.ts"] }));
 		expect(store.predict("three")).not.toContainEqual(expect.objectContaining({ tool: "read" }));
-		store.observe(input({ sessionID: "three", tool: "read", input: { filePath: "src/c.ts" } }));
-		store.observe(input({ sessionID: "four", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
+		store.observe(input("three", "read", { filePath: "src/c.ts" }));
+		store.observe(input("four", "grep", {}, { outputPaths: ["src/d.ts"] }));
 		const promoted = store.predict("four");
 		expect(promoted).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/d.ts" } }));
 		expect(promoted.find((item) => item.tool === "read")?.background).toBeUndefined();
@@ -739,13 +728,13 @@ describe("PatternAware", () => {
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {
-		const store = new PatternAwareStore(settings({ minBindingReplayProbability: 0.75 }));
+		const store = patternStore({ minBindingReplayProbability: 0.75 });
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
 
-		store.observe(input({ sessionID: "miss-one", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input("miss-one", "grep", {}, { outputPaths: ["src/c.ts"] }));
 		store.finishSession("miss-one");
-		store.observe(input({ sessionID: "miss-two", tool: "grep", input: {}, outputPaths: ["src/d.ts"] }));
+		store.observe(input("miss-two", "grep", {}, { outputPaths: ["src/d.ts"] }));
 		store.finishSession("miss-two");
 
 		const pattern = store
@@ -755,7 +744,7 @@ describe("PatternAware", () => {
 		expect(pattern?.historicalOpportunities).toBe(4);
 		expect(pattern?.empiricalProbability).toBe(0.5);
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/e.ts"] }));
+		store.observe(input("probe", "grep", {}, { outputPaths: ["src/e.ts"] }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.empiricalProbability).toBeGreaterThan(0);
 		expect(candidate?.empiricalProbability).toBeLessThan(0.75);
@@ -764,11 +753,11 @@ describe("PatternAware", () => {
 	});
 
 	test("learns indexed field fallbacks across historical samples", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainOutputRead(store, "one", { primary: "src/a.ts" }, "src/a.ts");
 		trainOutputRead(store, "two", { fallback: "src/b.ts" }, "src/b.ts");
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, output: { fallback: "src/c.ts" } }));
+		store.observe(input("probe", "grep", {}, { output: { fallback: "src/c.ts" } }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 
 		expect(candidate?.type).toBe("tool_call");
@@ -776,7 +765,7 @@ describe("PatternAware", () => {
 	});
 
 	test("learns a stable mapper branch after unrelated evidence", () => {
-		const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0 }));
+		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
 		for (let index = 0; index < 4; index++) {
 			trainOutputRead(store, `noise-${index}`, { path: `src/source-${index}.ts` }, `src/unrelated-${index}.ts`);
 		}
@@ -785,22 +774,19 @@ describe("PatternAware", () => {
 			trainOutputRead(store, `stable-${index}`, { path: file }, file);
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, output: { path: "src/result.ts" } }));
+		store.observe(input("probe", "grep", {}, { output: { path: "src/result.ts" } }));
 		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({
 			filePath: "src/result.ts",
 		});
 	});
 
 	test("combines multiple structured fields instead of memorizing a concrete path", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainJoinedRead(store, "one", "services/a", "alpha");
 		trainJoinedRead(store, "two", "services/b", "beta");
 
 		store.observe(
-			input({
-				sessionID: "probe",
-				tool: "inspect",
-				input: {},
+			input("probe", "inspect", {}, {
 				output: { root: "services/c", name: "gamma" },
 			}),
 		);
@@ -811,28 +797,22 @@ describe("PatternAware", () => {
 	});
 
 	test("does not compose presentation text into a path binding", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		for (const [sessionID, root, preview] of [
 			["one", "services/a", "alpha.ts"],
 			["two", "services/b", "beta.ts"],
 		]) {
 			store.observe(
-				input({
-					sessionID,
-					tool: "read",
-					input: { filePath: root },
+				input(sessionID, "read", { filePath: root }, {
 					output: { preview },
 				}),
 			);
-			store.observe(input({ sessionID, tool: "read", input: { filePath: `${root}/${preview}` } }));
+			store.observe(input(sessionID, "read", { filePath: `${root}/${preview}` }));
 			store.finishSession(sessionID);
 		}
 
 		store.observe(
-			input({
-				sessionID: "probe",
-				tool: "read",
-				input: { filePath: "services/c" },
+			input("probe", "read", { filePath: "services/c" }, {
 				output: { preview: "export const value = 1" },
 			}),
 		);
@@ -841,15 +821,12 @@ describe("PatternAware", () => {
 	});
 
 	test("expands a structured collection when actor ordering varies", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainResultReads(store, "one", ["src/a.ts", "src/b.ts"], ["src/b.ts", "src/a.ts"]);
 		trainResultReads(store, "two", ["src/c.ts", "src/d.ts"], ["src/c.ts", "src/d.ts"]);
 
 		store.observe(
-			input({
-				sessionID: "probe",
-				tool: "grep",
-				input: { pattern: "symbol" },
+			input("probe", "grep", { pattern: "symbol" }, {
 				output: { results: [{ path: "src/e.ts" }, { path: "src/f.ts" }] },
 			}),
 		);
@@ -863,7 +840,7 @@ describe("PatternAware", () => {
 	});
 
 	test("does not dilute a continuation path with unrelated sibling candidates", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		for (const [id, path] of [
 			["read-source", "src/source.ts"],
 			["read-test", "test/source.test.ts"],
@@ -877,29 +854,26 @@ describe("PatternAware", () => {
 			bindings: { '["command"]': { type: "constant", value: "npm test" } },
 		});
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { pattern: "source" } }));
+		store.observe(input("probe", "grep", { pattern: "source" }));
 		const source = store.predict("probe").find((item) => item.input.path === "src/source.ts");
 		expect(source?.empiricalProbability).toBeGreaterThan(0.9);
 
 		const child = store
-			.continue(source!.continuation, input({ sessionID: "probe", tool: "read", input: { path: "src/source.ts" } }))
+			.continue(source!.continuation, input("probe", "read", { path: "src/source.ts" }))
 			.find((item) => item.tool === "bash");
 		expect(child?.conditionalProbability).toBeGreaterThan(0.9);
 		expect(child?.empiricalProbability).toBeGreaterThan(0.8);
 	});
 
 	test("allocates collection variants by observed actor choice frequency", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		const pattern = acceptPattern(store, { "0": 10 }, {
 			id: "ranked-results",
 			bindings: collectionBindings({ "0": 9, "1": 1 }),
 		});
 
 		store.observe(
-			input({
-				sessionID: "probe",
-				tool: "grep",
-				input: { pattern: "source" },
+			input("probe", "grep", { pattern: "source" }, {
 				output: { results: [{ path: "src/likely.ts" }, { path: "src/unlikely.ts" }] },
 			}),
 		);
@@ -910,14 +884,14 @@ describe("PatternAware", () => {
 		expect(likely?.conditionalProbability).toBeGreaterThan(unlikely?.conditionalProbability ?? 1);
 		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
 		expect(candidates).toHaveLength(2);
-		store.observe(input({ sessionID: "probe", tool: "read", input: { filePath: "src/unlikely.ts" } }));
+		store.observe(input("probe", "read", { filePath: "src/unlikely.ts" }));
 		expect(store.snapshot().find((item) => item.id === pattern.id)).toMatchObject({
 			historicalOpportunities: pattern.historicalOpportunities + 1, historicalMatches: pattern.historicalMatches + 1,
 		});
 	});
 
 	test("charges evidence-annealed mapper complexity for transforms and ungrounded payloads", () => {
-		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		const store = patternStore({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 });
 		const source = { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] };
 		for (const [id, binding, averageDurationMs] of [
 			["z-direct", source, 100],
@@ -932,26 +906,26 @@ describe("PatternAware", () => {
 			});
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: { path: "src/index.ts" } }));
+		store.observe(input("probe", "grep", { path: "src/index.ts" }));
 		expect(store.predict("probe")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { path: "src/index.ts" } }),
 		);
 	});
 
 	test("retains multiple replayable mapper branches for one control context", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		for (const [sessionID, source, target] of [
 			["same-a", "src/a.ts", "src/a.ts"],
 			["same-b", "src/b.ts", "src/b.ts"],
 			["test-a", "src/c.ts", "src/c.ts.test"],
 			["test-b", "src/d.ts", "src/d.ts.test"],
 		] as const) {
-			store.observe(input({ sessionID, tool: "inspect", input: { value: source } }));
-			store.observe(input({ sessionID, tool: "inspect", input: { value: target } }));
+			store.observe(input(sessionID, "inspect", { value: source }));
+			store.observe(input(sessionID, "inspect", { value: target }));
 			store.finishSession(sessionID);
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "inspect", input: { value: "src/e.ts" } }));
+		store.observe(input("probe", "inspect", { value: "src/e.ts" }));
 		expect(store.predict("probe").map((candidate) => candidate.input)).toEqual(
 			expect.arrayContaining([{ value: "src/e.ts" }, { value: "src/e.ts.test" }]),
 		);
@@ -959,20 +933,17 @@ describe("PatternAware", () => {
 
 	test("contains non-finite persisted variant counts instead of emitting invalid probabilities", async () => {
 		const file = await patternFile("invalid-variants");
-		const first = new PatternAwareStore(settings(), file);
+		const first = patternStore({}, file);
 		await first.load();
 		acceptPattern(first, { "0": 10 }, {
 			id: "invalid-ranked-results",
 			bindings: collectionBindings({ "0": Number.NaN, "1": Number.POSITIVE_INFINITY }),
 		});
 		await first.flush();
-		const store = new PatternAwareStore(settings(), file);
+		const store = patternStore({}, file);
 		await store.load();
 		store.observe(
-			input({
-				sessionID: "probe-invalid-counts",
-				tool: "grep",
-				input: {},
+			input("probe-invalid-counts", "grep", {}, {
 				output: { results: [{ path: "src/a.ts" }, { path: "src/b.ts" }] },
 			}),
 		);
@@ -987,21 +958,21 @@ describe("PatternAware", () => {
 	});
 
 	test("does not let single-sample mappers bypass constant provenance evidence", () => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		for (const sessionID of ["one", "two", "three"]) {
-			store.observe(input({ sessionID, tool: "inspect", input: {}, output: { kind: "path" } }));
-			store.observe(input({ sessionID, tool: "read", input: { filePath: "README.md" } }));
+			store.observe(input(sessionID, "inspect", {}, { output: { kind: "path" } }));
+			store.observe(input(sessionID, "read", { filePath: "README.md" }));
 			store.finishSession(sessionID);
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "inspect", input: {}, output: { kind: "path" } }));
+		store.observe(input("probe", "inspect", {}, { output: { kind: "path" } }));
 		expect(store.predict("probe")).toEqual([]);
 		store.finishSession("probe");
-		store.observe(input({ sessionID: "four", tool: "inspect", input: {}, output: { kind: "path" } }));
-		store.observe(input({ sessionID: "four", tool: "read", input: { filePath: "README.md" } }));
+		store.observe(input("four", "inspect", {}, { output: { kind: "path" } }));
+		store.observe(input("four", "read", { filePath: "README.md" }));
 		store.finishSession("four");
 
-		store.observe(input({ sessionID: "probe-after-four", tool: "inspect", input: {}, output: { kind: "path" } }));
+		store.observe(input("probe-after-four", "inspect", {}, { output: { kind: "path" } }));
 		expect(store.predict("probe-after-four")).toContainEqual(
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
@@ -1012,33 +983,27 @@ describe("PatternAware", () => {
 			["wrong-outcome", { outcome: "failure" as const }, false],
 			["wrong-operation", { operation: "other" }, false],
 		] as const) {
-			store.observe(input({ sessionID, tool: "inspect", input: {}, ...overrides }));
+			store.observe(input(sessionID, "inspect", {}, { ...overrides }));
 			expect(store.predict(sessionID).some((item) => item.tool === "read"), sessionID).toBe(matches);
 		}
 	});
 
 	test("learns a reusable read range from varying actor windows", () => {
-		const store = new PatternAwareStore(settings(), undefined, piActionSemantics());
+		const store = patternStore({}, undefined, piActionSemantics());
 		for (const [sessionID, filePath, offset, limit] of [
 			["one", "src/a.ts", 320, 100],
 			["two", "src/b.ts", 840, 100],
 		] as const) {
 			store.observe(
-				input({
-					sessionID,
-					tool: "grep",
-					input: { pattern: "symbol" },
+				input(sessionID, "grep", { pattern: "symbol" }, {
 					output: { results: [{ path: filePath, line: offset + 20 }] },
 				}),
 			);
-			store.observe(input({ sessionID, tool: "read", input: { path: filePath, offset, limit } }));
+			store.observe(input(sessionID, "read", { path: filePath, offset, limit }));
 		}
 
 		store.observe(
-			input({
-				sessionID: "probe",
-				tool: "grep",
-				input: { pattern: "symbol" },
+			input("probe", "grep", { pattern: "symbol" }, {
 				output: { results: [{ path: "src/c.ts", line: 1_200 }] },
 			}),
 		);
@@ -1074,15 +1039,15 @@ describe("PatternAware", () => {
 			actorSchemaHash: "new-read-schema",
 		},
 	])("accounts for projected feedback with $name", ({ name, bindings, actor, actorSchemaHash }) => {
-		const store = new PatternAwareStore(settings(), undefined, piActionSemantics());
+		const store = patternStore({}, undefined, piActionSemantics());
 		const pattern = validatedGapPattern(
 			{ "0": 10 },
 			{ id: `projected-negative-${name}`, bindings, targetSchemaHash: "read-schema" },
 		);
 		expect(store.registerValidatedPattern(pattern)).toBe(true);
 
-		store.observe(input({ sessionID: name, tool: "grep", input: { pattern: "symbol" } }));
-		store.observe(input({ sessionID: name, tool: "read", input: actor, schemaHash: actorSchemaHash }));
+		store.observe(input(name, "grep", { pattern: "symbol" }));
+		store.observe(input(name, "read", actor, { schemaHash: actorSchemaHash }));
 
 		const after = store.snapshot().find((item) => item.id === pattern.id);
 		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
@@ -1092,7 +1057,7 @@ describe("PatternAware", () => {
 	test("deduplicates canonical K(a) variants and memoizes resolution, including misses", () => {
 		const semantics = piActionSemantics();
 		let resolutions = 0;
-		const store = new PatternAwareStore(settings(), undefined, { ...semantics,
+		const store = patternStore({}, undefined, { ...semantics,
 			actionKey: (...args) => { resolutions++; return semantics.actionKey(...args); },
 		});
 		for (const [id, bindings] of [
@@ -1105,7 +1070,7 @@ describe("PatternAware", () => {
 			acceptPattern(store, { "0": 10 }, { id, bindings });
 		}
 
-		store.observe(input({ sessionID: "dedupe", tool: "grep", input: { pattern: "symbol" } }));
+		store.observe(input("dedupe", "grep", { pattern: "symbol" }));
 		const reads = store.predict("dedupe").filter((candidate) => candidate.tool === "read");
 
 		expect(reads).toHaveLength(4);
@@ -1136,10 +1101,10 @@ describe("PatternAware", () => {
 			const first = tool === "bash" ? { command: "npm test" } : { path: "src/a.ts" };
 			const inputs = [first, tool === "read" ? { ...first, offset: 1 } : first];
 			for (const [index, value] of inputs.entries()) {
-				store.observe(input({ sessionID: mode, tool, input: value, schemaHash: "v1", learnTarget: mode !== "non-learning",
+				store.observe(input(mode, tool, value, { schemaHash: "v1", learnTarget: mode !== "non-learning",
 					outcome: index === 0 ? "failure" : "success", durationMs: index === 0 ? 500 : 700 }));
 				for (let noise = 0; noise < 3; noise++)
-					store.observe(input({ sessionID: mode, tool: "read", input: { path: `noise-${index}-${noise}.ts` } }));
+					store.observe(input(mode, "read", { path: `noise-${index}-${noise}.ts` }));
 				const recurrent = store.predict(mode, { [tool]: mode === "stale schema" ? "v2" : "v1" })
 					.find((candidate) => candidate.patternID.startsWith("action-backoff:") && !candidate.background);
 				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
@@ -1174,25 +1139,21 @@ describe("PatternAware", () => {
 				}
 			}
 			store.finishSession(mode);
-			store.observe(input({ sessionID: "other", tool: "read", input: { path: "other.ts" } }));
+			store.observe(input("other", "read", { path: "other.ts" }));
 			expect(store.predict("other").some((item) => item.patternID.startsWith("action-backoff:"))).toBe(false);
 		}
 	});
 
 	test.each([false, true])("bounds recurrent action samples and requires Actor evidence to unfold them: %s", (confirmed) => {
-		const store = new PatternAwareStore(
-			settings({ beamWidth: 2, maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }),
-			undefined,
-			piActionSemantics(),
-		);
+		const store = patternStore({ beamWidth: 2, maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }, undefined, piActionSemantics());
 		const sessionID = "sampled";
 		for (let index = 0; index < 2; index++) {
-			store.observe(input({ sessionID, tool: "bash", input: { command: "stable" }, durationMs: 100 }));
-			store.observe(input({ sessionID, tool: "read", input: { path: "stable.ts" }, durationMs: 10 }));
+			store.observe(input(sessionID, "bash", { command: "stable" }, { durationMs: 100 }));
+			store.observe(input(sessionID, "read", { path: "stable.ts" }, { durationMs: 10 }));
 		}
-		store.observe(input({ sessionID, tool: "bash", input: { command: "slow-a" }, durationMs: 900 }));
-		store.observe(input({ sessionID, tool: "bash", input: { command: "slow-b" }, durationMs: 1_000 }));
-		store.observe(input({ sessionID, tool: "read", input: { path: "slow.ts" }, durationMs: 2_000 }));
+		store.observe(input(sessionID, "bash", { command: "slow-a" }, { durationMs: 900 }));
+		store.observe(input(sessionID, "bash", { command: "slow-b" }, { durationMs: 1_000 }));
+		store.observe(input(sessionID, "read", { path: "slow.ts" }, { durationMs: 2_000 }));
 
 		const recurrent = store
 			.predict(sessionID)
@@ -1202,17 +1163,13 @@ describe("PatternAware", () => {
 		expect(new Set(sampled.map((candidate) => candidate.tool))).toEqual(new Set(["bash", "read"]));
 		const parent = recurrent[0]!;
 		const next = store.continue(parent.continuation,
-			input({ sessionID, tool: parent.tool, input: parent.input }), {}, confirmed);
+			input(sessionID, parent.tool, parent.input), {}, confirmed);
 		expect(next.some((candidate) => candidate.patternID.startsWith("action-backoff:"))).toBe(confirmed);
 	});
 
 
 	test("merges exact backoff and keeps contradicted patterns from evicting contextual evidence", () => {
-		const store = new PatternAwareStore(
-			settings({ beamWidth: 2, minOccurrences: 2 }),
-			undefined,
-			piActionSemantics(),
-		);
+		const store = patternStore({ beamWidth: 2, minOccurrences: 2 }, undefined, piActionSemantics());
 		const commands = [{ command: "npm test" }, { command: "npm run lint" }, { command: "slow probe" }];
 		for (const [index, command] of commands.entries()) {
 			acceptPattern(store, { "0": 2 }, {
@@ -1229,9 +1186,9 @@ describe("PatternAware", () => {
 			});
 		}
 		for (let index = 0; index < 2; index++) {
-			store.observe(input({ sessionID: "merged", tool: "bash", input: commands[0], durationMs: 100 }));
+			store.observe(input("merged", "bash", commands[0], { durationMs: 100 }));
 		}
-		store.observe(input({ sessionID: "merged", tool: "grep", input: { pattern: "trigger" } }));
+		store.observe(input("merged", "grep", { pattern: "trigger" }));
 		const matches = store.predict("merged").filter((candidate) => candidate.tool === "bash");
 
 		expect(matches.map((candidate) => candidate.input)).toEqual(commands.slice(0, 2));
@@ -1241,27 +1198,25 @@ describe("PatternAware", () => {
 	});
 
 	test.each([false, true])("unlocks and retains a multi-step frontier (LLM boundaries=%s)", (turnBoundaries) => {
-		const store = new PatternAwareStore(settings());
+		const store = patternStore();
 		trainFrontier(store, "one", "src/a.ts", "tests/alpha.test.ts", turnBoundaries);
 		trainFrontier(store, "two", "src/b.ts", "tests/beta.test.ts", turnBoundaries);
 		if (turnBoundaries) store.observeTurn();
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		store.observe(input("probe", "grep", {}, { outputPaths: ["src/c.ts"] }));
 		const read = store.predict("probe").find((item) => item.tool === "read");
 		expect(read?.depth).toBe(1);
 		const captured = structuredClone(read!.continuation.history);
-		store.observe(input({ sessionID: "probe", tool: "inspect", input: { later: true }, learnTarget: false }));
+		store.observe(input("probe", "inspect", { later: true }, { learnTarget: false }));
 		expect(read!.continuation.history).toEqual(captured);
 
-		const lsp = store.continue(read!.continuation, input({
-			sessionID: "probe", tool: "read", input: { filePath: "src/c.ts" },
+		const lsp = store.continue(read!.continuation, input("probe", "read", { filePath: "src/c.ts" }, {
 			output: { nextPath: "tests/gamma.test.ts" },
 		})).find((item) => item.tool === "lsp");
 		expect(lsp?.input).toEqual({ operation: "diagnostics", filePath: "tests/gamma.test.ts" });
 		expect(lsp?.depth).toBe(2);
 
-		const bash = store.continue(lsp!.continuation, input({
-			sessionID: "probe", tool: "lsp", input: lsp!.input,
+		const bash = store.continue(lsp!.continuation, input("probe", "lsp", lsp!.input, {
 			output: { command: "bun test tests/gamma.test.ts" },
 		})).find((item) => item.tool === "bash");
 		expect(bash?.input).toEqual({ command: "bun test tests/gamma.test.ts" });
@@ -1270,27 +1225,24 @@ describe("PatternAware", () => {
 	});
 
 	test("does not count tool-level PPM or failed target latency when valuing concrete patterns", () => {
-		const store = new PatternAwareStore(settings({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 }));
+		const store = patternStore({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 });
 		for (let index = 0; index < 8; index++) {
-			store.observe(input({ sessionID: `fast-${index}`, tool: "grep", input: {}, durationMs: 1 }));
+			store.observe(input(`fast-${index}`, "grep", {}, { durationMs: 1 }));
 			store.observe(
-				input({ sessionID: `fast-${index}`, tool: "read", input: { path: "README.md" }, durationMs: 1 }),
+				input(`fast-${index}`, "read", { path: "README.md" }, { durationMs: 1 }),
 			);
 		}
 		for (let index = 0; index < 4; index++) {
-			store.observe(input({ sessionID: `slow-${index}`, tool: "grep", input: {}, durationMs: 1 }));
+			store.observe(input(`slow-${index}`, "grep", {}, { durationMs: 1 }));
 			store.observe(
-				input({
-					sessionID: `slow-${index}`,
-					tool: "bash",
-					input: { command: "npm test" },
+				input(`slow-${index}`, "bash", { command: "npm test" }, {
 					outcome: index === 0 ? "failure" : "success",
 					durationMs: index === 0 ? 10_000 : 100,
 				}),
 			);
 		}
 
-		store.observe(input({ sessionID: "probe", tool: "grep", input: {} }));
+		store.observe(input("probe", "grep"));
 		const candidates = store.predict("probe");
 
 		expect(candidates.map((candidate) => candidate.tool)).toEqual(["bash", "read"]);
@@ -1299,31 +1251,25 @@ describe("PatternAware", () => {
 
 	test("unfolds recurrence only through distinct finite-motif contexts", () => {
 		const train = (length: number, maxPredictionDepth = 6) => {
-			const store = new PatternAwareStore(
-				settings({ beamWidth: 1, maxContextLength: 3, maxFutureGap: 0, maxPredictionDepth }),
-			);
+			const store = patternStore({ beamWidth: 1, maxContextLength: 3, maxFutureGap: 0, maxPredictionDepth });
 			for (const sessionID of ["one", "two"]) {
 				for (let depth = 0; depth < length; depth++) {
 					store.observe(
-						input({
-							sessionID,
-							tool: "inspect",
-							input: { value: `src/${sessionID}.ts${".test".repeat(depth)}` },
-						}),
+						input(sessionID, "inspect", { value: `src/${sessionID}.ts${".test".repeat(depth)}` }),
 					);
 				}
 			}
 			return store;
 		};
 		const unfold = (store: PatternAwareStore, sessionID: string) => {
-			store.observe(input({ sessionID, tool: "inspect", input: { value: "src/probe.ts" } }));
+			store.observe(input(sessionID, "inspect", { value: "src/probe.ts" }));
 			const candidates = [];
 			let candidate = store.predict(sessionID)[0];
 			while (candidate) {
 				candidates.push(candidate);
 				candidate = store.continue(
 					candidate.continuation,
-					input({ sessionID, tool: "inspect", input: candidate.input, learnTarget: false }),
+					input(sessionID, "inspect", candidate.input, { learnTarget: false }),
 				)[0];
 			}
 			return candidates;
@@ -1378,7 +1324,7 @@ describe("PatternAware", () => {
 	});
 
 	test("keeps waiting through a different invocation of the target tool while the gap remains", () => {
-		const store = new PatternAwareStore(settings({ maxFutureGap: 2 }));
+		const store = patternStore({ maxFutureGap: 2 });
 		const pattern = validatedGapPattern(
 			{ "1": 10 },
 			{
@@ -1388,9 +1334,9 @@ describe("PatternAware", () => {
 		);
 		expect(store.registerValidatedPattern(pattern)).toBe(true);
 
-		store.observe(input({ sessionID: "same-tool", tool: "grep", input: { pattern: "TODO" } }));
-		store.observe(input({ sessionID: "same-tool", tool: "read", input: { filePath: "src/intermediate.ts" } }));
-		store.observe(input({ sessionID: "same-tool", tool: "read", input: { filePath: "src/target.ts" } }));
+		store.observe(input("same-tool", "grep", { pattern: "TODO" }));
+		store.observe(input("same-tool", "read", { filePath: "src/intermediate.ts" }));
+		store.observe(input("same-tool", "read", { filePath: "src/target.ts" }));
 
 		const after = store.snapshot().find((item) => item.id === pattern.id);
 		expect(after?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
@@ -1419,8 +1365,8 @@ describe("PatternAware", () => {
 			first.replacePending([pendingPattern("oldest", 1), pendingPattern("middle", 2), pendingPattern("newest", 3)]),
 		).toEqual([expect.objectContaining({ patternID: "oldest" })]);
 
-		const store = new PatternAwareStore(settings());
-		store.observe(input({ sessionID: "finished", tool: "read", input: { filePath: "README.md" } }));
+		const store = patternStore();
+		store.observe(input("finished", "read", { filePath: "README.md" }));
 		expect(store.recent("finished")).toHaveLength(1);
 
 		store.finishSession("finished");
@@ -1429,7 +1375,7 @@ describe("PatternAware", () => {
 	});
 
 	test("validates imported binding replay independently of control confidence", () => {
-		const learned = new PatternAwareStore(settings());
+		const learned = patternStore();
 		trainGrepRead(learned, "one", "src/a.ts");
 		trainGrepRead(learned, "two", "src/b.ts");
 		const pattern = learned
@@ -1437,7 +1383,7 @@ describe("PatternAware", () => {
 			.find((item) => item.targetTool === "read" && item.context.length === 1 && item.context[0]?.tool === "grep");
 		expect(pattern).toBeDefined();
 
-		const imported = new PatternAwareStore(settings());
+		const imported = patternStore();
 		expect(imported.registerValidatedPattern(pattern!)).toBe(true);
 		expect(
 			imported.registerValidatedPattern({
@@ -1448,7 +1394,7 @@ describe("PatternAware", () => {
 				empiricalProbability: 0.1,
 			}),
 		).toBe(true);
-		imported.observe(input({ sessionID: "probe", tool: "grep", input: {}, outputPaths: ["src/c.ts"] }));
+		imported.observe(input("probe", "grep", {}, { outputPaths: ["src/c.ts"] }));
 		expect(imported.predict("probe").some((item) => item.tool === "read" && item.type === "tool_call")).toBe(true);
 	});
 });
@@ -1458,26 +1404,23 @@ function observeBatchTransition(
 	sessionID: string,
 	targets: ReadonlyArray<{ readonly tool: string; readonly input: Record<string, unknown> }>,
 ) {
-	store.observeBatch([input({ sessionID, turnID: `${sessionID}:context`, tool: "inspect", input: { scope: "src" } })]);
-	store.observeBatch(targets.map((target) => input({ sessionID, turnID: `${sessionID}:targets`, ...target })));
+	store.observeBatch([input(sessionID, "inspect", { scope: "src" }, { turnID: `${sessionID}:context`, })]);
+	store.observeBatch(targets.map((target) => input(sessionID, target.tool, target.input, { turnID: `${sessionID}:targets`, ...target })));
 	store.finishSession(sessionID);
 }
 
 function scanBatch(sessionID: string, filePath: string) {
 	const turnID = `${sessionID}:scan`;
 	return [
-		input({ sessionID, turnID, tool: "grep", input: { pattern: "TODO" }, outputPaths: [filePath] }),
-		input({ sessionID, turnID, tool: "find", input: { pattern: "src/**/*.ts" }, output: { count: 1 } }),
+		input(sessionID, "grep", { pattern: "TODO" }, { turnID, outputPaths: [filePath] }),
+		input(sessionID, "find", { pattern: "src/**/*.ts" }, { turnID, output: { count: 1 } }),
 	];
 }
 
 function trainGrepRead(store: PatternAwareStore, sessionID: string, filePath: string, schemaHash?: string) {
-	store.observe(input({ sessionID, tool: "grep", input: { pattern: "TODO" }, outputPaths: [filePath] }));
+	store.observe(input(sessionID, "grep", { pattern: "TODO" }, { outputPaths: [filePath] }));
 	store.observe(
-		input({
-			sessionID,
-			tool: "read",
-			input: { filePath },
+		input(sessionID, "read", { filePath }, {
 			output: { content: `contents of ${filePath}` },
 			...(schemaHash ? { schemaHash } : {}),
 		}),
@@ -1490,31 +1433,25 @@ function trainOutputRead(
 	output: Record<string, unknown>,
 	filePath: string,
 ) {
-	store.observe(input({ sessionID, tool: "grep", input: { pattern: "TODO" }, output }));
-	store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+	store.observe(input(sessionID, "grep", { pattern: "TODO" }, { output }));
+	store.observe(input(sessionID, "read", { filePath }));
 }
 
 function trainJoinedRead(store: PatternAwareStore, sessionID: string, root: string, name: string) {
-	store.observe(input({ sessionID, tool: "inspect", input: {}, output: { root, name } }));
-	store.observe(input({ sessionID, tool: "read", input: { filePath: `${root}/${name}` } }));
+	store.observe(input(sessionID, "inspect", {}, { output: { root, name } }));
+	store.observe(input(sessionID, "read", { filePath: `${root}/${name}` }));
 }
 
 function trainFrontier(store: PatternAwareStore, sessionID: string, sourcePath: string, testPath: string, turnBoundaries = false) {
 	const events = [
-		input({ sessionID, tool: "grep", input: {}, outputPaths: [sourcePath] }),
-		input({
-			sessionID,
-			tool: "read",
-			input: { filePath: sourcePath },
+		input(sessionID, "grep", {}, { outputPaths: [sourcePath] }),
+		input(sessionID, "read", { filePath: sourcePath }, {
 			output: { nextPath: testPath },
 		}),
-		input({
-			sessionID,
-			tool: "lsp",
-			input: { operation: "diagnostics", filePath: testPath },
+		input(sessionID, "lsp", { operation: "diagnostics", filePath: testPath }, {
 			output: { command: `bun test ${testPath}` },
 		}),
-		input({ sessionID, tool: "bash", input: { command: `bun test ${testPath}` } }),
+		input(sessionID, "bash", { command: `bun test ${testPath}` }),
 	];
 	for (const [index, event] of events.entries()) {
 		if (turnBoundaries) {
@@ -1532,14 +1469,19 @@ function trainResultReads(
 	reads: ReadonlyArray<string>,
 ) {
 	store.observe(
-		input({
-			sessionID,
-			tool: "grep",
-			input: { pattern: "symbol" },
+		input(sessionID, "grep", { pattern: "symbol" }, {
 			output: { results: results.map((filePath) => ({ path: filePath })) },
 		}),
 	);
-	for (const filePath of reads) store.observe(input({ sessionID, tool: "read", input: { filePath } }));
+	for (const filePath of reads) store.observe(input(sessionID, "read", { filePath }));
+}
+
+function patternStore(
+	overrides: Parameters<typeof settings>[0] = {},
+	file?: string,
+	semantics?: ConstructorParameters<typeof PatternAwareStore>[2],
+) {
+	return new PatternAwareStore(settings(overrides), file, semantics);
 }
 
 function settings(overrides: Partial<typeof PATTERN_AWARE_DEFAULTS> = {}) {
@@ -1637,19 +1579,24 @@ function patternFeedback(
 }
 
 function input(
-	overrides: Partial<Parameters<PatternAwareStore["observe"]>[0]> &
-		Pick<Parameters<PatternAwareStore["observe"]>[0], "sessionID" | "tool" | "input">,
+	sessionID: string,
+	tool: string,
+	concrete: Record<string, unknown> = {},
+	overrides: Partial<Parameters<PatternAwareStore["observe"]>[0]> = {},
 ) {
 	return {
-		turnID: `${overrides.sessionID}:turn`,
+		sessionID,
+		tool,
+		input: concrete,
+		turnID: `${sessionID}:turn`,
 		outcome: "success" as const,
 		durationMs: 10,
 		...overrides,
 	};
 }
 
-function event(overrides: Parameters<typeof input>[0]) {
-	return { ...input(overrides), sequence: 1 };
+function event(...args: Parameters<typeof input>) {
+	return { ...input(...args), sequence: 1 };
 }
 
 function recurrentAction(key: string, sequence: number) {

@@ -43,31 +43,28 @@ afterEach(async () => {
 describe("zero-modification Pi extension", () => {
 	it("registers stock overrides, previews the stream without claiming it, then adopts once", async () => {
 		const fixture = await createFixture({ reuse: { result: textResult("cached"), isError: false } });
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 		expect([...fixture.tools.keys()].sort()).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 		const read = fixture.tools.get("read")!;
 		expect(read).toMatchObject({ name: "read", label: "read" });
-		await fixture.emit("context", { messages: [] }, fixture.context);
+		await fixture.emit("context", { messages: [] });
 		const partial = {
 			content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }],
 		};
 		await fixture.emit(
 			"message_update",
 			{ assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } },
-			fixture.context,
 		);
 		expect(fixture.host.previewActorTool).toHaveBeenCalledWith({ turnID: "turn_1", tool: "read" }, undefined);
 		await fixture.emit(
 			"message_update",
 			{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: '{"path":', partial } },
-			fixture.context,
 		);
 		expect(fixture.host.previewActorTool).toHaveBeenCalledOnce();
 		expect(fixture.host.previewActorCall).not.toHaveBeenCalled();
 		await fixture.emit(
 			"message_update",
 			{ assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: '"notes.txt"}', partial } },
-			fixture.context,
 		);
 		await vi.waitFor(() => expect(fixture.host.previewActorCall).toHaveBeenCalledOnce());
 		await fixture.emit(
@@ -80,7 +77,6 @@ describe("zero-modification Pi extension", () => {
 					partial,
 				},
 			},
-			fixture.context,
 		);
 		expect(fixture.host.previewActorCall).toHaveBeenCalledWith(
 			{
@@ -102,11 +98,11 @@ describe("zero-modification Pi extension", () => {
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
 		const fixture = await createFixture({ overriddenTools: ["read"] });
 		const customRead = fixture.customTools.get("read") as ToolDefinition | undefined;
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 
 		expect(fixture.tools.has("read")).toBe(false);
 		expect(fixture.actorTools.get("read")).toBe(customRead);
-		await fixture.emit("context", { messages: [] }, fixture.context);
+		await fixture.emit("context", { messages: [] });
 		const turn = vi.mocked(fixture.host.startTurn).mock.calls[0]?.[0];
 		expect(turn?.tools.map((tool) => tool.name)).not.toContain("read");
 
@@ -134,13 +130,13 @@ describe("zero-modification Pi extension", () => {
 		if (mode === "cache") vi.mocked(fixture.host.runtime.prepareActorCall).mockRejectedValue(new Error("cache failed"));
 		else fixture.settle.mockRejectedValue(new Error("telemetry failed"));
 		vi.mocked(fixture.host.finishTurn).mockRejectedValue(new Error("cleanup failed"));
-		await fixture.emit("session_start", {}, fixture.context);
-		await fixture.emit("context", { messages: [] }, fixture.context);
+		await fixture.emit("session_start");
+		await fixture.emit("context", { messages: [] });
 
 		const result = await fixture.tools
 			.get("read")
 			?.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
-		await expect(fixture.emit("turn_end", {}, fixture.context)).resolves.toBeUndefined();
+		await expect(fixture.emit("turn_end")).resolves.toBeUndefined();
 
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledWith(expect.objectContaining({
@@ -158,7 +154,7 @@ describe("zero-modification Pi extension", () => {
 		const definitions = vi.spyOn(piTools, "createPiToolDefinitions").mockReturnValue(fixture.baseTools);
 		const command = (input: string) => fixture.commands.get("speculative-action")!.handler(input, fixture.context as ExtensionCommandContext);
 		try {
-			await fixture.emit("session_start", {}, fixture.context);
+			await fixture.emit("session_start");
 			for (const tool of ["grep", "find"]) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
 			expect(prepare).not.toHaveBeenCalled();
 			await command("on");
@@ -191,7 +187,7 @@ describe("zero-modification Pi extension", () => {
 			expect(dispose).toHaveBeenCalledTimes(2);
 			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
 		} finally {
-			await fixture.emit("session_shutdown", {}, fixture.context);
+			await fixture.emit("session_shutdown");
 			prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs();
 		}
 	});
@@ -202,7 +198,7 @@ describe("zero-modification Pi extension", () => {
 			speculation: { capabilities: [] },
 		} as unknown as SpeculativeAgentExecutionWorld;
 		const fixture = await createFixture({ executionWorlds: [primary] });
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 
 		const worlds = fixture.executionWorlds();
 		expect(worlds.map((world) => world.id)).toEqual(["primary_runtime", "linux_process_reuse", "git_worktree", "resource_version"]);
@@ -231,7 +227,7 @@ describe("zero-modification Pi extension", () => {
 			"Tools & execution": ["Execution routes", "Back"],
 			"Execution routes": ["[x] Unified execution environment", "[x] Local safe fallback", "Back"],
 		});
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(menus.get("Execution routes")).toEqual(expect.arrayContaining([
@@ -267,7 +263,7 @@ describe("zero-modification Pi extension", () => {
 			"Actor probe": ["Back"],
 			"Save settings to": ["This project"],
 		});
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 		const command = fixture.commands.get("speculative-action");
 		await command?.handler("", fixture.context as ExtensionCommandContext);
 
@@ -318,7 +314,7 @@ describe("zero-modification Pi extension", () => {
 					"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Status", "Close"],
 					"Tools & execution": ["Execution routes", "Back"],
 				});
-				await fixture.emit("session_start", {}, fixture.context);
+				await fixture.emit("session_start");
 				const applying = Promise.resolve(
 					fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext),
 				);
@@ -378,7 +374,7 @@ describe("zero-modification Pi extension", () => {
 		let clearConfirmations = 0;
 		fixture.ui.confirm = async (title) => title === "Clear reusable command history?" && ++clearConfirmations === 2;
 
-		await fixture.emit("session_start", {}, fixture.context);
+		await fixture.emit("session_start");
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
@@ -521,8 +517,8 @@ async function createFixture(options: FixtureOptions = {}) {
 		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds }),
 	});
 	await factory(pi);
-	const emit = async (event: string, payload: object, eventContext: ExtensionContext) => {
-		for (const handler of handlers.get(event) ?? []) await handler(payload as never, eventContext);
+	const emit = async (event: string, payload: object = {}) => {
+		for (const handler of handlers.get(event) ?? []) await handler(payload as never, context);
 	};
 	return {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle,
