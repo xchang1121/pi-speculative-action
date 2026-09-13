@@ -1716,6 +1716,55 @@ describe("structural speculative runtime", () => {
 		} finally { await fixture.runtime.dispose(); }
 	});
 
+	it.each(["binding", "preflight"] as const)("retires a peer's pending %s when its parent disappears", async (phase) => {
+		const preparing = barrier(), resume = barrier(), retired = barrier();
+		const materialized: string[] = [], preflighted: string[] = [];
+		let preparationSignal: AbortSignal | undefined;
+		const fixture = harness({
+			source: planSource({
+				propose: () => plan("root", { path: "parent.ts" }), continuationBatch: () => ["next"],
+				observe: () => ({ proposalID: "root", source: "source", revision: 1, remove: ["next"] }),
+			}),
+			peers: [{ id: "peer", enabled: () => true, propose: () => undefined,
+				continueFrom: ({ batch }) => ({ id: "child", source: "peer", revision: 0,
+					actions: [readAction("next", { path: "child.ts" }, { dependsOn: batch.map(({ identity }) => ({
+						proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id,
+						condition: "execution_succeeded",
+					})) })] }),
+				onSettled: ({ settlement }) => {
+					expect(settlement).toMatchObject({ observation: "unobserved", cause: { code: "dependency_impossible" } });
+					retired.arrive();
+				},
+			}],
+			actionKey: async (tool, args, context) => {
+				if (phase === "binding" && context.type === "start" && (args as { path: string }).path === "child.ts") {
+					preparing.arrive(); await resume.promise;
+				}
+				return buildPiActionKey(tool, args, "/workspace");
+			},
+			preflight: async (signal, candidate) => {
+				const candidatePath = (candidate.input as { path: string }).path;
+				preflighted.push(candidatePath);
+				if (phase === "preflight" && candidatePath === "child.ts") {
+					preparationSignal = signal; preparing.arrive(); await resume.promise;
+				}
+				return { ok: true };
+			},
+			onCandidateMaterialized: (candidate) => { materialized.push(String(candidate.input.path)); },
+		});
+		try {
+			await fixture.runtime.startTurn(start("parent")); await preparing.promise;
+			expect((await fixture.runtime.prepareActorCall(call("parent", { path: "parent.ts" })))?.output).toBe("speculative");
+			await retired.promise;
+			if (phase === "preflight") expect(preparationSignal?.aborted).toBe(true);
+			resume.arrive(); await nextTurn();
+			expect(materialized).toEqual(phase === "binding" ? ["parent.ts"] : ["parent.ts", "child.ts"]);
+			expect(preflighted).toEqual(materialized);
+		} finally { resume.arrive(); await fixture.runtime.dispose(); }
+		expect(fixture.executions()).toBe(1);
+		expect(fixture.runtime.inspect()).toMatchObject({ pendingPredictions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
+	});
+
 	it.each(["complete", "arrived", "closed", "failed", "disabled"] as const)("shares only a complete root batch with a peer: %s", async (mode) => {
 		const first = barrier(), secondReady = candidateSucceeded(1, "second.ts"), parentsReady = barrier(2);
 		const peerStarted = barrier(), peerGate = barrier(), childReady = candidateSucceeded(1, "child.ts");
