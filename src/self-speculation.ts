@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_BENEFIT_GATE_POLICY,
@@ -653,7 +654,7 @@ export class SelfSpeculationCoordinator {
 			this.observeVerificationEvidence(state, outcome);
 		} catch (error) {
 			this.failureCount++;
-			this.lastFailure = error instanceof Error ? error.message : String(error);
+			this.lastFailure = errorMessage(error);
 		}
 	}
 
@@ -881,7 +882,7 @@ export class SelfSpeculationCoordinator {
 		} catch (error) {
 			if (!externalSignal?.aborted) {
 				this.failureCount++;
-				this.lastFailure = error instanceof Error ? error.message : String(error);
+				this.lastFailure = errorMessage(error);
 			}
 			throw error;
 		} finally {

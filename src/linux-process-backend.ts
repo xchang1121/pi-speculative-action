@@ -90,7 +90,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
@@ -1340,10 +1340,6 @@ function bufferedProcessPrototype(
 		})),
 		platformFingerprint,
 	});
-}
-
-function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
-	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);
 }
 
 function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
