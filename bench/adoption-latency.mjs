@@ -197,7 +197,9 @@ int main(void) {
     const draftArgs = child ? { command: ': speculative-parent; worker' } : args;
     const baselineState = await state(root);
     let profile;
+    const profileBegin = performance.now();
     if (['find', 'grep'].includes(name) && !nativeSearch) profile = await createClosedSearchProfile(cwd);
+    const profilePreparationMs = profile ? performance.now() - profileBegin : 0;
     const environment = backend === 'linux-process' ? Object.freeze({ PATH: `${cwd}:/usr/bin:/bin`, HOME: os.homedir(), SHELL: '/bin/bash', LANG: 'C.UTF-8' }) : {};
     const bound = profile?.invocations.get(name) ?? resolvePiToolInvocation(name, args, { cwd, environment, ...(backend === 'linux-process' ? { shellPath: '/bin/bash' } : {}) });
     const bind = value => child ? resolvePiToolInvocation(name, value, { cwd, environment, shellPath: '/bin/bash' }) : bound;
@@ -208,7 +210,7 @@ int main(void) {
     const originalTool = { ...definition, execute: (id, value, signal, onUpdate) => definition.execute(id, value, signal, onUpdate,
       name === 'bash' ? undefined : { model: { input: ['text'] } }) };
     const native = bound?.authoritative ? async () => (await bound.authoritative({ args, callID: 'oracle', signal: new AbortController().signal })).result : () => originalTool.execute('oracle', args);
-    const row = { tool: selected, backend, mode, profiled, concurrency, trials: [],
+    const row = { tool: selected, backend, mode, profiled, concurrency, profilePreparationMs, trials: [],
       ...(backend === 'thinkthread' && ['write', 'edit'].includes(name) ? { limitation: 'Latency and ordinary content/mode comparison only. ThinkThread snapshot writes have known native permission/file-identity differences; these trials do not qualify general write semantics.' } : {}) };
     rows.push(row);
     const trials = row.trials;
@@ -230,60 +232,62 @@ int main(void) {
         };
         let producerCalls = 0, fallbackCalls = 0, readyAt, childReadyAt, terminalState, settlement, trace;
         const workspace = new WorkspaceSandboxService();
-        let baseWorld, tool = originalTool, processBackend, coordinator;
-        if (backend === 'thinkthread') baseWorld = thinkThreadApi.createThinkThreadExecutionWorld();
-        else if (backend === 'linux-process') {
-          const storeRoot = await fs.mkdtemp(path.join(owned, 'process-store-'));
-          processBackend = new processApi.LinuxProcessReuseBackend({ storeRoot,
-            ...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
-            ...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}) });
-          if (child) {
-            const complete = processBackend.handoffs.complete.bind(processBackend.handoffs);
-            processBackend.handoffs.complete = (...parameters) => {
-              const completed = complete(...parameters);
-              if (completed && parameters[2]) childReadyAt = performance.now();
-              return completed;
-            };
-          }
-          const originalExecutor = processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath: '/bin/bash' }));
-          const routeOptions = { sourceRoot: cwd, invocation: request => bind({ command: request.command })?.process };
-          const route = child ? await inTrace(producerTrace, () => processBackend.prepareActorReplay(originalExecutor, { ...routeOptions,
-            held: { realShell: '/bin/bash', executor: shellPath => processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath })),
-              scope: () => ({ sessionID: `adoption-${selected}-${index}`, turnID: 'turn' }) } }, true)) : undefined;
-          if (route) assert.equal(route.state, 'ready', route.detail);
-          coordinator = new processApi.ProcessExecutionCoordinator(route?.executor ?? processBackend.completedReplayExecutor(originalExecutor, routeOptions));
-          tool = processApi.createBashTool(cwd, { operations: coordinator.operations, shellPath: '/bin/bash', exposeSessionEnvironment: false,
-            spawnHook: context => ({ ...context, env: { ...environment } }) });
-          baseWorld = processApi.createLinuxProcessExecutionWorld({ workspaceSandbox: workspace, coordinator, tools: ['bash'],
-            backend: processBackend, storeRoot, driver: 'git' });
-          if (child && mode === 'running') {
-            const execute = processBackend.executeAndPublish.bind(processBackend);
-            processBackend.executeAndPublish = async (...parameters) => { entered.resolve(); await hold(parameters[0].signal); return execute(...parameters); };
-          }
-        } else baseWorld = ['write', 'edit'].includes(name) ? workspace.createExecutionWorld({ driver: 'git' })
-          : createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [name], maxBytes: () => 8 * 1024 * 1024 });
-        const eligible = !nativeSearch && !(backend === 'local' && name === 'bash') &&
-          (baseWorld.speculation.tools?.includes(name) ?? true);
-        const world = { ...baseWorld, speculation: { ...baseWorld.speculation, execute: async context => {
-          producerCalls++; if (!child) entered.resolve();
-          if (mode === 'running' && !child) await hold(context.signal);
-          return baseWorld.speculation.execute(context);
-        } } };
-        const host = createSpeculativeActionHost(`adoption-${selected}-${index}`, { cwd, executionWorlds: [world],
-          getSettings: () => ({ enabled: true, drafterEnabled: true, drafterGateEnabled: false, drafterMaxDepth: 0,
-            candidateLimit: 1, maxConcurrentActions: concurrency, tools: [name], resourceCacheMaxBytes: 16 * 1024 * 1024,
-            patternAware: { enabled: false } }), resolveInvocation: (_tool, value) => bind(value), preflight: () => true,
-          complete: async () => ({ role: 'assistant', api: model.api, provider: model.provider, model: model.id, timestamp: 0,
-            content: [{ type: 'toolCall', id: 'fixture-call', name, arguments: draftArgs }], stopReason: 'toolUse', usage }),
-          onActorActionSettled: ({ settlement: value }) => { settlement = value; },
-          onEvent: event => {
-            if (event.type === 'candidate' && ['succeeded', 'failed', 'cancelled'].includes(event.state.status)) {
-              terminalState = event.state; readyAt = performance.now(); terminal.resolve();
-            }
-            if (event.type === 'prediction' && event.settlement.observation === 'unobserved') { terminalState = event.settlement; terminal.resolve(); }
-          } });
-        const turnID = 'turn', tools = [tool];
+        let baseWorld, tool = originalTool, processBackend, coordinator, host;
+        const trial = { index, nativeMs };
+        trials.push(trial);
         try {
+          if (backend === 'thinkthread') baseWorld = thinkThreadApi.createThinkThreadExecutionWorld();
+          else if (backend === 'linux-process') {
+            const storeRoot = await fs.mkdtemp(path.join(owned, 'process-store-'));
+            processBackend = new processApi.LinuxProcessReuseBackend({ storeRoot,
+              ...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
+              ...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}) });
+            if (child) {
+              const complete = processBackend.handoffs.complete.bind(processBackend.handoffs);
+              processBackend.handoffs.complete = (...parameters) => {
+                const completed = complete(...parameters);
+                if (completed && parameters[2]) childReadyAt = performance.now();
+                return completed;
+              };
+            }
+            const originalExecutor = processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath: '/bin/bash' }));
+            const routeOptions = { sourceRoot: cwd, invocation: request => bind({ command: request.command })?.process };
+            const route = child ? await inTrace(producerTrace, () => processBackend.prepareActorReplay(originalExecutor, { ...routeOptions,
+              held: { realShell: '/bin/bash', executor: shellPath => processApi.adaptProcessToolOperations(processApi.createLocalBashOperations({ shellPath })),
+                scope: () => ({ sessionID: `adoption-${selected}-${index}`, turnID: 'turn' }) } }, true)) : undefined;
+            if (route) assert.equal(route.state, 'ready', route.detail);
+            coordinator = new processApi.ProcessExecutionCoordinator(route?.executor ?? processBackend.completedReplayExecutor(originalExecutor, routeOptions));
+            tool = processApi.createBashTool(cwd, { operations: coordinator.operations, shellPath: '/bin/bash', exposeSessionEnvironment: false,
+              spawnHook: context => ({ ...context, env: { ...environment } }) });
+            baseWorld = processApi.createLinuxProcessExecutionWorld({ workspaceSandbox: workspace, coordinator, tools: ['bash'],
+              backend: processBackend, storeRoot, driver: 'git' });
+            if (child && mode === 'running') {
+              const execute = processBackend.executeAndPublish.bind(processBackend);
+              processBackend.executeAndPublish = async (...parameters) => { entered.resolve(); await hold(parameters[0].signal); return execute(...parameters); };
+            }
+          } else baseWorld = ['write', 'edit'].includes(name) ? workspace.createExecutionWorld({ driver: 'git' })
+            : createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [name], maxBytes: () => 8 * 1024 * 1024 });
+          const eligible = !nativeSearch && !(backend === 'local' && name === 'bash') &&
+            (baseWorld.speculation.tools?.includes(name) ?? true);
+          const world = { ...baseWorld, speculation: { ...baseWorld.speculation, execute: async context => {
+            producerCalls++; if (!child) entered.resolve();
+            if (mode === 'running' && !child) await hold(context.signal);
+            return baseWorld.speculation.execute(context);
+          } } };
+          host = createSpeculativeActionHost(`adoption-${selected}-${index}`, { cwd, executionWorlds: [world],
+            getSettings: () => ({ enabled: true, drafterEnabled: true, drafterGateEnabled: false, drafterMaxDepth: 0,
+              candidateLimit: 1, maxConcurrentActions: concurrency, tools: [name], resourceCacheMaxBytes: 16 * 1024 * 1024,
+              patternAware: { enabled: false } }), resolveInvocation: (_tool, value) => bind(value), preflight: () => true,
+            complete: async () => ({ role: 'assistant', api: model.api, provider: model.provider, model: model.id, timestamp: 0,
+              content: [{ type: 'toolCall', id: 'fixture-call', name, arguments: draftArgs }], stopReason: 'toolUse', usage }),
+            onActorActionSettled: ({ settlement: value }) => { settlement = value; },
+            onEvent: event => {
+              if (event.type === 'candidate' && ['succeeded', 'failed', 'cancelled'].includes(event.state.status)) {
+                terminalState = event.state; readyAt = performance.now(); terminal.resolve();
+              }
+              if (event.type === 'prediction' && event.settlement.observation === 'unobserved') { terminalState = event.settlement; terminal.resolve(); }
+            } });
+          const turnID = 'turn', tools = [tool];
           await inTrace(producerTrace, () => host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools,
             context: { systemPrompt: 'Isolated adoption fixture; no model API.', messages: [], tools } }));
           if (eligible) await deadline(mode === 'ready' ? terminal.promise : Promise.race([entered.promise, terminal.promise]));
@@ -298,26 +302,41 @@ int main(void) {
           const result = await deadline(inTrace(trace, run)).finally(() => { currentActorTrace = undefined; });
           const returnedAt = performance.now(), adoptionMs = returnedAt - trace.begin, resultReadyAt = child ? childReadyAt : readyAt;
           await host.finishTurn(turnID);
+          const settlementMs = performance.now() - returnedAt;
           assert.deepEqual(wire(result), wire(expected), 'Actor output differs from the native oracle');
           assert.deepEqual(await state(root), expectedState, 'Actor file effects differ from the native oracle');
           assert.ok(settlement, 'Missing authoritative settlement');
           assert.equal(fallbackCalls, settlement.provider.kind === 'actor' ? 1 : 0, 'Duplicate authoritative execution');
           assert.equal(producerCalls, eligible ? 1 : 0, 'Unexpected producer execution count');
-          trials.push({ index, nativeMs, preparationMs, adoptionMs, producerCalls, fallbackCalls,
+          Object.assign(trial, { preparationMs, adoptionMs, settlementMs,
             outcome: settlement.provider.kind, readyAtArrival: resultReadyAt !== undefined && resultReadyAt <= trace.begin,
             ...(resultReadyAt === undefined ? {} : { remainingProducerMs: Math.max(0, resultReadyAt - trace.begin), readyToReturnMs: returnedAt - Math.max(resultReadyAt, trace.begin) }),
-            provider: settlement.provider, rejections: settlement.rejections,
-            terminal: terminalState?.status ?? terminalState?.cause?.code,
-            ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}),
-            ...(profiled ? { spans: trace.spans, producerSpans: producerTrace.spans } : {}) });
+            provider: settlement.provider, rejections: settlement.rejections });
         } catch (error) {
-          trials.push({ index, producerCalls, fallbackCalls, terminal: terminalState, error: { name: error.name, message: error.message },
-            ...(trace ? { spans: trace.spans } : {}), ...(profiled ? { producerSpans: producerTrace.spans } : {}),
-            ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}) });
+          trial.error = { name: error.name, message: error.message };
           throw error;
-        } finally { released.resolve(); try { await host.dispose(); } finally { await coordinator?.dispose(); await workspace.dispose(); currentProducerTrace = undefined; } }
+        } finally {
+          const cleanupBegin = performance.now();
+          released.resolve();
+          const cleanupErrors = [];
+          for (const owner of [host ?? baseWorld, coordinator, processBackend, workspace]) {
+            try { await owner?.dispose?.(); } catch (error) { cleanupErrors.push(String(error)); }
+          }
+          currentProducerTrace = undefined;
+          Object.assign(trial, { cleanupMs: performance.now() - cleanupBegin, producerCalls, fallbackCalls,
+            terminal: terminalState?.status ?? terminalState?.cause?.code,
+            ...(trial.error ? { terminalState } : {}),
+            ...(processBackend ? { processMetrics: processBackend.metrics(), actorProcessMetrics: processBackend.actorMetrics() } : {}),
+            ...(profiled ? { spans: trace?.spans ?? [], producerSpans: producerTrace.spans } : {}) });
+          if (cleanupErrors.length) { trial.cleanupErrors = cleanupErrors; throw new AggregateError(cleanupErrors, 'Benchmark cleanup failed'); }
+        }
+        trial.lifecycleMs = trial.preparationMs + trial.adoptionMs + trial.settlementMs + trial.cleanupMs;
       }
-    } finally { await profile?.pool.dispose(); }
+    } finally {
+      const profileCleanupBegin = performance.now();
+      try { await profile?.pool.dispose(); }
+      finally { row.profileCleanupMs = profile ? performance.now() - profileCleanupBegin : 0; }
+    }
     const hit = trial => child ? trial.actorProcessMetrics.hits > 0 : trial.outcome !== 'actor';
     const hitTimes = trials.filter(hit).map(trial => trial.adoptionMs), fallbackTimes = trials.filter(trial => !hit(trial)).map(trial => trial.adoptionMs);
     Object.assign(row, {
@@ -328,7 +347,7 @@ int main(void) {
   }
 } finally {
   await fs.writeFile(reportPath, JSON.stringify({ platform: process.platform, node: process.version, backend, runtimeIdentity, mode, profiled, apiRequests: 0,
-    scope: 'Full Host.execute entry to resolved Actor result. Producer preparation is separate. A deterministic proposal isolates adoption; this is not natural model/E2E evidence. Running mode releases the controlled producer after Actor joins, and reports remaining execution separately. Native search fallback is reported explicitly.', rows }, null, 2) + '\n', { flag: 'wx' });
+    scope: 'Full Host.execute entry to resolved Actor result, plus separate producer preparation, turn settlement and cleanup. lifecycleMs sums those measured intervals, excluding oracle checks and fixture construction; shared search-profile preparation is reported once per tool. A deterministic proposal isolates adoption; this is not natural model/E2E evidence. Running mode releases the controlled producer after Actor joins, and reports remaining execution separately. Native search fallback is reported explicitly.', rows }, null, 2) + '\n', { flag: 'wx' });
   hooks?.deregister(); baselineHooks?.deregister(); delete globalThis.__adoptionTrace;
   assert.equal(path.dirname(owned), fixtureParent); assert.ok(path.basename(owned).startsWith('pi-adoption-audit-'));
   await fs.rm(owned, { recursive: true, force: true });
