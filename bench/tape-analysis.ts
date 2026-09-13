@@ -31,12 +31,6 @@ interface TapeToolCall {
 	readonly arguments: unknown;
 }
 
-export type TapeAnalysis = ReturnType<typeof analyzeTape>;
-export type TapeForkGateAnalysis = ReturnType<typeof analyzeTapeForkGate>;
-export type TapeReprobeAnalysis = ReturnType<typeof analyzeTapeReprobe>;
-export type TapeDrafterWidthAnalysis = ReturnType<typeof analyzeTapeDrafterWidth>;
-export type TapeDrafterRaceAnalysis = ReturnType<typeof analyzeTapeDrafterRace>;
-
 interface ParsedExchange {
 	readonly sequence: number;
 	readonly model: string;
@@ -49,12 +43,11 @@ interface ParsedExchange {
 
 export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string) {
 	const { completed, actors, draftersByContext } = pairTape(tape, actorModel, drafterModel);
-	const opportunities = actors
-		.flatMap((actor) =>
-			actor.calls.map((actorAction) =>
-				opportunity(actor, actorAction, draftersByContext.get(actor.contextKey) ?? []),
-			),
-		);
+	const opportunities = actors.flatMap((actor) => {
+		const drafters = draftersByContext.get(actor.contextKey) ?? [];
+		const candidates = candidateReadiness(drafters);
+		return actor.calls.map((actorAction) => opportunity(actor, actorAction, drafters, candidates));
+	});
 	const exactHits = opportunities.filter((value) => value.exactHit).length;
 	const earlyHits = opportunities.filter((value) => value.exactReadyBeforeActor).length;
 	const candidateCount = sum(opportunities, (value) => value.candidateCount);
@@ -320,12 +313,8 @@ function summarizeCandidates(turns: readonly DrafterTurn[]) {
 		candidateCount: 0, uniqueCandidateCount: 0,
 	};
 	for (const { actor, drafters } of turns) {
-		const ready = new Map<string, number>();
-		for (const drafter of drafters) for (const call of drafter.calls) {
-			const identity = actionIdentity(call);
-			ready.set(identity, Math.min(ready.get(identity) ?? Infinity, drafter.endedAtMs));
-			metrics.candidateCount++;
-		}
+		const { ready, count } = candidateReadiness(drafters);
+		metrics.candidateCount += count;
 		metrics.drafterRequests += drafters.length;
 		metrics.drafterServiceMs += sum(drafters, exchange => exchange.endedAtMs);
 		metrics.drafterCompletionSpanMs += Math.max(0, ...drafters.map(exchange => exchange.endedAtMs));
@@ -365,18 +354,25 @@ function pairTape(tape: LlmTape, actorModel: string, drafterModel: string) {
 	return { completed, actors, draftersByContext };
 }
 
+/** One earliest-completion index per Actor decision, shared across that decision's tool calls. */
+function candidateReadiness(drafters: readonly ParsedExchange[]) {
+	const ready = new Map<string, number>();
+	let count = 0;
+	for (const drafter of drafters) for (const call of drafter.calls) {
+		const identity = actionIdentity(call);
+		ready.set(identity, Math.min(ready.get(identity) ?? Infinity, drafter.endedAtMs));
+		count++;
+	}
+	return { ready, count };
+}
+
 function opportunity(
 	actor: ParsedExchange,
 	actorAction: TapeToolCall,
 	drafters: readonly ParsedExchange[],
+	candidates: ReturnType<typeof candidateReadiness>,
 ) {
-	const candidates = drafters.flatMap((exchange) => exchange.calls);
-	const unique = new Map(candidates.map((candidate) => [actionIdentity(candidate), candidate]));
-	const actorIdentity = actionIdentity(actorAction);
-	const exact = drafters.filter((exchange) =>
-		exchange.calls.some((candidate) => actionIdentity(candidate) === actorIdentity),
-	);
-	const earliestExactReadyMs = exact.length ? Math.min(...exact.map((exchange) => exchange.endedAtMs)) : undefined;
+	const earliestExactReadyMs = candidates.ready.get(actionIdentity(actorAction));
 	const exactLeadMs = earliestExactReadyMs === undefined ? 0 : Math.max(0, actor.endedAtMs - earliestExactReadyMs);
 	return {
 		actorSequence: actor.sequence,
@@ -384,10 +380,10 @@ function opportunity(
 		actorDecodeMs: actor.endedAtMs,
 		drafterSequences: drafters.map((exchange) => exchange.sequence) as readonly number[],
 		drafterRequestCount: drafters.length,
-		candidateCount: candidates.length,
-		uniqueCandidateCount: unique.size,
-		duplicateCandidateCount: candidates.length - unique.size,
-		exactHit: exact.length > 0,
+		candidateCount: candidates.count,
+		uniqueCandidateCount: candidates.ready.size,
+		duplicateCandidateCount: candidates.count - candidates.ready.size,
+		exactHit: earliestExactReadyMs !== undefined,
 		exactReadyBeforeActor: exactLeadMs > 0,
 		...(earliestExactReadyMs === undefined ? {} : { earliestExactReadyMs }),
 		exactLeadMs,
