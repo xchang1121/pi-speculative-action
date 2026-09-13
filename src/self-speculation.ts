@@ -344,31 +344,13 @@ export class SelfSpeculationCoordinator {
 		const source = candidate.source || "unknown";
 		if (existing) {
 			existing.sources.add(source);
-			if (!existing.provenance.some((item) => item.proposalID === candidate.proposalID && item.actionID === candidate.actionID)) {
+			if (!existing.provenance.some((item) => item.proposalID === candidate.proposalID && item.actionID === candidate.actionID))
 				existing.provenance.push({ proposalID: candidate.proposalID, actionID: candidate.actionID });
-			}
-			existing.depth = Math.min(existing.depth, metric(candidate.depth, 0));
-			existing.horizon = Math.min(existing.horizon, metric(candidate.horizon, 0));
-			existing.latestDecisionSequence = Math.max(
-				existing.latestDecisionSequence,
-				candidate.latestDecisionSequence,
-			);
-			existing.conditionalProbability = Math.max(
-				existing.conditionalProbability,
-				metric(candidate.conditionalProbability, 0),
-			);
-			existing.empiricalProbability = Math.max(
-				existing.empiricalProbability,
-				metric(candidate.empiricalProbability, 0),
-			);
-			existing.expectedLatencyBenefitMs = Math.max(
-				existing.expectedLatencyBenefitMs,
-				metric(candidate.expectedLatencyBenefitMs, 0),
-			);
-			existing.expectedDurationMs = Math.max(
-				existing.expectedDurationMs,
-				metric(candidate.expectedDurationMs, 0),
-			);
+			for (const field of ["depth", "horizon"] as const)
+				existing[field] = Math.min(existing[field], metric(candidate[field], 0));
+			for (const field of ["conditionalProbability", "empiricalProbability", "expectedLatencyBenefitMs", "expectedDurationMs"] as const)
+				existing[field] = Math.max(existing[field], metric(candidate[field], 0));
+			existing.latestDecisionSequence = Math.max(existing.latestDecisionSequence, candidate.latestDecisionSequence);
 			return existing;
 		} else {
 			const record: CandidateRecord = {
@@ -531,9 +513,13 @@ export class SelfSpeculationCoordinator {
 		}
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
-			const retained = this.pendingCandidates.get(state.decisionSequence) ?? new Map<string, CandidateRecord>();
-			mergeCandidateRecords(retained, state.candidates.values());
-			this.pendingCandidates.set(state.decisionSequence, retained);
+			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
+			this.pendingCandidates.set(state.decisionSequence, new Map([...state.candidates].map(([key, candidate]) => [key, {
+				...candidate,
+				input: structuredClone(candidate.input),
+				sources: new Set(candidate.sources),
+				provenance: candidate.provenance.map((item) => ({ ...item })),
+			}])));
 		}
 		if (!state?.requestID) return;
 		const pending = [state.flushTask, state.forkTask].filter(
@@ -999,39 +985,6 @@ function candidatePayload(candidate: CandidateRecord, calibration: CandidateCali
 			expected_duration_ms: candidate.expectedDurationMs,
 		},
 	};
-}
-
-function mergeCandidateRecords(target: Map<string, CandidateRecord>, records: Iterable<CandidateRecord>): void {
-	for (const record of records) {
-		const existing = target.get(record.key);
-		if (!existing) {
-			target.set(record.key, {
-				...record,
-				input: structuredClone(record.input),
-				sources: new Set(record.sources),
-				provenance: record.provenance.map((item) => ({ ...item })),
-			});
-			continue;
-		}
-		for (const source of record.sources) existing.sources.add(source);
-		for (const item of record.provenance) {
-			if (!existing.provenance.some((value) => value.proposalID === item.proposalID && value.actionID === item.actionID))
-				existing.provenance.push({ ...item });
-		}
-		existing.depth = Math.min(existing.depth, record.depth);
-		existing.horizon = Math.min(existing.horizon, record.horizon);
-		existing.latestDecisionSequence = Math.max(
-			existing.latestDecisionSequence,
-			record.latestDecisionSequence,
-		);
-		existing.conditionalProbability = Math.max(existing.conditionalProbability, record.conditionalProbability);
-		existing.empiricalProbability = Math.max(existing.empiricalProbability, record.empiricalProbability);
-		existing.expectedLatencyBenefitMs = Math.max(
-			existing.expectedLatencyBenefitMs,
-			record.expectedLatencyBenefitMs,
-		);
-		existing.expectedDurationMs = Math.max(existing.expectedDurationMs, record.expectedDurationMs);
-	}
 }
 
 function rankedCandidates(
