@@ -1789,7 +1789,7 @@ class PatternBindingAnalysis {
 			appendCollectionBindings(result, this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
 		}
 		if (targetIsPath && typeof target === "string") {
-			const sources = uniquePathSources(pathSources);
+			const sources = uniqueBy(pathSources, (item) => bindingStructureKey(item.binding));
 			const normalizedTarget = normalizePath(target);
 			const joinMatches = new Map<string, Map<string, boolean>>();
 			for (const left of sources) {
@@ -1854,11 +1854,12 @@ class PatternBindingAnalysis {
 
 	evaluateBindingUncached(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): unknown {
 		if (binding.type === "constant") return binding.value;
-		if (binding.type === "each") {
+		if (binding.type === "event" || binding.type === "each") {
 			const index = context.length + binding.relativeEvent;
 			const event = context[index];
 			if (!event) return MISSING;
 			const collection = getPath(event[binding.field], binding.path);
+			if (binding.type === "event") return collection;
 			if (!Array.isArray(collection)) return MISSING;
 			const values = collection.map((item) => getPath(item, binding.itemPath)).filter((value) => value !== MISSING);
 			return values.length ? multiValue(values) : MISSING;
@@ -1880,24 +1881,15 @@ class PatternBindingAnalysis {
 			}
 			return MISSING;
 		}
-		if (binding.type === "template") {
+		if (binding.type === "template" || binding.type === "transform") {
 			const source = this.evaluateBinding(binding.source, context);
 			const values = bindingValuesFromResult(source).flatMap((value) =>
-				typeof value === "string" ? [`${binding.prefix}${value}${binding.suffix}`] : [],
+				typeof value === "string" ? [binding.type === "template"
+					? `${binding.prefix}${value}${binding.suffix}` : transform(binding.operation, value)] : [],
 			);
 			return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
 		}
-		if (binding.type === "transform") {
-			const source = this.evaluateBinding(binding.source, context);
-			const values = bindingValuesFromResult(source).flatMap((value) =>
-				typeof value === "string" ? [transform(binding.operation, value)] : [],
-			);
-			return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
-		}
-		const index = context.length + binding.relativeEvent;
-		const event = context[index];
-		if (!event) return MISSING;
-		return getPath(event[binding.field], binding.path);
+		return MISSING;
 	}
 
 	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>) {
@@ -2105,10 +2097,10 @@ function isPathField(key: string) {
 	);
 }
 
-function uniquePathSources(values: ReadonlyArray<{ readonly binding: PatternAwareBinding; readonly value: string }>) {
+function uniqueBy<Value>(values: readonly Value[], keyFor: (value: Value) => string): Value[] {
 	const seen = new Set<string>();
 	return values.filter((item) => {
-		const key = stableStringify(bindingStructure(item.binding));
+		const key = keyFor(item);
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
@@ -2117,18 +2109,17 @@ function uniquePathSources(values: ReadonlyArray<{ readonly binding: PatternAwar
 
 const bindingStructureKeys = new WeakMap<object, string>();
 
+function bindingStructureKey(binding: PatternAwareBinding): string {
+	let key = bindingStructureKeys.get(binding);
+	if (key === undefined) {
+		key = stableStringify(bindingStructure(binding));
+		bindingStructureKeys.set(binding, key);
+	}
+	return key;
+}
+
 function uniqueBindings(bindings: ReadonlyArray<PatternAwareBinding>) {
-	const seen = new Set<string>();
-	return bindings.filter((binding) => {
-		let key = bindingStructureKeys.get(binding);
-		if (key === undefined) {
-			key = stableStringify(bindingStructure(binding));
-			bindingStructureKeys.set(binding, key);
-		}
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
+	return uniqueBy(bindings, bindingStructureKey);
 }
 
 function bindingMapStructure(bindings: Readonly<Record<string, PatternAwareBinding>>) {
@@ -2171,28 +2162,19 @@ function bindingStructure(value: unknown): unknown {
 
 function bindingDependencies(bindings: Readonly<Record<string, PatternAwareBinding>>): PatternAwareDependency[] {
 	return Object.entries(bindings).flatMap(([encoded, binding]) => {
-		const sources = uniqueDependencySources(bindingSources(binding));
+		const sources = uniqueBy(bindingSources(binding), stableStringify);
 		return sources.length ? [{ targetPath: decodePath(encoded), sources }] : [];
 	});
 }
 
 function bindingSources(binding: PatternAwareBinding): PatternAwareDependencySource[] {
-	if (binding.type === "event") {
+	if (binding.type === "event" || binding.type === "each") {
 		return [
 			{
 				relativeEvent: binding.relativeEvent,
 				field: binding.field,
 				path: binding.path,
-			},
-		];
-	}
-	if (binding.type === "each") {
-		return [
-			{
-				relativeEvent: binding.relativeEvent,
-				field: binding.field,
-				path: binding.path,
-				itemPath: binding.itemPath,
+				...(binding.type === "each" ? { itemPath: binding.itemPath } : {}),
 			},
 		];
 	}
@@ -2200,16 +2182,6 @@ function bindingSources(binding: PatternAwareBinding): PatternAwareDependencySou
 	if (binding.type === "coalesce") return binding.sources.flatMap(bindingSources);
 	if (binding.type === "join") return [...bindingSources(binding.left), ...bindingSources(binding.right)];
 	return bindingSources(binding.source);
-}
-
-function uniqueDependencySources(sources: ReadonlyArray<PatternAwareDependencySource>) {
-	const seen = new Set<string>();
-	return sources.filter((source) => {
-		const key = stableStringify(source);
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
 }
 
 function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: PatternAwarePath, value: string) {
@@ -2238,15 +2210,9 @@ function bindingValuesFromResult(value: unknown): ReadonlyArray<unknown> {
 }
 
 function multiValue(values: ReadonlyArray<unknown>): MultiValue {
-	const seen = new Set<string>();
 	return {
 		[MULTI]: true,
-		values: values.filter((value) => {
-			const key = stableStringify(value);
-			if (seen.has(key)) return false;
-			seen.add(key);
-			return true;
-		}),
+		values: uniqueBy(values, stableStringify),
 	};
 }
 
