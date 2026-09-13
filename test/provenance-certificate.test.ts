@@ -1,6 +1,6 @@
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
-import { processPrototype, SPECULATIVE_PRODUCER as PRODUCER } from "./process-fixture.ts";
+import { processPrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
@@ -13,7 +13,6 @@ import {
 	processStrongKey,
 	processWeakKey,
 	type ProvenanceTaint,
-	sealProcessCertificate,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
 import {
@@ -63,9 +62,7 @@ describe("process provenance certificates", () => {
 			"/workspace/missing.txt",
 		);
 		if (!absent) throw new Error("expected negative lookup evidence");
-		const certificate = sealProcessCertificate({
-			prototype: prototype(),
-			producer: PRODUCER,
+		const certificate = processCertificate(prototype(), {
 			dependencyCertificate: {
 				complete: true,
 				dependencies: [
@@ -104,13 +101,8 @@ describe("process provenance certificates", () => {
 		const directory = await captureDirectoryDependency(path.join(root, "tree"), "/workspace/tree");
 		const absent = await captureAbsenceDependency(path.join(root, "missing"), "/workspace/missing");
 		if (!absent) throw new Error("expected absence");
-		const base = {
-			prototype: prototype(),
-			producer: PRODUCER,
-			result: { replayProfile: "buffered_noninteractive" as const, journal: [], exit: { kind: "code" as const, code: 0 } },
-		};
-		const certificate = sealProcessCertificate({
-			...base,
+		const semantic = prototype();
+		const certificate = processCertificate(semantic, {
 			dependencyCertificate: { complete: true, dependencies: [directory, absent], taints: [] },
 		});
 		await writeFile(path.join(root, "tree", "new.txt"), "new");
@@ -123,8 +115,7 @@ describe("process provenance certificates", () => {
 			changed: expect.arrayContaining(["/workspace/tree", "/workspace/missing"]),
 		});
 
-		const tainted = sealProcessCertificate({
-			...base,
+		const tainted = processCertificate(semantic, {
 			dependencyCertificate: { complete: true, dependencies: [], taints: ["clock"] },
 		});
 		expect(await validateProcessCertificate(tainted)).toMatchObject({ status: "indeterminate", reason: "tainted:clock" });
@@ -180,10 +171,7 @@ describe("process provenance certificates", () => {
 		]) {
 			const malformed = Object.freeze({ ...first, ...patch }) as never;
 			expect(() => processWeakKey(malformed)).toThrow();
-			expect(() => sealProcessCertificate({ prototype: malformed, producer: PRODUCER,
-				dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-				result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
-			})).toThrow();
+			expect(() => processCertificate(malformed)).toThrow();
 		}
 	});
 
@@ -194,10 +182,9 @@ describe("process provenance certificates", () => {
 		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };
 		let semantic!: ReturnType<typeof prototype>;
-		const seal = (dependencies: DynamicDependency[]) => sealProcessCertificate({
-			prototype: semantic, producer: PRODUCER,
+		const seal = (dependencies: DynamicDependency[]) => processCertificate(semantic, {
 			dependencyCertificate: { complete: true, dependencies, taints: [] },
-			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } }, createdAt: 123,
+			createdAt: 123,
 		});
 		let first!: ReturnType<typeof seal>, frozenValues: unknown[] = [];
 		const freezing = vi.spyOn(Object, "freeze");
@@ -234,22 +221,12 @@ describe("process provenance certificates", () => {
 
 	it("keeps producer authority out of semantic keys but inside certificate identity", () => {
 		const semantic = prototype();
-		const result = { replayProfile: "buffered_noninteractive" as const, journal: [], exit: { kind: "code" as const, code: 0 } };
-		const dependencyCertificate = { complete: true, dependencies: [], taints: [] };
-		const speculative = sealProcessCertificate({
-			prototype: semantic,
-			producer: PRODUCER,
-			dependencyCertificate,
-			result,
-		});
-		const actor = sealProcessCertificate({
-			prototype: semantic,
+		const speculative = processCertificate(semantic);
+		const actor = processCertificate(semantic, {
 			producer: {
 				observer: { provider: "test", fingerprint: sha256Digest("observer-v2") },
 				execution: { authority: "actor" },
 			},
-			dependencyCertificate,
-			result,
 		});
 
 		expect(actor.weakKey).toBe(speculative.weakKey);
@@ -267,11 +244,8 @@ describe("process provenance certificates", () => {
 			".git",
 		]);
 		if (!absent) throw new Error("expected absence");
-		const certificate = sealProcessCertificate({
-			prototype: prototype(),
-			producer: PRODUCER,
+		const certificate = processCertificate(prototype(), {
 			dependencyCertificate: { complete: true, dependencies: [directory, absent], taints: [] },
-			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
 		});
 		await mkdir(path.join(root, ".git"));
 		const resolvePath = (logical: string) => path.join(root, path.posix.relative("/workspace", logical));
@@ -326,10 +300,7 @@ describe("process provenance certificates", () => {
 	});
 
 	it("seals typed effects and rejects malformed topology and conflicting artifact sizes", () => {
-		const seal = (journal: readonly OrderedEffectEvent[]) => sealProcessCertificate({
-			prototype: prototype(),
-			producer: PRODUCER,
-			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+		const seal = (journal: readonly OrderedEffectEvent[]) => processCertificate(prototype(), {
 			result: { replayProfile: "buffered_noninteractive", journal, exit: { kind: "code", code: 0 } },
 		});
 		const entriesDigest = sha256Digest("empty directory"), digest = sha256Digest("same digest");

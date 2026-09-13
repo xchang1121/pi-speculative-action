@@ -1,10 +1,9 @@
 import { deferred } from "./async.ts";
-import { processPrototype } from "./process-fixture.ts";
+import { processPrototype, processCertificate as sealFixture } from "./process-fixture.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import {
-	sealProcessCertificate,
 	sha256Digest as digest,
 	type ProcessProvenanceCertificate,
 	type Sha256Digest,
@@ -65,12 +64,16 @@ describe("ProcessHandoffRegistry", () => {
 		}
 	});
 
-	it.each(["clear", "trim", "dispose"] as const)("revokes a completed handoff during validation on %s", async (operation) => {
-		const fixture = await producer(true), entered = deferred(), release = deferred();
-		await fixture.publish();
+	it.each([
+		["clear", "completed"], ["trim", "completed"], ["dispose", "completed"], ["dispose", "history"],
+	] as const)("revokes %s during a pending %s lookup", async (operation, phase) => {
+		const completed = phase === "completed";
+		const fixture = await producer(completed), entered = deferred(), release = deferred();
+		if (completed) await fixture.publish();
 		const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[]) => {
-			if (!live) return undefined;
-			entered.resolve(); await release.promise; return livePlan(live);
+			if (completed && !live) return undefined;
+			entered.resolve(); await release.promise;
+			return completed ? livePlan(live) : { certificate: fixture.certificate };
 		});
 		const actor = acquireActor(fixture, lookup);
 		await entered.promise;
@@ -79,22 +82,12 @@ describe("ProcessHandoffRegistry", () => {
 		else fixture.registry.dispose();
 		release.resolve();
 		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
-		await expect(fixture.ownership.commit(async () => "whole")).resolves.toBe("whole");
-		expect(lookup.mock.calls.length).toBe(operation === "dispose" ? 1 : 2);
-	});
-
-	it("revokes pending and later history lookups on disposal", async () => {
-		const fixture = await producer(), entered = deferred(), release = deferred();
-		const lookup = vi.fn(async () => {
-			entered.resolve(); await release.promise; return { certificate: fixture.certificate };
-		});
-		const actor = acquireActor(fixture, lookup);
-		await entered.promise;
-		fixture.registry.dispose(); release.resolve();
-		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
-		await expect(acquireActor(fixture, lookup)).resolves.toEqual({ kind: "miss", joined: false });
-		expect(lookup).toHaveBeenCalledTimes(1);
-		await expect(fixture.work.completion).resolves.toBeUndefined();
+		if (completed) await expect(fixture.ownership.commit(async () => "whole")).resolves.toBe("whole");
+		else {
+			await expect(acquireActor(fixture, lookup)).resolves.toEqual({ kind: "miss", joined: false });
+			await expect(fixture.work.completion).resolves.toBeUndefined();
+		}
+		expect(lookup).toHaveBeenCalledTimes(operation === "dispose" ? 1 : 2);
 	});
 
 	it("arbitrates whole and child ownership across validation and commit, retaining repeatable results", async () => {
@@ -214,12 +207,11 @@ function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = li
 }
 
 function processCertificate(oneShot: boolean, code: number) {
-	return sealProcessCertificate({
-		prototype: processPrototype({
-			executablePath: "/usr/bin/tool",
-			environment: {},
-			processContextDigest: digest("context"),
-		}),
+	return sealFixture(processPrototype({
+		executablePath: "/usr/bin/tool",
+		environment: {},
+		processContextDigest: digest("context"),
+	}), {
 		producer: {
 			observer: { provider: "test", fingerprint: digest("observer") },
 			execution: { authority: "speculative", confinement: { provider: "test", fingerprint: digest("sandbox") } },

@@ -1,4 +1,4 @@
-import { createExecPrototype, sha256Digest, type ProcessPrototypeInput, type ProcessProducerProof } from "../src/provenance-certificate.ts";
+import { createExecPrototype, sealProcessCertificate, sha256Digest, type ExecPrototype, type ProcessPrototypeInput, type ProcessProducerProof } from "../src/provenance-certificate.ts";
 
 export const SPECULATIVE_PRODUCER: ProcessProducerProof = {
 	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
@@ -18,6 +18,19 @@ export function processPrototype(overrides: Partial<ProcessPrototypeInput> = {})
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [],
 		platformFingerprint: "linux",
+		...overrides,
+	});
+}
+
+export function processCertificate(
+	prototype: ExecPrototype,
+	overrides: Partial<Omit<Parameters<typeof sealProcessCertificate>[0], "prototype">> = {},
+) {
+	return sealProcessCertificate({
+		prototype,
+		producer: SPECULATIVE_PRODUCER,
+		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
+		result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } },
 		...overrides,
 	});
 }

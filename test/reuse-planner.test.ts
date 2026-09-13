@@ -1,11 +1,10 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
-import { processPrototype as basePrototype, SPECULATIVE_PRODUCER as PRODUCER } from "./process-fixture.ts";
+import { processPrototype as basePrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	processWeakKey,
-	sealProcessCertificate,
 	sha256Digest,
 	type ProcessProvenanceCertificate,
 } from "../src/provenance-certificate.ts";
@@ -48,11 +47,7 @@ describe("ProcessReusePlanner", () => {
 
 	it("misses the v6 weak namespace and rewarms v7 without accepting legacy certificate identities", async () => {
 		const root = await temporaryRoot(), store = new ProvenanceCertificateStore(root);
-		const certificate = sealProcessCertificate({
-			prototype: processPrototype(), producer: PRODUCER,
-			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
-			result: { replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 } }, createdAt: 123,
-		});
+		const certificate = processCertificate(processPrototype(), { createdAt: 123 });
 		// Golden v6 hashes from 48bd3b6, with the same prototype, producer, dependencies, result, and timestamp.
 		const legacy = { ...certificate, version: 6,
 			weakKey: "sha256:063acac52cc249aa186e4f796eb0cb8dc3d1656c13c185912724042764cc325c" as const,
@@ -115,8 +110,7 @@ describe("ProcessReusePlanner", () => {
 	it("validates a transferable running result without weakening persistent history", async () => {
 		const fixture = await fixtureWithCertificate();
 		const find = vi.spyOn(fixture.store, "findByWeakKey");
-		const live = sealProcessCertificate({
-			prototype: fixture.certificate.prototype,
+		const live = processCertificate(fixture.certificate.prototype, {
 			producer: fixture.certificate.producer,
 			dependencyCertificate: { ...fixture.certificate.dependencyCertificate, taints: ["clock"] },
 			result: fixture.certificate.result,
@@ -203,8 +197,8 @@ async function fixtureWithCertificate(
 		await writeFile(input, value);
 		const dependency = await captureFileDependency(input, "/workspace/input.txt");
 		const output = await store.artifacts.put(versions.length > 1 ? `result:${value}` : "stdout");
-		const certificate = sealProcessCertificate({
-			prototype, producer: PRODUCER, createdAt: index + 1,
+		const certificate = processCertificate(prototype, {
+			createdAt: index + 1,
 			dependencyCertificate: { complete: true, dependencies: [dependency.dependency], taints },
 			result: {
 				replayProfile: "buffered_noninteractive",

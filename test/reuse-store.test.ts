@@ -1,14 +1,13 @@
 import { deferred, nextTurn } from "./async.ts";
 import { unlink, utimes } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
-import { processPrototype } from "./process-fixture.ts";
+import { processPrototype, processCertificate } from "./process-fixture.ts";
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	digestObject,
 	parseProcessCertificate,
-	sealProcessCertificate,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
 import { ArtifactCAS, ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -142,10 +141,8 @@ describe("persistent provenance store", () => {
 		const root = await temporaryRoot();
 		const store = new ProvenanceCertificateStore(root);
 		const missing = { digest: sha256Digest("missing"), size: 7 };
-		const certificate = sealProcessCertificate({
-			prototype: processPrototype(),
+		const certificate = processCertificate(processPrototype(), {
 			producer: PRODUCER,
-			dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 			result: {
 				replayProfile: "buffered_noninteractive",
 				journal: [{
@@ -230,10 +227,8 @@ function completed(
 	mode = "test",
 	observedProcessMs?: number,
 ) {
-	return sealProcessCertificate({
-		prototype: processPrototype({ environment: { MODE: mode } }),
+	return processCertificate(processPrototype({ environment: { MODE: mode } }), {
 		producer: PRODUCER,
-		dependencyCertificate: { complete: true, dependencies: [], taints: [] },
 		result: {
 			replayProfile: "buffered_noninteractive",
 			...(observedProcessMs !== undefined ? { observedProcessMs } : {}),
