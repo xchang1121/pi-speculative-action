@@ -103,8 +103,8 @@ import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-v21";
-const POLICY_ID = "sandlock-virtual-root-transparent-exec-v13";
-const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v2";
+const POLICY_ID = "sandlock-virtual-root-transparent-exec-v14";
+const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v3";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */

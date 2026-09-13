@@ -1,7 +1,7 @@
 import { deferred, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -166,24 +166,25 @@ describe("workspace-branch ExecutionWorld", () => {
 		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot("overlay-auto-cost");
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v2");
 		await Promise.all(
 			Array.from({ length: 100 }, (_value, index) =>
 				writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
 			),
 		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v1");
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v2");
 		await Promise.all(
 			Array.from({ length: 160 }, (_value, index) => {
 				const ordinal = index + 100;
 				return writeFile(path.join(root, `${ordinal.toString().padStart(4, "0")}.txt`), `${ordinal}\n`, "utf8");
 			}),
 		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v1:/);
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v2:/);
 	});
 
 	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {
 		const root = await temporaryRoot("write");
+		await writeFile(path.join(root, ".gitattributes"), "* text eol=lf ident\n");
 		const world = sandbox.createExecutionWorld({ driver: "git" });
 		expect(world.scope).toBe("fallback");
 		expect(effectCapabilitiesCover(world.speculation.capabilities, WORKSPACE_PATH_MUTATION_EFFECTS)).toBe(true);
@@ -646,7 +647,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(stat(path.join(outside, "out.txt"))).rejects.toThrow();
 	});
 
-	it("isolates repository metadata and reuses baselines when only excluded metadata changes", async () => {
+	it.each(["index", "template", "global-config", "system-config"])("isolates inherited Git %s settings and excluded repository metadata", async (setting) => {
 		const root = await temporaryRoot("git");
 		await runProgram("git", ["init"], root);
 		await runProgram("git", ["config", "user.email", "test@example.com"], root);
@@ -658,43 +659,67 @@ describe("workspace-branch ExecutionWorld", () => {
 		await runProgram("git", ["add", "staged.txt"], root);
 		const beforeStatus = await runProgram("git", ["status", "--short"], root);
 		const beforeBranch = await runProgram("git", ["branch", "--show-current"], root);
-		await sandbox.prepare(root, { driver: "git" });
+		const index = path.join(root, ".git/index"), beforeIndex = await readFile(index);
+		const external = await temporaryRoot("git-settings"), hook = path.join(external, "hooks/post-checkout");
+		await mkdir(path.dirname(hook));
+		await writeFile(hook, `#!/bin/sh\nprintf hooked > ${shellQuote(path.join(external, "hooked"))}\n`);
+		await chmod(hook, 0o755);
+		const config = path.join(external, "config");
+		await runProgram("git", ["config", "--file", config, "core.hooksPath", path.dirname(hook)]);
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		try {
+			if (setting === "index") vi.stubEnv("GIT_INDEX_FILE", index);
+			else if (setting === "template") vi.stubEnv("GIT_TEMPLATE_DIR", external);
+			else vi.stubEnv(setting === "global-config" ? "GIT_CONFIG_GLOBAL" : "GIT_CONFIG_SYSTEM", config);
+			await sandbox.prepare(root, { driver: "git" });
+			expect(await readFile(index)).toEqual(beforeIndex);
+			captures.mockClear();
 			await writeFile(path.join(root, ".git", "audit-cache"), "metadata changed\n");
 			await sandbox.prepare(root, { driver: "git" });
 			expect(captures).not.toHaveBeenCalled();
-		} finally { captures.mockRestore(); }
-		const args = { path: "created.txt", content: "speculative\n" };
-		await sandbox.createExecutionWorld().speculation.execute(context(root, "write", writeTool, args));
+			const args = { path: "created.txt", content: "speculative\n" };
+			await sandbox.createExecutionWorld().speculation.execute(context(root, "write", writeTool, args));
+			expect(await readFile(index)).toEqual(beforeIndex);
+			await expect(stat(path.join(external, "hooked"))).rejects.toThrow();
+		} finally { captures.mockRestore(); vi.unstubAllEnvs(); }
 
 		expect(await runProgram("git", ["status", "--short"], root)).toBe(beforeStatus);
 		expect(await runProgram("git", ["branch", "--show-current"], root)).toBe(beforeBranch);
 		await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
 	});
 
-	it("reuses unchanged baselines after mutations and isolates and cleans parallel workspaces", async () => {
+	it.each(["stat-cache", "attributes", "encoding"])("preserves exact bytes across %s changes and parallel workspaces", async (setting) => {
 		const root = await temporaryRoot("parallel");
-		await writeFile(path.join(root, "steady.txt"), "stable\n");
+		const encoding = setting === "encoding" ? "utf16le" : "utf8";
+		const stable = Buffer.from("$Id$\r\n", encoding), timestamp = new Date("2020-01-01T00:00:00Z");
+		await writeFile(path.join(root, "value1.txt"), stable);
+		if (setting !== "stat-cache") await writeFile(path.join(root, ".gitattributes"),
+			`*.txt text eol=lf ident${setting === "encoding" ? " working-tree-encoding=UTF-16LE" : ""}\n`);
 		const signal = new AbortController().signal, captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		try {
-			for (const baseline of ["base\n", "changed\n", "changed\n"]) {
-				await writeFile(path.join(root, "value.txt"), baseline);
+			vi.stubEnv("GIT_CONFIG_COUNT", "1");
+			vi.stubEnv("GIT_CONFIG_KEY_0", "core.trustctime");
+			vi.stubEnv("GIT_CONFIG_VALUE_0", "false");
+			for (const text of ["before\r\n", "after!\r\n", "after!\r\n"]) {
+				const baseline = Buffer.from(text, encoding);
+				await writeFile(path.join(root, "value[1].txt"), baseline);
+				await utimes(path.join(root, "value[1].txt"), timestamp, timestamp);
 				await sandbox.prepare(root, { driver: "git", signal });
 				const count = captures.mock.calls.length;
 				const roots = await Promise.all(["first\n", "second\n"].map((content) =>
 					sandbox.withWorkspace(root, async ({ sandboxRoot }) => {
-						expect(await readFile(path.join(sandboxRoot, "value.txt"), "utf8")).toBe(baseline);
-						await writeFile(path.join(sandboxRoot, "value.txt"), content);
-						expect(await readFile(path.join(sandboxRoot, "value.txt"), "utf8")).toBe(content);
+						expect(await readFile(path.join(sandboxRoot, "value[1].txt"))).toEqual(baseline);
+						expect(await readFile(path.join(sandboxRoot, "value1.txt"))).toEqual(stable);
+						await writeFile(path.join(sandboxRoot, "value[1].txt"), content);
+						expect(await readFile(path.join(sandboxRoot, "value[1].txt"), "utf8")).toBe(content);
 						return sandboxRoot;
 					})));
 				expect(captures.mock.calls.length).toBe(count);
 				expect(new Set(roots).size).toBe(2);
-				expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe(baseline);
+				expect(await readFile(path.join(root, "value[1].txt"))).toEqual(baseline);
 				for (const workspace of roots) await expect(stat(workspace)).rejects.toThrow();
 			}
-		} finally { captures.mockRestore(); }
+		} finally { captures.mockRestore(); vi.unstubAllEnvs(); }
 	});
 
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {

@@ -572,7 +572,7 @@ const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
-const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v1";
+const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v2";
 // Small-tree gains remain host-sensitive and carry one-time FUSE preparation cost, while the
 // 500/1,000-file A/B is material. Use a conservative power-of-two boundary and exact baseline.
 const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
@@ -693,7 +693,7 @@ async function resolveWorkspaceDriver(
 		if (requested === "overlayfs") throw new Error(capability.detail);
 		return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 	}
-	const overlay = { driver: "overlayfs", fingerprint: `linux-overlayfs:v1:${capability.fingerprint}` } as const;
+	const overlay = { driver: "overlayfs", fingerprint: `linux-overlayfs:v2:${capability.fingerprint}` } as const;
 	if (requested === "overlayfs") return overlay;
 	if (!sourceRoot) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 
@@ -1309,9 +1309,11 @@ async function createSandboxRepository(
 	const repository = path.join(parent, "snapshot.git");
 	const git = bindGit(gitBinary, parent, ["--git-dir", repository]);
 	try {
-		await bindGit(gitBinary, parent)(["init", "--bare", repository]);
-		await git(["config", "core.autocrlf", "false"]);
-		await git(["config", "core.longpaths", "true"]);
+		await bindGit(gitBinary, parent)(["init", "--bare", "--template=", repository]);
+		// This private snapshot stores raw bytes; caller configuration and attributes cannot transform them.
+		await mkdir(path.join(repository, "info"), { recursive: true });
+		await writeFile(path.join(repository, "config"), "\n[core]\n\tautocrlf = false\n\tlongpaths = true\n\tattributesFile = /dev/null\n", { flag: "a" });
+		await writeFile(path.join(repository, "info", "attributes"), "* -text -eol -filter -ident -working-tree-encoding\n");
 		return {
 			owner,
 			sourceRoot,
@@ -1396,14 +1398,16 @@ async function countGitBaselineEntries(repository: PooledGitRepository, commit: 
 }
 
 async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: readonly string[]): Promise<void> {
+	const options = { environment: { GIT_LITERAL_PATHSPECS: "1" } };
 	for (const batch of batchPathspecs(pathspecs)) {
+		// Resource changes revoke cached Git stat data, even when a writer restores mtime and size.
+		await repository.index(["rm", "-r", "-f", "--cached", "--ignore-unmatch", "--", ...batch], options);
 		let pending = batch;
 		for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
-			const tracked = new Set(parseNullList(await repository.git(["ls-files", "-z", "--"], { cwd: repository.sourceRoot })));
 			pending = (
 				await Promise.all(
 					pending.map(async (pathspec) =>
-						tracked.has(pathspec) || (await exists(path.join(repository.sourceRoot, pathspec)))
+						(await exists(path.join(repository.sourceRoot, pathspec)))
 							? pathspec
 							: undefined,
 					),
@@ -1411,7 +1415,7 @@ async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: rea
 			).filter((pathspec): pathspec is string => pathspec !== undefined);
 			if (!pending.length) break;
 			try {
-				await repository.index(["add", "-f", "-A", "--", ...pending]);
+				await repository.index(["add", "-f", "-A", "--", ...pending], options);
 				break;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.includes("did not match any files") || attempt === 2) {
@@ -2407,7 +2411,13 @@ function bindGit(
 			[...args],
 			{
 				cwd: options.cwd ?? cwd,
-				env: { ...process.env, ...options.environment },
+				env: {
+					...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_"))),
+					GIT_CONFIG_GLOBAL: "/dev/null",
+					GIT_CONFIG_NOSYSTEM: "1",
+					GIT_ATTR_NOSYSTEM: "1",
+					...options.environment,
+				},
 				encoding: "buffer",
 				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
 			},
