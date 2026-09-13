@@ -1,3 +1,4 @@
+import { StringDecoder } from "node:string_decoder";
 import { stableStringify } from "../src/stable-json.ts";
 import { BenefitGate, type BenefitGatePolicy } from "../src/fork-benefit-gate.ts";
 
@@ -450,15 +451,17 @@ interface DecodedSseEvent {
 
 function decodeSseEvents(chunks: readonly TapeChunk[]): readonly DecodedSseEvent[] {
 	const events: DecodedSseEvent[] = [];
+	const decoder = new StringDecoder("utf8");
 	let buffered = "";
 	let latestAtMs: number | undefined;
 	for (const chunk of chunks) {
-		buffered += Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+		buffered += decoder.write(Buffer.from(chunk.dataBase64, "base64"));
 		latestAtMs = finiteMetric(chunk.atMs) ?? latestAtMs;
 		const blocks = buffered.split(/\r?\n\r?\n/u);
 		buffered = blocks.pop() ?? "";
 		for (const block of blocks) appendDecodedSseEvent(events, block, latestAtMs);
 	}
+	buffered += decoder.end();
 	if (buffered.trim()) appendDecodedSseEvent(events, buffered, latestAtMs);
 	return events;
 }
