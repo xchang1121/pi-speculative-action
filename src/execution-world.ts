@@ -6,6 +6,7 @@ import {
 } from "./effect-model.ts";
 import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { errorMessage as errorDetail } from "./error-utils.ts";
 import { immutableSnapshot } from "./stable-json.ts";
 
 /** Concrete isolation used for one speculative execution. */
@@ -157,7 +158,7 @@ export async function validateWorldBranch<Output>(branch: WorldBranch<Output> | 
 			: { status: "indeterminate", cause: cause("freshness", "validation_unavailable"), metrics: zeroValidationMetrics() };
 		return immutableSnapshot(validation);
 	} catch (error) {
-		return immutableSnapshot({ status: "indeterminate", cause: cause("freshness", "validation_failed", error instanceof Error ? error.message : String(error)), metrics: zeroValidationMetrics() });
+		return immutableSnapshot({ status: "indeterminate", cause: cause("freshness", "validation_failed", errorDetail(error)), metrics: zeroValidationMetrics() });
 	}
 }
 
@@ -499,9 +500,6 @@ function supportsTool(operation: { readonly tools?: readonly string[] }, tool: s
 	return tool === undefined || operation.tools === undefined || operation.tools.includes(tool);
 }
 
-function errorDetail(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
 
 function isPromiseLike<Value>(value: Value | Promise<Value>): value is Promise<Value> {
 	return Boolean(value && typeof value === "object" && "then" in value && typeof value.then === "function");

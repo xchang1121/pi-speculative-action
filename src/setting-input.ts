@@ -7,7 +7,7 @@ export function nonNegativeInteger(value: unknown, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
 }
 
-export function nonNegativeNumber(value: unknown, fallback: number): number {
+export function nonNegativeNumber<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 

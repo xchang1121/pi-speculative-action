@@ -17,6 +17,7 @@ import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { advanceFilesystemClock } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
+import { positiveInteger as positiveCapacity, nonNegativeNumber as nonNegativeDuration } from "./setting-input.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
@@ -580,14 +581,6 @@ function availableCapabilityKey(
 	capability: Extract<LinuxOverlayfsCapability, { readonly available: true }>,
 ): string {
 	return `${capability.binary}\0${capability.fusermountBinary}\0${capability.fingerprint}`;
-}
-
-function positiveCapacity(value: number | undefined, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-
-function nonNegativeDuration(value: number | undefined, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function execText(executable: string, args: readonly string[]): Promise<string> {

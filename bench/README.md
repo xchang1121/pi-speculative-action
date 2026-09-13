@@ -357,6 +357,14 @@ Windows 的一次旧版 `native-grep` 回退与另一个原生 oracle 进程以�
 
 同版 20 轮原生 exec 边界和运行中采纳检查通过，原有一次消费、作用域、描述符、输入/元数据、污染与清理断言保持，3 秒领先仍仅是机制夹具。全套共 663 项：Windows 641 通过、22 项平台跳过；WSL 662 通过、1 项路径规则跳过。两端类型检查、基准检查、构建通过；后续私有视图类型清理的 85 个 JS/MJS 编译结果完全相同。资格为 `optional-diagnostics-direct-qualification.json` 和 `optional-diagnostics-direct-types-qualification.json`。此中间状态相对 `caaf4ef` 少 336 个物理行但多 2409 个 LF 字节，代码净减少要求尚未满足，仍需继续收敛。ThinkThread 与 PR #1 冻结部分未修改。
 
+### Runtime 边界的共享与状态归属
+
+`50eaca2` 后的重构统一候选工具筛选、错误文本及数值边界，移除会话释放的重复转发。诊断队列由正在交付的事件同时持有容量和时间信息，关闭通道由唯一关闭任务表示封存状态；原有测试扩展覆盖观察器与失败回调重入、并发排空和再次入队，保持容量、顺序及失败隔离。
+
+两端类型检查、基准检查、构建及全套 663 项通过（Windows 641 通过、22 跳过；WSL 662 通过、1 跳过）。另新增六次完整长程回放，分别覆盖两端的仅 Pattern、全开及无 Pattern，与已资格化 `50eaca2` 原始报告逐项核对全部模块、Actor/模型请求、文件效果、原始 Pattern 批次与学习、消费次数和清理。此次使用历史正确性参考，不是新配对性能试验，也不宣称重构带来提速；未重复运行的历史原生边界检查不冒充本次结果。原始耗时和失败候选均保留，资格为 `shared-runtime-boundaries-qualification.json` 与 `shared-runtime-boundaries-build-qualification.json`。
+
+此中间状态相对 `caaf4ef` 少 375 个物理行、多 1645 个 LF 字节；净减少要求仍待完成。ThinkThread 与 PR #1 冻结部分未修改。
+
 ### 模型套件
 
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。

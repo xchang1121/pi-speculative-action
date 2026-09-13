@@ -1,6 +1,7 @@
 import { type SpeculativeExecutionRoute, validateWorldBranch, type WorldBranch, type WorldResultCapture } from "./execution-world.ts";
 import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { cloneSharedData, immutableSnapshot } from "./stable-json.ts";
+import { errorMessage } from "./error-utils.ts";
 
 export type EffectTransactionState =
 	| "begun"
@@ -39,7 +40,7 @@ export class EffectCommitFailure extends Error {
 export function effectCommitFailure(
 	error: unknown,
 	disposition: EffectCommitDisposition,
-	message = error instanceof Error ? error.message : String(error),
+	message = errorMessage(error),
 	resolutionCause?: ResolutionCause,
 ): EffectCommitFailure {
 	return error instanceof EffectCommitFailure

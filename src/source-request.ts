@@ -1,4 +1,6 @@
 import { nonNegativeCount as finiteCount } from "./number-utils.ts";
+import { nonNegativeNumber } from "./setting-input.ts";
+import { errorDetail } from "./error-utils.ts";
 import type {
 	ResolutionCause,
 	SettledSourceRequest,
@@ -77,7 +79,7 @@ export async function runSourceRequest<Value>(input: {
 			(error) => ({ kind: "error" as const, error }),
 		);
 
-	const waited = await waitForCandidate(producer, input.generation.signal, finiteTimeout(input.timeoutMs));
+	const waited = await waitForCandidate(producer, input.generation.signal, nonNegativeNumber(input.timeoutMs, undefined));
 	if (waited.status === "deadline") {
 		const expiration = cause("source", "timeout");
 		controller.abort(expiration);
@@ -126,13 +128,4 @@ function result(
 		durationMs: Math.max(0, performance.now() - startedAt),
 		settlement: Object.freeze(settlement),
 	});
-}
-
-function finiteTimeout(value: number | undefined): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-}
-
-
-function errorDetail(error: unknown): string {
-	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
