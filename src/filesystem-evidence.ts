@@ -68,36 +68,51 @@ export async function captureStableFile(
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
-
-		const hash = createHash("sha256");
-		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
-		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
-		let bytesRead = 0;
-		for (;;) {
-			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
-			const { bytesRead: size } = await handle.read(chunk);
-			if (size === 0) break;
-			bytesRead += size;
-			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-			hash.update(chunk.subarray(0, size));
-		}
-
-		const after = await handle.stat({ bigint: true });
+		const capture = await captureDescriptor(handle, before, maxBytes, retainContent);
 		const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
-		if (
-			bytesRead !== Number(before.size) ||
-			beforePath !== afterPath ||
-			!sameFilesystemIdentity(before, after) ||
-			!sameFilesystemIdentity(after, pathStat)
-		) {
+		if (beforePath !== afterPath || !sameFilesystemIdentity(capture.stat, pathStat)) {
 			throw new Error("file_changed_during_capture");
 		}
-		return { hash: hash.digest("hex"), bytesRead, realPath: afterPath, stat: after,
-			...(content ? { content } : {}) };
+		return { ...capture, realPath: afterPath };
 	} finally {
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
+}
+
+/** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
+export async function hashExecutableFile(target: string): Promise<`sha256:${string}`> {
+	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+	try {
+		const before = await handle.stat({ bigint: true });
+		if (!before.isFile()) throw new Error("not_regular_file");
+		return `sha256:${(await captureDescriptor(handle, before, Infinity, false)).hash}`;
+	} finally { await handle.close(); }
+}
+
+async function captureDescriptor(
+	handle: import("node:fs/promises").FileHandle,
+	before: import("node:fs").BigIntStats,
+	maxBytes: number,
+	retainContent: boolean,
+): Promise<Omit<StableFileCapture, "realPath">> {
+	const hash = createHash("sha256");
+	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
+	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
+	let bytesRead = 0;
+	for (;;) {
+		const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
+		const { bytesRead: size } = await handle.read(chunk);
+		if (size === 0) break;
+		bytesRead += size;
+		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
+		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+		hash.update(chunk.subarray(0, size));
+	}
+	const after = await handle.stat({ bigint: true });
+	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
+		throw new Error("file_changed_during_capture");
+	}
+	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}) };
 }
 
 export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
