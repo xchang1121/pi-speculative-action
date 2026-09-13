@@ -1,12 +1,5 @@
 /** Host-neutral speculative runtime surface. Pi adapters live in the root and extension entries. */
-export {
-	type ActionProjectionCoverage,
-	type ActionProjectionRule,
-	READ_RANGE_ACTION_KEY_PROJECTOR,
-	READ_RANGE_COVERAGE_DETAILS_KEY,
-	type ReadRangeCoverage,
-	readRangesShareInFlight,
-} from "./action-key-projection.ts";
+export * from "./action-key-projection.ts";
 export {
 	type ActionEffect,
 	type ActionKey,
@@ -27,34 +20,9 @@ export {
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
 export type { DrafterToolDefinition } from "./common.ts";
-export type {
-	CandidateEventDescriptor,
-	CandidateExecutionProjection,
-	SpeculativeActionEvent,
-	SpeculativeCacheSnapshot,
-} from "./events.ts";
-export {
-	effectCapabilitiesCover,
-	effectRequirements,
-	type EffectCapabilities,
-	type EffectCapability,
-	type EffectRequirements,
-	normalizeEffectRequirements,
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "./effect-model.ts";
-export {
-	type EffectCommitDisposition,
-	EffectCommitFailure,
-	effectCommitFailure,
-	type EffectTransaction,
-	EffectTransactionCoordinator,
-	type EffectTransactionAttempt,
-	type EffectTransactionDescriptor,
-	type EffectTransactionState,
-	isPoisonedEffectCommit,
-} from "./effect-transaction.ts";
+export type * from "./events.ts";
+export * from "./effect-model.ts";
+export * from "./effect-transaction.ts";
 export {
 	type CapturedExecutionWorldResult,
 	emptyWorldReuseMetrics,
@@ -88,23 +56,8 @@ export {
 	type WorldReuseStrategy,
 	type WorldResultCapture,
 } from "./execution-world.ts";
-export {
-	type AuthoritativeExecutionHooks,
-	type AuthoritativeExecutionSettlement,
-	type AuthoritativeToolExecutor,
-	ToolExecutionGateway,
-	type ToolExecutionRequirement,
-	type ToolOperation,
-} from "./tool-execution-gateway.ts";
-export type {
-	MaterializedPlan,
-	PlanAction,
-	PlanActionDependency,
-	PlanActionDependencyCondition,
-	PlanDelta,
-	PlanProposal,
-	PlanUpdate,
-} from "./plan-proposal.ts";
+export * from "./tool-execution-gateway.ts";
+export type * from "./plan-proposal.ts";
 export {
 	captureResourceVersion,
 	closeResourceVersionManagers,
@@ -160,10 +113,5 @@ export {
 	type ValidationMetrics,
 	zeroValidationMetrics,
 } from "./settlement.ts";
-export { measureSpeculativeTask, TaskTimeline, TimelineInterval, type SpeculativeTaskTiming } from "./task-timing.ts";
-export {
-	emptySpeculativeTraceSummary,
-	reduceSpeculativeTrace,
-	type SpeculativeTraceSummary,
-	summarizeSpeculativeTrace,
-} from "./trace-summary.ts";
+export * from "./task-timing.ts";
+export * from "./trace-summary.ts";
