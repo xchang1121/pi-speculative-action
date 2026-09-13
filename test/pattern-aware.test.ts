@@ -890,6 +890,43 @@ describe("PatternAware", () => {
 		});
 	});
 
+	test("uses the current branch to rank a later step before backing off to common suffixes", () => {
+		const store = patternStore({ beamWidth: 1, maxContextLength: 3, maxFutureGap: 0, decayHalfLifeEvents: 0 });
+		for (const [tool, operation, count] of [["ls", "test", 16], ["grep", "lint", 3]] as const) {
+			for (let index = 0; index < count; index++) {
+				const sessionID = `${tool}-${index}`, filePath = `src/${sessionID}.ts`;
+				store.observe(input(sessionID, tool, {}, { outputPaths: [filePath] }));
+				store.observe(input(sessionID, "read", { filePath }));
+				store.observe(input(sessionID, "bash", { command: `bun ${operation} ${filePath}` }));
+				store.finishSession(sessionID);
+			}
+		}
+		store.observe(input("probe", "grep", {}, { outputPaths: ["lib/held-out.ts"] }));
+		const parent = store.predict("probe")[0]!;
+		expect(parent.input).toEqual({ filePath: "lib/held-out.ts" });
+		const before = store.snapshot();
+		const child = store.continue(parent.continuation, input("probe", "read", parent.input))[0]!;
+		expect(child.input).toEqual({ command: "bun lint lib/held-out.ts" });
+		expect(child.depth).toBe(2);
+		expect(child.empiricalProbability).toBeLessThanOrEqual(parent.empiricalProbability);
+		expect(store.snapshot()).toEqual(before);
+		store.observe(input("unknown", "inspect", {}, { learnTarget: false }));
+		store.observe(input("unknown", "read", { filePath: "lib/unseen.ts" }, { learnTarget: false }));
+		expect(store.predict("unknown")[0]?.input).toEqual({ command: "bun test lib/unseen.ts" });
+	});
+
+	test.each<Record<string, number>>([{}, { "1": 10 }, { "0": 10, "1": 10 }])("keeps unsupported future gaps out of contextual backoff: %j", (gaps) => {
+		const store = patternStore({ decayHalfLifeEvents: 0 });
+		acceptPattern(store, gaps, { id: "future" });
+		acceptPattern(store, { "0": 10 }, { id: "immediate", targetTool: "bash",
+			context: [{ tool: "ls", outcome: "success" }, { tool: "grep", outcome: "success" }],
+			bindings: constantBindings({ command: "npm test" }) });
+		store.observe(input("probe", "ls", {}, { learnTarget: false }));
+		store.observe(input("probe", "grep", {}, { learnTarget: false }));
+		const candidate = store.predict("probe").find((item) => item.tool === "read")!;
+		expect(candidate.conditionalProbability).toBe(store.snapshot().find((item) => item.id === "future")!.empiricalProbability);
+	});
+
 	test("charges evidence-annealed mapper complexity for transforms and ungrounded payloads", () => {
 		const store = patternStore({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 });
 		const source = { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] };
