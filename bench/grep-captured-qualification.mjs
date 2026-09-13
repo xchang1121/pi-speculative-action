@@ -38,10 +38,12 @@ const rows = semanticOnly ? [] : [
   { label: "repository", contents: await fs.readFile(new URL("../src/runtime-engine.ts", import.meta.url)), files: costOnly ? 8 : 32, patterns: ["authoritativeMutationResources", "\\b(?:[A-Za-z_]\\w*\\.){4,}[A-Za-z_]\\w*\\b", "(?:\\p{L}+\\s+){15}\\p{L}+"] },
   { label: "unicode", contents: Buffer.from("Αλφα βήτα Ελληνικά κώδικας γράμματα λέξεις μία δύο τρία τέσσερα\n".repeat(costOnly ? 7_000 : 50_000)), files: 1, patterns: ["needle", "^\\w{60}$", "(?P<word>Αλφα)", "."] },
 ];
+const repeats = semanticOnly ? 1 : costOnly ? 3 : 5;
+const timing = (samplesMs) => ({ ms: [...samplesMs].sort((a, b) => a - b)[Math.floor(samplesMs.length / 2)], samplesMs });
 const median = async (run) => {
   const times = []; let output;
-  for (let i = 0; i < (semanticOnly ? 1 : costOnly ? 3 : 5); i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
-  return { ms: [...times].sort((a, b) => a - b)[Math.floor(times.length / 2)], samplesMs: times, output };
+  for (let i = 0; i < repeats; i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
+  return { ...timing(times), output };
 };
 try {
   const binary = await captureStableFile(await resolveHostExecutable(rg, "rg"), 32 * 1024 * 1024, true);
@@ -129,18 +131,21 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     const before = actorCalls, started = performance.now();
     const result = await host.execute({ turnID: turn.turnID, id: `Actor-${++callID}`, tool: "grep", args, tools }, new AbortController().signal,
       async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
-    if (costOnly) {
-      const ms = performance.now() - started, { provider, rejections } = await settled.promise;
-      assert.equal(actorCalls - before, provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
-      trials.push({ ms, provider, rejections });
-    }
+    const ms = performance.now() - started, { provider, rejections } = await settled.promise;
+    assert.equal(actorCalls - before, provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
+    trials.push({ ms, provider, rejections });
     return result;
+  };
+  const sampleActor = async () => {
+    const first = trials.length;
+    for (let i = 0; i < repeats; i++) assert.deepEqual(await actor(), expected);
+    return timing(trials.slice(first).map(({ ms }) => ms));
   };
   try {
     let hostActor;
     if (costOnly) {
       turn.turnID = "baseline"; await host.startTurn(turn);
-      hostActor = await median(async () => { const result = await actor(); assert.deepEqual(result, expected); return result; });
+      hostActor = await sampleActor();
       assert.equal(executions, 0); assert.equal(actorCalls, 3);
       await host.finishTurn(turn.turnID);
       actorCalls = 0; trials.length = 0; drafterEnabled = true; turn.turnID = "probe";
@@ -158,16 +163,14 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
       assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
       return { profilePreparationMs, producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
-    const adopted = await median(async () => {
-      const result = await actor(); assert.deepEqual(result, expected); return result;
-    });
+    const adopted = await sampleActor();
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
     if (costOnly) for (const trial of trials) {
       if (trial.provider.kind === "actor") assert.ok(trial.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(trial));
     } else assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
     return { profilePreparationMs, producerMs, ...(costOnly
-      ? { hostActorMs: hostActor.ms, hostActorSamplesMs: hostActor.samplesMs, probeMs: adopted.ms, trials }
+      ? { hostActorMs: hostActor.ms, hostActorSamplesMs: hostActor.samplesMs, probeMs: adopted.ms, probeSamplesMs: adopted.samplesMs, trials }
       : { hitMs: adopted.ms, hitSamplesMs: adopted.samplesMs }),
       producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
   } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
