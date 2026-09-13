@@ -93,8 +93,11 @@ export interface DrafterPlanSourceController {
 
 export function createDrafterPlanSource(input: {
 	readonly sessionID: string;
+	/** Drafter model. Defaults to the actor model when omitted or unresolved. */
 	readonly draftModel?: DraftModelSelection;
+	/** Resolve drafter request options, including credentials when using a different provider. */
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
+	/** Provider completion used by the drafter. */
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();

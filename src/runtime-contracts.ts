@@ -122,6 +122,23 @@ interface TurnInput<SessionID> {
 
 type MaybePromise<T> = T | Promise<T>;
 
+export interface RuntimeTurnContext<StartInput, StateData> {
+	readonly startInput: StartInput;
+	readonly data: StateData;
+	readonly settings: SpeculativeActionSettings;
+}
+
+interface BoundCandidateCall {
+	readonly candidate: SpeculativeDraftCandidate;
+	readonly tool: string;
+	readonly concrete: Record<string, unknown>;
+	readonly action: ActionKey;
+	readonly route: SpeculativeExecutionRoute;
+	readonly callID: string;
+	readonly index: number;
+	readonly signal: AbortSignal;
+}
+
 export interface SpeculativePlanSource<
 	SessionID,
 	Output,
@@ -138,26 +155,17 @@ export interface SpeculativePlanSource<
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	/** Admission policy for concurrent initial proposals targeting one Actor decision. */
 	readonly concurrentProposalPolicy?: (settings: SpeculativeActionSettings) => "all" | "first_produced";
-	readonly propose: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
+	readonly propose: (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly definitions: readonly DrafterToolDefinition[];
 		readonly candidateNames: readonly string[];
 		readonly proposalIndex: number;
 		readonly proposalCount: number;
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanProposal | readonly PlanProposal[] | undefined>;
-	readonly continue?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
+	readonly continue?: (input: RuntimeTurnContext<StartInput, StateData> & PlanActionFeedback & {
 		readonly candidate: SpeculativeCandidate;
 		readonly adoptedAction?: AdoptedAction;
-		readonly proposalID: string;
-		readonly actionID: string;
 		readonly revision: number;
-		readonly feedback: unknown;
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
@@ -169,10 +177,7 @@ export interface SpeculativePlanSource<
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 	}) => boolean);
-	readonly observe?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
+	readonly observe?: (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly consumeInput: ConsumeInput;
 		readonly action?: ActionKey;
 		readonly tool: string;
@@ -222,64 +227,23 @@ export interface SpeculativeActionRuntimeAdapter<
 			| { readonly type: "consume"; readonly consumeInput: ConsumeInput },
 	) => MaybePromise<ActionKey | undefined>;
 	/** Resolve the highest-priority safe execution capability for this attempt. */
-	readonly resolveExecution: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly signal: AbortSignal;
-	}) => MaybePromise<SpeculativeExecutionRoute | undefined>;
+	readonly resolveExecution: (input: RuntimeTurnContext<StartInput, StateData> &
+		Omit<BoundCandidateCall, "route" | "callID" | "index">) => MaybePromise<SpeculativeExecutionRoute | undefined>;
 	/** Snapshot freshness before fallback execution; this callback must never execute the tool. */
-	readonly captureAuthoritativeResult?: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
+	readonly captureAuthoritativeResult?: (input: RuntimeTurnContext<StartInput, StateData> &
+		Omit<BoundCandidateCall, "candidate" | "route" | "index"> & {
 		readonly consumeInput: ConsumeInput;
-		readonly settings: SpeculativeActionSettings;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly callID: string;
-		readonly signal: AbortSignal;
 	}) => MaybePromise<AuthoritativeResultCapture<Output> | undefined>;
 	readonly actual: (input: ConsumeInput) => ActualToolCall;
-	readonly preflightCandidate: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly route: SpeculativeExecutionRoute;
-		readonly callID: string;
-		readonly index: number;
-		readonly signal: AbortSignal;
-	}) => MaybePromise<CandidatePreflight>;
-	readonly authorizeCandidate?: (input: {
+	readonly preflightCandidate: (input: RuntimeTurnContext<StartInput, StateData> & BoundCandidateCall) => MaybePromise<CandidatePreflight>;
+	readonly authorizeCandidate?: (input: Pick<BoundCandidateCall, "tool" | "concrete" | "action" | "route"> & {
 		readonly stateData: StateData;
 		readonly consumeInput: ConsumeInput;
 		readonly settings: SpeculativeActionSettings;
-		readonly action: ActionKey;
-		readonly route: SpeculativeExecutionRoute;
 		readonly candidate: SpeculativeCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
 		readonly signal?: AbortSignal;
 	}) => MaybePromise<CandidatePreflight>;
-	readonly executeCandidate: (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly candidate: SpeculativeDraftCandidate;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly action: ActionKey;
-		readonly route: SpeculativeExecutionRoute;
-		readonly callID: string;
-		readonly index: number;
-		readonly signal: AbortSignal;
+	readonly executeCandidate: (input: Omit<RuntimeTurnContext<StartInput, StateData>, "settings"> & BoundCandidateCall & {
 		readonly parentWorld?: WorldBranch<Output>;
 	}) => MaybePromise<WorldBranch<Output>>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];

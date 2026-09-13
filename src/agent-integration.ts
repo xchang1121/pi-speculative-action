@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionKey, type ActionSemanticsRegistry, ownActionKeyProjector, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "./action-semantics.ts";
@@ -14,8 +14,6 @@ import type {
 	AgentConsumeInput,
 	AgentStartInput,
 	AgentStateData,
-	DraftModelSelection,
-	DraftOptionsContext,
 } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
@@ -109,17 +107,11 @@ export interface SpeculativeAgentPreflightContext {
 
 export type { DraftOptionsContext } from "./agent-runtime-types.ts";
 
-export interface CreateSpeculativeActionHostOptions {
+export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<typeof createDrafterPlanSource>[0], "sessionID"> {
 	/** Workspace root used for action canonicalization and resource validation. */
 	readonly cwd: string;
 	/** Runtime settings. The feature remains disabled when omitted. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
-	/** Drafter model. Defaults to the actor model when omitted or unresolved. */
-	readonly draftModel?: DraftModelSelection;
-	/** Resolve drafter request options, including credentials when using a different provider. */
-	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
-	/** Provider completion used by the drafter. */
-	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
 	/** Bind the concrete executor used by both speculative and Actor calls; rejection fails this invocation. */
 	readonly resolveInvocation?: (
 		tool: string,
