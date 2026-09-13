@@ -101,11 +101,13 @@ describe("ablation suite report", () => {
 		} }] }) }));
 		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		process.argv = [process.execPath, "run.ts", "--instance", "offline", "--actor", "offline/model",
-			"--drafter", "offline/model", "--output", "offline-result.json"];
+			"--drafter", "offline/model", "--drafter-max-depth", "2", "--output", "offline-result.json"];
 		try {
 			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
 			expect(phases).toEqual(["prompt", "finishTurn", "hostDispose", "workspaceDispose"]);
-			const { summary } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
+			const { metadata, summary } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
+			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2 });
+			for (const key of ["repoCache", "runRoot", "output", "prepareOnly"]) expect(metadata).not.toHaveProperty(key);
 			expect(summary).toMatchObject({ patchCandidate: false, actorCost: 2, actorTokens: 13, accelerationRatio: 1,
 				changedFiles: ["src/file.ts"], benchmarkErrors: Object.fromEntries(phases.map(phase => [phase, `Error: ${phase} failed`])),
 			});
