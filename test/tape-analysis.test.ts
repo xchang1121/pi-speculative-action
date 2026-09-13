@@ -9,13 +9,14 @@ import {
 } from "../bench/tape-analysis.ts";
 
 describe("LLM tape action analysis", () => {
-	it("pairs exact contexts, deduplicates full K(a), and measures only early exact candidates", () => {
+	it.each([Infinity, 1, 2, 3, 5])("pairs exact contexts and full K(a) across %s-byte stream chunks", (chunkBytes) => {
 		const messages = [{ role: "user", content: "fix" }];
+		const args = JSON.stringify({ path: chunkBytes === Infinity ? "a" : "文档/😀.txt" });
 		const tape: LlmTape = {
 			exchanges: [
-				exchange(0, "actor", messages, 100, [call("read", '{"path":"a"}')]),
-				exchange(1, "draft", messages, 30, [call("read", '{"path":"a"}')]),
-				exchange(2, "draft", messages, 40, [call("read", '{"path":"a"}')]),
+				exchange(0, "actor", messages, 100, [call("read", args)]),
+				exchange(1, "draft", messages, 30, [call("read", args)], chunkBytes),
+				exchange(2, "draft", messages, 40, [call("read", args)], chunkBytes),
 				exchange(3, "draft", messages, 20, [call("read", '{"path":"b"}')]),
 				exchange(4, "draft", [{ role: "user", content: "other" }], 10, [call("read", '{"path":"a"}')]),
 			],
@@ -143,68 +144,29 @@ describe("LLM tape action analysis", () => {
 			availableDrafterRequests: 3,
 			availableDrafterServiceMs: 110,
 		});
-		expect(result.points).toEqual([
-			{
-				width: 1,
-				actorTurns: 1,
-				opportunities: 2,
-				exactHits: 1,
-				marginalExactHits: 1,
-				hitRate: 0.5,
-				exactReadyBeforeActor: 1,
-				earlyHitRate: 0.5,
-				drafterRequests: 1,
-				requestReductionFromAvailable: 2 / 3,
-				drafterServiceMs: 80,
-				serviceReductionFromAvailable: 30 / 110,
-				drafterCompletionSpanMs: 80,
-				candidateCount: 1,
-				uniqueCandidateCount: 1,
-				duplicateCandidateCount: 0,
-				uniqueYield: 1,
-				exactLeadMs: 20,
-			},
-			{
-				width: 2,
-				actorTurns: 1,
-				opportunities: 2,
-				exactHits: 2,
-				marginalExactHits: 1,
-				hitRate: 1,
-				exactReadyBeforeActor: 2,
-				earlyHitRate: 1,
-				drafterRequests: 2,
-				requestReductionFromAvailable: 1 / 3,
-				drafterServiceMs: 90,
-				serviceReductionFromAvailable: 20 / 110,
-				drafterCompletionSpanMs: 80,
-				candidateCount: 2,
-				uniqueCandidateCount: 2,
-				duplicateCandidateCount: 0,
-				uniqueYield: 1,
-				exactLeadMs: 110,
-			},
-			{
-				width: 3,
-				actorTurns: 1,
-				opportunities: 2,
-				exactHits: 2,
-				marginalExactHits: 0,
-				hitRate: 1,
-				exactReadyBeforeActor: 2,
-				earlyHitRate: 1,
-				drafterRequests: 3,
-				requestReductionFromAvailable: 0,
-				drafterServiceMs: 110,
-				serviceReductionFromAvailable: 0,
-				drafterCompletionSpanMs: 80,
-				candidateCount: 3,
-				uniqueCandidateCount: 2,
-				duplicateCandidateCount: 1,
-				uniqueYield: 2 / 3,
-				exactLeadMs: 170,
-			},
-		]);
+		// Columns are widths 1, 2 and 3; every reported field remains part of the exact comparison.
+		const expected = {
+			width: [1, 2, 3],
+			actorTurns: [1, 1, 1],
+			opportunities: [2, 2, 2],
+			exactHits: [1, 2, 2],
+			marginalExactHits: [1, 1, 0],
+			hitRate: [0.5, 1, 1],
+			exactReadyBeforeActor: [1, 2, 2],
+			earlyHitRate: [0.5, 1, 1],
+			drafterRequests: [1, 2, 3],
+			requestReductionFromAvailable: [2 / 3, 1 / 3, 0],
+			drafterServiceMs: [80, 90, 110],
+			serviceReductionFromAvailable: [30 / 110, 20 / 110, 0],
+			drafterCompletionSpanMs: [80, 80, 80],
+			candidateCount: [1, 2, 3],
+			uniqueCandidateCount: [1, 2, 2],
+			duplicateCandidateCount: [0, 0, 1],
+			uniqueYield: [1, 1, 2 / 3],
+			exactLeadMs: [20, 110, 170],
+		};
+		expect(result.points).toEqual([0, 1, 2].map((column) =>
+			Object.fromEntries(Object.entries(expected).map(([field, values]) => [field, values[column]]))));
 	});
 
 	it("rejects an empty static Drafter width grid", () => {
@@ -299,6 +261,7 @@ function exchange(
 	messages: unknown,
 	endedAtMs: number,
 	chunks: readonly TapeFixtureChunk[],
+	chunkBytes = Infinity,
 ): LlmTape["exchanges"][number] {
 	return {
 		sequence,
@@ -306,12 +269,14 @@ function exchange(
 		response: {
 			completed: true,
 			endedAtMs,
-			chunks: chunks.map((chunk) => {
+			chunks: chunks.flatMap((chunk) => {
 				const data = typeof chunk === "string" ? chunk : chunk.data;
-				return {
+				const bytes = Buffer.from(data), parts = [];
+				for (let offset = 0; offset < bytes.length; offset += chunkBytes) parts.push({
 					...(typeof chunk === "string" ? {} : { atMs: chunk.atMs }),
-					dataBase64: Buffer.from(data).toString("base64"),
-				};
+					dataBase64: bytes.subarray(offset, offset + chunkBytes).toString("base64"),
+				});
+				return parts;
 			}),
 		},
 	};
