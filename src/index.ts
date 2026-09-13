@@ -32,12 +32,7 @@ export {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "./action-semantics.ts";
-export {
-	createResourceSnapshotExecutionWorld,
-	type AgentExecutionWorld,
-	type SpeculativeAgentExecutionWorld,
-	type SpeculativeToolExecutionContext,
-} from "./agent-execution-world.ts";
+export * from "./agent-execution-world.ts";
 export {
 	type ActionDrafterGateSnapshot,
 	type CreateSpeculativeActionHostOptions,
@@ -56,53 +51,9 @@ export {
 } from "./common.ts";
 export { calculateContextTokens as usageTokenCount } from "@earendil-works/pi-agent-core";
 export type { ExecutionScope } from "./execution-world.ts";
-export {
-	createSpeculativeActionExtension,
-	type EffectiveSpeculativeActionSettings,
-	formatSpeculativeActionEvent,
-	formatSpeculativeActionStatus,
-	normalizeSpeculativeActionSettings,
-	resolveSpeculativeDraftModel,
-	type SpeculativeActionExecutionWorldContext,
-	type SpeculativeActionExtensionDependencies,
-	type SpeculativeActionMetrics,
-	type SpeculativeSettingsStore,
-} from "./extension.ts";
-export {
-	acquirePatternAwareStore,
-	applyBindings,
-	applyBindingsVariants,
-	asPatternAwareRuntimeContext,
-	inferBindings,
-	PATTERN_AWARE_DEFAULTS,
-	type PatternAwareActionSemantics,
-	type PatternAwareBinding,
-	type PatternAwareCandidate,
-	type PatternAwareContinuation,
-	type PatternAwareDependency,
-	type PatternAwareDependencySource,
-	type PatternAwareEvent,
-	type PatternAwareEventInput,
-	type PatternAwareEventSignature,
-	type PatternAwareFeedback,
-	type PatternAwareObservation,
-	type PatternAwarePath,
-	type PatternAwarePattern,
-	type PatternAwareRuntimeContext,
-	type PatternAwareSettings,
-	PatternAwareStore,
-	type PatternAwareStoreLease,
-	patternAwareAnalyzerKey,
-	patternAwarePersistenceFile,
-	patternAwareRuntimeContext,
-	patternAwareSettings,
-	projectPatternAwareObservation,
-} from "./pattern-aware.ts";
-export {
-	PI_READ_RANGE_PROJECTION_RULE,
-	withPiProjectionCoverage,
-	withPiReadCoverage,
-} from "./pi-read-projection.ts";
+export * from "./extension.ts";
+export * from "./pattern-aware.ts";
+export * from "./pi-read-projection.ts";
 export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 export {
 	type CompletedProcessReplayOptions,
@@ -112,10 +63,7 @@ export {
 	type LinuxProcessReuseMetrics,
 	type LinuxProcessSession,
 } from "./linux-process-backend.ts";
-export {
-	createLinuxProcessExecutionWorld,
-	type LinuxProcessExecutionWorldOptions,
-} from "./linux-process-world.ts";
+export * from "./linux-process-world.ts";
 export {
 	adaptProcessToolOperations,
 	ProcessExecutionCoordinator,
@@ -126,50 +74,11 @@ export {
 	type ProcessToolOperations,
 } from "./process-execution.ts";
 export { isResourceVersionToken } from "./resource-version.ts";
-export {
-	normalizeSelfSpeculationSettings,
-	SELF_SPECULATION_DEFAULTS,
-	SelfSpeculationCoordinator,
-	type SelfSpeculationCoordinatorOptions,
-	type SelfSpeculationCoordinatorSnapshot,
-	type SelfSpeculationForkTransport,
-	type SelfSpeculationSettings,
-	type SelfSpeculationSettingsInput,
-	type SelfSpeculationVerificationOutcome,
-	type SelfSpeculationVerificationStep,
-} from "./self-speculation.ts";
-export {
-	ACTOR_PROBE_SCHEDULE,
-	ActorForkPlanSource,
-	createActorForkPlanSource,
-	type ActorForkActionBatch,
-	type ActorForkActionCall,
-	type ActorForkActionEvidence,
-	type ActorProbeSchedule,
-	type ActorProbeSnapshot,
-} from "./actor-fork-plan-source.ts";
-export {
-	type ExecutionRoutingSettings,
-	type SpeculativeActionPackageSettings,
-	SpeculativeActionSettingsStore,
-	type SpeculativeSettingsScope,
-} from "./settings-store.ts";
+export * from "./self-speculation.ts";
+export * from "./actor-fork-plan-source.ts";
+export * from "./settings-store.ts";
 export type { ToolFilesystemOperations, ToolInvocation, ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
-export {
-	type PrepareSandboxWorkspaceOptions,
-	type QualifiedWorkspaceSandboxDriver,
-	readSandboxDirectoryState,
-	type SandboxDirectoryChange,
-	type SandboxDirectoryState,
-	type SandboxExecutionDelta,
-	type SandboxFileChange,
-	type SandboxWorkspaceChange,
-	type SandboxWorkspaceContext,
-	type SandboxWorkspaceBranchOptions,
-	type WorkspaceSandboxOptions,
-	type WorkspaceSandboxDriver,
-	WorkspaceSandboxService,
-} from "./workspace-sandbox.ts";
+export * from "./workspace-sandbox.ts";
 export {
 	linuxOverlayfsCapability,
 	mountLinuxOverlayfs,

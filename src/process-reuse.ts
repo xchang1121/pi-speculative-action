@@ -40,21 +40,5 @@ export {
 	validateDynamicDependencyCertificate,
 	validateProcessCertificate,
 } from "./provenance-validation.ts";
-export {
-	type ProcessReuseLookupMetrics,
-	type ProcessReuseMissReason,
-	type ProcessReusePlan,
-	ProcessReusePlanner,
-	type ProcessReuseRequest,
-	type ReplayObservationContract,
-} from "./reuse-planner.ts";
-export {
-	ArtifactCAS,
-	DEFAULT_PROVENANCE_STORE_LIMITS,
-	ProvenanceCertificateStore,
-	type ProvenanceStoreGCResult,
-	type ProvenanceStoreLimits,
-	type ProvenanceStoreOptions,
-	type ProvenanceStoreStats,
-	type VerifiedArtifactClosure,
-} from "./reuse-store.ts";
+export * from "./reuse-planner.ts";
+export * from "./reuse-store.ts";
