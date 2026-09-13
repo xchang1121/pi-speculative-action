@@ -299,6 +299,7 @@ export class LinuxProcessReuseBackend {
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly replayWorkspace = new WorkspaceSandboxService();
 	private disposal?: Promise<void>;
+	private producers = 0;
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
@@ -354,6 +355,16 @@ export class LinuxProcessReuseBackend {
 		return Object.freeze({ ...this.actorCounters });
 	}
 
+	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
+	async withProducer<Value>(run: () => Promise<Value>): Promise<Value> {
+		this.producers++;
+		try { return await run(); } finally { this.producers--; }
+	}
+
+	private get hasLiveResults(): boolean {
+		return this.producers > 0 || this.handoffs.hasResults;
+	}
+
 	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
 		let state: "degraded" | "ready" = "degraded";
@@ -382,8 +393,8 @@ export class LinuxProcessReuseBackend {
 		if (refresh) await (prepared = prepare());
 		return { get state() { return state; }, get detail() { return detail; }, executor: {
 			execute: async (request) => {
-				// A started backend may still publish children. Recheck after IO; never cache emptiness.
-				if ((!this.ready && !(await this.store.mayHaveCertificates()) && !this.ready) || this.disposed) return host.execute(request);
+				// Only actual production and retained evidence need replay. Recheck after IO; never cache emptiness.
+				if ((!this.hasLiveResults && !(await this.store.mayHaveCertificates()) && !this.hasLiveResults) || this.disposed) return host.execute(request);
 				return (await (prepared ??= prepare())).execute(request);
 			},
 		} };
@@ -461,6 +472,15 @@ export class LinuxProcessReuseBackend {
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 	}): Promise<LinuxProcessSession> {
+		return this.withProducer(async () => {
+			const session = await this.createSession(input);
+			this.producers++;
+			let closing: Promise<void> | undefined;
+			return { ...session, close: () => closing ??= session.close().finally(() => { this.producers--; }) };
+		});
+	}
+
+	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
 		if (this.disposed) throw new Error("Linux process backend is disposed");
 		const ready = await this.resolveReady();
 		throwIfAborted(input.signal);
@@ -532,15 +552,16 @@ export class LinuxProcessReuseBackend {
 			} },
 			metrics: () => Object.freeze({ ...session.metrics }),
 			seal: (changes) => {
-				session.sealPromise ??= this.seal(session, changes);
+				session.sealPromise ??= this.withProducer(() => this.seal(session, changes));
 				return session.sealPromise;
 			},
 			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 			close: () => session.closing ??= Promise.resolve().then(async () => {
 				controller.abort(new Error("Linux process session closed"));
-				await closeServer(server);
-				await Promise.allSettled(session.pending);
-				await rm(socketPath, { force: true }).catch(() => undefined);
+				try { await closeServer(server); } finally {
+					await Promise.allSettled(session.pending);
+					await rm(socketPath, { force: true }).catch(() => undefined);
+				}
 			}),
 		};
 	}
