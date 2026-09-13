@@ -424,6 +424,7 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	readonly continuationSlots: Set<SourceRequestSlot>;
 	readonly continuationTriggers: Set<"execution_succeeded" | "actor_adopted">;
 	continuationTail: Promise<void>;
+	peerContinuations?: Set<string>;
 	executionRoute?: SpeculativeExecutionRoute;
 }
 
@@ -2330,6 +2331,9 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (current?.identity.id !== node.identity.id) return;
 		const context = session.actionContexts.get(node.identity.id);
 		const source = context ? runtimeState.sourcesByID.get(context.identity.source) : undefined;
+		if (context && source?.continuationBatch && trigger === "execution_succeeded") {
+			try { queuePeerContinuations(session, current, context, source); } catch { /* Producer feedback is advisory. */ }
+		}
 		if (!context || !source?.continue) return;
 		if (source.multiStepEnabled?.(context.settings, context.feedback) === false) return;
 		if (context.continuationTriggers.has(trigger)) return;
@@ -2345,68 +2349,85 @@ export function makeStructuralSpeculativeActionRuntime<
 				? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq)
 				: current.expectedDecisionSeq;
 		const targetDecisionSequence = parentDecisionSequence + 1;
-		const requestLimit = clampCandidateLimit(source.proposalCount?.(context.settings));
 		const pending = context.continuationTail
-			.then(async () => {
-				if (session.lifecycle.sealed || targetDecisionSequence <= session.decisionSequence ||
-					session.plan.get(node.proposalID, node.action.id)?.identity.id !== node.identity.id) return;
-				const slot = claimSourceSlot(session, source.id, targetDecisionSequence, requestLimit, "continuation");
-				if (!slot) return;
-				context.continuationSlots.add(slot);
+			.then(() => requestContinuation(session, source, [context], targetDecisionSequence, (signal) => {
 				const revision = session.plan.reserveRevision(node.proposalID);
-				if (revision === undefined) {
-					releaseSourceRequest(session, slot);
-					return;
-				}
-				const generation = slot.generation;
-				session.pendingSourceRequests++;
-				const request = await runSourceRequest({
-					request: {
-						source: source.id,
-						turnID: context.startInput.turnID,
-						index: session.sourceRequestSequence++,
-						kind: "continuation",
-						targetDecisionSequence: slot.targetDecisionSequence,
-					},
-					generation,
-					timeoutMs: source.timeoutMs?.(context.settings),
-					produce: (requestSignal) =>
-						trackSourceTask(session, Promise.resolve(source.continue!({
-							startInput: context.startInput,
-							data: context.data,
-							settings: context.settings,
-							candidate: predictionCandidate(candidate, node),
-							...(adoptedAction ? { adoptedAction } : {}),
-							proposalID: node.proposalID,
-							actionID: node.action.id,
-							revision,
-							feedback: context.feedback,
-							output,
-							trigger,
-							signal: requestSignal,
-						}))),
-					count: (value) => asUpdates(value).length,
+				if (revision === undefined) return undefined;
+				return source.continue!({
+					startInput: context.startInput, data: context.data, settings: context.settings,
+					candidate: predictionCandidate(candidate, node), ...(adoptedAction ? { adoptedAction } : {}),
+					proposalID: node.proposalID, actionID: node.action.id, revision,
+					feedback: context.feedback, output, trigger, signal,
 				});
-				await sourceRequestFinished(
-					{
-						session,
-						startInput: context.startInput,
-						data: context.data,
-						settings: context.settings,
-						signal: generation.signal,
-						slot,
-					},
-					context.startInput.turnID,
-					source,
-					slot,
-					request,
-				);
-			})
+			}))
 			.catch(() => {
 				// Continuation failure cannot revoke completed work or Actor adoption.
 			});
 		context.continuationTail = pending;
 		trackSourceTask(session, pending);
+	};
+
+	const requestContinuation = async (
+		session: Session,
+		source: Source,
+		parents: readonly PlanActionContext<StartInput, StateData>[],
+		targetDecisionSequence: number,
+		produce: (signal: AbortSignal) => ReturnType<NonNullable<Source["continue"]>>,
+	): Promise<void> => {
+		const context = parents[0]!;
+		if (session.lifecycle.sealed || targetDecisionSequence <= session.decisionSequence || parents.some(({ identity }) =>
+			session.plan.get(identity.proposalID, identity.actionID)?.identity.id !== identity.id)) return;
+		const slot = claimSourceSlot(session, source.id, targetDecisionSequence,
+			clampCandidateLimit(source.proposalCount?.(context.settings)), "continuation");
+		if (!slot) return;
+		for (const parent of parents) parent.continuationSlots.add(slot);
+		session.pendingSourceRequests++;
+		const request = await runSourceRequest({
+			request: { source: source.id, turnID: context.startInput.turnID, index: session.sourceRequestSequence++,
+				kind: "continuation", targetDecisionSequence },
+			generation: slot.generation,
+			timeoutMs: source.timeoutMs?.(context.settings),
+			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal))),
+			count: (value) => asUpdates(value).length,
+		});
+		await sourceRequestFinished({ session, startInput: context.startInput, data: context.data, settings: context.settings,
+			signal: slot.generation.signal, slot }, context.startInput.turnID, source, slot, request);
+	};
+
+	const queuePeerContinuations = (
+		session: Session, node: PlanRuntimeNode, context: PlanActionContext<StartInput, StateData>, source: Source,
+	): void => {
+		const peers = runtimeState.sources.filter((peer) => peer.id !== source.id && peer.continueFrom &&
+			peer.enabled(context.settings) && peer.multiStepEnabled?.(context.settings) !== false);
+		if (!peers.length) return;
+		const ids = source.continuationBatch!({ proposalID: node.proposalID, actionID: node.action.id, feedback: context.feedback });
+		if (!ids?.length || !ids.includes(node.action.id) || new Set(ids).size !== ids.length) return;
+		const batch: Parameters<NonNullable<Source["continueFrom"]>>[0]["batch"][number][] = [];
+		const parents: PlanActionContext<StartInput, StateData>[] = [];
+		for (const id of ids) {
+			const parent = session.plan.get(node.proposalID, id);
+			const owner = parent && session.actionContexts.get(parent.identity.id);
+			if (!parent || !owner || owner.admissionSignal.aborted || parent.predictionState.status !== "pending" ||
+				parent.expectedDecisionSeq !== session.decisionSequence + 1 || parent.action.dependsOn?.length ||
+				parent.execution.status !== "succeeded") return;
+			const candidate = runtimeState.candidates.get(session.id, parent.execution.candidateID);
+			if (candidate?.work.execution.status !== "succeeded") return;
+			batch.push({ identity: parent.identity, candidate: predictionCandidate(candidate, parent), output: candidate.work.execution.output.output });
+			parents.push(owner);
+		}
+		const requested = parents[0]!.peerContinuations ??= new Set();
+		for (const peer of peers) {
+			if (requested.has(peer.id)) continue;
+			requested.add(peer.id);
+			const pending = requestContinuation(session, peer, parents, node.expectedDecisionSeq + 1, async (requestSignal) => {
+				const signal = AbortSignal.any([requestSignal, ...parents.map((parent) => parent.admissionSignal)]);
+				if (signal.aborted) return undefined;
+				const update = await peer.continueFrom!({ startInput: context.startInput, data: context.data,
+					settings: context.settings, batch, signal });
+				return signal.aborted ? undefined : update;
+			}).catch(() => { /* Peer prediction cannot revoke the completed parent batch. */ });
+			trackSourceTask(session, pending);
+		}
 	};
 
 	const retirePlanAction = (session: Session, retired: RetiredPlanNode, failure: ResolutionCause): void => {
@@ -2439,7 +2460,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const dependencyWorld = (session: Session, node: PlanRuntimeNode): Candidate | null | undefined => {
 		const parents = new Set<Candidate>();
 		for (const dependency of node.action.dependsOn ?? []) {
-			const parentNode = session.plan.get(node.proposalID, dependency.actionID);
+			const parentNode = session.plan.dependency(node.proposalID, dependency);
 			if (!parentNode || !("candidateID" in parentNode.execution) || !parentNode.execution.candidateID) continue;
 			const candidate = runtimeState.candidates.get(session.id, parentNode.execution.candidateID);
 			if (!candidate) continue;

@@ -475,6 +475,7 @@ export class PatternAwareStore {
 		inputs: ReadonlyArray<PatternAwareEventInput>,
 		schemaHashes: Readonly<Record<string, string>> = {},
 		predictionSettings: PatternAwareSettings = this.settings,
+		seed?: Pick<PatternAwareContinuation, "visitedPatternIDs" | "pathProbability">,
 	) {
 		if (!predictionSettings.enabled || !inputs.length) return [];
 		const ordered = ownBatch(inputs, sessionID), turnID = ordered[0]!.turnID;
@@ -496,8 +497,9 @@ export class PatternAwareStore {
 		return this.predictHistory(
 			history,
 			schemaHashes,
-			{ history, visitedPatternIDs: [], pathProbability: 1 },
+			{ history, visitedPatternIDs: [], pathProbability: 1, ...seed },
 			predictionSettings,
+			seed === undefined,
 		);
 	}
 

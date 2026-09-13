@@ -6,6 +6,7 @@ import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type {
 	MaterializedPlan,
 	PlanAction,
+	PlanActionDependency,
 	PlanActionDependencyCondition,
 	PlanUpdate,
 } from "./plan-proposal.ts";
@@ -163,8 +164,10 @@ type MutablePlan = {
 	nextRevision: number;
 	draftTokens: number;
 	nodes: Map<string, MutableNode>;
-	ordered: readonly MutableNode[];
+	graph: PlanGraph;
 };
+
+type PlanGraph = { readonly plans: Set<MutablePlan>; ordered: readonly MutableNode[] };
 
 interface PlanExecutionOwner {
 	readonly execution: CandidateExecutionState<unknown>;
@@ -189,6 +192,7 @@ type MutableNode = {
 	expectedDecisionSeq: number;
 	latestDecisionSeq: number;
 	criticalPathMs: number;
+	validDependencies: boolean;
 	execution: MutableNodeExecution;
 	opportunity: PredictionOpportunity;
 };
@@ -234,7 +238,8 @@ export class PlanRuntime {
 		const actions = new Map(proposal ? [] : [...current!.nodes].map(([id, node]) => [id, node.action] as const));
 		if (!proposal) for (const id of owned.remove ?? []) actions.delete(id);
 		for (const action of upserted) actions.set(action.id, action);
-		const ordered = dependencyOrder(actions);
+		const ordered = dependencyOrder(actions, (dependency) =>
+			dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({
 			id, source: owned.source, revision: owned.revision,
@@ -352,7 +357,7 @@ export class PlanRuntime {
 		const finalized = opportunity.confirm(actorAction, adoption);
 		if (!finalized) return undefined;
 		const current = this.mutable(opportunity.identity.proposalID, opportunity.identity.actionID);
-		if (current?.node.opportunity === opportunity) this.recompute(current.plan);
+		if (current?.node.opportunity === opportunity) this.recompute(current.plan.graph);
 		return finalized;
 	}
 
@@ -369,6 +374,11 @@ export class PlanRuntime {
 	get(proposalID: string, actionID: string): PlanRuntimeNode | undefined {
 		const value = this.mutable(proposalID, actionID);
 		return value ? this.snapshot(value.plan, value.node) : undefined;
+	}
+
+	dependency(proposalID: string, dependency: PlanActionDependency): PlanRuntimeNode | undefined {
+		const node = this.parent(proposalID, dependency);
+		return node ? this.get(node.identity.proposalID, node.action.id) : undefined;
 	}
 
 	opportunity(proposalID: string, actionID: string): PredictionOpportunity | undefined {
@@ -426,7 +436,7 @@ export class PlanRuntime {
 		for (const action of input.ordered) {
 			const previous = current?.nodes.get(action.id)?.action;
 			if (previous && ((touched.has(action.id) && !samePlanActionExecution(previous, action)) ||
-				action.dependsOn?.some((dependency) => replaced.has(dependency.actionID)))) replaced.add(action.id);
+				action.dependsOn?.some((dependency) => !dependency.proposalID && replaced.has(dependency.actionID)))) replaced.add(action.id);
 		}
 		const removed = current ? [...current.nodes.keys()].filter((id) => !input.actions.has(id)) : [];
 		const retiredIDs = new Set([...removed, ...replaced]);
@@ -456,6 +466,14 @@ export class PlanRuntime {
 			nodes.set(id, newNode(input.id, input.source, input.revision, action, anchor));
 		}
 
+		const connected = new Set(current ? [current.graph] : []);
+		for (const action of input.actions.values()) for (const dependency of action.dependsOn ?? []) {
+			if (dependency.proposalID) connected.add(this.plans.get(dependency.proposalID)!.graph);
+		}
+		const graph: PlanGraph = { plans: new Set(), ordered: [] };
+		for (const previous of connected) for (const plan of previous.plans) {
+			if (plan !== current) graph.plans.add(plan);
+		}
 		const next: MutablePlan = {
 			id: input.id,
 			source: input.source,
@@ -463,10 +481,25 @@ export class PlanRuntime {
 			nextRevision: Math.max(current?.nextRevision ?? 0, input.revision + 1),
 			draftTokens: input.draftTokens,
 			nodes,
-			ordered: Object.freeze(input.ordered.map((action) => nodes.get(action.id)!)),
+			graph,
 		};
 		this.plans.set(next.id, next);
-		this.recompute(next);
+		graph.plans.add(next);
+		for (const plan of graph.plans) plan.graph = graph;
+		const visited = new Set<MutableNode>(), ordered: MutableNode[] = [];
+		const visit = (node: MutableNode): void => {
+			if (visited.has(node)) return;
+			visited.add(node);
+			for (const dependency of node.action.dependsOn ?? []) {
+				const parent = this.parent(node.identity.proposalID, dependency);
+				if (parent) visit(parent);
+			}
+			ordered.push(node);
+		};
+		// Only plans sharing dependency ancestry need a common order and settlement pass.
+		for (const plan of graph.plans) for (const node of plan.nodes.values()) visit(node);
+		graph.ordered = ordered;
+		this.recompute(graph);
 		return {
 			accepted: true,
 			plan: planSnapshot(next),
@@ -487,6 +520,11 @@ export class PlanRuntime {
 
 	private mutableValues(): Array<{ readonly plan: MutablePlan; readonly node: MutableNode }> {
 		return [...this.plans.values()].flatMap((plan) => [...plan.nodes.values()].map((node) => ({ plan, node })));
+	}
+
+	private parent(proposalID: string, dependency: PlanActionDependency): MutableNode | undefined {
+		const node = this.mutable(dependency.proposalID ?? proposalID, dependency.actionID)?.node;
+		return !dependency.proposalID || node?.identity.id === dependency.identity ? node : undefined;
 	}
 
 	private select(
@@ -529,9 +567,10 @@ export class PlanRuntime {
 	}
 
 	private dependencyReadiness(plan: MutablePlan, node: MutableNode): "ready" | "waiting" | "blocked" {
+		if (!node.validDependencies) return "blocked";
 		let readiness: "ready" | "waiting" = "ready";
 		for (const dependency of node.action.dependsOn ?? []) {
-			const parent = plan.nodes.get(dependency.actionID);
+			const parent = this.parent(plan.id, dependency);
 			const state = parent ? dependencyReadiness(parent, dependency.condition) : "blocked";
 			if (state === "blocked") return state;
 			if (state === "waiting") readiness = state;
@@ -547,28 +586,31 @@ export class PlanRuntime {
 		);
 	}
 
-	private recompute(plan: MutablePlan): void {
+	private recompute(graph: PlanGraph): void {
 		// The accepted graph is immutable between revisions; reuse its validated topological order.
-		for (const node of plan.ordered) {
+		for (const node of graph.ordered) {
 			const settlement = node.opportunity.settlement;
 			const matched = predictionMatched(settlement) ? actorDecisionSequence(settlement.actorAction) : undefined;
 			node.earliestDecisionSeq = matched ?? node.anchorDecisionSeq + 1;
 			node.expectedDecisionSeq = matched ?? node.anchorDecisionSeq + horizon(node.action) + 1;
 			node.latestDecisionSeq = matched ?? node.anchorDecisionSeq + latestHorizon(node.action) + 1;
 			node.criticalPathMs = 0;
+			node.validDependencies = true;
 			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = plan.nodes.get(dependency.actionID)!;
+				const parent = this.parent(node.identity.proposalID, dependency);
+				if (!parent || !parent.validDependencies) node.validDependencies = false;
+				if (!parent) continue;
 				node.earliestDecisionSeq = Math.max(node.earliestDecisionSeq, parent.earliestDecisionSeq + 1);
 				node.expectedDecisionSeq = Math.max(node.expectedDecisionSeq, parent.expectedDecisionSeq + 1);
 				node.latestDecisionSeq = Math.max(node.latestDecisionSeq, parent.latestDecisionSeq + 1);
 			}
 		}
-		for (let index = plan.ordered.length - 1; index >= 0; index--) {
-			const node = plan.ordered[index]!;
+		for (let index = graph.ordered.length - 1; index >= 0; index--) {
+			const node = graph.ordered[index]!;
 			node.criticalPathMs += Math.max(1, finiteMetric(node.action.expectedDurationMs));
 			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = plan.nodes.get(dependency.actionID)!;
-				parent.criticalPathMs = Math.max(parent.criticalPathMs, node.criticalPathMs);
+				const parent = this.parent(node.identity.proposalID, dependency);
+				if (parent) parent.criticalPathMs = Math.max(parent.criticalPathMs, node.criticalPathMs);
 			}
 		}
 	}
@@ -596,6 +638,7 @@ function newNode(
 		expectedDecisionSeq: anchorDecisionSeq + horizon(action) + 1,
 		latestDecisionSeq: anchorDecisionSeq + latestHorizon(action) + 1,
 		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
+		validDependencies: true,
 		execution: { status: "deferred" },
 		opportunity: new PredictionOpportunity(identity),
 	};
@@ -697,11 +740,13 @@ function validateActions(
 		ids.add(source.id);
 		if (source.dependsOn) {
 			source.dependsOn = Object.freeze(
-				source.dependsOn.map(({ actionID, condition }) =>
-					Object.freeze({ actionID, condition: canonicalCondition(condition) }),
+				source.dependsOn.map(({ actionID, proposalID, identity, condition }) =>
+					Object.freeze({ actionID, ...(proposalID !== undefined || identity !== undefined ? { proposalID, identity } : {}),
+						condition: canonicalCondition(condition) }),
 				),
 			);
-			if (source.dependsOn.some((dependency) => !validToken(dependency.actionID))) {
+			if (source.dependsOn.some((dependency) => !validToken(dependency.actionID) ||
+				("proposalID" in dependency && (!validToken(dependency.proposalID!) || !validToken(dependency.identity!))))) {
 				return { ok: false, reason: "invalid_dependency" };
 			}
 		}
@@ -718,7 +763,7 @@ function validateActions(
 	return { ok: true, actions: Object.freeze(result) };
 }
 
-function dependencyOrder(actions: ReadonlyMap<string, PlanAction>): readonly PlanAction[] | undefined {
+function dependencyOrder(actions: ReadonlyMap<string, PlanAction>, external: (dependency: PlanActionDependency) => boolean): readonly PlanAction[] | undefined {
 	const visiting = new Set<string>();
 	const ordered = new Map<string, PlanAction>();
 	const visit = (actionID: string): boolean => {
@@ -727,7 +772,7 @@ function dependencyOrder(actions: ReadonlyMap<string, PlanAction>): readonly Pla
 		if (!action || visiting.has(actionID)) return false;
 		visiting.add(actionID);
 		for (const dependency of action.dependsOn ?? []) {
-			if (!visit(dependency.actionID)) return false;
+			if (!(dependency.proposalID ? external(dependency) : visit(dependency.actionID))) return false;
 		}
 		visiting.delete(actionID);
 		ordered.set(actionID, action);

@@ -130,6 +130,7 @@ function validResource() {
 
 function harness<SessionID = string>(input: {
 	readonly source: Source<SessionID>;
+	readonly peers?: readonly Source<SessionID>[];
 	readonly settings?: () => SpeculativeActionSettings;
 	readonly stateData?: (input: Start<SessionID>) => Promise<{ readonly cwd: string }>;
 	readonly execute?: (
@@ -162,7 +163,7 @@ function harness<SessionID = string>(input: {
 	const events: SpeculativeActionEvent<SessionID>[] = [];
 	let executions = 0;
 	const runtime = makeStructuralSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
-		sources: [input.source],
+		sources: [input.source, ...(input.peers ?? [])],
 		settings: input.settings ?? (() => settings),
 		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
 		stateData: input.stateData ?? (() => ({ cwd: "/workspace" })),
@@ -1715,6 +1716,75 @@ describe("structural speculative runtime", () => {
 		} finally { await fixture.runtime.dispose(); }
 	});
 
+	it.each(["complete", "arrived", "closed", "failed", "disabled"] as const)("shares only a complete root batch with a peer: %s", async (mode) => {
+		const first = barrier(), secondReady = candidateSucceeded(1, "second.ts"), parentsReady = barrier(2);
+		const peerStarted = barrier(), peerGate = barrier(), childReady = candidateSucceeded(1, "child.ts");
+		const settlements: PredictionSettlement[] = [], materialized: string[] = [];
+		let peerSignal: AbortSignal | undefined;
+		const continueFrom = vi.fn<NonNullable<Source["continueFrom"]>>(async ({ batch, signal }) => {
+			peerSignal = signal;
+			expect(batch.map(({ candidate, output }) => [candidate.input.path, output])).toEqual([
+				["first.ts", "first.ts:output"], ["second.ts", "second.ts:output"],
+			]);
+			peerStarted.arrive(); await peerGate.promise;
+			return { id: "peer", source: "peer", revision: 0, actions: [readAction("child", { path: "child.ts" }, {
+				dependsOn: batch.map(({ identity }) => ({ actionID: identity.actionID, proposalID: identity.proposalID,
+					identity: identity.id, condition: "execution_succeeded" })),
+			})] };
+		});
+		const fixture = harness({
+			source: planSource({ multiStepEnabled: () => false, requestLifetime: "actor_decision",
+				propose: ({ startInput }) => startInput.turnID === "parent" ? { id: "roots", source: "source", revision: 0,
+					actions: [readAction("first", { path: "first.ts" }), readAction("second", { path: "second.ts" })] } : undefined,
+				continuationBatch: () => ["first", "second"], onSettled: ({ settlement }) => { settlements.push(settlement); },
+			}),
+			peers: [{ id: "peer", enabled: () => mode !== "disabled", propose: () => undefined, continueFrom,
+				onSettled: ({ settlement }) => { settlements.push(settlement); } }],
+			execute: async (_tool, input) => {
+				if (input.path === "first.ts") { await first.promise; if (mode === "failed") throw new Error("parent failed"); }
+				return `${input.path}:output`;
+			},
+			onCandidateMaterialized: (candidate) => { materialized.push(String(candidate.input.path)); },
+			onEvent: (event) => {
+				secondReady.observe(event); childReady.observe(event);
+				if (event.type === "candidate" && event.state.status !== "running" &&
+					(event.candidate.predictedAction.includes("first.ts") || event.candidate.predictedAction.includes("second.ts"))) parentsReady.arrive();
+			},
+		});
+		let closing: Promise<void> | undefined;
+		try {
+			await fixture.runtime.startTurn(start("parent")); await secondReady.promise;
+			expect(continueFrom).not.toHaveBeenCalled();
+			first.arrive(); await parentsReady.promise;
+			if (mode === "failed" || mode === "disabled") { expect(continueFrom).not.toHaveBeenCalled(); return; }
+			await peerStarted.promise;
+			if (mode === "arrived") expect((await fixture.runtime.prepareActorCall(call("parent", { path: "first.ts" })))?.output).toBe("first.ts:output");
+			if (mode === "closed") {
+				let drained = false;
+				closing = fixture.runtime.dispose().then(() => { drained = true; });
+				await nextTurn(); expect(drained).toBe(false);
+			}
+			expect(peerSignal?.aborted).toBe(mode !== "complete");
+			peerGate.arrive();
+			if (mode === "complete") {
+				await childReady.promise;
+				for (const name of ["second", "first"]) expect((await fixture.runtime.prepareActorCall({
+					...call("parent", { path: `${name}.ts` }), id: name }))?.output).toBe(`${name}.ts:output`);
+				await fixture.runtime.finishTurn({ ...call("parent"), terminal: false });
+				await fixture.runtime.startTurn(start("child"));
+				expect((await fixture.runtime.prepareActorCall(call("child", { path: "child.ts" })))?.output).toBe("child.ts:output");
+				await fixture.runtime.finishTurn({ ...call("child"), terminal: true });
+				expect(settlements.map((settlement) => settlement.prediction.source)).toEqual(["source", "source", "peer"]);
+				expect(settlements.every((settlement) => settlement.observation === "observed" && settlement.match.matched &&
+					settlement.match.adoption.status === "adopted")).toBe(true);
+			}
+		} finally { first.arrive(); peerGate.arrive(); await closing; await fixture.runtime.dispose(); }
+		expect(continueFrom).toHaveBeenCalledTimes(1);
+		expect(materialized).toEqual(["first.ts", "second.ts", ...(mode === "complete" ? ["child.ts"] : [])]);
+		expect(fixture.executions()).toBe(mode === "complete" ? 3 : 2);
+		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
+	});
+
 	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {
 		const gate = barrier();
 		const parentReady = barrier();
@@ -1910,7 +1980,7 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["baseline", "replaced", "adopted", "claimed", "cancelled"] as const)("keeps child reuse on its current parent lineage: %s", async (mode) => {
+	it.each(["baseline", "peer", "replaced", "adopted", "claimed", "cancelled"] as const)("keeps child reuse on its current parent lineage: %s", async (mode) => {
 		const claimed = mode === "claimed" || mode === "cancelled", actorController = new AbortController();
 		const replacementChild = barrier();
 		let enabled = true, workspaceVersion = 0, holdReuse = false;
@@ -1927,6 +1997,7 @@ describe("structural speculative runtime", () => {
 			enabled: () => enabled,
 			proposalCount: () => 2,
 			continueOn: ["execution_succeeded"],
+			continuationBatch: () => ["parent"],
 			propose: ({ proposalIndex, startInput }) => startInput.turnID === "parent" ? ({
 				id: `chain:${proposalIndex}`,
 				source: "source",
@@ -1937,6 +2008,7 @@ describe("structural speculative runtime", () => {
 				? { proposalID: "chain:0", source: "source", revision: 2, upsert: [{ ...childAction, id: "alias" }] }
 				: concrete.path === "replace.ts" ? { proposalID: "chain:0", source: "source", revision: 3, upsert: [parentAction("parent-new")] } : undefined,
 			continue: ({ proposalID, actionID, revision, candidate, output }) => {
+				if (mode === "peer") return undefined;
 				if (actionID === "alias") { aliasOutputs.push(output); aliasReady.arrive(); }
 				if (String(candidate.input.content).startsWith("child")) return undefined;
 				return { proposalID, source: "source", revision, upsert: [childAction] };
@@ -1944,6 +2016,15 @@ describe("structural speculative runtime", () => {
 		});
 		const fixture = harness({
 			source,
+			peers: [{ id: "peer", enabled: () => mode === "peer", proposalCount: () => 2, propose: () => undefined,
+				continueFrom: ({ batch }) => {
+					expect(batch).toHaveLength(1);
+					const { identity } = batch[0]!;
+					return { id: `peer:${identity.id}`, source: "peer", revision: 0,
+						actions: [{ ...childAction, dependsOn: [{ proposalID: identity.proposalID, actionID: identity.actionID,
+							identity: identity.id, condition: "execution_succeeded" }] }] };
+				},
+			}],
 			actionKey: async (tool, input, context) => {
 				if (context.type === "start" && (input as { content?: string }).content === "parent-new") { parentBinding.arrive(); await parentGate.promise; }
 				return buildPiActionKey(tool, input, "/workspace");
@@ -1979,7 +2060,7 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.startTurn(start("parent")); await childrenReady.promise;
 			expect(executed.sort()).toEqual(["child", "child", "parent-0", "parent-1"]);
 			expect(childParents.sort()).toEqual(["parent-0", "parent-1"]);
-				if (mode !== "baseline") {
+			if (mode !== "baseline" && mode !== "peer") {
 				holdReuse = !claimed;
 				const alias = call("parent", { path: "alias.ts" });
 				await runFallback(fixture, alias);

@@ -23,7 +23,7 @@ import {
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
-import type { SpeculativeActionSettings } from "./runtime.ts";
+import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
@@ -101,17 +101,28 @@ export function createPatternPlanSource(input: {
 		);
 		return (await openedStore).store;
 	};
+	const predictedEvent = (startInput: AgentStartInput, action: Pick<SpeculativeCandidate, "key" | "input">,
+		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
+		sessionID: startInput.sessionID, turnID: startInput.turnID, tool: action.key.tool,
+		input: structuredClone(action.input), outcome: output.isError ? "failure" : "success",
+		...projectPatternAwareObservation(output.result, extractOutputPaths(action.key.tool, action.input, output.result), input.cwd),
+		durationMs, schemaHash: action.key.schemaHash,
+		...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
+		learnTarget: false,
+	});
 
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
 		enabled: (settings) => sourceSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
-		propose: async ({ startInput, settings, definitions }) => {
+		propose: async ({ startInput, settings, definitions, signal }) => {
 			const patternSettings = sourceSettings(settings);
 			if (!patternSettings.enabled) return undefined;
 			await analysisTail;
+			if (signal.aborted) return undefined;
 			const store = await resolveStore(settings);
+			if (signal.aborted) return undefined;
 			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
 			const signature = patternPredictionSignature(candidates);
 			const carried = carriedPredictions.get(startInput.sessionID);
@@ -125,6 +136,23 @@ export function createPatternPlanSource(input: {
 					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
 				),
 			};
+		},
+		continueFrom: async ({ startInput, data, settings, batch, signal }) => {
+			await analysisTail;
+			if (signal.aborted) return undefined;
+			const store = await resolveStore(settings);
+			if (signal.aborted) return undefined;
+			const id = `pattern:peer:${stableValueHash(batch.map(({ identity }) => identity.id))}`;
+			const candidates = store.predictAfterBatch(startInput.sessionID,
+				batch.map(({ candidate, output }) => predictedEvent(startInput, candidate, output, candidateExecutionMs(candidate))),
+				data.schemaHashes, sourceSettings(settings),
+				// No calibrated joint confidence is supplied for the foreign batch; use a neutral prior.
+				{ visitedPatternIDs: [id], pathProbability: 0.5 });
+			if (!candidates.length) return undefined;
+			const dependencies = batch.map(({ identity }) => ({ proposalID: identity.proposalID, actionID: identity.actionID,
+				identity: identity.id, condition: "execution_succeeded" as const }));
+			return { id, source: "pattern_aware", revision: 0, actions: candidates.map((candidate) =>
+				patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity), dependencies)) };
 		},
 		continue: async ({
 			startInput,
@@ -144,25 +172,9 @@ export function createPatternPlanSource(input: {
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
 			const action = adoptedAction ?? candidate;
-			const observation = projectPatternAwareObservation(
-				output.result,
-				extractOutputPaths(action.key.tool, action.input, output.result),
-				input.cwd,
-			);
 			const next = context.store.continue(
 				context.continuation,
-				{
-					sessionID: startInput.sessionID,
-					turnID: startInput.turnID,
-					tool: action.key.tool,
-					input: structuredClone(action.input) as Record<string, unknown>,
-					outcome: output.isError ? "failure" : "success",
-					...observation,
-					durationMs: candidateExecutionMs(candidate),
-					schemaHash: action.key.schemaHash,
-					...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
-					learnTarget: false,
-				},
+				predictedEvent(startInput, action, output, candidateExecutionMs(candidate)),
 				data.schemaHashes,
 				trigger === "actor_adopted",
 				sourceSettings(settings),

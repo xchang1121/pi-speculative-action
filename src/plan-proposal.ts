@@ -3,6 +3,9 @@ export type PlanActionDependencyCondition = "execution_settled" | "execution_suc
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
 export interface PlanActionDependency {
 	readonly actionID: string;
+	/** Cross-plan edges must pin the parent's immutable identity as well as its proposal. */
+	readonly proposalID?: string;
+	readonly identity?: string;
 	readonly condition?: PlanActionDependencyCondition;
 }
 
