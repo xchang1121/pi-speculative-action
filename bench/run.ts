@@ -384,30 +384,18 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	}
 	const coveredGoldFiles = goldFiles.filter((file) => changedFiles.includes(file));
 	const turnLimitReached = turnSequence >= input.maxTurns;
+	const { actor, drafter, repoCache, runRoot, output, prepareOnly, ...configuration } = input;
 	return {
 		metadata: {
-			label: input.label,
+			...configuration,
 			implementationCommit,
 			instance: task.row.instance_id,
 			repo: task.row.repo,
 			baseCommit: task.row.base_commit,
 			language: task.row.language,
 			sourceDataset: task.row.source_dataset,
-			actor: `${input.actor.provider}/${input.actor.id}`,
-			actorMaxTokens: input.actorMaxTokens,
-			actorTemperature: input.actorTemperature,
-			drafter: `${input.drafter.provider}/${input.drafter.id}`,
-			candidateLimit: input.candidateLimit,
-			drafterMaxTokens: input.drafterMaxTokens,
-			drafterDeterministicCandidates: input.drafterDeterministicCandidates,
-			drafterTemperatureMin: input.drafterTemperatureMin,
-			drafterTemperatureMax: input.drafterTemperatureMax,
-			drafterEnabled: input.drafterEnabled,
-			maxConcurrentActions: input.maxConcurrentActions,
-			maxTurns: input.maxTurns,
-			timeoutMs: input.timeoutMs,
-			patternAware: input.patternAware,
-			speculationEnabled: input.speculationEnabled,
+			actor: `${actor.provider}/${actor.id}`,
+			drafter: `${drafter.provider}/${drafter.id}`,
 			timingScope: "setup, Agent prompt, terminal settlement, host and workspace disposal",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: {
