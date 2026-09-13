@@ -38,10 +38,15 @@ try {
 			let run: SuiteBenchmarkRun = { instance, repeat, output };
 			try {
 				await mkdir(path.dirname(output), { recursive: true });
-				await execute(process.execPath, [tsx, runner, ...parsed.forwarded, "--instance", instance, "--output", output]);
-				const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
-				run = { ...run, implementationCommit: result.metadata.implementationCommit, summary: result.summary };
-				const errors = Object.values(result.summary.benchmarkErrors ?? {});
+				await writeFile(output, "", { flag: "wx" }); // Only this attempt may supply the result, including after failure.
+				const failed = await execute(process.execPath, [tsx, runner, ...parsed.forwarded, "--instance", instance, "--output", output])
+					.then(() => undefined, (error: unknown) => ({ error }));
+				try {
+					const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
+					run = { ...run, implementationCommit: result.metadata.implementationCommit, summary: result.summary };
+				} catch (error) { if (!failed) throw error; }
+				if (failed) throw failed.error;
+				const errors = Object.values(run.summary?.benchmarkErrors ?? {});
 				if (errors.length) throw new Error(`Benchmark failed: ${errors.join("; ")}`);
 			} catch (error) {
 				run = { ...run, error: String(error) };
