@@ -58,9 +58,9 @@ try {
     report.push(await qualifyNamespace());
   }
   for (const row of rows) {
-    if (selectedCases.size && !selectedCases.has(row.label)) continue;
     const cwd = path.join(root, row.label); await fs.mkdir(cwd);
     for (let i = 0; i < row.files; i++) await fs.writeFile(path.join(cwd, `${i}.txt`), row.contents);
+    if (selectedCases.size && !selectedCases.has(row.label)) continue;
     const tool = createGrepTool(cwd);
     for (const pattern of row.patterns) {
       const args = { path: ".", pattern, limit: pattern === "." ? 1 : 100, ...(pattern.startsWith("(?P") ? { context: 1 } : {}) };
@@ -81,11 +81,12 @@ try {
     }
   }
   if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
-  const cancellation = [{ mode: "limit", ...await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit") }];
+  const cancellationCwd = path.join(root, semanticOnly ? "namespace/search" : "unicode");
+  const cancellation = [{ mode: "limit", ...await qualifyCancellation(cancellationCwd, "limit") }];
   const cancellationRepeats = semanticOnly || costOnly ? 1 : 20;
   for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
-    cancellation.push({ mode, repeat, ...await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode) });
+    cancellation.push({ mode, repeat, ...await qualifyCancellation(cancellationCwd, mode) });
   }
   assert.equal(referenceClosed, referenceProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
