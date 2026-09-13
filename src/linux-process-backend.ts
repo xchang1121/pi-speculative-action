@@ -21,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import {
 	createExecPrototype,
 	digestObject,
@@ -71,6 +72,7 @@ import {
 	resolveLinuxExecHelper,
 	type HeldExecDecision,
 	type HeldExecProcess,
+	type HeldExecSnapshot,
 } from "./linux-held-exec.ts";
 import {
 	emptyWorldReuseMetrics,
@@ -955,26 +957,10 @@ export class LinuxProcessReuseBackend {
 				return { kind: "continue" };
 			}
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
-			const prototype = createExecPrototype({
-				executablePath: projection.toLogical(snapshot.executable),
-				executableDigest: await hashExecutableFile(`/proc/${process.pid}/exe`),
-				argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
-				logicalCwd: projection.toLogical(snapshot.cwd),
-				environment: Object.fromEntries(
-					Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)]),
-				),
-				umask: snapshot.context.umask,
-				processContextDigest: sha256Digest(snapshot.context.key),
-				stdin: { type: "closed", eof: true },
-				fileDescriptorTableComplete: true,
-				inheritedFDs: snapshot.context.descriptorTypes.map((type, fd) => ({
-					fd,
-					type,
-					flagsDigest: sha256Digest(`${snapshot.context.key}\0${fd}`),
-					...(fd === 0 ? { eof: true } : {}),
-				})),
-				platformFingerprint: await this.resolvePlatformFingerprint(),
-			});
+			const prototype = bufferedProcessPrototype(
+				snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`),
+				await this.resolvePlatformFingerprint(),
+			);
 			const weakKey = processWeakKey(prototype);
 			const timing = processTimingIdentity(prototype, weakKey);
 			const accepted = (producer: ProcessProducerProof) =>
@@ -1317,31 +1303,43 @@ export class LinuxProcessReuseBackend {
 		outputRoute: OutputRoute,
 	): Promise<ExecPrototype> {
 		const [executableDigest, ready] = await Promise.all([hashExecutableFile(executable), this.resolveReady()]);
-		const context = routedExecutionContext(ready.executionContext, outputRoute);
-		const contextDigest = sha256Digest(context.key);
-		const environment = Object.fromEntries(
-			Object.entries(request.environment).map(([name, value]) => [
-				name,
-				session.projection.normalizeValue(value),
-			]),
-		);
-		const argv = [request.argv0, ...request.args].map((value) => session.projection.normalizeValue(value));
-		return createExecPrototype({
-			executablePath: session.projection.toLogical(executable),
-			executableDigest,
-			argv,
-			logicalCwd: session.projection.toLogical(request.cwd),
-			environment,
-			umask: context.umask,
-			processContextDigest: contextDigest,
-			stdin: { type: "closed", eof: true },
-			fileDescriptorTableComplete: true,
-			inheritedFDs: context.descriptorTypes.map((type, fd) => ({
-				fd, type, flagsDigest: sha256Digest(`${context.key}\0${fd}`), ...(fd === 0 ? { eof: true } : {}),
-			})),
-			platformFingerprint: ready.platformFingerprint,
-		});
+		return bufferedProcessPrototype({
+			executable,
+			argv: [request.argv0, ...request.args],
+			cwd: request.cwd,
+			environment: request.environment,
+			context: routedExecutionContext(ready.executionContext, outputRoute),
+		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
+}
+
+function bufferedProcessPrototype(
+	snapshot: HeldExecSnapshot,
+	projection: ExecutionPathProjection,
+	executableDigest: Sha256Digest,
+	platformFingerprint: string,
+): ExecPrototype {
+	const { context } = snapshot;
+	return createExecPrototype({
+		executablePath: projection.toLogical(snapshot.executable),
+		executableDigest,
+		argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
+		logicalCwd: projection.toLogical(snapshot.cwd),
+		environment: Object.fromEntries(
+			Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)]),
+		),
+		umask: context.umask,
+		processContextDigest: sha256Digest(context.key),
+		stdin: { type: "closed", eof: true },
+		fileDescriptorTableComplete: true,
+		inheritedFDs: context.descriptorTypes.map((type, fd) => ({
+			fd,
+			type,
+			flagsDigest: sha256Digest(`${context.key}\0${fd}`),
+			...(fd === 0 ? { eof: true } : {}),
+		})),
+		platformFingerprint,
+	});
 }
 
 function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
@@ -2558,14 +2556,6 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw signal.reason ?? new Error("aborted");
 }
 
-function missing(error: unknown): boolean {
-	return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
 function permissionDenied(error: unknown): boolean {
 	return Boolean(error && typeof error === "object" && "code" in error && (error.code === "EACCES" || error.code === "EPERM"));
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }

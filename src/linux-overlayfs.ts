@@ -16,6 +16,7 @@ import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { advanceFilesystemClock } from "./filesystem-evidence.ts";
+import { errorMessage, isMissing } from "./error-utils.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
@@ -612,12 +613,4 @@ function assertOverlayOptionPath(value: string): void {
 	if (!path.isAbsolute(value) || /[,\n\r\0:]/.test(value)) {
 		throw new Error(`OverlayFS path cannot be encoded safely: ${value}`);
 	}
-}
-
-function isMissing(error: unknown): boolean {
-	return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }
