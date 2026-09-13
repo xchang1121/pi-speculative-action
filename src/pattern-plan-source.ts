@@ -4,7 +4,6 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionSemanticsRegistry } from "./action-semantics.ts";
 import {
 	agentBatchKey,
-	definitionSchemaHashes,
 	type AgentPlanSource,
 	type AgentStartInput,
 } from "./agent-runtime-types.ts";
@@ -116,14 +115,14 @@ export function createPatternPlanSource(input: {
 		enabled: (settings) => sourceSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
-		propose: async ({ startInput, settings, definitions, signal }) => {
+		propose: async ({ startInput, data, settings, signal }) => {
 			const patternSettings = sourceSettings(settings);
 			if (!patternSettings.enabled) return undefined;
 			await analysisTail;
 			if (signal.aborted) return undefined;
 			const store = await resolveStore(settings);
 			if (signal.aborted) return undefined;
-			const candidates = store.predict(startInput.sessionID, definitionSchemaHashes(definitions), patternSettings);
+			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
 			const signature = patternPredictionSignature(candidates);
 			const carried = carriedPredictions.get(startInput.sessionID);
 			carriedPredictions.delete(startInput.sessionID);
@@ -191,10 +190,10 @@ export function createPatternPlanSource(input: {
 				),
 			};
 		},
-		observe: async ({ startInput, data, settings, consumeInput, tool, concrete, output, durationMs, order }) => {
+		observe: async ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => {
 			const patternSettings = sourceSettings(settings);
 			if (!patternSettings.enabled) return undefined;
-			const definition = startInput.tools.find((item) => item.name === tool);
+			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const observation = projectPatternAwareObservation(
 				output?.result,
 				extractOutputPaths(tool, concrete, output?.result),
@@ -211,7 +210,7 @@ export function createPatternPlanSource(input: {
 				...observation,
 				durationMs,
 				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
-				...(definition ? { schemaHash: stableValueHash(definition.parameters) } : {}),
+				...(schemaHash === undefined ? {} : { schemaHash }),
 				learnTarget: candidateToolNames(settings, input.actionSemantics).includes(tool),
 			};
 			batch.set(order, event);
