@@ -62,10 +62,14 @@ const MUTATION_ROUTE: SpeculativeExecutionRoute = {
 
 type Source<SessionID = string> = SpeculativePlanSource<SessionID, string, Start<SessionID>, Call<SessionID>, { readonly cwd: string }>;
 
-function plan(source: string, proposalID: string, input: Record<string, unknown>) {
+function planSource(source: Omit<Source, "id" | "enabled"> & Partial<Pick<Source, "enabled">>): Source {
+	return { id: "source", enabled: () => true, ...source };
+}
+
+function plan(proposalID: string, input: Record<string, unknown> = { path: "README.md" }) {
 	return {
 		id: proposalID,
-		source,
+		source: "source",
 		revision: 0,
 		actions: [{ id: "next", type: "tool_call" as const, tool: "read", input, feedback: proposalID }],
 	};
@@ -79,21 +83,19 @@ function futureReadSource(
 	} = {},
 ): Source {
 	const { subsequent = "empty", ...action } = options;
-	return {
-		id: "source",
-		enabled: () => true,
+	return planSource({
 		propose: ({ startInput }) =>
 			startInput.turnID === "turn-1"
 				? {
-						...plan("source", "future", { path: "future.ts" }),
+						...plan("future", { path: "future.ts" }),
 						actions: [
 							{ id: "next", type: "tool_call", tool: "read", input: { path: "future.ts" }, horizon: 0, ...action },
 						],
 					}
 				: subsequent === "placeholder"
-					? plan("source", `empty:${startInput.turnID}`, {})
+					? plan(`empty:${startInput.turnID}`, {})
 					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
-	};
+	});
 }
 
 function childPlanUpdate(
@@ -257,9 +259,9 @@ describe("structural speculative runtime", () => {
 		const calls = [call("same-turn"), call("same-turn")], preparing = barrier(), gate = barrier();
 		const closed: Start[] = [], predicted: Start[] = [], prediction = barrier();
 		const fixture = harness({
-			source: { id: "source", enabled: () => true, propose: ({ startInput }) => {
+			source: planSource({ propose: ({ startInput }) => {
 				predicted.push(startInput); prediction.arrive(); return undefined;
-			} },
+			} }),
 			stateData: async (input) => { if (input === calls[0]) { preparing.arrive(); await gate.promise; } return { cwd: "/workspace" }; },
 			onTurnFinished: ({ startInput }) => { closed.push(startInput); },
 		});
@@ -330,19 +332,17 @@ describe("structural speculative runtime", () => {
 				{ id: "slow", type: "tool_call" as const, tool: "read", input: { path: "slow.ts" } },
 				{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "same-plan.ts" } },
 			] },
-			plan("source", "proposal:1", { path: "other-plan.ts" }),
+			plan("proposal:1", { path: "other-plan.ts" }),
 		];
-		const revisions = [proposals[0]!, { ...plan("source", "proposal:0", { path: "replacement.ts" }), revision: 1 }, proposals[1]!];
+		const revisions = [proposals[0]!, { ...plan("proposal:0", { path: "replacement.ts" }), revision: 1 }, proposals[1]!];
 		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, remove: ["slow"],
 			upsert: [{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "replacement.ts" } }] }, proposals[1]!];
 		const revised = mode === "revisions" || mode === "observed";
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			proposalCount: () => mode === "requests" ? 2 : 1,
 			propose: ({ proposalIndex }) => mode === "observed" ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
 			observe: ({ concrete }) => mode === "observed" && concrete.path === "seed.ts" ? observed : undefined,
-		};
+		});
 		const fixture = harness({
 			source,
 			actionKey: async (tool, args, context) => {
@@ -399,22 +399,20 @@ describe("structural speculative runtime", () => {
 		const settlements: PredictionSettlement[] = [];
 		const issued = vi.fn(), admitted = vi.fn();
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));
-		const offered = { ...plan("source", "stale", {}), draftTokens: 3 };
+		const offered = { ...plan("stale", {}), draftTokens: 3 };
 		offered.actions[0]!.input = {
 			get path() {
 				offered.draftTokens = 99;
 				return "README.md";
 			},
 		};
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			propose: () => offered,
 			onIssued: issued, onAdmitted: admitted,
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
-		};
+		});
 		const candidateReady = candidateSucceeded();
 		const fixture = harness({
 			source,
@@ -463,11 +461,9 @@ describe("structural speculative runtime", () => {
 						metrics: zeroValidationMetrics(),
 					},
 		);
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "in-flight", { path: "README.md" }),
-		};
+		const source = planSource({
+			propose: () => plan("in-flight"),
+		});
 		const fixture = harness({
 			source,
 			capture: () => {
@@ -493,11 +489,10 @@ describe("structural speculative runtime", () => {
 		const gate = barrier();
 		const executionStarted = barrier();
 		const candidateReady = candidateSucceeded();
-		const source: Source = {
-			id: "source",
+		const source = planSource({
 			enabled: () => enabled,
-			propose: () => plan("source", "bounded-join", { path: "README.md" }),
-		};
+			propose: () => plan("bounded-join"),
+		});
 		const fixture = harness({
 			source,
 			execute: async () => {
@@ -551,17 +546,15 @@ describe("structural speculative runtime", () => {
 		const executed: string[] = [];
 		let configured = settings, validations = 0;
 		const refreshes = late || mode === "refresh" || mode === "replaced" || mode === "evicted";
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			propose: ({ startInput }) => startInput.turnID === "turn-3" ? undefined : (late && startInput.turnID === "turn-2"
-				? ["first", "second"] : [startInput.turnID]).map((id) => plan("source", id, { path: "README.md" })),
+				? ["first", "second"] : [startInput.turnID]).map((id) => plan(id)),
 			continueOn: ["execution_succeeded"],
 			continue: ({ output }) => { if (output !== "generation:1") { outputs.push(output); continued.arrive(); } return undefined; },
 			observe: ({ concrete }) => mode === "replaced" && concrete.path === "replace.ts"
 				? { proposalID: "turn-2", source: "source", revision: 1,
 					upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }] } : undefined,
-		};
+		});
 		const fixture = harness({
 			source,
 			settings: () => configured,
@@ -638,16 +631,16 @@ describe("structural speculative runtime", () => {
 				try {
 					await finish.promise;
 					if (mode === "disposed") throw new Error("late producer failure");
-					return plan("source", "late", { path: "late.ts" });
+					return plan("late", { path: "late.ts" });
 				}
 				finally { await cleanup(); }
 			})();
 			const fixture = harness({
-				source: { id: "source", enabled: () => !observing,
+				source: planSource({ enabled: () => !observing,
 					timeoutMs: () => mode === "terminal" ? 0 : undefined,
-					propose: ({ signal }) => phase === "prediction" ? produce(signal) : plan("source", "late", { path: "README.md" }),
+					propose: ({ signal }) => phase === "prediction" ? produce(signal) : plan("late"),
 					...(phase === "continuation" ? { continue: ({ signal }: { signal: AbortSignal }) => produce(signal) } : {}),
-				},
+				}),
 				execute: async (_tool, _input, signal) => {
 					signal.addEventListener("abort", () => cancelled.arrive(), { once: true }); started.arrive();
 					if (phase === "running") await finish.promise;
@@ -704,21 +697,21 @@ describe("structural speculative runtime", () => {
 				return buildPiActionKey(tool, args, "/workspace");
 			});
 			const fixture = harness({
-				source: {
-					id: "source", enabled: () => true, proposalCount: () => 3,
+				source: planSource({
+					proposalCount: () => 3,
 					concurrentProposalPolicy: () => "first_produced",
 					propose: async ({ proposalIndex, signal }) => {
 						signal.addEventListener("abort", () => { aborted.push(proposalIndex); abortReasons[proposalIndex] = signal.reason.code; }, { once: true });
 						entered.arrive();
 						await entered.promise;
-						if (proposalIndex === 0) return mode === "empty" ? undefined : plan("source", "first", { path: "first.ts" });
+						if (proposalIndex === 0) return mode === "empty" ? undefined : plan("first", { path: "first.ts" });
 						if (proposalIndex === 1) {
 							await winner.promise;
-							return plan("source", "winner", { path: "README.md" });
+							return plan("winner");
 						}
 						return new Promise<undefined>((resolve) => signal.addEventListener("abort", () => resolve(undefined), { once: true }));
 					},
-				},
+				}),
 				actionKey: key,
 				onCandidateMaterialized: ({ input }) => { materialized.push(String(input.path)); },
 				onEvent: (event) => {
@@ -765,9 +758,9 @@ describe("structural speculative runtime", () => {
 			? validResource()
 			: { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() };
 		const fixture = harness({
-			source: { id: "source", enabled: () => true, continueOn: ["execution_succeeded"],
-				propose: ({ startInput }) => startInput.turnID === "second" ? plan("source", "recall", { path: "README.md" }) : undefined,
-				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } },
+			source: planSource({ continueOn: ["execution_succeeded"],
+				propose: ({ startInput }) => startInput.turnID === "second" ? plan("recall") : undefined,
+				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } }),
 			resolveExecution: () => mode === "exclusive" ? MUTATION_ROUTE : mode === "same" ? RESOURCE_ROUTE
 				: { ...RESOURCE_ROUTE, isolation: "runtime_sandbox", scope: "runtime", backend: "alternate", fingerprint: "alternate:v1" },
 			execute: () => { now += 6; return world(`fresh:${version}`, {
@@ -818,20 +811,18 @@ describe("structural speculative runtime", () => {
 		const admissionEntered = barrier();
 		const admission = barrier();
 		const requestsSettled = barrier(2);
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			requestLifetime: "actor_decision",
 			proposalCount: () => 2,
 			propose: ({ proposalIndex, signal }) => {
 				entered++;
 				proposalsEntered.arrive();
-				if (proposalIndex === 0) return plan("source", "empty", { path: "other.ts" });
+				if (proposalIndex === 0) return plan("empty", { path: "other.ts" });
 				return new Promise((_, reject) => {
 					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
 				});
 			},
-		};
+		});
 		const fixture = harness({
 			source,
 			preflight: async () => {
@@ -869,13 +860,13 @@ describe("structural speculative runtime", () => {
 			if (!result.admitted && forecasts.length === (mode === "future" ? 2 : 1)) queued.arrive();
 			return result;
 		});
-		const proposal = () => ({ ...plan("source", "demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) => ({
+		const proposal = () => ({ ...plan("demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) => ({
 					id: String(horizon), type: "tool_call" as const, tool: "read", input: { path: "README.md" }, horizon, expectedDurationMs: 500,
 				})) });
 		const fixture = harness({
-			source: { id: "source", enabled: () => true,
+			source: planSource({
 				propose: ({ startInput }) => mode !== "next-terminal" && startInput.turnID === "demand" ? proposal() : undefined,
-				observe: ({ consumeInput }) => mode === "next-terminal" && consumeInput.turnID === "demand" ? proposal() : undefined },
+				observe: ({ consumeInput }) => mode === "next-terminal" && consumeInput.turnID === "demand" ? proposal() : undefined }),
 			onCandidateMaterialized: () => materialized.arrive(),
 			onEvent: succeeded.observe,
 		});
@@ -920,12 +911,12 @@ describe("structural speculative runtime", () => {
 			});
 			const speculative = mode === "producer" || mode === "preview";
 			const fixture = harness({
-				source: { id: "source", enabled: () => true, propose: () => [
+				source: planSource({ propose: () => [
 					{ id: "busy", source: "source", revision: 0, actions: [
 						{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" }, expectedLatencyBenefitMs: speculative ? 0 : 1 }] },
 					...(mode === "preview" ? [] : [{ id: "target", source: "source", revision: 0, actions: [
 						{ id: "target", type: "tool_call" as const, tool: "read", input: { path: "target.ts" }, resourceDemand: mode === "queued" ? 2 : 1 }] }]),
-				] },
+				] }),
 				settings: () => ({ ...settings, maxConcurrentActions: mode === "running" ? 2 : 1 }),
 				actionKey: async (tool, args) => { if ((args as { path: string }).path === "target.ts") await busyStarted.promise; return buildPiActionKey(tool, args, "/workspace"); },
 				execute: async (_tool, input, signal) => {
@@ -992,8 +983,8 @@ describe("structural speculative runtime", () => {
 			return scenario === "uncovered" ? undefined : "narrow";
 		});
 		const fixture = harness({
-			source: { id: "source", enabled: () => true,
-				propose: () => plan("source", "projection", { path: "README.md", offset: 1, limit: 100 }) },
+			source: planSource({
+				propose: () => plan("projection", { path: "README.md", offset: 1, limit: 100 }) }),
 			projection,
 			authorize: () => { authorized.arrive(); return { ok: true }; },
 			execute: async () => { started.arrive(); if (running) await completion.promise;
@@ -1109,8 +1100,8 @@ describe("structural speculative runtime", () => {
 		const learned = entries === 2 && bytes === 4096;
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return String((args as { offset: number }).offset); });
 		const fixture = harness({
-			source: { id: "source", enabled: () => true, propose: ({ startInput }) => startInput.turnID === "first"
-				? plan("source", "inputs", { path: "input", offset: 1, limit: 1 }) : undefined },
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "first"
+				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
 			execute: () => { now += 10; return { ...world("1", { onDispose: disposed,
 				validate: async () => { now += 3; return validResource(); } }), reconstruct }; },
@@ -1160,7 +1151,7 @@ describe("structural speculative runtime", () => {
 		let executor = "bound", allowed = true;
 		const query = call("turn", { path: "README.md", offset: 10, limit: 1 });
 		const fixture = harness({
-			source: { id: "source", enabled: () => true, propose: () => plan("source", "inputs", { path: "README.md", offset: 1, limit: 1 }) },
+			source: planSource({ propose: () => plan("inputs", { path: "README.md", offset: 1, limit: 1 }) }),
 			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
 			authorize: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
 			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
@@ -1214,13 +1205,11 @@ describe("structural speculative runtime", () => {
 			if (phase === "poisoned") throw poisoned;
 			return "speculative";
 		});
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "claimed", { path: "README.md" }),
+		const source = planSource({
+			propose: () => plan("claimed"),
 			continueOn: ["actor_adopted"], continue: continuation,
 			onSettled: ({ settlement }) => { settlements.push(settlement); },
-		};
+		});
 		const fixture = harness({
 			source,
 			execute: (tool, concrete) => coordinator.execute(coordinator.begin({ tool, callID: "claimed", route: RESOURCE_ROUTE }), async () => ({
@@ -1262,9 +1251,9 @@ describe("structural speculative runtime", () => {
 		const gateway = new ToolExecutionGateway<undefined, string>([]), executeActor = vi.fn(async () => "Actor");
 		const settlements: PredictionSettlement[] = [];
 		const fixture = harness({
-			source: { id: "source", enabled: () => true,
-				propose: () => indeterminate ? plan("source", "incompatible", actor.input) : undefined,
-				onSettled: ({ settlement }) => { settlements.push(settlement); } },
+			source: planSource({
+				propose: () => indeterminate ? plan("incompatible", actor.input) : undefined,
+				onSettled: ({ settlement }) => { settlements.push(settlement); } }),
 			execute: async (tool, concrete) => {
 				const fingerprint = buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint;
 				const source = { ...world("speculative", { resources: ["a.txt"], executionFingerprint: fingerprint }), capturedBytes: 1,
@@ -1309,11 +1298,9 @@ describe("structural speculative runtime", () => {
 	it("keeps one turn on its settings snapshot while master disable remains immediate", async () => {
 		let configured = settings;
 		const candidateReady = candidateSucceeded();
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
-			propose: () => plan("source", "epoch", { path: "README.md" }),
-		};
+		const source = planSource({
+			propose: () => plan("epoch"),
+		});
 		const fixture = harness({
 			source,
 			settings: () => configured,
@@ -1432,13 +1419,13 @@ describe("structural speculative runtime", () => {
 		const filtered = mode.startsWith("feedback-");
 		let admissions = 0, proposals = 0, routes = 0;
 		const fixture = harness({
-			source: { id: "source", enabled: () => !dual, proposalCount: () => sourceCount,
+			source: planSource({ enabled: () => !dual, proposalCount: () => sourceCount,
 				continueOn: filtered ? () => { continued.arrive(); if (mode === "feedback-error") throw new Error("feedback failure"); return false; } : ["execution_succeeded"],
 				propose: async ({ startInput, proposalIndex }) => {
 					proposals++; proposed.arrive(); await offered.promise;
-					const proposal = plan("source", `${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
+					const proposal = plan(`${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
 					return mode === "future-prediction" ? { ...proposal, actions: proposal.actions.map((action) => ({ ...action, horizon: 3, expectedDurationMs: 10 })) } : proposal;
-				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } },
+				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } }),
 			preflight: async (_signal, draft) => {
 				if (draft.source === "actor_preview" && (mode === "late-prediction" || dual)) {
 					if (++admissions === (dual ? 2 : 1)) admitted.arrive(); await admissionGate.promise;
@@ -1516,8 +1503,8 @@ describe("structural speculative runtime", () => {
 		const entered = barrier(), gate = barrier(), ready = candidateSucceeded(), refreshed = candidateSucceeded(2), disposed = barrier(), commit = vi.fn();
 		let configured = settings, executions = 0, authorizations = 0, allowOld = false;
 		const fixture = harness({
-			source: { id: "source", enabled: () => true,
-				propose: ({ startInput }) => startInput.turnID.startsWith("producer") ? plan("source", startInput.turnID, { path: "README.md" }) : undefined },
+			source: planSource({
+				propose: ({ startInput }) => startInput.turnID.startsWith("producer") ? plan(startInput.turnID) : undefined }),
 			settings: () => configured,
 			actionKey: async (tool, args, context) => {
 				if (phase === "binding" && context.type === "consume") { entered.arrive(); await gate.promise; }
@@ -1605,9 +1592,7 @@ describe("structural speculative runtime", () => {
 		const predictedInput = projected ? { path: "README.md", offset: 1, limit: 100 } : { command: "build" };
 		const actionCount = horizons.length * proposalIDs.length, routeChecked = barrier(actionCount);
 		const project = vi.fn(READ_RANGE_ACTION_KEY_PROJECTOR.project);
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			propose: ({ startInput }) => startInput.turnID !== "turn-1" ? undefined : proposalIDs.map((id) => ({
 				id, source: "source", revision: 0,
 				actions: horizons.map((horizon, index) => ({
@@ -1615,7 +1600,7 @@ describe("structural speculative runtime", () => {
 				})),
 			})),
 			onSettled: ({ settlement }) => { settlements.push(settlement); },
-		};
+		});
 		const fixture = harness({
 			source,
 			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, project },
@@ -1676,12 +1661,10 @@ describe("structural speculative runtime", () => {
 		const continuationStarted = barrier();
 		const childReady = candidateSucceeded(1, "child.ts");
 		const settlements: PredictionSettlement[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			requestLifetime: "actor_decision",
 			continueOn: ["actor_adopted"],
-			propose: () => plan("source", "parallel-continuation", { path: "parent.ts" }),
+			propose: () => plan("parallel-continuation", { path: "parent.ts" }),
 			continue: async ({ proposalID, revision, trigger }) => {
 				if (trigger !== "actor_adopted") return undefined;
 				continuationStarted.arrive();
@@ -1703,7 +1686,7 @@ describe("structural speculative runtime", () => {
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
-		};
+		});
 		const fixture = harness({
 			source,
 			execute: (_tool, input) => {
@@ -1756,13 +1739,11 @@ describe("structural speculative runtime", () => {
 		let proposals = 0;
 		const continuations: string[] = [];
 		const executed: string[] = [];
-		const source: Source = {
-			id: "source",
-			enabled: () => true,
+		const source = planSource({
 			proposalCount: () => 1,
 			propose: () => {
 				proposals++;
-				return plan("source", "cross-turn", { path: "parent.ts" });
+				return plan("cross-turn", { path: "parent.ts" });
 			},
 			continue: async ({ proposalID, actionID, revision, candidate, trigger }) => {
 				if (String(candidate.input.path) !== "parent.ts") return undefined;
@@ -1778,7 +1759,7 @@ describe("structural speculative runtime", () => {
 				proposalID: "cross-turn", source: "source", revision: 2,
 				upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }],
 			} : undefined,
-		};
+		});
 		const fixture = harness({
 			source,
 			execute: (_tool, input) => {
@@ -1825,15 +1806,14 @@ describe("structural speculative runtime", () => {
 		const childPrepared = barrier();
 		const executed: string[] = [];
 		const childReady = candidateSucceeded(1, "late.ts");
-		const source: Source = {
-			id: "source",
+		const source = planSource({
 			enabled: () => enabled,
-			propose: () => plan("source", "conditional", { path: "parent.ts" }),
+			propose: () => plan("conditional", { path: "parent.ts" }),
 			continue: async ({ proposalID, actionID, revision, trigger }) => {
 				if (trigger !== "execution_succeeded") return undefined;
 				return childPlanUpdate({ proposalID, actionID, revision }, "late-child", "late.ts");
 			},
-		};
+		});
 		const fixture = harness({
 			source,
 			preflight: (_signal, candidate) => {
@@ -1888,8 +1868,7 @@ describe("structural speculative runtime", () => {
 		const parentAction = (content: string) => ({ id: "parent", type: "tool_call" as const, tool: "write", input: { path: `${content}.txt`, content } });
 		const childAction = { id: "child", type: "tool_call" as const, tool: "write", input: { path: "child.txt", content: "child" },
 			expectedDurationMs: 1_000, dependsOn: [{ actionID: "parent", condition: "execution_succeeded" as const }] };
-		const source: Source = {
-			id: "source",
+		const source = planSource({
 			enabled: () => enabled,
 			proposalCount: () => 2,
 			continueOn: ["execution_succeeded"],
@@ -1907,7 +1886,7 @@ describe("structural speculative runtime", () => {
 				if (String(candidate.input.content).startsWith("child")) return undefined;
 				return { proposalID, source: "source", revision, upsert: [childAction] };
 			},
-		};
+		});
 		const fixture = harness({
 			source,
 			actionKey: async (tool, input, context) => {
