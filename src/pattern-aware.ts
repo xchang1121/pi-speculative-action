@@ -537,9 +537,7 @@ export class PatternAwareStore {
 		authoritative = true,
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
-		const predictiveHistory = history;
-		const activeSessionID = predictiveHistory.at(-1)?.sessionID;
-		const result: PatternAwareCandidate[] = [];
+		const activeSessionID = history.at(-1)?.sessionID;
 		const groups = new Map<
 			string,
 			Array<{
@@ -549,7 +547,7 @@ export class PatternAwareStore {
 			}>
 		>();
 		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(predictiveHistory)) {
+		for (const { pattern, context } of this.trie.matching(history)) {
 			const patternID = pattern.id;
 			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
 				continue;
@@ -590,6 +588,15 @@ export class PatternAwareStore {
 		const estimatePpm = (tool: string) => (ppmEstimates ??=
 			this.sequenceModel.distribution(history.map((event) => signatureToken(signature(event))),
 				this.clock, settings.decayHalfLifeEvents)).get(tool);
+		const contextEvidence = new Map<number, Map<string, number>>();
+		for (const group of groups.values()) for (const { pattern } of group) {
+			const gaps = contextEvidence.get(pattern.context.length) ?? new Map<string, number>();
+			const evidence = pattern.historicalOpportunities * recencyWeight(pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
+			for (const [gap, count] of Object.entries(pattern.gapCounts)) {
+				if (count > 0 && Number(gap) <= settings.maxFutureGap) gaps.set(gap, Math.max(gaps.get(gap) ?? 0, evidence));
+			}
+			contextEvidence.set(pattern.context.length, gaps);
+		}
 		const predictions = [...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
@@ -599,7 +606,7 @@ export class PatternAwareStore {
 			const representative = ordered[0]!;
 			const patterns = ordered.map((item) => item.pattern);
 			const { horizon, latestHorizon, gapCoverage } = groupGapTiming(patterns, settings, this.clock);
-			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents);
+			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents, contextEvidence);
 			const targetTool = representative.pattern.targetTool;
 			const ppmEstimate = estimatePpm(targetTool);
 			let totalWeight = 0, weightedVariants = 0, weightedDuration = 0;
@@ -695,7 +702,10 @@ export class PatternAwareStore {
 		);
 		const continuationHistory = selected.length ? structuredClone(history) : [];
 		const emittedPerTool = new Map<string, number>();
-		for (const prediction of selected) {
+		return selected.map((prediction): PatternAwareCandidate => {
+			const { input, dependencies, background, context, recurrentFeedback, ppmEstimate,
+				mapperConfidence, variantProbability, gapCoverage, replayProbability, ...candidate } = prediction;
+			const { type: _type, actionIdentity: _identity, supportingPatternIDs, ...diagnostic } = candidate;
 			const beamRank = (emittedPerTool.get(prediction.tool) ?? 0) + 1;
 			emittedPerTool.set(prediction.tool, beamRank);
 			const nextContinuation: PatternAwareContinuation = {
@@ -703,61 +713,41 @@ export class PatternAwareStore {
 				visitedPatternIDs: [...continuation.visitedPatternIDs, prediction.patternID],
 				pathProbability: prediction.empiricalProbability,
 			};
-			if (prediction.recurrentFeedback) this.recurrentFeedback.set(nextContinuation, prediction.recurrentFeedback);
-			result.push({
-				type: "tool_call",
+			if (recurrentFeedback) this.recurrentFeedback.set(nextContinuation, recurrentFeedback);
+			return {
+				...candidate,
 				source: "pattern_aware",
-				tool: prediction.tool,
-				input: structuredClone(prediction.input),
-				patternID: prediction.patternID,
-				actionIdentity: prediction.actionIdentity,
-				supportingPatternIDs: prediction.supportingPatternIDs,
-				horizon: prediction.horizon,
-				latestHorizon: prediction.latestHorizon,
-				empiricalProbability: prediction.empiricalProbability,
-				conditionalProbability: prediction.conditionalProbability,
-				adoptionProbability: prediction.adoptionProbability,
-				expectedDurationMs: prediction.expectedDurationMs,
-				expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
-				...(prediction.background ? { background: true } : {}),
-				dependencies: structuredClone(prediction.dependencies),
+				input: structuredClone(input),
+				...(background ? { background: true } : {}),
+				dependencies: structuredClone(dependencies),
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
 				diagnostic: JSON.stringify(
 					{
+						...diagnostic,
 						source: "pattern_aware",
-						patternID: prediction.patternID,
-						supportingPatterns: prediction.supportingPatternIDs,
-						context: prediction.context,
-						tool: prediction.tool,
-						input: prediction.input,
-						empiricalProbability: prediction.empiricalProbability,
-						conditionalProbability: prediction.conditionalProbability,
-						adoptionProbability: prediction.adoptionProbability,
-						replayProbability: prediction.replayProbability,
-						horizon: prediction.horizon,
-						latestHorizon: prediction.latestHorizon,
-						ppmProbability: prediction.ppmEstimate?.probability,
-						ppmOrder: prediction.ppmEstimate?.order,
-						ppmEvidence: prediction.ppmEstimate?.evidence,
-						ppmEscapeMass: prediction.ppmEstimate?.escapeMass,
-						mapperConfidence: prediction.mapperConfidence,
-						variantProbability: prediction.variantProbability,
-						expectedLatencyBenefitMs: prediction.expectedLatencyBenefitMs,
-						background: prediction.background === true,
+						supportingPatterns: supportingPatternIDs,
+						context,
+						input,
+						replayProbability,
+						ppmProbability: ppmEstimate?.probability,
+						ppmOrder: ppmEstimate?.order,
+						ppmEvidence: ppmEstimate?.evidence,
+						ppmEscapeMass: ppmEstimate?.escapeMass,
+						mapperConfidence,
+						variantProbability,
+						background: background === true,
 						beamRank,
 						beamWidth: settings.beamWidth,
-						gapCoverage: prediction.gapCoverage,
-						expectedDurationMs: prediction.expectedDurationMs,
-						dependencies: prediction.dependencies,
+						gapCoverage,
+						dependencies,
 						depth: nextContinuation.visitedPatternIDs.length,
 					},
 					null,
 					2,
 				),
-			});
-		}
-		return result;
+			};
+		});
 	}
 
 	private recurrentPredictions(
@@ -2429,7 +2419,12 @@ function semanticOutputShape(value: unknown) {
 	return hash(stableStringify(discriminants.sort()));
 }
 
-function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number) {
+function backoffProbability(
+	patterns: ReadonlyArray<MutablePattern>,
+	clock: number,
+	halfLife: number,
+	contexts?: ReadonlyMap<number, ReadonlyMap<string, number>>,
+) {
 	const byLength = new Map<number, MutablePattern>();
 	for (const pattern of patterns) {
 		const current = byLength.get(pattern.context.length);
@@ -2437,7 +2432,16 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 			byLength.set(pattern.context.length, pattern);
 	}
 	let estimate = 0.5;
-	for (const pattern of [...byLength.values()].sort((left, right) => left.context.length - right.context.length)) {
+	const gaps = contexts ? [...new Set(patterns.flatMap((pattern) =>
+		Object.entries(pattern.gapCounts).filter(([, count]) => count > 0).map(([gap]) => gap)))] : [];
+	for (const order of [...new Set([...byLength.keys(), ...(contexts?.keys() ?? [])])].sort((left, right) => left - right)) {
+		const pattern = byLength.get(order);
+		if (!pattern) {
+			// An unseen action must escape an observed longer context; require evidence for every supported gap.
+			const evidence = gaps.length ? Math.min(...gaps.map((gap) => contexts?.get(order)?.get(gap) ?? 0)) : 0;
+			if (evidence > 0) estimate /= evidence + 1;
+			continue;
+		}
 		const weight = recencyWeight(pattern.lastSeenSequence, clock, halfLife);
 		const feedback = feedbackEvidence(pattern, clock, halfLife);
 		const opportunities = Math.max(
