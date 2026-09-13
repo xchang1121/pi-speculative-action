@@ -172,8 +172,8 @@ function asConcreteInput(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
 
-function publicCandidate<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function publicCandidate<Output>(
+	candidate: CandidateRecord<Output>,
 ): SpeculativeCandidate {
 	const execution = candidate.work.execution;
 	return {
@@ -186,8 +186,8 @@ function publicCandidate<Output, StartInput, StateData>(
 	};
 }
 
-function predictionCandidate<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function predictionCandidate<Output>(
+	candidate: CandidateRecord<Output>,
 	node: PlanRuntimeNode,
 ): SpeculativeCandidate {
 	return {
@@ -197,17 +197,17 @@ function predictionCandidate<Output, StartInput, StateData>(
 		conditionalProbability: node.action.conditionalProbability,
 		depth: node.action.depth,
 		planDependencies: node.action.dependsOn,
-	} as unknown as SpeculativeCandidate;
+	};
 }
 
-function activeExecution<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function activeExecution<Output>(
+	candidate: CandidateRecord<Output>,
 ): boolean {
 	return candidate.work.execution.status !== "failed" && candidate.work.execution.status !== "cancelled";
 }
 
-function candidateBranch<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function candidateBranch<Output>(
+	candidate: CandidateRecord<Output>,
 ): WorldBranch<Output> | undefined {
 	const execution = candidate.work.execution;
 	return execution.status === "succeeded" ? execution.output : undefined;
@@ -228,8 +228,8 @@ function captureCoverage<Output>(
 	});
 }
 
-async function projectOutput<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+async function projectOutput<Output>(
+	candidate: CandidateRecord<Output>,
 	actor: ActionKey,
 	output: Output,
 	match: ActionKeyMatch,
@@ -280,8 +280,8 @@ function outputIsError(value: unknown): boolean {
 	return Boolean(value && typeof value === "object" && (value as { readonly isError?: unknown }).isError === true);
 }
 
-function candidateEventDescriptor<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function candidateEventDescriptor<Output>(
+	candidate: CandidateRecord<Output>,
 ): CandidateEventDescriptor {
 	const branch = candidateBranch(candidate);
 	return {
@@ -309,8 +309,8 @@ function candidateEventDescriptor<Output, StartInput, StateData>(
 	};
 }
 
-function candidateExecutionProjection<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function candidateExecutionProjection<Output>(
+	candidate: CandidateRecord<Output>,
 ): CandidateExecutionProjection | undefined {
 	const state = candidate.work.execution;
 	if (state.status === "queued") return undefined;
@@ -331,8 +331,8 @@ function candidateExecutionProjection<Output, StartInput, StateData>(
 	};
 }
 
-function candidateCacheValue<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function candidateCacheValue<Output>(
+	candidate: CandidateRecord<Output>,
 	evidence: ResultCacheEvidence,
 	now: number,
 ): number {
@@ -352,8 +352,8 @@ function candidateCacheValue<Output, StartInput, StateData>(
 	);
 }
 
-function executionDuration<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>,
+function executionDuration<Output>(
+	candidate: CandidateRecord<Output>,
 ): number {
 	const execution = candidate.work.execution;
 	return "executionMs" in execution ? execution.executionMs : 0;
@@ -372,8 +372,8 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 }
 
 /** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
-function retainResultView<Output, StartInput, StateData>(
-	candidate: CandidateRecord<Output, StartInput, StateData>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
+function retainResultView<Output>(
+	candidate: CandidateRecord<Output>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
 	settings: SpeculativeActionSettings,
 ): boolean {
 	if (!projection.execution || candidate.resultViews?.has(action.key)) return false;
@@ -451,7 +451,7 @@ interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> extends R
 	readonly slot?: SourceRequestSlot;
 }
 
-interface CandidateRecord<Output, StartInput, StateData> {
+interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	readonly id: string;
 	readonly origin: "prediction" | "actor_preview" | "actor_result";
 	readonly key: ActionKey;
@@ -576,7 +576,7 @@ class StructuralRuntimeState<
 	readonly sessions = new Map<SessionID, SessionState<SessionID, Output, StartInput, StateData>>();
 	masterEnabled: boolean | undefined;
 
-	private readonly emitEvent: (event: SpeculativeActionEvent<SessionID>) => Promise<void>;
+	private readonly emitEvent: (event: SpeculativeActionEvent<SessionID>) => void | Promise<void>;
 
 	constructor(adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>) {
 		this.semantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
@@ -588,13 +588,7 @@ class StructuralRuntimeState<
 		}
 		this.projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], this.semantics);
 		this.candidates = new CandidateStore(this.projectionRules, candidateCacheValue);
-		this.emitEvent = async (event) => {
-			try {
-				await adapter.onEvent?.(event);
-			} catch {
-				// Events are projections and cannot mutate settlement.
-			}
-		};
+		this.emitEvent = (event) => adapter.onEvent?.(event);
 	}
 
 	masterDisabled(): boolean {
@@ -2181,20 +2175,18 @@ export function makeStructuralSpeculativeActionRuntime<
 			(settlement.provider.kind === "speculative"
 				? runtimeState.candidates.get(state.sessionID, settlement.provider.candidateID)
 				: undefined);
-		const settledCandidateDescriptor = settledCandidate
+		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
 			? Object.freeze(candidateEventDescriptor(settledCandidate))
 			: undefined;
-		const event: SpeculativeActionEvent<SessionID> = {
+		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: "actor_action",
+			...eventEnvelope(state.session, state.turnID, state.settings),
 			sessionID: state.sessionID,
-			turnID: state.turnID,
-			timestamp: Date.now(),
-			cache: cacheSnapshot(state.session, state.settings),
 			settlement,
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
 			...(settledCandidate ? { execution: settledCandidate.route.isolation } : {}),
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
-		};
+		} : undefined;
 		state.session.effects.enqueue(async () => {
 			try {
 				await adapter.onActorActionSettled?.({
@@ -2208,7 +2200,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			} catch {
 				// Policy feedback cannot alter authoritative settlement or source learning.
 			}
-			state.session.events.enqueue(event);
+			if (event) state.session.events.enqueue(event);
 			const concrete = asConcreteInput(actualCall.input) ?? {};
 			for (const source of runtimeState.sources) {
 				if (!source.observe || !source.enabled(state.settings)) continue;
@@ -2277,14 +2269,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const source = runtimeState.sourcesByID.get(context.identity.source);
-		const event: SpeculativeActionEvent<SessionID> = {
+		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: "prediction",
-			sessionID: session.id,
-			turnID: context.startInput.turnID,
-			timestamp: Date.now(),
-			cache: cacheSnapshot(session, context.settings),
+			...eventEnvelope(session, context.startInput.turnID, context.settings),
 			settlement,
-		};
+		} : undefined;
 		session.effects.enqueue(async () => {
 			try {
 				await adapter.onPredictionSettled?.({
@@ -2297,7 +2286,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			} catch {
 				// Policy feedback is a projection of settlement, never its owner.
 			}
-			session.events.enqueue(event);
+			if (event) session.events.enqueue(event);
 			try {
 				if (source?.onSettled) {
 					await source.onSettled({
@@ -2931,19 +2920,21 @@ export function makeStructuralSpeculativeActionRuntime<
 		};
 	};
 
+	/** Capture at the state transition; policy callbacks may delay delivery but cannot change the snapshot. */
+	const eventEnvelope = (session: Session, turnID: string, settings: SpeculativeActionSettings) => ({
+		sessionID: session.id,
+		turnID,
+		timestamp: Date.now(),
+		cache: cacheSnapshot(session, settings),
+	});
+
 	const queueTaskEvent = (session: Session, turnID: string, completedAt: number): void => {
-		if (!session.timeline) return;
-		const timing = session.timeline.measure(completedAt);
+		const timeline = session.timeline;
+		if (!timeline) return;
 		resetTaskTimeline(session);
-		const event: SpeculativeActionEvent<SessionID> = {
-			type: "task",
-			sessionID: session.id,
-			turnID,
-			timestamp: Date.now(),
-			cache: cacheSnapshot(session, session.settings),
-			timing,
-		};
-		session.events.enqueue(event);
+		if (adapter.onEvent) session.events.enqueue({
+			type: "task", ...eventEnvelope(session, turnID, session.settings), timing: timeline.measure(completedAt),
+		});
 	};
 
 	const queueSourceRequestEvent = (
@@ -2952,37 +2943,21 @@ export function makeStructuralSpeculativeActionRuntime<
 		settings: SpeculativeActionSettings,
 		result: SettledSourceRequest,
 	): void => {
-		const request: SettledSourceRequest = {
-			request: result.request,
-			startedAt: result.startedAt,
-			durationMs: result.durationMs,
-			settlement: result.settlement,
-		};
-		const event: SpeculativeActionEvent<SessionID> = {
-			type: "source_request",
-			sessionID: session.id,
-			turnID,
-			timestamp: Date.now(),
-			cache: cacheSnapshot(session, settings),
-			request,
-		};
-		session.events.enqueue(event);
+		if (adapter.onEvent) session.events.enqueue({
+			type: "source_request", ...eventEnvelope(session, turnID, settings),
+			request: { request: result.request, startedAt: result.startedAt, durationMs: result.durationMs, settlement: result.settlement },
+		});
 	};
 
 	const queueCandidateEvent = (session: Session, candidate: Candidate): void => {
+		if (!adapter.onEvent) return;
 		const state = candidateExecutionProjection(candidate);
 		if (!state) return;
 		const descriptor = candidateEventDescriptor(candidate);
-		const event: SpeculativeActionEvent<SessionID> = {
-			type: "candidate",
-			sessionID: session.id,
-			turnID: candidate.owner.startInput.turnID,
-			timestamp: Date.now(),
-			cache: cacheSnapshot(session, candidate.owner.settings),
-			candidate: descriptor,
-			state,
-		};
-		session.events.enqueue(event);
+		session.events.enqueue({
+			type: "candidate", ...eventEnvelope(session, candidate.owner.startInput.turnID, candidate.owner.settings),
+			candidate: descriptor, state,
+		});
 	};
 
 	return {

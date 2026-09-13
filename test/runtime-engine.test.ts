@@ -20,6 +20,8 @@ import type {
 	SpeculativePlanSource,
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
+import { CandidateStore } from "../src/candidate-stores.ts";
+import { TaskTimeline } from "../src/task-timing.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -144,7 +146,7 @@ function harness<SessionID = string>(input: {
 	readonly projection?: ActionProjectionRule<string>;
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => void | Promise<void>;
 	readonly onTurnFinished?: (input: { readonly startInput: Start<SessionID>; readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
-	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => void | Promise<void>;
+	readonly onEvent?: false | ((event: SpeculativeActionEvent<SessionID>) => void | Promise<void>);
 	readonly actionKey?: (
 		tool: string,
 		args: unknown,
@@ -206,9 +208,9 @@ function harness<SessionID = string>(input: {
 		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection ? [input.projection] : [])],
 		onCandidateMaterialized: input.onCandidateMaterialized,
 		onTurnFinished: input.onTurnFinished,
-		onEvent: async (event) => {
+		onEvent: input.onEvent === false ? undefined : async (event) => {
 			events.push(event);
-			await input.onEvent?.(event);
+			if (input.onEvent) await input.onEvent(event);
 		},
 	});
 	return { runtime, events, executions: () => executions };
@@ -230,6 +232,39 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it.each(["absent", "normal", "failed", "blocked"] as const)("owns settlement and task epochs independently of %s diagnostics", async (mode) => {
+		const delivery = barrier(), completed = [barrier(), barrier()], feedback: PredictionSettlement[] = [], observed: string[] = [];
+		const snapshots = vi.spyOn(CandidateStore.prototype, "snapshot"), timing = vi.spyOn(TaskTimeline.prototype, "recordTool");
+		const fixture = harness({
+			source: planSource({
+				propose: ({ startInput }) => plan(startInput.turnID, { path: `${startInput.turnID}.txt` }),
+				continue: ({ startInput }) => { completed[Number(startInput.turnID)]!.arrive(); return undefined; },
+				observe: ({ action }) => { observed.push(String(action?.input.path)); return undefined; },
+				onSettled: ({ settlement }) => { feedback.push(settlement); },
+			}),
+			onEvent: mode === "absent" ? false : () => {
+				if (mode === "failed") throw new Error("injected diagnostic failure");
+				if (mode === "blocked") return delivery.promise;
+			},
+		});
+		try {
+			for (let index = 0; index < 2; index++) {
+				const actor = call(String(index), { path: `${index}.txt` });
+				await fixture.runtime.startTurn(actor); await completed[index]!.promise;
+				expect((await fixture.runtime.prepareActorCall(actor))?.output).toBe("speculative");
+				await fixture.runtime.finishTurn({ ...actor, terminal: true });
+			}
+			expect(fixture.executions()).toBe(2);
+			expect(observed).toEqual(["0.txt", "1.txt"]);
+			expect(feedback).toHaveLength(2);
+			for (const settlement of feedback) expect(settlement).toMatchObject({ observation: "observed", match: { matched: true, adoption: { status: "adopted" } } });
+			expect(new Set(timing.mock.contexts).size).toBe(2);
+			expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0 });
+			if (mode === "absent") { expect(snapshots).not.toHaveBeenCalled(); expect(fixture.events).toEqual([]); }
+			else expect(snapshots).toHaveBeenCalled();
+		} finally { delivery.arrive(); await fixture.runtime.dispose(); snapshots.mockRestore(); timing.mockRestore(); }
+	});
+
 	it.each(["number-string", "objects", "symbols", "strings"])("owns turns and cached results by the actual session identity: %s", async (kind) => {
 		const ids: unknown[] = kind === "number-string" ? [1, "1"] : kind === "objects" ? [{}, {}] :
 			kind === "symbols" ? [Symbol("session"), Symbol("session")] : ["A", "B"];
