@@ -251,7 +251,7 @@ async function qualifyNamespace() {
       (mode === "absolute" ? common : mode === "dot-relative" ? "../common" : "local-common") + "\r\nsecond line ignored\n");
     await fs.writeFile(path.join(common, "info/exclude"), "/search/excluded.txt\n");
     for (const name of ["visible", "excluded"]) await fs.writeFile(path.join(workspace, `search/${name}.txt`), `needle ${name}\n`);
-    configurationCases.push([`git-${mode}`, { path: "search", pattern: "needle" }, false, workspace,
+    configurationCases.push([`git-${mode}`, {}, false, workspace,
       mode === "missing-common" ? [path.join(gitdir, "commondir"), common + "\n"] : [path.join(common, "info/exclude"), "/search/visible.txt\n"]]);
   }
   for (const mode of ["directory", "file"]) {
@@ -259,59 +259,60 @@ async function qualifyNamespace() {
     if (mode === "directory") await fs.mkdir(path.join(workspace, ".jj")); else await fs.writeFile(path.join(workspace, ".jj"), "repository marker\n");
     for (const name of ["visible", "excluded"]) await fs.writeFile(path.join(workspace, `search/${name}.txt`), `needle ${name}\n`);
     await fs.writeFile(path.join(workspace, ".gitignore"), "/search/excluded.txt\n");
-    configurationCases.push([`jj-${mode}`, { path: "search", pattern: "needle" }, false, workspace, [".gitignore", "/search/visible.txt\n"]]);
+    configurationCases.push([`jj-${mode}`, {}, false, workspace, [".gitignore", "/search/visible.txt\n"]]);
   }
   const checks = [];
-  for (const [label, args, rejected, workspace = cwd, configurationMutation] of [
-    ["directory-ignore", { path: "search", pattern: "needle", limit: 1000 }],
-    ["path-at-prefix", { path: "@search", pattern: "needle" }],
-    ["path-absolute", { path: path.join(cwd, "search"), pattern: "needle" }],
-    ["path-file-url", { path: pathToFileURL(path.join(cwd, "search")).href, pattern: "needle" }],
-    ["path-encoded-name", { path: pathToFileURL(path.join(cwd, "search/encoded\u00a0name.txt")).href, pattern: "needle", context: 1 }],
-    ["path-home", { path: "~/" + path.relative(pathRules.homeDir, path.join(cwd, "search")).split(path.sep).join("/"), pattern: "needle", glob: "search/a.txt" }],
-    ["path-external", { path: outside, pattern: "needle" }, "unkeyable"],
-    ["nested-search", { path: "search/nested", pattern: "needle" }],
-    ["glob", { path: "search", pattern: "needle", glob: "**/{a,z}.txt" }],
-    ["glob-override", { path: "search", pattern: "needle", glob: "*.tmp" }],
-    ["glob-relative", { path: "search", pattern: "needle", glob: "search/nested/keep.txt" }],
-    ["glob-anchored", { path: "search", pattern: "needle", glob: "/search/a.txt" }],
-    ["glob-negative", { path: "search", pattern: "needle", glob: "!*.txt" }],
-    ["glob-root-negative", { path: "search", pattern: "needle", glob: "!search/" }],
-    ["glob-positive-directory", { path: "search", pattern: "needle", glob: "**/blocked{,/**}" }],
-    ["glob-negative-directory", { path: "search", pattern: "needle", glob: "!**/nested/" }],
-    ["glob-literal-directory", { path: "search/syntax", pattern: "needle", glob: "**/literal*{,/**}", context: 1 }],
+  for (const [label, overrides, rejected, workspace = cwd, configurationMutation] of [
+    ["directory-ignore", { limit: 1000 }],
+    ["path-at-prefix", { path: "@search" }],
+    ["path-absolute", { path: path.join(cwd, "search") }],
+    ["path-file-url", { path: pathToFileURL(path.join(cwd, "search")).href }],
+    ["path-encoded-name", { path: pathToFileURL(path.join(cwd, "search/encoded\u00a0name.txt")).href, context: 1 }],
+    ["path-home", { path: "~/" + path.relative(pathRules.homeDir, path.join(cwd, "search")).split(path.sep).join("/"), glob: "search/a.txt" }],
+    ["path-external", { path: outside }, "unkeyable"],
+    ["nested-search", { path: "search/nested" }],
+    ["glob", { glob: "**/{a,z}.txt" }],
+    ["glob-override", { glob: "*.tmp" }],
+    ["glob-relative", { glob: "search/nested/keep.txt" }],
+    ["glob-anchored", { glob: "/search/a.txt" }],
+    ["glob-negative", { glob: "!*.txt" }],
+    ["glob-root-negative", { glob: "!search/" }],
+    ["glob-positive-directory", { glob: "**/blocked{,/**}" }],
+    ["glob-negative-directory", { glob: "!**/nested/" }],
+    ["glob-literal-directory", { path: "search/syntax", glob: "**/literal*{,/**}", context: 1 }],
     ["glob-config-data", { path: "search/syntax", pattern: ".", glob: "**" }],
-    ["mixed-encoding-context", { path: "search", pattern: "(?P<word>needle)", context: 1 }],
-    ["literal-case", { path: "search", pattern: "n.e", literal: true, ignoreCase: true }],
-    ["negative-query", { path: "search", pattern: "not-present-anywhere" }],
-    ["limit", { path: "search", pattern: "needle", limit: 1 }],
-    ["file", { path: "search/utf16.txt", pattern: "needle", context: 1 }],
-    ["explicit-ignored-directory", { path: "search/blocked", pattern: "needle" }],
-    ["ignored-subtree-change", { path: "search", pattern: "needle" }],
-    ["explicit-directory-link", { path: "search/internal-link", pattern: "needle" }],
-    ["explicit-external-link", { path: process.platform === "win32" ? "edge-external-link/external-link" : "search/external-link", pattern: "needle" }],
-    ["link-glob", { path: "search/internal-link", pattern: "needle", glob: "*.txt" }],
-    ["link-glob-relative", { path: "search/internal-link", pattern: "needle", glob: "search/internal-link/keep.txt" }],
-    ["link-glob-physical-name", { path: "search/internal-link", pattern: "needle", glob: "search/nested/keep.txt" }],
-    ["link-glob-directory", { path: "search/cycle-link", pattern: "needle", glob: "**/blocked{,/**}" }],
-    ["link-glob-negative-directory", { path: "search/cycle-link", pattern: "needle", glob: "!**/nested/" }],
-    ["unproven-cwd-glob", { path: "search", pattern: "needle", glob: "search/a.txt" }, true, cwdAlias],
-    ["explicit-dangling-link", { path: process.platform === "win32" ? "edge-dangling-link/dangling-link" : "search/dangling-link", pattern: "needle" }, true],
+    ["mixed-encoding-context", { pattern: "(?P<word>needle)", context: 1 }],
+    ["literal-case", { pattern: "n.e", literal: true, ignoreCase: true }],
+    ["negative-query", { pattern: "not-present-anywhere" }],
+    ["limit", { limit: 1 }],
+    ["file", { path: "search/utf16.txt", context: 1 }],
+    ["explicit-ignored-directory", { path: "search/blocked" }],
+    ["ignored-subtree-change", {}],
+    ["explicit-directory-link", { path: "search/internal-link" }],
+    ["explicit-external-link", { path: process.platform === "win32" ? "edge-external-link/external-link" : "search/external-link" }],
+    ["link-glob", { path: "search/internal-link", glob: "*.txt" }],
+    ["link-glob-relative", { path: "search/internal-link", glob: "search/internal-link/keep.txt" }],
+    ["link-glob-physical-name", { path: "search/internal-link", glob: "search/nested/keep.txt" }],
+    ["link-glob-directory", { path: "search/cycle-link", glob: "**/blocked{,/**}" }],
+    ["link-glob-negative-directory", { path: "search/cycle-link", glob: "!**/nested/" }],
+    ["unproven-cwd-glob", { glob: "search/a.txt" }, true, cwdAlias],
+    ["explicit-dangling-link", { path: process.platform === "win32" ? "edge-dangling-link/dangling-link" : "search/dangling-link" }, true],
     ...(process.platform === "win32" ? [
-      ["discovered-external-link", { path: "edge-external-link", pattern: "needle" }],
-      ["discovered-dangling-link", { path: "edge-dangling-link", pattern: "needle" }, true],
+      ["discovered-external-link", { path: "edge-external-link" }],
+      ["discovered-dangling-link", { path: "edge-dangling-link" }, true],
     ] : []),
     ...(process.platform === "win32" ? [] : [
-      ["explicit-file-link", { path: "search/file-link", pattern: "needle" }],
-      ["linked-ignore-file", { path: "search/linked-config", pattern: "needle" }],
+      ["explicit-file-link", { path: "search/file-link" }],
+      ["linked-ignore-file", { path: "search/linked-config" }],
     ]),
-    ["parent-config-alias", { path: "alias", pattern: "needle" }, false, configured],
-    ["parent-config", { path: "search", pattern: "needle" }, false, configured, ["../.ignore", "/workspace/search/visible.txt\n"]],
+    ["parent-config-alias", { path: "alias" }, false, configured],
+    ["parent-config", {}, false, configured, ["../.ignore", "/workspace/search/visible.txt\n"]],
     ...configurationCases,
     ["git-pointer-data", { path: ".", pattern: "gitdir: ", glob: ".git" }, false, path.join(root, "git-absolute")],
     ["explicit-git-directory", { path: ".git", pattern: "ref:" }],
   ]) {
     if (selectedCases.size && !selectedCases.has(label)) continue;
+    const args = { path: "search", pattern: "needle", ...overrides };
     const reference = async () => (await pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: workspace, args, home: pathRules.homeDir }, { signal,
       onInput: (operation, invocation, signal, emit) => runInput(operation === "process" ? "reference" : operation, invocation, signal, emit, { cwd: workspace }),
     }))).result;
