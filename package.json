@@ -56,7 +56,7 @@
 		"bench:tape": "tsx ./bench/tape.ts",
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
 		"bench:exec-boundary": "tsx ./bench/linux-exec-boundary.ts",
-		"bench:overlay-probe": "sh ./bench/overlayfs-capability-probe.sh",
+		"bench:overlay-probe": "vitest --run test/linux-overlayfs.test.ts test/workspace-sandbox.test.ts --maxWorkers=1 --no-file-parallelism -t OverlayFS",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"test": "vitest --run",
 		"prepack": "npm run build"
