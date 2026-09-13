@@ -146,85 +146,41 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
-	it("preserves an explicitly configured legacy tool-call format", async () => {
+	it.each(["legacy format", "explicit Profile", "automatic Profile"] as const)("preserves control-path contracts (%s)", async (mode) => {
 		const requests: CapturedRequest[] = [];
+		const explicit = mode === "explicit Profile", automatic = mode === "automatic Profile";
 		const coordinator = coordinatorFixture(
 			requests,
-			{ forkEnabled: false, draftFormat: "qwen_xml" },
+			explicit ? { actorProfile: "qwen35_xml", forkTransport: "sidecar" }
+				: { forkEnabled: false, ...(automatic ? { actorProfile: "auto" } : { draftFormat: "qwen_xml" }) },
 			["actor-request"],
+			explicit ? (request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath
+				? forkReceipt("read", { path: "a.txt" }, undefined, "qwen35_xml")
+				: { registered: true, draft_token_count: 3 } : undefined,
 		);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		coordinator.addCandidate(candidate("drafter", "key-a", "unused", "read", { path: "a.txt" }, 0.9));
 		const actor = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, any>;
+		if (explicit) coordinator.observeActorOutput(delta("text_delta", "reason"));
 		await coordinator.dispose();
 
-		expect(actor.self_speculation.draft_format).toBe("qwen_xml");
-		expect(actor.self_speculation.version).toBe(1);
-		expect(actor.self_speculation).not.toHaveProperty("actor_profile");
-		const candidateRequest = requests.find(
-			(request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath,
-		);
-		expect(candidateRequest?.body.format).toBe("qwen_xml");
-	});
-
-	it("passes an explicit Actor Profile through every control path", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(
-			requests,
-			{
-				actorProfile: "qwen35_xml",
-				forkTransport: "sidecar",
-			},
-			["actor-request"],
-			(request) =>
-				request.path === SELF_SPECULATION_DEFAULTS.forkPath
-					? forkReceipt("read", { path: "a.txt" }, undefined, "qwen35_xml")
-					: { registered: true, draft_token_count: 3 },
-		);
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "key-a", "unused", "read", { path: "a.txt" }, 0.9));
-		coordinator.decorateActorPayload({ model: "actor" });
-		coordinator.observeActorOutput(delta("text_delta", "reason"));
-		await coordinator.dispose();
-
-		const candidateRequest = requests.find(
-			(request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath,
-		);
-		const forkRequest = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath);
-		expect(candidateRequest?.body).toMatchObject({
-			actor_profile: "qwen35_xml",
-		});
-		expect(forkRequest?.body.options).toMatchObject({
-			actor_profile: "qwen35_xml",
-		});
-		expect(coordinator.snapshot()).toMatchObject({
-			resolvedActorProfile: "qwen35_xml",
-			profileResolutionSource: "explicit",
-		});
-	});
-
-	it("uses Profile v2 only when automatic model resolution is selected", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(
-			requests,
-			{ actorProfile: "auto", forkEnabled: false },
-			["actor-request"],
-		);
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "key-a", "unused", "read", { path: "a.txt" }, 0.9));
-		const actor = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, any>;
-		await coordinator.dispose();
-
-		expect(actor.self_speculation).toMatchObject({
-			version: 2,
-			actor_profile: "auto",
-		});
-		expect(actor.self_speculation).not.toHaveProperty("draft_format");
-		const candidateRequest = requests.find(
-			(request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath,
-		);
-		expect(candidateRequest?.body.actor_profile).toBe("auto");
-		expect(candidateRequest?.body).not.toHaveProperty("format");
+		const candidateRequest = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
+		if (explicit) {
+			const forkRequest = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath);
+			expect(candidateRequest?.body).toMatchObject({ actor_profile: "qwen35_xml" });
+			expect(forkRequest?.body.options).toMatchObject({ actor_profile: "qwen35_xml" });
+			expect(coordinator.snapshot()).toMatchObject({ resolvedActorProfile: "qwen35_xml", profileResolutionSource: "explicit" });
+		} else if (automatic) {
+			expect(actor.self_speculation).toMatchObject({ version: 2, actor_profile: "auto" });
+			expect(actor.self_speculation).not.toHaveProperty("draft_format");
+			expect(candidateRequest?.body.actor_profile).toBe("auto");
+			expect(candidateRequest?.body).not.toHaveProperty("format");
+		} else {
+			expect(actor.self_speculation.draft_format).toBe("qwen_xml");
+			expect(actor.self_speculation.version).toBe(1);
+			expect(actor.self_speculation).not.toHaveProperty("actor_profile");
+			expect(candidateRequest?.body.format).toBe("qwen_xml");
+		}
 	});
 
 	it("records clear-time target verification without confusing registration receipts", async () => {
