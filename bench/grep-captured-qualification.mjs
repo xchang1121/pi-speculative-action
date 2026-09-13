@@ -41,7 +41,7 @@ const rows = semanticOnly ? [] : [
 const median = async (run) => {
   const times = []; let output;
   for (let i = 0; i < (semanticOnly ? 1 : costOnly ? 3 : 5); i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
-  return { ms: times.sort((a, b) => a - b)[Math.floor(times.length / 2)], output };
+  return { ms: [...times].sort((a, b) => a - b)[Math.floor(times.length / 2)], samplesMs: times, output };
 };
 try {
   const binary = await captureStableFile(await resolveHostExecutable(rg, "rg"), 32 * 1024 * 1024, true);
@@ -69,21 +69,21 @@ try {
         const configured = await median(() => tool.execute("sorted host Actor", args));
         captured = await qualifyCaptured(cwd, args, configured.output);
         captured.sortedHostActorMs = configured.ms;
+        captured.sortedHostActorSamplesMs = configured.samplesMs;
         captured.nativeOutputEqual = JSON.stringify(configured.output) === JSON.stringify(native.output);
       } finally { if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart; }
       report.push({ fixture: row.label, files: row.files, bytes: row.contents.length * row.files, pattern,
-        nativeActorMs: native.ms,
+        nativeActorMs: native.ms, nativeActorSamplesMs: native.samplesMs,
         outputBytes: Buffer.byteLength(JSON.stringify(native.output)), noMatch: native.output.content[0]?.text === "No matches found", captured });
       console.log(JSON.stringify(report.at(-1)));
     }
   }
   if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
-  const cancellation = {};
-  cancellation.limit = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit");
+  const cancellation = [{ mode: "limit", ...await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit") }];
   const cancellationRepeats = semanticOnly || costOnly ? 1 : 20;
   for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
-    cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode);
+    cancellation.push({ mode, repeat, ...await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode) });
   }
   assert.equal(referenceClosed, referenceProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
@@ -137,10 +137,10 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     return result;
   };
   try {
-    let hostActorMs;
+    let hostActor;
     if (costOnly) {
       turn.turnID = "baseline"; await host.startTurn(turn);
-      hostActorMs = (await median(async () => { const result = await actor(); assert.deepEqual(result, expected); return result; })).ms;
+      hostActor = await median(async () => { const result = await actor(); assert.deepEqual(result, expected); return result; });
       assert.equal(executions, 0); assert.equal(actorCalls, 3);
       await host.finishTurn(turn.turnID);
       actorCalls = 0; trials.length = 0; drafterEnabled = true; turn.turnID = "probe";
@@ -166,7 +166,9 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
       if (trial.provider.kind === "actor") assert.ok(trial.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(trial));
     } else assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { profilePreparationMs, producerMs, ...(costOnly ? { hostActorMs, probeMs: adopted.ms, trials } : { hitMs: adopted.ms }),
+    return { profilePreparationMs, producerMs, ...(costOnly
+      ? { hostActorMs: hostActor.ms, hostActorSamplesMs: hostActor.samplesMs, probeMs: adopted.ms, trials }
+      : { hitMs: adopted.ms, hitSamplesMs: adopted.samplesMs }),
       producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
   } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
 }
