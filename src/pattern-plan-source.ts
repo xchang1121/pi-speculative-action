@@ -234,12 +234,14 @@ export function createPatternPlanSource(input: {
 		},
 		onIssued: ({ feedback }) => {
 			const context = asPatternPlanFeedback(feedback);
+			if (context) context.store.issued(context.continuation);
 			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
 		},
 		onSettled: ({ feedback, settlement }) => {
 			const context = asPatternPlanFeedback(feedback);
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
+			if (context) context.store.settled(context.continuation, settlement);
 			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
 		flush: async () => {

@@ -315,6 +315,7 @@ export class PatternAwareStore {
 	private readonly controlOpportunitiesByContext = new Map<string, Map<string, number>>();
 	private readonly sessions: PatternSessionRegistry<PatternAwareEvent>;
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
+	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
 	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
@@ -647,6 +648,7 @@ export class PatternAwareStore {
 			});
 			return {
 				background,
+				recurrentFeedback: undefined as MutablePatternFeedback | undefined,
 				actionIdentity: hash(identity),
 				type: "tool_call" as const,
 				tool: representative.pattern.targetTool,
@@ -693,6 +695,7 @@ export class PatternAwareStore {
 						: existing;
 			predictions[index] = {
 				...preferred,
+				recurrentFeedback: recurrent.recurrentFeedback,
 				background: existing.background && recurrent.background,
 				supportingPatternIDs: [...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs])],
 			};
@@ -720,6 +723,7 @@ export class PatternAwareStore {
 				visitedPatternIDs: [...continuation.visitedPatternIDs, prediction.patternID],
 				pathProbability: prediction.empiricalProbability,
 			};
+			if (prediction.recurrentFeedback) this.recurrentFeedback.set(nextContinuation, prediction.recurrentFeedback);
 			result.push({
 				type: "tool_call",
 				source: "pattern_aware",
@@ -788,42 +792,41 @@ export class PatternAwareStore {
 		const values = [...actions].filter((item) => {
 			const current = schemaHashes[item.action.tool];
 			return current === undefined || current === item.action.schemaHash;
+		}).map((item) => {
+			let feedback = this.recurrentFeedback.get(item);
+			if (!feedback) {
+				feedback = emptyPatternFeedback(this.clock);
+				this.recurrentFeedback.set(item, feedback);
+			}
+			return { ...item, feedback };
 		});
 		const massByTool = new Map<string, number>();
 		for (const item of values) {
 			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
 			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + mass);
 		}
-		const rank = (item: PatternRecurrentAction) =>
-			recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) *
-			Math.max(item.count, item.totalDurationMs);
 		const provenTools = new Set(
 			values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool),
 		);
-		const candidates = perToolBeam(
-			values
-				.filter((item) => item.count >= settings.minOccurrences || provenTools.has(item.action.tool))
-				.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`))
-				.sort(
-					(left, right) =>
-						Number(right.count >= settings.minOccurrences) - Number(left.count >= settings.minOccurrences) ||
-						rank(right) - rank(left) ||
-						left.action.key.localeCompare(right.action.key),
-				),
-			settings.beamWidth,
-			(item) => item.action.tool,
-		);
+		// The final beam ranks merged contextual and recurrent support using the same settled evidence.
+		const candidates = values
+			.filter((item) => item.count >= settings.minOccurrences || provenTools.has(item.action.tool))
+			.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`));
 		return candidates.map((item) => {
 			const patternID = `action-backoff:${hash(item.action.key)}`;
 			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
-			const conditionalProbability = clampProbability(mass / Math.max(mass, massByTool.get(item.action.tool) ?? 0));
+			const evidence = feedbackEvidence(item, this.clock, settings.decayHalfLifeEvents);
+			const conditionalProbability = clampProbability((mass + evidence.matched) /
+				(Math.max(mass, massByTool.get(item.action.tool) ?? 0) + evidence.matched + evidence.mismatched));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const expectedDurationMs = item.totalDurationMs / Math.max(1, item.count);
 			const ppmEstimate = estimatePpm(item.action.tool);
+			const adoptionProbability = patternAdoptionProbability([item], this.clock, settings.decayHalfLifeEvents);
 			const expectedLatencyBenefitMs =
-				empiricalProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
+				empiricalProbability * adoptionProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
 			return {
-				background: item.count < settings.minOccurrences,
+				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched,
+				recurrentFeedback: item.feedback,
 				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })),
 				type: "tool_call" as const,
 				tool: item.action.tool,
@@ -839,7 +842,7 @@ export class PatternAwareStore {
 				variantProbability: 1,
 				conditionalProbability,
 				empiricalProbability,
-				adoptionProbability: 1,
+				adoptionProbability,
 				expectedDurationMs,
 				ppmEstimate,
 				mapperConfidence: 1,
@@ -848,43 +851,49 @@ export class PatternAwareStore {
 		});
 	}
 
-	issued(patternID: string) {
-		const pattern = this.patterns.get(patternID);
-		if (!pattern) return;
-		pattern.feedback.issued++;
-		this.persist();
+	/** Use a persisted pattern ID or the original candidate continuation for session backoff feedback. */
+	issued(support: string | PatternAwareContinuation) {
+		const feedback = this.supportFeedback(support);
+		if (!feedback) return;
+		feedback.issued++;
+		if (typeof support === "string") this.persist();
 	}
 
-	settled(patternID: string, settlement: PredictionSettlement) {
-		const pattern = this.patterns.get(patternID);
-		if (!pattern) return;
-		const recent = feedbackEvidence(pattern, this.clock, this.settings.decayHalfLifeEvents);
-		pattern.feedback.recentMatchedWeight = recent.matched;
-		pattern.feedback.recentMismatchedWeight = recent.mismatched;
-		pattern.feedback.recentAdoptedWeight = recent.adopted;
-		pattern.feedback.recentRejectedWeight = recent.rejected;
-		pattern.feedback.sequence = this.clock;
+	settled(support: string | PatternAwareContinuation, settlement: PredictionSettlement) {
+		const feedback = this.supportFeedback(support);
+		if (!feedback) return;
+		const recent = feedbackEvidence({ feedback }, this.clock, this.settings.decayHalfLifeEvents);
+		feedback.recentMatchedWeight = recent.matched;
+		feedback.recentMismatchedWeight = recent.mismatched;
+		feedback.recentAdoptedWeight = recent.adopted;
+		feedback.recentRejectedWeight = recent.rejected;
+		feedback.sequence = this.clock;
 		if (settlement.observation === "unobserved") {
 			const key = `${settlement.cause.stage}:${settlement.cause.code}`;
-			pattern.feedback.unobserved[key] = (pattern.feedback.unobserved[key] ?? 0) + 1;
+			feedback.unobserved[key] = (feedback.unobserved[key] ?? 0) + 1;
 		} else {
-			pattern.feedback.observed++;
+			feedback.observed++;
 			if (!settlement.match.matched) {
-				pattern.feedback.recentMismatchedWeight++;
+				feedback.recentMismatchedWeight++;
 			} else {
-				pattern.feedback.matched++;
-				pattern.feedback.recentMatchedWeight++;
+				feedback.matched++;
+				feedback.recentMatchedWeight++;
 				if (settlement.match.adoption.status === "adopted") {
-					pattern.feedback.adopted++;
-					pattern.feedback.recentAdoptedWeight++;
+					feedback.adopted++;
+					feedback.recentAdoptedWeight++;
 				} else {
 					const stage = settlement.match.adoption.cause.stage;
-					pattern.feedback.rejectedAfterMatch[stage] = (pattern.feedback.rejectedAfterMatch[stage] ?? 0) + 1;
-					pattern.feedback.recentRejectedWeight++;
+					feedback.rejectedAfterMatch[stage] = (feedback.rejectedAfterMatch[stage] ?? 0) + 1;
+					feedback.recentRejectedWeight++;
 				}
 			}
 		}
-		this.persist();
+		if (typeof support === "string") this.persist();
+	}
+
+	private supportFeedback(support: string | PatternAwareContinuation): MutablePatternFeedback | undefined {
+		// Continuation identity keeps late feedback attached to the original bounded session sample.
+		return typeof support === "string" ? this.patterns.get(support)?.feedback : this.recurrentFeedback.get(support);
 	}
 
 	snapshot(): ReadonlyArray<PatternAwarePattern> {
@@ -2476,7 +2485,7 @@ function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
 	);
 }
 
-function feedbackEvidence(pattern: MutablePattern, clock: number, halfLife: number) {
+function feedbackEvidence(pattern: Pick<MutablePattern, "feedback">, clock: number, halfLife: number) {
 	const weight = recencyWeight(pattern.feedback.sequence, clock, halfLife);
 	return {
 		matched: pattern.feedback.recentMatchedWeight * weight,
@@ -2486,7 +2495,7 @@ function feedbackEvidence(pattern: MutablePattern, clock: number, halfLife: numb
 	};
 }
 
-function patternAdoptionProbability(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number) {
+function patternAdoptionProbability(patterns: ReadonlyArray<Pick<MutablePattern, "feedback">>, clock: number, halfLife: number) {
 	let adopted = 0;
 	let rejected = 0;
 	for (const pattern of patterns) {

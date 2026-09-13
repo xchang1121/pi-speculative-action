@@ -1130,7 +1130,8 @@ describe("PatternAware", () => {
 
 	test("promotes canonical same-session actions beyond context only with authoritative, schema-compatible support", () => {
 		for (const mode of ["command", "path aliases", "stale schema", "non-learning"] as const) {
-			const store = new PatternAwareStore(settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }), undefined, piActionSemantics());
+			const config = settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 });
+			const store = new PatternAwareStore(config, undefined, piActionSemantics());
 			const tool = mode === "command" || mode === "non-learning" ? "bash" : "read";
 			const first = tool === "bash" ? { command: "npm test" } : { path: "src/a.ts" };
 			const inputs = [first, tool === "read" ? { ...first, offset: 1 } : first];
@@ -1147,6 +1148,29 @@ describe("PatternAware", () => {
 					expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
 					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
 					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
+					// Inspect demoted samples even when competing reads displace them from the default beam.
+					const forecast = () => store.predict(mode, { [tool]: "v1" }, { ...config, beamWidth: 16 })
+						.find((candidate) => candidate.actionIdentity === recurrent!.actionIdentity)!;
+					const learned = store.snapshot(), history = store.recent(mode), before = forecast();
+					const settle = (settlement: Parameters<PatternAwareStore["settled"]>[1]) => {
+						const candidate = forecast();
+						store.issued(candidate.continuation);
+						store.settled(candidate.continuation, settlement);
+						return forecast();
+					};
+					expect(settle(unobservedSettlement("control", "turn_closed"))).toEqual(before);
+					const rejected = settle(rejectedSettlement("freshness", "resource_changed"));
+					expect(rejected.adoptionProbability).toBeLessThan(recurrent!.adoptionProbability);
+					expect(rejected.expectedLatencyBenefitMs).toBeLessThan(recurrent!.expectedLatencyBenefitMs);
+					settle(unmatchedSettlement());
+					const contradicted = settle(unmatchedSettlement());
+					expect(contradicted.background).toBe(true);
+					expect(contradicted.empiricalProbability).toBeLessThan(recurrent!.empiricalProbability);
+					const adopted = settle(adoptedSettlement());
+					expect(adopted.background).not.toBe(true);
+					expect(adopted.adoptionProbability).toBeGreaterThan(rejected.adoptionProbability);
+					expect(store.snapshot()).toEqual(learned);
+					expect(store.recent(mode)).toEqual(history);
 				}
 			}
 			store.finishSession(mode);
