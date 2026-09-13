@@ -8,9 +8,13 @@ export interface DrafterToolDefinition {
 }
 
 export interface DrafterRequestSettings {
+	/** Output-informed successor actions retained after the first Drafter action. */
 	readonly drafterMaxDepth: number;
+	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
 	readonly drafterMaxTokens?: number;
+	/** Number of leading Drafter requests sent at temperature zero. */
 	readonly drafterDeterministicCandidates: number;
+	/** Inclusive temperature range stratified across the remaining requests. */
 	readonly drafterTemperatureMin: number;
 	readonly drafterTemperatureMax: number;
 }

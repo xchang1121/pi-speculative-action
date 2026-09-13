@@ -7,6 +7,7 @@ import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "
 import {
 	clampCandidateLimit,
 	DEFAULTS,
+	type DrafterRequestSettings,
 	normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection,
 } from "./common.ts";
@@ -53,25 +54,9 @@ const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
 type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation>; readonly [RAW_ACTOR_CALL]?: true };
 
-export interface SpeculativeAgentSettingsInput {
-	readonly enabled?: boolean;
-	readonly drafterEnabled?: boolean;
+export interface SpeculativeAgentSettingsInput extends Partial<DrafterRequestSettings>, Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
 	/** Adaptively skip a root Drafter batch when its measured action-side utility is negative. */
 	readonly drafterGateEnabled?: boolean;
-	/** Output-informed successor actions retained after the first Drafter action. */
-	readonly drafterMaxDepth?: number;
-	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
-	readonly drafterMaxTokens?: number;
-	/** Number of leading Drafter requests sent at temperature zero. */
-	readonly drafterDeterministicCandidates?: number;
-	/** Inclusive temperature range stratified across the remaining requests. */
-	readonly drafterTemperatureMin?: number;
-	readonly drafterTemperatureMax?: number;
-	readonly candidateLimit?: number;
-	readonly maxConcurrentActions?: number;
-	readonly resourceCacheMaxEntries?: number;
-	readonly resourceCacheMaxBytes?: number;
-	readonly predictionTimeoutMs?: number;
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly selfSpeculation?: SelfSpeculationSettingsInput;
 	/** Prediction selection, independent of execution permissions; omitted uses the registered tools. */

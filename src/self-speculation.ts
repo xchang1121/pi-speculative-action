@@ -24,49 +24,16 @@ export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
 export interface SelfSpeculationSettingsInput extends Partial<SelfSpeculationSettings> {}
 
-export interface SelfSpeculationSettings {
-	readonly enabled: boolean;
-	/** Trusted control-plane endpoint exposed by the inference runtime. */
-	readonly endpoint: string;
-	/** Top-level field carrying the stable request ID in provider payloads. */
-	readonly requestIDField: string;
-	readonly candidatePath: string;
-	readonly forkPath: string;
-	readonly clearPath: string;
-	readonly timeoutMs: number;
-	readonly maxCandidates: number;
-	readonly maxDraftTokens: number;
-	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
-	readonly actorProfile: string;
-	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
-	readonly draftFormat: string;
-	/** Exact target-model boundary preceding a boundary-relative action draft. */
-	readonly draftBoundary: string;
+export interface SelfSpeculationSettings extends Readonly<typeof selfSpeculationDefaults> {
 	/** Optional environment variable containing a bearer token for the control plane. */
 	readonly apiKeyEnv?: string;
-	readonly forkEnabled: boolean;
-	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
-	readonly forkActionEnabled: boolean;
-	/** Minimum SPORK selected-token top-1 probability required for action execution. */
-	readonly forkActionMinConfidence: number;
-	readonly forkTransport: SelfSpeculationForkTransport;
-	readonly forkMaxTokens: number;
-	readonly forkTemperature: number;
-	readonly forkDecoder: string;
-	readonly forkForcedPrefix: string;
-	/** Require a capable engine to expose token logprobs to its SPORK fork. */
-	readonly requireLogprobs: boolean;
-	readonly forkGateEnabled: boolean;
-	readonly forkGateMinSamples: number;
-	readonly forkGateWindowSize: number;
-	readonly forkGateMinNetBenefitMs: number;
-	readonly forkGateProbeInterval: number;
-	readonly forkGateFailureThreshold: number;
 }
 
-export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze({
+const selfSpeculationDefaults = {
 	enabled: false,
+	/** Trusted control-plane endpoint exposed by the inference runtime. */
 	endpoint: "http://127.0.0.1:8000",
+	/** Top-level field carrying the stable request ID in provider payloads. */
 	requestIDField: "request_id",
 	candidatePath: "/self-speculation/candidates",
 	forkPath: "/self-speculation/fork",
@@ -74,17 +41,23 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	timeoutMs: 2_000,
 	maxCandidates: 8,
 	maxDraftTokens: 28,
+	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
 	actorProfile: "tagged_json",
+	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
 	draftFormat: "auto",
+	/** Exact target-model boundary preceding a boundary-relative action draft. */
 	draftBoundary: "auto",
 	forkEnabled: true,
+	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
 	forkActionEnabled: true,
+	/** Minimum SPORK selected-token top-1 probability required for action execution. */
 	forkActionMinConfidence: 0.9,
-	forkTransport: "provider",
+	forkTransport: "provider" as SelfSpeculationForkTransport,
 	forkMaxTokens: 128,
 	forkTemperature: 0,
 	forkDecoder: "auto",
 	forkForcedPrefix: "auto",
+	/** Require a capable engine to expose token logprobs to its SPORK fork. */
 	requireLogprobs: false,
 	forkGateEnabled: DEFAULT_BENEFIT_GATE_POLICY.enabled,
 	forkGateMinSamples: DEFAULT_BENEFIT_GATE_POLICY.minSamples,
@@ -92,7 +65,9 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 	forkGateMinNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
 	forkGateProbeInterval: DEFAULT_BENEFIT_GATE_POLICY.probeInterval,
 	forkGateFailureThreshold: DEFAULT_BENEFIT_GATE_POLICY.failureThreshold,
-});
+};
+
+export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(selfSpeculationDefaults);
 
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
