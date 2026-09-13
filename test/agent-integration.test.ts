@@ -686,6 +686,9 @@ describe("speculative action host", () => {
 		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
 		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>();
+		const actorTool = origin === "actor" ? { ...grepTool, parameters: Type.Object({ ...grepSchema.properties,
+			flags: Type.Optional(Type.String()) }) } : grepTool;
+		let actorSchema = "";
 		let allowRead = origin !== "rejected";
 		const predictAfterBatch = vi.spyOn(patternStore, "predictAfterBatch");
 		const issued = vi.spyOn(patternStore, "issued");
@@ -706,6 +709,7 @@ describe("speculative action host", () => {
 				arguments: { pattern: "one", path: "." } }], "toolUse"),
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
 			onCandidateMaterialized: (candidate) => { materialized.push(candidate); },
+			onActorActionMaterialized: ({ action }) => { actorSchema = action.schemaHash; },
 			onActorActionSettled: () => { if (origin === "closing") ready.resolve(); },
 			onEvent: (event) => {
 				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
@@ -714,7 +718,7 @@ describe("speculative action host", () => {
 				if (event.type === "source_request" && event.turnID === "next") nextRequest.resolve(event.request.settlement.status);
 			},
 		});
-		const call = { turnID: "probe:turn", id: "actor-grep", tool: "grep", args: { pattern: "one", path: "." }, tools };
+		const call = { turnID: "probe:turn", id: "actor-grep", tool: "grep", args: { pattern: "one", path: "." }, tools: [actorTool, readTool] };
 		try {
 			await host.startTurn({ ...startInput(grepTool, call.turnID),
 				context: { systemPrompt: "system", messages: [], tools }, tools });
@@ -732,6 +736,8 @@ describe("speculative action host", () => {
 				expect(materialized).toHaveLength(0);
 			} else {
 				await waitFor(() => materialized.some((candidate) => candidate.source === "pattern_aware" && candidate.tool === "read"));
+				expect(actorSchema).not.toBe("");
+				expect(predictAfterBatch.mock.calls[0]?.[1][0]?.schemaHash).toBe(actorSchema);
 				expect(materialized).toContainEqual(expect.objectContaining({
 					sessionID: "probe", turnID: call.turnID, expectedDecisionSequence: 2, latestDecisionSequence: 2,
 					source: "pattern_aware", tool: "read", input: { path: "notes.txt" },
