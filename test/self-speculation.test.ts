@@ -266,14 +266,15 @@ describe("self-speculation control plane", () => {
 		});
 	});
 
-	it("uses target verification to calibrate the next decision without changing action probabilities", async () => {
+	it.each(["decoder", "Actor adoption"])("orders next-decision candidates using %s evidence", async (evidence) => {
+		const verified = evidence === "decoder";
 		const requests: CapturedRequest[] = [];
 		const coordinator = coordinatorFixture(
 			requests,
 			{ forkEnabled: false },
-			["actor-1", "actor-2"],
+			verified ? ["actor-1", "actor-2"] : ["actor-2"],
 			(request) =>
-				request.path === SELF_SPECULATION_DEFAULTS.clearPath && request.body.request_id === "actor-1"
+				verified && request.path === SELF_SPECULATION_DEFAULTS.clearPath && request.body.request_id === "actor-1"
 					? {
 							verification: {
 								num_spec_steps: 2,
@@ -306,64 +307,38 @@ describe("self-speculation control plane", () => {
 		);
 
 		coordinator.startTurn("turn-1", model(), context(), 1);
-		coordinator.addCandidate(candidate("drafter", "drafter-1", "unused", "read", { path: "a.txt" }, 0.9));
-		coordinator.addCandidate(
-			candidate("pattern-aware", "pattern-1", "unused", "read", { path: "b.txt" }, 0.8),
-		);
-		coordinator.decorateActorPayload({ model: "actor" });
-		coordinator.endTurn();
-		await vi.waitFor(() => expect(coordinator.snapshot().decoderVerificationSteps).toBe(2));
-
-		coordinator.startTurn("turn-2", model(), context(), 2);
-		coordinator.addCandidate(
-			candidate("drafter", "drafter-2", "unused", "read", { path: "c.txt" }, 0.9, 2),
-		);
-		coordinator.addCandidate(
-			candidate("pattern-aware", "pattern-2", "unused", "read", { path: "d.txt" }, 0.8, 2),
-		);
-		coordinator.decorateActorPayload({ model: "actor" });
-		await coordinator.dispose();
-
-		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
-		expect(bundles.at(-1)?.body.candidates.map((item: Record<string, any>) => item.sources)).toEqual([
-			["pattern-aware"],
-			["drafter"],
-		]);
-		expect(bundles.at(-1)?.body.candidates[0].score.decoder_acceptance_probability).toBeGreaterThan(
-			bundles.at(-1)?.body.candidates[1].score.decoder_acceptance_probability,
-		);
-		expect(coordinator.snapshot()).toMatchObject({ decoderEvidenceContexts: 2, decoderVerificationSteps: 2 });
-	});
-
-	it("lets independent Actor adoption evidence feed decoder candidate ordering", async () => {
-		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-2"]);
-		coordinator.startTurn("turn-1", model(), context(), 1);
-		for (let index = 0; index < 3; index++) {
+		if (verified) {
+			coordinator.addCandidate(candidate("drafter", "drafter-1", "unused", "read", { path: "a.txt" }, 0.9));
+			coordinator.addCandidate(candidate("pattern-aware", "pattern-1", "unused", "read", { path: "b.txt" }, 0.8));
+			coordinator.decorateActorPayload({ model: "actor" });
+		} else for (let index = 0; index < 3; index++) {
 			coordinator.observePredictionSettlement(predictionFeedback("drafter", false, index));
 			coordinator.observePredictionSettlement(predictionFeedback("pattern-aware", true, index));
 		}
 		coordinator.endTurn();
+		if (verified) await vi.waitFor(() => expect(coordinator.snapshot().decoderVerificationSteps).toBe(2));
 
 		coordinator.startTurn("turn-2", model(), context(), 2);
-		coordinator.addCandidate(
-			candidate("drafter", "drafter-action", "unused", "read", { path: "a.txt" }, 0.95, 2),
-		);
-		coordinator.addCandidate(
-			candidate("pattern-aware", "pattern-action", "unused", "read", { path: "b.txt" }, 0.6, 2),
-		);
+		const later = verified
+			? [["drafter", "drafter-2", "c.txt", 0.9], ["pattern-aware", "pattern-2", "d.txt", 0.8]] as const
+			: [["drafter", "drafter-action", "a.txt", 0.95], ["pattern-aware", "pattern-action", "b.txt", 0.6]] as const;
+		for (const [source, key, path, probability] of later)
+			coordinator.addCandidate(candidate(source, key, "unused", "read", { path }, probability, 2));
 		coordinator.decorateActorPayload({ model: "actor" });
 		await coordinator.dispose();
 
-		const bundle = requests.find((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
-		expect(bundle?.body.candidates.map((item: Record<string, any>) => item.sources)).toEqual([
+		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
+		expect(bundles).toHaveLength(verified ? 2 : 1);
+		const selected = (verified ? bundles.at(-1) : bundles[0])!.body.candidates;
+		expect(selected.map((item: Record<string, any>) => item.sources)).toEqual([
 			["pattern-aware"],
 			["drafter"],
 		]);
-		expect(bundle?.body.candidates[0].score.action_adoption_probability).toBeGreaterThan(
-			bundle?.body.candidates[1].score.action_adoption_probability,
-		);
-		expect(coordinator.snapshot()).toMatchObject({
+		const score = verified ? "decoder_acceptance_probability" : "action_adoption_probability";
+		expect(selected[0].score[score]).toBeGreaterThan(selected[1].score[score]);
+		expect(selected.map((item: Record<string, any>) => [item.score.conditional_probability, item.score.empirical_probability]))
+			.toEqual([...later].reverse().map((entry) => [entry[3], entry[3]]));
+		expect(coordinator.snapshot()).toMatchObject(verified ? { decoderEvidenceContexts: 2, decoderVerificationSteps: 2 } : {
 			actionEvidenceContexts: 2,
 			actionEvidenceObservations: 6,
 			actionEvidenceAdoptions: 3,
