@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
+import { isRecord } from "./stable-json.ts";
 
 export interface ExecutionRoutingSettings {
 	readonly primary?: boolean;
@@ -159,8 +160,4 @@ function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOve
 		}
 	}
 	return Object.keys(result).length ? result : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
 }

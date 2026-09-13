@@ -1,5 +1,14 @@
 import { types } from "node:util";
 
+/** A field-addressable object; this is not a proof of plain or immutable data. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+	return isObject(value) && !Array.isArray(value);
+}
+
+export function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return isRecord(value) ? value : undefined;
+}
+
 /** JSON.stringify with UTF-16-ordered named keys, numeric indices first, and no intermediate object tree. */
 export function stableStringify(value: unknown): string {
 	return serialize(value) as string;

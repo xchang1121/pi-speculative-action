@@ -15,7 +15,7 @@ import {
 } from "./pattern-session-state.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
-import { stableEqual as sameValue, stableStringify } from "./stable-json.ts";
+import { asRecord, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { nonNegativeInteger, positiveInteger, probability as probabilitySetting } from "./setting-input.ts";
 
 export type PatternAwareSettings = Readonly<typeof patternAwareDefaults>;
@@ -2794,12 +2794,6 @@ function normalizePath(value: string) {
 
 function hash(value: string) {
 	return createHash("sha256").update(value).digest("hex").slice(0, 32);
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: undefined;
 }
 
 function isObject(value: unknown): value is object {
