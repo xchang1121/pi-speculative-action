@@ -327,8 +327,6 @@ describe("Linux process ExecutionWorld", () => {
 					return removed;
 				});
 				let restoreServerClose: (() => void) | undefined;
-				const context = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
-				const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "output-lifetime", { fingerprint: executionFingerprint, context })!;
 				spawning.mockImplementation((...input) => {
 					const top = JSON.stringify(input[1]).includes("top-trace-");
 					const child = spawn(...(top && failure === "spawn" ? [path.join(fixture.root, "missing-executable"), input[1], input[2]] : input) as Parameters<typeof spawn>);
@@ -341,8 +339,8 @@ describe("Linux process ExecutionWorld", () => {
 					}
 					return child;
 				});
-				const running = fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
-					callID: failure, signal: controller.signal });
+				const running = forkReusableBash(fixture, { ...args, label: failure, actionNamespace: "output-lifetime",
+					executionFingerprint, signal: controller.signal });
 				void running.catch(() => undefined);
 				try {
 					if (failure === "nested-abort" || failure === "session-close") {
@@ -526,10 +524,8 @@ describe("Linux process ExecutionWorld", () => {
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const args = { command: ":" };
 			const expected = await tool.execute("oracle", args);
-			const context = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment, shellPath: fixture.shellPath });
-			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "cancel-interposition", { fingerprint: executionFingerprint, context })!;
-			running = fixture.world.speculation.execute({ cwd: fixture.workspace, tool, toolName: "bash", args, action,
-				callID: "cancel-interposition", signal: controller.signal });
+			running = forkReusableBash({ ...fixture, tool, environment }, { ...args, label: "cancel-interposition",
+				actionNamespace: "cancel-interposition", executionFingerprint, signal: controller.signal });
 			void running.then(() => { returned = true; }, () => { returned = true; });
 			await Promise.race([entered.promise, running]); if (cancel) controller.abort(); await nextTurn();
 			expect({ returned, owned: existsSync(activeRoot!) }).toEqual({ returned: false, owned: true });

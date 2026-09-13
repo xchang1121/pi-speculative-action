@@ -174,6 +174,7 @@ export interface ReusableBashInput {
 	readonly actionNamespace: string;
 	readonly executionFingerprint: string;
 	readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
+	readonly signal?: AbortSignal;
 }
 
 export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "environment" | "shellPath">, input: ReusableBashInput) {
@@ -196,7 +197,7 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 		args,
 		action,
 		callID: `bench-${input.label}`,
-		signal: new AbortController().signal,
+		signal: input.signal ?? new AbortController().signal,
 		executionScope: input.executionScope ?? BENCHMARK_SCOPE,
 	});
 }
