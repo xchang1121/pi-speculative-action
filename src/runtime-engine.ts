@@ -1066,19 +1066,15 @@ export function makeStructuralSpeculativeActionRuntime<
 					continuationSlots: new Set(),
 					continuationTail: Promise.resolve(),
 				});
-				if (source.onIssued) {
-					session.effects.enqueue(() =>
-						source.onIssued!({
-							proposalID: node.identity.proposalID,
-							actionID: node.identity.actionID,
-							feedback: action.feedback,
-						}),
-					);
-				}
 			} else {
 				const context = session.actionContexts.get(node.identity.id)!;
 				context.feedback = action.feedback;
 				context.draft = planActionDraft(node);
+			}
+			for (const notify of [issued ? source.onIssued : undefined, source.onAdmitted]) {
+				if (notify) session.effects.enqueue(() => notify.call(source, {
+					proposalID: node.identity.proposalID, actionID: node.identity.actionID, feedback: action.feedback,
+				}));
 			}
 			materializations.push(materializeAction(session, node).finally(() => dispatchReady(session)));
 		}
