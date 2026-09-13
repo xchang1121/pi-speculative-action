@@ -13,6 +13,7 @@ import {
 } from "./provenance-certificate.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
+import { hasErrorCode, isMissing as missing } from "./error-utils.ts";
 
 export interface ProvenanceStoreLimits {
 	readonly maxCertificates: number;
@@ -443,7 +444,7 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 			await link(temporary, target);
 			return true;
 		} catch (error) {
-			if (!alreadyExists(error)) throw error;
+			if (!hasErrorCode(error, "EEXIST")) throw error;
 			return false;
 		}
 	} finally {
@@ -454,16 +455,4 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 function digestHex(digest: Sha256Digest): string {
 	if (!isSha256Digest(digest)) throw new Error("invalid sha256 digest");
 	return digest.slice("sha256:".length);
-}
-
-function missing(error: unknown): boolean {
-	return hasCode(error, "ENOENT");
-}
-
-function alreadyExists(error: unknown): boolean {
-	return hasCode(error, "EEXIST");
-}
-
-function hasCode(error: unknown, code: string): boolean {
-	return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }

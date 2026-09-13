@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
+import { errorMessage, isMissing } from "./error-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,
@@ -277,7 +278,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 			}
 			this.lastStructure = verified;
 		} catch (error) {
-			this.poisonReason = `workspace_transaction_clock:${error instanceof Error ? error.message : String(error)}`;
+			this.poisonReason = `workspace_transaction_clock:${errorMessage(error)}`;
 		}
 	}
 
@@ -300,7 +301,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 			try {
 				before = await this.captureFencedBefore();
 			} catch (error) {
-				this.poisonReason = `workspace_transaction_sync:${error instanceof Error ? error.message : String(error)}`;
+				this.poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
 			}
 			const capture = this.poisonReason || !before
 				? new GitWorkspaceTransactionCapture(this)
@@ -348,7 +349,7 @@ class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
 					after: verified,
 				};
 			} catch (error) {
-				const reason = `workspace_transaction_capture:${error instanceof Error ? error.message : String(error)}`;
+				const reason = `workspace_transaction_capture:${errorMessage(error)}`;
 				this.poisonReason = reason;
 				return {
 					complete: false,
@@ -2377,10 +2378,6 @@ function withCommitLocks<T>(
 ): Promise<T> {
 	const target = targets[index];
 	return target ? withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
-}
-
-function isMissing(error: unknown): boolean {
-	return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
 async function exists(target: string): Promise<boolean> {

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { errorMessage } from "./error-utils.ts";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 /** One process launch as observed at the generic tool-execution outlet. */
@@ -105,7 +106,7 @@ export class ProcessExecutionCoordinator {
 			preparation: Promise.resolve().then(() => this.actorRoute!.prepare(refresh))
 			.catch((error): PreparedProcessExecutionRoute => ({
 				state: "unavailable",
-				detail: error instanceof Error ? error.message : String(error),
+				detail: errorMessage(error),
 			}))
 			.then((prepared) => (generation.prepared = prepared)),
 		};

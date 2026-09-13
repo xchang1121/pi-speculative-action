@@ -2,7 +2,8 @@ import type { Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
-import type { DynamicDependency, Sha256Digest } from "./provenance-certificate.ts";
+import { isMissing } from "./error-utils.ts";
+import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
 import {
 	digestObject,
 	filesystemEntryType,
@@ -114,7 +115,7 @@ export async function captureWorkspaceStructureEntry(
 	try {
 		stat = await lstat(target);
 	} catch (error) {
-		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+		if (isMissing(error)) return undefined;
 		throw error;
 	}
 	return captureExistingWorkspaceStructureEntry(target, stat, excludeEntries);
@@ -162,7 +163,7 @@ async function captureExistingWorkspaceStructureEntry(
 	}
 	return {
 		kind: "unsupported",
-		type: specialFileType(stat),
+		type: filesystemEntryType(stat),
 		changeDigest: statChangeDigest(stat),
 		changeTimeMs: stat.ctimeMs,
 	};
@@ -405,7 +406,7 @@ function changedRootMetadata(
 	return before.metadataDigest === after.metadataDigest ? undefined : "unsupported_workspace_root_metadata";
 }
 
-export function directoryEntriesDigest(entries: readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; isSocket(): boolean; isFIFO(): boolean; isCharacterDevice(): boolean; isBlockDevice(): boolean }[]): Sha256Digest {
+export function directoryEntriesDigest(entries: readonly (FilesystemTypeEvidence & { readonly name: string })[]): Sha256Digest {
 	return digestObject(
 		entries
 			.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
@@ -425,18 +426,6 @@ function statChangeDigest(stat: Stats): Sha256Digest {
 		links: stat.nlink,
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
-}
-
-function specialFileType(stat: Stats): string {
-	return stat.isSocket()
-		? "socket"
-		: stat.isFIFO()
-			? "fifo"
-			: stat.isCharacterDevice()
-				? "char"
-				: stat.isBlockDevice()
-					? "block"
-					: "other";
 }
 
 function replacePath(value: string, from: string, to: string): string {

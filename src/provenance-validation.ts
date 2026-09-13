@@ -1,6 +1,7 @@
 import { lstat, readdir, readlink, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import {
 	type DynamicDependency,
 	type DynamicDependencyCertificate,
@@ -332,12 +333,4 @@ function elapsed(startedAt: number): number {
 
 function finiteLimit(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, value) : Number.POSITIVE_INFINITY;
-}
-
-function missing(error: unknown): boolean {
-	return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }
