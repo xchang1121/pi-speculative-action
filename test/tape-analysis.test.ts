@@ -1,14 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
 	analyzeTape,
-	analyzeTapeDrafterRace,
-	analyzeTapeDrafterWidth,
-	analyzeTapeForkGate,
-	analyzeTapeReprobe,
 	type LlmTape,
 } from "../bench/tape-analysis.ts";
 
 describe("LLM tape action analysis", () => {
+	it("charges each recorded request once across a multi-tool Actor batch", () => {
+		const messages = [{ role: "user", content: "two actions" }];
+		const batch = calls(["read", '{"path":"a"}'], ["write", '{"path":"b"}']);
+		const result = analyzeTape({ exchanges: [
+			exchange(0, "actor", messages, 100, [batch]),
+			exchange(1, "draft", messages, 30, [batch]),
+			exchange(2, "draft", messages, 60, [call("read", '{"path":"a"}')]),
+		] }, "actor", "draft");
+		expect(result.summary).toMatchObject({ opportunities: 2, candidateCount: 3,
+			uniqueCandidateCount: 2, actorServiceMs: 100, drafterServiceMs: 90 });
+	});
+
 	it.each([Infinity, 1, 2, 3, 5])("pairs exact contexts and full K(a) across %s-byte stream chunks", (chunkBytes) => {
 		const messages = [{ role: "user", content: "fix" }];
 		const args = JSON.stringify({ path: chunkBytes === Infinity ? "a" : "文档/😀.txt" });
@@ -25,23 +33,24 @@ describe("LLM tape action analysis", () => {
 		const result = analyzeTape(tape, "actor", "draft");
 
 		expect(result.summary).toEqual({
+			actorRequests: 1,
+			drafterRequests: 4,
+			actorServiceMs: 100,
+			drafterServiceMs: 100,
+			requestsWithoutDuration: 0,
 			opportunities: 1,
-			exactHits: 1,
-			hitRate: 1,
-			exactReadyBeforeActor: 1,
-			earlyHitRate: 1,
-			candidateCount: 3,
-			uniqueCandidateCount: 2,
+			exactMatches: 1,
+			matchRate: 1,
+			candidateCount: 4,
+			uniqueCandidateCount: 3,
 			duplicateCandidateCount: 1,
-			uniqueYield: 2 / 3,
-			actorDecodeMs: 100,
-			drafterServiceMs: 90,
-			exactLeadMs: 70,
+			uniqueYield: 3 / 4,
 		});
-		expect(result.opportunities[0]).toMatchObject({
-			drafterSequences: [1, 2, 3],
-			exactReadyBeforeActor: true,
-			earliestExactReadyMs: 30,
+		expect(result.opportunities).toEqual([{
+			actorSequence: 0, actorAction: { name: "read", arguments: JSON.parse(args) }, drafterSequences: [1, 2],
+		}]);
+		expect(result.requests[1]).toMatchObject({
+			body: tape.exchanges[1]!.request.descriptor.body, serviceMs: 30,
 		});
 	});
 
@@ -62,194 +71,57 @@ describe("LLM tape action analysis", () => {
 		});
 	});
 
-	it("replays the rolling gate against the fastest-completing same-context Drafter", () => {
-		const exchanges: LlmTape["exchanges"][number][] = [];
-		for (let index = 0; index < 7; index++) {
-			const messages = [{ role: "user", content: `decision-${index}` }];
-			exchanges.push(exchange(index * 2, "actor", messages, 100, [call("read", `{"path":"actor-${index}"}`)]));
-			exchanges.push(exchange(index * 2 + 1, "draft", messages, 60, [call("read", `{"path":"miss-${index}"}`)]));
-			if (index === 0)
-				exchanges.push(exchange(1_000, "draft", messages, 10, [call("read", '{"path":"actor-0"}')]));
-		}
-		const result = analyzeTapeForkGate({ exchanges }, "actor", "draft", {
-			enabled: true,
-			minSamples: 4,
-			windowSize: 4,
-			minNetBenefitMs: 25,
-			probeInterval: 4,
-			failureThreshold: 2,
-		});
-
-		expect(result).toMatchObject({
-			decisions: 7,
-			allowed: 4,
-			skipped: 3,
-			exactHitsAvailable: 1,
-			exactHitsRetained: 1,
-			forkCostMs: 370,
-			gatedForkCostMs: 190,
-		});
+	it.each(["messages", "tools", "functions"])("requires equal %s while retaining decoding options in the request evidence", (field) => {
+		const messages = [{ role: "user", content: "same request" }];
+		const event = call("read", '{"path":"a"}');
+		const base = { messages, tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }], functions: [] };
+		const bodies = [
+			{ ...base, model: "actor", reasoning_effort: "high", max_tokens: 1000, tool_choice: "auto" },
+			{ ...base, model: "draft", reasoning_effort: "low", max_tokens: 128, tool_choice: "required" },
+			{ ...base, model: "draft", [field]: [{ changed: true }] },
+		];
+		const tape = { exchanges: bodies.map((body, index) => ({ ...exchange(index, body.model, messages, 20, [event]),
+			request: { descriptor: { body } } })) };
+		const result = analyzeTape(tape, "actor", "draft");
+		expect(result.opportunities[0]?.drafterSequences).toEqual([1]);
+		expect(result.requests.map((request) => request.body)).toEqual(bodies);
 	});
 
-	it("measures bounded D2 recovery separately from later Actor snapshot runway", () => {
-		const messages = [{ role: "user", content: "decision" }];
-		const result = analyzeTapeReprobe(
-			{
-				exchanges: [
-					exchange(0, "actor", messages, 120, [
-						{ atMs: 10, data: content("thinking ") },
-						{ atMs: 40, data: content("more") },
-						{ atMs: 90, data: call("read", '{"path":"actor"}') },
-					]),
-					exchange(1, "draft", messages, 30, [call("read", '{"path":"miss"}')]),
-					exchange(2, "draft", messages, 50, [call("read", '{"path":"actor"}')]),
-					exchange(3, "draft", messages, 70, [call("read", '{"path":"later"}')]),
-				],
-			},
-			"actor",
-			"draft",
-		);
-
-		expect(result).toEqual({
-			decisions: 1,
-			actorActionTurns: 1,
-			d1ExactHits: 0,
-			d1Misses: 1,
-			boundedReprobes: 1,
-			secondProbeRecoveredHits: 1,
-			anyLaterRecoveredHits: 1,
-			additionalForkCostMs: 50,
-			snapshotReprobeTurns: 1,
-			snapshotReprobeActionTurns: 1,
-			snapshotReprobeRunwayMs: 50,
-		});
+	it("retains partial, failed and malformed requests with usage while excluding their batches from comparison", () => {
+		const messages = [{ role: "user", content: "decision" }], event = call("read", '{"path":"a"}');
+		const usage = { prompt_tokens: 80, completion_tokens: 12, total_tokens: 92,
+			prompt_tokens_details: { cached_tokens: 50 }, completion_tokens_details: { reasoning_tokens: 8 } };
+		const receipt = `data: ${JSON.stringify({ choices: [], usage })}\n\n`;
+		const exchanges = [exchange(0, "actor", messages, 100, [event]), exchange(1, "actor", messages, 90, [event]),
+			...Array.from({ length: 4 }, (_, index) => exchange(index + 2, "draft", messages, (index + 1) * 10, [event, receipt]))];
+		exchanges[2] = { ...exchanges[2]!, response: { ...exchanges[2]!.response, completed: false } };
+		exchanges[3] = { ...exchanges[3]!, response: { ...exchanges[3]!.response, status: 503, error: { code: "upstream" } } };
+		exchanges[4] = exchange(4, "draft", messages, 30, [event, "data: {malformed}\n\n", receipt]);
+		exchanges.push(exchange(6, "draft", messages, NaN, [call("read", "{")]));
+		const tape = { exchanges }, before = structuredClone(tape), result = analyzeTape(tape, "actor", "draft");
+		expect(tape).toEqual(before);
+		expect(result.summary).toMatchObject({ actorRequests: 2, drafterRequests: 5, actorServiceMs: 190,
+			drafterServiceMs: 100, requestsWithoutDuration: 1, opportunities: 2, exactMatches: 2, candidateCount: 1 });
+		expect(result.opportunities.map((opportunity) => opportunity.drafterSequences)).toEqual([[5], [5]]);
+		expect(result.requests.slice(2, 6).map((request) => request.usage)).toEqual([usage, usage, usage, usage]);
+		expect(result.requests[4]).toMatchObject({ malformedEvents: 1 });
+		expect(result.requests[6]).toMatchObject({ invalidCalls: 1, serviceMs: undefined });
 	});
 
-	it("replays Drafter width in dispatch order and charges request costs once per Actor turn", () => {
-		const messages = [{ role: "user", content: "decision" }];
-		const tape: LlmTape = {
-			exchanges: [
-				exchange(0, "actor", messages, 100, [calls(["read", '{"path":"first"}'], ["write", '{"path":"second"}'])]),
-				exchange(1, "draft", messages, 80, [call("read", '{"path":"first"}')]),
-				exchange(2, "draft", messages, 10, [call("write", '{"path":"second"}')]),
-				exchange(3, "draft", messages, 20, [call("read", '{"path":"first"}')]),
-			],
-		};
-
-		const result = analyzeTapeDrafterWidth(tape, "actor", "draft", [3, 1, 2, 2, 0]);
-
-		expect(result).toMatchObject({
-			actorTurns: 1,
-			opportunities: 2,
-			availableDrafterRequests: 3,
-			availableDrafterServiceMs: 110,
-		});
-		// Columns are widths 1, 2 and 3; every reported field remains part of the exact comparison.
-		const expected = {
-			width: [1, 2, 3],
-			actorTurns: [1, 1, 1],
-			opportunities: [2, 2, 2],
-			exactHits: [1, 2, 2],
-			marginalExactHits: [1, 1, 0],
-			hitRate: [0.5, 1, 1],
-			exactReadyBeforeActor: [1, 2, 2],
-			earlyHitRate: [0.5, 1, 1],
-			drafterRequests: [1, 2, 3],
-			requestReductionFromAvailable: [2 / 3, 1 / 3, 0],
-			drafterServiceMs: [80, 90, 110],
-			serviceReductionFromAvailable: [30 / 110, 20 / 110, 0],
-			drafterCompletionSpanMs: [80, 80, 80],
-			candidateCount: [1, 2, 3],
-			uniqueCandidateCount: [1, 2, 2],
-			duplicateCandidateCount: [0, 0, 1],
-			uniqueYield: [1, 1, 2 / 3],
-			exactLeadMs: [20, 110, 170],
-		};
-		expect(result.points).toEqual([0, 1, 2].map((column) =>
-			Object.fromEntries(Object.entries(expected).map(([field, values]) => [field, values[column]]))));
+	it("assembles interleaved tool arguments in provider batch order", () => {
+		const delta = (index: number, fn: object) => `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index, function: fn }] } }] })}\n\n`;
+		const chunks = [delta(1, { name: "write", arguments: '{"path":' }), delta(0, { name: "read", arguments: '{"path":"文档/😀.txt"}' }), delta(1, { arguments: '"b"}' })];
+		const result = analyzeTape({ exchanges: [exchange(0, "actor", [], 100, chunks, 1), exchange(1, "draft", [], 10, chunks, 2)] }, "actor", "draft");
+		expect(result.requests.map((request) => request.calls)).toEqual([0, 1].map(() => [
+			{ name: "read", arguments: { path: "文档/😀.txt" } }, { name: "write", arguments: { path: "b" } },
+		]));
+		expect(result.summary).toMatchObject({ opportunities: 2, exactMatches: 2, candidateCount: 2, drafterServiceMs: 10 });
 	});
 
-	it("rejects an empty static Drafter width grid", () => {
-		expect(() => analyzeTapeDrafterWidth({ exchanges: [] }, "actor", "draft", [0, -1, 1.5])).toThrow(
-			"At least one positive integer Drafter width is required",
-		);
-	});
-
-	it.each([false, true])("races whole response batches and charges only residual service (batch=%s)", (batch) => {
-		const messages = [{ role: "user", content: "decision" }];
-		const tape: LlmTape = {
-			exchanges: [
-				exchange(0, "actor", messages, 100, [calls(["read", '{"path":"slow"}'], ["write", '{"path":"fast"}'])]),
-				exchange(1, "draft", messages, 80, [call("read", '{"path":"slow"}')]),
-				exchange(2, "draft", messages, 10, [batch
-					? calls(["write", '{"path":"fast"}'], ["read", '{"path":"slow"}'], ["write", '{"path":"fast"}'])
-					: call("write", '{"path":"fast"}')]),
-				// Faster completion is outside width=2 and must not enter the race.
-				exchange(3, "draft", messages, 1, [call("read", '{"path":"slow"}')]),
-			],
-		};
-
-		expect(analyzeTapeDrafterRace(tape, "actor", "draft", 2)).toEqual({
-			width: 2,
-			actorTurns: 1,
-			opportunities: 2,
-			winnerTurns: 1,
-			noWinnerTurns: 0,
-			selectedDrafterRequests: 2,
-			abortableDrafterRequests: 1,
-			abortableRequestRate: 0.5,
-			fullDrafterServiceMs: 90,
-			racedDrafterServiceMs: 20,
-			residualServiceSavedMs: 70,
-			serviceReduction: 70 / 90,
-			fullCandidateCount: batch ? 4 : 2,
-			fullUniqueCandidateCount: 2,
-			racedCandidateCount: batch ? 3 : 1,
-			racedUniqueCandidateCount: batch ? 2 : 1,
-			fullExactHits: 2,
-			racedExactHits: batch ? 2 : 1,
-			laterRecoveredExactHits: batch ? 0 : 1,
-			fullExactReadyBeforeActor: 2,
-			racedExactReadyBeforeActor: batch ? 2 : 1,
-			fullExactLeadMs: batch ? 180 : 110,
-			racedExactLeadMs: batch ? 180 : 90,
-		});
-	});
-
-	it("does not let an empty response win or claim already-completed peers as abortable", () => {
-		const messages = [{ role: "user", content: "decision" }];
-		const result = analyzeTapeDrafterRace(
-			{
-				exchanges: [
-					exchange(0, "actor", messages, 100, [call("read", '{"path":"winner"}')]),
-					exchange(1, "draft", messages, 5, [content("no tool")]),
-					exchange(2, "draft", messages, 20, [call("read", '{"path":"winner"}')]),
-					exchange(3, "draft", messages, 50, [call("read", '{"path":"late"}')]),
-				],
-			},
-			"actor",
-			"draft",
-			3,
-		);
-
-		expect(result).toMatchObject({
-			winnerTurns: 1,
-			abortableDrafterRequests: 1,
-			fullDrafterServiceMs: 75,
-			racedDrafterServiceMs: 45,
-			residualServiceSavedMs: 30,
-			fullCandidateCount: 2,
-			racedCandidateCount: 1,
-			fullExactHits: 1,
-			racedExactHits: 1,
-			laterRecoveredExactHits: 0,
-		});
-	});
-
-	it("rejects an invalid Drafter race width", () => {
-		expect(() => analyzeTapeDrafterRace({ exchanges: [] }, "actor", "draft", 0)).toThrow(
-			"A positive integer Drafter race width is required",
-		);
+	it("rejects ambiguous model roles and duplicate request identities", () => {
+		expect(() => analyzeTape({ exchanges: [] }, "same", "same")).toThrow("Distinct model IDs");
+		const request = exchange(0, "actor", [], 1, []);
+		expect(() => analyzeTape({ exchanges: [request, request] }, "actor", "draft")).toThrow("unique non-negative integers");
 	});
 });
 
@@ -280,10 +152,6 @@ function exchange(
 			}),
 		},
 	};
-}
-
-function content(value: string): string {
-	return `data: ${JSON.stringify({ choices: [{ delta: { content: value } }] })}\n\n`;
 }
 
 function call(name: string, argumentsDelta: string): string {
