@@ -161,6 +161,42 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
+	it("retires every selected pool when another pool fails to close", async () => {
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		const owner = new WorkspaceSandboxService(), pools: string[] = [], removed: string[] = [];
+		const roots = await Promise.all(["failed", "healthy", "retained"].map(label => temporaryRoot(label)));
+		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
+			const directory = await fs.mkdtemp(prefix, options);
+			if (String(prefix).endsWith("pi-speculative-action-pool-")) pools.push(directory);
+			return directory;
+		});
+		try {
+			for (const root of roots) await owner.prepare(root, { driver: "git" });
+			expect(pools).toHaveLength(3);
+			vi.mocked(rm).mockImplementation(async (target, options) => {
+				if (pools.includes(String(target))) {
+					removed.push(String(target));
+					if (String(target) === pools[0]) throw new Error("pool removal failed");
+				}
+				return fs.rm(target, options);
+			});
+			await expect(owner.closePools(roots.slice(0, 2))).rejects.toThrow("pool removal failed");
+			expect(removed.sort()).toEqual(pools.slice(0, 2).sort());
+			await expect(stat(pools[1]!)).rejects.toThrow();
+			expect((await stat(pools[2]!)).isDirectory()).toBe(true);
+			await owner.dispose();
+			expect(removed.sort()).toEqual([...pools].sort());
+		} finally {
+			vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp); vi.mocked(rm).mockImplementation(fs.rm);
+			await owner.dispose();
+			for (const pool of pools) {
+				expect(path.dirname(pool)).toBe(path.resolve(os.tmpdir()));
+				expect(path.basename(pool)).toMatch(/^pi-speculative-action-pool-/);
+				await fs.rm(pool, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("qualifies auto OverlayFS by the exact immutable baseline size", async ({ skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
