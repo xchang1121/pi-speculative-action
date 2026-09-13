@@ -2231,11 +2231,12 @@ export function makeStructuralSpeculativeActionRuntime<
 						order: settlement.actorAction.sequence,
 					});
 					if (state.lifecycle === "active") {
-						await admitUpdates(
+						// Preserve observation order; only session retirement drains optional binding and route preparation.
+						void trackSourceTask(state.session, admitUpdates(
 							{ session: state.session, startInput: state.startInput, data: state.data,
 								settings: state.settings, signal: state.generation.signal },
 							source, updates,
-						);
+						));
 					}
 				} catch {
 					// Learning and continuation never alter an authoritative Actor result.
@@ -2729,6 +2730,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		settlePredictionFrontier(state);
 		state.lifecycle = "closing";
 		state.generation.expire(input.failure);
+		for (const node of state.session.plan.pending()) {
+			if (!node.actionKey && state.session.actionContexts.get(node.identity.id)?.admissionSignal.aborted)
+				failUnlaunchable(state.session, node, cause("source", "generation_expired"));
+		}
 		for (const preview of state.actorPreviews.values()) {
 			abandonActorPreview(state, preview, input.failure);
 		}

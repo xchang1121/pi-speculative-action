@@ -682,16 +682,20 @@ describe("speculative action host", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it.each(["actor", "drafter", "closing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
+	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
 		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
-		const tools = [grepTool, readTool], ready = deferred<void>();
+		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
 		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>();
 		let allowRead = origin !== "rejected";
 		const predictAfterBatch = vi.spyOn(patternStore, "predictAfterBatch");
 		const issued = vi.spyOn(patternStore, "issued");
 		const carried = origin === "carried" || origin === "revised";
 		const world = toolRuntimeWorld();
-		const fingerprint = vi.fn(origin !== "actor" ? world.speculation.fingerprint : () => { throw new Error("Fixture world unavailable"); });
+		const fingerprint = vi.fn<NonNullable<SpeculativeAgentExecutionWorld["speculation"]["fingerprint"]>>(async (request) => {
+			if (origin === "actor") throw new Error("Fixture world unavailable");
+			if (origin === "preparing" && request.action?.tool === "read") { ready.resolve(); await routeGate.promise; }
+			return world.speculation.fingerprint!(request);
+		});
 		const host = createSpeculativeActionHost("probe", {
 			cwd,
 			getSettings: () => ({ ...settings(origin === "drafter" ? 1 : 4), drafterEnabled: origin === "drafter",
@@ -733,7 +737,7 @@ describe("speculative action host", () => {
 					source: "pattern_aware", tool: "read", input: { path: "notes.txt" },
 				}));
 				expect(patternStore.recent("probe")).toHaveLength(0);
-				if (origin === "rejected" || carried) await ready.promise;
+				if (origin === "preparing" || origin === "rejected" || carried) await ready.promise;
 				if (origin === "revised") {
 					const before = issued.mock.calls.length;
 					await host.execute({ ...call, id: "another-grep" }, undefined, execute);
@@ -742,14 +746,14 @@ describe("speculative action host", () => {
 				}
 				await host.finishTurn(call.turnID);
 			}
-			if (origin === "closing" || origin === "rejected" || carried) {
+			if (origin === "closing" || origin === "preparing" || origin === "rejected" || carried) {
 				allowRead = true;
 				await host.startTurn({ ...startInput(readTool, "next"),
 					context: { systemPrompt: "system", messages: [], tools }, tools });
 				expect(await nextRequest.promise).toBe(carried ? "empty" : "produced");
 				if (!carried) await waitFor(() => materialized.some((candidate) => candidate.turnID === "next" && candidate.tool === "read"));
 			}
-		} finally { available.resolve(patternStore); await host.dispose(); }
+		} finally { routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }
 	});
 
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
