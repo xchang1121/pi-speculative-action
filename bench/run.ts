@@ -140,6 +140,9 @@ if (options.prepareOnly) {
 	await mkdir(path.dirname(output), { recursive: true });
 	await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
 	process.stdout.write(`${JSON.stringify({ output, ...result.summary }, null, 2)}\n`);
+	if (Object.keys(result.summary.benchmarkErrors).length) {
+		throw new Error(`Benchmark failed: ${JSON.stringify(result.summary.benchmarkErrors)}`);
+	}
 }
 
 async function prepareTask(input: BenchmarkOptions) {
@@ -338,25 +341,30 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	});
 
 	const agentStartedAt = performance.now();
-	let agentCompletedAt: number;
-	let taskCompletedAt: number;
+	let agentCompletedAt = agentStartedAt;
+	const benchmarkErrors: Record<string, string> = {};
 	let timedOut = false;
 	const timeout = setTimeout(() => {
 		timedOut = true;
 		agent.abort();
 	}, input.timeoutMs);
-	try {
-		await agent.prompt(prompt);
-	} finally {
-		agentCompletedAt = performance.now();
-		clearTimeout(timeout);
+	for (const [phase, operation] of [
+		["prompt", () => agent.prompt(prompt)],
+		["finishTurn", () => lastTurnID ? host.finishTurn(lastTurnID, true) : undefined],
+		["hostDispose", () => host.dispose()],
+		["workspaceDispose", () => workspaceSandbox.dispose()],
+	] as const) {
 		try {
-			if (lastTurnID) await host.finishTurn(lastTurnID, true);
-		} finally {
-			try { await host.dispose(); } finally { await workspaceSandbox.dispose(); }
+			await operation();
+		} catch (error) {
+			benchmarkErrors[phase] = String(error);
 		}
-		taskCompletedAt = performance.now();
+		if (phase === "prompt") {
+			agentCompletedAt = performance.now();
+			clearTimeout(timeout);
+		}
 	}
+	const taskCompletedAt = performance.now();
 	const summary = summarizeSpeculativeTrace(events);
 	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
@@ -446,6 +454,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			turnLimitReached,
 			timedOut,
 			agentError: agent.state.errorMessage,
+			benchmarkErrors,
 			toolIntentMs,
 			rawActorToolExecutions: counters.executions,
 			rawActorToolServiceMs: counters.serviceMs,
@@ -461,6 +470,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				!timedOut &&
 				!turnLimitReached &&
 				!agent.state.errorMessage &&
+				!Object.keys(benchmarkErrors).length &&
 				patchClean &&
 				changedFiles.length > 0 &&
 				coveredGoldFiles.length > 0,

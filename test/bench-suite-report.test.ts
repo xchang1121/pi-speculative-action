@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import {
 	nearestRank,
 	pairedLatencyStatistics,
@@ -7,6 +9,117 @@ import {
 } from "../bench/suite-report.ts";
 
 describe("ablation suite report", () => {
+	it.each([
+		["exit", "Benchmark runner exited with 7"],
+		["invalid-result", "Incomplete benchmark result"],
+		["benchmark", "Benchmark failed: cleanup failed"],
+	])("preserves completed and failed runs after a runner %s", async (failure, message) => {
+		const originalArgv = process.argv;
+		const files = new Map<string, string>();
+		let attempts = 0;
+		vi.resetModules();
+		vi.doMock("node:fs/promises", () => ({
+			mkdir: async () => {},
+			readFile: async (file: string) => file.endsWith("suite.json")
+				? JSON.stringify({ offline: ["first", "failed", "unstarted"] }) : files.get(file),
+			writeFile: async (file: string, data: string) => { files.set(file, data); },
+		}));
+		vi.doMock("node:child_process", () => ({ spawn: (_file: string, args: string[]) => {
+			const child = new EventEmitter();
+			const instance = args[args.indexOf("--instance") + 1]!;
+			const output = args[args.indexOf("--output") + 1]!;
+			attempts++;
+			queueMicrotask(() => {
+				files.set(output, instance === "first" || failure === "benchmark" ? JSON.stringify({
+					metadata: { implementationCommit: "commit" }, summary: run(instance, 1, instance === "first" ? {} : {
+						patchCandidate: false, benchmarkErrors: { hostDispose: "cleanup failed" },
+					}).summary,
+				}) : "{}");
+				child.emit("exit", instance !== "first" && failure === "exit" ? 7 : 0, null);
+			});
+			return child;
+		} }));
+		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		process.argv = [process.execPath, "suite.ts", "--suite", "offline", "--output-root", "offline-results"];
+		try {
+			await expect(import("../bench/suite.ts")).rejects.toThrow(message);
+			expect(attempts).toBe(2);
+			const report = JSON.parse(files.get(path.resolve("offline-results", "suite-result.json")) ?? "null");
+			expect(report).toMatchObject({ runs: 2, patchCandidates: 1, allRunsScreenedIn: false,
+				pooled: { runs: 1, accelerationRatio: 1 }, byInstance: { failed: null },
+				invalidRuns: [{ instance: "failed", repeat: 1, error: expect.stringContaining(message) }],
+			});
+			expect(report.runOutputs.map((value: { instance: string }) => value.instance)).toEqual(["first", "failed"]);
+		} finally {
+			process.argv = originalArgv;
+			stdout.mockRestore();
+			vi.doUnmock("node:fs/promises"); vi.doUnmock("node:child_process"); vi.resetModules();
+		}
+	});
+
+	it("retains prompt and every disposal failure with measured timing and usage", async () => {
+		const originalArgv = process.argv, files = new Map<string, string>(), phases: string[] = [];
+		const fail = (phase: string) => { phases.push(phase); throw new Error(`${phase} failed`); };
+		vi.resetModules();
+		vi.doMock("node:fs/promises", () => ({
+			mkdir: async () => {}, mkdtemp: async () => path.resolve("offline-task"), stat: async () => ({}),
+			writeFile: async (file: string, data: string) => { files.set(file, data); },
+		}));
+		vi.doMock("node:child_process", () => ({ execFile: (_file: string, args: string[], _options: unknown,
+			callback: (error: null, stdout: string, stderr: string) => void) => {
+			callback(null, args.includes("--name-only") ? "src/file.ts\n" : "commit", "");
+		} }));
+		vi.doMock("@earendil-works/pi-agent-core", () => ({ Agent: class {
+			state = { messages: [{ role: "assistant", usage: {
+				cost: { total: 2 }, totalTokens: 13, input: 10, output: 3, cacheRead: 0, cacheWrite: 0,
+			} }] };
+			prompt: () => Promise<never>;
+			constructor(input: { streamFn: () => Promise<unknown> }) {
+				this.prompt = async () => { await input.streamFn(); return fail("prompt"); };
+			}
+			subscribe() {}
+		} }));
+		vi.doMock("@earendil-works/pi-ai/compat", () => ({
+			getProviders: () => ["offline"], getModels: () => [{ provider: "offline", id: "model" }], streamSimple: () => ({}),
+		}));
+		vi.doMock("@earendil-works/pi-coding-agent", () => ({ VERSION: "0.84.1", ...Object.fromEntries(
+			["Read", "Write", "Edit", "Ls", "Bash", "Find", "Grep"].flatMap(name => ["", "Definition"].map(suffix =>
+				[`create${name}Tool${suffix}`, () => ({ name: name.toLowerCase() })])),
+		) }));
+		vi.doMock("../src/agent-integration.ts", () => ({ createSpeculativeActionHost: () => ({
+			startTurn: async () => {}, finishTurn: () => fail("finishTurn"), dispose: () => fail("hostDispose"),
+		}) }));
+		vi.doMock("../src/agent-execution-world.ts", () => ({ createResourceSnapshotExecutionWorld: () => ({}) }));
+		vi.doMock("../src/workspace-sandbox.ts", () => ({ WorkspaceSandboxService: class {
+			createExecutionWorld() { return {}; }
+			dispose() { return fail("workspaceDispose"); }
+		} }));
+		vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ rows: [{ row: {
+			instance_id: "offline", repo: "offline/repo", base_commit: "commit", patch: "diff --git a/src/file.ts b/src/file.ts",
+			test_patch: "", problem_statement: "offline", language: "TypeScript", source_dataset: "offline",
+			FAIL_TO_PASS: [], PASS_TO_PASS: [],
+		} }] }) }));
+		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		process.argv = [process.execPath, "run.ts", "--instance", "offline", "--actor", "offline/model",
+			"--drafter", "offline/model", "--output", "offline-result.json"];
+		try {
+			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
+			expect(phases).toEqual(["prompt", "finishTurn", "hostDispose", "workspaceDispose"]);
+			const { summary } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
+			expect(summary).toMatchObject({ patchCandidate: false, actorCost: 2, actorTokens: 13, accelerationRatio: 1,
+				changedFiles: ["src/file.ts"], benchmarkErrors: Object.fromEntries(phases.map(phase => [phase, `Error: ${phase} failed`])),
+			});
+			expect(summary.actualEndToEndMs).toBeGreaterThanOrEqual(summary.agentPromptMs);
+			expect(summary.actualEndToEndMs).toBeCloseTo(summary.setupMs + summary.agentPromptMs + summary.teardownMs, 6);
+		} finally {
+			process.argv = originalArgv; stdout.mockRestore(); vi.unstubAllGlobals();
+			vi.doUnmock("node:fs/promises"); vi.doUnmock("node:child_process");
+			vi.doUnmock("@earendil-works/pi-agent-core"); vi.doUnmock("@earendil-works/pi-ai/compat");
+			vi.doUnmock("@earendil-works/pi-coding-agent"); vi.doUnmock("../src/agent-integration.ts");
+			vi.doUnmock("../src/agent-execution-world.ts"); vi.doUnmock("../src/workspace-sandbox.ts"); vi.resetModules();
+		}
+	});
+
 	it("pools only completed patch candidates and exposes every screening failure", () => {
 		const report = summarizeSuite([
 			run("task-a", 1, {

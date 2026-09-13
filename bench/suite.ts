@@ -31,36 +31,38 @@ const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 const runs: SuiteBenchmarkRun[] = [];
 await mkdir(outputRoot, { recursive: true });
 
-for (let repeat = 1; repeat <= parsed.repeats; repeat++) {
-	for (const instance of instances) {
-		const output = path.join(outputRoot, `repeat-${repeat}`, `${safeName(instance)}.json`);
-		await mkdir(path.dirname(output), { recursive: true });
-		await execute(process.execPath, [tsx, runner, ...parsed.forwarded, "--instance", instance, "--output", output]);
-		const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
-		runs.push({
-			instance,
-			repeat,
-			output,
-			implementationCommit: result.metadata.implementationCommit,
-			summary: result.summary,
-		});
+try {
+	for (let repeat = 1; repeat <= parsed.repeats; repeat++) {
+		for (const instance of instances) {
+			const output = path.join(outputRoot, `repeat-${repeat}`, `${safeName(instance)}.json`);
+			let run: SuiteBenchmarkRun = { instance, repeat, output };
+			try {
+				await mkdir(path.dirname(output), { recursive: true });
+				await execute(process.execPath, [tsx, runner, ...parsed.forwarded, "--instance", instance, "--output", output]);
+				const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
+				run = { ...run, implementationCommit: result.metadata.implementationCommit, summary: result.summary };
+				const errors = Object.values(result.summary.benchmarkErrors ?? {});
+				if (errors.length) throw new Error(`Benchmark failed: ${errors.join("; ")}`);
+			} catch (error) {
+				run = { ...run, error: String(error) };
+				throw error;
+			} finally {
+				runs.push(run);
+			}
+		}
 	}
+} finally {
+	const report = {
+		metadata: {
+			suite: parsed.suite, label, repeats: parsed.repeats, instances, forwardedArguments: parsed.forwarded,
+		},
+		...summarizeSuite(runs),
+		runOutputs: runs.map(({ instance, repeat, output }) => ({ instance, repeat, output })),
+	};
+	const reportFile = path.join(outputRoot, "suite-result.json");
+	await writeFile(reportFile, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+	process.stdout.write(`${JSON.stringify({ output: reportFile, ...report }, null, 2)}\n`);
 }
-
-const report = {
-	metadata: {
-		suite: parsed.suite,
-		label,
-		repeats: parsed.repeats,
-		instances,
-		forwardedArguments: parsed.forwarded,
-	},
-	...summarizeSuite(runs),
-	runOutputs: runs.map(({ instance, repeat, output }) => ({ instance, repeat, output })),
-};
-const reportFile = path.join(outputRoot, "suite-result.json");
-await writeFile(reportFile, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-process.stdout.write(`${JSON.stringify({ output: reportFile, ...report }, null, 2)}\n`);
 
 function parseSuiteArguments(args: readonly string[]) {
 	const forwarded = [...args];

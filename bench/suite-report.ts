@@ -11,6 +11,7 @@ export interface SuiteBenchmarkSummary {
 	readonly timedOut: boolean;
 	readonly turnLimitReached: boolean;
 	readonly agentError?: string;
+	readonly benchmarkErrors?: Readonly<Record<string, string>>;
 	readonly patchClean: boolean;
 	readonly changedFiles: readonly string[];
 	readonly coveredGoldFiles: readonly string[];
@@ -20,9 +21,12 @@ export interface SuiteBenchmarkRun {
 	readonly instance: string;
 	readonly repeat: number;
 	readonly output: string;
-	readonly implementationCommit: string;
-	readonly summary: SuiteBenchmarkSummary;
+	readonly implementationCommit?: string;
+	readonly summary?: SuiteBenchmarkSummary;
+	readonly error?: string;
 }
+
+type MeasuredRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
 
 export interface SuiteStatisticsOptions {
 	readonly bootstrapSamples?: number;
@@ -40,7 +44,9 @@ export function summarizeSuite(
 	options: SuiteStatisticsOptions = {},
 ) {
 	const statistics = normalizeStatisticsOptions(options);
-	const accepted = runs.filter((run) => run.summary.patchCandidate);
+	const accepted = runs.filter((run): run is MeasuredRun => !!run.summary?.patchCandidate && !run.error &&
+		!Object.keys(run.summary.benchmarkErrors ?? {}).length);
+	const acceptedSet = new Set<SuiteBenchmarkRun>(accepted);
 	return {
 		runs: runs.length,
 		patchCandidates: accepted.length,
@@ -52,14 +58,15 @@ export function summarizeSuite(
 			bootstrapSamples: statistics.bootstrapSamples,
 			seed: statistics.seed,
 		},
-		implementationCommits: [...new Set(runs.map((run) => run.implementationCommit))],
+		implementationCommits: [...new Set(runs.flatMap((run) => run.implementationCommit ? [run.implementationCommit] : []))],
 		invalidRuns: runs
-			.filter((run) => !run.summary.patchCandidate)
+			.filter((run) => !acceptedSet.has(run))
 			.map((run) => ({
 				instance: run.instance,
 				repeat: run.repeat,
 				output: run.output,
-				reasons: screeningFailures(run.summary),
+				...(run.error ? { error: run.error } : {}),
+				reasons: [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)],
 			})),
 		pooled: accepted.length ? pooled(accepted, statistics) : undefined,
 		byInstance: Object.fromEntries(
@@ -129,7 +136,7 @@ export function pairedLatencyStatistics(
 	} as const;
 }
 
-function pooled(runs: readonly SuiteBenchmarkRun[], options: Required<SuiteStatisticsOptions>) {
+function pooled(runs: readonly MeasuredRun[], options: Required<SuiteStatisticsOptions>) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
 	const serializedCounterfactualMs = sum(runs, "serializedCounterfactualMs");
 	const actorActions = sum(runs, "actorActions");
@@ -206,7 +213,7 @@ function seededRandom(seed: number): () => number {
 	};
 }
 
-function sum(runs: readonly SuiteBenchmarkRun[], key: NumericSummaryKey): number {
+function sum(runs: readonly MeasuredRun[], key: NumericSummaryKey): number {
 	return runs.reduce((total, run) => total + run.summary[key], 0);
 }
 
@@ -214,11 +221,13 @@ type NumericSummaryKey = {
 	[Key in keyof SuiteBenchmarkSummary]-?: SuiteBenchmarkSummary[Key] extends number ? Key : never;
 }[keyof SuiteBenchmarkSummary];
 
-function screeningFailures(summary: SuiteBenchmarkSummary): string[] {
+function screeningFailures(summary: SuiteBenchmarkSummary | undefined): string[] {
+	if (!summary) return ["unavailable_summary"];
 	const reasons = [
 		summary.timedOut ? "timed_out" : undefined,
 		summary.turnLimitReached ? "turn_limit_reached" : undefined,
 		summary.agentError ? "agent_error" : undefined,
+		Object.keys(summary.benchmarkErrors ?? {}).length ? "benchmark_error" : undefined,
 		!summary.patchClean ? "patch_not_clean" : undefined,
 		!summary.changedFiles.length ? "no_changed_files" : undefined,
 		!summary.coveredGoldFiles.length ? "no_gold_file_overlap" : undefined,
