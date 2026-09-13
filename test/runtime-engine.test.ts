@@ -1,3 +1,4 @@
+import type { PlanAction } from "../src/plan-proposal.ts";
 import { deferred, barrier, nextTurn } from "./async.ts";
 import { testBranch as world } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
@@ -66,12 +67,20 @@ function planSource(source: Omit<Source, "id" | "enabled"> & Partial<Pick<Source
 	return { id: "source", enabled: () => true, ...source };
 }
 
+function readAction<Input>(
+	id: string,
+	input: Input,
+	options: Partial<Omit<PlanAction, "id" | "type" | "tool" | "input">> = {},
+) {
+	return { id, type: "tool_call" as const, tool: "read", ...options, input };
+}
+
 function plan(proposalID: string, input: Record<string, unknown> = { path: "README.md" }) {
 	return {
 		id: proposalID,
 		source: "source",
 		revision: 0,
-		actions: [{ id: "next", type: "tool_call" as const, tool: "read", input, feedback: proposalID }],
+		actions: [readAction("next", input, { feedback: proposalID })],
 	};
 }
 
@@ -89,7 +98,7 @@ function futureReadSource(
 				? {
 						...plan("future", { path: "future.ts" }),
 						actions: [
-							{ id: "next", type: "tool_call", tool: "read", input: { path: "future.ts" }, horizon: 0, ...action },
+							readAction("next", { path: "future.ts" }, { horizon: 0, ...action }),
 						],
 					}
 				: subsequent === "placeholder"
@@ -108,13 +117,7 @@ function childPlanUpdate(
 		source: "source",
 		revision: context.revision,
 		upsert: [
-			{
-				id,
-				type: "tool_call" as const,
-				tool: "read",
-				input: { path },
-				dependsOn: [{ actionID: context.actionID, condition: "execution_succeeded" as const }],
-			},
+			readAction(id, { path }, { dependsOn: [{ actionID: context.actionID, condition: "execution_succeeded" as const }] }),
 		],
 	};
 }
@@ -216,6 +219,10 @@ async function runFallback(fixture: ReturnType<typeof harness<string>>, actor: C
 	expect(prepared).toBeDefined();
 	expect(prepared?.output).toBeUndefined();
 	await prepared?.settle(durationMs, output);
+}
+
+function start(turnID: string): Start {
+	return { sessionID: "session", turnID };
 }
 
 function call(turnID: string, input: Record<string, unknown> = { path: "README.md" }): Call {
@@ -329,14 +336,14 @@ describe("structural speculative runtime", () => {
 		const replacements: MaterializedSpeculativeCandidate<string>[] = [];
 		const proposals = [
 			{ id: "proposal:0", source: "source", revision: 0, actions: [
-				{ id: "slow", type: "tool_call" as const, tool: "read", input: { path: "slow.ts" } },
-				{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "same-plan.ts" } },
+				readAction("slow", { path: "slow.ts" }),
+				readAction("same-plan", { path: "same-plan.ts" }),
 			] },
 			plan("proposal:1", { path: "other-plan.ts" }),
 		];
 		const revisions = [proposals[0]!, { ...plan("proposal:0", { path: "replacement.ts" }), revision: 1 }, proposals[1]!];
 		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, remove: ["slow"],
-			upsert: [{ id: "same-plan", type: "tool_call" as const, tool: "read", input: { path: "replacement.ts" } }] }, proposals[1]!];
+			upsert: [readAction("same-plan", { path: "replacement.ts" })] }, proposals[1]!];
 		const revised = mode === "revisions" || mode === "observed";
 		const source = planSource({
 			proposalCount: () => mode === "requests" ? 2 : 1,
@@ -362,7 +369,7 @@ describe("structural speculative runtime", () => {
 		});
 		let turnID = "parallel-admission";
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			await fixture.runtime.startTurn(start(turnID));
 			if (mode === "observed") {
 				const seed = call(turnID, { path: "seed.ts" });
 				await runFallback(fixture, seed, 1, "Actor");
@@ -382,7 +389,7 @@ describe("structural speculative runtime", () => {
 			}
 			if (mode === "observed") {
 				slow.arrive(); await fixture.runtime.finishTurn({ ...call(turnID), terminal: false });
-				turnID = "next-decision"; await fixture.runtime.startTurn({ sessionID: "session", turnID });
+				turnID = "next-decision"; await fixture.runtime.startTurn(start(turnID));
 			}
 			if (revised) expect(replacements).toMatchObject([{
 				source: "source", proposalID: "proposal:0", actionID: mode === "revisions" ? "next" : "same-plan",
@@ -420,7 +427,7 @@ describe("structural speculative runtime", () => {
 			actionKey,
 			onEvent: candidateReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await fixture.runtime.startTurn(start("turn"));
 		await candidateReady.promise;
 
 		const prepared = await fixture.runtime.prepareActorCall(call("turn"));
@@ -472,7 +479,7 @@ describe("structural speculative runtime", () => {
 			},
 			validate,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await fixture.runtime.startTurn(start("turn"));
 		await captureStarted.promise;
 
 		const consumed = fixture.runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output);
@@ -503,13 +510,13 @@ describe("structural speculative runtime", () => {
 			onEvent: candidateReady.observe,
 		});
 
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "calibration" });
+		await fixture.runtime.startTurn(start("calibration"));
 		const calibration = call("calibration");
 		await runFallback(fixture, calibration, 100);
 		await fixture.runtime.finishTurn({ ...calibration, terminal: false });
 
 		enabled = true;
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "prediction" });
+		await fixture.runtime.startTurn(start("prediction"));
 		await executionStarted.promise;
 		const prepared = await fixture.runtime.prepareActorCall(call("prediction"));
 		expect(prepared?.output).toBeUndefined();
@@ -529,7 +536,7 @@ describe("structural speculative runtime", () => {
 			},
 		});
 		enabled = false;
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "retained" });
+		await fixture.runtime.startTurn(start("retained"));
 		expect((await fixture.runtime.prepareActorCall(call("retained")))?.output).toBe("learned");
 		await fixture.runtime.finishTurn({ ...call("retained"), terminal: true });
 		const event = fixture.events.find((event) => event.type === "actor_action" && event.turnID === "retained");
@@ -553,7 +560,7 @@ describe("structural speculative runtime", () => {
 			continue: ({ output }) => { if (output !== "generation:1") { outputs.push(output); continued.arrive(); } return undefined; },
 			observe: ({ concrete }) => mode === "replaced" && concrete.path === "replace.ts"
 				? { proposalID: "turn-2", source: "source", revision: 1,
-					upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }] } : undefined,
+					upsert: [readAction("next", { path: "replacement.ts" })] } : undefined,
 		});
 		const fixture = harness({
 			source,
@@ -579,11 +586,11 @@ describe("structural speculative runtime", () => {
 		});
 		let closing: Promise<void> | undefined, closed = false;
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" }); await ready.promise;
+			await fixture.runtime.startTurn(start("turn-1")); await ready.promise;
 			const unrelated = call("turn-1", { path: "other.ts" });
 			await runFallback(fixture, unrelated);
 			await fixture.runtime.finishTurn({ ...unrelated, terminal: false });
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" }); await validating.promise;
+			await fixture.runtime.startTurn(start("turn-2")); await validating.promise;
 			if (late) {
 				validationGate.arrive(); await refreshed.promise; secondValidation.arrive(); await continued.promise;
 				expect(outputs).toEqual(["generation:2", "generation:2"]);
@@ -593,7 +600,7 @@ describe("structural speculative runtime", () => {
 			} else if (mode === "evicted") {
 				await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: false });
 				configured = { ...settings, resourceCacheMaxBytes: 1 };
-				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
+				await fixture.runtime.startTurn(start("turn-3"));
 				expect(fixture.runtime.inspect().sharedCandidates).toBe(0);
 			} else if (mode !== "refresh") {
 				closing = (mode === "disposed" || mode === "unwrapped" ? fixture.runtime.dispose() : mode === "disabled"
@@ -609,7 +616,7 @@ describe("structural speculative runtime", () => {
 			if (refreshes) {
 				if (mode === "replaced") {
 					await fixture.runtime.finishTurn({ ...call("turn-2"), terminal: false });
-					await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-3" });
+					await fixture.runtime.startTurn(start("turn-3"));
 				}
 				expect((await fixture.runtime.prepareActorCall(call(late || mode === "refresh" ? "turn-2" : "turn-3",
 					{ path: mode === "replaced" ? "replacement.ts" : "README.md" })))?.output).toBe("generation:2");
@@ -655,7 +662,7 @@ describe("structural speculative runtime", () => {
 				...(phase === "promotion" ? { rejectCandidateOutput: () => { throw new Error("optional cache policy failed"); } } : {}),
 			});
 			try {
-				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+				await fixture.runtime.startTurn(start("turn"));
 				if (observing) {
 					const prepared = await fixture.runtime.prepareActorCall(call("turn"));
 					expect(prepared?.output).toBeUndefined();
@@ -720,7 +727,7 @@ describe("structural speculative runtime", () => {
 				},
 			});
 			try {
-				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+				await fixture.runtime.startTurn(start("turn"));
 				await first.promise; await nextTurn();
 				expect(aborted, mode).toEqual(mode === "late" ? [] : [0]);
 				if (mode !== "late") expect(abortReasons[0]).toBe("source_slot_unused");
@@ -834,7 +841,7 @@ describe("structural speculative runtime", () => {
 				if (event.type === "source_request") requestsSettled.arrive();
 			},
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await fixture.runtime.startTurn(start("turn"));
 		await Promise.all([proposalsEntered.promise, admissionEntered.promise]);
 
 		const prepared = await fixture.runtime.prepareActorCall(call("turn"));
@@ -860,9 +867,9 @@ describe("structural speculative runtime", () => {
 			if (!result.admitted && forecasts.length === (mode === "future" ? 2 : 1)) queued.arrive();
 			return result;
 		});
-		const proposal = () => ({ ...plan("demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) => ({
-					id: String(horizon), type: "tool_call" as const, tool: "read", input: { path: "README.md" }, horizon, expectedDurationMs: 500,
-				})) });
+		const proposal = () => ({ ...plan("demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) =>
+			readAction(String(horizon), { path: "README.md" }, { horizon, expectedDurationMs: 500 }),
+		) });
 		const fixture = harness({
 			source: planSource({
 				propose: ({ startInput }) => mode !== "next-terminal" && startInput.turnID === "demand" ? proposal() : undefined,
@@ -913,9 +920,9 @@ describe("structural speculative runtime", () => {
 			const fixture = harness({
 				source: planSource({ propose: () => [
 					{ id: "busy", source: "source", revision: 0, actions: [
-						{ id: "busy", type: "tool_call", tool: "read", input: { path: "busy.ts" }, expectedLatencyBenefitMs: speculative ? 0 : 1 }] },
+						readAction("busy", { path: "busy.ts" }, { expectedLatencyBenefitMs: speculative ? 0 : 1 })] },
 					...(mode === "preview" ? [] : [{ id: "target", source: "source", revision: 0, actions: [
-						{ id: "target", type: "tool_call" as const, tool: "read", input: { path: "target.ts" }, resourceDemand: mode === "queued" ? 2 : 1 }] }]),
+						readAction("target", { path: "target.ts" }, { resourceDemand: mode === "queued" ? 2 : 1 })] }]),
 				] }),
 				settings: () => ({ ...settings, maxConcurrentActions: mode === "running" ? 2 : 1 }),
 				actionKey: async (tool, args) => { if ((args as { path: string }).path === "target.ts") await busyStarted.promise; return buildPiActionKey(tool, args, "/workspace"); },
@@ -928,7 +935,7 @@ describe("structural speculative runtime", () => {
 				},
 			});
 			try {
-				await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await busyStarted.promise;
+				await fixture.runtime.startTurn(start("turn")); await busyStarted.promise;
 				if (mode === "preview") await fixture.runtime.previewActorCall(call("turn", { path: "target.ts" }));
 				if (mode === "running") await targetStarted.promise;
 				if (mode === "queued") await targetQueued.promise;
@@ -996,7 +1003,7 @@ describe("structural speculative runtime", () => {
 			}; },
 			onEvent: candidateReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" });
+		await fixture.runtime.startTurn(start("turn"));
 		await (running ? started.promise : candidateReady.promise);
 		projection.canShareInFlight = () => true;
 		if (!outputOnly) projection.projectOutput = () => "changed callback";
@@ -1108,12 +1115,12 @@ describe("structural speculative runtime", () => {
 			onEvent: ready.observe,
 		});
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "first" }); await ready.promise;
+			await fixture.runtime.startTurn(start("first")); await ready.promise;
 			for (const [index, offset] of [2, 3, 2].entries()) {
 				const turnID = index === 2 ? "second" : "first";
 				if (index === 2) {
 					await fixture.runtime.finishTurn({ ...call("first"), terminal: false });
-					await fixture.runtime.startTurn({ sessionID: "session", turnID });
+					await fixture.runtime.startTurn(start(turnID));
 				}
 				const actor = { ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) };
 				if (!learned || index > 0) await fixture.runtime.previewActorCall(actor);
@@ -1133,7 +1140,7 @@ describe("structural speculative runtime", () => {
 				hiddenLatencyMs: learned || bytes === 128 ? 10 : 50,
 			});
 			now += 10;
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "next-task" });
+			await fixture.runtime.startTurn(start("next-task"));
 			expect((await fixture.runtime.prepareActorCall(call("next-task", { path: "input", offset: 2, limit: 1 })))?.output).toBe("2");
 			await fixture.runtime.finishTurn({ ...call("next-task"), terminal: true });
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (bytes === 128 ? 1 : 0));
@@ -1167,7 +1174,7 @@ describe("structural speculative runtime", () => {
 		});
 		let preparation: Promise<void> | undefined, closing: Promise<void> | undefined;
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await ready.promise;
+			await fixture.runtime.startTurn(start("turn")); await ready.promise;
 			preparation = fixture.runtime.previewActorCall(query); await entered.promise;
 			expect(committed).not.toHaveBeenCalled();
 			if (phase === "closing") {
@@ -1221,7 +1228,7 @@ describe("structural speculative runtime", () => {
 		});
 		let consuming: Promise<string | undefined> | undefined, closing: Promise<void> | undefined;
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn" }); await candidateReady.promise;
+			await fixture.runtime.startTurn(start("turn")); await candidateReady.promise;
 			consuming = fixture.runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output); await entered.promise;
 			if (phase !== "poisoned") closing = phase === "disposed" ? fixture.runtime.dispose()
 				: fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
@@ -1306,7 +1313,7 @@ describe("structural speculative runtime", () => {
 			settings: () => configured,
 			onEvent: candidateReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+		await fixture.runtime.startTurn(start("turn-1"));
 		await candidateReady.promise;
 
 		configured = { ...settings, tools: settings.tools.filter((tool) => tool !== "read") };
@@ -1314,7 +1321,7 @@ describe("structural speculative runtime", () => {
 		expect((await fixture.runtime.prepareActorCall(call("turn-1")))?.output).toBe("speculative");
 		await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
 
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+		await fixture.runtime.startTurn(start("turn-2"));
 		expect((await fixture.runtime.prepareActorCall(call("turn-2")))?.output).toBe("speculative");
 
 		configured = { ...settings, enabled: false };
@@ -1339,7 +1346,7 @@ describe("structural speculative runtime", () => {
 			},
 		});
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-1" });
+			await fixture.runtime.startTurn(start("turn-1"));
 			await (phase === "running" ? started.promise : ready.promise);
 			const mutation: Call = { ...call("turn-1"), id: "mutation", tool: phase === "observation" ? "read" : "write",
 				input: { path: "future.ts", ...(phase === "observation" ? { offset: 100, limit: 1 } : { content: "new" }) } };
@@ -1351,7 +1358,7 @@ describe("structural speculative runtime", () => {
 			expect(executions).toBe(phase === "running" ? 2 : 1);
 			expect(settlements).toHaveLength(0);
 			await fixture.runtime.finishTurn({ ...call("turn-1"), terminal: false });
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "turn-2" });
+			await fixture.runtime.startTurn(start("turn-2"));
 			const actor = call("turn-2", { path: "future.ts" }), hit = !["sealed stale", "sealed unproven"].includes(phase);
 			const prepared = await fixture.runtime.prepareActorCall(actor);
 			expect(prepared?.output).toBe(hit ? `future:${phase === "running" ? 2 : 1}` : undefined);
@@ -1385,7 +1392,7 @@ describe("structural speculative runtime", () => {
 				captureAuthoritativeResult: (action) => { captured = action; return undefined; },
 			});
 			const turnID = `in-flight-key:${formalPath}:${settlePreview}`;
-			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			await fixture.runtime.startTurn(start(turnID));
 			const previewCall = call(turnID, { path: "preview.ts" });
 			const preview = fixture.runtime.previewActorCall(previewCall);
 			await firstKeyStarted.promise;
@@ -1608,7 +1615,7 @@ describe("structural speculative runtime", () => {
 		});
 		let turnID = "turn-1";
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID });
+			await fixture.runtime.startTurn(start(turnID));
 			await routeChecked.promise;
 			await nextTurn();
 			expect(fixture.runtime.inspect()).toMatchObject({
@@ -1619,7 +1626,7 @@ describe("structural speculative runtime", () => {
 				await runFallback(fixture, earlier);
 				await fixture.runtime.finishTurn({ ...earlier, terminal: false });
 				turnID = `turn-${previous + 1}`;
-				await fixture.runtime.startTurn({ sessionID: "session", turnID });
+				await fixture.runtime.startTurn(start(turnID));
 			}
 			const firstCall: Call = {
 				sessionID: "session", turnID, id: "first", tool,
@@ -1674,12 +1681,7 @@ describe("structural speculative runtime", () => {
 					source: "source",
 					revision,
 					upsert: [
-						{
-							id: "child",
-							type: "tool_call",
-							tool: "read",
-							input: { path: "child.ts" },
-						},
+						readAction("child", { path: "child.ts" }),
 					],
 				};
 			},
@@ -1696,7 +1698,7 @@ describe("structural speculative runtime", () => {
 			},
 			onEvent: childReady.observe,
 		});
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "parallel-continuation" });
+		await fixture.runtime.startTurn(start("parallel-continuation"));
 		await parentReady.promise;
 
 		const parent = {
@@ -1718,7 +1720,7 @@ describe("structural speculative runtime", () => {
 		expect((await fixture.runtime.prepareActorCall(sameBatchChild))?.output).toBe("child.ts:output");
 		await fixture.runtime.finishTurn({ ...parent, terminal: false });
 
-		await fixture.runtime.startTurn({ sessionID: "session", turnID: "next-decision" });
+		await fixture.runtime.startTurn(start("next-decision"));
 		expect(
 			(await fixture.runtime.prepareActorCall({ ...sameBatchChild, turnID: "next-decision", id: "next-decision-child" }))?.output,
 		).toBe("child.ts:output");
@@ -1757,7 +1759,7 @@ describe("structural speculative runtime", () => {
 			},
 			observe: ({ concrete }) => phase === "replaced" && concrete.path === "replace.ts" ? {
 				proposalID: "cross-turn", source: "source", revision: 2,
-				upsert: [{ id: "next", type: "tool_call", tool: "read", input: { path: "replacement.ts" } }],
+				upsert: [readAction("next", { path: "replacement.ts" })],
 			} : undefined,
 		});
 		const fixture = harness({
@@ -1770,7 +1772,7 @@ describe("structural speculative runtime", () => {
 		});
 		let closing: Promise<void> | undefined;
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent-turn" });
+			await fixture.runtime.startTurn(start("parent-turn"));
 			await continuationStarted.promise;
 			expect((await fixture.runtime.prepareActorCall(call("parent-turn", { path: "parent.ts" })))?.output).toBe("parent.ts:output");
 			if (phase === "terminal") closing = fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: true });
@@ -1782,7 +1784,7 @@ describe("structural speculative runtime", () => {
 			} else {
 				await fixture.runtime.finishTurn({ ...call("parent-turn"), terminal: false });
 				expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 1 });
-				await fixture.runtime.startTurn({ sessionID: "session", turnID: "child-turn" });
+				await fixture.runtime.startTurn(start("child-turn"));
 				expect(proposals).toBe(1);
 				if (retained) { gate.arrive(); await childReady.promise; }
 				else {
@@ -1831,7 +1833,7 @@ describe("structural speculative runtime", () => {
 		});
 
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "miss" });
+			await fixture.runtime.startTurn(start("miss"));
 			await childPrepared.promise;
 			expect(dependencyChange).toBe(false);
 			await childReady.promise;
@@ -1841,7 +1843,7 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.finishTurn({ ...call("miss"), terminal: false });
 
 			enabled = false;
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "target" });
+			await fixture.runtime.startTurn(start("target"));
 			expect((await fixture.runtime.prepareActorCall(call("target", { path: "late.ts" })))?.output).toBe("late.ts:output");
 			await fixture.runtime.finishTurn({ ...call("target"), terminal: true });
 			expect(executed).toEqual(["parent.ts", "late.ts"]);
@@ -1921,7 +1923,7 @@ describe("structural speculative runtime", () => {
 		const expectedParent = mode === "replaced" ? "parent-new" : "parent-0";
 		const parentCall: Call = { sessionID: "session", turnID: "parent", id: "actor-parent", tool: "write", input: parentAction(expectedParent).input };
 		try {
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "parent" }); await childrenReady.promise;
+			await fixture.runtime.startTurn(start("parent")); await childrenReady.promise;
 			expect(executed.sort()).toEqual(["child", "child", "parent-0", "parent-1"]);
 			expect(childParents.sort()).toEqual(["parent-0", "parent-1"]);
 				if (mode !== "baseline") {
@@ -1942,7 +1944,7 @@ describe("structural speculative runtime", () => {
 			}
 			if (mode !== "adopted") expect((await fixture.runtime.prepareActorCall(parentCall))?.output).toBe(expectedParent);
 			enabled = claimed; await fixture.runtime.finishTurn({ ...parentCall, terminal: false });
-			await fixture.runtime.startTurn({ sessionID: "session", turnID: "child" });
+			await fixture.runtime.startTurn(start("child"));
 			const childCall: Call = { ...parentCall, turnID: "child", id: "actor-child", input: childAction.input };
 			holdReuse = claimed;
 			const childConsumption = fixture.runtime.prepareActorCall(childCall, actorController.signal).then(prepared => prepared?.output);
