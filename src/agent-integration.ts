@@ -45,7 +45,7 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
-import { nonNegativeInteger, positiveInteger } from "./setting-input.ts";
+import { booleanOr, nonNegativeInteger, positiveInteger } from "./setting-input.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
@@ -67,9 +67,9 @@ export interface SpeculativeAgentSettingsInput extends Partial<DrafterRequestSet
 export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSettingsInput = {}, allowed = DEFAULTS.tools) {
 	return {
 		...normalizeDrafterRequestSettings(input),
-		enabled: typeof input.enabled === "boolean" ? input.enabled : DEFAULTS.enabled,
-		drafterEnabled: typeof input.drafterEnabled === "boolean" ? input.drafterEnabled : DEFAULTS.drafterEnabled,
-		drafterGateEnabled: typeof input.drafterGateEnabled === "boolean" ? input.drafterGateEnabled : DEFAULTS.drafterGateEnabled,
+		enabled: booleanOr(input.enabled, DEFAULTS.enabled),
+		drafterEnabled: booleanOr(input.drafterEnabled, DEFAULTS.drafterEnabled),
+		drafterGateEnabled: booleanOr(input.drafterGateEnabled, DEFAULTS.drafterGateEnabled),
 		candidateLimit: clampCandidateLimit(input.candidateLimit ?? DEFAULTS.candidateLimit),
 		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),

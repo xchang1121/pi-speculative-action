@@ -387,6 +387,18 @@ ready 的 Host 对照未插桩；running 保持原受控接续、释放和阶段
 
 同版 20 轮原生 exec 边界与 running 采纳资格通过，保持原一次消费、作用域、描述符、元数据、输入改变、作业控制、原等待与回收断言。资格为 `shared-path-probes-qualification.json` 和 `shared-path-probes-build-qualification.json`。当前相对 `caaf4ef` 少 356 个物理行、多 3185 个 LF 字节，净减少要求仍待完成；体积报告为 `code-size-shared-path-probes.json`。ThinkThread 与 PR #1 冻结部分未修改。
 
+### 配置边界与已拥有数据的投影
+
+以 `ad6fa51` 为相邻基线，归并重复的对象判定、布尔和数值解析；保留原字段域、默认值与 `asRecord` 导出。SelfSpeculation 用完整的字段解析表消除逐项重复的默认值读取，窗口与最小样本数仍单独约束。Sidecar 在取得快照时直接生成协议上下文，并用已解析的完整调用计算批次身份，移除两次重复投影。Bash 取消用例复用现有夹具的调用构造，保留正常结束、取消、在途文件探测排空与资源所有权断言。
+
+Windows/WSL 代码、基准类型检查和构建通过，两端仍为 664 项测试：Windows 641 通过、23 项平台跳过；WSL 663 通过、1 项跳过。85 个编译模块逐项核对并保存完整快照。每个版本、平台均比较 3954 组配置输入、312 组公开标量/动作边界和 20 组完整 Sidecar 请求与批次，覆盖调用顺序、重复证据、无效调用和调用者后续修改，结果一致；资格见 `boundary-projections-build-qualification.json` 与 `boundary-projections-boundary-qualification.json`。Sidecar gate 含实际经过时间，该值逐样本保留，不能充当严格相等的计时 oracle。
+
+本地解析的每次中位成本：SelfSpeculation 在 Windows 三种输入形态约 `1.19–1.25 → 0.91–1.14 μs`，WSL 约 `1.05–1.10 → 0.95–1.08 μs`。这不等于 Actor 或模型收益。给小型 Pattern 配置套用同一字段表的先行试验反而慢约 4–8 倍，已撤回；其原始前后报告和补丁继续保留。独立 Sidecar 夹具首次因缺少闭合括号而未执行，原脚本、失败日志与修正后的 v2 结果均保留，没有放宽检查。
+
+新增六次严格长程 mock 回放，各平台分别启用仅 Pattern、全部来源和无 Pattern；完整 Actor 输入输出、后续请求 payload/阶段/thinking/选项/预算/usage、文件效果、原始 Pattern 批次与真实 Store 学习、一次消费及清理均通过，与相邻版本已保存的六次回放一致。当前三种设置的 Windows 总时长约 `10.530 / 10.017 / 9.944` 秒，WSL 约 `35.709 / 34.699 / 34.500` 秒；参考运行并非本次交错配对，不能据此声称稳定整体提速。仅 Pattern 仍只有两次投影、零精确命中；全开仍由 Drafter 提供 Windows 22、WSL 23 次文件采纳。Windows 全开失败候选为 7 条，参考为 8 条：当前第 13 轮 Pattern 根请求返回空，相关候选延后出现；原始批次在固定成本下的学习前沿仍一致，不将该差异记作优化收益。WSL 全开仍有 10 条失败，两组含 Drafter 的回放各保留一次子进程命中。
+
+长程资格见 `boundary-projections-qualification.json`。原生进程模块与相邻版字节一致，沿用上一节原生边界报告，同时由当前 Linux 全套与长程回放覆盖；不声称新增原生计时样本。相对 `caaf4ef`，`src/test/bench` 实际代码目前净减少 419 个物理行、104 个 LF 字节，包含 C、文档除外，见 `code-size-boundary-projections.json`。历史偶发问题、准备总成本与 Pattern 有效覆盖仍需继续推进，ThinkThread 与 PR #1 冻结部分未修改。
+
 ### 模型套件
 
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。

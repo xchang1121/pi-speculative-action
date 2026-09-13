@@ -10,7 +10,9 @@ import {
 	UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
-import { immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
+import { asRecord, immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
+import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";
+export { asRecord } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
@@ -448,7 +450,7 @@ export function inferredActionEffect(tool: string): ActionEffect | undefined {
 }
 
 export function normalizeReadOffset(value: unknown): number {
-	return normalizePositiveInteger(value, READ_DEFAULT_OFFSET);
+	return positiveInteger(value, READ_DEFAULT_OFFSET);
 }
 
 export function normalizeReadLimit(value: unknown): number {
@@ -458,11 +460,6 @@ export function normalizeReadLimit(value: unknown): number {
 
 function finiteOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-export function asRecord(value: unknown): Record<string, unknown> | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	return value as Record<string, unknown>;
 }
 
 function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined {
@@ -497,8 +494,8 @@ function canonicalGrep(input: unknown, cwd: string): CanonicalAction | undefined
 			...(typeof record.glob === "string" ? { glob: record.glob } : {}),
 			ignoreCase: record.ignoreCase === true,
 			literal: record.literal === true,
-			context: normalizeNonNegativeInteger(record.context, 0),
-			limit: normalizePositiveInteger(record.limit, GREP_DEFAULT_LIMIT),
+			context: nonNegativeInteger(record.context, 0),
+			limit: positiveInteger(record.limit, GREP_DEFAULT_LIMIT),
 		},
 	};
 }
@@ -514,7 +511,7 @@ function canonicalFind(input: unknown, cwd: string): CanonicalAction | undefined
 		input: {
 			pattern: record.pattern,
 			path: root,
-			limit: normalizePositiveInteger(record.limit, FIND_DEFAULT_LIMIT),
+			limit: positiveInteger(record.limit, FIND_DEFAULT_LIMIT),
 		},
 	};
 }
@@ -526,7 +523,7 @@ function canonicalLs(input: unknown, cwd: string): CanonicalAction | undefined {
 	if (root === undefined) return undefined;
 	return {
 		resources: [root],
-		input: { path: root, limit: normalizePositiveInteger(record.limit, LS_DEFAULT_LIMIT) },
+		input: { path: root, limit: positiveInteger(record.limit, LS_DEFAULT_LIMIT) },
 	};
 }
 
@@ -646,16 +643,6 @@ function normalizeWorkspacePath(value: string, cwd: string, reading = false): st
 	if (relative === undefined) return undefined;
 	const resource = slash(relative || ".");
 	return piPaths.resolveToCwd(resource, root) === target ? resource : `./${resource}`;
-}
-
-function normalizePositiveInteger(value: unknown, fallback: number): number {
-	const number = finiteOrUndefined(value);
-	return number !== undefined && number > 0 ? Math.floor(number) : fallback;
-}
-
-function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
-	const number = finiteOrUndefined(value);
-	return number !== undefined && number >= 0 ? Math.floor(number) : fallback;
 }
 
 function validOptionalInteger(value: unknown, minimum: number): boolean {

@@ -18,8 +18,9 @@ import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./run
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
-import { stableStringify } from "./stable-json.ts";
-import { nonNegativeNumber, positiveInteger, probability } from "./setting-input.ts";
+import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
+import { nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
+import { booleanOr, nonNegativeNumber, positiveInteger, probability, settingsParser } from "./setting-input.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
 
@@ -70,60 +71,42 @@ const selfSpeculationDefaults = {
 
 export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(selfSpeculationDefaults);
 
+const parseSettings = settingsParser(selfSpeculationDefaults, {
+	enabled: booleanOr,
+	endpoint: (value, fallback) => (nonEmptyString(value) ?? fallback).replace(/\/+$/u, ""),
+	requestIDField: textOr,
+	candidatePath: httpPath,
+	forkPath: httpPath,
+	clearPath: httpPath,
+	timeoutMs: positiveInteger,
+	maxCandidates: positiveInteger,
+	maxDraftTokens: positiveInteger,
+	actorProfile: textOr,
+	draftFormat: textOr,
+	draftBoundary: textOr,
+	forkEnabled: booleanOr,
+	forkActionEnabled: booleanOr,
+	forkActionMinConfidence: probability,
+	forkTransport: (value) => value === "sidecar" ? "sidecar" : "provider",
+	forkMaxTokens: positiveInteger,
+	forkTemperature: nonNegativeNumber,
+	forkDecoder: textOr,
+	forkForcedPrefix: textOr,
+	requireLogprobs: booleanOr,
+	forkGateEnabled: booleanOr,
+	forkGateMinSamples: positiveInteger,
+	forkGateWindowSize: positiveInteger,
+	forkGateMinNetBenefitMs: nonNegativeNumber,
+	forkGateProbeInterval: positiveInteger,
+	forkGateFailureThreshold: positiveInteger,
+});
+
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
-	const endpoint = nonEmptyString(input.endpoint) ?? SELF_SPECULATION_DEFAULTS.endpoint;
+	const result = parseSettings(input);
+	result.forkGateWindowSize = Math.max(result.forkGateMinSamples, result.forkGateWindowSize);
 	const apiKeyEnv = nonEmptyString(input.apiKeyEnv);
-	const forkGateMinSamples = positiveInteger(
-		input.forkGateMinSamples,
-		SELF_SPECULATION_DEFAULTS.forkGateMinSamples,
-	);
-	const forkGateWindowSize = Math.max(
-		forkGateMinSamples,
-		positiveInteger(input.forkGateWindowSize, SELF_SPECULATION_DEFAULTS.forkGateWindowSize),
-	);
-	return {
-		enabled: booleanOr(input.enabled, SELF_SPECULATION_DEFAULTS.enabled),
-		endpoint: endpoint.replace(/\/+$/u, ""),
-		requestIDField: nonEmptyString(input.requestIDField) ?? SELF_SPECULATION_DEFAULTS.requestIDField,
-		candidatePath: httpPath(input.candidatePath, SELF_SPECULATION_DEFAULTS.candidatePath),
-		forkPath: httpPath(input.forkPath, SELF_SPECULATION_DEFAULTS.forkPath),
-		clearPath: httpPath(input.clearPath, SELF_SPECULATION_DEFAULTS.clearPath),
-		timeoutMs: positiveInteger(input.timeoutMs, SELF_SPECULATION_DEFAULTS.timeoutMs),
-		maxCandidates: positiveInteger(input.maxCandidates, SELF_SPECULATION_DEFAULTS.maxCandidates),
-		maxDraftTokens: positiveInteger(input.maxDraftTokens, SELF_SPECULATION_DEFAULTS.maxDraftTokens),
-		actorProfile: nonEmptyString(input.actorProfile) ?? SELF_SPECULATION_DEFAULTS.actorProfile,
-		draftFormat: nonEmptyString(input.draftFormat) ?? SELF_SPECULATION_DEFAULTS.draftFormat,
-		draftBoundary: nonEmptyString(input.draftBoundary) ?? SELF_SPECULATION_DEFAULTS.draftBoundary,
-		...(apiKeyEnv ? { apiKeyEnv } : {}),
-		forkEnabled: booleanOr(input.forkEnabled, SELF_SPECULATION_DEFAULTS.forkEnabled),
-		forkActionEnabled: booleanOr(input.forkActionEnabled, SELF_SPECULATION_DEFAULTS.forkActionEnabled),
-		forkActionMinConfidence: probability(
-			input.forkActionMinConfidence,
-			SELF_SPECULATION_DEFAULTS.forkActionMinConfidence,
-		),
-		forkTransport: input.forkTransport === "sidecar" ? "sidecar" : "provider",
-		forkMaxTokens: positiveInteger(input.forkMaxTokens, SELF_SPECULATION_DEFAULTS.forkMaxTokens),
-		forkTemperature: nonNegativeNumber(input.forkTemperature, SELF_SPECULATION_DEFAULTS.forkTemperature),
-		forkDecoder: nonEmptyString(input.forkDecoder) ?? SELF_SPECULATION_DEFAULTS.forkDecoder,
-		forkForcedPrefix: nonEmptyString(input.forkForcedPrefix) ?? SELF_SPECULATION_DEFAULTS.forkForcedPrefix,
-		requireLogprobs: booleanOr(input.requireLogprobs, SELF_SPECULATION_DEFAULTS.requireLogprobs),
-		forkGateEnabled: booleanOr(input.forkGateEnabled, SELF_SPECULATION_DEFAULTS.forkGateEnabled),
-		forkGateMinSamples,
-		forkGateWindowSize,
-		forkGateMinNetBenefitMs: nonNegativeNumber(
-			input.forkGateMinNetBenefitMs,
-			SELF_SPECULATION_DEFAULTS.forkGateMinNetBenefitMs,
-		),
-		forkGateProbeInterval: positiveInteger(
-			input.forkGateProbeInterval,
-			SELF_SPECULATION_DEFAULTS.forkGateProbeInterval,
-		),
-		forkGateFailureThreshold: positiveInteger(
-			input.forkGateFailureThreshold,
-			SELF_SPECULATION_DEFAULTS.forkGateFailureThreshold,
-		),
-	};
+	return apiKeyEnv ? { ...result, apiKeyEnv } : result;
 }
 
 export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<SelfSpeculationCoordinator["snapshot"]> {}
@@ -143,7 +126,7 @@ interface TurnState {
 	readonly turnID: string;
 	readonly decisionSequence: number;
 	readonly model: Model<Api>;
-	readonly context: Context;
+	readonly context: ReturnType<typeof contextPayload>;
 	readonly settings: SelfSpeculationSettings;
 	readonly candidates: Map<string, CandidateRecord>;
 	requestID?: string;
@@ -280,7 +263,7 @@ export class SelfSpeculationCoordinator {
 			turnID,
 			decisionSequence,
 			model,
-			context: serializableContext(context),
+			context: contextPayload(context),
 			settings,
 			candidates,
 			requestBound: false,
@@ -447,7 +430,7 @@ export class SelfSpeculationCoordinator {
 				version: 1,
 				request_id: state.requestID,
 				model: modelPayload(state.model),
-				context: contextPayload(state.context, state.providerPayload),
+				context: { ...state.context, ...(state.providerPayload !== undefined ? { provider_payload: state.providerPayload } : {}) },
 				snapshot: {
 					attempt: probe.attempt,
 					generated_text: probe.generatedText,
@@ -749,8 +732,8 @@ export class SelfSpeculationCoordinator {
 			return fork ? { committed: false, batches: [] } : undefined;
 		}
 		this.receipts++;
-		this.draftTokensSubmitted += nonNegativeInteger(receipt.draft_token_count);
-		this.draftTokensAccepted += nonNegativeInteger(receipt.accepted_token_count);
+		this.draftTokensSubmitted += nonNegativeCount(receipt.draft_token_count);
+		this.draftTokensAccepted += nonNegativeCount(receipt.accepted_token_count);
 		if (fork) {
 			this.completedForks++;
 			state.forkCompletedAt = performance.now();
@@ -784,9 +767,9 @@ export class SelfSpeculationCoordinator {
 			if (!fork) continue;
 			if (!sources.includes("self-speculation")) continue;
 			const forkObservation = record(candidate.fork);
-			this.totalForkLatencyMs += observedNonNegativeNumber(forkObservation?.total_ms);
+			this.totalForkLatencyMs += nonNegativeFinite(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
-			const logprobTokens = nonNegativeInteger(logprobs?.token_count);
+			const logprobTokens = nonNegativeCount(logprobs?.token_count);
 			const meanLogprob = finiteNumber(logprobs?.mean);
 			const confidence = probability(record(logprobs?.tool_name)?.minimum_probability, undefined);
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
@@ -800,14 +783,14 @@ export class SelfSpeculationCoordinator {
 					(confidence === undefined || confidence < state.settings.forkActionMinConfidence))
 			)
 				continue;
-			const fingerprint = sidecarActionBatchFingerprint(calls);
+			const fingerprint = stableStringify(calls);
 			const score = record(candidate.score);
 			const evidence: ActorForkActionEvidence = {
 				candidateIDs,
 				sources,
 				provenance: structuredClone(array(candidate.provenance)),
 				actionIdentities: structuredClone(array(candidate.action_identities)),
-				draftTokenCount: nonNegativeInteger(candidate.draft_token_count),
+				draftTokenCount: nonNegativeCount(candidate.draft_token_count),
 				...(confidence !== undefined ? { confidence } : {}),
 				...(score ? { score: structuredClone(score) } : {}),
 				...(forkObservation ? { fork: structuredClone(forkObservation) } : {}),
@@ -1072,28 +1055,15 @@ function rankedCandidates(
 		.map(({ candidate }) => candidate);
 }
 
-function serializableContext(context: Context): Context {
+function contextPayload(context: Context) {
 	return {
-		...context,
+		system_prompt: context.systemPrompt,
 		messages: structuredClone(context.messages),
 		tools: context.tools?.map((tool) => ({
 			name: tool.name,
 			description: tool.description,
 			parameters: structuredClone(tool.parameters),
 		})),
-	};
-}
-
-function contextPayload(context: Context, providerPayload?: unknown): Readonly<Record<string, unknown>> {
-	return {
-		system_prompt: context.systemPrompt,
-		messages: context.messages,
-		tools: context.tools?.map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-		})),
-		...(providerPayload !== undefined ? { provider_payload: providerPayload } : {}),
 	};
 }
 
@@ -1263,20 +1233,12 @@ function requiresForkLogprobs(settings: SelfSpeculationSettings): boolean {
 	);
 }
 
-function booleanOr(value: unknown, fallback: boolean): boolean {
-	return typeof value === "boolean" ? value : fallback;
+function textOr(value: unknown, fallback: string): string {
+	return nonEmptyString(value) ?? fallback;
 }
 
 function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-	return isRecord(value) ? value : undefined;
 }
 
 function array(value: unknown): readonly unknown[] {
@@ -1285,14 +1247,6 @@ function array(value: unknown): readonly unknown[] {
 
 function finiteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function observedNonNegativeNumber(value: unknown): number {
-	return Math.max(0, finiteNumber(value) ?? 0);
-}
-
-function nonNegativeInteger(value: unknown): number {
-	return Math.floor(observedNonNegativeNumber(value));
 }
 
 function actionIdentity(key: string): string {
@@ -1318,18 +1272,6 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number): ParsedS
 		tool,
 		input: structuredClone(input),
 	};
-}
-
-function sidecarActionBatchFingerprint(calls: readonly ParsedSidecarActionCall[]): string {
-	return stableStringify(
-		calls.map((call) => ({
-			index: call.index,
-			...(call.callID ? { callID: call.callID } : {}),
-			...(call.format ? { format: call.format } : {}),
-			tool: call.tool,
-			input: call.input,
-		})),
-	);
 }
 
 function sidecarActionBatchID(fingerprint: string): string {

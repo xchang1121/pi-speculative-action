@@ -1,5 +1,5 @@
 import { StringDecoder } from "node:string_decoder";
-import { stableStringify } from "../src/stable-json.ts";
+import { asRecord as record, stableStringify } from "../src/stable-json.ts";
 import { BenefitGate, type BenefitGatePolicy } from "../src/fork-benefit-gate.ts";
 
 interface TapeChunk {
@@ -487,12 +487,6 @@ function sum<Value>(values: readonly Value[], value: (item: Value) => number): n
 
 function ratio(numerator: number, denominator: number): number {
 	return denominator > 0 ? numerator / denominator : 0;
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: undefined;
 }
 
 function array(value: unknown): readonly unknown[] {

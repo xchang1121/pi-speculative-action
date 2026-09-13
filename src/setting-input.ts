@@ -15,6 +15,23 @@ export function probability<F extends number | undefined>(value: unknown, fallba
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
 }
 
+export function booleanOr(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+/** Every stored field declares its parser; unknown fields never enter the normalized result. */
+export function settingsParser<Settings extends Record<string, unknown>>(
+	defaults: Settings,
+	parsers: { readonly [Key in keyof Settings]: (value: unknown, fallback: Settings[Key]) => Settings[Key] },
+): (input: Readonly<Record<string, unknown>> | undefined) => Settings {
+	const keys = Object.keys(defaults) as Array<Extract<keyof Settings, string>>;
+	return (input) => {
+		const result = {} as Settings;
+		for (const key of keys) result[key] = parsers[key](input?.[key], defaults[key]);
+		return result;
+	};
+}
+
 export type SettingInputResult<T> =
 	| { readonly ok: true; readonly value: T }
 	| { readonly ok: false; readonly error: string };
