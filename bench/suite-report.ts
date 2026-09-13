@@ -91,6 +91,7 @@ export function pairedLatencyStatistics(
 	options: SuiteStatisticsOptions = {},
 ) {
 	if (!observations.length) throw new Error("paired latency statistics require at least one observation");
+	const clusters = new Map<string, { count: number; baselineMs: number; treatmentMs: number; differenceMs: number }>();
 	for (const observation of observations) {
 		if (
 			!Number.isFinite(observation.baselineMs) ||
@@ -100,35 +101,40 @@ export function pairedLatencyStatistics(
 		) {
 			throw new Error("paired latency observations require non-negative baselines and positive treatments");
 		}
+		const total = clusters.get(observation.cluster) ?? { count: 0, baselineMs: 0, treatmentMs: 0, differenceMs: 0 };
+		total.count++;
+		total.baselineMs += observation.baselineMs;
+		total.treatmentMs += observation.treatmentMs;
+		total.differenceMs += observation.treatmentMs - observation.baselineMs;
+		clusters.set(observation.cluster, total);
 	}
 	const statistics = normalizeStatisticsOptions(options);
-	const clusters = new Map<string, PairedLatencyObservation[]>();
-	for (const observation of observations) {
-		const values = clusters.get(observation.cluster) ?? [];
-		values.push(observation);
-		clusters.set(observation.cluster, values);
-	}
 	const clusterValues = [...clusters.values()];
-	const ratioOfMeans = latencyRatio(observations);
+	const baselineMeanMs = mean(observations.map((observation) => observation.baselineMs));
+	const treatmentMeanMs = mean(observations.map((observation) => observation.treatmentMs));
 	const meanDifferenceMs = mean(observations.map((observation) => observation.treatmentMs - observation.baselineMs));
 	const ratios: number[] = [];
 	const differences: number[] = [];
 	const random = seededRandom(statistics.seed);
 	for (let sample = 0; sample < statistics.bootstrapSamples; sample++) {
-		const selected: PairedLatencyObservation[] = [];
+		let baselineMs = 0, treatmentMs = 0, differenceMs = 0, count = 0;
 		for (let index = 0; index < clusterValues.length; index++) {
-			selected.push(...clusterValues[Math.floor(random() * clusterValues.length)]!);
+			const selected = clusterValues[Math.floor(random() * clusterValues.length)]!;
+			baselineMs += selected.baselineMs;
+			treatmentMs += selected.treatmentMs;
+			differenceMs += selected.differenceMs;
+			count += selected.count;
 		}
-		ratios.push(latencyRatio(selected));
-		differences.push(mean(selected.map((observation) => observation.treatmentMs - observation.baselineMs)));
+		ratios.push((baselineMs / count) / (treatmentMs / count));
+		differences.push(differenceMs / count);
 	}
 	return {
 		pairs: observations.length,
 		clusters: clusters.size,
-		ratioOfMeans,
+		ratioOfMeans: baselineMeanMs / treatmentMeanMs,
 		...(ratios.length ? { ratioOfMeansCI95: [quantile(ratios, 0.025), quantile(ratios, 0.975)] as const } : {}),
-		baselineMeanMs: mean(observations.map((observation) => observation.baselineMs)),
-		treatmentMeanMs: mean(observations.map((observation) => observation.treatmentMs)),
+		baselineMeanMs,
+		treatmentMeanMs,
 		meanDifferenceMs,
 		...(differences.length
 			? { meanDifferenceCI95: [quantile(differences, 0.025), quantile(differences, 0.975)] as const }
@@ -180,11 +186,6 @@ function normalizeStatisticsOptions(options: SuiteStatisticsOptions): Required<S
 		throw new Error("bootstrapSamples must be a non-negative integer");
 	if (!Number.isSafeInteger(seed)) throw new Error("seed must be an integer");
 	return { bootstrapSamples, seed };
-}
-
-function latencyRatio(observations: readonly PairedLatencyObservation[]): number {
-	const treatment = mean(observations.map((observation) => observation.treatmentMs));
-	return mean(observations.map((observation) => observation.baselineMs)) / treatment;
 }
 
 function mean(values: readonly number[]): number {

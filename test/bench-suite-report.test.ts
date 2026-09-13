@@ -202,17 +202,22 @@ describe("ablation suite report", () => {
 		});
 	});
 
-	it("reports ratio of means rather than averaging per-task speedups", () => {
+	it("weights unequal cluster sizes in both point estimates and bootstrap samples", () => {
 		const statistics = pairedLatencyStatistics(
 			[
 				{ cluster: "short", baselineMs: 1, treatmentMs: 0.5 },
 				{ cluster: "long", baselineMs: 100, treatmentMs: 200 },
+				{ cluster: "long", baselineMs: 300, treatmentMs: 600 },
 			],
-			{ bootstrapSamples: 50 },
+			{ bootstrapSamples: 1, seed: 42 },
 		);
 
-		expect(statistics.ratioOfMeans).toBeCloseTo(101 / 200.5, 12);
+		expect(statistics.ratioOfMeans).toBeCloseTo(401 / 800.5, 12);
 		expect(statistics.ratioOfMeans).toBeLessThan(1);
+		// Seed 42 draws the long cluster, then the short cluster, including both long repeats.
+		expect(statistics.ratioOfMeansCI95).toEqual([statistics.ratioOfMeans, statistics.ratioOfMeans]);
+		expect(statistics.meanDifferenceMs).toBeCloseTo(399.5 / 3, 12);
+		expect(statistics.meanDifferenceCI95).toEqual([statistics.meanDifferenceMs, statistics.meanDifferenceMs]);
 	});
 });
 
