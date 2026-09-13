@@ -15,19 +15,7 @@ export class TimelineInterval {
 	}
 }
 
-export interface SpeculativeTaskTiming {
-	readonly startedAt: number;
-	readonly completedAt: number;
-	readonly endToEndMs: number;
-	readonly nonToolMs: number;
-	readonly actorPhaseMs: number;
-	readonly orchestrationMs: number;
-	readonly toolExecutionMs: number;
-	readonly serializedMs: number;
-	readonly hiddenLatencyMs: number;
-	/** Distinct accepted producer/query computations in this task, not Actor call count. */
-	readonly authoritativeToolCount: number;
-}
+export interface SpeculativeTaskTiming extends ReturnType<TaskTimeline["measure"]> {}
 
 /** Retains scalar endpoints; counting never owns Actor identities, results or retired computations. */
 export class TaskTimeline {
@@ -48,7 +36,7 @@ export class TaskTimeline {
 		this.authoritativeTools.push(interval.startedAt, interval.completedAt);
 	}
 
-	measure(endedAt: number): SpeculativeTaskTiming {
+	measure(endedAt: number) {
 		const startedAt = this.startedAt, completedAt = Math.max(startedAt, metric(endedAt));
 		const actorPhases = clipped(this.actorPhases, startedAt, completedAt, false);
 		const authoritativeTools = clipped(this.authoritativeTools, startedAt, completedAt, true);
@@ -71,6 +59,7 @@ export class TaskTimeline {
 			toolExecutionMs,
 			serializedMs,
 			hiddenLatencyMs,
+			/** Distinct accepted producer/query computations in this task, not Actor call count. */
 			authoritativeToolCount: authoritativeTools.length,
 		});
 	}

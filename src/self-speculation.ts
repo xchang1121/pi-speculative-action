@@ -125,47 +125,7 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 	};
 }
 
-export interface SelfSpeculationCoordinatorSnapshot {
-	readonly actorRequestID?: string;
-	readonly resolvedActorProfile?: string;
-	readonly profileResolutionSource?: string;
-	readonly bufferedCandidates: number;
-	readonly candidateSubmissions: number;
-	readonly forkRequests: number;
-	readonly forkRetries: number;
-	readonly candidateReceipts: number;
-	readonly forkCompletions: number;
-	readonly forkCandidates: number;
-	readonly forkAgreements: number;
-	readonly forkExactMatches: number;
-	readonly submittedDraftTokens: number;
-	/** Registration acknowledgements; not necessarily target-model acceptance. */
-	readonly acceptedDraftTokens: number;
-	readonly verificationRequests: number;
-	readonly verifiedDraftProposals: number;
-	readonly verifiedDraftTokens: number;
-	readonly verifiedAcceptedDraftTokens: number;
-	readonly verifiedRejectedDraftTokens: number;
-	readonly unresolvedDraftProposals: number;
-	readonly unresolvedDraftTokens: number;
-	readonly verifiedDraftAcceptanceRate?: number;
-	readonly lastVerification?: SelfSpeculationVerificationOutcome;
-	readonly forkLatencyMs: number;
-	readonly forkLogprobTokens: number;
-	readonly forkMeanLogprob?: number;
-	readonly forkGateSkips: number;
-	readonly forkGateSamples: number;
-	readonly forkGateExpectedNetBenefitMs?: number;
-	readonly forkActionAdoptions: number;
-	readonly forkExecutionAheadMs: number;
-	readonly decoderEvidenceContexts: number;
-	readonly decoderVerificationSteps: number;
-	readonly actionEvidenceContexts: number;
-	readonly actionEvidenceObservations: number;
-	readonly actionEvidenceAdoptions: number;
-	readonly failures: number;
-	readonly lastError?: string;
-}
+export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<SelfSpeculationCoordinator["snapshot"]> {}
 
 export interface SelfSpeculationVerificationStep {
 	readonly candidateIndex: number;
@@ -626,11 +586,11 @@ export class SelfSpeculationCoordinator {
 		this.track(cleanup);
 	}
 
-	snapshot(): SelfSpeculationCoordinatorSnapshot {
+	snapshot() {
 		const gate = this.latestGateKey ? this.forkGate.snapshot(this.latestGateKey) : undefined;
 		const decoderEvidence = this.decoderEvidence.snapshot();
 		const actionEvidence = this.actionEvidence.snapshot();
-		return {
+		const snapshot = {
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
 			...(this.lastResolvedActorProfile
 				? { resolvedActorProfile: this.lastResolvedActorProfile }
@@ -650,6 +610,7 @@ export class SelfSpeculationCoordinator {
 			forkAgreements: this.agreedForkCandidates,
 			forkExactMatches: this.exactForkMatches,
 			submittedDraftTokens: this.draftTokensSubmitted,
+			/** Registration acknowledgements; not necessarily target-model acceptance. */
 			acceptedDraftTokens: this.draftTokensAccepted,
 			verificationRequests: this.verificationRequests,
 			verifiedDraftProposals: this.verifiedDraftProposals,
@@ -682,6 +643,7 @@ export class SelfSpeculationCoordinator {
 			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
+		return snapshot as Readonly<typeof snapshot>;
 	}
 
 	private recordVerification(receipt: unknown, state: TurnState): void {
