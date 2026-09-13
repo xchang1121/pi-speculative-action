@@ -18,25 +18,7 @@ import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { nonNegativeInteger, positiveInteger, probability as probabilitySetting } from "./setting-input.ts";
 
-export type PatternAwareSettings = {
-	readonly enabled: boolean;
-	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
-	readonly multiStepEnabled: boolean;
-	readonly maxContextLength: number;
-	/** Maximum competing concrete actions retained per tool at each PatternAware frontier. */
-	readonly beamWidth: number;
-	/** Maximum number of recursively predicted actions on one branch. */
-	readonly maxPredictionDepth: number;
-	readonly maxFutureGap: number;
-	/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
-	readonly futureGapCoverage: number;
-	readonly decayHalfLifeEvents: number;
-	/** Support required to promote a relation after its single bounded first-recurrence probe. */
-	readonly minOccurrences: number;
-	/** Minimum historical replay precision required for a concrete argument mapper. */
-	readonly minBindingReplayProbability: number;
-	readonly maxPatterns: number;
-};
+export type PatternAwareSettings = Readonly<typeof patternAwareDefaults>;
 
 export type PatternAwareEventSignature = {
 	readonly tool: string;
@@ -244,19 +226,27 @@ type TrieNode = {
 	readonly patterns: Set<MutablePattern>;
 };
 
-export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = {
+const patternAwareDefaults = {
 	enabled: true,
+	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
 	multiStepEnabled: true,
 	maxContextLength: 4,
+	/** Maximum competing concrete actions retained per tool at each PatternAware frontier. */
 	beamWidth: 4,
+	/** Maximum number of recursively predicted actions on one branch. */
 	maxPredictionDepth: 6,
 	maxFutureGap: 2,
+	/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
 	futureGapCoverage: 0.25,
 	decayHalfLifeEvents: 2048,
+	/** Support required to promote a relation after its single bounded first-recurrence probe. */
 	minOccurrences: 2,
+	/** Minimum historical replay precision required for a concrete argument mapper. */
 	minBindingReplayProbability: 0.75,
 	maxPatterns: 4096,
 };
+
+export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults;
 
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
