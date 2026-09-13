@@ -697,6 +697,46 @@ describe("workspace-branch ExecutionWorld", () => {
 		} finally { captures.mockRestore(); }
 	});
 
+	it("retires a stale prepared workspace once across competing warm-ups", async () => {
+		const root = await temporaryRoot("warmup-retirement"), entered = deferred(), release = deferred();
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<void>[] = [];
+		let heldRoot: string | undefined, removals = 0;
+		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
+			const directory = await fs.mkdtemp(prefix, options);
+			if (!heldRoot && String(prefix).endsWith(`${path.sep}action-`)) {
+				heldRoot = directory; entered.resolve(); await release.promise;
+			}
+			return directory;
+		});
+		vi.mocked(rm).mockImplementation(async (target, options) => {
+			if (String(target) === heldRoot) removals++;
+			return fs.rm(target, options);
+		});
+		try {
+			await writeFile(path.join(root, "value.txt"), "before\n");
+			pending.push(sandbox.prepare(root, { driver: "git" }));
+			await entered.promise;
+			const repository = await Reflect.get(sandbox, "state").repositories.values().next().value;
+			const previous = repository.baseline.commit;
+			await writeFile(path.join(root, "value.txt"), "after\n");
+			pending.push(sandbox.prepare(root, { driver: "git" }));
+			await vi.waitFor(() => expect(repository.baseline.commit).not.toBe(previous));
+			await repository.lock; await nextTurn();
+			const count = validations.mock.calls.length;
+			pending.push(sandbox.prepare(root, { driver: "git" }));
+			await vi.waitFor(() => expect(validations.mock.calls.length).toBeGreaterThan(count));
+			await repository.lock; await nextTurn();
+			release.resolve(); await Promise.all(pending);
+			expect(removals).toBe(1);
+			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))
+				.toBe("after\n");
+		} finally {
+			release.resolve(); await Promise.allSettled(pending); validations.mockRestore();
+			vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp); vi.mocked(rm).mockImplementation(fs.rm);
+		}
+	});
+
 	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
 		const root = await temporaryRoot("transaction");
 		await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
