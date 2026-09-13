@@ -92,19 +92,8 @@ export type PatternAwareDependency = {
 };
 
 export type PatternAwareBinding = (
-	| {
-			readonly type: "event";
-			readonly relativeEvent: number;
-			readonly field: "input" | "output" | "outputPaths";
-			readonly path: PatternAwarePath;
-	  }
-	| {
-			readonly type: "each";
-			readonly relativeEvent: number;
-			readonly field: "input" | "output" | "outputPaths";
-			readonly path: PatternAwarePath;
-			readonly itemPath: PatternAwarePath;
-	  }
+	| (Omit<PatternAwareDependencySource, "itemPath"> & { readonly type: "event" })
+	| (Required<PatternAwareDependencySource> & { readonly type: "each" })
 	| {
 			readonly type: "constant";
 			readonly value: unknown;

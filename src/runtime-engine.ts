@@ -29,6 +29,7 @@ import type {
 	ActualToolCall,
 	AuthoritativeResultCapture,
 	PreparedActorCall,
+	RuntimeTurnContext,
 	SpeculativeActionEvent,
 	SpeculativeActionRuntime,
 	SpeculativeActionRuntimeAdapter,
@@ -415,13 +416,10 @@ function errorDetail(error: unknown): string {
 	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
-interface PlanActionContext<StartInput, StateData> {
+interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
 	readonly identity: PlanActionIdentity;
 	readonly opportunity: PredictionOpportunity;
 	feedback: unknown;
-	readonly startInput: StartInput;
-	readonly data: StateData;
-	readonly settings: SpeculativeActionSettings;
 	readonly attemptStartedAt: number;
 	readonly predictionLatencyMs: number;
 	readonly draftTokens: number;
@@ -447,11 +445,8 @@ interface SourceRequestSlot {
 	active: boolean;
 }
 
-interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> {
+interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
 	readonly session: SessionState<SessionID, Output, StartInput, StateData>;
-	readonly startInput: StartInput;
-	readonly data: StateData;
-	readonly settings: SpeculativeActionSettings;
 	readonly signal: AbortSignal;
 	readonly slot?: SourceRequestSlot;
 }
@@ -464,10 +459,7 @@ interface CandidateRecord<Output, StartInput, StateData> {
 	readonly work: CandidateExecution<WorldBranch<Output>>;
 	readonly worldParent?: CandidateRecord<Output, StartInput, StateData>;
 	actorAdopted: boolean;
-	readonly owner: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
+	readonly owner: RuntimeTurnContext<StartInput, StateData> & {
 		readonly draft: SpeculativeDraftCandidate;
 		readonly index: number;
 	};
@@ -1082,10 +1074,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!materializations.length) dispatchReady(session);
 	};
 
-	const executionRouteFor = async (input: {
-		readonly startInput: StartInput;
-		readonly data: StateData;
-		readonly settings: SpeculativeActionSettings;
+	const executionRouteFor = async (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly draft: SpeculativeDraftCandidate;
 		readonly action: ActionKey;
 		readonly concrete: Record<string, unknown>;
