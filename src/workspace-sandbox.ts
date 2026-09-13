@@ -1653,11 +1653,13 @@ async function closeWorkspaceSandboxPoolsNow(
 		const separator = key.indexOf("\0");
 		return rootKeys.has(separator === -1 ? key : key.slice(0, separator));
 	});
-	for (const [key, item] of pending) {
+	const closed = await Promise.allSettled(pending.map(async ([key, item]) => {
 		if (state.repositories.get(key) === item) state.repositories.delete(key);
 		const repository = await item.catch(() => undefined);
 		if (repository) await closeSandboxRepository(repository);
-	}
+	}));
+	const failure = closed.find(result => result.status === "rejected");
+	if (failure) throw failure.reason;
 }
 
 function closeSandboxRepository(repository: PooledGitRepository): Promise<void> {
