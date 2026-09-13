@@ -149,11 +149,12 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.outputs.at(-1)).toEqual(textResult("./target.txt"));
 	});
 
-	it("prioritizes fresh recurrence evidence under a one-slot scheduler", async () => {
+	it.each(["ls", "read"] as const)("prioritizes fresh %s recurrence evidence under a one-slot scheduler", async (tool) => {
 		const cwd = await workspace(), ready = barrier();
 		await writeFile(path.join(cwd, "old.txt"), "old", "utf8");
+		const fresh = tool === "read" ? { path: "notes.txt" } : { path: "." };
 		const settings: PatternAwareSettings = { ...PATTERN_AWARE_DEFAULTS,
-			beamWidth: 4, decayHalfLifeEvents: 64, maxContextLength: 1, maxFutureGap: 0 };
+			beamWidth: 1, decayHalfLifeEvents: 64, maxContextLength: 1, maxFutureGap: 0 };
 		const store = patternStore(cwd, settings), sessionID = "decayed-recurrence";
 		let sequence = 0;
 		const observe = (tool: "read" | "ls", input: Record<string, unknown>) => store.observe({
@@ -162,20 +163,21 @@ describe("faux LLM speculative action end to end", () => {
 		for (let index = 0; index < 32; index++) observe("read", { path: "old.txt" });
 		for (let index = 0; index < 256; index++) store.observeTurn();
 		observe("read", { path: "old.txt" });
-		for (let index = 0; index < 3; index++) observe("ls", { path: "." });
+		for (let index = 0; index < 3; index++) observe(tool, fresh);
 		store.observe({ sessionID, turnID: "context-marker", tool: "write", input: { path: "marker.txt", content: "marker" },
 			outcome: "success", durationMs: 1, learnTarget: false });
 		const result = await runAgent({
 			cwd, sessionID, patternStore: store,
 			settings: { ...drafterSettings(), drafterEnabled: false, patternAware: settings, tools: ["read", "ls"] },
 			tools: [fileRead(cwd), { name: "ls", label: "ls", description: "List a fixture", parameters: readSchema, execute: async () => textResult("ls") }],
-			actorTurns: [turn(fauxToolCall("ls", { path: "." }), ready.promise), turn("done")],
-			onEvent: (event) => { if (event.type === "candidate" && event.candidate.tool === "ls" && event.state.status === "succeeded") ready.resolve(); },
+			actorTurns: [turn(fauxToolCall(tool, fresh), ready.promise), turn("done")],
+			onEvent: (event) => { if (event.type === "candidate" && event.candidate.tool === tool && event.state.status === "succeeded") ready.resolve(); },
 		});
 		expect(result.summary).toMatchObject({ actorActions: 1, speculativeHits: 1, actorFallbacks: 0 });
-		expect(result.events.find((event) => event.type === "candidate" && event.state.status === "running")).toMatchObject({ candidate: { tool: "ls" } });
+		expect(result.events.find((event) => event.type === "candidate" && event.state.status === "running")).toMatchObject({ candidate: { tool } });
+		expect(result.executions[tool]).toBe(1);
 		expect(result.actorFallbacks).toEqual([]);
-		expect(result.outputs).toEqual([textResult("ls")]);
+		expect(result.outputs).toEqual([textResult(tool === "read" ? "one\ntwo\nthree\n" : "ls")]);
 	});
 });
 

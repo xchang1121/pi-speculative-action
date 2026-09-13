@@ -778,28 +778,25 @@ export class PatternAwareStore {
 				feedback = emptyPatternFeedback(this.clock);
 				this.recurrentFeedback.set(item, feedback);
 			}
-			return { ...item, feedback };
+			return { ...item, feedback, patternID: `action-backoff:${hash(item.action.key)}`,
+				mass: item.weightedCount * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) };
 		});
 		const massByTool = new Map<string, number>();
 		for (const item of values) {
-			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
-			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + mass);
+			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + item.mass);
 		}
 		const provenTools = new Set(
 			values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool),
 		);
 		// The final beam ranks merged contextual and recurrent support using the same settled evidence.
-		const candidates = values
-			.filter((item) => item.count >= settings.minOccurrences || provenTools.has(item.action.tool))
-			.filter((item) => !continuation.visitedPatternIDs.includes(`action-backoff:${hash(item.action.key)}`));
+		const candidates = values.filter((item) => provenTools.has(item.action.tool) && !continuation.visitedPatternIDs.includes(item.patternID));
 		return candidates.map((item) => {
-			const patternID = `action-backoff:${hash(item.action.key)}`;
-			const mass = item.count * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
+			const { patternID, mass } = item;
 			const evidence = feedbackEvidence(item, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability((mass + evidence.matched) /
 				(Math.max(mass, massByTool.get(item.action.tool) ?? 0) + evidence.matched + evidence.mismatched));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const expectedDurationMs = item.totalDurationMs / Math.max(1, item.count);
+			const expectedDurationMs = item.weightedDurationMs / item.weightedCount;
 			const ppmEstimate = estimatePpm(item.action.tool);
 			const adoptionProbability = patternAdoptionProbability([item], this.clock, settings.decayHalfLifeEvents);
 			const expectedLatencyBenefitMs =
@@ -810,7 +807,7 @@ export class PatternAwareStore {
 				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })),
 				type: "tool_call" as const,
 				tool: item.action.tool,
-				input: structuredClone(item.input),
+				input: item.input,
 				patternID,
 				supportingPatternIDs: [] as string[],
 				context: [] as PatternAwareEventSignature[],
@@ -917,15 +914,18 @@ export class PatternAwareStore {
 		const durationMs =
 			event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
+			const decay = recencyWeight(existing.lastSeenSequence, event.sequence, this.settings.decayHalfLifeEvents);
 			existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
-			existing.totalDurationMs = Math.min(Number.MAX_VALUE / 2, existing.totalDurationMs + durationMs);
+			existing.weightedCount = Math.min(Number.MAX_SAFE_INTEGER, existing.weightedCount * decay + 1);
+			existing.weightedDurationMs = Math.min(Number.MAX_VALUE / 2, existing.weightedDurationMs * decay + durationMs);
 			existing.lastSeenSequence = event.sequence;
 		} else {
 			session.recurrentActions.set(action.key, {
 				action,
 				input: structuredClone(event.input),
 				count: 1,
-				totalDurationMs: durationMs,
+				weightedCount: 1,
+				weightedDurationMs: durationMs,
 				lastSeenSequence: event.sequence,
 			});
 		}
