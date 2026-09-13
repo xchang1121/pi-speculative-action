@@ -10,19 +10,27 @@ import {
 
 describe("ablation suite report", () => {
 	it.each([
-		["exit", "Benchmark runner exited with 7"],
-		["invalid-result", "Incomplete benchmark result"],
-		["benchmark", "Benchmark failed: cleanup failed"],
-	])("preserves completed and failed runs after a runner %s", async (failure, message) => {
+		["exit", "Benchmark runner exited with 7", false, 7],
+		["exit-result", "Benchmark runner exited with 7", true, 7],
+		["invalid-result", "Incomplete benchmark result", false, 0],
+		["benchmark", "Benchmark failed: cleanup failed", true, 0],
+		["existing-output", "EEXIST", false, 0],
+	] as const)("preserves completed and failed runs after a runner %s", async (failure, message, complete, exitCode) => {
 		const originalArgv = process.argv;
 		const files = new Map<string, string>();
+		const previous = JSON.stringify({ metadata: { implementationCommit: "old" }, summary: run("failed", 1, {}).summary });
+		const failedOutput = path.resolve("offline-results", "repeat-1", "failed.json");
+		if (failure === "existing-output") files.set(failedOutput, previous);
 		let attempts = 0;
 		vi.resetModules();
 		vi.doMock("node:fs/promises", () => ({
 			mkdir: async () => {},
 			readFile: async (file: string) => file.endsWith("suite.json")
 				? JSON.stringify({ offline: ["first", "failed", "unstarted"] }) : files.get(file),
-			writeFile: async (file: string, data: string) => { files.set(file, data); },
+			writeFile: async (file: string, data: string, options?: { flag?: string } | string) => {
+				if (typeof options === "object" && options.flag === "wx" && files.has(file)) throw new Error("EEXIST");
+				files.set(file, data);
+			},
 		}));
 		vi.doMock("node:child_process", () => ({ spawn: (_file: string, args: string[]) => {
 			const child = new EventEmitter();
@@ -30,12 +38,12 @@ describe("ablation suite report", () => {
 			const output = args[args.indexOf("--output") + 1]!;
 			attempts++;
 			queueMicrotask(() => {
-				files.set(output, instance === "first" || failure === "benchmark" ? JSON.stringify({
-					metadata: { implementationCommit: "commit" }, summary: run(instance, 1, instance === "first" ? {} : {
+				if (instance === "first" || failure !== "exit") files.set(output, instance === "first" || complete ? JSON.stringify({
+					metadata: { implementationCommit: `${instance}-commit` }, summary: run(instance, 1, instance === "first" ? {} : {
 						patchCandidate: false, benchmarkErrors: { hostDispose: "cleanup failed" },
 					}).summary,
 				}) : "{}");
-				child.emit("exit", instance !== "first" && failure === "exit" ? 7 : 0, null);
+				child.emit("exit", instance === "first" ? 0 : exitCode, null);
 			});
 			return child;
 		} }));
@@ -43,13 +51,16 @@ describe("ablation suite report", () => {
 		process.argv = [process.execPath, "suite.ts", "--suite", "offline", "--output-root", "offline-results"];
 		try {
 			await expect(import("../bench/suite.ts")).rejects.toThrow(message);
-			expect(attempts).toBe(2);
+			expect(attempts).toBe(failure === "existing-output" ? 1 : 2);
 			const report = JSON.parse(files.get(path.resolve("offline-results", "suite-result.json")) ?? "null");
 			expect(report).toMatchObject({ runs: 2, patchCandidates: 1, allRunsScreenedIn: false,
 				pooled: { runs: 1, accelerationRatio: 1 }, byInstance: { failed: null },
 				invalidRuns: [{ instance: "failed", repeat: 1, error: expect.stringContaining(message) }],
 			});
 			expect(report.runOutputs.map((value: { instance: string }) => value.instance)).toEqual(["first", "failed"]);
+			expect(report.invalidRuns[0].reasons).toContain(complete ? "benchmark_error" : "unavailable_summary");
+			expect(report.implementationCommits).toEqual(["first-commit", ...(complete ? ["failed-commit"] : [])]);
+			if (failure === "existing-output") expect(files.get(failedOutput)).toBe(previous);
 		} finally {
 			process.argv = originalArgv;
 			stdout.mockRestore();
