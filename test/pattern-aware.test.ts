@@ -184,6 +184,13 @@ describe("PatternAware", () => {
 
 		const batch = scanBatch("probe", "src/c.ts").reverse();
 		const preview = store.predictAfterBatch("probe", batch).find((item) => item.tool === "read");
+		const before = store.snapshot(), seed = { visitedPatternIDs: ["foreign-batch"], pathProbability: 0.5 };
+		const peer = store.predictAfterBatch("probe", batch, {}, settings(), seed).find((item) => item.tool === "read");
+		expect(peer).toMatchObject({ input: preview?.input, depth: 2, conditionalProbability: preview?.conditionalProbability });
+		expect(peer?.empiricalProbability).toBeCloseTo(preview!.empiricalProbability * 0.5);
+		expect(store.predictAfterBatch("probe", batch, {}, settings({ maxPredictionDepth: 1 }), seed)).toEqual([]);
+		expect(store.snapshot()).toEqual(before);
+		expect(store.recent("probe")).toEqual([]);
 		store.observeBatch(batch);
 		for (const input of batch) (input.outputPaths as string[])?.splice(0);
 		const candidate = store.predict("probe").find((item) => item.tool === "read");

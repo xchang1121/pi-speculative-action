@@ -7,6 +7,45 @@ import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("PlanRuntime", () => {
+	it.each(["replace", "remove"] as const)("pins cross-source ancestors through %s and propagates their timing", (mode) => {
+		const plan = new PlanRuntime();
+		plan.apply(proposal([action("parent", { latestHorizon: 5 })]), 0);
+		const dependency = { proposalID: "plan", actionID: "parent", identity: plan.get("plan", "parent")!.identity.id,
+			condition: "execution_succeeded" as const };
+		const peer = { id: "peer", source: "peer", revision: 0, actions: [
+			action("parent", { dependsOn: [dependency] }),
+			action("leaf", { dependsOn: [{ actionID: "parent", condition: "execution_succeeded" as const }] }),
+		] };
+		for (const invalid of [{ ...dependency, identity: "stale" }, { ...dependency, proposalID: undefined },
+			{ ...dependency, identity: undefined }, { ...dependency, proposalID: "missing" }]) {
+			expect(plan.apply({ ...peer, actions: [action("parent", { dependsOn: [invalid] })] }, 0))
+				.toEqual({ accepted: false, reason: "invalid_dependency" });
+		}
+		expect(plan.apply(peer, 0)).toMatchObject({ accepted: true });
+		expect(plan.apply({ id: "third", source: "third", revision: 0, actions: [action("leaf", {
+			dependsOn: [{ proposalID: "peer", actionID: "leaf", identity: plan.get("peer", "leaf")!.identity.id }],
+		})] }, 0)).toMatchObject({ accepted: true });
+		for (const proposalID of ["plan", "peer"]) {
+			const execution = new CandidateExecution<string>("shared");
+			plan.attachExecution(proposalID, "parent", proposalID, execution);
+			execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
+		}
+		expect(plan.get("peer", "leaf")).toMatchObject({ readiness: "ready", expectedDecisionSeq: 3 });
+		const actor = { id: "actor", turnID: "turn", sequence: 4 };
+		const opportunity = plan.claimMatch("plan", "parent", actor, { kind: "exact", distance: 0 })!;
+		plan.confirm(opportunity, actor, { status: "adopted", candidateID: "plan" });
+		expect(plan.get("peer", "parent")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 5 });
+		expect(plan.get("peer", "leaf")).toMatchObject({ expectedDecisionSeq: 6, latestDecisionSeq: 6 });
+		expect(plan.get("third", "leaf")).toMatchObject({ expectedDecisionSeq: 7, latestDecisionSeq: 7 });
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 2,
+			...(mode === "remove" ? { remove: ["parent"] } : { upsert: [action("parent", { input: { path: "replacement.ts" } })] }),
+		}, 4)).toMatchObject({ accepted: true });
+		for (const id of ["parent", "leaf"]) expect(plan.get("peer", id)?.readiness).toBe("blocked");
+		expect(plan.get("third", "leaf")?.readiness).toBe("blocked");
+		expect(plan.matchable(10).filter((node) => node.source === "peer")).toEqual([]);
+		expect(plan.apply({ ...peer, revision: 1 }, 4)).toMatchObject({ accepted: false, reason: "invalid_dependency" });
+	});
+
 	it("schedules at the expected horizon and retains the prediction until its latest horizon", () => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("future", { horizon: 0, latestHorizon: 2 })]), 4);

@@ -19,7 +19,6 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
 const directories = temporaryDirectories("pi-spec-faux-e2e-");
 const readSchema = Type.Object({ path: Type.String() });
-const bashSchema = Type.Object({ command: Type.String() });
 
 afterEach(directories.dispose);
 
@@ -118,35 +117,53 @@ describe("faux LLM speculative action end to end", () => {
 		}
 	});
 
-	it("learns a dynamic action argument from authoritative tool output", async () => {
+	it.each(["actor", "peer"] as const)("binds a dynamic next step from an %s batch without premature learning", async (origin) => {
 		const cwd = await workspace(), ready = barrier();
-		const files = ["./a.txt", "./b.txt", "./c.txt", "./d.txt", "./target.txt"];
+		let historyBeforeChild: ReturnType<PatternAwareStore["recent"]> | undefined;
+		const searchInput = (file: string) => ({ path: "discover/" + file });
+		const files = ["a.txt", "b.txt", "c.txt", "d.txt", "target.txt"];
 		await Promise.all(files.map((file) => writeFile(path.join(cwd, file), file, "utf8")));
 		const settings = { ...PATTERN_AWARE_DEFAULTS, maxFutureGap: 0, minOccurrences: 2 };
 		const store = patternStore(cwd, settings);
 		for (const [index, file] of files.slice(0, 4).entries()) {
 			const sessionID = "atomic-training-" + index;
-			store.observe({ sessionID, turnID: sessionID + ":bash", tool: "bash", input: { command: "discover " + file },
+			store.observe({ sessionID, turnID: sessionID + ":ls", tool: "ls", input: searchInput(file),
 				output: { values: [file] }, outcome: "success", durationMs: 1 });
 			store.observe({ sessionID, turnID: sessionID + ":read", tool: "read", input: { path: file }, outcome: "success", durationMs: 120 });
 			store.finishSession(sessionID);
 		}
-		const discover: AgentTool<typeof bashSchema> = {
-			name: "bash", label: "discover", description: "Return the discovered workspace path", parameters: bashSchema,
-			execute: async (_id, args) => ({ content: [{ type: "text", text: args.command.split(/\s+/).at(-1) ?? "" }], details: undefined }),
+		const discover: AgentTool<typeof readSchema> = {
+			name: "ls", label: "discover", description: "Return a fixture's workspace path", parameters: readSchema,
+			execute: async (_id, args) => textResult(args.path.split("/").at(-1)!),
 		};
+		const parent = fauxToolCall("ls", searchInput("target.txt"));
 		const result = await runAgent({
 			cwd, sessionID: "atomic-output", patternStore: store,
-			settings: { ...drafterSettings(), drafterEnabled: false, patternAware: settings, tools: ["bash", "read"] },
+			settings: { ...drafterSettings(), drafterEnabled: origin === "peer", drafterMaxDepth: 0,
+				patternAware: settings, tools: ["ls", "read"] },
 			tools: [discover, fileRead(cwd)],
-			actorTurns: [turn(fauxToolCall("bash", { command: "discover ./target.txt" })),
-				turn(fauxToolCall("read", { path: "./target.txt" }), ready.promise), turn("done")],
-			onEvent: (event) => { if (event.type === "candidate" && event.candidate.tool === "read" && event.state.status === "succeeded") ready.resolve(); },
+			actorTurns: [turn(parent, origin === "peer" ? ready.promise : undefined),
+				turn(fauxToolCall("read", { path: "target.txt" }), ready.promise), turn("done")],
+			draftTurns: [turn(parent), turn("no tool"), turn("no tool")],
+			onEvent: (event) => {
+				if (event.type === "candidate" && event.candidate.tool === "read" && event.state.status === "succeeded") {
+					historyBeforeChild = store.recent("atomic-output");
+					ready.resolve();
+				}
+			},
 		});
-		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1, actorFallbacks: 1 });
-		expect(result.executions).toEqual({ bash: 1, read: 1 });
-		expect(result.actorFallbacks).toEqual(["bash"]);
-		expect(result.outputs.at(-1)).toEqual(textResult("./target.txt"));
+		expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: origin === "peer" ? 2 : 1, actorFallbacks: origin === "peer" ? 0 : 1 });
+		expect(result.executions).toEqual({ ls: 1, read: 1 });
+		expect(result.actorFallbacks).toEqual(origin === "peer" ? [] : ["ls"]);
+		expect(result.outputs.at(-1)).toEqual(textResult("target.txt"));
+		const adopted = result.events.flatMap((event) => event.type === "prediction" && event.settlement.observation === "observed" &&
+			event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.prediction.source] : []);
+		expect(adopted).toEqual(origin === "peer" ? ["drafter", "pattern_aware"] : ["pattern_aware"]);
+		if (origin === "peer") {
+			expect(historyBeforeChild).toEqual([]);
+			expect(result.events.find((event) => event.type === "candidate" && event.candidate.source === "pattern_aware"))
+				.toMatchObject({ candidate: { depth: 2 } });
+		}
 	});
 
 	it.each(["ls", "read"] as const)("prioritizes fresh %s recurrence evidence under a one-slot scheduler", async (tool) => {

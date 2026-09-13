@@ -4,7 +4,7 @@ import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
 import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
-import type { ActorActionIdentity, ActorActionSettlement, PredictionSettlement } from "./settlement.ts";
+import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
 
 export type {
 	SpeculativeActionEvent,
@@ -168,6 +168,17 @@ export interface SpeculativePlanSource<
 		readonly revision: number;
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
+		readonly signal: AbortSignal;
+	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
+	/** Declare the original ordered batch; peers receive it only after every root execution succeeds. */
+	readonly continuationBatch?: (input: PlanActionFeedback) => readonly string[] | undefined;
+	/** Predict from another source's hypothetical batch without recording Actor observations. */
+	readonly continueFrom?: (input: RuntimeTurnContext<StartInput, StateData> & {
+		readonly batch: readonly {
+			readonly identity: PlanActionIdentity;
+			readonly candidate: SpeculativeCandidate;
+			readonly output: Output;
+		}[];
 		readonly signal: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Collect/filter execution feedback before a continuation consumes request capacity. */

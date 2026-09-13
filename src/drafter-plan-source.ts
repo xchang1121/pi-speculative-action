@@ -140,6 +140,10 @@ export function createDrafterPlanSource(input: {
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
+		continuationBatch: ({ feedback }) => {
+			const batch = asDrafterPlanFeedback(feedback);
+			return batch && [...batch.calls.keys()];
+		},
 		multiStepEnabled: (settings, feedback) => {
 			const maxDepth = normalizeDrafterRequestSettings(settings.sourceConfig).drafterMaxDepth;
 			if (maxDepth === 0) return false;
