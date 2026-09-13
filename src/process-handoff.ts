@@ -190,6 +190,6 @@ export class ProcessHandoffRegistry {
 	}
 }
 
-function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
+export function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
 	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);
 }

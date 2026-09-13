@@ -1,4 +1,5 @@
 import { KEYABLE_TOOLS } from "./action-semantics.ts";
+import { positiveCount } from "./number-utils.ts";
 import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 
 export interface DrafterToolDefinition {
@@ -40,7 +41,7 @@ export const DEFAULTS = {
 };
 
 export function clampCandidateLimit(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+	return positiveCount(value);
 }
 
 /** Only omitted selection defaults to allowed tools; malformed input disables prediction. */

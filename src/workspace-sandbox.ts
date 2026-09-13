@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
-import { errorMessage, isMissing } from "./error-utils.ts";
+import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,
@@ -2321,7 +2321,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 			await mkdir(current);
 			created?.push(current);
 		} catch (error) {
-			if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+			if (!hasErrorCode(error, "EEXIST")) throw error;
 			const info = await lstat(current);
 			if (info.isSymbolicLink() || !info.isDirectory()) {
 				throw new Error(`sandbox commit parent is not a real directory: ${current}`, { cause: error });
@@ -2335,8 +2335,7 @@ async function removeCreatedDirectories(directories: readonly string[]): Promise
 		try {
 			await rmdir(directory);
 		} catch (error) {
-			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-			if (code !== "ENOENT") throw error;
+			if (!isMissing(error)) throw error;
 		}
 	}
 }
