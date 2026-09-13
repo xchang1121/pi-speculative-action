@@ -1,6 +1,4 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,16 +17,6 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 
 export type NumericMetrics = Readonly<Record<string, number>>;
-export function benchmarkWriteAllC(type: "char" | "unsigned char" = "char"): string {
-	return String.raw`static int write_all(int fd, const ${type} *data, size_t length) {
-  while (length > 0) {
-    ssize_t written = write(fd, data, length);
-    if (written < 0) { if (errno == EINTR) continue; return -1; }
-    data += written; length -= (size_t)written;
-  }
-  return 0;
-}`;
-}
 export const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
 	readonly state: "ready";
@@ -274,12 +262,6 @@ function commandOutput(executable: string, args: readonly string[], cwd?: string
 	});
 }
 
-export async function fileDigest(target: string): Promise<string> {
-	const hash = createHash("sha256");
-	for await (const chunk of createReadStream(target)) hash.update(chunk);
-	return hash.digest("hex");
-}
-
 export function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {
 	return result.content
 		.filter((item): item is { readonly type: "text"; readonly text: string } =>
@@ -301,32 +283,12 @@ export function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetric
 	);
 }
 
-export function median(values: readonly number[]): number {
-	const sorted = [...values].sort((left, right) => left - right);
-	return sorted[Math.floor(sorted.length / 2)]!;
-}
-
 export function argument(name: string): string | undefined {
 	const index = process.argv.indexOf(name);
 	if (index < 0) return undefined;
 	const value = process.argv[index + 1];
 	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
 	return value;
-}
-
-export function integerArgument(name: string, fallback: number, minimum: number, maximum: number): number {
-	const raw = argument(name);
-	if (raw === undefined) return fallback;
-	const value = Number(raw);
-	if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-		throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
-	}
-	return value;
-}
-
-export function workspaceDriverArgument(value: string | undefined): WorkspaceSandboxDriver {
-	if (value === undefined || value === "auto" || value === "git" || value === "overlayfs") return value ?? "auto";
-	throw new Error(`--workspace-driver must be auto, git, or overlayfs: ${value}`);
 }
 
 export function assert(condition: unknown, message: string): asserts condition {
