@@ -127,28 +127,9 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 
 export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<SelfSpeculationCoordinator["snapshot"]> {}
 
-export interface SelfSpeculationVerificationStep {
-	readonly candidateIndex: number;
-	readonly candidateID?: string;
-	readonly candidateIDs: readonly string[];
-	readonly sources: readonly string[];
-	readonly draftedTokens: number;
-	readonly acceptedTokens: number;
-	readonly rejectedTokens: number;
-}
+export interface SelfSpeculationVerificationStep extends Readonly<SelfSpeculationVerificationOutcome["steps"][number]> {}
 
-export interface SelfSpeculationVerificationOutcome {
-	readonly requestID: string;
-	readonly speculativeSteps: number;
-	readonly draftedTokens: number;
-	readonly acceptedTokens: number;
-	readonly rejectedTokens: number;
-	readonly acceptanceRate: number;
-	readonly meanAcceptanceLength: number;
-	readonly unresolvedProposals: number;
-	readonly unresolvedDraftTokens: number;
-	readonly steps: readonly SelfSpeculationVerificationStep[];
-}
+export interface SelfSpeculationVerificationOutcome extends ReturnType<typeof parseVerificationOutcome> {}
 
 export interface SelfSpeculationCoordinatorOptions {
 	readonly settings: () => SelfSpeculationSettings;
@@ -1151,7 +1132,7 @@ function parseVerificationOutcome(
 	verification: Readonly<Record<string, unknown>>,
 	requestID: string,
 	sourcesByCandidateID: ReadonlyMap<string, readonly string[]>,
-): SelfSpeculationVerificationOutcome {
+) {
 	const rawSteps = verification.steps;
 	if (rawSteps !== undefined && !Array.isArray(rawSteps))
 		throw new Error("self-speculation verification steps must be an array");
