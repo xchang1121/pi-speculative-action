@@ -1,22 +1,17 @@
 import type { ActorHitTiming } from "./settlement.ts";
 
-export interface BenefitGatePolicy {
-	readonly enabled: boolean;
-	readonly minSamples: number;
-	readonly windowSize: number;
-	readonly minNetBenefitMs: number;
-	readonly probeInterval: number;
-	readonly failureThreshold: number;
-}
+export interface BenefitGatePolicy extends Readonly<typeof benefitGateDefaults> {}
 
-export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze({
+const benefitGateDefaults = {
 	enabled: true,
 	minSamples: 4,
 	windowSize: 4,
 	minNetBenefitMs: 25,
 	probeInterval: 4,
 	failureThreshold: 2,
-});
+};
+
+export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze(benefitGateDefaults);
 
 export interface BenefitObservation {
 	readonly costMs: number;
@@ -48,12 +43,7 @@ export interface BenefitDecision {
 	readonly expectedNetBenefitMs?: number;
 }
 
-export interface BenefitGateSnapshot {
-	readonly samples: number;
-	readonly expectedNetBenefitMs?: number;
-	readonly consecutiveFailures: number;
-	readonly suppressedDecisions: number;
-}
+export interface BenefitGateSnapshot extends ReturnType<BenefitGate["snapshot"]> {}
 
 interface GateState {
 	readonly samples: Array<{ netBenefit: number | undefined; failed: boolean }>;
@@ -108,15 +98,16 @@ export class BenefitGate {
 		return update;
 	}
 
-	snapshot(key: string): BenefitGateSnapshot {
+	snapshot(key: string) {
 		const state = this.state(key);
 		const expected = mean(state.samples);
-		return {
+		const snapshot = {
 			samples: state.samples.length,
 			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
 			consecutiveFailures: consecutiveFailures(state),
 			suppressedDecisions: state.totalSuppressed,
 		};
+		return snapshot as Readonly<typeof snapshot>;
 	}
 
 	reset(): void {
