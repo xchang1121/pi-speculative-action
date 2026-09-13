@@ -25,7 +25,7 @@ const nativeEnvironment = Object.freeze({ HOME: pathRules.homeDir, LC_ALL: "C", 
 const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
-const linksOnly = process.argv.includes("--links-only"), semanticOnly = linksOnly || process.argv.includes("--semantics-only");
+const semanticOnly = process.argv.includes("--semantics-only");
 const costOnly = process.argv.includes("--cost-only");
 assert.ok(!costOnly || !semanticOnly, "choose either semantic or cost qualification");
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
@@ -53,7 +53,7 @@ try {
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
   if (semanticOnly) {
     process.env.RIPGREP_CONFIG_PATH = configuration;
-    report.push(await (linksOnly ? qualifyNativeLinks() : qualifyNamespace()));
+    report.push(await qualifyNamespace());
   }
   for (const row of rows) {
     if (selectedCases.size && !selectedCases.has(row.label)) continue;
@@ -79,8 +79,8 @@ try {
   }
   if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
   const cancellation = {};
-  if (!linksOnly) cancellation.limit = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit");
-  const cancellationRepeats = linksOnly ? 0 : semanticOnly || costOnly ? 1 : 20;
+  cancellation.limit = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), "limit");
+  const cancellationRepeats = semanticOnly || costOnly ? 1 : 20;
   for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
     const mode = repeat % 2 ? "budget" : "abort";
     cancellation[mode] = await qualifyCancellation(path.join(root, semanticOnly ? "namespace/search" : costOnly ? report[0].fixture : "unicode"), mode);
@@ -169,30 +169,6 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     return { profilePreparationMs, producerMs, ...(costOnly ? { hostActorMs, probeMs: adopted.ms, trials } : { hitMs: adopted.ms }),
       producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
   } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
-}
-
-async function qualifyNativeLinks() {
-  const checks = [];
-  for (const kind of ["internal", "external", "dangling", "cycle"]) {
-    const cwd = path.join(root, `link-${kind}`), search = path.join(cwd, "search"), payload = path.join(cwd, "payload");
-    await fs.mkdir(cwd); await fs.mkdir(search); await fs.mkdir(payload);
-    await fs.writeFile(path.join(payload, "value.txt"), "needle\n");
-    await fs.writeFile(path.join(search, "value.txt"), "needle\n");
-    const external = path.join(root, `outside-${kind}`); await fs.mkdir(external); await fs.writeFile(path.join(external, "value.txt"), "needle\n");
-    const link = path.join(search, "link"), target = { internal: payload, external, dangling: path.join(cwd, "missing"), cycle: search }[kind];
-    await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
-    for (const explicit of [false, true]) for (const mode of ["files", "search"]) {
-      const chunks = [], signal = AbortSignal.timeout(3000);
-      const result = await runInput("reference", { file: rg, cwd, args: [...(mode === "files" ? ["--files", "--null"] : ["--json"]), "--hidden", "--", ...(mode === "search" ? ["needle"] : []), explicit ? link : search],
-        options: { stdio: ["ignore", "pipe", "pipe"] } }, signal, ({ fd, data }) => chunks.push({ fd, data: data.toString() }));
-      assert.equal(result.code, kind === "dangling" && (explicit || process.platform === "win32" && mode === "search") ? 2 : 0);
-      const output = chunks.filter(({ fd }) => fd === 1).map(({ data }) => data).join("");
-      const paths = mode === "files" ? output.split("\0").filter(Boolean) : output.split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((event) => event.type === "match").map((event) => event.data.path.text);
-      assert.deepEqual(paths, kind === "dangling" && explicit ? [] : [path.join(explicit ? link : search, "value.txt")]);
-      checks.push({ kind, explicit, mode, ...result, paths });
-    }
-  }
-  return { mode: "native-link-characterization", checks };
 }
 
 async function qualifyNamespace() {

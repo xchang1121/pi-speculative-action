@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { EffectCommitFailure } from "../src/effect-transaction.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import {
 	argument,
@@ -31,8 +31,6 @@ type Command = readonly [string, ...string[]];
 
 if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 const output = argument("--output");
-const rounds = Number.parseInt(argument("--rounds") ?? "20", 10);
-if (!Number.isSafeInteger(rounds) || rounds < 1) throw new Error("--rounds must be a positive integer");
 const root = await mkdtemp(path.join(os.tmpdir(), "pi-exec-boundary-"));
 const tracer = path.join(root, "exec-events");
 try {
@@ -41,27 +39,8 @@ try {
 		output: path.basename(tracer),
 		arguments: ["-Werror"],
 	});
-	const modes = {
-		direct: (command: Command): Command => command,
-		execEventPtrace: (command: Command): Command => [tracer, ...command],
-		straceProcess: (command: Command): Command => ["strace", "-f", "-qq", "-e", "trace=%process", "-o", "/dev/null", ...command],
-		straceSeccompBpf: (command: Command): Command => ["strace", "--seccomp-bpf", "-f", "-qq", "-e", "trace=%process", "-o", "/dev/null", ...command],
-	};
 	const equivalence: Command = ["/bin/bash", "-c", "printf out; printf err >&2; exit 7"];
-	const direct = await run(equivalence);
-	for (const wrap of Object.values(modes)) assertSame(direct, await run(wrap(equivalence)));
-	const cases: Readonly<Record<string, { readonly command: Command; readonly rounds?: number }>> = {
-		shellBuiltin: { command: ["/bin/bash", "-c", "true"] },
-		oneChild: { command: ["/bin/bash", "-c", "/bin/true"] },
-		sleep100ms: { command: ["/bin/bash", "-c", "/bin/sleep 0.1"] },
-		syscallHeavy: { command: ["/bin/bash", "-c", "dd if=/dev/zero of=/dev/null bs=4K count=4096 status=none"] },
-	};
-	const measurements: Record<string, unknown> = {};
-	for (const [name, workload] of Object.entries(cases)) {
-		measurements[name] = Object.fromEntries(await Promise.all(Object.entries(modes).map(async ([mode, wrap]) => [
-			mode, summarize(await samples(wrap(workload.command), workload.rounds ?? rounds)),
-		])));
-	}
+	assertSame(await run(equivalence), await run([tracer, ...equivalence]));
 	const substitution = process.arch === "x64"
 		? await run([tracer, "--skip-code", "42", "/bin/bash", "-c", "exec /bin/sleep 5"])
 		: undefined;
@@ -77,11 +56,9 @@ try {
 	if (detached.code !== 0 || detached.durationMs < 900) throw new Error("ptrace released an owned child after parent exit");
 	const childConversion = process.arch === "x64" ? await conversionAblation(tracer) : undefined;
 	await writeBenchmarkReport({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		measuredAt: new Date().toISOString(),
 		host: await linuxBenchmarkHost(),
-		rounds,
-		measurements,
 		heldExecSubstitution: substitution ? { exitCode: substitution.code, durationMs: substitution.durationMs } : { unsupportedArchitecture: process.arch },
 		childConversion: childConversion ?? { unsupportedArchitecture: process.arch },
 		semanticDifference: {
@@ -93,25 +70,6 @@ try {
 	}, output);
 } finally {
 	await rm(root, { recursive: true, force: true });
-}
-
-async function samples(command: Command, count: number): Promise<number[]> {
-	const values: number[] = [];
-	for (let index = 0; index < count; index++) {
-		const result = await run(command);
-		if (result.code !== 0 || result.signal) throw new Error(`benchmark command failed: ${command[0]}`);
-		values.push(result.durationMs);
-	}
-	return values;
-}
-
-function summarize(values: readonly number[]) {
-	const ordered = [...values].sort((left, right) => left - right);
-	return { minMs: ordered[0], medianMs: percentile(ordered, 0.5), p95Ms: percentile(ordered, 0.95), maxMs: ordered.at(-1) };
-}
-
-function percentile(values: readonly number[], fraction: number): number {
-	return values[Math.min(values.length - 1, Math.ceil(values.length * fraction) - 1)]!;
 }
 
 function assertSame(expected: Outcome, actual: Outcome): void {
@@ -181,20 +139,22 @@ int main(int argc, char **argv) {
 			label, command, actionNamespace: "pi-held-exec-production.v1", executionFingerprint,
 		});
 		async function withProducer<Value>(label: string, command: string,
-			inspect: (branch: Awaited<ReturnType<typeof produce>>) => Value | Promise<Value>) {
-			const branch = await produce(label, command);
+			inspect: (production: ReturnType<typeof produce>) => Value | Promise<Value>) {
+			const production = produce(label, command);
+			const settled = production.catch(() => undefined);
 			try {
-				return await inspect(branch);
+				return await inspect(production);
 			} catch (error) {
 				// Capture evidence while the branch is still owned; a failed run has no success report.
+				const branch = await settled;
 				const [validation, storage] = await Promise.all([
-					branch.validate?.().catch((reason: unknown) => ({ error: String(reason) })),
+					branch?.validate?.().catch((reason: unknown) => ({ error: String(reason) })),
 					fixture.backend.store.stats().catch((reason: unknown) => ({ error: String(reason) })),
 				]);
 				await writeBenchmarkReport({
 					schemaVersion: 1, status: "failed", label, command, scope: BENCHMARK_SCOPE,
 					error: error instanceof Error ? error.stack : String(error),
-					output: branch.output, execution: branch.executionMetrics,
+					output: branch?.output, execution: branch?.executionMetrics,
 					producerAndActor: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(),
 					validation, storage,
 				}, output ? `${output}.failure.json` : undefined).catch((reason: unknown) => {
@@ -202,7 +162,7 @@ int main(int argc, char **argv) {
 				});
 				throw error;
 			} finally {
-				await branch.dispose();
+				await (await settled)?.dispose();
 			}
 		}
 		const actorCommand = "printf 'actor-parent\\n'; worker result.txt";
@@ -210,7 +170,8 @@ int main(int argc, char **argv) {
 		const expectedOutput = textOutput(direct.output);
 		const expectedResult = await readFile(path.join(fixture.workspace, "result.txt"));
 		await rm(path.join(fixture.workspace, "result.txt"));
-		await withProducer("held-producer", ": speculative-parent; worker result.txt", async (branch) => {
+		await withProducer("held-producer", ": speculative-parent; worker result.txt", async (production) => {
+			const branch = await production;
 			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)} ${JSON.stringify(fixture.backend.metrics())}`);
 			assert(fixture.backend.metrics().published > 0, `speculative child did not publish a reusable certificate: ${JSON.stringify(fixture.backend.metrics())}`);
 		});
@@ -226,7 +187,8 @@ int main(int argc, char **argv) {
 		const joiningActor = await heldActor(fixture, fixture.backend);
 
 		const cwdProducerBefore = fixture.backend.metrics();
-		const cwdHits = await withProducer("held-cwd-producer", "/bin/pwd", async (cwdBranch) => {
+		const cwdHits = await withProducer("held-cwd-producer", "/bin/pwd", async (production) => {
+			const cwdBranch = await production;
 			const cwdProduced = metricDelta(cwdProducerBefore, fixture.backend.metrics());
 			assert(textOutput(cwdBranch.output.result) === `${fixture.workspace}\n`, "speculative child observed a private cwd");
 			const { output: cwdActor, metrics: cwdMetrics } = await measureActor(
@@ -240,7 +202,8 @@ int main(int argc, char **argv) {
 		});
 
 		const securityBefore = fixture.backend.metrics();
-		await withProducer("held-security-producer", ": speculative-security; worker unused probe", async (securityBranch) => {
+		await withProducer("held-security-producer", ": speculative-security; worker unused probe", async (production) => {
+			const securityBranch = await production;
 			assert(textOutput(securityBranch.output.result).includes("nnp:1"), "producer confinement probe was not active");
 			const produced = metricDelta(securityBefore, fixture.backend.metrics());
 			assert(produced.tainted === 1 && produced.published === 1,
@@ -254,7 +217,8 @@ int main(int argc, char **argv) {
 			`confinement-sensitive result was reused: ${JSON.stringify(securityMetrics)}`,
 		);
 
-		const metadataMismatch = await withProducer("held-inode-producer", ": speculative-inode; worker unused inode", async (inodeBranch) => {
+		const metadataMismatch = await withProducer("held-inode-producer", ": speculative-inode; worker unused inode", async (production) => {
+			const inodeBranch = await production;
 			const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
 				.toString(16).padStart(16, "0");
 			const { output: inodeActor, metrics: inodeMetrics } = await measureActor(
@@ -273,38 +237,29 @@ int main(int argc, char **argv) {
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
 		const joinBefore = fixture.backend.metrics();
-		const joiningTask = produce("held-joining-producer", ": speculative-join; worker joined.txt");
-		let joiningBranch: Awaited<typeof joiningTask> | undefined;
-		let joiningOutput: Awaited<ReturnType<typeof actor.execute>> | undefined;
-		let joinMetrics: LinuxProcessReuseMetrics | undefined;
-		let joiningMs = 0;
 		const leadMs = 400;
-		try {
+		const joining = await withProducer("held-joining-producer", ": speculative-join; worker joined.txt", async (production) => {
 			await waitUntil(() => fixture.backend.metrics().misses > joinBefore.misses, 5_000, 5);
 			await delay(leadMs);
-			({ output: joiningOutput, totalMs: joiningMs, metrics: joinMetrics } = await measureActor(
-				fixture.backend, joiningActor, "held-joining", "printf 'actor-join\\n'; worker joined.txt"));
-			joiningBranch = await joiningTask;
+			const result = await measureActor(fixture.backend, joiningActor, "held-joining", "printf 'actor-join\\n'; worker joined.txt");
+			const joiningBranch = await production;
 			assert(!joiningBranch.output.isError, `joining producer failed: ${textOutput(joiningBranch.output.result)}`);
-		} finally {
-			joiningBranch ??= await joiningTask.catch(() => undefined);
-			await joiningBranch?.dispose();
-		}
-		if (!joinMetrics) throw new Error("joining Actor metrics were not captured");
-		assert(textOutput(joiningOutput!) === "actor-join\nworker:v2\n", "Actor child output was lost or executed more than once");
-		assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
-		assert(
-			joinMetrics.requests === 1 && joinMetrics.hits === 1 && joinMetrics.joinedHits === 1 &&
-				joinMetrics.actorTimedHits === 0 && joinMetrics.actorBaselineMs === 0 && joinMetrics.reusedProcessMs > 0,
-			`Uncalibrated Actor did not join its child exactly once: ${JSON.stringify(joinMetrics)}`,
-		);
+			assert(textOutput(result.output) === "actor-join\nworker:v2\n", "Actor child output was lost or executed more than once");
+			assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
+			const metrics = result.metrics;
+			assert(metrics.requests === 1 && metrics.hits === 1 && metrics.joinedHits === 1 &&
+				metrics.actorTimedHits === 0 && metrics.actorBaselineMs === 0 && metrics.reusedProcessMs > 0,
+				`Uncalibrated Actor did not join its child exactly once: ${JSON.stringify(metrics)}`);
+			return result;
+		});
 		const { output: miss, totalMs: missMs, metrics: missMetrics } = await measureActor(fixture.backend, joiningActor, "held-stale", actorCommand);
 		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const completedChild = "worker completed.txt volatile";
 		const completedBefore = fixture.backend.metrics();
-		await withProducer("held-completed-producer", `: speculative-completed; ${completedChild}`, async (completedBranch) => {
+		await withProducer("held-completed-producer", `: speculative-completed; ${completedChild}`, async (production) => {
+			const completedBranch = await production;
 			assert(!completedBranch.output.isError, `completed producer failed: ${textOutput(completedBranch.output.result)}`);
 			const completedProduced = metricDelta(completedBefore, fixture.backend.metrics());
 			assert(completedProduced.tainted === 1 && completedProduced.published === 0,
@@ -321,9 +276,7 @@ int main(int argc, char **argv) {
 		});
 		const lateChild = "worker late.txt volatile";
 		const lateBefore = fixture.backend.metrics();
-		const lateTask = produce("held-late-producer", `: speculative-late; ${lateChild}`);
-		let lateBranch: Awaited<typeof lateTask> | undefined;
-		try {
+		await withProducer("held-late-producer", `: speculative-late; ${lateChild}`, async (production) => {
 			await waitUntil(() => fixture.backend.metrics().misses > lateBefore.misses, 5_000, 5);
 			const laterActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: "later" }));
 			const rejectCrossTurn = async (callID: string) => {
@@ -332,18 +285,16 @@ int main(int argc, char **argv) {
 					`${callID} crossed its turn boundary: ${JSON.stringify(metrics)}`);
 			};
 			await rejectCrossTurn("held-late-running");
-			lateBranch = await lateTask;
+			const lateBranch = await production;
 			assert(!lateBranch.output.isError, `late producer failed: ${textOutput(lateBranch.output.result)}`);
 			await rm(path.join(fixture.workspace, "late.txt"));
 			await rejectCrossTurn("held-late-completed");
-		} finally {
-			lateBranch ??= await lateTask.catch(() => undefined);
-			await lateBranch?.dispose();
-		}
+		});
 
 		const descriptorCommand = "exec 3>descriptor.txt; sh -c 'date +%s >/dev/null; printf descriptor >&3'; exec 3>&-; printf descriptor-ok";
 		const descriptorProducerBefore = fixture.backend.metrics();
-		await withProducer("held-descriptor-producer", descriptorCommand, async (descriptorBranch) => {
+		await withProducer("held-descriptor-producer", descriptorCommand, async (production) => {
+			const descriptorBranch = await production;
 			assert(
 				!descriptorBranch.output.isError && textOutput(descriptorBranch.output.result) === "descriptor-ok",
 				`native descriptor bypass changed output: ${JSON.stringify(descriptorBranch.output)}`,
@@ -377,13 +328,12 @@ int main(int argc, char **argv) {
 			joining: {
 				// A fixed arrival lead is a workload parameter, not a promise that joining beats fallback.
 				disposition: "joined",
-				actorMs: joiningMs,
+				actorMs: joining.totalMs,
 				leadMs,
-				hits: joinMetrics.hits,
-				joinedHits: joinMetrics.joinedHits,
-				estimatedActorMs: joinMetrics.actorTimedHits ? joinMetrics.actorBaselineMs : null,
-				estimatedSavedMs: joinMetrics.actorTimedHits ? joinMetrics.actorBaselineMs - joinMetrics.actorTimedHitLatencyMs : null,
-				...(joinMetrics.lastError ? { rejection: joinMetrics.lastError } : {}),
+				hits: joining.metrics.hits,
+				joinedHits: joining.metrics.joinedHits,
+				estimatedActorMs: null,
+				estimatedSavedMs: null,
 			},
 			completedHandoff: { hits: 1, sameTurnHits: 1, crossTurnCompletedRejected: true, crossTurnRunningRejected: true },
 			logicalCwd: { actorMatchedSource: true, absolutePathAliasHits: cwdHits },

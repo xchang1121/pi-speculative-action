@@ -30,11 +30,11 @@ node --import tsx bench/grep-captured-qualification.mjs --cost-only
 在 Linux 原生文件系统中的 checkout 运行，先使用当前后端自检：
 
 ```sh
-npm run bench:exec-boundary -- --rounds 5 --output /tmp/exec-boundary.json
+npm run bench:exec-boundary -- --output /tmp/exec-boundary.json
 npm run bench:overlay-probe
 ```
 
-`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的单次回退。OverlayFS 探针只证明本机能力，不代替完整进程资格。
+`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的单次回退。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，缺少能力时保留跳过原因；它不代替完整进程资格。
 
 失败时保留原错误和最小复现信息；时钟证明拒绝不能通过延长等待或跳过检查消除。
 
