@@ -1109,7 +1109,8 @@ describe("PatternAware", () => {
 					.find((candidate) => candidate.patternID.startsWith("action-backoff:") && !candidate.background);
 				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
 				else {
-					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0, expectedDurationMs: 350 });
+					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0 });
+					expect(recurrent!.expectedDurationMs).toBeCloseTo(700 / (1 + 2 ** (-4 / config.decayHalfLifeEvents)), 10);
 					expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
 					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
 					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
@@ -1141,6 +1142,32 @@ describe("PatternAware", () => {
 			store.finishSession(mode);
 			store.observe(input("other", "read", { path: "other.ts" }));
 			expect(store.predict("other").some((item) => item.patternID.startsWith("action-backoff:"))).toBe(false);
+		}
+	});
+
+	test.each([0, 64])("weights recurrent evidence by each observation's age (half-life=%i)", (halfLife) => {
+		const store = patternStore({ decayHalfLifeEvents: halfLife, maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 }, undefined, piActionSemantics());
+		const samples: Array<{ path: string; sequence: number; durationMs: number }> = [];
+		let sequence = 0;
+		const observe = (path: string, durationMs: number, outcome: "success" | "failure" = "success") => {
+			store.observe(input("weighted", "read", { path }, { durationMs, outcome }));
+			samples.push({ path, sequence: ++sequence, durationMs: outcome === "success" ? durationMs : 0 });
+		};
+		for (let index = 0; index < 32; index++) observe("old.ts", 100);
+		for (let index = 0; index < 256; index++, sequence++) store.observeTurn();
+		observe("old.ts", 1);
+		observe("fresh.ts", 5_000, "failure");
+		observe("fresh.ts", 80); observe("fresh.ts", 80);
+		store.observe(input("weighted", "marker", {}, { learnTarget: false })); sequence++;
+		const weighted = samples.map((sample) => ({ ...sample, weight: halfLife ? 2 ** (-(sequence - sample.sequence) / halfLife) : 1 }));
+		const total = weighted.reduce((sum, sample) => sum + sample.weight, 0);
+		const predictions = store.predict("weighted");
+		for (const path of ["old.ts", "fresh.ts"]) {
+			const evidence = weighted.filter((sample) => sample.path === path), mass = evidence.reduce((sum, sample) => sum + sample.weight, 0);
+			const prediction = predictions.find((candidate) => candidate.input.path === path)!;
+			expect(prediction.background).not.toBe(true);
+			expect(prediction.conditionalProbability).toBeCloseTo(mass / total, 12);
+			expect(prediction.expectedDurationMs).toBeCloseTo(evidence.reduce((sum, sample) => sum + sample.durationMs * sample.weight, 0) / mass, 10);
 		}
 	});
 
@@ -1613,7 +1640,8 @@ function recurrentAction(key: string, sequence: number) {
 		},
 		input: {},
 		count: 1,
-		totalDurationMs: 1,
+		weightedCount: 1,
+		weightedDurationMs: 1,
 		lastSeenSequence: sequence,
 	};
 }

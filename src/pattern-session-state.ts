@@ -12,7 +12,9 @@ export interface PatternRecurrentAction {
 	readonly action: ActionKey;
 	readonly input: Record<string, unknown>;
 	count: number;
-	totalDurationMs: number;
+	/** Sufficient statistics at lastSeenSequence; count retains the actual support threshold. */
+	weightedCount: number;
+	weightedDurationMs: number;
 	lastSeenSequence: number;
 }
 
