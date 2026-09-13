@@ -1886,65 +1886,66 @@ async function createProcessInterposition(input: {
 	const executables: Array<readonly [string, string]> = [];
 	const execMounts: ExecMount[] = [];
 	const dependencies: DynamicDependency[] = [];
-	const dependencySources = new Set<string>();
+	const sources = new Map<string, InterposedDirectory[]>();
 	for (const directory of directories) {
-		throwIfAborted(input.signal);
-		await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
-		await writeFile(
-			path.join(directory.view, ".pi-spec-dispatch-v1"),
-			["PI_SPEC_DISPATCH_V1", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
-			{ mode: 0o600 },
-		);
+		const aliases = sources.get(directory.source) ?? [];
+		aliases.push(directory);
+		sources.set(directory.source, aliases);
+	}
+	for (const [source, aliases] of sources) {
+		for (const directory of aliases) {
+			throwIfAborted(input.signal);
+			await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
+			await writeFile(
+				path.join(directory.view, ".pi-spec-dispatch-v1"),
+				["PI_SPEC_DISPATCH_V1", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
+				{ mode: 0o600 },
+			);
+		}
 		let entries: string[];
 		try {
-			entries = await readdir(directory.source);
+			entries = await readdir(source);
 		} catch {
 			continue;
 		}
-		// Bound independent entry preparation; every probe and link settles before evidence capture.
+		// Each physical entry is probed once; aliases retain independent exec-only mappings.
+		// Bound preparation and settle every alias link before capturing directory evidence.
 		for (let start = 0; start < entries.length; start += 16) {
 			throwIfAborted(input.signal);
 			await Promise.all(entries.slice(start, start + 16).map(async (name) => {
 				if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) return;
-				const sourceEntry = path.join(directory.source, name);
-				const viewEntry = path.join(directory.view, name);
+				const sourceEntry = path.join(source, name);
 				try {
 					const resolved = await realpath(sourceEntry);
 					const resolvedStat = await lstat(resolved);
-					let executable = resolvedStat.isFile() && !excluded.has(resolved);
-					if (executable) {
-						try {
-							await access(sourceEntry, fsConstants.X_OK);
-						} catch {
-							executable = false;
-						}
-					}
-					if (executable) {
+					if (!resolvedStat.isFile() || excluded.has(resolved)) return;
+					await access(sourceEntry, fsConstants.X_OK);
+				} catch {
+					return; // Unproved entries remain visible through the original directory.
+				}
+				for (const directory of aliases) {
+					const viewEntry = path.join(directory.view, name);
+					try {
 						await link(launcher, viewEntry);
 						const intercepted = path.join(directory.target, name);
 						executables.push([intercepted, path.join(directory.shadow, name)]);
 						executables.push([viewEntry, path.join(directory.shadow, name)]);
 						execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
+					} catch {
+						// One unavailable view cannot suppress another alias's mapping.
 					}
-				} catch {
-					// An entry that cannot be proved executable remains visible through its original directory.
 				}
 			}));
 		}
 		throwIfAborted(input.signal);
-		if (!dependencySources.has(directory.source)) {
-			dependencySources.add(directory.source);
-			dependencies.push(
-				await captureDirectoryDependency(
-					directory.source,
-					input.projection.isWorkspacePhysical(directory.source)
-						? input.projection.toLogical(directory.source)
-						: slash(directory.source),
-					true,
-					path.resolve(directory.source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
-				),
-			);
-		}
+		dependencies.push(
+			await captureDirectoryDependency(
+				source,
+				input.projection.isWorkspacePhysical(source) ? input.projection.toLogical(source) : slash(source),
+				true,
+				path.resolve(source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
+			),
+		);
 	}
 	const mounts = uniqueSandboxMounts([
 		...directories.map(({ shadow, source }) => ({ virtualPath: shadow, hostPath: source, readOnly: true })),
