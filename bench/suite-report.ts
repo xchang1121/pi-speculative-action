@@ -35,8 +35,6 @@ export interface PairedLatencyObservation {
 	readonly treatmentMs: number;
 }
 
-export type PairedLatencyStatistics = ReturnType<typeof pairedLatencyStatistics>;
-
 export function summarizeSuite(
 	runs: readonly SuiteBenchmarkRun[],
 	options: SuiteStatisticsOptions = {},
