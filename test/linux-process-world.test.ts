@@ -130,9 +130,10 @@ describe("Linux process ExecutionWorld", () => {
 			expectedRemainingMs: 0, expectedAdoptionMs: 100,
 			expectedActorMs: 10, expectedNetBenefitMs: -90,
 		});
-		const invocation = vi.fn(() => resolvePiToolInvocation("bash", { command: ":" }, {
+		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, {
 			cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath,
-		})?.process);
+		})!.process!;
+		const invocation = vi.fn(() => processInvocation);
 		const coordinator = new ProcessExecutionCoordinator(host, {
 			enabled: () => true,
 			prepare: (refresh) => fixture.backend.prepareActorReplay(host, {
@@ -142,6 +143,9 @@ describe("Linux process ExecutionWorld", () => {
 			reset: () => fixture.backend.resetActorReplay(),
 		});
 		const invoke = () => coordinator.operations.exec(":", fixture.workspace, { env: fixture.environment, onData: () => {} });
+		const gates = [deferred(), deferred()], sessionsReady = deferred(), captureEntered = deferred(), captureReleased = deferred();
+		const producers: Promise<unknown>[] = [];
+		let sessions = 0;
 		let calls: Promise<unknown> | undefined, refreshing: Promise<unknown> | undefined;
 		try {
 			await invoke();
@@ -163,16 +167,51 @@ describe("Linux process ExecutionWorld", () => {
 			expect(coordinator.actorDiagnostics().state).toBe("ready");
 			await invoke(); // Clearing evidence is rechecked even after the helper was initialized.
 			expect(host.execute).toHaveBeenCalledTimes(3); expect(invocation).toHaveBeenCalledTimes(2);
+			expect(await fixture.backend.check()).toMatchObject({ state: "ready" }); await invoke();
+			expect(host.execute, "backend preparation alone cannot produce a replay result").toHaveBeenCalledTimes(4);
+			expect(held.execute).toHaveBeenCalledTimes(2);
 			const availability = vi.spyOn(fixture.backend.store, "mayHaveCertificates").mockImplementationOnce(async () => {
-				await fixture.backend.check(); return false; // A producer can begin while the empty lookup awaits IO.
+				producers.push(...gates.map(gate => fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+					const session = await fixture.backend.open({ workspace, sourceRoot: fixture.workspace, invocation: processInvocation });
+					try { if (++sessions === gates.length) sessionsReady.resolve(); await gate.promise; }
+					finally { const first = session.close(), second = session.close(); await first; expect(second).toBe(first); }
+				})));
+				await Promise.race([sessionsReady.promise, Promise.all(producers)]);
+				return false; // Actual sessions appeared while the empty history lookup was awaiting IO.
 			});
 			try { await invoke(); expect(held.execute).toHaveBeenCalledTimes(3); } finally { availability.mockRestore(); }
+			const cancelled = new AbortController(); cancelled.abort(new Error("cancelled preparation"));
+			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				await expect(fixture.backend.open({ workspace, sourceRoot: fixture.workspace, invocation: processInvocation, signal: cancelled.signal }))
+					.rejects.toThrow("cancelled preparation");
+			});
+			gates[0]!.resolve(); await producers[0]; await invoke();
+			expect(held.execute, "one closed or failed producer cannot retire its live sibling").toHaveBeenCalledTimes(4);
+			gates[1]!.resolve(); await producers[1]; await invoke(); expect(host.execute).toHaveBeenCalledTimes(5);
+
+			const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
+			const forking = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(options => fork({ ...options,
+				afterCapture: async (workspace, capture) => {
+					captureEntered.resolve(); await captureReleased.promise;
+					return options.afterCapture!(workspace, capture); // The process is closed; final evidence can still be published.
+				},
+			}));
+			try {
+				const producing = forkReusableBash(fixture, { command: ":", label: "sealing", actionNamespace: "readiness", executionFingerprint: "readiness" })
+					.then(async branch => { try { expect(branch.output.isError).toBe(false); } finally { await branch.dispose(); } });
+				producers.push(producing);
+				await Promise.race([captureEntered.promise, producing]); await invoke();
+				expect(held.execute, "outer evidence capture still owns possible publication").toHaveBeenCalledTimes(5);
+				captureReleased.resolve(); await producing;
+			} finally { captureReleased.resolve(); forking.mockRestore(); }
+			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(6);
 			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
 			await coordinator.refreshActorRoute();
 			expect(coordinator.actorDiagnostics()).toMatchObject({ state: "degraded", detail: expect.stringContaining("functional probe failed") });
-			await invoke(); expect(host.execute).toHaveBeenCalledTimes(4);
+			await invoke(); expect(host.execute).toHaveBeenCalledTimes(7);
 		} finally {
-			release(); await Promise.allSettled([calls, refreshing]);
+			release(); gates.forEach(gate => gate.resolve()); captureReleased.resolve();
+			await Promise.allSettled([calls, refreshing, ...producers]);
 			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore(); observed.mockRestore();
 			await fixture.dispose();
 		}

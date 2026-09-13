@@ -80,6 +80,9 @@ export class ProcessHandoffRegistry {
 		this.trim();
 	}
 
+	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
+	get hasResults(): boolean { return this.byKey.size > 0; }
+
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		let joined = false, historyChecked = false;
 		const considered = new Map<HandoffRecord, Sha256Digest>();

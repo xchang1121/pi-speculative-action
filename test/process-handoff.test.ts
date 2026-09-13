@@ -41,6 +41,7 @@ describe("ProcessHandoffRegistry", () => {
 	it("publishes memory before noncreating or failed persistence outcomes", async () => {
 		for (const [stored, failure] of [[false, undefined], [undefined, new Error("store unavailable")]] as const) {
 			const fixture = await producer();
+			expect(fixture.registry.hasResults).toBe(true);
 			const persistenceStarted = deferred<void>();
 			const persistence = deferred<boolean>();
 			const publishing = fixture.publish(() => {
@@ -48,10 +49,12 @@ describe("ProcessHandoffRegistry", () => {
 				return persistence.promise;
 			});
 			await persistenceStarted.promise;
+			expect(fixture.registry.hasResults).toBe(true);
 
 			const lookup = vi.fn(livePlan);
 			const actor = await acquireActor(fixture, lookup);
 			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
+			expect(fixture.registry.hasResults).toBe(false);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
 
 			if (failure) {

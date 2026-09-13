@@ -95,7 +95,7 @@ export function createLinuxProcessExecutionWorld(
 					...(signal ? { signal } : {}),
 				});
 			},
-			execute: async (context) => {
+			execute: (context) => backend.withProducer(async () => {
 			const invocation = processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
@@ -156,7 +156,7 @@ export function createLinuxProcessExecutionWorld(
 				Object.assign(branch, { commit: () => ownership.commit(commit) });
 			}
 			return branch;
-			},
+			}),
 		},
 		dispose: async () => {
 			const ownedRoots = [...roots];
