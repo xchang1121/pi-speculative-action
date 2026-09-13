@@ -1,3 +1,4 @@
+import { positiveCount as units } from "./number-utils.ts";
 import type { ActionEffect } from "./action-semantics.ts";
 import type { SpeculativeExecution } from "./execution-world.ts";
 
@@ -31,8 +32,4 @@ export function actionResourceProfile(effect: ActionEffect | undefined): Specula
 	if (effect === "observation") return { class: "filesystem", units: 1 };
 	if (effect === "workspace_mutation") return { class: "workspace", units: 1 };
 	return { class: "global", units: 1 };
-}
-
-function units(value: number): number {
-	return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }

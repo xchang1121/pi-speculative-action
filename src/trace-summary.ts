@@ -1,3 +1,4 @@
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
@@ -205,10 +206,6 @@ function cloneCache(cache: SpeculativeCacheSnapshot): SpeculativeCacheSnapshot {
 
 function causeKey(cause: ResolutionCause): string {
 	return `${cause.stage}:${cause.code}`;
-}
-
-function metric(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function ratio(numerator: number, denominator: number): number {

@@ -1,3 +1,5 @@
+import { clampProbability, nonNegativeCount as nonNegativeInteger } from "./number-utils.ts";
+
 export type PpmCountTrieRow = {
 	readonly context: readonly string[];
 	readonly counts: Readonly<Record<string, number>>;
@@ -277,10 +279,6 @@ function node(): CountNode {
 	return { children: new Map(), targets: new Map(), total: 0, lastSeen: 0 };
 }
 
-function nonNegativeInteger(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-}
-
 function positiveCount(value: number): number | undefined {
 	return Number.isFinite(value) && value > 0 ? safeCount(value) : undefined;
 }
@@ -292,10 +290,6 @@ function safeCount(value: number): number {
 function safeTotal(value: number): number {
 	const maximum = Number.MAX_VALUE / 2;
 	return Math.min(maximum, Math.max(0, Number.isFinite(value) ? value : maximum));
-}
-
-function clampProbability(value: number): number {
-	return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 }
 
 function decayedCount(value: TargetCount | undefined, sequence: number, halfLife: number): number {

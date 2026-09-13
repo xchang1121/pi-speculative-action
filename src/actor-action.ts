@@ -1,3 +1,4 @@
+import { nonNegativeFinite as finite } from "./number-utils.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { AuthoritativeResultCapture } from "./runtime-contracts.ts";
 import {
@@ -220,8 +221,4 @@ function normalizeExecutionBlockedTiming(attemptLeadMs: number, durationMs: numb
 function freezePredictions(predictions: readonly PredictionIdentity[]): readonly PredictionIdentity[] {
 	const unique = new Map(predictions.map((prediction) => [prediction.id, Object.freeze({ ...prediction })]));
 	return Object.freeze([...unique.values()]);
-}
-
-function finite(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }

@@ -1,3 +1,4 @@
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 import type { ResolutionCause } from "./settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
@@ -187,8 +188,4 @@ export class CandidateExecution<Output> {
 		this.settleCompletion(settlement);
 		return true;
 	}
-}
-
-function metric(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }

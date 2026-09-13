@@ -1,3 +1,4 @@
+import { nonNegativeCount as sequence, nonNegativeFinite as finite, positiveCount as units } from "./number-utils.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { SpeculativeExecution, WorldCompatibilityEvidence } from "./execution-world.ts";
 import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
@@ -563,19 +564,7 @@ function resourceClasses(): readonly SpeculativeResourceClass[] {
 	return ["filesystem", "workspace", "process", "global"];
 }
 
-function units(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
-}
-
-function finite(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
-}
-
 function positive(value: number | undefined, fallback: number): number {
 	const normalized = finite(value);
 	return normalized > 0 ? normalized : Math.max(1, finite(fallback));
-}
-
-function sequence(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
