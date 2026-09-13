@@ -324,6 +324,12 @@ WSL ready 普通 Bash 的原生/Host 返回/准备 p50 为 2.84/15.14/1625.07 ms
 
 因此保留试验补丁与全部新增用例，生产代码恢复为原 `32eb5a0`。后续减少重复准备需要结合当前可验证的可用性或实际共享工作，并保留即时恢复反例；两次历史失败不足以证明下一次准备仍无用。本次阶段提交归类为 `docs`，不新增生产门控，也不宣称 API 请求、自然准确率或费用改善。全部原始失败、负收益与不完整试验保留。资格报告为 `preparation-backoff-qualification.json`，恢复报告为 `preparation-backoff-recovery.json`，归档为 `preparation-backoff-experiment/manifest.json`；完整补丁 SHA-256 为 `a2a3c48641782a6ec3f6806f03be127828087cb5cf94deb1534f5c57fb2be2a5`。生产代码相对 `caaf4ef` 仍净减 352 个物理行、48 个 LF 字节，试验副本没有进入生产构建。
 
+### 原生搜索回退的输出对照
+
+Windows 的一次旧版 `native-grep` 回退与另一个原生 oracle 进程以不同顺序返回相同两行，原基准因此失败。Pi 的原生搜索没有请求排序，两个独立进程的文本顺序不能充当转发正确性的证明。`adoption-latency.mjs` 现在逐项断言实际回退输入，在返回 Host 前保存完整原生输出，并核对 Host 原样交付；报告同时保留两份原始搜索输出，不排序、不改工具语义。捕获 profile 和其他工具继续使用独立原生 oracle，文件效果、生产者/原生次数、清理检查保持。回退输入断言与输出捕获计入 Host 时间。
+
+修正后的 Windows/WSL 32 份双向版本与诊断开关报告通过，共 1728 次调用；包含 48 次 ready 子进程命中和 48 次 running 子进程接续。四次原生搜索顺序差异及最初失败报告均保留，详见 `optional-diagnostics-adoption-qualification.json`。该提交归类为 `fix`，修正基准对照，不宣称生产执行提速。
+
 ### 模型套件
 
 模型套件选择 [Claw-SWE-Bench Lite](https://huggingface.co/datasets/TokenRhythm/Claw-SWE-Bench) 的真实问题，只取得选定 base commit；每次创建新的 detached 工作区，不把 gold patch 给 Agent。
