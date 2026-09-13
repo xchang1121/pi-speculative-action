@@ -253,7 +253,7 @@ const MAX_PATH_SOURCES = 24;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
-const PERSISTENCE_VERSION = 19;
+const PERSISTENCE_VERSION = 20;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -2340,12 +2340,10 @@ function ownBatch(inputs: ReadonlyArray<PatternAwareEventInput>, sessionID?: str
 	if (inputs.some((input) => input.sessionID !== sessionID || input.turnID !== inputs[0]!.turnID)) {
 		throw new Error("PatternAware batch actions must belong to one session and provider turn");
 	}
+	// Bindings use member positions: argument changes must not reorder distinct tools.
 	return inputs
-		.map((input, index) => ({ input, index, key: stableStringify({
-			tool: input.tool, outcome: input.outcome,
-			...(input.operation ? { operation: input.operation } : {}), input: input.input,
-		}) }))
-		.sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+		.map((input) => ({ input, key: stableStringify([input.tool, input.outcome, input.operation ?? "", input.input]) }))
+		.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0)
 		.map((item) => item.input);
 }
 

@@ -170,20 +170,26 @@ describe("PatternAware", () => {
 			.find((item) => item.tool === "read")).toBeUndefined();
 	});
 
-	test("learns provider batches canonically without inventing sibling causality", () => {
+	test.each([
+		["tools", ["TODO", "TODO", "TODO"], "src/**/*.ts", false],
+		["arguments", ["aaa", "zzz", "xyz"], "mmm", false],
+		["unicode", ["caf\u00e9", "caf\u00e9", "caf\u00e9"], "cafe\u0301", true],
+	] as const)("learns canonical provider batches across %s without sibling causality", (_name, queries, sibling, sameTool) => {
 		const store = patternStore();
 		for (const [sessionID, filePath, reverse] of [
 			["one", "src/a.ts", false],
 			["two", "src/b.ts", true],
 		] as const) {
-			const batch = scanBatch(sessionID, filePath);
+			const batch = scanBatch(sessionID, filePath, [queries[reverse ? 1 : 0], sibling], sameTool);
 			store.observeBatch(reverse ? [...batch].reverse() : batch);
+			expect(store.recent(sessionID).map((event) => event.input.pattern)).toEqual([sibling, queries[reverse ? 1 : 0]]);
 			store.observeBatch([input(sessionID, "read", { filePath }, { turnID: `${sessionID}:read`, })]);
 			store.finishSession(sessionID);
 		}
 
-		const batch = scanBatch("probe", "src/c.ts").reverse();
-		const preview = store.predictAfterBatch("probe", batch).find((item) => item.tool === "read");
+		const batch = scanBatch("probe", "src/c.ts", [queries[2], sibling], sameTool).reverse();
+		const previews = store.predictAfterBatch("probe", batch).filter((item) => item.tool === "read"), preview = previews[0];
+		expect(previews.map((item) => item.input)).toEqual([{ filePath: "src/c.ts" }]);
 		const before = store.snapshot(), seed = { visitedPatternIDs: ["foreign-batch"], pathProbability: 0.5 };
 		const peer = store.predictAfterBatch("probe", batch, {}, settings(), seed).find((item) => item.tool === "read");
 		expect(peer).toMatchObject({ input: preview?.input, depth: 2, conditionalProbability: preview?.conditionalProbability });
@@ -447,7 +453,7 @@ describe("PatternAware", () => {
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
-		expect(persisted.version).toBe(19);
+		expect(persisted.version).toBe(20);
 		expect(persisted.events.length).toBeGreaterThan(0);
 		expect(
 			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
@@ -474,13 +480,13 @@ describe("PatternAware", () => {
 		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
-	test("restores only valid current patterns, indexed pools and feedback, and owns every public snapshot", async () => {
+	test.each([19, 20])("restores valid patterns and owns public snapshots (version=%s)", async (version) => {
 		const file = await patternFile("corrupt-state");
 		const restoredInput = { path: "README.md", fields: { "\u00e9": 2, "e\u0301": 1 } };
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
 		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
-		await fs.writeFile(file, JSON.stringify({ version: 19,
+		await fs.writeFile(file, JSON.stringify({ version,
 			patterns: [valid,
 				{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
 				{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
@@ -495,6 +501,7 @@ describe("PatternAware", () => {
 		}));
 		const store = patternStore({ minOccurrences: 1 }, file);
 		await expect(store.load()).resolves.toBeUndefined();
+		if (version === 19) { expect(store.snapshot()).toEqual([]); return; }
 		const expected = store.snapshot(), exposed = store.snapshot()[0]!;
 		expect(expected.map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
 		expect(exposed.feedback).toEqual(valid.feedback);
@@ -576,7 +583,7 @@ describe("PatternAware", () => {
 		);
 		await fs.writeFile(
 			file,
-			JSON.stringify({ version: 19, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
+			JSON.stringify({ version: 20, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
 		);
 
 		const store = patternStore({ maxContextLength: 1 }, file);
@@ -632,7 +639,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
-		expect(persisted.version).toBe(19);
+		expect(persisted.version).toBe(20);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
@@ -1480,11 +1487,12 @@ function observeBatchTransition(
 	store.finishSession(sessionID);
 }
 
-function scanBatch(sessionID: string, filePath: string) {
+function scanBatch(sessionID: string, filePath: string, patterns: readonly [string, string], sameTool: boolean) {
 	const turnID = `${sessionID}:scan`;
 	return [
-		input(sessionID, "grep", { pattern: "TODO" }, { turnID, outputPaths: [filePath] }),
-		input(sessionID, "find", { pattern: "src/**/*.ts" }, { turnID, output: { count: 1 } }),
+		input(sessionID, "grep", { pattern: patterns[0] }, { turnID, outputPaths: [filePath] }),
+		input(sessionID, sameTool ? "grep" : "find", { pattern: patterns[1] },
+			{ turnID, ...(sameTool ? { outputPaths: [filePath.replace("src/", "ignored/").replace(".ts", ".txt")] } : { output: { count: 1 } }) }),
 	];
 }
 
