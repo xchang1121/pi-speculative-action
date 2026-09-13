@@ -61,8 +61,7 @@ export class BoundedEventQueue<Event> {
 	private readonly onFailure: PostSettlementFailureHandler;
 	private readonly pending: PendingEvent<Event>[] = [];
 	private readonly idleWaiters = new Set<() => void>();
-	private activeSince?: number;
-	private draining = false;
+	private active?: PendingEvent<Event>;
 	private closed = false;
 	private droppedValue = 0;
 
@@ -79,35 +78,29 @@ export class BoundedEventQueue<Event> {
 
 	enqueue(event: Event): boolean {
 		if (this.closed) return false;
-		const active = this.draining ? 1 : 0;
+		const active = this.active ? 1 : 0;
 		if (active + this.pending.length >= this.capacityValue) {
 			this.droppedValue++;
 			return false;
 		}
 		this.pending.push({ value: event, enqueuedAt: performance.now() });
-		if (!this.draining) {
-			this.draining = true;
-			void this.drain();
-		}
+		if (!this.active) void this.drain();
 		return true;
 	}
 
 	snapshot(now = performance.now()): BoundedEventQueueSnapshot {
-		const oldest = this.activeSince ?? this.pending[0]?.enqueuedAt;
+		const oldest = this.active?.enqueuedAt ?? this.pending[0]?.enqueuedAt;
 		return Object.freeze({
 			capacity: this.capacityValue,
-			pending: this.pending.length + (this.draining ? 1 : 0),
+			pending: this.pending.length + (this.active ? 1 : 0),
 			dropped: this.droppedValue,
 			oldestPendingMs: oldest === undefined ? 0 : Math.max(0, now - oldest),
 		});
 	}
 
 	async flush(): Promise<void> {
-		if (!this.draining && this.pending.length === 0) return;
-		await new Promise<void>((resolve) => {
-			this.idleWaiters.add(resolve);
-			if (!this.draining && this.pending.length === 0 && this.idleWaiters.delete(resolve)) resolve();
-		});
+		if (!this.active && this.pending.length === 0) return;
+		await new Promise<void>((resolve) => { this.idleWaiters.add(resolve); });
 	}
 
 	/** Seal delivery; callers may detach from an already bounded backlog during runtime disposal. */
@@ -121,7 +114,7 @@ export class BoundedEventQueue<Event> {
 			while (true) {
 				const next = this.pending.shift();
 				if (!next) return;
-				this.activeSince = next.enqueuedAt;
+				this.active = next;
 				try {
 					await this.deliver(next.value);
 				} catch (error) {
@@ -130,17 +123,11 @@ export class BoundedEventQueue<Event> {
 					} catch {
 						// Diagnostics cannot poison later observer delivery.
 					}
-				} finally {
-					this.activeSince = undefined;
 				}
 			}
 		} finally {
-			this.draining = false;
-			if (this.pending.length > 0 && !this.closed) {
-				this.draining = true;
-				void this.drain();
-				return;
-			}
+			// The empty-queue check and release are synchronous; enqueued callbacks drain in the loop.
+			this.active = undefined;
 			for (const resolve of this.idleWaiters) resolve();
 			this.idleWaiters.clear();
 		}

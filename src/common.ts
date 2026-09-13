@@ -1,4 +1,5 @@
-import { KEYABLE_TOOLS } from "./action-semantics.ts";
+import { KEYABLE_TOOLS, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import type { SpeculativeActionSettings } from "./runtime-contracts.ts";
 import { positiveCount } from "./number-utils.ts";
 import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 
@@ -42,6 +43,14 @@ export const DEFAULTS = {
 
 export function clampCandidateLimit(value: unknown): number {
 	return positiveCount(value);
+}
+
+export function candidateToolNames(
+	settings: SpeculativeActionSettings,
+	semantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
+): readonly string[] {
+	const known = new Set(semantics.toolNames());
+	return [...new Set(settings.tools)].filter((tool) => known.has(tool));
 }
 
 /** Only omitted selection defaults to allowed tools; malformed input disables prediction. */

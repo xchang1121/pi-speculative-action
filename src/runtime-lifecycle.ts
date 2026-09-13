@@ -8,23 +8,19 @@
 export class RuntimeLifecycleLane {
 	private tail: Promise<void> = Promise.resolve();
 	private closeTask?: Promise<void>;
-	private sealedValue = false;
 	private readonly work = new Set<Promise<unknown>>();
 	private readonly released = new WeakMap<object, Promise<void>>();
 
 	get sealed(): boolean {
-		return this.sealedValue;
+		return this.closeTask !== undefined;
 	}
 
 	run(operation: () => void | Promise<void>): Promise<void> {
-		if (this.sealedValue) return this.closeTask ?? this.tail;
-		return this.enqueue(operation);
+		return this.closeTask ?? this.enqueue(operation);
 	}
 
 	close(operation: () => void | Promise<void>): Promise<void> {
-		if (this.closeTask) return this.closeTask;
-		this.sealedValue = true;
-		this.closeTask = this.enqueue(async () => {
+		this.closeTask ??= this.enqueue(async () => {
 			try { await operation(); } finally { await this.drain(); }
 		});
 		return this.closeTask;
@@ -32,7 +28,7 @@ export class RuntimeLifecycleLane {
 
 	/** New borrowers require an open owner; tracked continuations may still drain after sealing. */
 	admit<Value>(operation: () => Promise<Value>): Promise<Value> {
-		if (this.sealedValue) return Promise.reject(new Error("execution lifetime is closed"));
+		if (this.sealed) return Promise.reject(new Error("execution lifetime is closed"));
 		return this.track(Promise.resolve().then(operation));
 	}
 

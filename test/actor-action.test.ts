@@ -108,14 +108,15 @@ describe("PostSettlementQueue", () => {
 });
 
 describe("BoundedEventQueue", () => {
-	it("bounds stalled observers, preserves order, and resumes after failures", async () => {
+	it("bounds stalled observers and drains reentrant delivery through failures and concurrent flushes", async () => {
 		const { promise: blocked, resolve: release } = deferred();
 		const delivered: number[] = [];
-		const failures = vi.fn();
+		const failures = vi.fn(() => { queue.enqueue(6); throw new Error("diagnostic failed"); });
 		const queue = new BoundedEventQueue<number>(4, async (event) => {
 			delivered.push(event);
 			if (event === 1) await blocked;
 			if (event === 2) throw new Error("observer failed");
+			if (event === 3) queue.enqueue(7);
 		}, failures);
 
 		expect(queue.enqueue(1)).toBe(true);
@@ -125,12 +126,14 @@ describe("BoundedEventQueue", () => {
 		expect(queue.enqueue(5)).toBe(false);
 		expect(queue.snapshot()).toMatchObject({ capacity: 4, pending: 4, dropped: 1 });
 
-		release();
-		await queue.flush();
-		expect(delivered).toEqual([1, 2, 3, 4]);
+		const flushing = [queue.flush(), queue.flush()];
+		release(); await Promise.all(flushing);
+		expect(delivered).toEqual([1, 2, 3, 4, 6, 7]);
 		expect(failures).toHaveBeenCalledOnce();
 		expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: 1, oldestPendingMs: 0 });
+		expect(queue.enqueue(8)).toBe(true); await queue.flush();
+		expect(delivered).toEqual([1, 2, 3, 4, 6, 7, 8]);
 		await queue.close();
-		expect(queue.enqueue(6)).toBe(false);
+		expect(queue.enqueue(9)).toBe(false);
 	});
 });

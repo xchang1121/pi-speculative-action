@@ -12,7 +12,9 @@ import {
 	type ResultCacheEvidence,
 	speculativeCacheValue,
 } from "./candidate-stores.ts";
-import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
+import { candidateToolNames, clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
+import { nonNegativeFinite as finiteMetric } from "./number-utils.ts";
+import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
@@ -400,20 +402,12 @@ function maybe<T>(value: T | undefined): T[] {
 	return value === undefined ? [] : [value];
 }
 
-function finiteMetric(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
-}
-
 function actionTimingIdentity(action: ActionKey): ServiceTimingIdentity {
 	return {
 		tool: action.tool,
 		executionFingerprint: action.executionFingerprint,
 		actionKeyHash: action.hash,
 	};
-}
-
-function errorDetail(error: unknown): string {
-	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
@@ -595,11 +589,6 @@ class StructuralRuntimeState<
 		return this.masterEnabled === false;
 	}
 
-	candidateNames(settings: SpeculativeActionSettings): readonly string[] {
-		const known = new Set(this.semantics.toolNames());
-		return [...new Set(settings.tools)].filter((tool) => known.has(tool));
-	}
-
 	sessionFor(
 		sessionID: SessionID,
 		settings: SpeculativeActionSettings,
@@ -756,7 +745,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		if (signal?.aborted) return;
 		const definitions = adapter.definitions(input);
-		const names = runtimeState.candidateNames(settings);
+		const names = candidateToolNames(settings, runtimeState.semantics);
 		if (!definitions.length) return;
 		const session = runtimeState.sessionFor(input.sessionID, settings);
 		await session.lifecycle.run(async () => {
@@ -1127,7 +1116,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const concrete = asConcreteInput(node.action.input);
-		if (!concrete || !context.settings.enabled || !runtimeState.candidateNames(context.settings).includes(node.action.tool)) {
+		if (!concrete || !context.settings.enabled || !candidateToolNames(context.settings, runtimeState.semantics).includes(node.action.tool)) {
 			failUnlaunchable(session, node, cause("admission", concrete ? "tool_disabled" : "invalid_input"));
 			return;
 		}
@@ -2853,10 +2842,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		});
 	};
 
-	const releaseSession = async (sessionID: SessionID): Promise<void> => {
-		await disposeSession(sessionID);
-	};
-
 	const dispose = async (): Promise<void> => {
 		await Promise.all([...runtimeState.sessions.keys()].map((sessionID) => disposeSession(sessionID)));
 	};
@@ -2970,7 +2955,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		},
 		finishTurn,
 		settingsChanged,
-		releaseSession,
+		releaseSession: disposeSession,
 		disposeSession,
 		dispose,
 		inspect,
