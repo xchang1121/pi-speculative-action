@@ -10,7 +10,7 @@ import { createFindTool, createGrepTool, createLsTool, createReadTool, createRea
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
-import { captureStableFile } from "../src/filesystem-evidence.ts";
+import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { THINKTHREAD_TOOL_RUNNER_VERSION } from "../src/thinkthread/tool-runner-protocol.ts";
@@ -266,10 +266,12 @@ describe("speculative action resource versions", () => {
 		} finally { vi.unstubAllEnvs(); }
 	});
 
-	test.for([["empty", "short"], ["admission"], ["grow", "shrink"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
+	test.for([["empty", "short", "chunks"], ["admission"], ["grow", "shrink", "read-error"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
 		if (process.platform === "win32" && changes.includes("replace")) return skip("Windows denies replacement of the open destination");
-		for (const change of changes) for (const retain of [false, true]) {
-			const payload = Buffer.from(change === "empty" ? "" : "initial contents");
+		for (const change of changes) for (const mode of ["hash", "content", "executable"]) {
+			const executable = mode === "executable", retain = mode === "content";
+			if (executable && ["admission", "seal"].includes(change)) continue; // Only path captures certify pathname stability.
+			const payload = change === "chunks" ? Buffer.alloc(2 * 1024 * 1024 + 7, 43) : Buffer.from(change === "empty" ? "" : "initial contents");
 			const root = await workspace({ value: payload }), file = path.join(root, "value");
 			const nativeOpen = fs.open.bind(fs), handle = await nativeOpen(file, "r"), read = handle.read.bind(handle), stat = handle.stat.bind(handle);
 			let inspections = 0;
@@ -284,20 +286,40 @@ describe("speculative action resource versions", () => {
 				return result;
 			}) as typeof handle.stat);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (buffer: Buffer) => {
+				if (change === "read-error") throw new Error("injected read failure");
 				if (change === "grow") await fs.appendFile(file, "more");
 				if (change === "shrink") await fs.truncate(file, 1);
 				if (change === "replace") { const replacement = path.join(root, "new"); await fs.writeFile(replacement, payload); await fs.rename(replacement, file); }
 				return read(buffer, 0, Math.min(3, buffer.byteLength), null);
 			}) as typeof handle.read);
 			try {
-				const capture = captureStableFile(file, Infinity, retain);
-				if (["empty", "short"].includes(change)) {
-					expect(await capture).toMatchObject({ hash: createHash("sha256").update(payload).digest("hex"), bytesRead: payload.length,
-						...(retain ? { content: payload } : {}) });
-				} else await expect(capture).rejects.toThrow("file_changed_during_capture");
+				const capture = executable ? hashExecutableFile(file) : captureStableFile(file, Infinity, retain);
+				if (["empty", "short", "chunks"].includes(change)) {
+					const hash = createHash("sha256").update(payload).digest("hex");
+					if (executable) expect(await capture).toBe(`sha256:${hash}`);
+					else expect(await capture).toMatchObject({ hash, bytesRead: payload.length, ...(retain ? { content: payload } : {}) });
+					if (!retain) for (const [buffer] of vi.mocked(handle.read).mock.calls) {
+						expect(Buffer.isBuffer(buffer) ? buffer.byteLength : Infinity).toBeLessThanOrEqual(1024 * 1024);
+					}
+				} else await expect(capture).rejects.toThrow(change === "read-error" ? "injected read failure" : "file_changed_during_capture");
 				if (change === "admission") expect(handle.read).not.toHaveBeenCalled();
 				expect(handle.fd).toBe(-1);
 			} finally { open.mockRestore(); }
+		}
+	});
+
+	test.runIf(process.platform === "linux")("hashes the pinned image through aliases after its pathname changes", async () => {
+		for (const change of ["replace", "unlink", "rewrite"]) {
+			const root = await workspace({ image: "old" }), file = path.join(root, "image"), handle = await fs.open(file, "r");
+			const alias = `/proc/self/fd/${handle.fd}`, digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+			try {
+				expect(await hashExecutableFile(alias)).toBe(digest("old"));
+				if (change === "replace") { await fs.rename(file, path.join(root, "old")); await fs.writeFile(file, "new"); }
+				else if (change === "unlink") await fs.unlink(file);
+				else await fs.writeFile(file, "new");
+				expect(await hashExecutableFile(alias)).toBe(digest(change === "rewrite" ? "new" : "old"));
+				await expect(captureStableFile(alias)).rejects.toThrow("not_regular_file");
+			} finally { await handle.close(); }
 		}
 	});
 

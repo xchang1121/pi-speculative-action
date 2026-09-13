@@ -63,6 +63,7 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
+import { hashExecutableFile } from "./filesystem-evidence.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -935,7 +936,7 @@ export class LinuxProcessReuseBackend {
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 			const prototype = createExecPrototype({
 				executablePath: projection.toLogical(snapshot.executable),
-				executableDigest: sha256Digest(await readFile(`/proc/${process.pid}/exe`)),
+				executableDigest: await hashExecutableFile(`/proc/${process.pid}/exe`),
 				argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
 				logicalCwd: projection.toLogical(snapshot.cwd),
 				environment: Object.fromEntries(
@@ -1294,7 +1295,7 @@ export class LinuxProcessReuseBackend {
 		executable: string,
 		outputRoute: OutputRoute,
 	): Promise<ExecPrototype> {
-		const [content, ready] = await Promise.all([readFile(executable), this.resolveReady()]);
+		const [executableDigest, ready] = await Promise.all([hashExecutableFile(executable), this.resolveReady()]);
 		const context = routedExecutionContext(ready.executionContext, outputRoute);
 		const contextDigest = sha256Digest(context.key);
 		const environment = Object.fromEntries(
@@ -1306,7 +1307,7 @@ export class LinuxProcessReuseBackend {
 		const argv = [request.argv0, ...request.args].map((value) => session.projection.normalizeValue(value));
 		return createExecPrototype({
 			executablePath: session.projection.toLogical(executable),
-			executableDigest: sha256Digest(content),
+			executableDigest,
 			argv,
 			logicalCwd: session.projection.toLogical(request.cwd),
 			environment,
@@ -2342,7 +2343,7 @@ async function topLevelProcessPrototype(
 	if (invocation.commandTransport === "argv") argv.push(request.command);
 	return createExecPrototype({
 		executablePath: invocation.shell,
-		executableDigest: sha256Digest(await readFile(invocation.shell)),
+		executableDigest: await hashExecutableFile(invocation.shell),
 		argv: argv.map((value) => projection.normalizeValue(value)),
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
