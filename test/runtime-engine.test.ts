@@ -328,7 +328,7 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["requests", "single", "batch", "revisions", "observed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
+	it.each(["requests", "single", "batch", "revisions", "observed", "observed-terminal", "observed-disabled", "observed-disposed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
 		const slow = barrier(), slowStarted = barrier(), executed: string[] = [];
 		const independentStarted = barrier(mode === "single" ? 1 : 2);
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
@@ -345,10 +345,11 @@ describe("structural speculative runtime", () => {
 		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, remove: ["slow"],
 			upsert: [readAction("same-plan", { path: "replacement.ts" })] }, proposals[1]!];
 		const revised = mode === "revisions" || mode === "observed";
+		const observation = mode.startsWith("observed"), retiring = observation && !revised;
 		const source = planSource({
 			proposalCount: () => mode === "requests" ? 2 : 1,
-			propose: ({ proposalIndex }) => mode === "observed" ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
-			observe: ({ concrete }) => mode === "observed" && concrete.path === "seed.ts" ? observed : undefined,
+			propose: ({ proposalIndex }) => observation ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
+			observe: ({ concrete }) => observation && concrete.path === "seed.ts" ? retiring ? proposals : observed : undefined,
 		});
 		const fixture = harness({
 			source,
@@ -370,13 +371,19 @@ describe("structural speculative runtime", () => {
 		let turnID = "parallel-admission";
 		try {
 			await fixture.runtime.startTurn(start(turnID));
-			if (mode === "observed") {
+			if (observation) {
 				const seed = call(turnID, { path: "seed.ts" });
 				await runFallback(fixture, seed, 1, "Actor");
 			}
 			await slowStarted.promise; await independentStarted.promise;
 			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), "same-plan.ts"]);
 			expect(keyed).not.toContain("replacement.ts");
+			if (retiring) {
+				let closed = false;
+				const closing = fixture.runtime.finishTurn(call(turnID)).then(() => { closed = true; });
+				await nextTurn(); expect(closed).toBe(true); await closing;
+				turnID = "next-decision"; await fixture.runtime.startTurn(start(turnID));
+			}
 			if (revised) {
 				const revision = mode === "revisions" ? revisions[1]! : observed[1]!;
 				Object.assign(revision, { [mode === "revisions" ? "id" : "proposalID"]: "proposal:1", revision: 2 });
@@ -396,6 +403,17 @@ describe("structural speculative runtime", () => {
 				input: { path: "replacement.ts" },
 			}]);
 			expect((await fixture.runtime.prepareActorCall(call(turnID, { path: revised ? "replacement.ts" : "same-plan.ts" })))?.output).toBe("speculative");
+			if (retiring) {
+				let closed = false;
+				const closing = (mode === "observed-disposed" ? fixture.runtime.dispose() : mode === "observed-disabled"
+					? fixture.runtime.settingsChanged({ ...settings, enabled: false })
+					: fixture.runtime.finishTurn({ ...call(turnID), terminal: true })).then(() => { closed = true; });
+				await nextTurn(); expect(closed).toBe(false);
+				expect(fixture.runtime.inspect().pendingPredictions).toBeGreaterThan(0);
+				slow.arrive(); await closing;
+				expect(executed).not.toContain("slow.ts");
+				expect(fixture.runtime.inspect().pendingPredictions).toBe(0);
+			}
 		} finally {
 			slow.arrive();
 			await fixture.runtime.finishTurn({ ...call(turnID), terminal: true }); await fixture.runtime.dispose();
