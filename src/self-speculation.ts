@@ -139,8 +139,7 @@ interface TurnState {
 	readonly forkCandidateKeys: Set<string>;
 	readonly agreedForkKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
-	readonly candidateSourcesByID: Map<string, Set<string>>;
-	readonly candidateToolsByID: Map<string, Set<string>>;
+	readonly reportedCandidates: Map<string, ReportedCandidate>;
 	readonly gateKey: string;
 	readonly forkUtility: { costMs: number; benefitMs: number | undefined };
 	forkStartedAt?: number;
@@ -148,6 +147,11 @@ interface TurnState {
 	forkFailed: boolean;
 	ended: boolean;
 	gateSampleRecorded: boolean;
+}
+
+interface ReportedCandidate {
+	readonly sources: Set<string>;
+	readonly tools: Set<string>;
 }
 
 interface CandidateRecord {
@@ -207,32 +211,35 @@ export class SelfSpeculationCoordinator {
 	private latestStartedDecisionSequence = 0;
 	private acceptingCandidates = false;
 	private candidateSequence = 0;
-	private submissions = 0;
-	private forks = 0;
-	private forkRetries = 0;
-	private receipts = 0;
-	private completedForks = 0;
-	private observedForkCandidates = 0;
-	private agreedForkCandidates = 0;
-	private exactForkMatches = 0;
-	private draftTokensSubmitted = 0;
-	private draftTokensAccepted = 0;
-	private verificationRequests = 0;
-	private verifiedDraftProposals = 0;
-	private verifiedDraftTokens = 0;
-	private verifiedAcceptedDraftTokens = 0;
-	private verifiedRejectedDraftTokens = 0;
-	private unresolvedDraftProposals = 0;
-	private unresolvedDraftTokens = 0;
+	private readonly counters = {
+		candidateSubmissions: 0,
+		forkRequests: 0,
+		forkRetries: 0,
+		candidateReceipts: 0,
+		forkCompletions: 0,
+		forkCandidates: 0,
+		forkAgreements: 0,
+		forkExactMatches: 0,
+		submittedDraftTokens: 0,
+		/** Registration acknowledgements; not necessarily target-model acceptance. */
+		acceptedDraftTokens: 0,
+		verificationRequests: 0,
+		verifiedDraftProposals: 0,
+		verifiedDraftTokens: 0,
+		verifiedAcceptedDraftTokens: 0,
+		verifiedRejectedDraftTokens: 0,
+		unresolvedDraftProposals: 0,
+		unresolvedDraftTokens: 0,
+		forkLatencyMs: 0,
+		forkLogprobTokens: 0,
+		forkGateSkips: 0,
+		forkActionAdoptions: 0,
+		forkExecutionAheadMs: 0,
+		failures: 0,
+	};
 	private lastVerification?: SelfSpeculationVerificationOutcome;
-	private totalForkLatencyMs = 0;
 	private totalForkLogprob = 0;
-	private totalForkLogprobTokens = 0;
-	private forkGateSkips = 0;
-	private forkActionAdoptions = 0;
-	private totalForkExecutionAheadMs = 0;
 	private latestGateKey?: string;
-	private failureCount = 0;
 	private lastFailure?: string;
 	private lastResolvedActorProfile?: string;
 	private lastProfileResolutionSource?: string;
@@ -272,8 +279,7 @@ export class SelfSpeculationCoordinator {
 			forkCandidateKeys: new Set(),
 			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
-			candidateSourcesByID: new Map(),
-			candidateToolsByID: new Map(),
+			reportedCandidates: new Map(),
 			gateKey: modelKey(model),
 			forkUtility: { costMs: 0, benefitMs: 0 },
 			forkFailed: false,
@@ -318,14 +324,14 @@ export class SelfSpeculationCoordinator {
 		if (state && candidates === state.candidates && record.sources.has("self-speculation")) {
 			if (!state.forkCandidateKeys.has(record.key)) {
 				state.forkCandidateKeys.add(record.key);
-				this.observedForkCandidates++;
+				this.counters.forkCandidates++;
 			}
 			if (
 				[...record.sources].some((source) => source !== "self-speculation") &&
 				!state.agreedForkKeys.has(record.key)
 			) {
 				state.agreedForkKeys.add(record.key);
-				this.agreedForkCandidates++;
+				this.counters.forkAgreements++;
 			}
 			this.reconcileForkMatches(state);
 		}
@@ -396,14 +402,14 @@ export class SelfSpeculationCoordinator {
 		if (probe.attempt === 1) {
 			const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 			if (!gateDecision.allowed) {
-				this.forkGateSkips++;
+				this.counters.forkGateSkips++;
 				this.actorForkPlanSource.publish(state.turnID, []);
 				return;
 			}
 		} else {
-			this.forkRetries++;
+			this.counters.forkRetries++;
 		}
-		this.forks++;
+		this.counters.forkRequests++;
 		state.forkStartedAt ??= performance.now();
 		const signal = this.actorForkPlanSource.startProbe(state.turnID);
 		const task = this.post(
@@ -474,8 +480,8 @@ export class SelfSpeculationCoordinator {
 		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
 		const shares = matchedSources.size;
 		creditAdoption(state.forkUtility, settlement.provider.timing, shares);
-		this.totalForkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
-		this.forkActionAdoptions++;
+		this.counters.forkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
+		this.counters.forkActionAdoptions++;
 	}
 
 	/** Feed semantic prediction adoption into decoder ranking without touching token evidence. */
@@ -542,6 +548,7 @@ export class SelfSpeculationCoordinator {
 		const decoderEvidence = this.decoderEvidence.snapshot();
 		const actionEvidence = this.actionEvidence.snapshot();
 		const snapshot = {
+			...this.counters,
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
 			...(this.lastResolvedActorProfile
 				? { resolvedActorProfile: this.lastResolvedActorProfile }
@@ -552,46 +559,22 @@ export class SelfSpeculationCoordinator {
 			bufferedCandidates:
 				(this.active?.candidates.size ?? 0) +
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
-			candidateSubmissions: this.submissions,
-			forkRequests: this.forks,
-			forkRetries: this.forkRetries,
-			candidateReceipts: this.receipts,
-			forkCompletions: this.completedForks,
-			forkCandidates: this.observedForkCandidates,
-			forkAgreements: this.agreedForkCandidates,
-			forkExactMatches: this.exactForkMatches,
-			submittedDraftTokens: this.draftTokensSubmitted,
-			/** Registration acknowledgements; not necessarily target-model acceptance. */
-			acceptedDraftTokens: this.draftTokensAccepted,
-			verificationRequests: this.verificationRequests,
-			verifiedDraftProposals: this.verifiedDraftProposals,
-			verifiedDraftTokens: this.verifiedDraftTokens,
-			verifiedAcceptedDraftTokens: this.verifiedAcceptedDraftTokens,
-			verifiedRejectedDraftTokens: this.verifiedRejectedDraftTokens,
-			unresolvedDraftProposals: this.unresolvedDraftProposals,
-			unresolvedDraftTokens: this.unresolvedDraftTokens,
-			...(this.verifiedDraftTokens > 0
-				? { verifiedDraftAcceptanceRate: this.verifiedAcceptedDraftTokens / this.verifiedDraftTokens }
+			...(this.counters.verifiedDraftTokens > 0
+				? { verifiedDraftAcceptanceRate: this.counters.verifiedAcceptedDraftTokens / this.counters.verifiedDraftTokens }
 				: {}),
 			...(this.lastVerification ? { lastVerification: this.lastVerification } : {}),
-			forkLatencyMs: this.totalForkLatencyMs,
-			forkLogprobTokens: this.totalForkLogprobTokens,
-			...(this.totalForkLogprobTokens > 0
-				? { forkMeanLogprob: this.totalForkLogprob / this.totalForkLogprobTokens }
+			...(this.counters.forkLogprobTokens > 0
+				? { forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens }
 				: {}),
-			forkGateSkips: this.forkGateSkips,
 			forkGateSamples: gate?.samples ?? 0,
 			...(gate?.expectedNetBenefitMs === undefined
 				? {}
 				: { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
-			forkActionAdoptions: this.forkActionAdoptions,
-			forkExecutionAheadMs: this.totalForkExecutionAheadMs,
 			decoderEvidenceContexts: decoderEvidence.contexts,
 			decoderVerificationSteps: decoderEvidence.observations,
 			actionEvidenceContexts: actionEvidence.contexts,
 			actionEvidenceObservations: actionEvidence.trials,
 			actionEvidenceAdoptions: actionEvidence.successes,
-			failures: this.failureCount,
 			...(this.lastFailure ? { lastError: this.lastFailure } : {}),
 		};
 		return snapshot as Readonly<typeof snapshot>;
@@ -601,28 +584,22 @@ export class SelfSpeculationCoordinator {
 		const verification = record(record(receipt)?.verification);
 		if (!verification || !state.requestID) return;
 		try {
-			const sourcesByCandidateID = new Map(
-				[...state.candidateSourcesByID].map(([candidateID, sources]) => [
-					candidateID,
-					[...sources].sort(),
-				] as const),
-			);
 			const outcome = parseVerificationOutcome(
 				verification,
 				state.requestID,
-				sourcesByCandidateID,
+				state.reportedCandidates,
 			);
-			this.verificationRequests++;
-			this.verifiedDraftProposals += outcome.speculativeSteps;
-			this.verifiedDraftTokens += outcome.draftedTokens;
-			this.verifiedAcceptedDraftTokens += outcome.acceptedTokens;
-			this.verifiedRejectedDraftTokens += outcome.rejectedTokens;
-			this.unresolvedDraftProposals += outcome.unresolvedProposals;
-			this.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
+			this.counters.verificationRequests++;
+			this.counters.verifiedDraftProposals += outcome.speculativeSteps;
+			this.counters.verifiedDraftTokens += outcome.draftedTokens;
+			this.counters.verifiedAcceptedDraftTokens += outcome.acceptedTokens;
+			this.counters.verifiedRejectedDraftTokens += outcome.rejectedTokens;
+			this.counters.unresolvedDraftProposals += outcome.unresolvedProposals;
+			this.counters.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
 			this.lastVerification = outcome;
 			this.observeVerificationEvidence(state, outcome);
 		} catch (error) {
-			this.failureCount++;
+			this.counters.failures++;
 			this.lastFailure = errorMessage(error);
 		}
 	}
@@ -632,7 +609,7 @@ export class SelfSpeculationCoordinator {
 			const records = [...state.candidates.values()].filter((candidate) => step.candidateIDs.includes(candidate.id));
 			const tools = new Set(records.map((candidate) => candidate.tool));
 			for (const candidateID of step.candidateIDs) {
-				for (const tool of state.candidateToolsByID.get(candidateID) ?? []) tools.add(tool);
+				for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
 			}
 			if (!tools.size) continue;
 			const sources = step.sources.length
@@ -695,7 +672,7 @@ export class SelfSpeculationCoordinator {
 				settings,
 			);
 			this.recordReceipt(receipt, state, false);
-			this.submissions++;
+			this.counters.candidateSubmissions++;
 		}
 	}
 
@@ -717,11 +694,11 @@ export class SelfSpeculationCoordinator {
 		if (!isRecord(receipt)) {
 			return fork ? { committed: false, batches: [] } : undefined;
 		}
-		this.receipts++;
-		this.draftTokensSubmitted += nonNegativeCount(receipt.draft_token_count);
-		this.draftTokensAccepted += nonNegativeCount(receipt.accepted_token_count);
+		this.counters.candidateReceipts++;
+		this.counters.submittedDraftTokens += nonNegativeCount(receipt.draft_token_count);
+		this.counters.acceptedDraftTokens += nonNegativeCount(receipt.accepted_token_count);
 		if (fork) {
-			this.completedForks++;
+			this.counters.forkCompletions++;
 			state.forkCompletedAt = performance.now();
 		}
 		const details = record(receipt.details);
@@ -743,24 +720,22 @@ export class SelfSpeculationCoordinator {
 				.map((value, index) => parsedSidecarActionCall(value, index))
 				.filter((value): value is ParsedSidecarActionCall => value !== undefined);
 			for (const candidateID of candidateIDs) {
-				const knownSources = state.candidateSourcesByID.get(candidateID) ?? new Set<string>();
-				for (const source of sources) knownSources.add(source);
-				state.candidateSourcesByID.set(candidateID, knownSources);
-				const knownTools = state.candidateToolsByID.get(candidateID) ?? new Set<string>();
-				for (const call of calls) knownTools.add(call.tool);
-				state.candidateToolsByID.set(candidateID, knownTools);
+				const known = state.reportedCandidates.get(candidateID) ?? { sources: new Set<string>(), tools: new Set<string>() };
+				for (const source of sources) known.sources.add(source);
+				for (const call of calls) known.tools.add(call.tool);
+				state.reportedCandidates.set(candidateID, known);
 			}
 			if (!fork) continue;
 			if (!sources.includes("self-speculation")) continue;
 			const forkObservation = record(candidate.fork);
-			this.totalForkLatencyMs += nonNegativeFinite(forkObservation?.total_ms);
+			this.counters.forkLatencyMs += nonNegativeFinite(forkObservation?.total_ms);
 			const logprobs = record(forkObservation?.logprobs);
 			const logprobTokens = nonNegativeCount(logprobs?.token_count);
 			const meanLogprob = finiteNumber(logprobs?.mean);
 			const confidence = probability(record(logprobs?.tool_name)?.minimum_probability, undefined);
 			if (logprobTokens > 0 && meanLogprob !== undefined) {
 				this.totalForkLogprob += meanLogprob * logprobTokens;
-				this.totalForkLogprobTokens += logprobTokens;
+				this.counters.forkLogprobTokens += logprobTokens;
 			}
 			if (
 				!rawCalls.length ||
@@ -802,7 +777,7 @@ export class SelfSpeculationCoordinator {
 		for (const key of state.forkCandidateKeys) {
 			if (!state.actorActionKeys.has(key) || state.matchedForkKeys.has(key)) continue;
 			state.matchedForkKeys.add(key);
-			this.exactForkMatches++;
+			this.counters.forkExactMatches++;
 		}
 	}
 
@@ -850,7 +825,7 @@ export class SelfSpeculationCoordinator {
 			return response.status === 204 ? undefined : await response.json().catch(() => undefined);
 		} catch (error) {
 			if (!externalSignal?.aborted) {
-				this.failureCount++;
+				this.counters.failures++;
 				this.lastFailure = errorMessage(error);
 			}
 			throw error;
@@ -1055,7 +1030,7 @@ function actionEvidenceContext(state: TurnState, tool: string, source: string) {
 function parseVerificationOutcome(
 	verification: Readonly<Record<string, unknown>>,
 	requestID: string,
-	sourcesByCandidateID: ReadonlyMap<string, readonly string[]>,
+	reportedCandidates: ReadonlyMap<string, ReportedCandidate>,
 ) {
 	const rawSteps = verification.steps;
 	if (rawSteps !== undefined && !Array.isArray(rawSteps))
@@ -1084,7 +1059,7 @@ function parseVerificationOutcome(
 			.filter((value): value is string => value !== undefined);
 		const sources = reportedSources.length
 			? [...new Set(reportedSources)]
-			: [...new Set(candidateIDs.flatMap((id) => sourcesByCandidateID.get(id) ?? []))];
+			: [...new Set(candidateIDs.flatMap((id) => [...(reportedCandidates.get(id)?.sources ?? [])].sort()))];
 		return Object.freeze({
 			candidateIndex,
 			...(candidateID ? { candidateID } : {}),
