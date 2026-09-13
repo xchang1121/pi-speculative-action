@@ -1,3 +1,4 @@
+import { nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
@@ -775,12 +776,4 @@ function validToken(value: string): boolean {
 
 function validRevision(value: number): boolean {
 	return Number.isSafeInteger(value) && value >= 0;
-}
-
-function finiteMetric(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
-}
-
-function sequence(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }

@@ -1,3 +1,4 @@
+import { clampProbability, nonNegativeFinite } from "./number-utils.ts";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -1980,8 +1981,7 @@ export function applyBindings(
 }
 
 function variantCount(counts: Readonly<Record<string, number>>, index: number): number {
-	const value = counts[String(index)];
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+	return nonNegativeFinite(counts[String(index)]);
 }
 
 function* reverseContextFields(
@@ -2460,10 +2460,6 @@ function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: numb
 		estimate = local * (1 - escapeProbability) + estimate * escapeProbability;
 	}
 	return Math.max(0, Math.min(1, estimate));
-}
-
-function clampProbability(value: number) {
-	return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 }
 
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {

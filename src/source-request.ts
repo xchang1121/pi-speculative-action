@@ -1,3 +1,4 @@
+import { nonNegativeCount as finiteCount } from "./number-utils.ts";
 import type {
 	ResolutionCause,
 	SettledSourceRequest,
@@ -131,9 +132,6 @@ function finiteTimeout(value: number | undefined): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function finiteCount(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-}
 
 function errorDetail(error: unknown): string {
 	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);

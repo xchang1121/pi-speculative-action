@@ -1,3 +1,4 @@
+import { nonNegativeFinite } from "./number-utils.ts";
 import { type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { makeStructuralSpeculativeActionRuntime } from "./runtime-engine.ts";
 import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime-contracts.ts";
@@ -16,6 +17,5 @@ export function candidateToolNames(
 }
 
 export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
-	const value = candidate.work?.execution?.executionMs;
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+	return nonNegativeFinite(candidate.work?.execution?.executionMs);
 }

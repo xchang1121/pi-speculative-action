@@ -1,3 +1,4 @@
+import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { createHash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 
@@ -680,10 +681,6 @@ function validateArtifact(reference: ArtifactReference, sizes: Map<Sha256Digest,
 
 function validLogicalPath(value: string): boolean {
 	return typeof value === "string" && value.startsWith("/") && !value.includes("\0");
-}
-
-function finiteTimestamp(value: number | undefined): number {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
 
 function deepFreeze<Value>(value: Value): Value {

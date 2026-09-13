@@ -1,3 +1,5 @@
+import { nonNegativeFinite as metric } from "./number-utils.ts";
+
 /** One immutable computation interval, shared by every adoption of that computation. */
 export class TimelineInterval {
 	readonly startedAt: number;
@@ -115,8 +117,4 @@ function unionDuration(intervals: readonly TimelineInterval[]): number {
 		current = interval;
 	}
 	return current ? total + current.completedAt - current.startedAt : total;
-}
-
-function metric(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }

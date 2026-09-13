@@ -1,3 +1,4 @@
+import { nonNegativeCount as finiteLimit, nonNegativeFinite as finiteValue } from "./number-utils.ts";
 import {
 	type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
 	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector,
@@ -287,16 +288,8 @@ export interface ResultCacheSnapshot {
 	readonly hotBytes: number;
 }
 
-function finiteLimit(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-}
-
 function finiteFraction(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.8;
-}
-
-function finiteValue(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function entryBytes(entry: CandidateStoreEntry): number {
