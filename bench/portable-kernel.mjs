@@ -187,7 +187,7 @@ async function qualifyPiSearch(name) {
 		const sample = async (execute) => {
 			const times = []; let output;
 			for (let index = 0; index < 3; index++) { const started = performance.now(); output = await execute(); times.push(performance.now() - started); }
-			return { output, medianMs: times.sort((a, b) => a - b)[1] };
+			return { output, samplesMs: times, medianMs: [...times].sort((a, b) => a - b)[1] };
 		};
 		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
 		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
@@ -285,7 +285,8 @@ async function qualifyPiSearch(name) {
 			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await Promise.all([retiring, rejected]);
 			await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, args })), /search pool retired/);
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
-		return { nativeActorMs: native.medianMs, profileWarmActorMs: baseline.medianMs, behaviors, rejectedEscapingLinks: true,
+		return { nativeActorMs: native.medianMs, nativeActorSamplesMs: native.samplesMs,
+			profileWarmActorMs: baseline.medianMs, profileWarmActorSamplesMs: baseline.samplesMs, behaviors, rejectedEscapingLinks: true,
 			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable", inputTransport, speculativeMs: completed.executionMs,
 			readyAdoptionMs: adopted.totalMs, unpromotedObservation: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),

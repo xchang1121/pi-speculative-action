@@ -23,6 +23,8 @@ node --import tsx bench/grep-captured-qualification.mjs --cost-only
 
 第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 语义资格覆盖配置、目录、链接、输出及原生输入进程的回收；成本模式独立测量配置一致的原生调用、Host 和采纳。
 
+重复计时除中位数外保留按执行顺序排列的 `*SamplesMs`；grep 的 `cancellation` 按执行顺序记录每次结果，不覆盖相同模式的早期试验。
+
 需要已有、合格的 Pi rg，不安装或下载。可用 `--case=<名称>` 选择 grep 场景。资格针对显式 captured profile，不能外推 Native Pi 默认语义、macOS、ARM64 或 ThinkThread。
 
 ## Linux / WSL 进程资格
