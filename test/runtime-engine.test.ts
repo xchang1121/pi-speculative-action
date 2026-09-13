@@ -397,6 +397,7 @@ describe("structural speculative runtime", () => {
 
 	it("settles matched and adopted as orthogonal facts exactly once", async () => {
 		const settlements: PredictionSettlement[] = [];
+		const issued = vi.fn(), admitted = vi.fn();
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));
 		const offered = { ...plan("source", "stale", {}), draftTokens: 3 };
 		offered.actions[0]!.input = {
@@ -409,6 +410,7 @@ describe("structural speculative runtime", () => {
 			id: "source",
 			enabled: () => true,
 			propose: () => offered,
+			onIssued: issued, onAdmitted: admitted,
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
@@ -429,6 +431,10 @@ describe("structural speculative runtime", () => {
 		await fixture.runtime.finishTurn({ ...call("turn"), terminal: true });
 
 		expect(settlements).toHaveLength(1);
+		for (const notify of [issued, admitted]) {
+			expect(notify.mock.contexts).toEqual([source]);
+			expect(notify).toHaveBeenCalledWith({ proposalID: "stale", actionID: "next", feedback: "stale" });
+		}
 		expect(settlements[0]).toMatchObject({
 			observation: "observed",
 			match: {

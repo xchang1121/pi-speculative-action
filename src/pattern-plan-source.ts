@@ -29,6 +29,7 @@ import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternIDs: ReadonlyArray<string> };
+type CarriedPrediction = { readonly signature: string; readonly pending: Set<PatternPlanFeedback>; abandoned: boolean };
 
 export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
@@ -61,7 +62,8 @@ export function createPatternPlanSource(input: {
 	let openedStoreKey: string | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const revisions = new Map<string, number>();
-	const carriedPredictions = new Map<string, string>();
+	const carriedPredictions = new Map<string, CarriedPrediction>();
+	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
 	let analysisTail: Promise<void> = Promise.resolve();
 
 	const queueAnalysis = (analysis: () => void | Promise<void>): void => {
@@ -114,7 +116,7 @@ export function createPatternPlanSource(input: {
 			const signature = patternPredictionSignature(candidates);
 			const carried = carriedPredictions.get(startInput.sessionID);
 			carriedPredictions.delete(startInput.sessionID);
-			if (carried === signature || !candidates.length) return undefined;
+			if (!candidates.length || carried?.signature === signature && !carried.pending.size && !carried.abandoned) return undefined;
 			return {
 				id: `pattern:${startInput.turnID}`,
 				source: "pattern_aware",
@@ -212,15 +214,23 @@ export function createPatternPlanSource(input: {
 				data.schemaHashes,
 				patternSettings,
 			);
-			carriedPredictions.set(consumeInput.sessionID, patternPredictionSignature(candidates));
+			const actions = candidates.map((candidate) =>
+				patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)));
+			// An observation can finish after its turn closes, or lose individual actions during admission.
+			const carried = { signature: patternPredictionSignature(candidates),
+				pending: new Set(actions.map((action) => action.feedback)), abandoned: false };
+			for (const action of actions) predictionBatches.set(action.feedback, carried);
+			carriedPredictions.set(consumeInput.sessionID, carried);
 			return {
 				id: `pattern:${consumeInput.turnID}`,
 				source: "pattern_aware",
 				revision: nextRevision(consumeInput.sessionID, consumeInput.turnID),
-				actions: candidates.map((candidate) =>
-					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
-				),
+				actions,
 			};
+		},
+		onAdmitted: ({ feedback }) => {
+			const context = asPatternPlanFeedback(feedback);
+			if (context) predictionBatches.get(context)?.pending.delete(context);
 		},
 		onIssued: ({ feedback }) => {
 			const context = asPatternPlanFeedback(feedback);
@@ -228,6 +238,8 @@ export function createPatternPlanSource(input: {
 		},
 		onSettled: ({ feedback, settlement }) => {
 			const context = asPatternPlanFeedback(feedback);
+			const carried = context && predictionBatches.get(context);
+			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
 			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
 		flush: async () => {
@@ -326,7 +338,7 @@ function asPatternPlanFeedback(value: unknown): PatternPlanFeedback | undefined 
 	const context = asPatternAwareRuntimeContext(value);
 	const patternIDs = (value as { patternIDs?: unknown })?.patternIDs;
 	if (!context || !Array.isArray(patternIDs) || !patternIDs.every((item) => typeof item === "string")) return undefined;
-	return { ...context, patternIDs };
+	return value as PatternPlanFeedback;
 }
 
 function patternPlanAction(
@@ -334,7 +346,7 @@ function patternPlanAction(
 	store: PatternAwareStore,
 	id: string,
 	dependsOn?: PlanAction["dependsOn"],
-): PlanAction {
+): PlanAction & { readonly feedback: PatternPlanFeedback } {
 	return {
 		id,
 		type: "tool_call",

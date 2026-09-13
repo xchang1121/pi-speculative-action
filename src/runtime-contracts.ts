@@ -181,18 +181,19 @@ export interface SpeculativePlanSource<
 		readonly durationMs: number;
 		readonly order: number;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
-	readonly onIssued?: (input: {
-		readonly proposalID: string;
-		readonly actionID: string;
-		readonly feedback: unknown;
-	}) => MaybePromise<void>;
-	readonly onSettled?: (input: {
-		readonly proposalID: string;
-		readonly actionID: string;
-		readonly feedback: unknown;
+	/** Runs for every pending action accepted from an update, including retained identities. Binding can still reject it. */
+	readonly onAdmitted?: (input: PlanActionFeedback) => MaybePromise<void>;
+	readonly onIssued?: (input: PlanActionFeedback) => MaybePromise<void>;
+	readonly onSettled?: (input: PlanActionFeedback & {
 		readonly settlement: PredictionSettlement;
 	}) => MaybePromise<void>;
 	readonly flush?: () => MaybePromise<void>;
+}
+
+interface PlanActionFeedback {
+	readonly proposalID: string;
+	readonly actionID: string;
+	readonly feedback: unknown;
 }
 
 export interface ActualToolCall {
