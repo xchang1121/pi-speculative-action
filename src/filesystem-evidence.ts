@@ -5,6 +5,25 @@ import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
+export const FILESYSTEM_CONCURRENCY = 12;
+
+/** Bound independent filesystem work and drain every admitted operation before propagating failure. */
+export async function mapFilesystem<Input, Output>(
+	values: ReadonlyArray<Input>,
+	run: (value: Input) => Promise<Output>,
+) {
+	const output: Output[] = [];
+	let cursor = 0;
+	const pending = Array.from({ length: Math.min(FILESYSTEM_CONCURRENCY, values.length) }, async () => {
+		while (cursor < values.length) {
+			const index = cursor++;
+			output[index] = await run(values[index]);
+		}
+	});
+	try { await Promise.all(pending); }
+	catch (error) { cursor = values.length; await Promise.allSettled(pending); throw error; }
+	return output;
+}
 
 export type StableFileCapture = {
 	readonly hash: string;

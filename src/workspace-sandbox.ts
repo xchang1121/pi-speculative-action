@@ -14,7 +14,7 @@ import type {
 	WorldCommitMetrics,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
-import { advanceFilesystemClock, assertNoSymlinkPath, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, assertNoSymlinkPath, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import {
@@ -813,11 +813,11 @@ async function commitSandboxExecution(
 			let resourcesCommitted = 0;
 			try {
 				for (const change of changes) await assertCommitTarget(change);
-				for (const change of changes) {
+				await mapFilesystem(changes, async (change) => {
 					if (!change.validationOnly && change.kind !== "directory" && !change.operation && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
-				}
+				});
 				const validationStarted = performance.now();
 				for (const change of changes) {
 					const current =
