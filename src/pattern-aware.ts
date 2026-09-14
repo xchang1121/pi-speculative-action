@@ -400,18 +400,13 @@ export class PatternAwareStore {
 		if (evicted) this.finishSessionState(evicted);
 		const history = session.history;
 		this.resolvePendingBatch(session, events);
-		let contextTokens: string[] | undefined;
-		for (const event of events) {
-			if (event.learnTarget !== false) {
-				this.sequenceModel.observe(
-					contextTokens ??= history.map((item) => signatureToken(signature(item))),
-					event.tool,
-					event.sequence,
-					this.settings.decayHalfLifeEvents,
-				);
-				this.learn(history, event);
-				this.observeRecurrentAction(session, event);
-			}
+		const learningTargets = events.filter((event) => event.learnTarget !== false);
+		const contexts = learningTargets.length ? [...this.learningContexts(history)] : [];
+		const contextTokens = learningTargets.length ? history.map((item) => signatureToken(signature(item))) : [];
+		for (const event of learningTargets) {
+			this.sequenceModel.observe(contextTokens, event.tool, event.sequence, this.settings.decayHalfLifeEvents);
+			for (const { context, gap } of contexts) this.learnOccurrence(context, event, gap);
+			this.observeRecurrentAction(session, event);
 		}
 		history.push(...events);
 		this.startPending(session, history);
@@ -923,7 +918,8 @@ export class PatternAwareStore {
 		}
 	}
 
-	private learn(history: ReadonlyArray<PatternAwareEvent>, target: PatternAwareEvent) {
+	/** Batch members share immutable context slices without retaining links to older windows. */
+	private *learningContexts(history: ReadonlyArray<PatternAwareEvent>) {
 		const batches = actionBatchStarts(history);
 		const maxGap = Math.min(this.settings.maxFutureGap, Math.max(0, batches.length - 1));
 		for (let gap = 0; gap <= maxGap; gap++) {
@@ -933,7 +929,7 @@ export class PatternAwareStore {
 			for (let length = 1; length <= maxLength; length++) {
 				const start = batches[contextEnd - length]!;
 				if (end - start > this.settings.maxContextLength) break;
-				this.learnOccurrence(history.slice(start, end), target, gap);
+				yield { context: history.slice(start, end), gap };
 			}
 		}
 	}
