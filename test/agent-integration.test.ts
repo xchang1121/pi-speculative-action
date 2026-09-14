@@ -93,6 +93,20 @@ function startInput(tool: AgentTool, turnID = "turn-1") {
 	};
 }
 
+function patternRequest(
+	tool: AgentTool,
+	patternAware: ReturnType<typeof patternAwareSettings>,
+	sessionID = "session",
+	schemaHashes: Readonly<Record<string, string>> = {},
+) {
+	return {
+		startInput: { ...startInput(tool), sessionID },
+		data: { tools: new Map([["read", tool]]), schemaHashes },
+		settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
+		definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
+	};
+}
+
 async function temporaryWorkspace(base?: string): Promise<string> {
 	const root = await directories.create(base);
 	await writeFile(path.join(root, "notes.txt"), "one\ntwo\nthree\nfour", "utf8");
@@ -686,15 +700,14 @@ describe("speculative action host", () => {
 	it("drains an admitted Pattern learning batch when disposal starts immediately", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const store = new PatternAwareStore(patternAware), start = { ...startInput(tool), sessionID: "session" };
-		const configuration = { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } };
+		const store = new PatternAwareStore(patternAware), request = patternRequest(tool, patternAware, "session", { read: "schema" });
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		try {
-			await controller.source.observe!({ startInput: start, data: { tools: new Map([["read", tool]]), schemaHashes: { read: "schema" } },
-				settings: configuration, consumeInput: { sessionID: "session", turnID: start.turnID, tool: "read", args: { path: "notes.txt" }, tools: [tool] },
+			await controller.source.observe!({ ...request,
+				consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: { path: "notes.txt" }, tools: [tool] },
 				tool: "read", concrete: { path: "notes.txt" }, output: { result: textResult("one"), isError: false }, durationMs: 1, order: 0 });
-			controller.turnFinished(start, configuration, false);
+			controller.turnFinished(request.startInput, request.settings, false);
 			await controller.dispose();
 			expect(store.recent("session")).toMatchObject([{ tool: "read", input: { path: "notes.txt" }, outcome: "success", schemaHash: "schema" }]);
 		} finally { await controller.dispose(); }
@@ -708,11 +721,7 @@ describe("speculative action host", () => {
 		const bootstrap = await acquirePatternAwareStore(cwd, older, cwd, semantics), oldStore = bootstrap.store;
 		const controller = createPatternPlanSource({ sessionID: "probe", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const propose = (patternAware: typeof older) => controller.source.propose({
-			startInput: { ...startInput(tool), sessionID: "probe" }, data: { tools: new Map([["read", tool]]), schemaHashes: { read: "schema" } },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
-			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
-		});
+		const propose = (patternAware: typeof older) => controller.source.propose(patternRequest(tool, patternAware, "probe", { read: "schema" }));
 		try {
 			for (let index = 0; index < 3; index++) {
 				const sessionID = `training-${index}`, file = `file-${index}.txt`;
@@ -753,11 +762,7 @@ describe("speculative action host", () => {
 		const patternAware = patternAwareSettings({ enabled: true }), store = new PatternAwareStore(patternAware);
 		const flush = vi.spyOn(store, "flush"), controller = createPatternPlanSource({ sessionID: "session", cwd, store: available.promise,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const pending = Promise.resolve(controller.source.propose({
-			startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
-			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
-		}));
+		const pending = Promise.resolve(controller.source.propose(patternRequest(tool, patternAware)));
 		try {
 			await nextTurn();
 			let closed = false;
@@ -785,11 +790,7 @@ describe("speculative action host", () => {
 		});
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const propose = (patternAware: typeof older) => controller.source.propose({
-			startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
-			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
-		});
+		const propose = (patternAware: typeof older) => controller.source.propose(patternRequest(tool, patternAware));
 		let pending: Promise<PromiseSettledResult<unknown>[]> | undefined, closing: Promise<void> | undefined;
 		try {
 			await propose(older);

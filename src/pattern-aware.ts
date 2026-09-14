@@ -1825,52 +1825,43 @@ class PatternBindingAnalysis {
 		});
 	}
 
-	evaluateBinding(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): unknown {
-		return this.memo(context, binding, () => this.evaluateBindingUncached(binding, context));
+	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
+		return this.memo(context, binding, () => this.evaluateBindingValues(binding, context));
 	}
 
-	evaluateBindingUncached(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): unknown {
-		if (binding.type === "constant") return binding.value;
+	evaluateBindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
+		if (binding.type === "constant") return [binding.value];
+		if (binding.type === "coalesce") {
+			for (const source of binding.sources) {
+				const values = this.bindingValues(source, context);
+				if (values.length) return values;
+			}
+			return [];
+		}
+		let values: ReadonlyArray<unknown>;
 		if (binding.type === "event" || binding.type === "each") {
 			const index = context.length + binding.relativeEvent;
 			const event = context[index];
-			if (!event) return MISSING;
+			if (!event) return [];
 			const collection = getPath(event[binding.field], binding.path);
-			if (binding.type === "event") return collection;
-			if (!Array.isArray(collection)) return MISSING;
-			const values = collection.map((item) => getPath(item, binding.itemPath)).filter((value) => value !== MISSING);
-			return values.length ? multiValue(values) : MISSING;
-		}
-		if (binding.type === "join") {
-			const left = this.evaluateBinding(binding.left, context);
-			const right = this.evaluateBinding(binding.right, context);
-			const values = bindingValuesFromResult(left).flatMap((leftValue) =>
-				bindingValuesFromResult(right).flatMap((rightValue) =>
+			if (binding.type === "event") return collection === MISSING ? [] : [collection];
+			values = Array.isArray(collection)
+				? collection.map((item) => getPath(item, binding.itemPath)).filter((value) => value !== MISSING) : [];
+		} else if (binding.type === "join") {
+			const left = this.bindingValues(binding.left, context);
+			const right = this.bindingValues(binding.right, context);
+			values = left.flatMap((leftValue) =>
+				right.flatMap((rightValue) =>
 					typeof leftValue === "string" && typeof rightValue === "string" ? [joinPath(leftValue, rightValue)] : [],
 				),
 			);
-			return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
-		}
-		if (binding.type === "coalesce") {
-			for (const source of binding.sources) {
-				const value = this.evaluateBinding(source, context);
-				if (value !== MISSING) return value;
-			}
-			return MISSING;
-		}
-		if (binding.type === "template" || binding.type === "transform") {
-			const source = this.evaluateBinding(binding.source, context);
-			const values = bindingValuesFromResult(source).flatMap((value) =>
+		} else if (binding.type === "template" || binding.type === "transform") {
+			values = this.bindingValues(binding.source, context).flatMap((value) =>
 				typeof value === "string" ? [binding.type === "template"
 					? `${binding.prefix}${value}${binding.suffix}` : transform(binding.operation, value)] : [],
 			);
-			return values.length > 1 ? multiValue(values) : (values[0] ?? MISSING);
-		}
-		return MISSING;
-	}
-
-	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>) {
-		return bindingValuesFromResult(this.evaluateBinding(binding, context));
+		} else return [];
+		return uniqueBy(values, stableStringify);
 	}
 
 	bindingMatches(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>, target: unknown) {
@@ -1948,8 +1939,6 @@ function hasSufficientBindingProvenance(
 }
 
 const MISSING = Symbol("missing");
-const MULTI = Symbol("multi");
-type MultiValue = { readonly [MULTI]: true; readonly values: ReadonlyArray<unknown> };
 
 export function applyBindings(
 	bindings: Readonly<Record<string, PatternAwareBinding>>,
@@ -2178,22 +2167,6 @@ function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: Pat
 		key === "name" ||
 		/[\\/]/.test(value)
 	);
-}
-
-function bindingValuesFromResult(value: unknown): ReadonlyArray<unknown> {
-	if (value === MISSING) return [];
-	return isMultiValue(value) ? value.values : [value];
-}
-
-function multiValue(values: ReadonlyArray<unknown>): MultiValue {
-	return {
-		[MULTI]: true,
-		values: uniqueBy(values, stableStringify),
-	};
-}
-
-function isMultiValue(value: unknown): value is MultiValue {
-	return Boolean(value && typeof value === "object" && MULTI in value);
 }
 
 function transform(operation: "dirname" | "basename" | "normalize_path", value: string) {
