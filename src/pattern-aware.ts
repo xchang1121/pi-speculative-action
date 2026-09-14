@@ -1521,7 +1521,7 @@ class PatternBindingAnalysis {
 		const bindings: Record<string, PatternAwareBinding> = {};
 		for (const [targetPath, value] of this.leaves(target)) {
 			const key = encodePath(targetPath);
-			bindings[key] = this.findBinding(context, value, targetPath) ?? { type: "constant", value };
+			bindings[key] = this.candidateBindings(context, value, "first", isPathField(String(targetPath.at(-1) ?? "")))[0] ?? { type: "constant", value };
 		}
 		return bindings;
 	}
@@ -1552,7 +1552,7 @@ class PatternBindingAnalysis {
 			}
 			const targetIsPath = isPathField(String(targetPath.at(-1) ?? ""));
 			const direct = uniqueBindings(
-				samples.flatMap((sample, index) => this.candidateBindings(sample.context, targets[index], false, targetIsPath)),
+				samples.flatMap((sample, index) => this.candidateBindings(sample.context, targets[index], "direct", targetIsPath)),
 			);
 			const completeDirect = direct.find((candidate) =>
 				samples.every((sample, index) => this.bindingMatches(candidate, sample.context, targets[index])),
@@ -1563,7 +1563,7 @@ class PatternBindingAnalysis {
 						...direct,
 						...samples.flatMap((sample, index) =>
 							typeof targets[index] === "string"
-								? this.candidateBindings(sample.context, targets[index], true, targetIsPath)
+								? this.candidateBindings(sample.context, targets[index], "all", targetIsPath)
 								: [],
 						),
 					]);
@@ -1685,39 +1685,34 @@ class PatternBindingAnalysis {
 		}));
 	}
 
-	findBinding(
-		context: ReadonlyArray<PatternAwareEvent>,
-		target: unknown,
-		targetPath: PatternAwarePath,
-	): PatternAwareBinding | undefined {
-		return this.candidateBindings(context, target, true, isPathField(String(targetPath.at(-1) ?? "")))[0];
-	}
-
 	candidateBindings(
 		context: ReadonlyArray<PatternAwareEvent>,
 		target: unknown,
-		includeComposites = true,
+		mode: "direct" | "all" | "first" = "all",
 		targetIsPath = false,
 	): PatternAwareBinding[] {
-		const key = "bindings:" + Number(includeComposites) + Number(targetIsPath) + ":" + typeof target + ":" +
+		const key = "bindings:" + mode + Number(targetIsPath) + ":" + typeof target + ":" +
 			(typeof target === "string" ? target : stableStringify(target));
-		return [...this.memo(context, key, () => this.inferCandidateBindings(context, target, includeComposites, targetIsPath))];
+		return [...this.memo(context, key, () => {
+			const bindings = this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath);
+			if (mode === "first") for (const binding of bindings) return [binding];
+			return uniqueBindings([...bindings]);
+		})];
 	}
 
-	inferCandidateBindings(
+	*inferCandidateBindings(
 		context: ReadonlyArray<PatternAwareEvent>,
 		target: unknown,
 		includeComposites: boolean,
 		targetIsPath: boolean,
-	): PatternAwareBinding[] {
-		if (!includeComposites) return this.indexedBindings(context, target, targetIsPath);
-		const result: PatternAwareBinding[] = [];
+	): Generator<PatternAwareBinding, undefined> {
+		if (!includeComposites) { yield* this.indexedBindings(context, target, targetIsPath); return; }
 		const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
 			for (const [sourcePath, source] of this.leaves(value)) {
 				const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
 				const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
-				if (sameValue(source, target) && (!targetIsPath || pathSource)) result.push(direct);
+				if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
 				if (typeof source !== "string" || typeof target !== "string") continue;
 				const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
 					{ binding: direct, value: source },
@@ -1727,7 +1722,7 @@ class PatternBindingAnalysis {
 					for (const operation of ["dirname", "basename", "normalize_path"] as const) {
 						const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
 						const value = transform(operation, source);
-						if (value === target) result.push(transformed);
+						if (value === target) yield transformed;
 						if (operation !== "basename") sources.push({ binding: transformed, value });
 						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 					}
@@ -1737,15 +1732,15 @@ class PatternBindingAnalysis {
 					if (value.length < 3) continue;
 					const offset = target.indexOf(value);
 					if (offset < 0) continue;
-					result.push({
+					yield {
 						type: "template",
 						source: binding,
 						prefix: target.slice(0, offset),
 						suffix: target.slice(offset + value.length),
-					});
+					};
 				}
 			}
-			appendCollectionBindings(result, this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
+			yield* collectionBindings(this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
 		}
 		if (targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
@@ -1761,27 +1756,24 @@ class PatternBindingAnalysis {
 						matchesByRight.set(right.value, matches);
 					}
 					if (!matches) continue;
-					result.push({ type: "join", operation: "join_path", left: left.binding, right: right.binding });
+					yield { type: "join", operation: "join_path", left: left.binding, right: right.binding };
 				}
 			}
 		}
-		return uniqueBindings(result);
 	}
 
-	indexedBindings(
+	*indexedBindings(
 		context: ReadonlyArray<PatternAwareEvent>,
 		target: unknown,
 		targetIsPath: boolean,
-	): PatternAwareBinding[] {
-		const result: PatternAwareBinding[] = [];
+	): Generator<PatternAwareBinding, undefined> {
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
 			for (const sourcePath of this.indexedLeaves(value, target)) {
 				if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
-				result.push({ type: "event", relativeEvent, field, path: sourcePath });
+				yield { type: "event", relativeEvent, field, path: sourcePath };
 			}
-			appendCollectionBindings(result, this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
+			yield* collectionBindings(this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
 		}
-		return uniqueBindings(result);
 	}
 
 	indexedLeaves(value: unknown, target: unknown): ReadonlyArray<PatternAwarePath> {
@@ -1946,18 +1938,17 @@ function* reverseContextFields(
 
 type CollectionLocation = { readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath };
 
-function appendCollectionBindings(
-	result: PatternAwareBinding[],
+function* collectionBindings(
 	items: ReadonlyArray<CollectionLocation>,
 	relativeEvent: number,
 	field: PatternAwareDependencySource["field"],
 	target: unknown,
 	targetIsPath: boolean,
-): void {
+): Generator<PatternAwareBinding, undefined> {
 	for (const item of items) {
 		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target))
 			continue;
-		result.push({ type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath });
+		yield { type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath };
 	}
 }
 
