@@ -1770,11 +1770,10 @@ class PatternBindingAnalysis {
 			appendCollectionBindings(result, this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
 		}
 		if (targetIsPath && typeof target === "string") {
-			const sources = uniqueBy(pathSources, (item) => bindingStructureKey(item.binding));
 			const normalizedTarget = normalizePath(target);
 			const joinMatches = new Map<string, Map<string, boolean>>();
-			for (const left of sources) {
-				for (const right of sources) {
+			for (const left of pathSources) {
+				for (const right of pathSources) {
 					if (left === right) continue;
 					const matchesByRight = joinMatches.get(left.value) ?? new Map<string, boolean>();
 					joinMatches.set(left.value, matchesByRight);
