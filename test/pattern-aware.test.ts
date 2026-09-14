@@ -15,7 +15,6 @@ import {
 	patternAwareSettings,
 	projectPatternAwareObservation,
 } from "../src/pattern-aware.ts";
-import { patternSessionBudgets, PatternSessionRegistry } from "../src/pattern-session-state.ts";
 import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
 const temporary: string[] = [];
@@ -1429,27 +1428,29 @@ describe("PatternAware", () => {
 		expect(cache.set("third", 3)).toEqual({ key: "second", value: 2 });
 		expect([...cache.values()]).toEqual([null, 3]);
 
-		const registry = new PatternSessionRegistry(patternSessionBudgets(2));
-		const first = registry.ensure("first").state;
-		registry.ensure("second");
-		registry.get("first");
-		expect(registry.ensure("third").evicted?.id).toBe("second");
-		first.recurrentActions.set("one", recurrentAction("one", 1));
-		first.recurrentActions.set("two", recurrentAction("two", 2));
-		first.recurrentActions.get("one");
-		first.recurrentActions.set("three", recurrentAction("three", 3));
-		expect([...first.recurrentActions.values()].map((item) => item.action.key)).toEqual(["one", "three"]);
-		expect(
-			first.replacePending([pendingPattern("oldest", 1), pendingPattern("middle", 2), pendingPattern("newest", 3)]),
-		).toEqual([expect.objectContaining({ patternID: "oldest" })]);
+		const recurrent = patternStore({ maxPatterns: 2 }, undefined, piActionSemantics());
+		for (const filePath of ["one", "two", "one", "three"]) recurrent.observe(input("recurrent", "read", { path: filePath }));
+		expect(recurrent.predict("recurrent").map(item => item.input.path).sort()).toEqual(["one", "three"]);
 
-		const store = patternStore();
-		store.observe(input("finished", "read", { filePath: "README.md" }));
-		expect(store.recent("finished")).toHaveLength(1);
+		const pending = patternStore({ maxPatterns: 2, maxFutureGap: 8 });
+		const bounded = acceptPattern(pending, { "5": 10 }, { bindings: collectionBindings() });
+		for (const filePath of ["oldest", "middle", "newest"]) pending.observe(input("pending", "grep", {}, {
+			output: { results: [{ path: filePath }] }, learnTarget: false,
+		}));
+		for (const [index, filePath] of ["oldest", "middle", "newest"].entries()) {
+			pending.observe(input("pending", "read", { filePath }, { learnTarget: false }));
+			expect(pending.snapshot().find(item => item.id === bounded.id)?.historicalMatches).toBe(bounded.historicalMatches + index);
+		}
 
-		store.finishSession("finished");
-
-		expect(store.recent("finished")).toHaveLength(0);
+		const store = patternStore({ maxPatterns: 2 }), pattern = acceptPattern(store, { "1": 10 });
+		for (const sessionID of ["first", "second"]) store.observe(input(sessionID, "grep", {}, { learnTarget: false }));
+		expect(store.recent("first")).toHaveLength(1);
+		store.observe(input("third", "grep", {}, { learnTarget: false }));
+		expect(store.recent("second")).toHaveLength(0);
+		expect(store.snapshot().find(item => item.id === pattern.id)?.historicalOpportunities).toBe(pattern.historicalOpportunities + 1);
+		store.finishSession("first");
+		expect(store.recent("first")).toHaveLength(0);
+		expect(store.snapshot().find(item => item.id === pattern.id)?.historicalOpportunities).toBe(pattern.historicalOpportunities + 2);
 	});
 
 	test("validates imported binding replay independently of control confidence", () => {
@@ -1676,28 +1677,4 @@ function input(
 
 function event(...args: Parameters<typeof input>) {
 	return { ...input(...args), sequence: 1 };
-}
-
-function recurrentAction(key: string, sequence: number) {
-	return {
-		action: {
-			key,
-			hash: key,
-			tool: "read",
-			input: {},
-			resources: [],
-			semanticsEpoch: "test",
-			schemaHash: "test",
-			executionFingerprint: "test",
-		},
-		input: {},
-		count: 1,
-		weightedCount: 1,
-		weightedDurationMs: 1,
-		lastSeenSequence: sequence,
-	};
-}
-
-function pendingPattern(patternID: string, triggerSequence: number) {
-	return { patternID, triggerSequence, expectedInputs: [], remaining: 1 };
 }
