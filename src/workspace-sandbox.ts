@@ -201,7 +201,6 @@ interface SharedOverlayBaseline extends PreparedGitWorkspace {
 interface AutoWorkspaceDriverDecision {
 	readonly commit: string;
 	readonly capabilityFingerprint: string;
-	readonly treeEntries: number;
 	readonly resolved: QualifiedWorkspaceSandboxDriver;
 }
 
@@ -713,7 +712,6 @@ async function resolveWorkspaceDriver(
 		repository.autoDriverDecision = {
 			commit,
 			capabilityFingerprint: capability.fingerprint,
-			treeEntries,
 			resolved,
 		};
 		return resolved;
