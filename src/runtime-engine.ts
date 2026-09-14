@@ -56,10 +56,11 @@ import type {
 	ResolutionCause,
 	ResourceValidation,
 	SettledSourceRequest,
+	SourceRequestIdentity,
 	SourceRequestKind,
 } from "./settlement.ts";
 import { cause } from "./settlement.ts";
-import { runSourceRequest, SourceGeneration, type SourceRequestResult } from "./source-request.ts";
+import { runSourceRequest, SourceGeneration } from "./source-request.ts";
 import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 
 interface TurnInput<SessionID> {
@@ -428,14 +429,11 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 
 /** One producer request and its admitted actions share a cancellation lifetime and decision budget. */
 interface SourceRequestSlot {
-	readonly source: string;
-	readonly targetDecisionSequence: number;
-	readonly requestKind: SourceRequestKind;
+	readonly request: SourceRequestIdentity;
 	readonly expiresAtTarget: boolean;
 	readonly generation: SourceGeneration;
 	readonly owners: Set<string>;
 	pending: boolean;
-	active: boolean;
 }
 
 interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
@@ -766,6 +764,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const claimSourceSlot = (
 		session: Session,
 		source: string,
+		turnID: string,
 		targetDecisionSequence: number,
 		limit: number,
 		requestKind: SourceRequestKind,
@@ -773,27 +772,22 @@ export function makeStructuralSpeculativeActionRuntime<
 		parent?: AbortSignal,
 	): SourceRequestSlot | undefined => {
 		const used = [...session.sourceSlots].filter(
-			(slot) => slot.active && slot.source === source && slot.targetDecisionSequence === targetDecisionSequence,
+			(slot) => slot.request.source === source && slot.request.targetDecisionSequence === targetDecisionSequence,
 		).length;
 		if (used >= limit) return undefined;
 		const slot: SourceRequestSlot = {
-			source,
-			targetDecisionSequence,
-			requestKind,
+			request: { source, turnID, index: session.sourceRequestSequence++, kind: requestKind, targetDecisionSequence },
 			expiresAtTarget,
 			generation: new SourceGeneration(parent),
 			owners: new Set(),
 			pending: true,
-			active: true,
 		};
 		session.sourceSlots.add(slot);
 		return slot;
 	};
 
 	const releaseSourceSlot = (session: Session, slot: SourceRequestSlot, failure: ResolutionCause): void => {
-		if (!slot.active) return;
-		slot.active = false;
-		session.sourceSlots.delete(slot);
+		if (!session.sourceSlots.delete(slot)) return;
 		slot.generation.expire(failure);
 	};
 
@@ -812,10 +806,10 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const slot of [...session.sourceSlots]) {
 			if (
 				slot === winner ||
-				!slot.active ||
-				slot.requestKind !== "proposal" ||
-				slot.source !== winner.source ||
-				slot.targetDecisionSequence !== winner.targetDecisionSequence
+				!session.sourceSlots.has(slot) ||
+				slot.request.kind !== "proposal" ||
+				slot.request.source !== winner.request.source ||
+				slot.request.targetDecisionSequence !== winner.request.targetDecisionSequence
 			)
 				continue;
 			releaseSourceSlot(session, slot, cause("source", "proposal_race_lost"));
@@ -824,7 +818,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const expireSourceHorizon = (session: Session, decisionSequence: number, failure: ResolutionCause): void => {
 		for (const slot of [...session.sourceSlots]) {
-			if (slot.expiresAtTarget && slot.targetDecisionSequence <= decisionSequence)
+			if (slot.expiresAtTarget && slot.request.targetDecisionSequence <= decisionSequence)
 				releaseSourceSlot(session, slot, failure);
 		}
 	};
@@ -855,81 +849,58 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!source.enabled(state.settings)) continue;
 			const count = clampCandidateLimit(source.proposalCount?.(state.settings));
 			for (let index = 0; index < count; index++) {
-				const targetDecisionSequence = state.decisionSequence;
 				const slot = claimSourceSlot(
 					state.session,
 					source.id,
-					targetDecisionSequence,
+					state.turnID,
+					state.decisionSequence,
 					count,
 					"proposal",
 					source.requestLifetime === "actor_decision",
 					state.generation.signal,
 				);
 				if (!slot) break;
-				const generation = slot.generation;
-				state.session.pendingSourceRequests++;
-				const pending = runSourceRequest({
-					request: {
-						source: source.id,
-						turnID: state.turnID,
-						index: state.session.sourceRequestSequence++,
-						kind: "proposal",
-						targetDecisionSequence,
-					},
-					generation,
-					timeoutMs: source.timeoutMs?.(state.settings),
-					produce: (requestSignal) =>
-						trackSourceTask(state.session, Promise.resolve(source.propose({
-							...turnContext(state),
-							definitions: state.definitions,
-							candidateNames: state.candidateNames,
-							proposalIndex: index,
-							proposalCount: count,
-							signal: requestSignal,
-						}))),
-					count: (value) => asUpdates(value).length,
-				}).then((request) =>
-					sourceRequestFinished(
-						{
-							session: state.session,
-							...turnContext(state),
-							signal: generation.signal,
-							slot,
-						},
-						state.turnID,
-						source,
-						slot,
-						request,
-					),
-				);
+				const pending = requestSource({ ...turnContext(state), session: state.session, slot }, source, (signal) =>
+					source.propose({
+						...turnContext(state),
+						definitions: state.definitions,
+						candidateNames: state.candidateNames,
+						proposalIndex: index,
+						proposalCount: count,
+						signal,
+					}));
 				trackSourceTask(state.session, pending);
 			}
 		}
 	};
 
-	const sourceRequestFinished = async (
-		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
-		turnID: string,
+	/** Initial and continuation requests retain the same identity, production and admission owners. */
+	const requestSource = (
+		input: Omit<PlanAdmissionScope<SessionID, Output, StartInput, StateData>, "signal"> & { readonly slot: SourceRequestSlot },
 		source: Source,
-		slot: SourceRequestSlot,
-		request: SourceRequestResult<PlanUpdate | readonly PlanUpdate[] | undefined>,
+		produce: (signal: AbortSignal) => ReturnType<NonNullable<Source["continue"]>>,
 	): Promise<void> => {
-		const session = scope.session;
-		session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
-		try {
-			queueSourceRequestEvent(session, turnID, scope.settings, request);
-			if (
-				request.settlement.status !== "produced" ||
-				request.value === undefined ||
-				!slot.active ||
-				scope.signal.aborted
-			) {
-				return;
+		const { session, slot } = input;
+		const scope = { ...input, signal: slot.generation.signal };
+		session.pendingSourceRequests++;
+		return runSourceRequest({
+			request: slot.request,
+			generation: slot.generation,
+			timeoutMs: source.timeoutMs?.(scope.settings),
+			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal))),
+			count: (value) => asUpdates(value).length,
+		}).then(async (request) => {
+			session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
+			try {
+				queueSourceRequestEvent(session, slot.request.turnID, scope.settings, request);
+				if (request.settlement.status === "produced" && request.value !== undefined &&
+					session.sourceSlots.has(slot) && !scope.signal.aborted) {
+					await admitUpdates(scope, source, request.value, request);
+				}
+			} finally {
+				releaseSourceRequest(session, slot);
 			}
-			await admitUpdates(scope, source, request.value, request);
-		} finally {
-			releaseSourceRequest(session, slot);
-		}
+		});
 	};
 
 	const admitUpdates = async (
@@ -1079,7 +1050,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction)) return;
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
-		if (slot?.active && slot.requestKind === "proposal" &&
+		if (slot && session.sourceSlots.has(slot) && slot.request.kind === "proposal" &&
 			runtimeState.sourcesByID.get(node.source)?.concurrentProposalPolicy?.(context.settings) === "first_produced")
 			cancelCompetingProposals(session, slot);
 		const onCandidateMaterialized = adapter.onCandidateMaterialized;
@@ -2290,21 +2261,11 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = parents[0]!;
 		if (session.lifecycle.sealed || targetDecisionSequence <= session.decisionSequence || parents.some(({ identity }) =>
 			session.plan.get(identity.proposalID, identity.actionID)?.identity.id !== identity.id)) return;
-		const slot = claimSourceSlot(session, source.id, targetDecisionSequence,
+		const slot = claimSourceSlot(session, source.id, context.startInput.turnID, targetDecisionSequence,
 			clampCandidateLimit(source.proposalCount?.(context.settings)), "continuation");
 		if (!slot) return;
 		for (const parent of parents) parent.continuationSlots.add(slot);
-		session.pendingSourceRequests++;
-		const request = await runSourceRequest({
-			request: { source: source.id, turnID: context.startInput.turnID, index: session.sourceRequestSequence++,
-				kind: "continuation", targetDecisionSequence },
-			generation: slot.generation,
-			timeoutMs: source.timeoutMs?.(context.settings),
-			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal))),
-			count: (value) => asUpdates(value).length,
-		});
-		await sourceRequestFinished({ ...turnContext(context), session,
-			signal: slot.generation.signal, slot }, context.startInput.turnID, source, slot, request);
+		await requestSource({ ...turnContext(context), session, slot }, source, produce);
 	};
 
 	const queuePeerContinuations = (
