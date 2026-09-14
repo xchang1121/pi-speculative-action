@@ -1552,35 +1552,28 @@ class PatternBindingAnalysis {
 			const direct = uniqueBindings(
 				samples.flatMap((sample, index) => this.candidateBindings(sample.context, targets[index], "direct", targetIsPath)),
 			);
-			const completeDirect = direct.find((candidate) =>
+			let selected = direct.find((candidate) =>
 				samples.every((sample, index) => this.bindingMatches(candidate, sample.context, targets[index])),
 			);
-			const candidates = completeDirect
-				? []
-				: uniqueBindings([
-						...direct,
-						...samples.flatMap((sample, index) =>
-							typeof targets[index] === "string"
-								? this.candidateBindings(sample.context, targets[index], "all", targetIsPath)
-								: [],
-						),
-					]);
-			const fallbackSources = uniqueBindings(
-				direct.filter((binding) => binding.type === "event" || binding.type === "transform"),
-			);
-			if (!completeDirect && fallbackSources.length > 1) {
-				candidates.push({ type: "coalesce", sources: fallbackSources });
-			}
-			let selected = completeDirect;
-			let selectedReplay = completeDirect ? samples.length : -1;
-			for (const candidate of candidates) {
-				const replay = samples.reduce(
-					(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
-					0,
-				);
-				if (replay <= selectedReplay) continue;
-				selected = candidate;
-				selectedReplay = replay;
+			if (!selected) {
+				const candidates = uniqueBindings([
+					...direct,
+					...samples.flatMap((sample, index) => typeof targets[index] === "string"
+						? this.candidateBindings(sample.context, targets[index], "all", targetIsPath) : []),
+				]);
+				const fallbackSources = direct.filter((binding) => binding.type === "event");
+				if (fallbackSources.length > 1) candidates.push({ type: "coalesce", sources: fallbackSources });
+				let selectedReplay = -1;
+				for (const candidate of candidates) {
+					const replay = samples.reduce(
+						(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
+						0,
+					);
+					if (replay <= selectedReplay) continue;
+					selected = candidate;
+					selectedReplay = replay;
+					if (replay === samples.length) break;
+				}
 			}
 			if (selected) selected = this.withObservedVariantCounts(selected, samples, targets);
 			if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
@@ -1688,14 +1681,14 @@ class PatternBindingAnalysis {
 		target: unknown,
 		mode: "direct" | "all" | "first" = "all",
 		targetIsPath = false,
-	): PatternAwareBinding[] {
+	): readonly PatternAwareBinding[] {
 		const key = "bindings:" + mode + Number(targetIsPath) + ":" + typeof target + ":" +
 			(typeof target === "string" ? target : stableStringify(target));
-		return [...this.memo(context, key, () => {
+		return this.memo(context, key, () => {
 			const bindings = this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath);
 			if (mode === "first") for (const binding of bindings) return [binding];
 			return uniqueBindings([...bindings]);
-		})];
+		});
 	}
 
 	*inferCandidateBindings(
