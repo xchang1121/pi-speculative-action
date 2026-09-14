@@ -124,7 +124,7 @@ async function qualifySandlock(binary) {
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
 	const content = await readFile(source);
-	const sourceDigest = sha256("static-v1", content);
+	const sourceDigest = sha256("static-pthread-v1", content);
 	const target = heldExec;
 	const stamp = `${target}.sha256`;
 	try {
@@ -139,7 +139,7 @@ async function installHeldExec() {
 	const compiler = await executable(["cc", "gcc", "clang"]);
 	const temporary = `${target}.${process.pid}.tmp`;
 	try {
-		await run(compiler, ["-static", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
+		await run(compiler, ["-static", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
 		await chmod(temporary, 0o755);
 		await run(temporary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
 		await rename(temporary, target);
