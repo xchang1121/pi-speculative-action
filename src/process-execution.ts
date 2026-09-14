@@ -85,6 +85,8 @@ export class ProcessExecutionCoordinator {
 
 	/** Bind an executor to exactly one tool execution and every async child it creates. */
 	runWith<Value>(executor: ProcessExecutor, operation: () => Promise<Value>): Promise<Value> {
+		// Overlap Actor readiness with actual production; its generation owns preparation through retirement.
+		if (!this.disposed && this.actorRoute?.enabled()) this.scope.exit(() => this.prepareActorRoute(true));
 		return this.scope.run(executor, operation);
 	}
 
