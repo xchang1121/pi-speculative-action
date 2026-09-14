@@ -4,7 +4,7 @@ import { testBranch } from "./branch.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
-import { Agent, type AgentMessage, type AgentTool, type AgentToolResult } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createFauxCore, type FauxContentBlock, type FauxResponseStep, fauxAssistantMessage, fauxThinking, fauxToolCall, type Message } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -227,7 +227,7 @@ async function runAgent(input: RunAgentInput) {
 	actor.setResponses([...input.actorTurns]);
 	drafter.setResponses([...(input.draftTurns ?? [])]);
 	const events: SpeculativeActionEvent<string>[] = [], streamEvents: string[] = [], actorFallbacks: string[] = [];
-	const executions: Record<string, number> = {}, outputs: AgentToolResult<unknown>[] = [];
+	const executions: Record<string, number> = {};
 	const draftFeedback: unknown[] = [];
 	const measuredTools = input.tools.map((base): AgentTool => ({
 		...base,
@@ -249,12 +249,10 @@ async function runAgent(input: RunAgentInput) {
 		...base,
 		execute: async (callID, args, signal, onUpdate) => {
 			if (!currentTurnID) throw new Error("Actor tool executed outside a provider turn");
-			const result = await host.execute({ turnID: currentTurnID, id: callID, tool: base.name, args, tools: measuredTools }, signal, () => {
+			return host.execute({ turnID: currentTurnID, id: callID, tool: base.name, args, tools: measuredTools }, signal, () => {
 				actorFallbacks.push(base.name);
 				return base.execute(callID, args as never, signal, onUpdate as never);
 			});
-			outputs.push(result);
-			return result;
 		},
 	}));
 	const agent = new Agent({ streamFn: actor.streamSimple, sessionId: input.sessionID,
@@ -279,6 +277,8 @@ async function runAgent(input: RunAgentInput) {
 	});
 	try { await agent.prompt(prompt); }
 	finally { await host.dispose(); } // The real owner drains settlement; the fixture must not poll or reimplement it.
+	const outputs = agent.state.messages.flatMap(message => message.role === "toolResult"
+		? [{ content: message.content, details: message.details }] : []);
 	return { events, executions, streamEvents, actorFallbacks, outputs, draftFeedback, summary: summarizeSpeculativeTrace(events) };
 }
 
