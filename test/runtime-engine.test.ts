@@ -21,7 +21,7 @@ import type {
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { CandidateStore } from "../src/candidate-stores.ts";
-import { TaskTimeline } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -843,7 +843,9 @@ describe("structural speculative runtime", () => {
 			await fixture.runtime.startTurn(first);
 			const original = await fixture.runtime.prepareActorCall(first);
 			expect(original?.output).toBeUndefined(); now += 4;
-			await original?.settle(4, "actor:1");
+			const execution = new TimelineInterval(now - 4, now);
+			now += 50; // Observation may arrive after the executor has completed.
+			await original?.settle(4, "actor:1", execution);
 			await fixture.runtime.finishTurn({ ...first, terminal: false });
 			now += 2;
 			if (mode === "stale-before") version++;
@@ -858,6 +860,9 @@ describe("structural speculative runtime", () => {
 			else expect((await fixture.runtime.prepareActorCall(second))?.output).toBe(mode === "exclusive" ? "actor:1" : outputs[0]);
 			expect(captures).toBe(fallback ? 2 : 1); expect(seals).toBe(captures);
 			await fixture.runtime.finishTurn({ ...second, terminal: true });
+			const providers = fixture.events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
+			expect(providers[0]?.toolExecution).toBe(execution);
+			if (reusable && !fallback) expect(providers[1]?.toolExecution).toBe(execution);
 			expect(fixture.events.filter((event) => event.type === "prediction")).toHaveLength(1);
 			expect(fixture.events.find((event) => event.type === "task")?.timing).toMatchObject({
 				authoritativeToolCount: reusable && !fallback ? 1 : 2,

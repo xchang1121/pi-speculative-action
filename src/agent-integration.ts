@@ -425,7 +425,7 @@ export function createSpeculativeActionHost(
 								await prepared?.settle(settlement.durationMs,
 									settlement.status === "succeeded"
 											? { result: settlement.output, isError: false }
-											: toolErrorSettlement(settlement.error));
+											: toolErrorSettlement(settlement.error), settlement.toolExecution);
 							},
 						}
 					: {}),

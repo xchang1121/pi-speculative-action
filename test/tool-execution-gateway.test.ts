@@ -60,8 +60,10 @@ describe("ToolExecutionGateway", () => {
 	it("settles each authoritative attempt once without replacing its executor or failure", async () => {
 		const gateway = new ToolExecutionGateway<TestContext, string>([]);
 		const operation = { tool: "third_party_tool", callID: "actor", input: { value: 42 } };
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const failure = new Error("Actor failure"), poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
-		const succeed = async () => 42, fail = () => { throw failure; };
+		const succeed = async () => { now += 20; return 42; }, fail = () => { now += 20; throw failure; };
 		const observerFailure = new Error("Observer failure"), failObservation = () => { throw observerFailure; };
 		const observers = [undefined, failObservation, async () => failObservation(), (value: AuthoritativeExecutionSettlement<number>) => {
 			Object.assign(value, { status: "succeeded", output: -1, error: observerFailure });
@@ -74,22 +76,29 @@ describe("ToolExecutionGateway", () => {
 			{ name: "Actor rejects", actor: async () => fail(), reuse: undefined, error: failure, executions: 1 },
 			{ name: "poisoned commit", actor: succeed, reuse: async () => { throw poisoned; }, error: poisoned, executions: 0 },
 		];
-		for (const row of cases) for (const observe of observers) {
+		try { for (const row of cases) for (const observe of observers) {
+			let executionStartedAt = now;
 			const executor = vi.fn((received: ToolOperation) => {
 				expect(received).toBe(operation);
+				executionStartedAt = now;
 				return row.actor();
 			});
-			const settled = observe && vi.fn(observe);
+			const settled = observe && vi.fn(async (value: AuthoritativeExecutionSettlement<number>) => {
+				now += 100; await nextTurn();
+				await observe(value);
+			});
 			const execution = gateway.executeAuthoritative(operation, executor, { reuse: row.reuse, settled });
 			if ("error" in row) await expect(execution, row.name).rejects.toBe(row.error);
 			else await expect(execution, row.name).resolves.toBe(row.output);
 			expect(executor, row.name).toHaveBeenCalledTimes(row.executions);
 			if (settled) expect(settled, row.name).toHaveBeenCalledTimes(row.executions);
+			if (settled && row.executions) expect(Object.isFrozen(settled.mock.calls[0]![0].toolExecution)).toBe(true);
 			if (settled && row.executions) expect(settled).toHaveBeenCalledWith(expect.objectContaining({
-				status: "error" in row ? "failed" : "succeeded", durationMs: expect.any(Number),
+				status: "error" in row ? "failed" : "succeeded", durationMs: 20,
+				toolExecution: { startedAt: executionStartedAt, completedAt: executionStartedAt + 20 },
 				...("error" in row ? { error: row.error } : { output: row.output }),
 			}));
-		}
+		} } finally { clock.mockRestore(); await gateway.dispose(); }
 	});
 });
 

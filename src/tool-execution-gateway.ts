@@ -2,6 +2,7 @@ import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { TimelineInterval } from "./task-timing.ts";
 import {
 	EffectTransactionCoordinator,
 	type EffectTransaction,
@@ -45,9 +46,14 @@ export interface ToolExecutionRequirement {
 
 export type AuthoritativeToolExecutor<Output> = (operation: ToolOperation) => Promise<Output>;
 
-export type AuthoritativeExecutionSettlement<Output> =
-	| { readonly status: "succeeded"; readonly output: Output; readonly durationMs: number }
-	| { readonly status: "failed"; readonly error: unknown; readonly durationMs: number };
+type AuthoritativeExecutionOutcome<Output> =
+	| { readonly status: "succeeded"; readonly output: Output }
+	| { readonly status: "failed"; readonly error: unknown };
+
+export type AuthoritativeExecutionSettlement<Output> = AuthoritativeExecutionOutcome<Output> & {
+	readonly durationMs: number;
+	readonly toolExecution: TimelineInterval;
+};
 
 export interface AuthoritativeExecutionHooks<Output> {
 	/** Optional reuse provider. A poisoned commit propagates; non-commit provider failures fall through. */
@@ -123,13 +129,14 @@ export class ToolExecutionGateway<Context, Output> {
 				}
 			}
 			const startedAt = performance.now();
-			let settlement: AuthoritativeExecutionSettlement<AuthoritativeOutput>;
+			let outcome: AuthoritativeExecutionOutcome<AuthoritativeOutput>;
 			try {
-				settlement = { status: "succeeded", output: await executor(operation), durationMs: Math.max(0, performance.now() - startedAt) };
+				outcome = { status: "succeeded", output: await executor(operation) };
 			} catch (error) {
-				settlement = { status: "failed", error, durationMs: Math.max(0, performance.now() - startedAt) };
+				outcome = { status: "failed", error };
 			}
-			Object.freeze(settlement);
+			const toolExecution = new TimelineInterval(startedAt, performance.now());
+			const settlement = Object.freeze({ ...outcome, toolExecution, durationMs: toolExecution.completedAt - toolExecution.startedAt });
 			try { await hooks.settled?.(settlement); }
 			catch { /* Observation cannot replace the original Actor settlement. */ }
 			if (settlement.status === "failed") throw settlement.error;

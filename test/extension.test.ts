@@ -31,6 +31,7 @@ import * as piTools from "../src/pi-tool-invocation.ts";
 import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 
 const directories = temporaryDirectories("pi-spec-extension-");
 const hosts: SpeculativeActionHost[] = [];
@@ -143,7 +144,7 @@ describe("zero-modification Pi extension", () => {
 			tool: "read", args: { path: "notes.txt" },
 		}), undefined);
 		if (mode === "cache") expect(fixture.settle).not.toHaveBeenCalled();
-		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(Number), { result, isError: false });
+		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(Number), { result, isError: false }, expect.any(TimelineInterval));
 	});
 
 	it("binds only prepared searches, quietly retains native Actor otherwise, and retires on refresh or disable", async () => {

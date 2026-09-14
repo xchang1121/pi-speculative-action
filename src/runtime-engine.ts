@@ -1951,8 +1951,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		state.actorObservation ??= actualKey ? identity : null;
 		let capturePreparationMs = 0;
 		const prepared: { output?: Output; settle: PreparedActorCall<Output>["settle"] } = {
-			settle: (durationMs, output) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, durationMs, output, capturePreparationMs)),
+			settle: (durationMs, output, toolExecution) => state.session.lifecycle.track(
+				settleActorCall(state, input, actualCall, actorAction, durationMs, output, capturePreparationMs, toolExecution)),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -2123,12 +2123,13 @@ export function makeStructuralSpeculativeActionRuntime<
 		duration: number,
 		output: Output | undefined,
 		capturePreparationMs: number,
+		toolExecution?: TimelineInterval,
 	): Promise<void> => {
 		if (!state.actorActions.delete(actorAction)) return;
 		const settlementStartedAt = performance.now();
 		const capture = actorAction.takeCapture();
 		const durationMs = finiteMetric(duration);
-		if (!actorAction.settleActor(durationMs, outputIsError(output), performance.now())) {
+		if (!actorAction.settleActor(durationMs, outputIsError(output), toolExecution)) {
 			state.session.lifecycle.release(capture);
 			return;
 		}

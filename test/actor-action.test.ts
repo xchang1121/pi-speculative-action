@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 
 const identity = { id: "call-1", sequence: 7, turnID: "turn-1" } as const;
 const exact = { kind: "exact", distance: 0 } as const;
@@ -70,13 +71,18 @@ describe("ActorAction", () => {
 		}
 	});
 
-	it("settles isolation-blocked benefit with the same capped timing decomposition", () => {
-		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs, completedAt] of [[80, 80, 40, 1000], [200, 120, 0, undefined]]) {
+	it("settles isolation-blocked benefit without moving a completed computation into later Actor work", () => {
+		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs] of [[80, 80, 40], [200, 120, 0]]) for (const legacy of [false, true]) {
+			const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
 			const action = new ActorAction({ identity, tool: "bash", actionKey,
 				fallback: cause("execution", "isolation_unavailable") });
 			expect(action.deferToFallback([], attemptLeadMs)?.status).toBe("rejected");
-			expect(action.settleActor(120, false, completedAt)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
+			expect(action.settleActor(120, false, legacy ? 220 : execution)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
 				executionBlockedTiming: { attemptLeadMs, executionAheadMs, hitLatencyMs } } });
+			if (!legacy) expect(action.settlement?.provider.toolExecution).toBe(execution);
+			timeline.recordActor(0, 100); timeline.recordActor(220, 500);
+			timeline.recordTool(action.settlement!.provider.toolExecution);
+			expect(timeline.measure(500)).toMatchObject({ serializedMs: 500, toolExecutionMs: 120, hiddenLatencyMs: 0 });
 		}
 	});
 });

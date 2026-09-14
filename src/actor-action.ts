@@ -164,11 +164,12 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	settleActor(
 		durationMs: number,
 		isError: boolean,
-		completedAt = performance.now(),
+		execution: number | TimelineInterval = performance.now(),
 	): ActorActionSettlement | undefined {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
 		const duration = finite(durationMs);
-		const completed = finite(completedAt);
+		const toolExecution = typeof execution === "number"
+			? new TimelineInterval(finite(execution) - duration, execution) : TimelineInterval.from(execution);
 		const executionBlockedTiming =
 			this.stateValue.executionBlockedAttemptLeadMs === undefined
 				? undefined
@@ -178,7 +179,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			origin: "fallback",
 			durationMs: duration,
 			isError,
-			toolExecution: new TimelineInterval(completed - duration, completed),
+			toolExecution,
 			...(executionBlockedTiming ? { executionBlockedTiming } : {}),
 		}), this.stateValue.matchedPredictions);
 	}
