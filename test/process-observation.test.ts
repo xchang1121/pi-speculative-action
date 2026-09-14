@@ -6,6 +6,7 @@ import {
 	captureWorkspaceStructure,
 	diffWorkspaceStructures,
 	ExecutionPathProjection,
+	hydrateWorkspaceFileEntry,
 	snapshotDependency,
 } from "../src/process-observation.ts";
 
@@ -29,31 +30,24 @@ describe("process observation", () => {
 		expect(beforeEntry.metadataDigest).toBe(afterEntry.metadataDigest);
 		// Same-size rapid rewrites can share observable timestamps on coarse-clock filesystems.
 		// The regular-file delta, not incidental metadata movement, is the authoritative evidence.
-		const diff = diffWorkspaceStructures(
-			before,
-			after,
-			[
-				{
-					relativePath: "value.bin",
-					before: beforeBytes,
-					after: afterBytes,
-					beforeMode: beforeEntry.mode,
-					afterMode: afterEntry.mode,
-				},
-			],
-			projection,
-		);
+		const delta = {
+			relativePath: "./value.bin",
+			before: beforeBytes,
+			after: afterBytes,
+			beforeMode: beforeEntry.mode,
+			afterMode: afterEntry.mode,
+		};
+		const diff = diffWorkspaceStructures(before, after, [delta], projection);
 		expect(diff.complete).toBe(true);
 		expect(diff.effects).toHaveLength(1);
-		expect(diff.effects[0]).toMatchObject({ kind: "write", relativePath: "value.bin" });
-		expect(diff.effects[0]).not.toHaveProperty("after");
-		const effect = diff.effects[0];
-		if (effect?.kind !== "write") throw new Error("write effect missing");
-		expect(effect.before).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
+		expect(diff.effects[0]).toMatchObject({ logicalPath: projection.toLogical(target), relativePath: "value.bin" });
+		expect(diff.effects[0]?.change).toBe(delta);
+		const input = hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
+		expect(input).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		const parentEntry = before.entries.get("");
 		if (parentEntry?.kind !== "directory") throw new Error("workspace root structure missing");
 		expect(projection.toPhysical(path.join(source, "value.bin"))).toBe(target);
-		expect(snapshotDependency(projection.toLogical(target), effect.before, parentEntry)).toMatchObject({
+		expect(snapshotDependency(projection.toLogical(target), input, parentEntry)).toMatchObject({
 			kind: "file",
 			role: "input",
 		});
@@ -68,18 +62,19 @@ describe("process observation", () => {
 
 		expect(diff.complete).toBe(true);
 		expect(diff.effects).toHaveLength(1);
-		expect(diff.effects[0]).toMatchObject({ kind: "mkdir", relativePath: "empty" });
-		const created = diff.effects[0];
-		if (created?.kind !== "mkdir") throw new Error("mkdir effect missing");
+		expect(diff.effects[0]).toMatchObject({ relativePath: "empty", change: { kind: "directory" } });
+		const created = diff.effects[0]?.change;
+		if (created?.kind !== "directory") throw new Error("mkdir effect missing");
+		expect(created.before).toBeUndefined();
 		expect(created.after).toMatchObject({ kind: "directory", mode: expect.any(Number) });
 
 		await fs.rmdir(path.join(workspace, "empty"));
 		const removed = diffWorkspaceStructures(after, await captureWorkspaceStructure(workspace), [], projection);
 		expect(removed.complete).toBe(true);
 		expect(removed.effects).toHaveLength(1);
-		expect(removed.effects[0]).toMatchObject({ kind: "rmdir", relativePath: "empty" });
-		if (removed.effects[0]?.kind !== "rmdir") throw new Error("rmdir effect missing");
-		expect(removed.effects[0].before.entriesDigest).toBe(created.after.entriesDigest);
+		expect(removed.effects[0]).toMatchObject({ relativePath: "empty", change: { kind: "directory" } });
+		expect(removed.effects[0]?.change.after).toBeUndefined();
+		expect(removed.effects[0]?.change.before).toBe(created.after);
 	});
 
 	test("fails closed when replaying bytes would lose hard-link identity", async ({ onTestFinished }) => {
