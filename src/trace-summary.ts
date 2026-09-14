@@ -75,8 +75,17 @@ export function reduceSpeculativeTrace<SessionID>(
 	current: SpeculativeTraceSummary,
 	event: SpeculativeActionEvent<SessionID>,
 ): SpeculativeTraceSummary {
-	const next = mutableSummary(current);
-	next.cache = cloneCache(event.cache);
+	const next = {
+		...current,
+		sourceOutcomes: { ...current.sourceOutcomes },
+		predictionUnobserved: { ...current.predictionUnobserved },
+		predictionRejectedAfterMatch: { ...current.predictionRejectedAfterMatch },
+		candidateTerminalCauses: { ...current.candidateTerminalCauses },
+		actorCandidateRejections: { ...current.actorCandidateRejections },
+		partialResultReuseByProjector: { ...current.partialResultReuseByProjector },
+		processReuse: { ...current.processReuse },
+		cache: cloneCache(event.cache),
+	};
 	switch (event.type) {
 		case "task":
 			next.tasks++;
@@ -167,20 +176,6 @@ export function summarizeSpeculativeTrace<SessionID>(
 	events: ReadonlyArray<SpeculativeActionEvent<SessionID>>,
 ): SpeculativeTraceSummary {
 	return events.reduce<SpeculativeTraceSummary>(reduceSpeculativeTrace, emptySpeculativeTraceSummary());
-}
-
-function mutableSummary(current: SpeculativeTraceSummary) {
-	return {
-		...current,
-		sourceOutcomes: { ...current.sourceOutcomes },
-		predictionUnobserved: { ...current.predictionUnobserved },
-		predictionRejectedAfterMatch: { ...current.predictionRejectedAfterMatch },
-		candidateTerminalCauses: { ...current.candidateTerminalCauses },
-		actorCandidateRejections: { ...current.actorCandidateRejections },
-		partialResultReuseByProjector: { ...current.partialResultReuseByProjector },
-		processReuse: { ...current.processReuse },
-		cache: cloneCache(current.cache),
-	};
 }
 
 function addReuseMetrics(left: WorldReuseMetrics, right: WorldReuseMetrics): WorldReuseMetrics {
