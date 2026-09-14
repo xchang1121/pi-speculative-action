@@ -5,6 +5,7 @@ import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.
 import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
+import type { TimelineInterval } from "./task-timing.ts";
 
 export type {
 	SpeculativeActionEvent,
@@ -304,7 +305,7 @@ export interface SpeculativeRuntimeInspection {
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
 export interface PreparedActorCall<Output> {
 	readonly output?: Output;
-	readonly settle: (durationMs: number, output?: Output) => Promise<void>;
+	readonly settle: (durationMs: number, output?: Output, toolExecution?: TimelineInterval) => Promise<void>;
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
