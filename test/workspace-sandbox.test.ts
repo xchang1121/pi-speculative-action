@@ -798,6 +798,54 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
+	it.each(["none", "workspace", "registration"])("owns workspace removal and %s cleanup failure before returning", async (failure) => {
+		const root = await temporaryRoot("workspace-removal"), entered = deferred(), release = deferred();
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		await writeFile(path.join(root, "value.txt"), "before\n");
+		let owned: { processRoot: string; gitDirectory: string; dispose: () => Promise<void> } | undefined, settled = false;
+		const removed: string[] = [], fault = new Error("private removal failed");
+		vi.mocked(rm).mockImplementation(async (target, options) => {
+			if (owned && [owned.processRoot, owned.gitDirectory].includes(String(target))) {
+				removed.push(String(target));
+				if (String(target) === (failure === "registration" ? owned.gitDirectory : owned.processRoot)) {
+					entered.resolve(); await release.promise;
+					if (failure !== "none") throw fault;
+				}
+			}
+			return fs.rm(target, options);
+		});
+		const execution = sandbox.withWorkspace(root, async (workspace) => {
+			owned = Reflect.get(workspace, "gitWorkspace");
+			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "private\n");
+		}).then(() => { settled = true; }, error => { settled = true; throw error; });
+		try {
+			await entered.promise; await nextTurn();
+			expect(settled).toBe(false);
+			expect((await stat(owned!.gitDirectory)).isDirectory()).toBe(true);
+			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("before\n");
+			release.resolve();
+			if (failure === "none") await execution;
+			else await expect(execution).rejects.toMatchObject({ errors: [fault] });
+			const disposal = owned!.dispose();
+			expect(owned!.dispose()).toBe(disposal);
+			await disposal.catch(() => undefined);
+			expect(removed).toEqual(failure === "workspace" ? [owned!.processRoot] : [owned!.processRoot, owned!.gitDirectory]);
+			vi.mocked(rm).mockImplementation(fs.rm);
+			if (failure === "none") await sandbox.withWorkspace(root, async (workspace) => {
+				const next = Reflect.get(workspace, "gitWorkspace");
+				expect(next.gitDirectory).toBe(owned!.gitDirectory);
+				await owned!.dispose();
+				expect((await stat(next.gitDirectory)).isDirectory()).toBe(true);
+				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("before\n");
+			});
+			await sandbox.closePools([root]);
+			await expect(stat(owned!.processRoot)).rejects.toThrow();
+			await expect(stat(owned!.gitDirectory)).rejects.toThrow();
+		} finally {
+			release.resolve(); await execution.catch(() => undefined); vi.mocked(rm).mockImplementation(fs.rm);
+		}
+	});
+
 	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
 		const root = await temporaryRoot("transaction");
 		await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
