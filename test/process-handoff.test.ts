@@ -35,7 +35,8 @@ describe("ProcessHandoffRegistry", () => {
 
 		await expect(actor).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate }, joined: false });
 		expect(lookup).toHaveBeenCalledTimes(3);
-		await expect(acquireActor(previous)).resolves.toMatchObject({ kind: "hit", plan: { certificate: previous.certificate } });
+		await expect(acquireActor(previous, live => livePlan(live?.filter(candidate => candidate === previous.certificate))))
+			.resolves.toMatchObject({ kind: "hit", plan: { certificate: previous.certificate } });
 	});
 
 	it("publishes memory before noncreating or failed persistence outcomes", async () => {
@@ -54,7 +55,7 @@ describe("ProcessHandoffRegistry", () => {
 			const lookup = vi.fn(livePlan);
 			const actor = await acquireActor(fixture, lookup, undefined, scope);
 			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
-			expect(fixture.registry.hasResults).toBe(false);
+			expect(fixture.registry.hasResults).toBe(true);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
 
 			if (failure) {
@@ -64,14 +65,19 @@ describe("ProcessHandoffRegistry", () => {
 				persistence.resolve(stored!);
 				await expect(publishing).resolves.toBe(stored);
 			}
+			await expect(acquireActor(fixture, lookup, undefined, scope)).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
+			fixture.registry.clearCompleted();
+			expect(fixture.registry.hasResults).toBe(false);
+			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
 		}
 	});
 
-	it.each([
+	it.each(([
 		["clear", "completed"], ["trim", "completed"], ["dispose", "completed"], ["dispose", "history"],
-	] as const)("revokes %s during a pending %s lookup", async (operation, phase) => {
+	] as const).flatMap(([operation, phase]) => (phase === "completed" ? [false, true] : [false]).map(oneShot => ({ operation, phase, oneShot }))))(
+		"revokes $operation during a pending $phase lookup (one-shot $oneShot)", async ({ operation, phase, oneShot }) => {
 		const completed = phase === "completed";
-		const fixture = await producer(completed), entered = deferred(), release = deferred();
+		const fixture = await producer(oneShot), entered = deferred(), release = deferred();
 		if (completed) await fixture.publish();
 		const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[]) => {
 			if (completed && !live) return undefined;
@@ -98,15 +104,18 @@ describe("ProcessHandoffRegistry", () => {
 			const fixture = await producer(oneShot);
 			await fixture.publish();
 			const validating = deferred<void>(), release = deferred<void>();
-			const child = acquireActor(fixture, async (live) => {
+			let validations = 0;
+			const children = Array.from({ length: 2 }, () => acquireActor(fixture, async (live) => {
 				if (!live) return undefined;
-				validating.resolve(); await release.promise; return livePlan(live);
-			});
+				if (++validations === 2) validating.resolve();
+				await release.promise; return livePlan(live);
+			}));
 			await validating.promise;
 			const effects = vi.fn(async () => "whole");
 			if (wholeFirst) await expect(fixture.ownership.commit(effects)).resolves.toBe("whole");
 			release.resolve();
-			await expect(child).resolves.toMatchObject({ kind: oneShot && wholeFirst ? "miss" : "hit" });
+			expect((await Promise.all(children)).map(child => child.kind)).toEqual(oneShot ? [wholeFirst ? "miss" : "hit", "miss"] : ["hit", "hit"]);
+			expect(validations).toBe(2);
 			if (!wholeFirst) {
 				const whole = fixture.ownership.commit(effects);
 				if (oneShot) await expect(whole).rejects.toMatchObject({ disposition: "recoverable" });

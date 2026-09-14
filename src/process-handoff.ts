@@ -32,8 +32,7 @@ export interface ProcessHandoff {
 
 type HandoffState =
 	| { readonly status: "running" }
-	| { readonly status: "completed"; readonly candidate?: ProcessProvenanceCertificate }
-	| { readonly status: "claimed" };
+	| { readonly status: "completed"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
@@ -102,8 +101,7 @@ export class ProcessHandoffRegistry {
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(options.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
-					selected.record.state = { status: "claimed" };
-					this.remove(options.key, selected.record);
+					if (selected.oneShot) this.remove(options.key, selected.record);
 					return { kind: "hit", plan, joined };
 				}
 				continue;
