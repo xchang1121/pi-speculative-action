@@ -75,6 +75,12 @@ describe("PatternAware", () => {
 		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
 		target.edits[0]!.newText = "changed";
 		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
+		for (const items of [[], Array(1), [undefined]]) {
+			const bindings = inferBindings([event("slots", "seed", { items }, { output: {}, outputPaths: [] })], { value: undefined });
+			expect(bindings['["value"]']).toEqual(0 in items
+				? { type: "event", relativeEvent: -1, field: "input", path: ["items", 0] }
+				: { type: "constant", value: undefined });
+		}
 	});
 
 	test("derives adjacent paths and commands through bounded path templates", () => {
