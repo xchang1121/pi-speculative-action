@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 
 const nativeRequested = process.argv[2] === "--native-dispatch";
 const native = nativeInvocation();
@@ -188,33 +189,18 @@ function descriptor(fd, aliases) {
 	};
 }
 
-function exchange(request) {
-	return new Promise((resolve, reject) => {
-		const socket = net.createConnection(socketPath);
+async function exchange(request) {
+	const socket = net.createConnection(socketPath).setEncoding("utf8");
+	socket.setTimeout(24 * 60 * 60 * 1000, () => socket.destroy(new Error("broker timeout")));
+	try {
+		await once(socket, "connect");
+		socket.end(`${JSON.stringify(request)}\n`);
 		let body = "";
-		let settled = false;
-		const finish = (error, value) => {
-			if (settled) return;
-			settled = true;
-			socket.destroy();
-			error ? reject(error) : resolve(value);
-		};
-		socket.setTimeout(24 * 60 * 60 * 1000, () => finish(new Error("broker timeout")));
-		socket.once("error", (error) => finish(error));
-		socket.once("connect", () => {
-			socket.end(`${JSON.stringify(request)}\n`);
-		});
-		socket.on("data", (chunk) => {
-			body += chunk.toString("utf8");
-		});
-		socket.once("end", () => {
-			try {
-				finish(undefined, JSON.parse(body.trim()));
-			} catch (error) {
-				finish(error);
-			}
-		});
-	});
+		for await (const chunk of socket) body += chunk;
+		return JSON.parse(body.trim());
+	} finally {
+		socket.destroy();
+	}
 }
 
 function readDescriptorTarget(fd) {
