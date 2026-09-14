@@ -39,7 +39,7 @@ describe("ProcessHandoffRegistry", () => {
 	});
 
 	it("publishes memory before noncreating or failed persistence outcomes", async () => {
-		for (const [stored, failure] of [[false, undefined], [undefined, new Error("store unavailable")]] as const) {
+		for (const scope of [SCOPE, OTHER_SCOPE]) for (const [stored, failure] of [[false, undefined], [undefined, new Error("store unavailable")]] as const) {
 			const fixture = await producer();
 			expect(fixture.registry.hasResults).toBe(true);
 			const persistenceStarted = deferred<void>();
@@ -52,7 +52,7 @@ describe("ProcessHandoffRegistry", () => {
 			expect(fixture.registry.hasResults).toBe(true);
 
 			const lookup = vi.fn(livePlan);
-			const actor = await acquireActor(fixture, lookup);
+			const actor = await acquireActor(fixture, lookup, undefined, scope);
 			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
 			expect(fixture.registry.hasResults).toBe(false);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
@@ -144,48 +144,63 @@ describe("ProcessHandoffRegistry", () => {
 		}
 	});
 
-	it("joins only a running handoff in the same scope", async () => {
-		const fixture = await producer();
+	it.each([false, true].flatMap(oneShot => [SCOPE, OTHER_SCOPE].map(scope => ({ oneShot, scope }))))(
+		"waits in $scope.turnID and preserves one-shot ownership ($oneShot)", async ({ oneShot, scope }) => {
+		const fixture = await producer(oneShot);
 		const parallelProducer = await fixture.registry.acquire({
-			key: fixture.key, scope: SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: async () => undefined,
+			key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: async () => undefined,
 		});
-		expect(parallelProducer.kind).toBe("work");
-		if (parallelProducer.kind === "work") fixture.registry.complete(fixture.key, parallelProducer.work);
+		if (parallelProducer.kind !== "work") throw new Error("independent producers must not wait for each other");
 		const waitEntered = deferred<void>();
 		const releaseWait = deferred<void>();
-		const waitForRunning = vi.fn(async () => {
+		const waitForRunning = vi.fn(async (running: ProcessHandoff) => {
+			if (running === parallelProducer.work) {
+				fixture.registry.complete(fixture.key, running); // Failed same-scope work must yield to the repeatable candidate.
+				return "completed" as const;
+			}
 			waitEntered.resolve();
 			await releaseWait.promise;
 			return "completed" as const;
 		});
 
-		await expect(acquireActor(fixture, async () => undefined, waitForRunning, OTHER_SCOPE))
-			.resolves.toEqual({ kind: "miss", joined: false });
+		for (const foreign of [undefined, { sessionID: "other", turnID: "turn" }]) await expect(fixture.registry.acquire({
+			key: fixture.key, scope: foreign, role: "actor", lookup: async () => undefined, waitForRunning,
+		})).resolves.toEqual({ kind: "miss", joined: false });
 		expect(waitForRunning).not.toHaveBeenCalled();
 
 		const lookup = vi.fn(livePlan);
-		const sameScope = acquireActor(fixture, lookup, waitForRunning);
+		const actor = acquireActor(fixture, lookup, waitForRunning, scope);
 		await waitEntered.promise;
+		expect(waitForRunning.mock.calls[0]![0]).toBe(scope === SCOPE ? fixture.work : parallelProducer.work);
 		await fixture.publish();
 		releaseWait.resolve();
-		await expect(sameScope).resolves.toMatchObject({ kind: "hit", joined: true });
-		expect(lookup.mock.calls).toEqual([[undefined, new Set()], [[fixture.certificate]]]);
+		const transferable = !oneShot || scope === SCOPE;
+		await expect(actor).resolves.toMatchObject({ kind: transferable ? "hit" : "miss", joined: true });
+		expect(lookup.mock.calls).toEqual([[undefined, new Set()], ...(scope === OTHER_SCOPE ? [[undefined, new Set()]] : []),
+			transferable ? [[fixture.certificate]] : [undefined, new Set()]]);
+		const whole = fixture.ownership.commit(async () => "whole");
+		if (oneShot && transferable) await expect(whole).rejects.toMatchObject({ disposition: "recoverable" });
+		else await expect(whole).resolves.toBe("whole");
+		fixture.registry.dispose();
 	});
 
-	it("returns an Actor miss when the running-join deadline wins", async () => {
+	it.each(["deadline", "producer failure", "disposal"].flatMap(phase => [SCOPE, OTHER_SCOPE].map(scope => ({ phase, scope }))))(
+		"returns a miss after $phase while waiting in $scope.turnID", async ({ phase, scope }) => {
 		const fixture = await producer();
 		const waitEntered = deferred<void>();
 		const deadline = deferred<void>();
 		const actor = acquireActor(fixture, undefined, async () => {
 			waitEntered.resolve();
 			await deadline.promise;
-			return "miss";
-		});
+			return phase === "deadline" ? "miss" : "completed";
+		}, scope);
 		await waitEntered.promise;
 
+		if (phase === "producer failure") fixture.registry.complete(fixture.key, fixture.work);
+		else if (phase === "disposal") fixture.registry.dispose();
 		deadline.resolve();
-		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
-		fixture.registry.complete(fixture.key, fixture.work);
+		await expect(actor).resolves.toEqual({ kind: "miss", joined: phase !== "deadline" });
+		fixture.registry.dispose();
 	});
 });
 

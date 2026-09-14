@@ -65,7 +65,7 @@ type AcquireOptions<Plan> = AcquireBase<Plan> & (
 	  }
 );
 
-/** Owns every legal transition and selection of same-scope process handoffs. */
+/** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry {
 	private readonly byKey = new Map<Sha256Digest, HandoffRecord[]>();
 	private maxCompleted: number;
@@ -91,9 +91,10 @@ export class ProcessHandoffRegistry {
 			const records = this.byKey.get(options.key) ?? [];
 			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
-				if (state.status !== "completed" || !state.candidate || considered.has(record) || !sameScope(record.scope, options.scope)) return [];
+				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
 				const oneShot = state.candidate.dependencyCertificate.taints.length > 0;
-				return oneShot && record.ownership.wholeClaimed ? [] : [{ record, state, candidate: state.candidate, oneShot }];
+				return oneShot && (!sameScope(record.scope, options.scope) || record.ownership.wholeClaimed)
+					? [] : [{ record, state, candidate: state.candidate, oneShot }];
 			});
 			if (completed.length) {
 				const plan = await options.lookup(completed.map(({ candidate }) => candidate));
@@ -115,7 +116,9 @@ export class ProcessHandoffRegistry {
 				continue; // A candidate may have completed while history was being read.
 			}
 			if (options.role === "producer") return { kind: "work", work: this.reserve(options.key, options.ownership, options.scope), joined };
-			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope));
+			// Waiting grants no transfer authority; only repeatable sealed evidence may cross turns.
+			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope)) ??
+				records.find((record) => record.state.status === "running" && options.scope && record.scope?.sessionID === options.scope.sessionID);
 			if (!running || (await options.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
 			joined = true;
 			historyChecked = false;
