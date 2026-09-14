@@ -10,7 +10,7 @@ import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { asRecord, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
-import { nonNegativeInteger, positiveInteger, probability as probabilitySetting } from "./setting-input.ts";
+import { booleanOr, nonNegativeInteger, positiveInteger, probability as probabilitySetting, settingsParser } from "./setting-input.ts";
 
 export type PatternAwareSettings = Readonly<typeof patternAwareDefaults>;
 
@@ -241,6 +241,20 @@ const patternAwareDefaults = {
 };
 
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults;
+
+const parsePatternSettings = settingsParser(patternAwareDefaults, {
+	enabled: booleanOr,
+	multiStepEnabled: booleanOr,
+	maxContextLength: positiveInteger,
+	beamWidth: positiveInteger,
+	maxPredictionDepth: positiveInteger,
+	maxFutureGap: nonNegativeInteger,
+	futureGapCoverage: probabilitySetting,
+	decayHalfLifeEvents: positiveInteger,
+	minOccurrences: positiveInteger,
+	minBindingReplayProbability: probabilitySetting,
+	maxPatterns: positiveInteger,
+});
 
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
@@ -1436,26 +1450,7 @@ function configuredPersistenceFile(file: string, analyzerKey: string, semanticsK
 }
 
 export function patternAwareSettings(value: unknown): PatternAwareSettings {
-	const record = asRecord(value);
-	return {
-		enabled: typeof record?.enabled === "boolean" ? record.enabled : PATTERN_AWARE_DEFAULTS.enabled,
-		multiStepEnabled:
-			typeof record?.multiStepEnabled === "boolean"
-				? record.multiStepEnabled
-				: PATTERN_AWARE_DEFAULTS.multiStepEnabled,
-		maxContextLength: positiveInteger(record?.maxContextLength, PATTERN_AWARE_DEFAULTS.maxContextLength),
-		beamWidth: positiveInteger(record?.beamWidth, PATTERN_AWARE_DEFAULTS.beamWidth),
-		maxPredictionDepth: positiveInteger(record?.maxPredictionDepth, PATTERN_AWARE_DEFAULTS.maxPredictionDepth),
-		maxFutureGap: nonNegativeInteger(record?.maxFutureGap, PATTERN_AWARE_DEFAULTS.maxFutureGap),
-		futureGapCoverage: probabilitySetting(record?.futureGapCoverage, PATTERN_AWARE_DEFAULTS.futureGapCoverage),
-		decayHalfLifeEvents: positiveInteger(record?.decayHalfLifeEvents, PATTERN_AWARE_DEFAULTS.decayHalfLifeEvents),
-		minOccurrences: positiveInteger(record?.minOccurrences, PATTERN_AWARE_DEFAULTS.minOccurrences),
-		minBindingReplayProbability: probabilitySetting(
-			record?.minBindingReplayProbability,
-			PATTERN_AWARE_DEFAULTS.minBindingReplayProbability,
-		),
-		maxPatterns: positiveInteger(record?.maxPatterns, PATTERN_AWARE_DEFAULTS.maxPatterns),
-	};
+	return parsePatternSettings(asRecord(value));
 }
 
 export function patternAwarePersistenceFile(workspace: string, stateDirectory?: string) {

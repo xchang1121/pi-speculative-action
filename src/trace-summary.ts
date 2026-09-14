@@ -169,15 +169,7 @@ export function summarizeSpeculativeTrace<SessionID>(
 	return events.reduce<SpeculativeTraceSummary>(reduceSpeculativeTrace, emptySpeculativeTraceSummary());
 }
 
-type MutableSummary = {
-	-readonly [Key in keyof SpeculativeTraceSummary]: SpeculativeTraceSummary[Key] extends Readonly<
-		Record<string, number>
-	>
-		? Record<string, number>
-		: SpeculativeTraceSummary[Key];
-};
-
-function mutableSummary(current: SpeculativeTraceSummary): MutableSummary {
+function mutableSummary(current: SpeculativeTraceSummary) {
 	return {
 		...current,
 		sourceOutcomes: { ...current.sourceOutcomes },

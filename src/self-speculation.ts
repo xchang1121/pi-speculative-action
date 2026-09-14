@@ -180,14 +180,6 @@ interface CandidateCalibration {
 	readonly jointProbability: number;
 }
 
-interface ParsedSidecarActionCall {
-	readonly index: number;
-	readonly callID?: string;
-	readonly format?: string;
-	readonly tool: string;
-	readonly input: Readonly<Record<string, unknown>>;
-}
-
 interface ForkReceiptOutcome {
 	readonly committed: boolean;
 	readonly batches: readonly ActorForkActionBatch[];
@@ -718,7 +710,7 @@ export class SelfSpeculationCoordinator {
 			const rawCalls = array(candidate.tool_calls);
 			const calls = rawCalls
 				.map((value, index) => parsedSidecarActionCall(value, index))
-				.filter((value): value is ParsedSidecarActionCall => value !== undefined);
+				.filter((value) => value !== undefined);
 			for (const candidateID of candidateIDs) {
 				const known = state.reportedCandidates.get(candidateID) ?? { sources: new Set<string>(), tools: new Set<string>() };
 				for (const source of sources) known.sources.add(source);
@@ -1181,7 +1173,7 @@ function actionIdentity(key: string): string {
 	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
 }
 
-function parsedSidecarActionCall(value: unknown, fallbackIndex: number): ParsedSidecarActionCall | undefined {
+function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const call = record(value);
 	const tool = nonEmptyString(call?.name);
 	const input = record(call?.arguments);

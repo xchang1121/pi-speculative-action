@@ -529,13 +529,6 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	lifecycle: "active" | "closing" | "finished";
 }
 
-interface RankedCandidate<Output, StartInput, StateData> {
-	readonly candidate: CandidateRecord<Output, StartInput, StateData>;
-	readonly match: ActionKeyMatch;
-	readonly ready: boolean;
-	readonly remainingMs: number;
-}
-
 interface ClaimedPrediction {
 	readonly node: PlanRuntimeNode;
 	readonly opportunity: PredictionOpportunity;
@@ -575,7 +568,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		readonly actualCall: ActualToolCall;
 		readonly actualKey: ActionKey;
 		readonly actorAction: ActorAction<Candidate, Output>;
-		readonly ranked: readonly RankedCandidate<Output, StartInput, StateData>[];
+		readonly ranked: ReturnType<typeof rankCandidates>;
 		readonly actorArrivedAt: number;
 		readonly preview?: ActorPreviewRecord;
 		readonly signal?: AbortSignal;
@@ -2459,7 +2452,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		session: Session,
 		action: ActionKey,
 		preferred?: string,
-	): readonly RankedCandidate<Output, StartInput, StateData>[] => {
+	) => {
 		const now = performance.now();
 		return runtimeState.candidates.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded")
 			.flatMap(({ entry: candidate, match }) => {

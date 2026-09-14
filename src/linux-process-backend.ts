@@ -189,14 +189,6 @@ interface ExecMount {
 	readonly hostPath: string;
 }
 
-interface ProcessInterposition {
-	readonly mounts: readonly SandboxMount[];
-	readonly execMounts: readonly ExecMount[];
-	readonly directories: readonly InterposedDirectory[];
-	readonly executables: readonly (readonly [intercepted: string, original: string])[];
-	readonly dependencies: readonly DynamicDependency[];
-}
-
 interface DispatcherRequest {
 	readonly version: 2;
 	readonly token: string;
@@ -243,7 +235,7 @@ interface ActiveSession {
 	readonly invocation: ToolProcessInvocation;
 	readonly scope?: ExecutionScope;
 	readonly projection: ExecutionPathProjection;
-	readonly interposition: ProcessInterposition;
+	readonly interposition: Awaited<ReturnType<typeof createProcessInterposition>>;
 	readonly originalPath: string;
 	readonly deniedPaths: readonly string[];
 	readonly producer: ProcessProducerProof;
@@ -270,11 +262,6 @@ interface TopLevelCapture {
 	readonly before: WorkspaceStructureSnapshot;
 	readonly after: WorkspaceStructureSnapshot;
 	readonly observation: StraceObservation;
-}
-
-interface WorkspaceDependencySource {
-	readonly entry: (physicalPath: string) => Promise<WorkspaceTreeEntry | undefined>;
-	readonly parentEntry: (physicalPath: string) => Promise<WorkspaceTreeEntry | undefined>;
 }
 
 interface SpawnOutcome {
@@ -1468,7 +1455,7 @@ function sameDirectoryStateValue(
 function transactionDependencySource(
 	snapshot: WorkspaceStructureSnapshot,
 	changes: readonly WorkspaceRegularDelta[],
-): WorkspaceDependencySource {
+) {
 	const deltas = new Map<string, WorkspaceRegularDelta>();
 	for (const change of changes) {
 		const relative = path.normalize(change.relativePath);
@@ -1500,7 +1487,7 @@ function transactionDependencySource(
 	};
 	return {
 		entry,
-		parentEntry: (physicalPath) =>
+		parentEntry: (physicalPath: string) =>
 			path.resolve(physicalPath) === path.resolve(snapshot.root)
 				? Promise.resolve(undefined)
 				: entry(path.dirname(physicalPath)),
@@ -1509,15 +1496,10 @@ function transactionDependencySource(
 
 async function captureDependencies(
 	session: ActiveSession,
-	before: WorkspaceDependencySource,
+	before: ReturnType<typeof transactionDependencySource>,
 	observed: readonly ObservedProcessPath[],
 	effects: readonly { readonly logicalPath: string; readonly relativePath: string; readonly before?: unknown }[],
-): Promise<{
-	readonly complete: boolean;
-	readonly dependencies: readonly DynamicDependency[];
-	readonly taints: readonly ProvenanceTaint[];
-	readonly incompleteReasons: readonly string[];
-}> {
+) {
 	const dependencies = new Map<string, DynamicDependency>();
 	const taints = new Set<ProvenanceTaint>();
 	const incompleteReasons = new Set<string>();
@@ -1815,7 +1797,7 @@ async function createProcessInterposition(input: {
 	readonly socketPath: string;
 	readonly dispatcherBinary: string;
 	readonly excludedExecutables: readonly string[];
-}): Promise<ProcessInterposition> {
+}) {
 	const root = path.join(input.privateRoot, "process-interposition");
 	const viewRoot = path.join(root, "views");
 	const shadowRoot = path.join(root, "originals");
