@@ -2049,37 +2049,34 @@ export function makeStructuralSpeculativeActionRuntime<
 		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: "actor_action",
 			...eventEnvelope(state.session, state.turnID, state.settings),
-			sessionID: state.sessionID,
 			settlement,
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
 			...(settledCandidate ? { execution: settledCandidate.route.isolation } : {}),
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 		} : undefined;
-		state.session.effects.enqueue(async () => {
+		state.session.effects.enqueue(() => adapter.onActorActionSettled?.({
+			sessionID: state.sessionID,
+			turnID: state.turnID,
+			...(key ? { action: key } : {}),
+			settlement,
+			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
+			candidateFeedback: settledCandidate?.owner.draft.feedback,
+		}));
+		if (event) state.session.effects.enqueue(() => { state.session.events.enqueue(event); });
+		for (const source of sources) {
 			try {
-				await adapter.onActorActionSettled?.({
-					sessionID: state.sessionID,
-					turnID: state.turnID,
-					...(key ? { action: key } : {}),
-					settlement,
-					...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
-					candidateFeedback: settledCandidate?.owner.draft.feedback,
+				if (!source.observe) continue;
+				const observation = cloneSharedData({
+					concrete: asConcreteInput(actualCall.input) ?? {}, ...(output !== undefined ? { output } : {}),
 				});
-			} catch {
-				// Policy feedback cannot alter authoritative settlement or source learning.
-			}
-			if (event) state.session.events.enqueue(event);
-			const concrete = asConcreteInput(actualCall.input) ?? {};
-			for (const source of sources) {
-				if (!source.observe || !source.enabled(state.settings)) continue;
-				try {
-					const updates = await source.observe({
+				state.session.effects.enqueue(async () => {
+					if (!source.enabled(state.settings)) return;
+					const updates = await source.observe?.({
 						...turnContext(state),
 						consumeInput: input,
 						...(key ? { action: key } : {}),
 						tool: actorAction.tool,
-						concrete,
-						...(output !== undefined ? { output } : {}),
+						...observation,
 						durationMs:
 							settlement.provider.kind === "actor"
 								? settlement.provider.durationMs
@@ -2093,11 +2090,9 @@ export function makeStructuralSpeculativeActionRuntime<
 							source, updates,
 						));
 					}
-				} catch {
-					// Learning and continuation never alter an authoritative Actor result.
-				}
-			}
-		});
+				});
+			} catch { /* Unowned data can settle normally but cannot train a source. */ }
+		}
 	};
 
 	const confirmPredictions = (
@@ -2137,31 +2132,21 @@ export function makeStructuralSpeculativeActionRuntime<
 			...eventEnvelope(session, context.startInput.turnID, context.settings),
 			settlement,
 		} : undefined;
+		session.effects.enqueue(() => adapter.onPredictionSettled?.({
+			sessionID: session.id,
+			turnID: context.startInput.turnID,
+			tool: node.action.tool,
+			...(node.actionKey ? { action: node.actionKey } : {}),
+			settlement,
+		}));
 		session.effects.enqueue(async () => {
-			try {
-				await adapter.onPredictionSettled?.({
-					sessionID: session.id,
-					turnID: context.startInput.turnID,
-					tool: node.action.tool,
-					...(node.actionKey ? { action: node.actionKey } : {}),
-					settlement,
-				});
-			} catch {
-				// Policy feedback is a projection of settlement, never its owner.
-			}
 			if (event) session.events.enqueue(event);
-			try {
-				if (source?.onSettled) {
-					await source.onSettled({
-						proposalID: context.identity.proposalID,
-						actionID: context.identity.actionID,
-						feedback: context.feedback,
-						settlement,
-					});
-				}
-			} catch {
-				// Source feedback is a projection of settlement, never its owner.
-			}
+			await source?.onSettled?.({
+				proposalID: context.identity.proposalID,
+				actionID: context.identity.actionID,
+				feedback: context.feedback,
+				settlement,
+			});
 		});
 		const adopted =
 			settlement.observation === "observed" &&

@@ -838,7 +838,7 @@ describe("speculative action host", () => {
 	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
 		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
-		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>();
+		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>(), feedbackGate = deferred<void>();
 		const actorTool = origin === "actor" ? { ...grepTool, parameters: Type.Object({ ...grepSchema.properties,
 			flags: Type.Optional(Type.String()) }) } : grepTool;
 		let actorSchema = "";
@@ -863,7 +863,7 @@ describe("speculative action host", () => {
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
 			onCandidateMaterialized: (candidate) => { materialized.push(candidate); },
 			onActorActionMaterialized: ({ action }) => { actorSchema = action.schemaHash; },
-			onActorActionSettled: () => { if (origin === "closing") ready.resolve(); },
+			onActorActionSettled: async () => { if (origin === "closing") ready.resolve(); await feedbackGate.promise; },
 			onEvent: (event) => {
 				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
 				if (carried && event.type === "candidate" && event.state.status === "succeeded" ||
@@ -881,6 +881,7 @@ describe("speculative action host", () => {
 			const execute = vi.fn(() => grepTool.execute(call.id, call.args));
 			const result = await host.execute(call, undefined, execute);
 			expect(result.content).toEqual((await grepTool.execute("oracle", call.args)).content);
+			Object.assign(result.content[0]!, { text: "caller.txt:1:one" }); feedbackGate.resolve();
 			expect(execute).toHaveBeenCalledTimes(origin === "drafter" ? 0 : 1);
 			if (origin === "closing") {
 				await ready.promise; await nextTurn();
@@ -912,7 +913,7 @@ describe("speculative action host", () => {
 				expect(await nextRequest.promise).toBe(carried ? "empty" : "produced");
 				if (!carried) await waitFor(() => materialized.some((candidate) => candidate.turnID === "next" && candidate.tool === "read"));
 			}
-		} finally { routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }
+		} finally { feedbackGate.resolve(); routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }
 	});
 
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
