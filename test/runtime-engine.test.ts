@@ -145,6 +145,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	readonly onEvent?: false | TestAdapter<SessionID>["onEvent"];
 }) {
 	const events: SpeculativeActionEvent<SessionID>[] = [];
+	const ready = candidateSucceeded<SessionID>();
 	let executions = 0;
 	const runtime = makeStructuralSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
 		sources: [input.source, ...(input.peers ?? [])],
@@ -187,10 +188,11 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: input.onEvent === false ? undefined : async (event) => {
 			events.push(event);
+			ready.observe(event);
 			if (input.onEvent) await input.onEvent(event);
 		},
 	});
-	return { runtime, events, executions: () => executions };
+	return { runtime, events, executions: () => executions, ready };
 }
 
 async function runFallback(runtime: ReturnType<typeof harness<string>>["runtime"], actor: Call, durationMs = 1, output = "actor"): Promise<void> {
@@ -506,12 +508,10 @@ describe("structural speculative runtime", () => {
 				settlements.push(settlement);
 			},
 		});
-		const candidateReady = candidateSucceeded();
-		const { runtime, events } = harness({
+		const { runtime, events, ready: candidateReady } = harness({
 			source,
 			expired: () => true,
 			actionKey,
-			onEvent: candidateReady.observe,
 		});
 		await runtime.startTurn(start("turn"));
 		await candidateReady.promise;
@@ -581,19 +581,17 @@ describe("structural speculative runtime", () => {
 		let enabled = false;
 		const gate = barrier();
 		const executionStarted = barrier();
-		const candidateReady = candidateSucceeded();
 		const source = planSource({
 			enabled: () => enabled,
 			propose: () => plan("bounded-join"),
 		});
-		const { runtime, events } = harness({
+		const { runtime, events, ready: candidateReady } = harness({
 			source,
 			execute: async () => {
 				executionStarted.arrive();
 				await gate.promise;
 				return "learned";
 			},
-			onEvent: candidateReady.observe,
 		});
 
 		await runtime.startTurn(start("calibration"));
@@ -951,7 +949,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["matched", "terminal", "future", "next-terminal"] as const)("launches queued work only for current demand after Actor timings change: %s", async (mode) => {
-		const queued = barrier(), materialized = barrier(), succeeded = candidateSucceeded();
+		const queued = barrier(), materialized = barrier();
 		const original = SpeculationScheduler.prototype.admit;
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
 			const result = original.call(this, job, forecasts, ...rest);
@@ -961,12 +959,11 @@ describe("structural speculative runtime", () => {
 		const proposal = () => ({ ...plan("demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) =>
 			readAction(String(horizon), { path: "README.md" }, { horizon, expectedDurationMs: 500 }),
 		) });
-		const { runtime, executions: executionCount } = harness({
+		const { runtime, executions: executionCount, ready: succeeded } = harness({
 			source: planSource({
 				propose: ({ startInput }) => mode !== "next-terminal" && startInput.turnID === "demand" ? proposal() : undefined,
 				observe: ({ consumeInput }) => mode === "next-terminal" && consumeInput.turnID === "demand" ? proposal() : undefined }),
 			onCandidateMaterialized: () => materialized.arrive(),
-			onEvent: succeeded.observe,
 		});
 		try {
 			for (const [index, durationMs] of [1, 1000, 1000, 1000].entries()) {
@@ -1058,7 +1055,6 @@ describe("structural speculative runtime", () => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed");
-		const candidateReady = candidateSucceeded();
 		const entered = barrier(), release = barrier(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
@@ -1085,7 +1081,7 @@ describe("structural speculative runtime", () => {
 			if (scenario === "rejected") throw new Error("evaluation failed");
 			return scenario === "uncovered" ? undefined : "narrow";
 		});
-		const { runtime, events } = harness({
+		const { runtime, events, ready: candidateReady } = harness({
 			source: planSource({
 				propose: () => plan("projection", { path: "README.md", offset: 1, limit: 100 }) }),
 			projection,
@@ -1097,7 +1093,6 @@ describe("structural speculative runtime", () => {
 				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
-			onEvent: candidateReady.observe,
 		});
 		await runtime.startTurn(start("turn"));
 		await (running ? started.promise : candidateReady.promise);
@@ -1197,18 +1192,17 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each([[2, 4096, 2], [1, 4096, 3], [2, 128, 3]])("bounds sealed query results by %i entries and %i bytes", async (entries, bytes, evaluations) => {
-		const ready = candidateSucceeded(), disposed = vi.fn();
+		const disposed = vi.fn();
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const learned = entries === 2 && bytes === 4096;
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return String((args as { offset: number }).offset); });
-		const { runtime, events, executions: executionCount } = harness({
+		const { runtime, events, executions: executionCount, ready } = harness({
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "first"
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
 			execute: () => { now += 10; return { ...world("1", { onDispose: disposed,
 				validate: async () => { now += 3; return validResource(); } }), reconstruct }; },
-			onEvent: ready.observe,
 		});
 		try {
 			await runtime.startTurn(start("first")); await ready.promise;
@@ -1248,12 +1242,12 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["input", "executor", "denied", "closing"])("keeps prepared intent non-authoritative through %s", async (phase) => {
-		const ready = candidateSucceeded(), entered = barrier(), release = barrier();
+		const entered = barrier(), release = barrier();
 		const disposed = vi.fn(), committed = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
 		const gateway = new ToolExecutionGateway<unknown, string>([]), actor = vi.fn(async () => "Actor");
 		let executor = "bound", allowed = true;
 		const query = call("turn", { path: "README.md", offset: 10, limit: 1 });
-		const { runtime } = harness({
+		const { runtime, ready } = harness({
 			source: planSource({ propose: () => plan("inputs", { path: "README.md", offset: 1, limit: 1 }) }),
 			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
 			authorizeCandidate: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
@@ -1266,7 +1260,6 @@ describe("structural speculative runtime", () => {
 					return String(offset);
 				},
 			})),
-			onEvent: ready.observe,
 		});
 		let preparation: Promise<void> | undefined, closing: Promise<void> | undefined;
 		try {
@@ -1300,7 +1293,7 @@ describe("structural speculative runtime", () => {
 
 	it.each(["poisoned", "terminal", "disposed"] as const)("preserves claimed Actor commit ownership through %s", async (phase) => {
 		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
-		const candidateReady = candidateSucceeded(), entered = barrier(), release = barrier();
+		const entered = barrier(), release = barrier();
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const continuation = vi.fn(() => undefined), settlements: PredictionSettlement[] = [];
 		const commit = vi.fn(async () => {
@@ -1313,14 +1306,13 @@ describe("structural speculative runtime", () => {
 			continueOn: ["actor_adopted"], continue: continuation,
 			onSettled: ({ settlement }) => { settlements.push(settlement); },
 		});
-		const { runtime } = harness({
+		const { runtime, ready: candidateReady } = harness({
 			source,
 			execute: (tool, concrete) => coordinator.execute(coordinator.begin({ tool, callID: "claimed", route: RESOURCE_ROUTE }), async () => ({
 				...world("speculative", { executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint }),
 				validate: async () => (validResource()),
 				commit, dispose: cleanup,
 			})),
-			onEvent: candidateReady.observe,
 		});
 		let consuming: Promise<string | undefined> | undefined, closing: Promise<void> | undefined;
 		try {
@@ -1350,10 +1342,10 @@ describe("structural speculative runtime", () => {
 			throw scenario === "classified" ? effectCommitFailure(new Error("changed"), "recoverable", "changed", failure)
 				: effectCommitFailure(new Error("commit failed"), "recoverable");
 		});
-		const transactions = new EffectTransactionCoordinator<string>(), candidateReady = candidateSucceeded();
+		const transactions = new EffectTransactionCoordinator<string>();
 		const gateway = new ToolExecutionGateway<undefined, string>([]), executeActor = vi.fn(async () => "Actor");
 		const settlements: PredictionSettlement[] = [];
-		const { runtime, events } = harness({
+		const { runtime, events, ready: candidateReady } = harness({
 			source: planSource({
 				propose: () => indeterminate ? plan("incompatible", actor.input) : undefined,
 				onSettled: ({ settlement }) => { settlements.push(settlement); } }),
@@ -1369,7 +1361,6 @@ describe("structural speculative runtime", () => {
 				Object.assign(source.compatibility, { status: "compatible", executionFingerprint: fingerprint });
 				return transaction;
 			},
-			onEvent: candidateReady.observe,
 		});
 		try {
 			await runtime.startTurn(actor);
@@ -1400,14 +1391,12 @@ describe("structural speculative runtime", () => {
 
 	it("keeps one turn on its settings snapshot while master disable remains immediate", async () => {
 		let configured = settings;
-		const candidateReady = candidateSucceeded();
 		const source = planSource({
 			propose: () => plan("epoch"),
 		});
-		const { runtime } = harness({
+		const { runtime, ready: candidateReady } = harness({
 			source,
 			settings: () => configured,
-			onEvent: candidateReady.observe,
 		});
 		await runtime.startTurn(start("turn-1"));
 		await candidateReady.promise;
@@ -1427,12 +1416,11 @@ describe("structural speculative runtime", () => {
 
 	it.each(["running", "sealed valid", "sealed stale", "sealed unproven", "observation"])("reconciles Actor effects with $0 ownership", async (phase) => {
 		let version = 0, executions = 0;
-		const started = barrier(), gate = barrier(), ready = candidateSucceeded(), commits = vi.fn();
+		const started = barrier(), gate = barrier(), commits = vi.fn();
 		const settlements: PredictionSettlement[] = [];
-		const { runtime } = harness({
+		const { runtime, ready } = harness({
 			source: { ...futureReadSource({ latestHorizon: 1, expectedDurationMs: 10, subsequent: "placeholder" }),
 				onSettled: ({ settlement }) => { settlements.push(settlement); } },
-			onEvent: ready.observe,
 			execute: async () => {
 				const captured = version, output = `future:${++executions}`;
 				started.arrive(); if (phase === "running" && executions === 1) await gate.promise;
@@ -1645,11 +1633,11 @@ describe("structural speculative runtime", () => {
 
 	it.each(["expiry", "inflight", "independent"] as const)("owns isolated preview execution through %s", async (mode) => {
 		let effects = 0, native = 0;
-		const started = barrier(), gate = barrier(), ready = candidateSucceeded(), disposed = vi.fn(), independent = mode === "independent";
+		const started = barrier(), gate = barrier(), disposed = vi.fn(), independent = mode === "independent";
 		const actor: Call = { ...call(mode), tool: independent ? "bash" : "write",
 			input: independent ? { command: "increment-counter" } : { path: "preview.txt", content: mode } };
 		const second = { ...actor, id: "second-effect" };
-		const { runtime, executions: executionCount } = harness({
+		const { runtime, executions: executionCount, ready } = harness({
 			source: { id: "disabled", enabled: () => false, propose: () => undefined },
 			resolveExecution: ({ tool }) => independent || tool === "write" ? MUTATION_ROUTE : undefined,
 			execute: async () => {
@@ -1659,7 +1647,6 @@ describe("structural speculative runtime", () => {
 					checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 }, resources: ["."],
 					onCommit: () => effects++, onDispose: disposed });
 			},
-			onEvent: ready.observe,
 		});
 		try {
 			await runtime.startTurn(actor);
@@ -2251,11 +2238,11 @@ function isWorldBranch(value: unknown): value is WorldBranch<string> {
 	);
 }
 
-function candidateSucceeded(expected = 1, actionFragment?: string) {
+function candidateSucceeded<SessionID = string>(expected = 1, actionFragment?: string) {
 	const reached = barrier(expected);
 	return {
 		promise: reached.promise,
-		observe: (event: SpeculativeActionEvent<string>) => {
+		observe: (event: SpeculativeActionEvent<SessionID>) => {
 			if (
 				event.type === "candidate" &&
 				event.state.status === "succeeded" &&
