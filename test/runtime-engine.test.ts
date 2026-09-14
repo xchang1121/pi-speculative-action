@@ -153,7 +153,7 @@ function harness<SessionID = string>(input: {
 		args: unknown,
 		context: { readonly type: "start" | "consume" },
 	) => ReturnType<typeof buildPiActionKey> | Promise<ReturnType<typeof buildPiActionKey>>;
-	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined;
+	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined | Promise<SpeculativeExecutionRoute | undefined>;
 	readonly captureAuthoritativeResult?: (
 		action: NonNullable<ReturnType<typeof buildPiActionKey>>,
 		signal: AbortSignal,
@@ -1780,6 +1780,49 @@ describe("structural speculative runtime", () => {
 			expect(fixture.executions()).toBe(0);
 			expect(fixture.events.some((event) => event.type === "candidate")).toBe(false);
 		} finally { await fixture.runtime.dispose(); }
+	});
+
+	it.each(["route", "preflight"] as const)("matches a continuation during pending %s without authorizing execution", async (phase) => {
+		const preparing = barrier(), resume = barrier(), settlements: PredictionSettlement[] = [];
+		const child = { ...call("child"), tool: "write", input: { path: "child.ts", content: "next" } };
+		const hold = async () => { preparing.arrive(); await resume.promise; };
+		const fixture = harness({
+			source: planSource({
+				propose: ({ startInput }) => startInput.turnID === "parent" ? plan("root") : undefined,
+				continueOn: ["execution_succeeded"],
+				continue: ({ proposalID, actionID, revision }) => ({ proposalID, source: "source", revision,
+					upsert: [{ id: "child", type: "tool_call", tool: child.tool, input: child.input,
+						dependsOn: [{ actionID, condition: "execution_succeeded" }] }] }),
+				onSettled: ({ settlement }) => { settlements.push(settlement); },
+			}),
+			resolveExecution: async (tool) => {
+				if (tool === "read") return RESOURCE_ROUTE;
+				if (phase === "route") await hold();
+				return MUTATION_ROUTE;
+			},
+			preflight: async (_signal, candidate) => {
+				if (phase === "preflight" && candidate.tool === child.tool) await hold();
+				return { ok: true };
+			},
+		});
+		try {
+			await fixture.runtime.startTurn(start("parent")); await preparing.promise;
+			expect((await fixture.runtime.prepareActorCall(call("parent")))?.output).toBe("speculative");
+			await fixture.runtime.finishTurn(call("parent"));
+			await fixture.runtime.startTurn(child);
+			const prepared = await fixture.runtime.prepareActorCall(child);
+			expect(prepared?.output).toBeUndefined();
+			expect(fixture.executions()).toBe(1);
+			await prepared?.settle(1, "actor");
+			resume.arrive();
+			await fixture.runtime.finishTurn({ ...child, terminal: true });
+			expect(settlements.filter(({ prediction }) => prediction.actionID === "child")).toMatchObject([{
+				observation: "observed", match: { matched: true, relation: { kind: "exact" },
+					adoption: { status: "rejected", cause: { stage: "admission", code: "preparation_pending" } } },
+			}]);
+		} finally { resume.arrive(); await fixture.runtime.dispose(); }
+		expect(fixture.executions()).toBe(1);
+		expect(fixture.runtime.inspect()).toMatchObject({ pendingPredictions: 0, deferredPlanActions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
 	});
 
 	it.each(["binding", "preflight"] as const)("retires a peer's pending %s when its parent disappears", async (phase) => {

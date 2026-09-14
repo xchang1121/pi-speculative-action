@@ -20,7 +20,7 @@ import type {
 } from "./settlement.ts";
 
 type PlanNodeExecution =
-	| { readonly status: "deferred" }
+	| { readonly status: "deferred" | "preparing" }
 	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
 	| { readonly status: "queued"; readonly candidateID: string }
@@ -174,7 +174,7 @@ interface PlanExecutionOwner {
 }
 
 type MutableNodeExecution =
-	| { readonly status: "deferred" }
+	| { readonly status: "deferred" | "preparing" }
 	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
 	| {
@@ -318,21 +318,23 @@ export class PlanRuntime {
 
 	bindActionKey(proposalID: string, actionID: string, actionKey: ActionKey): boolean {
 		const node = this.mutable(proposalID, actionID)?.node;
-		if (!node || node.actionKey) return false;
+		if (!node || node.actionKey || node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
 		node.actionKey = actionKey;
+		node.execution = { status: "preparing" };
 		return true;
 	}
 
-	markExecutionBlocked(proposalID: string, actionID: string, cause: ResolutionCause): boolean {
-		const node = this.mutable(proposalID, actionID)?.node;
-		if (node?.execution.status !== "deferred" || !node.actionKey) return false;
-		node.execution = { status: "execution_blocked", cause: Object.freeze({ ...cause }) };
+	finishPreparation(identity: PlanActionIdentity, blocked?: ResolutionCause): boolean {
+		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		if (node?.identity.id !== identity.id || node.execution.status !== "preparing" || node.opportunity.state.status === "settled") return false;
+		node.execution = blocked ? { status: "execution_blocked", cause: Object.freeze({ ...blocked }) } : { status: "deferred" };
 		return true;
 	}
 
 	attachExecution(proposalID: string, actionID: string, candidateID: string, owner: PlanExecutionOwner): boolean {
 		const node = this.mutable(proposalID, actionID)?.node;
-		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "scheduled")) return false;
+		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "preparing" && node.execution.status !== "scheduled")) return false;
+		if (node.execution.status === "preparing" && owner.execution.status !== "failed" && owner.execution.status !== "cancelled") return false;
 		node.execution = { status: "attached", candidateID, owner };
 		return true;
 	}
@@ -459,7 +461,7 @@ export class PlanRuntime {
 			const previous = current?.nodes.get(id);
 			if (previous && !replaced.has(id)) {
 				previous.action = action;
-				if (touched.has(id) && previous.execution.status === "deferred") previous.anchorDecisionSeq = anchor;
+				if (touched.has(id) && (previous.execution.status === "deferred" || previous.execution.status === "preparing")) previous.anchorDecisionSeq = anchor;
 				nodes.set(id, previous);
 				continue;
 			}
