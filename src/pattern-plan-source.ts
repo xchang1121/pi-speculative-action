@@ -57,8 +57,8 @@ export function createPatternPlanSource(input: {
 			input.actionSemantics.buildKey(tool, actionInput, input.cwd, schemaHash),
 		projectors: input.projectionRules,
 	};
-	let openedStore: Promise<PatternAwareStoreLease> | undefined;
-	let openedStoreKey: string | undefined;
+	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
+	let disposal: Promise<void> | undefined;
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
@@ -66,6 +66,7 @@ export function createPatternPlanSource(input: {
 	let analysisTail: Promise<void> = Promise.resolve();
 
 	const queueAnalysis = (analysis: () => void | Promise<void>): void => {
+		if (disposal) return;
 		analysisTail = analysisTail
 			.then(() => new Promise<void>(setImmediate))
 			.then(analysis)
@@ -82,23 +83,24 @@ export function createPatternPlanSource(input: {
 		return revision;
 	};
 	const resolveStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
+		if (disposal) throw new Error("Pattern source is disposed");
 		if (input.store) return input.store;
 		const patternSettings = sourceSettings(settings);
 		const configurationKey = patternAwareAnalyzerKey(patternSettings);
-		if (openedStore && openedStoreKey !== configurationKey) {
-			const previous = await openedStore;
-			previous.store.finishSession(input.sessionID);
-			await previous.release();
-			openedStore = undefined;
+		if (!openedStore || openedStore.key !== configurationKey) {
+			const previous = openedStore;
+			const opening = { key: configurationKey, lease: Promise.resolve().then(async () => {
+				if (previous) await previous.lease.then(async (lease) => {
+					try { lease.store.finishSession(input.sessionID); } finally { await lease.release(); }
+				}).catch(() => undefined); // Failed persistence or loading cannot poison the next analyzer.
+				return acquirePatternAwareStore(input.workspaceIdentity ?? input.cwd, patternSettings,
+					input.stateDirectory, patternActionSemantics);
+			}) };
+			// Publish the owner before retiring its predecessor; concurrent requests share this lease.
+			openedStore = opening;
+			void opening.lease.catch(() => { if (openedStore === opening) openedStore = undefined; });
 		}
-		openedStoreKey = configurationKey;
-		openedStore ??= acquirePatternAwareStore(
-			input.workspaceIdentity ?? input.cwd,
-			patternSettings,
-			input.stateDirectory,
-			patternActionSemantics,
-		);
-		return (await openedStore).store;
+		return (await openedStore.lease).store;
 	};
 	const predictedEvent = (startInput: AgentStartInput, action: Pick<SpeculativeCandidate, "key" | "input">,
 		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
@@ -112,7 +114,7 @@ export function createPatternPlanSource(input: {
 
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
-		enabled: (settings) => sourceSettings(settings).enabled,
+		enabled: (settings) => !disposal && sourceSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
 		propose: async ({ startInput, data, settings, signal }) => {
@@ -257,7 +259,7 @@ export function createPatternPlanSource(input: {
 		},
 		flush: async () => {
 			await analysisTail;
-			if (openedStore) await (await openedStore).store.flush();
+			if (openedStore) await (await openedStore.lease).store.flush();
 			if (input.store) await (await input.store).flush();
 		},
 	};
@@ -305,7 +307,7 @@ export function createPatternPlanSource(input: {
 			const store = input.store
 				? await input.store
 				: openedStore
-					? (await openedStore).store
+					? (await openedStore.lease).store
 					: undefined;
 			if (!store) return;
 			store.finishSession(input.sessionID);
@@ -315,14 +317,17 @@ export function createPatternPlanSource(input: {
 				// Persistence failure must not change Agent lifecycle semantics.
 			}
 		},
-		dispose: async () => {
-			if (!openedStore) return;
+		dispose: () => disposal ??= (async () => {
+			await analysisTail;
+			const current = openedStore;
+			openedStore = undefined;
+			if (!current) return;
 			try {
-				await (await openedStore).release();
+				await (await current.lease).release();
 			} catch {
 				// Persistence failure must not change Agent uninstall semantics.
 			}
-		},
+		})(),
 	};
 }
 
