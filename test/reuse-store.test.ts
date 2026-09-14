@@ -24,7 +24,7 @@ const PRODUCER = {
 afterEach(dispose);
 
 describe("persistent provenance store", () => {
-	it.each(["held", "scan_failure", "delete_failure"] as const)("drains admitted publication and every maintenance sibling (%s)", async (phase) => {
+	it.each(["held", "scan_failure", "delete_failure"] as const)("owns publication inputs and drains maintenance siblings (%s)", async (phase) => {
 		const root = await temporaryRoot();
 		const initial = new ProvenanceCertificateStore(root);
 		expect(await initial.mayHaveCertificates()).toBe(false);
@@ -39,7 +39,10 @@ describe("persistent provenance store", () => {
 		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
 		expect(parseProcessCertificate(legacy)).toBeUndefined();
 		for (const version of [2, 6]) expect(parseProcessCertificate({ ...certificate, version })).toBeUndefined();
-		expect(await initial.put(certificate)).toBe(true);
+		const mutable = structuredClone(certificate), publishing = initial.put(mutable);
+		await Promise.resolve();
+		Object.assign(mutable, completed(first, 123, "changed"));
+		expect(await publishing).toBe(true);
 		expect(await initial.put(duplicate)).toBe(false);
 		expect(await initial.mayHaveCertificates()).toBe(true);
 
@@ -209,8 +212,10 @@ describe("persistent provenance store", () => {
 		}
 		const reference = await cas.put("leased bytes");
 		expect(await cas.has(reference)).toBe(true);
-		expect((await cas.get(reference))?.toString("utf8")).toBe("leased bytes");
-		const closure = await cas.load([reference, reference]);
+		const mutable = { ...reference }, pending = Promise.all([cas.get(mutable), cas.load([reference, mutable])]);
+		mutable.digest = sha256Digest("mutated");
+		const [bytes, closure] = await pending;
+		expect(bytes?.toString("utf8")).toBe("leased bytes");
 		if (!closure) throw new Error("expected verified closure");
 		expect(closure).toMatchObject({ artifacts: 1, bytes: reference.size });
 
