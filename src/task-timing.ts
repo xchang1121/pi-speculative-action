@@ -103,18 +103,13 @@ function unionDuration(intervals: readonly TimelineInterval[]): number {
 		(left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt,
 	);
 	let total = 0;
-	let current: TimelineInterval | undefined;
+	let start = 0, end = 0;
 	for (const interval of sorted) {
-		if (!current) {
-			current = interval;
-			continue;
+		if (interval.startedAt > end) {
+			total += end - start;
+			start = interval.startedAt;
 		}
-		if (interval.startedAt <= current.completedAt) {
-			current = { startedAt: current.startedAt, completedAt: Math.max(current.completedAt, interval.completedAt) };
-			continue;
-		}
-		total += current.completedAt - current.startedAt;
-		current = interval;
+		end = Math.max(end, interval.completedAt);
 	}
-	return current ? total + current.completedAt - current.startedAt : total;
+	return total + end - start;
 }

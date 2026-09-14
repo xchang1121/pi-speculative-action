@@ -18,6 +18,7 @@ import {
 	captureResourceVersion,
 	closeResourceVersionManagers,
 	ResourceVersionManager,
+	type ResourceVersionToken,
 	releaseResourceVersion,
 	resourceDependencies,
 } from "../src/resource-version.ts";
@@ -33,54 +34,67 @@ afterEach(async () => {
 
 describe("speculative action resource versions", () => {
 	test.each([true, false])("seals eager observations and on-demand inputs (watch=%s)", async (watch) => {
-		for (const onDemand of [false, true]) for (const change of ["unchanged", "sibling", "write", "restore", "replace", "entries"] as const) {
-			const root = await workspace({ "value.txt": "A" });
+		for (const onDemand of [false, true]) for (const change of ["unchanged", "ancestor", "sibling", "write", "restore", "replace", "entries"] as const) {
+			const parent = await workspace({ "workspace/value.txt": "A" }), root = path.join(parent, "workspace");
 			const file = path.join(root, "value.txt");
 			const manager = new ResourceVersionManager(root, { watch });
 			const target = change === "entries" ? ["."] : ["value.txt"];
-			const token = await manager.capture(onDemand ? undefined : resourceDependencies(action(change === "entries" ? "ls" : "read", target), root), 8192);
-			if (onDemand) {
-				expect((await manager.validate(token)).expired).toBe(true); // Open capture is never an adoptable certificate.
-				const value = change === "entries" ? root : file, view = token.view!;
-				const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
-				for (const capture of watch ? inputs : inputs.reverse()) await capture();
-				const evidence = [view.bytes, [...token.observations]];
-				const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat"), resolved = vi.spyOn(fs, "realpath");
-				try {
-					expect(await view.exists(value)).toBe(true);
-					for (const fields of [undefined, "type", "entry"] as const) {
-						const info = await view.stat(value, fields);
-						expect(info.isDirectory()).toBe(change === "entries");
-						expect(info.size).toBe(change !== "entries" && !fields ? 1 : undefined);
-					}
-					if (change !== "entries") await view.access(value);
-					expect([opened.mock.calls.length, stat.mock.calls.length, resolved.mock.calls.length, view.bytes, [...token.observations]])
-						.toEqual([0, 0, 0, ...evidence]);
-				} finally { opened.mockRestore(); stat.mockRestore(); resolved.mockRestore(); }
-				expect(change === "entries" ? await view.readdir(root) : (await view.readFile(file)).toString()).toEqual(change === "entries" ? ["value.txt"] : "A");
-			}
-			if (change === "write" || change === "restore") await fs.writeFile(file, "B");
-			if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
-			if (change === "restore") {
-				await fs.writeFile(file, "A");
-				await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
-			}
-			if (change === "replace" || change === "entries") {
-				const temporary = path.join(root, "temporary.txt");
-				await fs.writeFile(temporary, "A");
-				if (change === "replace") await fs.rename(temporary, file);
-				else {
-					await fs.rm(temporary);
-					await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
+			// Only ancestors outside this fixture are fixed; its parent, workspace and files stay physical.
+			const ancestors = new Map<string, import("node:fs").BigIntStats>(), nativeStat = fs.lstat;
+			if (!onDemand) for (let directory = path.dirname(parent); !ancestors.has(directory); directory = path.dirname(directory))
+				ancestors.set(directory, await nativeStat(directory, { bigint: true }));
+			const stat = onDemand ? undefined : vi.spyOn(fs, "lstat").mockImplementation((async (file, options) =>
+				(options?.bigint && ancestors.get(String(file))) || nativeStat(file, options)) as typeof fs.lstat);
+			let token: ResourceVersionToken | undefined;
+			try {
+				token = await manager.capture(onDemand ? undefined : resourceDependencies(action(change === "entries" ? "ls" : "read", target), root), 8192);
+				if (onDemand) {
+					expect((await manager.validate(token)).expired).toBe(true); // Open capture is never an adoptable certificate.
+					const value = change === "entries" ? root : file, view = token.view!;
+					const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
+					for (const capture of watch ? inputs : inputs.reverse()) await capture();
+					const evidence = [view.bytes, [...token.observations]];
+					const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat"), resolved = vi.spyOn(fs, "realpath");
+					try {
+						expect(await view.exists(value)).toBe(true);
+						for (const fields of [undefined, "type", "entry"] as const) {
+							const info = await view.stat(value, fields);
+							expect(info.isDirectory()).toBe(change === "entries");
+							expect(info.size).toBe(change !== "entries" && !fields ? 1 : undefined);
+						}
+						if (change !== "entries") await view.access(value);
+						expect([opened.mock.calls.length, stat.mock.calls.length, resolved.mock.calls.length, view.bytes, [...token.observations]])
+							.toEqual([0, 0, 0, ...evidence]);
+					} finally { opened.mockRestore(); stat.mockRestore(); resolved.mockRestore(); }
+					expect(change === "entries" ? await view.readdir(root) : (await view.readFile(file)).toString()).toEqual(change === "entries" ? ["value.txt"] : "A");
 				}
-			}
-			token.view!.seal();
-			expect((await manager.validate(token)).expired, change).toBe(change === "write");
-			expect((await manager.seal(token)).expired, change).toBe(onDemand || process.platform === "win32" || change !== "unchanged");
-			const released = manager.validate(token);
-			releaseResourceVersion(token);
-			expect((await released).expired).toBe(true); // Release during validation retires the evidence, not just its payload.
-			manager.close();
+				if (change === "write" || change === "restore") await fs.writeFile(file, "B");
+				if (change === "unchanged") await directories.create(); // Shared ancestor noise must not change this fixture's expected outcome.
+				if (change === "ancestor") await fs.mkdir(path.join(parent, "unrelated"));
+				if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
+				if (change === "restore") {
+					await fs.writeFile(file, "A");
+					await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
+				}
+				if (change === "replace" || change === "entries") {
+					const temporary = path.join(root, "temporary.txt");
+					await fs.writeFile(temporary, "A");
+					if (change === "replace") await fs.rename(temporary, file);
+					else {
+						await fs.rm(temporary);
+						await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
+					}
+				}
+				token.view!.seal();
+				expect((await manager.validate(token)).expired, change).toBe(change === "write");
+				const sealed = await manager.seal(token);
+				expect(sealed.expired, JSON.stringify({ watch, onDemand, change, sealed })).toBe(onDemand || process.platform === "win32" || change !== "unchanged");
+				if (change === "ancestor" && !onDemand && process.platform !== "win32")
+					expect(sealed).toMatchObject({ mode: "exact", reason: "resource_observation_window_changed" });
+				const released = manager.validate(token);
+				releaseResourceVersion(token);
+				expect((await released).expired).toBe(true); // Release during validation retires the evidence, not just its payload.
+			} finally { await token?.release(); stat?.mockRestore(); manager.close(); }
 		}
 	});
 

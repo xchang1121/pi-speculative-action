@@ -352,10 +352,10 @@ function candidateCacheValue<Output>(
 }
 
 function executionDuration<Output>(
-	candidate: CandidateRecord<Output>,
+	candidate: CandidateRecord<Output> | undefined,
 ): number {
-	const execution = candidate.work.execution;
-	return "executionMs" in execution ? execution.executionMs : 0;
+	const execution = candidate?.work.execution;
+	return execution && "executionMs" in execution ? execution.executionMs : 0;
 }
 
 function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
@@ -2082,11 +2082,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		state.session.timeline?.recordTool(settlement.provider.toolExecution);
 		if (selection?.projection) state.session.timeline?.recordTool(selection.projection);
 		const key = actorAction.actionKey;
-		const settledCandidate =
-			selection?.candidate ??
-			(settlement.provider.kind === "speculative"
-				? runtimeState.candidates.get(state.sessionID, settlement.provider.candidateID)
-				: undefined);
+		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
 			? Object.freeze(candidateEventDescriptor(settledCandidate))
 			: undefined;
@@ -2127,9 +2123,7 @@ export function makeStructuralSpeculativeActionRuntime<
 						durationMs:
 							settlement.provider.kind === "actor"
 								? settlement.provider.durationMs
-								: settledCandidate
-									? executionDuration(settledCandidate)
-									: candidateExecutionDuration(state.session, settlement.provider.candidateID),
+								: executionDuration(settledCandidate),
 						order: settlement.actorAction.sequence,
 					});
 					if (state.lifecycle === "active") {
@@ -2889,11 +2883,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		dispose,
 		inspect,
 	};
-
-	function candidateExecutionDuration(session: Session, candidateID: string): number {
-		const execution = runtimeState.candidates.get(session.id, candidateID)?.work.execution;
-		return execution && "executionMs" in execution ? execution.executionMs : 0;
-	}
 
 	function recordValidation(candidate: Candidate, validation: ResourceValidation): void {
 		candidate.validationMs += finiteMetric(validation.metrics.durationMs);
