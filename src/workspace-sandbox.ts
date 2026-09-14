@@ -942,11 +942,9 @@ async function createPrivateSandboxWorkspace(
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWorkspace): Promise<WorkspaceTransactionDriver> {
-	interface Capture extends WorkspaceTransactionCapture {
+	interface Capture {
 		contaminated: boolean;
-		settled: boolean;
 		readonly before?: WorkspaceStructureSnapshot;
-		readonly frontier?: ReadonlyMap<string, RegularFileState | undefined>;
 	}
 	const baselineTree = (await workspace.pool.git(["rev-parse", `${workspace.commit}^{tree}`], { cwd: workspace.processRoot })).toString("utf8").trim();
 	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
@@ -987,26 +985,20 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 					poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
 				}
 			}
-			const capture: Capture = {
-				contaminated, settled: false,
-				before, frontier: before ? new Map(frontier) : undefined,
-				finish: () => finish(capture), abort: () => abort(capture),
-			};
+			const capture: Capture = { contaminated, before };
 			active.add(capture);
-			return capture;
+			return { finish: () => finish(capture), abort: () => abort(capture) };
 		});
 
 	async function finish(capture: Capture): Promise<WorkspaceTransactionDelta> {
 		return withWorkspaceLock(lock, async () => {
-			if (capture.settled || !active.has(capture)) {
+			if (!active.delete(capture)) {
 				return { complete: false, changes: [], reason: "transaction_already_settled" };
 			}
-			capture.settled = true;
-			active.delete(capture);
 			if (capture.contaminated) {
 				return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
 			}
-			if (!capture.before || !capture.frontier) {
+			if (!capture.before) {
 				return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
 			}
 			try {
@@ -1022,7 +1014,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 					poisonReason = transitions.reason;
 					return { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
 				}
-				const changes = await captureTransitions(transitions.paths, capture.frontier, after);
+				const changes = await captureTransitions(transitions.paths, after);
 				const verified = await captureStructure();
 				if (!sameWorkspaceChangeSnapshot(after, verified)) {
 					throw new Error("workspace changed while sealing transaction endpoint");
@@ -1098,9 +1090,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 
 	async function abort(capture: Capture): Promise<void> {
 		await withWorkspaceLock(lock, async () => {
-			if (capture.settled) return;
-			capture.settled = true;
-			active.delete(capture);
+			if (!active.delete(capture)) return;
 			for (const capture of active) capture.contaminated = true;
 		});
 	}
@@ -1141,7 +1131,6 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 
 	async function captureTransitions(
 		paths: readonly string[],
-		beforeFrontier: ReadonlyMap<string, RegularFileState | undefined>,
 		after: WorkspaceStructureSnapshot,
 	): Promise<readonly WorkspaceRegularDelta[]> {
 		const changes: WorkspaceRegularDelta[] = [];
@@ -1149,8 +1138,9 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		let afterBytes = 0;
 		let retainedBytes = stateMapBytes(frontier);
 		for (const relativePath of paths) {
-			const previous = beforeFrontier.has(relativePath)
-				? beforeFrontier.get(relativePath)
+			// The lock and overlap rejection keep this frontier unchanged throughout the interval.
+			const previous = frontier.has(relativePath)
+				? frontier.get(relativePath)
 				: await readGitTreeRegularState(
 						git,
 						baselineTree,

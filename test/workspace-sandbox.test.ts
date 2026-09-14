@@ -969,17 +969,9 @@ describe("workspace-branch ExecutionWorld", () => {
 			const first = await workspace.transactions.begin();
 			const second = await workspace.transactions.begin();
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "overlap\n", "utf8");
-			const [firstDelta, secondDelta] = await Promise.all([first.finish(), second.finish()]);
-			expect(firstDelta).toMatchObject({
-				complete: false,
-				changes: [],
-				reason: "overlapping_workspace_transaction",
-			});
-			expect(secondDelta).toMatchObject({
-				complete: false,
-				changes: [],
-				reason: "overlapping_workspace_transaction",
-			});
+			for (const delta of await Promise.all([first.finish(), second.finish()])) {
+				expect(delta).toMatchObject({ complete: false, changes: [], reason: "overlapping_workspace_transaction" });
+			}
 
 			const recovered = await workspace.transactions.begin();
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "recovered\n", "utf8");
