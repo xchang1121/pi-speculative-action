@@ -1,10 +1,11 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype as basePrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	processWeakKey,
+	referencedArtifacts,
 	sha256Digest,
 	type ProcessProvenanceCertificate,
 } from "../src/provenance-certificate.ts";
@@ -139,7 +140,8 @@ describe("ProcessReusePlanner", () => {
 		} finally { freezing.mockRestore(); find.mockRestore(); }
 	});
 
-	it.each(["l2", "live", "handoff"])("validates batched input states without rereading attempted disk copies (%s)", async (source) => {
+	it.each(["l2", "live", "handoff", "cross-turn"])("validates batched input states without rereading attempted disk copies (%s)", async (source) => {
+		const handoff = source === "handoff" || source === "cross-turn";
 		const { input, store, request, planner, certificates } = await fixtureWithCertificate(false, [], ["one", "two", "three"]);
 		await writeFile(input, "one");
 
@@ -150,34 +152,39 @@ describe("ProcessReusePlanner", () => {
 			return plan.kind === "completed_replay" ? plan : undefined;
 		};
 		const registry = new ProcessHandoffRegistry(3), scope = { sessionID: "test", turnID: "test" };
-		if (source === "handoff") for (const certificate of certificates.slice(0, 2)) {
+		if (handoff) for (const certificate of certificates.slice(0, 2)) {
 			const work = await registry.acquire({ key: request.weakKey, scope, role: "producer",
 				ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
 			if (work.kind !== "work") throw new Error("expected work");
 			await registry.publish(request.weakKey, work.work, certificate, async () => false);
 		}
-		const acquire = () => registry.acquire({ key: request.weakKey, scope, role: "actor", lookup, waitForRunning: async () => "miss" });
-		const acquired = source === "handoff" ? await acquire() : undefined;
-		const plan = source === "handoff" ? acquired?.kind === "hit" ? acquired.plan : undefined
+		const acquire = () => registry.acquire({ key: request.weakKey, scope: source === "cross-turn" ? { ...scope, turnID: "next" } : scope,
+			role: "actor", lookup, waitForRunning: async () => "miss" });
+		const acquired = handoff ? await acquire() : undefined;
+		const plan = handoff ? acquired?.kind === "hit" ? acquired.plan : undefined
 			: await lookup(source === "live" ? certificates : undefined);
 
 		expect(plan).toMatchObject({
 			kind: "completed_replay",
 			source: source === "live" ? "live" : "l2", certificate: { id: certificates[2]!.id },
 			lookup: {
-				candidateCertificates: source === "handoff" ? 1 : 3,
-				eligibleCertificates: source === "handoff" ? 1 : 3,
+				candidateCertificates: handoff ? 1 : 3,
+				eligibleCertificates: handoff ? 1 : 3,
 				pathsetsValidated: 1,
 				filesRead: 1,
 				bytesRead: 3,
 			},
 		});
-		expect(get).toHaveBeenCalledTimes(source === "live" ? 0 : source === "handoff" ? 1 : 3);
-		if (source === "handoff") {
+		expect(get).toHaveBeenCalledTimes(source === "live" ? 0 : handoff ? 1 : 3);
+		if (handoff) {
 			await writeFile(input, "changed");
 			expect(await acquire()).toMatchObject({ kind: "miss" });
 			await writeFile(input, "three");
 			expect(await acquire()).toMatchObject({ kind: "hit", plan: { source: "live", certificate: { id: certificates[0]!.id } } });
+			const hex = referencedArtifacts(certificates[1]!)[0]!.digest.slice(7);
+			await unlink(path.join(store.artifacts.root, "sha256", hex.slice(0, 2), hex.slice(2)));
+			await writeFile(input, "two");
+			expect(await acquire(), "in-memory evidence still requires a complete effect closure").toMatchObject({ kind: "miss" });
 		}
 	});
 });

@@ -32,7 +32,7 @@ export interface ProcessReuseRequest {
 	readonly acceptProducer?: (proof: ProcessProducerProof) => boolean;
 	/** Already attempted certificate identities; skipping them grants no replay authority. */
 	readonly excludedCertificates?: ReadonlySet<Sha256Digest>;
-	/** Same-scope handoff candidates; accepted taints are never written into persistent history. */
+	/** Sealed handoff candidates; accepting tainted inputs requires a same-scope transfer. */
 	readonly live?: {
 		readonly certificate: ProcessProvenanceCertificate | readonly ProcessProvenanceCertificate[];
 		readonly acceptedTaints: readonly ProvenanceTaint[];
