@@ -1,5 +1,6 @@
 import { clampProbability, nonNegativeFinite } from "./number-utils.ts";
 import { createHash } from "node:crypto";
+import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -312,7 +313,6 @@ export class PatternAwareStore {
 	private indexDirty = true;
 	private clock = 0;
 	private write: Promise<void> = Promise.resolve();
-	private writeError?: unknown;
 	private dirty = false;
 	private persistTimer?: ReturnType<typeof setTimeout>;
 	private loaded = false;
@@ -895,11 +895,6 @@ export class PatternAwareStore {
 			}
 			this.enqueuePersist();
 			await this.write;
-			if (this.writeError) {
-				const error = this.writeError;
-				this.writeError = undefined;
-				throw error;
-			}
 			if (!this.dirty) return;
 		}
 	}
@@ -1305,22 +1300,8 @@ export class PatternAwareStore {
 			sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
 		};
 		const target = this.persistenceFile;
-		this.write = this.write
-			.catch(() => undefined)
-			.then(async () => {
-				await fs.mkdir(path.dirname(target), { recursive: true });
-				const temporary = `${target}.${process.pid}.tmp`;
-				await fs.writeFile(temporary, `${JSON.stringify(state)}\n`, "utf8");
-				await fs.rename(temporary, target).catch(async () => {
-					await fs.rm(target, { force: true });
-					await fs.rename(temporary, target);
-				});
-				this.writeError = undefined;
-			})
-			.catch((error) => {
-				this.writeError = error;
-				this.dirty = true;
-			});
+		this.write = this.write.catch(() => undefined).then(() => writeJsonFile(target, state));
+		void this.write.catch(() => { this.dirty = true; });
 	}
 
 	private persistedLearningState(): {

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -164,4 +164,17 @@ export async function assertNoSymlinkPath(root: string, target: string): Promise
 			throw error;
 		}
 	}
+}
+
+/** Publish an owned JSON stage without deleting the previous snapshot on failure. */
+export async function writeJsonFile(file: string, value: unknown, space?: number): Promise<void> {
+	if (value === undefined) return fs.rm(file, { force: true });
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temporary = `${file}.${randomUUID()}.tmp`;
+	const handle = await fs.open(temporary, "wx");
+	try {
+		try { await handle.writeFile(`${JSON.stringify(value, null, space)}\n`, "utf8"); }
+		finally { await handle.close(); }
+		await fs.rename(temporary, file);
+	} finally { await fs.rm(temporary, { force: true }).catch(() => undefined); }
 }
