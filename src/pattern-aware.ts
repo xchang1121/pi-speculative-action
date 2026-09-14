@@ -1498,17 +1498,16 @@ class PatternBindingAnalysis {
 		return value;
 	}
 
-	private valueIndex<Location>(
-		value: unknown,
-		key: string,
-		entries: () => Iterable<readonly [Location, unknown]>,
-	): ReadonlyMap<string, ReadonlyArray<Location>> {
-		return this.memo(value, key, () => {
-			const index = new Map<string, Location[]>();
-			for (const [location, item] of entries()) {
-				const key = stableStringify(item), locations = index.get(key) ?? [];
-				locations.push(location);
-				index.set(key, locations);
+	private valueIndex(value: unknown) {
+		return this.memo(value, "value-index", () => {
+			const index = new Map<string, { leaves: PatternAwarePath[]; collections: CollectionLocation[] }>();
+			for (const [path, item] of this.leaves(value)) {
+				const key = stableStringify(item);
+				let locations = index.get(key);
+				if (!locations) index.set(key, locations = { leaves: [], collections: [] });
+				locations.leaves.push(path);
+				const collection = path.findIndex(segment => typeof segment === "number");
+				if (collection >= 0) locations.collections.push({ path: path.slice(0, collection), itemPath: path.slice(collection + 1) });
 			}
 			return index;
 		});
@@ -1533,11 +1532,10 @@ class PatternBindingAnalysis {
 	): Record<string, PatternAwareBinding> | undefined {
 		if (!samples.length) return;
 		const bindings: Record<string, PatternAwareBinding> = {};
-		const targetPaths = new Map(
-			samples.flatMap((sample) =>
-				this.leaves(sample.target.input).map(([targetPath]) => [encodePath(targetPath), targetPath] as const),
-			),
-		);
+		const targetPaths = new Map<string, PatternAwarePath>();
+		for (const sample of samples) for (const [targetPath] of this.leaves(sample.target.input)) {
+			targetPaths.set(encodePath(targetPath), targetPath);
+		}
 		for (const [encodedPath, targetPath] of [...targetPaths].sort(([left], [right]) => left.localeCompare(right))) {
 			const targets = samples.map((sample) => getPath(sample.target.input, targetPath));
 			if (targets.some((value) => value === MISSING)) {
@@ -1740,7 +1738,9 @@ class PatternBindingAnalysis {
 					};
 				}
 			}
-			yield* collectionBindings(this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
+			yield* collectionBindings(
+				this.valueIndex(value).get(stableStringify(target))?.collections ?? [], relativeEvent, field, target, targetIsPath,
+			);
 		}
 		if (targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
@@ -1768,31 +1768,14 @@ class PatternBindingAnalysis {
 		targetIsPath: boolean,
 	): Generator<PatternAwareBinding, undefined> {
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
-			for (const sourcePath of this.indexedLeaves(value, target)) {
+			const locations = this.valueIndex(value).get(stableStringify(target));
+			if (!locations) continue;
+			for (const sourcePath of locations.leaves) {
 				if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
 				yield { type: "event", relativeEvent, field, path: sourcePath };
 			}
-			yield* collectionBindings(this.indexedCollections(value, target), relativeEvent, field, target, targetIsPath);
+			yield* collectionBindings(locations.collections, relativeEvent, field, target, targetIsPath);
 		}
-	}
-
-	indexedLeaves(value: unknown, target: unknown): ReadonlyArray<PatternAwarePath> {
-		return this.valueIndex(value, "leaf-index", () => this.leaves(value)).get(stableStringify(target)) ?? [];
-	}
-
-	indexedCollections(value: unknown, target: unknown): ReadonlyArray<CollectionLocation> {
-		return this.valueIndex(value, "collection-index", () => this.collectionEntries(value)).get(stableStringify(target)) ?? [];
-	}
-
-	*collectionEntries(value: unknown, path: PatternAwarePath = []): Generator<readonly [CollectionLocation, unknown], undefined> {
-		if (Array.isArray(value)) {
-			for (const item of value) for (const [itemPath, candidate] of this.leaves(item)) {
-				yield [{ path: [...path], itemPath }, candidate];
-			}
-			return;
-		}
-		const record = asRecord(value);
-		if (record) for (const [key, item] of Object.entries(record)) yield* this.collectionEntries(item, [...path, key]);
 	}
 
 	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
@@ -1838,16 +1821,13 @@ class PatternBindingAnalysis {
 		return this.bindingValues(binding, context).some((value) => sameValue(value, target));
 	}
 
-	leaves(value: unknown): Array<[Array<string | number>, unknown]> {
-		return this.memo(value, "leaves", () => {
-			if (!isObject(value)) return [[[], value]];
-			const array = Array.isArray(value);
-			const entries: Array<[string | number, unknown]> = array
-				? value.map((item, index) => [index, item]) : Object.entries(value);
-			return entries.length ? entries.flatMap(([key, item]) => this.leaves(item).map(
-				([segments, leaf]): [Array<string | number>, unknown] => [[key, ...segments], leaf],
-			)) : [[[], array ? [] : {}]];
-		});
+	*leaves(value: unknown, segments: PatternAwarePath = []): Generator<readonly [PatternAwarePath, unknown], undefined> {
+		if (!isObject(value)) { yield [segments, value]; return; }
+		const array = Array.isArray(value);
+		const entries: Array<[string | number, unknown]> = array
+			? value.map((item, index) => [index, item]) : Object.entries(value);
+		if (!entries.length) yield [segments, this.memo(value, "empty-leaf", () => array ? [] : {})];
+		for (const entry of entries) if (entry) yield* this.leaves(entry[1], [...segments, entry[0]]);
 	}
 }
 
