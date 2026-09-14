@@ -1,16 +1,10 @@
 import { nonNegativeCount as sequence, nonNegativeFinite as finite, positiveCount as units } from "./number-utils.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import type { SpeculativeExecution, WorldCompatibilityEvidence } from "./execution-world.ts";
+import type { WorldCompatibilityEvidence } from "./execution-world.ts";
 import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
-import type {
-	SpeculativeResourceBudget,
-	SpeculativeResourceClass,
-	SpeculativeResourceProfile,
-} from "./resource-budget.ts";
-import { resourceProfile, speculativeResourceBudget } from "./resource-budget.ts";
+import { fitsResourceBudget } from "./resource-budget.ts";
 
 export interface PredictionForecast extends ServiceTimingIdentity {
-	readonly execution: SpeculativeExecution;
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
@@ -27,7 +21,7 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 
 export interface ScheduledWork {
 	readonly expectedDurationMs: number;
-	readonly resource: SpeculativeResourceProfile;
+	readonly resourceUnits: number;
 	readonly decisionBatchesUntilCall: number;
 	readonly criticalPathMs: number;
 	readonly priorityMs: number;
@@ -165,18 +159,17 @@ export class SpeculationScheduler<Job extends object> {
 	admit(
 		job: Job,
 		forecasts: readonly PredictionForecast[],
-		capacity: number | SpeculativeResourceBudget,
+		capacity: number,
 		role: "producer" | "actor" = "producer",
 		/** Ranking may supply its estimate from the same synchronous admission pass. */
 		work: ScheduledWork = this.evaluate(forecasts),
 		/** Physical producer identity; consumer forecasts can describe projected actions. Omit for confirmed Actor previews. */
 		executionIdentity?: ServiceTimingIdentity,
 	): SchedulerAdmission {
-		const budget = normalizeBudget(capacity);
 		if (role === "producer") {
 			if (forecasts.length && !forecasts.some((forecast) => this.canLaunch(forecast, work.expectedDurationMs)))
 				return { admitted: false, work, reason: "not_profitable" };
-			if (!fits([...this.entries.values()], work.resource, budget))
+			if (!fitsResourceBudget(this.entries.values(), work.resourceUnits, capacity))
 				return { admitted: false, work, reason: "budget_exhausted" };
 			if (executionIdentity?.actionKeyHash &&
 				this.speculativeServiceTimes.get(timingKeys(executionIdentity)[0]!)?.allowExecution(job, this.decisionSequence) === false)
@@ -199,18 +192,17 @@ export class SpeculationScheduler<Job extends object> {
 
 	/** Choose cancellation victims; only their executor completion returns physical capacity. */
 	preemptFor(
-		resource: SpeculativeResourceProfile,
-		capacity: number | SpeculativeResourceBudget,
+		resourceUnits: number,
+		capacity: number,
 		canPreempt: (job: Job) => boolean = () => true,
 	): readonly Job[] {
-		const budget = normalizeBudget(capacity);
 		const remaining = [...this.entries.values()];
 		const victims: SchedulerEntry<Job>[] = [];
 		while (
-			!fits(
+			!fitsResourceBudget(
 				remaining.filter((entry) => !victims.includes(entry)),
-				resource,
-				budget,
+				resourceUnits,
+				capacity,
 			)
 		) {
 			const victim = remaining
@@ -225,13 +217,9 @@ export class SpeculationScheduler<Job extends object> {
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
 		if (forecasts.length === 0) return emptyWork();
 		const evaluated = forecasts.map((forecast) => this.evaluateOne(forecast));
-		const resource = evaluated.reduce(
-			(current, item) => mergeResource(current, item.resource),
-			evaluated[0]!.resource,
-		);
 		return {
 			expectedDurationMs: Math.max(...evaluated.map((item) => item.expectedDurationMs)),
-			resource,
+			resourceUnits: Math.max(...evaluated.map((item) => item.resourceUnits)),
 			decisionBatchesUntilCall: Math.min(...evaluated.map((item) => item.decisionBatchesUntilCall)),
 			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
 			priorityMs: Math.max(...evaluated.map((item) => item.priorityMs)),
@@ -368,18 +356,13 @@ export class SpeculationScheduler<Job extends object> {
 
 	private evaluateOne(forecast: PredictionForecast): ScheduledWork {
 		const expectedDurationMs = this.duration(forecast) ?? 1;
-		const baseResource = resourceProfile(forecast.execution);
-		const resource = {
-			class: baseResource.class,
-			units: Math.max(baseResource.units, units(forecast.resourceDemand)),
-		};
 		const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
 		const runwayMs = this.actorRunway(forecast);
 		const benefitDurationMs = positive(forecast.expectedDurationMs, expectedDurationMs);
 		const runwayScale = runwayMs === undefined ? 1 : Math.min(1, runwayMs / benefitDurationMs);
 		return {
 			expectedDurationMs,
-			resource,
+			resourceUnits: units(forecast.resourceDemand),
 			decisionBatchesUntilCall: sequence(forecast.decisionBatchesUntilCall),
 			criticalPathMs,
 			priorityMs:
@@ -534,7 +517,7 @@ function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | und
 function emptyWork(): ScheduledWork {
 	return {
 		expectedDurationMs: 0,
-		resource: { class: "filesystem", units: 1 },
+		resourceUnits: 1,
 		decisionBatchesUntilCall: 0,
 		criticalPathMs: 0,
 		priorityMs: 0,
@@ -550,52 +533,6 @@ function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job
 		left.work.criticalPathMs - right.work.criticalPathMs ||
 		right.sequence - left.sequence
 	);
-}
-
-function normalizeBudget(capacity: number | SpeculativeResourceBudget): SpeculativeResourceBudget {
-	return typeof capacity === "number" ? speculativeResourceBudget(capacity) : capacity;
-}
-
-function mergeResource(
-	left: SpeculativeResourceProfile,
-	right: SpeculativeResourceProfile,
-): SpeculativeResourceProfile {
-	return {
-		class: left.class === right.class ? left.class : "global",
-		units: Math.max(left.units, right.units),
-	};
-}
-
-function fits<Job>(
-	entries: readonly SchedulerEntry<Job>[],
-	incoming: SpeculativeResourceProfile,
-	budget: SpeculativeResourceBudget,
-): boolean {
-	if (totalUnits(entries) + incoming.units > budget.total) return false;
-	for (const resourceClass of resourceClasses()) {
-		const incomingUnits = incoming.class === resourceClass || incoming.class === "global" ? incoming.units : 0;
-		if (classUnits(entries, resourceClass) + incomingUnits > budget.classes[resourceClass]) return false;
-	}
-	return true;
-}
-
-function totalUnits<Job>(entries: readonly SchedulerEntry<Job>[]): number {
-	return entries.reduce((total, entry) => total + entry.work.resource.units, 0);
-}
-
-function classUnits<Job>(entries: readonly SchedulerEntry<Job>[], resourceClass: SpeculativeResourceClass): number {
-	return entries.reduce(
-		(total, entry) =>
-			total +
-			(entry.work.resource.class === resourceClass || entry.work.resource.class === "global"
-				? entry.work.resource.units
-				: 0),
-		0,
-	);
-}
-
-function resourceClasses(): readonly SpeculativeResourceClass[] {
-	return ["filesystem", "workspace", "process", "global"];
 }
 
 function positive(value: number | undefined, fallback: number): number {

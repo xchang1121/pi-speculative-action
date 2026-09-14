@@ -22,7 +22,6 @@ import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validate
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
-import { actionResourceProfile, resourceProfile } from "./resource-budget.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { cloneSharedData } from "./stable-json.ts";
 import { containsLogicalPath } from "./path-utils.ts";
@@ -126,13 +125,11 @@ function definedFields<T, K extends keyof T>(value: T, keys: readonly K[]): Part
 
 function forecastFor(
 	node: PlanRuntimeNode,
-	route: SpeculativeExecutionRoute,
 	decisionSequence: number,
 	actorPhase?: PredictionForecast["actorPhase"],
 ): PredictionForecast {
 	return {
 		tool: node.action.tool,
-		execution: route.isolation,
 		...(node.actionKey
 			? { executionFingerprint: node.actionKey.executionFingerprint, actionKeyHash: node.actionKey.hash }
 			: {}),
@@ -1199,7 +1196,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			session.launchTimers.delete(node.prediction.id);
 			const context = session.actionContexts.get(node.identity.id);
 			if (!context?.executionRoute) continue;
-			const forecast = forecastFor(node, context.executionRoute, session.decisionSequence, actorPhase);
+			const forecast = forecastFor(node, session.decisionSequence, actorPhase);
 			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
@@ -1253,7 +1250,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		await admitCandidate(session, { key: node.actionKey, route, worldParent: parent }, () => {
 			const scheduled = session.scheduler.evaluate([
-				forecastFor(node, route, session.decisionSequence, actorPhaseFor(session)),
+				forecastFor(node, session.decisionSequence, actorPhaseFor(session)),
 			]);
 			return createCandidate(session, context, context.draft, {
 				origin: "prediction",
@@ -1342,7 +1339,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 			if (!admission.admitted && admission.reason === "budget_exhausted" && !work.background) {
 				for (const victim of session.scheduler.preemptFor(
-					admission.work.resource,
+					admission.work.resourceUnits,
 					concurrentLimit(session.settings),
 					(victim) => {
 						if (victim.work.execution.status !== "running" || !reservationAvailable(victim.work.reservation)) return false;
@@ -1545,7 +1542,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		const { route } = admission;
 		const forecast: PredictionForecast = {
 			tool: actualCall.tool,
-			execution: route.isolation,
 			executionFingerprint: action.executionFingerprint,
 			actionKeyHash: action.hash,
 			decisionBatchesUntilCall: 0,
@@ -1703,7 +1699,6 @@ export function makeStructuralSpeculativeActionRuntime<
 				if (candidate.work.execution.status === "queued") {
 					preemptForActor(
 						state.session,
-						resourceProfile(candidate.route.isolation),
 						state.settings,
 						matchingCandidates,
 					);
@@ -1901,7 +1896,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				const failure = cause("matching", "action_not_keyable");
 				abandonActorPreview(state, preview, failure);
 				actorAction.deferToFallback([], undefined, failure);
-				preemptForActor(state.session, { class: "global", units: 1 }, state.settings);
+				preemptForActor(state.session, state.settings);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				return Object.freeze(prepared);
 			}
@@ -1973,7 +1968,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 			const effect = runtimeState.semantics.effect(actualKey);
-			preemptForActor(state.session, actionResourceProfile(effect), state.settings);
+			preemptForActor(state.session, state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			if (adapter.captureAuthoritativeResult && effect === "observation") {
 				const startedAt = performance.now();
@@ -2411,12 +2406,11 @@ export function makeStructuralSpeculativeActionRuntime<
 	): readonly PredictionForecast[] => {
 		const nodes = session.plan.consumers(candidate.id);
 		const actorPhase = actorPhaseFor(session);
-		if (nodes.length) return nodes.map((node) => forecastFor(node, candidate.route, session.decisionSequence, actorPhase));
+		if (nodes.length) return nodes.map((node) => forecastFor(node, session.decisionSequence, actorPhase));
 		if (!candidate.previews?.size && reservationAvailable(candidate.work.reservation)) return [];
 		return [
 			{
 				tool: candidate.key.tool,
-				execution: candidate.route.isolation,
 				executionFingerprint: candidate.key.executionFingerprint,
 				actionKeyHash: candidate.key.hash,
 				expectedDurationMs: candidate.expectedDurationMs,
@@ -2529,12 +2523,11 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const preemptForActor = (
 		session: Session,
-		resource: ReturnType<typeof resourceProfile>,
 		settings: SpeculativeActionSettings,
 		protectedCandidates: readonly Candidate[] = [],
 	): void => {
 		for (const candidate of session.scheduler.preemptFor(
-			resource,
+			1,
 			concurrentLimit(settings),
 			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
 		)) {

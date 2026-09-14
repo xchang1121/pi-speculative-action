@@ -476,12 +476,7 @@ export class LinuxProcessReuseBackend {
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 	}): Promise<LinuxProcessSession> {
-		return this.withProducer(async () => {
-			const session = await this.createSession(input);
-			this.producers++;
-			let closing: Promise<void> | undefined;
-			return { ...session, close: () => closing ??= session.close().finally(() => { this.producers--; }) };
-		});
+		return this.withProducer(() => this.createSession(input));
 	}
 
 	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
@@ -546,6 +541,7 @@ export class LinuxProcessReuseBackend {
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		await listenUnixSocket(server, socketPath);
+		this.producers++;
 		return {
 			ownership: session.ownership,
 			executor: { execute: (request) => {
@@ -566,7 +562,7 @@ export class LinuxProcessReuseBackend {
 					await Promise.allSettled(session.pending);
 					await rm(socketPath, { force: true }).catch(() => undefined);
 				}
-			}),
+			}).finally(() => { this.producers--; }),
 		};
 	}
 

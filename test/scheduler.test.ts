@@ -97,18 +97,19 @@ describe("SpeculationScheduler", () => {
 	it("merges duplicate K(a) forecasts without source-count inflation", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const one = scheduler.evaluate([
-			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120 }),
+			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120, resourceDemand: 2 }),
 		]);
 		const duplicate = scheduler.evaluate([
-			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120 }),
+			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120, resourceDemand: 2 }),
 			forecast({ expectedDurationMs: 80, decisionBatchesUntilCall: 4, criticalPathMs: 100 }),
 		]);
-		expect(duplicate).toEqual(one);
+		expect(duplicate).toEqual({ ...one, resourceUnits: 2 });
+		expect(scheduler.admit({}, [forecast({ resourceDemand: 2 })], 1).admitted).toBe(false);
 	});
 
 	it("defers future work only from observed Actor timing and known service cost", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		const future = forecast({ tool: "bash", execution: "runtime_sandbox", decisionBatchesUntilCall: 2,
+		const future = forecast({ tool: "bash", decisionBatchesUntilCall: 2,
 			actorPhase: { kind: "decision", elapsedMs: 20 } });
 		for (const expectedDurationMs of [undefined, 0, -1, NaN, Infinity, 500])
 			expect(scheduler.launchDelay({ ...future, expectedDurationMs })).toBe(0);
@@ -138,7 +139,7 @@ describe("SpeculationScheduler", () => {
 		scheduler.admit(unlikelyLong, [forecast({ expectedDurationMs: 500, expectedLatencyBenefitMs: 10 })], 2);
 		scheduler.admit(likelyShort, [forecast({ expectedDurationMs: 50, expectedLatencyBenefitMs: 40 })], 2);
 
-		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2)).toEqual([unlikelyLong]);
+		expect(scheduler.preemptFor(1, 2)).toEqual([unlikelyLong]);
 		expect(scheduler.evaluate([forecast({ expectedDurationMs: 50 })])).toMatchObject({
 			criticalPathMs: 50,
 			priorityMs: 50,
@@ -302,7 +303,7 @@ describe("SpeculationScheduler", () => {
 		const background = {};
 		scheduler.admit(foreground, [forecast({ expectedLatencyBenefitMs: 1 })], 2);
 		scheduler.admit(background, [forecast({ background: true, expectedLatencyBenefitMs: 1_000 })], 2);
-		expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => job === background)).toEqual([
+		expect(scheduler.preemptFor(1, 2, (job) => job === background)).toEqual([
 			background,
 		]);
 	});
@@ -313,7 +314,7 @@ describe("SpeculationScheduler", () => {
 			scheduler.admit(near, [forecast({ decisionBatchesUntilCall: 1, criticalPathMs: 500 })], 2);
 			scheduler.admit(far, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
 			const victim = joined ? near : far;
-			expect(scheduler.preemptFor({ class: "filesystem", units: 1 }, 2, (job) => !joined || job !== far)).toEqual([victim]);
+			expect(scheduler.preemptFor(1, 2, (job) => !joined || job !== far)).toEqual([victim]);
 			expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([near, far]);
 			expect(scheduler.admit(next, [forecast()], 2).admitted).toBe(false);
 			scheduler.complete(victim);
@@ -338,7 +339,6 @@ describe("SpeculationScheduler", () => {
 function forecast(overrides: Partial<PredictionForecast> = {}): PredictionForecast {
 	return {
 		tool: "read",
-		execution: "resource_snapshot",
 		expectedDurationMs: 50,
 		decisionBatchesUntilCall: 1,
 		...overrides,
