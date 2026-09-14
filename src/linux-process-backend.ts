@@ -1128,23 +1128,8 @@ export class LinuxProcessReuseBackend {
 				stage = "artifacts";
 				const journal: OrderedEffectEvent[] = [];
 				let sequence = 0;
-				const changes = new Map(delta.changes.map((change) => [path.normalize(change.relativePath), change]));
 				for (const effect of effects.effects) {
-					switch (effect.kind) {
-						case "delete":
-						case "write": {
-							const change = changes.get(path.normalize(effect.relativePath));
-							if (!change) throw new Error(`transaction change is unavailable: ${effect.relativePath}`);
-							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, change));
-							break;
-						}
-						case "rmdir":
-							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, { kind: "directory", before: effect.before }));
-							break;
-						case "mkdir":
-							journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, { kind: "directory", after: effect.after }));
-							break;
-					}
+					journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, effect.change));
 				}
 				for (const event of outcome.output) {
 					const data = await this.store.artifacts.put(event.data);
@@ -1364,7 +1349,6 @@ async function sealSessionEvidence(
 			effects.effects,
 		);
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
-		if (!effects.complete) session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
 		session.topLevelEvidence = mergeDependencyEvidence(
 			[
 				{
@@ -1372,7 +1356,6 @@ async function sealSessionEvidence(
 						capture.before.complete &&
 						capture.after.complete &&
 						capture.observation.complete &&
-						effects.complete &&
 						evidence.complete,
 					dependencies: evidence.dependencies,
 					taints: [...new Set([...capture.observation.taints, ...evidence.taints])],
@@ -1396,36 +1379,17 @@ async function sourceDirectoryChanges(
 ): Promise<readonly SandboxDirectoryChange[]> {
 	const changes: SandboxDirectoryChange[] = [];
 	for (const effect of effects) {
-		if (effect.kind !== "mkdir" && effect.kind !== "rmdir") continue;
+		if (effect.change.kind !== "directory") continue;
 		const resource = slash(path.normalize(effect.relativePath));
 		const target = path.resolve(session.sourceRoot, resource);
 		if (!pathContains(session.sourceRoot, target) || target === path.resolve(session.sourceRoot)) {
 			throw new Error(`directory effect escapes source workspace: ${effect.relativePath}`);
 		}
 		const sourceBefore = await readSandboxDirectoryState(target);
-		if (effect.kind === "mkdir") {
+		const before = effect.change.before ? directoryState(effect.change.before) : undefined;
+		if (before === undefined) {
 			if (sourceBefore !== undefined) throw new Error(`directory creation baseline changed: ${resource}`);
-			changes.push({
-				kind: "directory",
-				root: session.sourceRoot,
-				target,
-				resource,
-				after: {
-					entriesDigest: effect.after.entriesDigest,
-					mode: effect.after.mode,
-					uid: effect.after.uid,
-					gid: effect.after.gid,
-				},
-			});
-			continue;
-		}
-		const sandboxBefore = {
-			entriesDigest: effect.before.entriesDigest,
-			mode: effect.before.mode,
-			uid: effect.before.uid,
-			gid: effect.before.gid,
-		};
-		if (!sameDirectoryStateValue(sourceBefore, sandboxBefore)) {
+		} else if (!sameDirectoryStateValue(sourceBefore, before)) {
 			throw new Error(`source directory differs from execution baseline: ${resource}`);
 		}
 		changes.push({
@@ -1433,7 +1397,8 @@ async function sourceDirectoryChanges(
 			root: session.sourceRoot,
 			target,
 			resource,
-			before: sandboxBefore,
+			...(before ? { before } : {}),
+			...(effect.change.after ? { after: directoryState(effect.change.after) } : {}),
 		});
 	}
 	return Object.freeze(changes);
@@ -1498,7 +1463,7 @@ async function captureDependencies(
 	session: ActiveSession,
 	before: ReturnType<typeof transactionDependencySource>,
 	observed: readonly ObservedProcessPath[],
-	effects: readonly { readonly logicalPath: string; readonly relativePath: string; readonly before?: unknown }[],
+	effects: readonly { readonly logicalPath: string }[],
 ) {
 	const dependencies = new Map<string, DynamicDependency>();
 	const taints = new Set<ProvenanceTaint>();

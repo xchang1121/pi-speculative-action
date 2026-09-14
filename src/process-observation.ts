@@ -169,26 +169,18 @@ async function captureExistingWorkspaceStructureEntry(
 	};
 }
 
-/** Effect shape used only to seal input evidence; replay bytes remain owned by the transaction. */
-type WorkspaceTransactionEffect =
-	| {
-			readonly kind: "write" | "delete";
-			readonly logicalPath: string;
-			readonly relativePath: string;
-			readonly before?: WorkspaceTreeEntry;
-	  }
-	| {
-			readonly kind: "mkdir";
-			readonly logicalPath: string;
-			readonly relativePath: string;
-			readonly after: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
-	  }
-	| {
-			readonly kind: "rmdir";
-			readonly logicalPath: string;
-			readonly relativePath: string;
-			readonly before: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
-	  };
+/** Validated transaction changes, ordered for replay without copying or hashing their bytes. */
+interface WorkspaceTransactionEffect {
+	readonly logicalPath: string;
+	readonly relativePath: string;
+	readonly change:
+		| (WorkspaceRegularDelta & { readonly kind?: "file" })
+		| {
+				readonly kind: "directory";
+				readonly before?: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
+				readonly after?: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>;
+		  };
+}
 
 export interface WorkspaceTransactionDiff {
 	readonly effects: readonly WorkspaceTransactionEffect[];
@@ -228,9 +220,9 @@ export function diffWorkspaceStructures(
 		const current = after.entries.get(relativePath);
 		const delta = byPath.get(relativePath);
 		if (delta) {
-			const joined = joinRegularDelta(relativePath, previous, current, delta, projection, after.root);
-			if ("reason" in joined) return { effects: [], complete: false, reason: joined.reason };
-			effects.push(joined.effect);
+			const reason = regularDeltaFailure(relativePath, previous, current, delta);
+			if (reason) return { effects: [], complete: false, reason };
+			effects.push({ logicalPath: projection.toLogical(path.join(after.root, relativePath)), relativePath, change: delta });
 			continue;
 		}
 		if (sameStructureEntry(previous, current)) continue;
@@ -243,11 +235,11 @@ export function diffWorkspaceStructures(
 			}
 			const logicalPath = projection.toLogical(path.join(after.root, relativePath));
 			if (previous === undefined && current?.kind === "directory") {
-				effects.push({ kind: "mkdir", logicalPath, relativePath, after: current });
+				effects.push({ logicalPath, relativePath, change: { kind: "directory", after: current } });
 				continue;
 			}
 			if (previous?.kind === "directory" && current === undefined) {
-				effects.push({ kind: "rmdir", logicalPath, relativePath, before: previous });
+				effects.push({ logicalPath, relativePath, change: { kind: "directory", before: previous } });
 				continue;
 			}
 			return { effects: [], complete: false, reason: `unsupported_directory_type_change:${relativePath}` };
@@ -261,14 +253,14 @@ function orderWorkspaceTransactionEffects(
 	effects: readonly WorkspaceTransactionEffect[],
 ): WorkspaceTransactionEffect[] {
 	const phase = (effect: WorkspaceTransactionEffect): number =>
-		effect.kind === "delete" ? 0 : effect.kind === "rmdir" ? 1 : effect.kind === "mkdir" ? 2 : 3;
+		effect.change.kind === "directory" ? (effect.change.after === undefined ? 1 : 2) : (effect.change.after === undefined ? 0 : 3);
 	const depth = (effect: WorkspaceTransactionEffect): number =>
 		effect.relativePath.split(path.sep).filter(Boolean).length;
 	return [...effects].sort((left, right) => {
 		const phaseDifference = phase(left) - phase(right);
 		if (phaseDifference !== 0) return phaseDifference;
 		const depthDifference = depth(left) - depth(right);
-		if (left.kind === "delete" || left.kind === "rmdir") {
+		if (left.change.after === undefined) {
 			if (depthDifference !== 0) return -depthDifference;
 		} else if (depthDifference !== 0) return depthDifference;
 		return left.relativePath.localeCompare(right.relativePath);
@@ -289,46 +281,32 @@ export function hydrateWorkspaceFileEntry(
 	};
 }
 
-function joinRegularDelta(
+function regularDeltaFailure(
 	relativePath: string,
 	previous: WorkspaceStructureEntry | undefined,
 	current: WorkspaceStructureEntry | undefined,
 	delta: WorkspaceRegularDelta,
-	projection: ExecutionPathProjection,
-	root: string,
-): { readonly effect: WorkspaceTransactionEffect } | { readonly reason: string } {
-	let beforeEntry: Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined;
+): string | undefined {
 	if (delta.before === undefined) {
-		if (previous !== undefined) return { reason: `delta_before_missing:${relativePath}` };
+		if (previous !== undefined) return `delta_before_missing:${relativePath}`;
 	} else {
-		if (previous?.kind !== "file") return { reason: `delta_before_type:${relativePath}` };
-		if (previous.links !== 1) return { reason: `unsupported_hardlink:${relativePath}` };
+		if (previous?.kind !== "file") return `delta_before_type:${relativePath}`;
+		if (previous.links !== 1) return `unsupported_hardlink:${relativePath}`;
 		if (delta.beforeMode !== undefined && delta.beforeMode !== previous.mode) {
-			return { reason: `delta_before_mode:${relativePath}` };
+			return `delta_before_mode:${relativePath}`;
 		}
-		beforeEntry = hydrateWorkspaceFileEntry(previous, delta.before);
-		if (!beforeEntry) return { reason: `delta_before_size:${relativePath}` };
+		if (delta.before.byteLength !== previous.size) return `delta_before_size:${relativePath}`;
 	}
 
-	const logicalPath = projection.toLogical(path.join(root, relativePath));
 	if (delta.after === undefined) {
-		if (!beforeEntry || current !== undefined) return { reason: `delta_delete_shape:${relativePath}` };
-		return { effect: { kind: "delete", logicalPath, relativePath, before: beforeEntry } };
+		return delta.before === undefined || current !== undefined ? `delta_delete_shape:${relativePath}` : undefined;
 	}
-	if (current?.kind !== "file") return { reason: `delta_after_type:${relativePath}` };
-	if (current.links !== 1) return { reason: `unsupported_hardlink:${relativePath}` };
+	if (current?.kind !== "file") return `delta_after_type:${relativePath}`;
+	if (current.links !== 1) return `unsupported_hardlink:${relativePath}`;
 	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) {
-		return { reason: `delta_after_mode:${relativePath}` };
+		return `delta_after_mode:${relativePath}`;
 	}
-	if (delta.after.byteLength !== current.size) return { reason: `delta_after_size:${relativePath}` };
-	return {
-		effect: {
-			kind: "write",
-			logicalPath,
-			relativePath,
-			...(beforeEntry ? { before: beforeEntry } : {}),
-		},
-	};
+	if (delta.after.byteLength !== current.size) return `delta_after_size:${relativePath}`;
 }
 
 export function snapshotDependency(
