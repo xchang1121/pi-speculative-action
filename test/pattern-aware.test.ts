@@ -1,6 +1,6 @@
 import { deferred, nextTurn } from "./async.ts";
 import fs from "node:fs/promises";
-import os from "node:os";
+import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
@@ -17,11 +17,9 @@ import {
 } from "../src/pattern-aware.ts";
 import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
-const temporary: string[] = [];
+const directories = temporaryDirectories("pi-pattern-");
 
-afterEach(async () => {
-	await Promise.all(temporary.splice(0).map((item) => fs.rm(item, { recursive: true, force: true })));
-});
+afterEach(directories.dispose);
 
 describe("PatternAware", () => {
 	test("late-binds a target input from authoritative structured output paths", () => {
@@ -448,7 +446,7 @@ describe("PatternAware", () => {
 	});
 
 	test("persists a deduplicated learning table and rebuilds its opportunity index", async () => {
-		const file = await patternFile("learning-table");
+		const file = await patternFile();
 		const first = patternStore({}, file);
 		await first.load();
 		trainGrepRead(first, "one", "src/a.ts");
@@ -486,7 +484,7 @@ describe("PatternAware", () => {
 	});
 
 	test.each([19, 20])("restores valid patterns and owns public snapshots (version=%s)", async (version) => {
-		const file = await patternFile("corrupt-state");
+		const file = await patternFile();
 		const restoredInput = { path: "README.md", fields: { "\u00e9": 2, "e\u0301": 1 } };
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
@@ -537,8 +535,7 @@ describe("PatternAware", () => {
 	});
 
 	test.each([false, true])("shares analyzer state and drains every release caller (flush failure=%s)", async (fails) => {
-		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "pi-pattern-lease-"));
-		temporary.push(workspace);
+		const workspace = await directories.create();
 		const first = await acquirePatternAwareStore(workspace, settings());
 		const second = await acquirePatternAwareStore(workspace, settings());
 		const predictorOnly = await acquirePatternAwareStore(
@@ -576,7 +573,7 @@ describe("PatternAware", () => {
 	});
 
 	test("enforces the configured context bound while learning, restoring, and registering patterns", async () => {
-		const file = await patternFile("context-bound");
+		const file = await patternFile();
 		const long = validatedGapPattern(
 			{ "0": 2 },
 			{
@@ -607,7 +604,7 @@ describe("PatternAware", () => {
 	});
 
 	test("transfers data-flow patterns across processes before global support", async () => {
-		const file = await patternFile("pool");
+		const file = await patternFile();
 		const first = patternStore({ minOccurrences: 2 }, file);
 		await first.load();
 		trainGrepRead(first, "one", "src/a.ts");
@@ -629,7 +626,7 @@ describe("PatternAware", () => {
 	});
 
 	test("persists PPM counts so beam ordering survives a process restart", async () => {
-		const file = await patternFile("ppm");
+		const file = await patternFile();
 		const configured = settings({ beamWidth: 1 });
 		const first = new PatternAwareStore(configured, file);
 		await first.load();
@@ -672,7 +669,7 @@ describe("PatternAware", () => {
 			expect.objectContaining({ tool: "read", input: { filePath: "README.md" } }),
 		);
 
-		const file = await patternFile("constant-pool");
+		const file = await patternFile();
 		const train = async (sessionID: string) => {
 			const store = patternStore({ minOccurrences: 2 }, file);
 			await store.load();
@@ -996,7 +993,7 @@ describe("PatternAware", () => {
 	});
 
 	test("contains non-finite persisted variant counts instead of emitting invalid probabilities", async () => {
-		const file = await patternFile("invalid-variants");
+		const file = await patternFile();
 		const first = patternStore({}, file);
 		await first.load();
 		acceptPattern(first, { "0": 10 }, {
@@ -1582,10 +1579,8 @@ function settings(overrides: Partial<typeof PATTERN_AWARE_DEFAULTS> = {}) {
 	return { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, ...overrides };
 }
 
-async function patternFile(label: string): Promise<string> {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), `pi-pattern-${label}-`));
-	temporary.push(directory);
-	return path.join(directory, "patterns.json");
+async function patternFile(): Promise<string> {
+	return path.join(await directories.create(), "patterns.json");
 }
 
 function piActionSemantics() {

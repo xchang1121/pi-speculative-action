@@ -1,3 +1,4 @@
+import { temporaryDirectories } from "./filesystem.ts";
 import { deferred, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
@@ -31,7 +32,7 @@ const writeTool = createWriteTool(process.cwd());
 const editTool = createEditTool(process.cwd());
 
 let sandbox: WorkspaceSandboxService;
-const temporaryRoots = new Set<string>();
+const { create: temporaryRoot, dispose: disposeRoots } = temporaryDirectories("pi-spec-");
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
@@ -40,22 +41,14 @@ vi.mock("node:fs/promises", async (original) => {
 
 afterEach(async () => {
 	try { await sandbox.dispose(); }
-	finally {
-		const roots = [...temporaryRoots]; temporaryRoots.clear();
-		const removed = await Promise.allSettled(roots.map(async (root) => {
-			expect(path.dirname(root)).toBe(path.resolve(os.tmpdir()));
-			expect(path.basename(root)).toMatch(/^pi-spec-/);
-			await rm(root, { recursive: true, force: true });
-		}));
-		expect(removed.filter((result) => result.status === "rejected")).toEqual([]);
-	}
+	finally { await disposeRoots(); }
 });
 
 describe("workspace-branch ExecutionWorld", () => {
 	it("stops cancelled preparation between stages without cancelling a concurrent owner", async () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
-			const root = await temporaryRoot("cancel-prepare"), controller = new AbortController();
+			const root = await temporaryRoot(), controller = new AbortController();
 			let workspaces = 0, captures = 0;
 			const { promise: started, resolve: entered } = deferred(), { promise: gate, resolve: release } = deferred();
 			const capture = ResourceVersionManager.prototype.capture;
@@ -88,13 +81,13 @@ describe("workspace-branch ExecutionWorld", () => {
 				expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("live owner\n");
 			} finally {
 				release(); await pending.catch(() => undefined); observer.mockRestore(); vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp);
-				await sandbox.closePools([root]); await rm(root, { recursive: true, force: true });
+				await sandbox.closePools([root]);
 			}
 		}
 	});
 
 	it.each(["explicit", "idle", "idle-replaced"])("owns %s pool retirement through service disposal", async (retirement) => {
-		const root = await temporaryRoot("service-lifecycle");
+		const root = await temporaryRoot();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const first = new WorkspaceSandboxService();
 		const second = new WorkspaceSandboxService();
@@ -157,14 +150,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			release.resolve(); timers.mockRestore(); vi.mocked(rm).mockImplementation(fs.rm);
 			validations.mockRestore();
 			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
-			await rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("retires every selected pool when another pool fails to close", async () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const owner = new WorkspaceSandboxService(), pools: string[] = [], removed: string[] = [];
-		const roots = await Promise.all(["failed", "healthy", "retained"].map(label => temporaryRoot(label)));
+		const roots = await Promise.all(["failed", "healthy", "retained"].map(() => temporaryRoot()));
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
 			const directory = await fs.mkdtemp(prefix, options);
 			if (String(prefix).endsWith("pi-speculative-action-pool-")) pools.push(directory);
@@ -200,7 +192,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("qualifies auto OverlayFS by the exact immutable baseline size", async ({ skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
-		const root = await temporaryRoot("overlay-auto-cost");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
 		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v2");
 		await Promise.all(
@@ -219,7 +211,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {
-		const root = await temporaryRoot("write");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, ".gitattributes"), "* text eol=lf ident\n");
 		const world = sandbox.createExecutionWorld({ driver: "git" });
 		expect(world.scope).toBe("fallback");
@@ -254,7 +246,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["capture", "refine", "execute", "checkpoint"])("owns %s deltas across branch commit and descendant materialization", async (boundary) => {
-		const root = await temporaryRoot("after-capture");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, "value.txt"), "before\n", "utf8");
 		const action = buildPiActionKey("write", { path: "value.txt", content: "after\n" }, root);
 		if (!action) throw new Error("action key missing");
@@ -300,7 +292,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("seals copy-ups, creations, and whiteouts from the typed OverlayFS frontier", async ({ skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
-		const root = await temporaryRoot("overlay-frontier");
+		const root = await temporaryRoot();
 		await mkdir(path.join(root, "replaced"));
 		await Promise.all([
 			writeFile(path.join(root, "changed.txt"), "before\n", "utf8"),
@@ -351,7 +343,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const host = await linuxOverlayfsCapability();
 		if (!host.available) return skip(host.detail);
-		const root = await temporaryRoot("overlay-quarantine");
+		const root = await temporaryRoot();
 		const marker = path.join(root, "probe-unmounted");
 		const retainedTarget = path.join(root, "retained-mount");
 		const wrapper = path.join(root, "fusermount-unresolved");
@@ -383,12 +375,11 @@ describe("workspace-branch ExecutionWorld", () => {
 				expect(await fuseOverlayMountTargets()).not.toContain(target);
 				await rm(path.dirname(path.dirname(target)), { recursive: true, force: true });
 			}
-			await rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("validates consumed inputs and written outputs together without rewriting reads", async () => {
-		const root = await temporaryRoot("conflict");
+		const root = await temporaryRoot();
 		const input = path.join(root, "input.txt"), target = path.join(root, "output.txt");
 		const directory = path.join(root, "readable"); await mkdir(directory);
 		await writeFile(path.join(directory, "keep"), "");
@@ -433,12 +424,11 @@ describe("workspace-branch ExecutionWorld", () => {
 		} finally {
 			await chmod(input, 0o666).catch(() => undefined);
 			await chmod(directory, 0o755).catch(() => undefined);
-			await rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("materializes a parent checkpoint privately and commits ordered deltas", async () => {
-		const root = await temporaryRoot("lineage");
+		const root = await temporaryRoot();
 		const target = path.join(root, "lineage.txt");
 		await writeFile(target, "base\n", "utf8");
 		const world = sandbox.createExecutionWorld();
@@ -449,7 +439,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(sandbox.fork({ cwd: root, action: requiredAction("write", parentArgs, root),
 			parentCheckpoint: { ...parent.checkpoint! }, execute: async () => settlement("unused"),
 		})).rejects.toThrow("another backend");
-		await expect(sandbox.fork({ cwd: await temporaryRoot("other-workspace"), action: requiredAction("write", parentArgs, root),
+		await expect(sandbox.fork({ cwd: await temporaryRoot(), action: requiredAction("write", parentArgs, root),
 			parentCheckpoint: parent.checkpoint, execute: async () => settlement("unused"),
 		})).rejects.toThrow("another workspace");
 		const childArgs = { path: "lineage.txt", edits: [{ oldText: "parent", newText: "child" }] };
@@ -468,7 +458,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("preserves native directory creation and rejects unproven self-observation", async () => {
-		const root = await temporaryRoot("directory-lineage");
+		const root = await temporaryRoot();
 		const directory = path.join(root, "generated", "nested");
 		const mask = process.umask();
 		try {
@@ -504,14 +494,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			}
 		} finally {
 			process.umask(mask);
-			await rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("owns partial directory creation and permits fallback only after complete rollback", async () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const fault of ["topology", "mkdir", "foreign"]) {
-			const root = await temporaryRoot(`directory-${fault}`), template = await temporaryRoot("directory-template");
+			const root = await temporaryRoot(), template = await temporaryRoot();
 			const directory = path.join(root, "generated"), foreign = path.join(directory, "foreign.txt");
 			const file = fileTransition(root, fault === "topology" ? "generated/value.txt" : "generated/nested/value.txt", undefined, "child");
 			const gateway = new ToolExecutionGateway<unknown, ToolSettlement>([]);
@@ -540,13 +529,12 @@ describe("workspace-branch ExecutionWorld", () => {
 				else await expect(stat(directory)).rejects.toThrow();
 			} finally {
 				vi.mocked(mkdir).mockReset(); await gateway.dispose();
-				await Promise.all([rm(root, { recursive: true, force: true }), rm(template, { recursive: true, force: true })]);
 			}
 		}
 	});
 
 	it("deletes a typed directory tree in child-before-parent order", async () => {
-		const root = await temporaryRoot("directory-delete");
+		const root = await temporaryRoot();
 		const outer = path.join(root, "generated");
 		const inner = path.join(outer, "nested");
 		const target = path.join(inner, "value.txt");
@@ -573,7 +561,7 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("preserves native file identity and never retries a possibly applied content write", async () => {
 		for (const fault of ["none", "hardlink", "readonly", "write", "close"]) {
-			const root = await temporaryRoot(`content-${fault}`), target = path.join(root, "value.txt");
+			const root = await temporaryRoot(), target = path.join(root, "value.txt");
 			await writeFile(target, "before");
 			const observer = await open(target, "r"), prototype = Object.getPrototypeOf(observer);
 			const originalWrite = observer.writeFile;
@@ -604,13 +592,13 @@ describe("workspace-branch ExecutionWorld", () => {
 				if (fault === "hardlink") expect(await readFile(path.join(root, "alias.txt"), "utf8")).toBe("after");
 			} finally {
 				vi.restoreAllMocks(); await observer.close(); await gateway.dispose();
-				await chmod(target, 0o644); await rm(root, { recursive: true, force: true });
+				await chmod(target, 0o644);
 			}
 		}
 	});
 
 	it.each([false, true])("drains parallel private staging before committing, failing or closing (failure=%s)", async (failure) => {
-		const root = await temporaryRoot("parallel-staging"), target = path.join(root, "control");
+		const root = await temporaryRoot(), target = path.join(root, "control");
 		await writeFile(target, "control");
 		const observer = await open(target, "r"), sync = observer.sync;
 		const entered = deferred(), release = deferred(), handles: FileHandle[] = [];
@@ -651,7 +639,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["unchanged", "paths", "after", "before", "directory-before", "directory-after"])("owns queued %s data and validates every baseline before one commit wins", async (mutation) => {
-		const root = await temporaryRoot("lock");
+		const root = await temporaryRoot();
 		const target = path.join(root, "value.txt");
 		await writeFile(target, "base\n", "utf8");
 		const alternate = path.join(root, "alternate.txt"), directory = path.join(root, "directory");
@@ -702,8 +690,8 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["native", "thinkthread"])("rejects path escape and source symlink traversal before invoking %s tools", async (route) => {
-		const root = await temporaryRoot("paths");
-		const outside = await temporaryRoot("outside");
+		const root = await temporaryRoot();
+		const outside = await temporaryRoot();
 		let executions = 0;
 		const countingTool = {
 			...writeTool,
@@ -725,7 +713,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["index", "template", "global-config", "system-config"])("isolates inherited Git %s settings and excluded repository metadata", async (setting) => {
-		const root = await temporaryRoot("git");
+		const root = await temporaryRoot();
 		await runProgram("git", ["init"], root);
 		await runProgram("git", ["config", "user.email", "test@example.com"], root);
 		await runProgram("git", ["config", "user.name", "Test"], root);
@@ -737,7 +725,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const beforeStatus = await runProgram("git", ["status", "--short"], root);
 		const beforeBranch = await runProgram("git", ["branch", "--show-current"], root);
 		const index = path.join(root, ".git/index"), beforeIndex = await readFile(index);
-		const external = await temporaryRoot("git-settings"), hook = path.join(external, "hooks/post-checkout");
+		const external = await temporaryRoot(), hook = path.join(external, "hooks/post-checkout");
 		await mkdir(path.dirname(hook));
 		await writeFile(hook, `#!/bin/sh\nprintf hooked > ${shellQuote(path.join(external, "hooked"))}\n`);
 		await chmod(hook, 0o755);
@@ -766,7 +754,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["stat-cache", "attributes", "encoding"])("preserves exact bytes across %s changes and parallel workspaces", async (setting) => {
-		const root = await temporaryRoot("parallel");
+		const root = await temporaryRoot();
 		const encoding = setting === "encoding" ? "utf16le" : "utf8";
 		const stable = Buffer.from("$Id$\r\n", encoding), timestamp = new Date("2020-01-01T00:00:00Z");
 		await writeFile(path.join(root, "value1.txt"), stable);
@@ -800,7 +788,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
-		const root = await temporaryRoot("warmup-retirement"), entered = deferred(), release = deferred();
+		const root = await temporaryRoot(), entered = deferred(), release = deferred();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<void>[] = [];
 		let heldRoot: string | undefined, removals = 0;
@@ -840,7 +828,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it.each(["none", "workspace", "registration"])("owns workspace removal and %s cleanup failure before returning", async (failure) => {
-		const root = await temporaryRoot("workspace-removal"), entered = deferred(), release = deferred();
+		const root = await temporaryRoot(), entered = deferred(), release = deferred();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		await writeFile(path.join(root, "value.txt"), "before\n");
 		let owned: { processRoot: string; gitDirectory: string; dispose: () => Promise<void> } | undefined, settled = false;
@@ -888,7 +876,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
-		const root = await temporaryRoot("transaction");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
 		await writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8");
 		await writeFile(path.join(root, "untouched.txt"), "stable\n", "utf8");
@@ -949,7 +937,7 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("marks unsupported inode transitions incomplete without undoing the operation", async ({ skip }) => {
 		if (process.platform === "win32") return skip("symlink creation requires Windows privileges");
-		const root = await temporaryRoot("transaction-inode");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, "target.txt"), "target\n", "utf8");
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const capture = await workspace.transactions.begin();
@@ -963,7 +951,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("fails closed for overlapping workspace mutation intervals and recovers afterward", async () => {
-		const root = await temporaryRoot("transaction-overlap");
+		const root = await temporaryRoot();
 		await writeFile(path.join(root, "value.txt"), "base\n", "utf8");
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const first = await workspace.transactions.begin();
@@ -985,7 +973,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("drains admitted file requests and refuses cancelled or swallowed failures", async () => {
-		const root = await temporaryRoot("cancelled");
+		const root = await temporaryRoot();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const target = path.join(root, "held.txt"), world = sandbox.createExecutionWorld();
 		try {
@@ -1018,7 +1006,6 @@ describe("workspace-branch ExecutionWorld", () => {
 			}))).rejects.toThrow("Workspace input does not exist");
 		} finally {
 			vi.mocked(writeFile).mockImplementation(fs.writeFile);
-			await rm(root, { recursive: true, force: true });
 		}
 	});
 });
@@ -1066,12 +1053,6 @@ function settlement(text: string): ToolSettlement {
 function fileTransition(root: string, resource: string, before: string | undefined, after: string | undefined): SandboxFileChange {
 	return { root, resource, target: path.resolve(root, resource),
 		before: before === undefined ? undefined : Buffer.from(before), after: after === undefined ? undefined : Buffer.from(after) };
-}
-
-async function temporaryRoot(label: string): Promise<string> {
-	const root = await mkdtemp(path.join(os.tmpdir(), `pi-spec-${label}-`));
-	temporaryRoots.add(root);
-	return root;
 }
 
 async function fuseOverlayMountTargets(): Promise<string[]> {
