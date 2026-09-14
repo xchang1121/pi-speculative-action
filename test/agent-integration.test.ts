@@ -683,12 +683,97 @@ describe("speculative action host", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it("drains an admitted Pattern learning batch when disposal starts immediately", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware), start = { ...startInput(tool), sessionID: "session" };
+		const configuration = { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } };
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store,
+			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		try {
+			await controller.source.observe!({ startInput: start, data: { tools: new Map([["read", tool]]), schemaHashes: { read: "schema" } },
+				settings: configuration, consumeInput: { sessionID: "session", turnID: start.turnID, tool: "read", args: { path: "notes.txt" }, tools: [tool] },
+				tool: "read", concrete: { path: "notes.txt" }, output: { result: textResult("one"), isError: false }, durationMs: 1, order: 0 });
+			controller.turnFinished(start, configuration, false);
+			await controller.dispose();
+			expect(store.recent("session")).toMatchObject([{ tool: "read", input: { path: "notes.txt" }, outcome: "success", schemaHash: "schema" }]);
+		} finally { await controller.dispose(); }
+	});
+
+	it.each([false, true])("owns late Pattern feedback across configuration replacement and return=%s", async (returning) => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 }), newer = patternAwareSettings({ ...older, maxContextLength: 3 });
+		const semantics = { namespace: "pi-action-semantics-v1",
+			actionKey: (name: string, args: Readonly<Record<string, unknown>>, schema?: string) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] };
+		const bootstrap = await acquirePatternAwareStore(cwd, older, cwd, semantics), oldStore = bootstrap.store;
+		const controller = createPatternPlanSource({ sessionID: "probe", cwd, stateDirectory: cwd,
+			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const propose = (patternAware: typeof older) => controller.source.propose({
+			startInput: { ...startInput(tool), sessionID: "probe" }, data: { tools: new Map([["read", tool]]), schemaHashes: { read: "schema" } },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
+			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
+		});
+		try {
+			for (let index = 0; index < 3; index++) {
+				const sessionID = `training-${index}`, file = `file-${index}.txt`;
+				oldStore.observe({ sessionID, turnID: "scan", tool: "grep", input: { pattern: "one", path: "." }, outputPaths: [file], outcome: "success", durationMs: 1 });
+				oldStore.observe({ sessionID, turnID: "read", tool: "read", input: { path: file }, outcome: "success", durationMs: 1, schemaHash: "schema" });
+				oldStore.finishSession(sessionID);
+			}
+			oldStore.observe({ sessionID: "probe", turnID: "before", tool: "grep", input: { pattern: "one", path: "." }, outputPaths: ["notes.txt"], outcome: "success", durationMs: 1 });
+			const plan = await propose(older);
+			if (!plan || !("actions" in plan)) throw new Error("Expected a learned Pattern proposal");
+			const action = plan.actions.find(action => (action.feedback as { patternIDs: string[] }).patternIDs.length)!;
+			const feedback = { proposalID: plan.id, actionID: action.id, feedback: action.feedback };
+			const patternID = (action.feedback as { patternIDs: string[] }).patternIDs[0]!;
+			await controller.source.onIssued!(feedback); await bootstrap.release(); await propose(newer);
+			if (returning) {
+				await propose(older);
+				const active = await acquirePatternAwareStore(cwd, older, cwd, semantics);
+				try { expect(active.store).toBe(oldStore); } finally { await active.release(); }
+			}
+			const before = oldStore.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed;
+			const settlement = { prediction: { id: "prediction", source: "pattern_aware", proposalID: plan.id, actionID: action.id },
+				observation: "observed" as const, actorAction: { id: "actor", sequence: 0, turnID: "turn-1" }, match: { matched: false as const } };
+			await controller.source.onSettled!({ ...feedback, settlement });
+			await controller.finishSession(); await controller.dispose();
+			const closed = oldStore.snapshot();
+			await controller.source.onIssued!(feedback); await controller.source.onSettled!({ ...feedback, settlement });
+			expect(oldStore.snapshot()).toEqual(closed);
+			const fresh = await acquirePatternAwareStore(cwd, older, cwd, semantics);
+			try {
+				expect(fresh.store).not.toBe(oldStore);
+				expect(fresh.store.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed).toBe(before + 1);
+			} finally { await fresh.release(); }
+		} finally { await controller.dispose(); await bootstrap.release(); await oldStore.flush(); }
+	});
+
+	it("joins an admitted Pattern request during disposal without releasing an external Store", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), available = deferred<PatternAwareStore>();
+		const patternAware = patternAwareSettings({ enabled: true }), store = new PatternAwareStore(patternAware);
+		const flush = vi.spyOn(store, "flush"), controller = createPatternPlanSource({ sessionID: "session", cwd, store: available.promise,
+			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const pending = Promise.resolve(controller.source.propose({
+			startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
+			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
+		}));
+		try {
+			await nextTurn();
+			let closed = false;
+			const closing = controller.dispose().then(() => { closed = true; });
+			await nextTurn(); expect(closed).toBe(false);
+			available.resolve(store); await expect(pending).resolves.toBeUndefined(); await closing;
+			expect(flush).not.toHaveBeenCalled();
+		} finally { available.resolve(store); await pending; await controller.dispose(); }
+	});
+
 	it.each(["concurrent", "closing", "load failure", "flush failure", "replaced", "replaced load failure"])("owns Pattern analyzer replacement through %s", async (phase) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), stores: PatternAwareStore[] = [];
 		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 });
 		const newer = patternAwareSettings({ ...older, maxContextLength: 3 });
 		const replacing = phase.startsWith("replaced"), newest = replacing ? patternAwareSettings({ ...older, maxContextLength: 4 }) : newer;
-		const entered = deferred(), release = deferred(), loading = deferred(), resume = deferred();
+		const loading = deferred(), resume = deferred();
 		const load = PatternAwareStore.prototype.load;
 		const observer = vi.spyOn(PatternAwareStore.prototype, "load").mockImplementation(async function (this: PatternAwareStore) {
 			stores.push(this);
@@ -708,27 +793,34 @@ describe("speculative action host", () => {
 		let pending: Promise<PromiseSettledResult<unknown>[]> | undefined, closing: Promise<void> | undefined;
 		try {
 			await propose(older);
-			const flush = stores[0]!.flush.bind(stores[0]);
-			vi.spyOn(stores[0]!, "flush").mockImplementationOnce(async () => {
-				entered.resolve(); await release.promise; await flush();
-				if (phase === "flush failure") throw new Error("flush failed");
-			});
+			if (phase === "flush failure") vi.spyOn(stores[0]!, "flush").mockRejectedValueOnce(new Error("flush failed"));
 			pending = Promise.allSettled([propose(newer), propose(newest)]);
-			await entered.promise;
+			await loading.promise;
 			if (phase === "closing") {
 				let closed = false;
 				closing = controller.dispose(); void closing.then(() => { closed = true; });
-				release.resolve(); await loading.promise; await nextTurn();
+				await nextTurn();
 				expect(closed).toBe(false);
 				expect(controller.dispose()).toBe(closing);
 			}
-			release.resolve(); resume.resolve();
+			resume.resolve();
 			expect((await pending).map(result => result.status)).toEqual([
 				phase.includes("load failure") ? "rejected" : "fulfilled", phase === "load failure" ? "rejected" : "fulfilled",
 			]);
-			if (phase !== "closing") { await expect(propose(newest)).resolves.toBeUndefined(); await controller.finishSession(); }
+			if (phase !== "closing") {
+				await expect(propose(newest)).resolves.toBeUndefined();
+				const entered = deferred(), release = deferred(), store = stores.at(-1)!, flush = store.flush.bind(store);
+				if (phase === "flush failure") vi.spyOn(store, "flush").mockImplementationOnce(async () => {
+					entered.resolve(); await release.promise; await flush();
+				});
+				let finished = false;
+				const finishing = controller.finishSession().then(() => { finished = true; });
+				try {
+					if (phase === "flush failure") { await entered.promise; await nextTurn(); expect(finished).toBe(false); }
+				} finally { release.resolve(); await finishing; }
+			}
 			await controller.dispose();
-			await expect(propose(newest)).rejects.toThrow("disposed");
+			await expect(propose(newest)).rejects.toThrow("closed");
 			expect(stores).toHaveLength(replacing || phase === "load failure" ? 3 : 2);
 			const retired = [...stores];
 			for (const configuration of new Set([older, newer, newest])) {
@@ -737,7 +829,7 @@ describe("speculative action host", () => {
 				try { expect(retired).not.toContain(fresh.store); } finally { await fresh.release(); }
 			}
 		} finally {
-			release.resolve(); resume.resolve(); await pending; await closing; await controller.dispose();
+			resume.resolve(); await pending; await closing; await controller.dispose();
 			observer.mockRestore(); await Promise.allSettled(stores.map(store => store.flush()));
 		}
 	});
