@@ -166,6 +166,14 @@ describe("PlanRuntime", () => {
 		expect(plan.matchable(1)).toMatchObject([{ actionKey: key, execution: blocked
 			? { status: "execution_blocked", cause: failure } : { status: "deferred" } }]);
 		expect(plan.launchable()).toHaveLength(blocked ? 0 : 1);
+		expect(plan.apply({ proposalID: "plan", source: "source", revision: 2, upsert: [action("bash", { input: { path: "replacement.ts" } })] }, 0))
+			.toMatchObject({ accepted: true });
+		const replacement = plan.get("plan", "bash")!.identity, rejected = cause("admission", "not_permitted");
+		expect(plan.rejectExecution(identity, rejected)).toBe(false);
+		expect(plan.rejectExecution(replacement, rejected)).toBe(true);
+		expect(plan.rejectExecution(replacement, rejected)).toBe(false);
+		expect(plan.get("plan", "bash")?.execution).toEqual({ status: "failed", cause: rejected });
+		expect(plan.attachExecution("plan", "bash", "late", new CandidateExecution("shared"))).toBe(false);
 	});
 
 	it.each(["succeeded", "failed", "cancelled"] as const)("queries current dependencies independently of %s execution and Actor settlement", (status) => {

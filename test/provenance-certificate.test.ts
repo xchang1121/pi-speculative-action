@@ -29,47 +29,34 @@ const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
-	it("validates positive, directory, negative, symlink, executable, and DSO evidence", async () => {
+	it("validates complete filesystem evidence and detects file, directory and negative lookup changes", async () => {
 		const root = await workspace();
 		await mkdir(path.join(root, "lib"));
-		await writeFile(path.join(root, "input.txt"), "one");
-		await writeFile(path.join(root, "metadata.txt"), "metadata");
-		await writeFile(path.join(root, "tool"), "executable");
-		await writeFile(path.join(root, "lib", "runtime.so"), "library");
+		for (const [name, content] of [
+			["input.txt", "one"], ["metadata.txt", "metadata"], ["tool", "executable"], ["lib/runtime.so", "library"],
+		] as const) await writeFile(path.join(root, name), content);
+		const location = (name: string) => [path.join(root, name), `/workspace/${name}`] as const;
 		let link: Awaited<ReturnType<typeof captureSymlinkDependency>> | undefined;
 		try {
 			await symlink("input.txt", path.join(root, "input.link"));
-			link = await captureSymlinkDependency(path.join(root, "input.link"), "/workspace/input.link");
+			link = await captureSymlinkDependency(...location("input.link"));
 		} catch (error) {
 			if (!(error && typeof error === "object" && "code" in error && error.code === "EPERM")) throw error;
 			// Windows without Developer Mode cannot create symlinks; Linux integration covers this path.
 		}
-		const input = await captureFileDependency(path.join(root, "input.txt"), "/workspace/input.txt");
-		const executable = await captureFileDependency(
-			path.join(root, "tool"),
-			"/workspace/tool",
-			"executable",
-		);
-		const library = await captureFileDependency(
-			path.join(root, "lib", "runtime.so"),
-			"/workspace/lib/runtime.so",
-			"shared_object",
-		);
-		const directory = await captureDirectoryDependency(path.join(root, "lib"), "/workspace/lib");
-		const metadata = await captureMetadataDependency(path.join(root, "metadata.txt"), "/workspace/metadata.txt", true);
-		const absent = await captureAbsenceDependency(
-			path.join(root, "missing.txt"),
-			"/workspace/missing.txt",
-		);
+		const files = await Promise.all(([
+			["input.txt", "input"], ["tool", "executable"], ["lib/runtime.so", "shared_object"],
+		] as const).map(([name, role]) => captureFileDependency(...location(name), role)));
+		const directory = await captureDirectoryDependency(...location("lib"));
+		const metadata = await captureMetadataDependency(...location("metadata.txt"), true);
+		const absent = await captureAbsenceDependency(...location("missing.txt"));
 		if (!absent) throw new Error("expected negative lookup evidence");
 		const certificate = processCertificate(prototype(), {
 			dependencyCertificate: {
 				complete: true,
 				dependencies: [
-					input.dependency,
+					...files.map(({ dependency }) => dependency),
 					metadata,
-					executable.dependency,
-					library.dependency,
 					directory,
 					absent,
 					...(link ? [link] : []),
@@ -78,9 +65,10 @@ describe("process provenance certificates", () => {
 			},
 			result: { replayProfile: "buffered_noninteractive", observedProcessMs: 1250.5, journal: [], exit: { kind: "code", code: 0 } },
 		});
-		const validation = await validateProcessCertificate(certificate, {
+		const validate = () => validateProcessCertificate(certificate, {
 			resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
 		});
+		const validation = await validate();
 		expect(validation).toMatchObject({ status: "valid", filesRead: 3 });
 		expect(certificate.strongKey).toBe(
 			validation.status === "valid" ? validation.strongKey : undefined,
@@ -88,51 +76,24 @@ describe("process provenance certificates", () => {
 		expect(certificate.result.observedProcessMs).toBe(1250.5);
 
 		await writeFile(path.join(root, "input.txt"), "changed");
-		expect(
-			await validateProcessCertificate(certificate, {
-				resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
-			}),
-		).toMatchObject({ status: "stale", changed: expect.arrayContaining(["/workspace/input.txt"]) });
-	});
-
-	it("invalidates negative lookups and directory enumerations and fails closed on taints", async () => {
-		const root = await workspace();
-		await mkdir(path.join(root, "tree"));
-		const directory = await captureDirectoryDependency(path.join(root, "tree"), "/workspace/tree");
-		const absent = await captureAbsenceDependency(path.join(root, "missing"), "/workspace/missing");
-		if (!absent) throw new Error("expected absence");
-		const semantic = prototype();
-		const certificate = processCertificate(semantic, {
-			dependencyCertificate: { complete: true, dependencies: [directory, absent], taints: [] },
-		});
-		await writeFile(path.join(root, "tree", "new.txt"), "new");
-		await writeFile(path.join(root, "missing"), "appeared");
-		const validation = await validateProcessCertificate(certificate, {
-			resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
-		});
-		expect(validation).toMatchObject({
+		expect(await validate()).toMatchObject({ status: "stale", changed: ["/workspace/input.txt"] });
+		await writeFile(path.join(root, "lib", "new.txt"), "new");
+		await writeFile(path.join(root, "missing.txt"), "appeared");
+		expect(await validate()).toMatchObject({
 			status: "stale",
-			changed: expect.arrayContaining(["/workspace/tree", "/workspace/missing"]),
+			changed: expect.arrayContaining(["/workspace/input.txt", "/workspace/lib", "/workspace/missing.txt"]),
 		});
-
-		const tainted = processCertificate(semantic, {
-			dependencyCertificate: { complete: true, dependencies: [], taints: ["clock"] },
-		});
-		expect(await validateProcessCertificate(tainted)).toMatchObject({ status: "indeterminate", reason: "tainted:clock" });
 	});
 
-	it("transfers native one-shot inputs but rejects external effects", async () => {
-		const validate = (taint: ProvenanceTaint) =>
-			validateTransferredProcessEvidence({ complete: true, dependencies: [], taints: [taint] });
-		for (const taint of ["clock", "random", "pid_observation"] satisfies ProvenanceTaint[]) {
-			expect(await validate(taint)).toMatchObject({ status: "valid" });
-		}
-		for (const taint of ["network", "ipc"] satisfies ProvenanceTaint[]) {
-			expect(await validate(taint)).toMatchObject({
-				status: "indeterminate",
-				cause: { detail: `tainted:${taint}` },
-			});
-		}
+	it.each([
+		["clock", true], ["random", true], ["pid_observation", true], ["network", false], ["ipc", false],
+	] satisfies ReadonlyArray<readonly [ProvenanceTaint, boolean]>)("distinguishes reuse and one-shot transfer of %s evidence", async (taint, transferable) => {
+		const evidence = { complete: true, dependencies: [], taints: [taint] };
+		expect(await validateProcessCertificate(processCertificate(prototype(), { dependencyCertificate: evidence })))
+			.toMatchObject({ status: "indeterminate", reason: `tainted:${taint}` });
+		expect(await validateTransferredProcessEvidence(evidence)).toMatchObject(transferable
+			? { status: "valid" }
+			: { status: "indeterminate", cause: { detail: `tainted:${taint}` } });
 	});
 
 	it("keys complete environment and process context without persisting raw values", () => {

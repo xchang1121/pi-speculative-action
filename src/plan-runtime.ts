@@ -20,13 +20,9 @@ import type {
 } from "./settlement.ts";
 
 type PlanNodeExecution =
-	| { readonly status: "deferred" | "preparing" }
-	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
-	| { readonly status: "scheduled" }
-	| { readonly status: "queued"; readonly candidateID: string }
-	| { readonly status: "running"; readonly candidateID: string }
-	| { readonly status: "succeeded"; readonly candidateID: string }
-	| { readonly status: "failed" | "cancelled"; readonly cause: ResolutionCause; readonly candidateID?: string };
+	| Exclude<MutableNodeExecution, { readonly status: "attached" }>
+	| { readonly status: "queued" | "running" | "succeeded"; readonly candidateID: string }
+	| { readonly status: "failed" | "cancelled"; readonly cause: ResolutionCause; readonly candidateID: string };
 
 export type PredictionOpportunityState =
 	| { readonly status: "pending" }
@@ -39,7 +35,7 @@ export type PredictionOpportunityState =
 
 export type PlanNodeReadiness = "ready" | "waiting" | "blocked" | "settled";
 
-interface PlanRuntimeNodeBase {
+export interface PlanRuntimeNode {
 	readonly identity: PlanActionIdentity;
 	readonly proposalID: string;
 	readonly source: string;
@@ -53,14 +49,9 @@ interface PlanRuntimeNodeBase {
 	readonly criticalPathMs: number;
 	readonly execution: PlanNodeExecution;
 	readonly readiness: PlanNodeReadiness;
-}
-
-export type PlanRuntimeNode = PlanRuntimeNodeBase & {
 	readonly prediction: PredictionIdentity;
 	readonly predictionState: PredictionOpportunityState;
-};
-
-export type PredictionPlanRuntimeNode = PlanRuntimeNode;
+}
 
 export interface RetiredPlanNode {
 	readonly node: PlanRuntimeNode;
@@ -175,7 +166,7 @@ interface PlanExecutionOwner {
 
 type MutableNodeExecution =
 	| { readonly status: "deferred" | "preparing" }
-	| { readonly status: "execution_blocked"; readonly cause: ResolutionCause }
+	| { readonly status: "execution_blocked" | "failed"; readonly cause: ResolutionCause }
 	| { readonly status: "scheduled" }
 	| {
 			readonly status: "attached";
@@ -318,9 +309,16 @@ export class PlanRuntime {
 
 	attachExecution(proposalID: string, actionID: string, candidateID: string, owner: PlanExecutionOwner): boolean {
 		const node = this.mutable(proposalID, actionID)?.node;
-		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "preparing" && node.execution.status !== "scheduled")) return false;
-		if (node.execution.status === "preparing" && owner.execution.status !== "failed" && owner.execution.status !== "cancelled") return false;
+		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "scheduled")) return false;
 		node.execution = { status: "attached", candidateID, owner };
+		return true;
+	}
+
+	/** Preparation and dependency rejection own no physical execution or candidate ID. */
+	rejectExecution(identity: PlanActionIdentity, failure: ResolutionCause): boolean {
+		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		if (node?.identity.id !== identity.id || !["deferred", "preparing", "scheduled"].includes(node.execution.status)) return false;
+		node.execution = Object.freeze({ status: "failed", cause: Object.freeze({ ...failure }) });
 		return true;
 	}
 
@@ -376,25 +374,25 @@ export class PlanRuntime {
 		return this.select();
 	}
 
-	pending(): readonly PredictionPlanRuntimeNode[] {
+	pending(): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status === "pending");
 	}
 
-	matchable(decisionSequence: number): readonly PredictionPlanRuntimeNode[] {
+	matchable(decisionSequence: number): readonly PlanRuntimeNode[] {
 		const sequence = Math.max(0, Math.floor(decisionSequence));
 		return this.select((node, plan) => this.isMatchable(plan, node, sequence));
 	}
 
-	unsettled(): readonly PredictionPlanRuntimeNode[] {
+	unsettled(): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status !== "settled");
 	}
 
-	consumers(candidateID: string): readonly PredictionPlanRuntimeNode[] {
+	consumers(candidateID: string): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status !== "settled" &&
 			node.execution.status === "attached" && node.execution.candidateID === candidateID);
 	}
 
-	due(settledDecisionSeq: number): readonly PredictionPlanRuntimeNode[] {
+	due(settledDecisionSeq: number): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status === "pending" && node.latestDecisionSeq <= settledDecisionSeq);
 	}
 
