@@ -204,314 +204,6 @@ interface AutoWorkspaceDriverDecision {
 	readonly resolved: QualifiedWorkspaceSandboxDriver;
 }
 
-class GitWorkspaceTransactionCapture implements WorkspaceTransactionCapture {
-	contaminated = false;
-	settled = false;
-	readonly owner: GitWorkspaceTransactionDriver;
-	readonly before?: WorkspaceStructureSnapshot;
-	readonly frontier?: ReadonlyMap<string, RegularFileState | undefined>;
-
-	constructor(
-		owner: GitWorkspaceTransactionDriver,
-		before?: WorkspaceStructureSnapshot,
-		frontier?: ReadonlyMap<string, RegularFileState | undefined>,
-	) {
-		this.owner = owner;
-		this.before = before;
-		this.frontier = frontier;
-	}
-
-	readonly finish = (): Promise<WorkspaceTransactionDelta> => this.owner.finish(this);
-	readonly abort = (): Promise<void> => this.owner.abort(this);
-}
-
-class GitWorkspaceTransactionDriver implements WorkspaceTransactionDriver {
-	private readonly active = new Set<GitWorkspaceTransactionCapture>();
-	private lock: Promise<void> = Promise.resolve();
-	private readonly git: ReturnType<typeof bindGit>;
-	private readonly sandboxRoot: string;
-	private readonly baselineTree: string;
-	private readonly captureStructure: () => Promise<WorkspaceStructureSnapshot>;
-	private readonly openClock: () => Promise<FileHandle>;
-	private readonly expectedClockLinks: 0 | 1;
-	private readonly clockRoots: readonly string[];
-	private lastStructure: WorkspaceStructureSnapshot;
-	private readonly frontier: Map<string, RegularFileState | undefined>;
-	private poisonReason?: string;
-	private clock?: { readonly handle: FileHandle; readonly identity: import("node:fs").Stats };
-	private disposed = false;
-
-	constructor(
-		git: ReturnType<typeof bindGit>,
-		sandboxRoot: string,
-		baselineTree: string,
-		captureStructure: () => Promise<WorkspaceStructureSnapshot>,
-		openClock: () => Promise<FileHandle>,
-		expectedClockLinks: 0 | 1,
-		clockRoots: readonly string[],
-		initialStructure: WorkspaceStructureSnapshot,
-		initialFrontier: ReadonlyMap<string, RegularFileState | undefined>,
-	) {
-		this.git = git;
-		this.sandboxRoot = sandboxRoot;
-		this.baselineTree = baselineTree;
-		this.captureStructure = captureStructure;
-		this.openClock = openClock;
-		this.expectedClockLinks = expectedClockLinks;
-		this.clockRoots = clockRoots;
-		this.lastStructure = initialStructure;
-		this.frontier = new Map(initialFrontier);
-		if (!initialStructure.complete) this.poisonReason = "workspace_structure_limit";
-	}
-
-	async initialize(): Promise<void> {
-		if (this.poisonReason) return;
-		try {
-			await this.assertChangeClockFilesystem();
-			await this.advanceChangeClock(this.lastStructure);
-			const verified = await this.captureStructure();
-			if (!sameWorkspaceChangeSnapshot(this.lastStructure, verified)) {
-				throw new Error("workspace changed while initializing transaction clock");
-			}
-			this.lastStructure = verified;
-		} catch (error) {
-			this.poisonReason = `workspace_transaction_clock:${errorMessage(error)}`;
-		}
-	}
-
-	readonly begin = (): Promise<WorkspaceTransactionCapture> =>
-		this.withLock(async () => {
-			if (this.disposed) throw new Error("workspace transaction driver is disposed");
-			if (this.active.size > 0) {
-				for (const capture of this.active) capture.contaminated = true;
-				const capture = new GitWorkspaceTransactionCapture(this);
-				capture.contaminated = true;
-				this.active.add(capture);
-				return capture;
-			}
-			if (this.poisonReason) {
-				const capture = new GitWorkspaceTransactionCapture(this);
-				this.active.add(capture);
-				return capture;
-			}
-			let before: WorkspaceStructureSnapshot | undefined;
-			try {
-				before = await this.captureFencedBefore();
-			} catch (error) {
-				this.poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
-			}
-			const capture = this.poisonReason || !before
-				? new GitWorkspaceTransactionCapture(this)
-				: new GitWorkspaceTransactionCapture(this, before, new Map(this.frontier));
-			this.active.add(capture);
-			return capture;
-		});
-
-	async finish(capture: GitWorkspaceTransactionCapture): Promise<WorkspaceTransactionDelta> {
-		return this.withLock(async () => {
-			if (capture.settled || !this.active.has(capture)) {
-				return { complete: false, changes: [], reason: "transaction_already_settled" };
-			}
-			capture.settled = true;
-			this.active.delete(capture);
-			if (capture.contaminated) {
-				return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
-			}
-			if (!capture.before || !capture.frontier) {
-				return { complete: false, changes: [], reason: this.poisonReason ?? "workspace_transaction_unavailable" };
-			}
-			try {
-				const observed = await this.captureStructure();
-				await this.advanceChangeClock(observed);
-				const after = await this.captureStructure();
-				if (!sameWorkspaceChangeSnapshot(observed, after)) {
-					throw new Error("workspace changed while fencing transaction endpoint");
-				}
-				const transitions = regularStructureTransitions(capture.before, after);
-				this.lastStructure = after;
-				if (!transitions.complete) {
-					this.poisonReason = transitions.reason;
-					return { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
-				}
-				const changes = await this.captureTransitions(transitions.paths, capture.frontier, after);
-				const verified = await this.captureStructure();
-				if (!sameWorkspaceChangeSnapshot(after, verified)) {
-					throw new Error("workspace changed while sealing transaction endpoint");
-				}
-				this.lastStructure = verified;
-				return {
-					complete: true,
-					changes,
-					before: capture.before,
-					after: verified,
-				};
-			} catch (error) {
-				const reason = `workspace_transaction_capture:${errorMessage(error)}`;
-				this.poisonReason = reason;
-				return {
-					complete: false,
-					changes: [],
-					reason,
-					before: capture.before,
-				};
-			}
-		});
-	}
-
-	private async captureFencedBefore(): Promise<WorkspaceStructureSnapshot> {
-		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
-			const current = await this.captureStructure();
-			await this.advanceChangeClock(current);
-			const fenced = await this.captureStructure();
-			if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
-			await this.synchronizeFrontier(fenced);
-			if (this.poisonReason) throw new Error(this.poisonReason);
-			const verified = await this.captureStructure();
-			if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
-			this.lastStructure = verified;
-			return verified;
-		}
-		throw new Error("workspace did not stabilize before transaction execution");
-	}
-
-	private async assertChangeClockFilesystem(): Promise<void> {
-		const handle = await this.openClock();
-		let retained = false;
-		try {
-			const [workspace, clock, ...clockRoots] = await Promise.all([
-				lstat(this.sandboxRoot),
-				handle.stat(),
-				...this.clockRoots.map((root) => lstat(root)),
-			]);
-			if (
-				!workspace.isDirectory() ||
-				!clock.isFile() ||
-				clock.nlink !== this.expectedClockLinks ||
-				clockRoots.length === 0 ||
-				clockRoots.some((root) => !root.isDirectory() || root.dev !== clock.dev)
-			) {
-				throw new Error("workspace transaction clock is not private or its backing timestamp domain changed");
-			}
-			this.clock = { handle, identity: clock };
-			retained = true;
-		} finally {
-			if (!retained) await handle.close();
-		}
-	}
-
-	private async advanceChangeClock(snapshot: WorkspaceStructureSnapshot): Promise<void> {
-		let boundary = Number.NEGATIVE_INFINITY;
-		for (const entry of snapshot.entries.values()) boundary = Math.max(boundary, entry.changeTimeMs);
-		if (!Number.isFinite(boundary)) throw new Error("workspace change clock boundary is unavailable");
-		if (!this.clock) throw new Error("workspace transaction clock is unavailable");
-		await advanceFilesystemClock(this.clock.handle, boundary, this.clock.identity);
-	}
-
-	async abort(capture: GitWorkspaceTransactionCapture): Promise<void> {
-		await this.withLock(async () => {
-			if (capture.settled) return;
-			capture.settled = true;
-			this.active.delete(capture);
-			for (const active of this.active) active.contaminated = true;
-		});
-	}
-
-	readonly dispose = (): Promise<void> =>
-		this.withLock(async () => {
-			if (this.disposed) return;
-			this.disposed = true;
-			for (const capture of this.active) capture.contaminated = true;
-			this.active.clear();
-			const clock = this.clock;
-			this.clock = undefined;
-			await clock?.handle.close();
-		});
-
-	private async synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
-		const transitions = regularStructureTransitions(this.lastStructure, current);
-		this.lastStructure = current;
-		if (!transitions.complete) {
-			this.poisonReason = transitions.reason;
-			return;
-		}
-		let retainedBytes = stateMapBytes(this.frontier);
-		for (const relativePath of transitions.paths) {
-			const entry = current.entries.get(relativePath);
-			retainedBytes -= this.frontier.get(relativePath)?.content.byteLength ?? 0;
-			const state =
-				entry?.kind === "file"
-					? await readRegularState(
-							path.resolve(this.sandboxRoot, relativePath),
-							WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
-						)
-					: undefined;
-			retainedBytes += state?.content.byteLength ?? 0;
-			this.frontier.set(relativePath, state);
-		}
-	}
-
-	private async captureTransitions(
-		paths: readonly string[],
-		beforeFrontier: ReadonlyMap<string, RegularFileState | undefined>,
-		after: WorkspaceStructureSnapshot,
-	): Promise<readonly WorkspaceRegularDelta[]> {
-		const changes: WorkspaceRegularDelta[] = [];
-		let beforeBytes = 0;
-		let afterBytes = 0;
-		let retainedBytes = stateMapBytes(this.frontier);
-		for (const relativePath of paths) {
-			const previous = beforeFrontier.has(relativePath)
-				? beforeFrontier.get(relativePath)
-				: await readGitTreeRegularState(
-						this.git,
-						this.baselineTree,
-						relativePath,
-						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
-					);
-			beforeBytes += previous?.content.byteLength ?? 0;
-			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) {
-				throw new Error("workspace transaction before-state exceeds capture limit");
-			}
-			const entry = after.entries.get(relativePath);
-			retainedBytes -= this.frontier.get(relativePath)?.content.byteLength ?? 0;
-			const current =
-				entry?.kind === "file"
-					? await readRegularState(
-							path.resolve(this.sandboxRoot, relativePath),
-							Math.min(
-								WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes,
-								WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
-							),
-						)
-					: undefined;
-			afterBytes += current?.content.byteLength ?? 0;
-			retainedBytes += current?.content.byteLength ?? 0;
-			this.frontier.set(relativePath, current);
-			if (!sameOptionalState(previous, current)) {
-				changes.push({
-					relativePath,
-					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
-					...(current ? { after: current.content, afterMode: current.mode } : {}),
-				});
-			}
-		}
-		return Object.freeze(changes);
-	}
-
-	private async withLock<T>(run: () => Promise<T>): Promise<T> {
-		const previous = this.lock;
-		let release: () => void = () => {};
-		this.lock = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		await previous;
-		try {
-			return await run();
-		} finally {
-			release();
-		}
-	}
-}
 
 function regularStructureTransitions(
 	before: WorkspaceStructureSnapshot,
@@ -1250,22 +942,252 @@ async function createPrivateSandboxWorkspace(
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWorkspace): Promise<WorkspaceTransactionDriver> {
+	interface Capture extends WorkspaceTransactionCapture {
+		contaminated: boolean;
+		settled: boolean;
+		readonly before?: WorkspaceStructureSnapshot;
+		readonly frontier?: ReadonlyMap<string, RegularFileState | undefined>;
+	}
 	const baselineTree = (await workspace.pool.git(["rev-parse", `${workspace.commit}^{tree}`], { cwd: workspace.processRoot })).toString("utf8").trim();
 	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
-	const initialStructure = await workspace.structure.capture();
-	const driver = new GitWorkspaceTransactionDriver(
-		workspace.baselineGit,
-		workspace.sandboxRoot,
-		baselineTree,
-		workspace.structure.capture,
-		workspace.openTransactionClock,
-		workspace.transactionClockLinks,
-		workspace.transactionClockRoots,
-		initialStructure,
-		workspace.baselineFrontier,
-	);
-	await driver.initialize();
-	return driver;
+	let lastStructure = await workspace.structure.capture();
+	const { baselineGit: git, sandboxRoot, openTransactionClock: openClock,
+		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
+	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
+	const active = new Set<Capture>(), lock = { lock: Promise.resolve() };
+	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
+	let clock: { readonly handle: FileHandle; readonly identity: import("node:fs").Stats } | undefined;
+	let disposed = false;
+
+	if (!poisonReason) {
+		try {
+			await assertChangeClockFilesystem();
+			await advanceChangeClock(lastStructure);
+			const verified = await captureStructure();
+			if (!sameWorkspaceChangeSnapshot(lastStructure, verified)) {
+				throw new Error("workspace changed while initializing transaction clock");
+			}
+			lastStructure = verified;
+		} catch (error) {
+			poisonReason = `workspace_transaction_clock:${errorMessage(error)}`;
+		}
+	}
+
+	const begin = (): Promise<WorkspaceTransactionCapture> =>
+		withWorkspaceLock(lock, async () => {
+			if (disposed) throw new Error("workspace transaction driver is disposed");
+			const contaminated = active.size > 0;
+			let before: WorkspaceStructureSnapshot | undefined;
+			if (contaminated) {
+				for (const capture of active) capture.contaminated = true;
+			} else if (!poisonReason) {
+				try {
+					before = await captureFencedBefore();
+				} catch (error) {
+					poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
+				}
+			}
+			const capture: Capture = {
+				contaminated, settled: false,
+				before, frontier: before ? new Map(frontier) : undefined,
+				finish: () => finish(capture), abort: () => abort(capture),
+			};
+			active.add(capture);
+			return capture;
+		});
+
+	async function finish(capture: Capture): Promise<WorkspaceTransactionDelta> {
+		return withWorkspaceLock(lock, async () => {
+			if (capture.settled || !active.has(capture)) {
+				return { complete: false, changes: [], reason: "transaction_already_settled" };
+			}
+			capture.settled = true;
+			active.delete(capture);
+			if (capture.contaminated) {
+				return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
+			}
+			if (!capture.before || !capture.frontier) {
+				return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
+			}
+			try {
+				const observed = await captureStructure();
+				await advanceChangeClock(observed);
+				const after = await captureStructure();
+				if (!sameWorkspaceChangeSnapshot(observed, after)) {
+					throw new Error("workspace changed while fencing transaction endpoint");
+				}
+				const transitions = regularStructureTransitions(capture.before, after);
+				lastStructure = after;
+				if (!transitions.complete) {
+					poisonReason = transitions.reason;
+					return { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
+				}
+				const changes = await captureTransitions(transitions.paths, capture.frontier, after);
+				const verified = await captureStructure();
+				if (!sameWorkspaceChangeSnapshot(after, verified)) {
+					throw new Error("workspace changed while sealing transaction endpoint");
+				}
+				lastStructure = verified;
+				return {
+					complete: true,
+					changes,
+					before: capture.before,
+					after: verified,
+				};
+			} catch (error) {
+				const reason = `workspace_transaction_capture:${errorMessage(error)}`;
+				poisonReason = reason;
+				return {
+					complete: false,
+					changes: [],
+					reason,
+					before: capture.before,
+				};
+			}
+		});
+	}
+
+	async function captureFencedBefore(): Promise<WorkspaceStructureSnapshot> {
+		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
+			const current = await captureStructure();
+			await advanceChangeClock(current);
+			const fenced = await captureStructure();
+			if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
+			await synchronizeFrontier(fenced);
+			if (poisonReason) throw new Error(poisonReason);
+			const verified = await captureStructure();
+			if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
+			lastStructure = verified;
+			return verified;
+		}
+		throw new Error("workspace did not stabilize before transaction execution");
+	}
+
+	async function assertChangeClockFilesystem(): Promise<void> {
+		const handle = await openClock();
+		let retained = false;
+		try {
+			const [workspaceInfo, clockInfo, ...rootInfo] = await Promise.all([
+				lstat(sandboxRoot),
+				handle.stat(),
+				...clockRoots.map((root) => lstat(root)),
+			]);
+			if (
+				!workspaceInfo.isDirectory() ||
+				!clockInfo.isFile() ||
+				clockInfo.nlink !== expectedClockLinks ||
+				rootInfo.length === 0 ||
+				rootInfo.some((root) => !root.isDirectory() || root.dev !== clockInfo.dev)
+			) {
+				throw new Error("workspace transaction clock is not private or its backing timestamp domain changed");
+			}
+			clock = { handle, identity: clockInfo };
+			retained = true;
+		} finally {
+			if (!retained) await handle.close();
+		}
+	}
+
+	async function advanceChangeClock(snapshot: WorkspaceStructureSnapshot): Promise<void> {
+		let boundary = Number.NEGATIVE_INFINITY;
+		for (const entry of snapshot.entries.values()) boundary = Math.max(boundary, entry.changeTimeMs);
+		if (!Number.isFinite(boundary)) throw new Error("workspace change clock boundary is unavailable");
+		if (!clock) throw new Error("workspace transaction clock is unavailable");
+		await advanceFilesystemClock(clock.handle, boundary, clock.identity);
+	}
+
+	async function abort(capture: Capture): Promise<void> {
+		await withWorkspaceLock(lock, async () => {
+			if (capture.settled) return;
+			capture.settled = true;
+			active.delete(capture);
+			for (const capture of active) capture.contaminated = true;
+		});
+	}
+
+	const dispose = (): Promise<void> =>
+		withWorkspaceLock(lock, async () => {
+			if (disposed) return;
+			disposed = true;
+			for (const capture of active) capture.contaminated = true;
+			active.clear();
+			const closingClock = clock;
+			clock = undefined;
+			await closingClock?.handle.close();
+		});
+
+	async function synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
+		const transitions = regularStructureTransitions(lastStructure, current);
+		lastStructure = current;
+		if (!transitions.complete) {
+			poisonReason = transitions.reason;
+			return;
+		}
+		let retainedBytes = stateMapBytes(frontier);
+		for (const relativePath of transitions.paths) {
+			const entry = current.entries.get(relativePath);
+			retainedBytes -= frontier.get(relativePath)?.content.byteLength ?? 0;
+			const state =
+				entry?.kind === "file"
+					? await readRegularState(
+							path.resolve(sandboxRoot, relativePath),
+							WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
+						)
+					: undefined;
+			retainedBytes += state?.content.byteLength ?? 0;
+			frontier.set(relativePath, state);
+		}
+	}
+
+	async function captureTransitions(
+		paths: readonly string[],
+		beforeFrontier: ReadonlyMap<string, RegularFileState | undefined>,
+		after: WorkspaceStructureSnapshot,
+	): Promise<readonly WorkspaceRegularDelta[]> {
+		const changes: WorkspaceRegularDelta[] = [];
+		let beforeBytes = 0;
+		let afterBytes = 0;
+		let retainedBytes = stateMapBytes(frontier);
+		for (const relativePath of paths) {
+			const previous = beforeFrontier.has(relativePath)
+				? beforeFrontier.get(relativePath)
+				: await readGitTreeRegularState(
+						git,
+						baselineTree,
+						relativePath,
+						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
+					);
+			beforeBytes += previous?.content.byteLength ?? 0;
+			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) {
+				throw new Error("workspace transaction before-state exceeds capture limit");
+			}
+			const entry = after.entries.get(relativePath);
+			retainedBytes -= frontier.get(relativePath)?.content.byteLength ?? 0;
+			const current =
+				entry?.kind === "file"
+					? await readRegularState(
+							path.resolve(sandboxRoot, relativePath),
+							Math.min(
+								WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes,
+								WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
+							),
+						)
+					: undefined;
+			afterBytes += current?.content.byteLength ?? 0;
+			retainedBytes += current?.content.byteLength ?? 0;
+			frontier.set(relativePath, current);
+			if (!sameOptionalState(previous, current)) {
+				changes.push({
+					relativePath,
+					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
+					...(current ? { after: current.content, afterMode: current.mode } : {}),
+				});
+			}
+		}
+		return Object.freeze(changes);
+	}
+
+	return { begin, dispose };
 }
 
 async function acquireSandboxRepository(
@@ -1337,7 +1259,7 @@ async function acquireSandboxBaseline(
 	authorEnvironment: Readonly<Record<string, string>>,
 	signal?: AbortSignal,
 ): Promise<string> {
-	return withRepositoryLock(repository, async () => {
+	return withWorkspaceLock(repository, async () => {
 		throwIfAborted(signal);
 		const baseline = repository.baseline;
 		if (baseline) {
@@ -1514,7 +1436,7 @@ async function acquireOverlayBaseline(
 	repository: PooledGitRepository,
 	commit: string,
 ): Promise<SharedOverlayBaseline> {
-	return withRepositoryLock(repository, async () => {
+	return withWorkspaceLock(repository, async () => {
 		for (const [candidateCommit, pending] of repository.overlayBaselines) {
 			if (candidateCommit === commit) continue;
 			const candidate = await pending.catch(() => undefined);
@@ -1567,10 +1489,10 @@ async function sandboxIndexChanges(repository: PooledGitRepository): Promise<str
 		.map((file) => path.resolve(repository.sourceRoot, file));
 }
 
-async function withRepositoryLock<T>(repository: PooledGitRepository, run: () => Promise<T>): Promise<T> {
-	const previous = repository.lock;
+async function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise<T>): Promise<T> {
+	const previous = owner.lock;
 	let release: () => void = () => {};
-	repository.lock = new Promise<void>((resolve) => {
+	owner.lock = new Promise<void>((resolve) => {
 		release = resolve;
 	});
 	await previous;
