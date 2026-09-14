@@ -67,18 +67,13 @@ export class ArtifactCAS {
 	}
 
 	async get(reference: ArtifactReference): Promise<Buffer | undefined> {
-		if (!isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
+		const { digest, size } = reference;
+		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) {
 			throw new Error("invalid artifact reference");
 		}
-		let bytes: Buffer;
-		try {
-			bytes = await readFile(this.artifactPath(reference.digest));
-		} catch (error) {
-			if (missing(error)) return undefined;
-			throw error;
-		}
-		if (bytes.byteLength !== reference.size || sha256Digest(bytes) !== reference.digest) {
-			throw new Error(`artifact integrity check failed for ${reference.digest}`);
+		const bytes = await readOptional(this.artifactPath(digest));
+		if (bytes && (bytes.byteLength !== size || sha256Digest(bytes) !== digest)) {
+			throw new Error(`artifact integrity check failed for ${digest}`);
 		}
 		return bytes;
 	}
@@ -89,30 +84,29 @@ export class ArtifactCAS {
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
 	async load(references: readonly ArtifactReference[]): Promise<VerifiedArtifactClosure | undefined> {
-		const expected = new Map<Sha256Digest, ArtifactReference>();
-		for (const reference of references) {
-			const previous = expected.get(reference.digest);
-			if (previous && previous.size !== reference.size) {
-				throw new Error(`conflicting artifact sizes for ${reference.digest}`);
+		const sizes = new Map<Sha256Digest, number>();
+		for (const { digest, size } of references) {
+			if (sizes.has(digest) && sizes.get(digest) !== size) {
+				throw new Error(`conflicting artifact sizes for ${digest}`);
 			}
-			expected.set(reference.digest, reference);
+			sizes.set(digest, size);
 		}
 		const values = new Map<Sha256Digest, Buffer>();
-		for (const reference of expected.values()) {
-			const value = await this.get(reference);
+		for (const [digest, size] of sizes) {
+			const value = await this.get({ digest, size });
 			if (!value) return undefined;
-			values.set(reference.digest, value);
+			values.set(digest, value);
 		}
 		return Object.freeze({
 			artifacts: values.size,
 			bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
-			read: (reference: ArtifactReference): Buffer => {
-				if (!isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
+			read: ({ digest, size }: ArtifactReference): Buffer => {
+				if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) {
 					throw new Error("invalid artifact reference");
 				}
-				const value = values.get(reference.digest);
-				if (!value || value.byteLength !== reference.size) {
-					throw new Error(`artifact is outside the verified closure: ${reference.digest}`);
+				const value = values.get(digest);
+				if (!value || value.byteLength !== size) {
+					throw new Error(`artifact is outside the verified closure: ${digest}`);
 				}
 				return value;
 			},
@@ -169,20 +163,20 @@ export class ProvenanceCertificateStore {
 	}
 
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
+		const owned = parseProcessCertificate(certificate);
+		if (!owned) throw new Error("invalid process provenance certificate");
 		const published = await this.exclusive(async () => {
-			const parsed = parseProcessCertificate(certificate);
-			if (!parsed || parsed.id !== certificate.id) throw new Error("invalid process provenance certificate");
-			for (const reference of referencedArtifacts(certificate)) {
+			for (const reference of referencedArtifacts(owned)) {
 				if (!(await this.artifacts.has(reference))) {
 					throw new Error(`certificate references missing artifact ${reference.digest}`);
 				}
 			}
 			const published = await publishImmutable(
-				this.certificatePath(certificate.id),
-				Buffer.from(stableStringify(certificate), "utf8"),
+				this.certificatePath(owned.id),
+				Buffer.from(stableStringify(owned), "utf8"),
 			);
-			if ((await this.get(certificate.id))?.id !== certificate.id) throw new Error("certificate publication failed");
-			await publishImmutable(this.weakReferencePath(certificate.weakKey, certificate.id), new Uint8Array());
+			if ((await this.get(owned.id))?.id !== owned.id) throw new Error("certificate publication failed");
+			await publishImmutable(this.weakReferencePath(owned.weakKey, owned.id), new Uint8Array());
 			return published;
 		});
 		if (Date.now() >= this.gcDueAt) {
@@ -193,13 +187,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	async get(id: Sha256Digest): Promise<ProcessProvenanceCertificate | undefined> {
-		let bytes: Buffer;
-		try {
-			bytes = await readFile(this.certificatePath(id));
-		} catch (error) {
-			if (missing(error)) return undefined;
-			throw error;
-		}
+		const bytes = await readOptional(this.certificatePath(id));
+		if (!bytes) return undefined;
 		let value: unknown;
 		try {
 			value = JSON.parse(bytes.toString("utf8"));
@@ -439,6 +428,10 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 	} finally {
 		await rm(temporary, { force: true });
 	}
+}
+
+function readOptional(target: string) {
+	return readFile(target).catch((error): undefined => { if (!missing(error)) throw error; });
 }
 
 function digestHex(digest: Sha256Digest): string {
