@@ -16,7 +16,8 @@ import { ActionSemanticsRegistry, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
-import { PATTERN_AWARE_DEFAULTS, PatternAwareStore } from "../src/pattern-aware.ts";
+import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
+import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
@@ -680,6 +681,65 @@ describe("speculative action host", () => {
 			} });
 		} finally { finish.resolve(); await host.dispose(); }
 		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it.each(["concurrent", "closing", "load failure", "flush failure", "replaced", "replaced load failure"])("owns Pattern analyzer replacement through %s", async (phase) => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), stores: PatternAwareStore[] = [];
+		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 });
+		const newer = patternAwareSettings({ ...older, maxContextLength: 3 });
+		const replacing = phase.startsWith("replaced"), newest = replacing ? patternAwareSettings({ ...older, maxContextLength: 4 }) : newer;
+		const entered = deferred(), release = deferred(), loading = deferred(), resume = deferred();
+		const load = PatternAwareStore.prototype.load;
+		const observer = vi.spyOn(PatternAwareStore.prototype, "load").mockImplementation(async function (this: PatternAwareStore) {
+			stores.push(this);
+			if (stores.length === 2) {
+				loading.resolve(); await resume.promise;
+				if (phase.includes("load failure")) throw new Error("load failed");
+			}
+			return load.call(this);
+		});
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
+			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const propose = (patternAware: typeof older) => controller.source.propose({
+			startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
+			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
+		});
+		let pending: Promise<PromiseSettledResult<unknown>[]> | undefined, closing: Promise<void> | undefined;
+		try {
+			await propose(older);
+			const flush = stores[0]!.flush.bind(stores[0]);
+			vi.spyOn(stores[0]!, "flush").mockImplementationOnce(async () => {
+				entered.resolve(); await release.promise; await flush();
+				if (phase === "flush failure") throw new Error("flush failed");
+			});
+			pending = Promise.allSettled([propose(newer), propose(newest)]);
+			await entered.promise;
+			if (phase === "closing") {
+				let closed = false;
+				closing = controller.dispose(); void closing.then(() => { closed = true; });
+				release.resolve(); await loading.promise; await nextTurn();
+				expect(closed).toBe(false);
+				expect(controller.dispose()).toBe(closing);
+			}
+			release.resolve(); resume.resolve();
+			expect((await pending).map(result => result.status)).toEqual([
+				phase.includes("load failure") ? "rejected" : "fulfilled", phase === "load failure" ? "rejected" : "fulfilled",
+			]);
+			if (phase !== "closing") { await expect(propose(newest)).resolves.toBeUndefined(); await controller.finishSession(); }
+			await controller.dispose();
+			await expect(propose(newest)).rejects.toThrow("disposed");
+			expect(stores).toHaveLength(replacing || phase === "load failure" ? 3 : 2);
+			const retired = [...stores];
+			for (const configuration of new Set([older, newer, newest])) {
+				const fresh = await acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics-v1",
+					actionKey: (name, args, schema) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] });
+				try { expect(retired).not.toContain(fresh.store); } finally { await fresh.release(); }
+			}
+		} finally {
+			release.resolve(); resume.resolve(); await pending; await closing; await controller.dispose();
+			observer.mockRestore(); await Promise.allSettled(stores.map(store => store.flush()));
+		}
 	});
 
 	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
