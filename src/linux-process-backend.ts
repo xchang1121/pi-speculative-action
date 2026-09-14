@@ -296,7 +296,6 @@ export class LinuxProcessReuseBackend {
 	private heldExec?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry;
-	private readonly certificateScopes = new Map<Sha256Digest, ExecutionScope>();
 	private readonly processScheduler = new SpeculationScheduler<object>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
@@ -317,7 +316,6 @@ export class LinuxProcessReuseBackend {
 			maintain: async (operation) => {
 				this.handoffs.clearCompleted();
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
-				if (operation === "clear") this.certificateScopes.clear();
 				return {
 					removedEntries: result.removedCertificates,
 					removedArtifacts: result.removedArtifacts,
@@ -576,7 +574,6 @@ export class LinuxProcessReuseBackend {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
 		this.handoffs.dispose();
-		this.certificateScopes.clear();
 		return this.disposal = this.resetActorReplay().finally(() => this.replayWorkspace.dispose());
 	}
 
@@ -779,7 +776,6 @@ export class LinuxProcessReuseBackend {
 			},
 		});
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
-			this.rememberScope(certificate.id, session.scope);
 			this.add(session, "wholeCommandPublished");
 		}
 	}
@@ -833,7 +829,7 @@ export class LinuxProcessReuseBackend {
 			session.scope,
 			{ ownership: session.ownership },
 		);
-		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired.joined);
+		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired);
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
@@ -849,7 +845,7 @@ export class LinuxProcessReuseBackend {
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership },
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
 		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
 		if (admission && !admission.allowed) {
@@ -877,7 +873,7 @@ export class LinuxProcessReuseBackend {
 			} : { role: "producer" as const, ownership: participant.ownership }),
 		});
 		return {
-			...(acquired.kind === "hit" ? { plan: acquired.plan } : {}),
+			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer } : {}),
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
 			waitedMs,
@@ -994,7 +990,7 @@ export class LinuxProcessReuseBackend {
 					try {
 						throwIfAborted(process.signal);
 						await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
-						this.recordHit(plan.certificate, acquired.joined, undefined, scope);
+						this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 						this.processScheduler.observeAdoption(
 							timing,
 							Math.max(0, performance.now() - requestStarted - acquired.waitedMs),
@@ -1024,7 +1020,7 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
-		joined: boolean,
+		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff },
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
 		let replayed = false;
@@ -1033,7 +1029,7 @@ export class LinuxProcessReuseBackend {
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
 			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 			session.nestedEvidence.push(certificate.dependencyCertificate);
-			this.recordHit(certificate, joined, session);
+			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			replayed = true;
 			return { version: 2, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
@@ -1181,7 +1177,6 @@ export class LinuxProcessReuseBackend {
 				});
 				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				this.rememberScope(certificate.id, session.scope);
 				if (taints.size) {
 					this.add(session, "tainted");
 					this.setError(session, `tainted:${[...taints].join(",")}`);
@@ -1230,7 +1225,7 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private recordHit(
-		certificate: ProcessProvenanceCertificate,
+		producer: ExecutionScope | undefined,
 		joined: boolean,
 		session?: ActiveSession,
 		scope: ExecutionScope | undefined = session?.scope,
@@ -1238,7 +1233,6 @@ export class LinuxProcessReuseBackend {
 		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.addActor(metric);
 		add("hits");
 		if (joined) add("joinedHits");
-		const producer = this.certificateScopes.get(certificate.id);
 		add(
 			producer && scope
 				? sameScope(producer, scope)
@@ -1256,15 +1250,6 @@ export class LinuxProcessReuseBackend {
 	private setActorError(detail: string): void {
 		this.counters.lastError = detail;
 		this.actorCounters.lastError = detail;
-	}
-
-	private rememberScope(id: Sha256Digest, scope: ExecutionScope | undefined): void {
-		if (!scope) return;
-		this.certificateScopes.delete(id);
-		this.certificateScopes.set(id, scope);
-		while (this.certificateScopes.size > this.store.limits.maxCertificates) {
-			this.certificateScopes.delete(this.certificateScopes.keys().next().value!);
-		}
 	}
 
 	private async resolveRequestedExecutable(session: ActiveSession, request: DispatcherRequest): Promise<string> {
