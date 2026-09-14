@@ -8,7 +8,7 @@ import {
 	PI_ACTION_SEMANTICS,
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
-import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 import type { ToolFilesystemStat } from "./tool-settlement.ts";
 
@@ -187,7 +187,6 @@ type ResourceEvent = {
 };
 
 const MAX_EVENT_HISTORY = 4096;
-const FINGERPRINT_CONCURRENCY = 12;
 
 export class ResourceVersionManager {
 	private epoch = 0;
@@ -513,7 +512,7 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 
 async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView) {
 	const context = { realRoot, excludes, view, nearestExisting: missingResourceResolver(realRoot) };
-	return mapFingerprints(dependencies, async (dependency) => {
+	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
 		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, context);
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
@@ -627,7 +626,7 @@ async function fingerprintPath(
 	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
 	const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 	const descendants = new Set(ancestors).add(identity);
-	const children = scope === "names" ? [] : await mapFingerprints([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
+	const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
 		const child = await fingerprintPath(path.join(target, entry.name), scope, context, descendants, scope !== "entries");
 		return { name: entry.name, ...child };
 	});
@@ -730,23 +729,6 @@ function assertInside(realRoot: string, target: string): void {
 	if (!containsFilesystemPath(realRoot, target)) throw new Error(`resource_symlink_escapes_workspace:${target}`);
 }
 
-async function mapFingerprints<Input, Output>(
-	values: ReadonlyArray<Input>,
-	run: (value: Input) => Promise<Output>,
-) {
-	const output: Output[] = [];
-	let cursor = 0;
-	const pending = Array.from({ length: Math.min(FINGERPRINT_CONCURRENCY, values.length) }, async () => {
-		while (cursor < values.length) {
-			const index = cursor++;
-			output[index] = await run(values[index]);
-		}
-	});
-	try { await Promise.all(pending); }
-	catch (error) { cursor = values.length; await Promise.allSettled(pending); throw error; }
-	return output;
-}
-
 function validation(
 	started: number,
 	expired: boolean,
@@ -796,7 +778,7 @@ class AsyncGate {
 	private readonly waiting: Array<() => void> = [];
 
 	async run<Value>(task: () => Promise<Value>) {
-		if (this.active < FINGERPRINT_CONCURRENCY) this.active++;
+		if (this.active < FILESYSTEM_CONCURRENCY) this.active++;
 		else await new Promise<void>((resolve) => this.waiting.push(resolve));
 		try {
 			return await task();

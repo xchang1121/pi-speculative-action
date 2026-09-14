@@ -609,6 +609,47 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
+	it.each([false, true])("drains parallel private staging before committing, failing or closing (failure=%s)", async (failure) => {
+		const root = await temporaryRoot("parallel-staging"), target = path.join(root, "control");
+		await writeFile(target, "control");
+		const observer = await open(target, "r"), sync = observer.sync;
+		const entered = deferred(), release = deferred(), handles: FileHandle[] = [];
+		let returned = false, closed = false, active = 0, peak = 0;
+		const syncing = vi.spyOn(Object.getPrototypeOf(observer), "sync").mockImplementation(async function (this: FileHandle) {
+			const index = handles.push(this) - 1;
+			peak = Math.max(peak, ++active);
+			try {
+				if (index === 0) { entered.resolve(); await release.promise; }
+				else if (index === 1 && failure) throw new Error("injected staging sync failure");
+				await sync.call(this);
+			} finally { active--; }
+		});
+		const changes = Array.from({ length: 16 }, (_, index) => fileTransition(root, `file-${index}`, undefined, `value-${index}`));
+		const pending = sandbox.commitDelta({ output: settlement("done"), changes }).then(
+			output => { returned = true; return { output }; }, error => { returned = true; return { error }; });
+		let retirement: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			await vi.waitFor(() => expect(handles.length).toBeGreaterThan(1));
+			retirement = sandbox.dispose().then(() => { closed = true; });
+			await nextTurn();
+			expect({ returned, closed }).toEqual({ returned: false, closed: false });
+			for (const change of changes) await expect(stat(change.target)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			release.resolve(); await Promise.allSettled([pending, retirement ?? sandbox.dispose()]);
+			syncing.mockRestore(); await observer.close();
+		}
+		expect(peak).toBeGreaterThan(1); expect(peak).toBeLessThanOrEqual(12);
+		expect(handles.every(handle => handle.fd === -1)).toBe(true);
+		const result = await pending;
+		if (failure) expect(result).toMatchObject({ error: { disposition: "recoverable", message: "injected staging sync failure" } });
+		else {
+			expect(result).toEqual({ output: settlement("done") });
+			for (const change of changes) expect(await readFile(change.target)).toEqual(change.after);
+		}
+		expect((await readdir(root)).sort()).toEqual(["control", ...(failure ? [] : changes.map(change => change.resource))].sort());
+	});
+
 	it.each(["unchanged", "paths", "after", "before", "directory-before", "directory-after"])("owns queued %s data and validates every baseline before one commit wins", async (mutation) => {
 		const root = await temporaryRoot("lock");
 		const target = path.join(root, "value.txt");
