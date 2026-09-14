@@ -12,7 +12,7 @@ import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-co
 import { describe, expect, test, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { LinuxHeldExecBoundary } from "../src/linux-held-exec.ts";
+import { LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership } from "../src/process-handoff.ts";
@@ -73,15 +73,18 @@ describe("Linux process ExecutionWorld", () => {
 			}
 			for (const disposition of [undefined, "recoverable", "poisoned"] as const) {
 				const after = path.join(root, `after-${disposition}`);
+				const scope = { sessionID: "session", turnID: "original" };
 				const commit = vi.fn(async () => {
 					if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
 				});
+				const decide = vi.fn(async (_process: HeldExecProcess) => ({ kind: "replay" as const, output: [], exitCode: 0, commit }));
 				const executor = boundary.executor(adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary })), {
 					sourceRoot: root, realShell: "/bin/bash",
-					decide: async () => ({ kind: "replay", output: [], exitCode: 0, commit }),
+					decide,
 				});
 				const run = executor.execute({ command: `/bin/true; printf continued > '${after}'`, cwd: root,
-					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5 });
+					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5, scope });
+				scope.turnID = "later";
 				if (disposition) {
 					await expect(run).rejects.toMatchObject({ disposition: "poisoned" });
 					await expect(stat(after)).rejects.toThrow();
@@ -90,6 +93,9 @@ describe("Linux process ExecutionWorld", () => {
 					expect(await readFile(after, "utf8")).toBe("continued");
 				}
 				expect(commit).toHaveBeenCalledOnce();
+				expect(decide).toHaveBeenCalledOnce();
+				expect(decide.mock.calls[0]![0].scope).toEqual({ sessionID: "session", turnID: "original" });
+				expect(Object.isFrozen(decide.mock.calls[0]![0].scope)).toBe(true);
 			}
 			let closed = false;
 			const { promise: entered, resolve: started } = deferred();

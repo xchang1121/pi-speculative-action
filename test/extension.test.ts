@@ -27,6 +27,7 @@ import {
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import type { ProcessExecutionRequest } from "../src/process-execution.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
 import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
@@ -302,6 +303,31 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.store.effective()).toMatchObject({ enabled: true });
 		expect(fixture.store.effective()?.tools).not.toContain("bash");
 		expect(fixture.store.scope).toBe("project");
+	});
+
+	it("keeps each Actor scope across tool binding and overlapping turns", async () => {
+		const executeProcess = vi.fn(async (_request: ProcessExecutionRequest) => ({ exitCode: 0 }));
+		const prepare = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockResolvedValue({
+			state: "ready", detail: "ready", executor: { execute: executeProcess },
+		});
+		const gate = deferred(), pending: Promise<unknown>[] = [];
+		try {
+			const fixture = await createFixture({ settings: { enabled: true } });
+			await fixture.emit("session_start");
+			const execute = fixture.host.execute;
+			vi.spyOn(fixture.host, "execute").mockImplementation(async (...args) => { await gate.promise; return execute(...args); });
+			const invoke = (command: string) => fixture.tools.get("bash")!.execute(command, { command }, undefined, undefined, fixture.context);
+			pending.push(invoke(": unscoped"));
+			await fixture.emit("context", { messages: [] });
+			pending.push(invoke(": first-turn"));
+			await fixture.emit("context", { messages: [] });
+			gate.resolve(); await Promise.all(pending);
+			expect(executeProcess).toHaveBeenCalledTimes(2);
+			expect(prepare.mock.results).toHaveLength(1);
+			expect(executeProcess.mock.calls.map(([request]) => [request.command, request.scope]).sort()).toEqual([
+				[": first-turn", { sessionID: "session", turnID: "turn_1" }], [": unscoped", undefined],
+			]);
+		} finally { gate.resolve(); await Promise.allSettled(pending); prepare.mockRestore(); }
 	});
 
 	it("publishes applied settings only after the Actor route refresh settles", async () => {

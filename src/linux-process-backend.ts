@@ -76,6 +76,7 @@ import {
 } from "./linux-held-exec.ts";
 import {
 	emptyWorldReuseMetrics,
+	snapshotExecutionScope,
 	type ExecutionScope,
 	type ExecutionWorldStorageControl,
 	type WorldReuseMetrics,
@@ -383,7 +384,7 @@ export class LinuxProcessReuseBackend {
 				executor = boundary.executor(options.held.executor(boundary.shellPath), {
 					realShell: options.held.realShell,
 					sourceRoot: path.resolve(options.sourceRoot),
-					decide: (process) => this.decideHeldExec(process, options.held?.scope?.()),
+					decide: (process) => this.decideHeldExec(process, process.scope),
 				}, host);
 				state = "ready";
 				detail = "matching whole Bash calls plus completed or running child processes";
@@ -395,6 +396,9 @@ export class LinuxProcessReuseBackend {
 		if (refresh) await (prepared = prepare());
 		return { get state() { return state; }, get detail() { return detail; }, executor: {
 			execute: async (request) => {
+				try {
+					request = { ...request, scope: snapshotExecutionScope("scope" in request ? request.scope : options.held?.scope?.()) };
+				} catch { return host.execute(request); }
 				// Only actual production and retained evidence need replay. Recheck after IO; never cache emptiness.
 				if ((!this.hasLiveResults && !(await this.store.mayHaveCertificates()) && !this.hasLiveResults) || this.disposed) return host.execute(request);
 				return (await (prepared ??= prepare())).execute(request);
