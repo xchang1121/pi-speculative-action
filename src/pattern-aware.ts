@@ -2194,27 +2194,6 @@ function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSet
 }
 
 function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {
-	const gaps = combineWeightedGaps(patterns, settings, clock);
-	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
-	const quantile = (coverage: number) => {
-		const target = total * coverage;
-		let covered = 0;
-		for (const [gap, weight] of gaps) {
-			covered += weight;
-			if (covered >= target) return gap;
-		}
-		return gaps.at(-1)?.[0] ?? 0;
-	};
-	const horizon = quantile(settings.futureGapCoverage);
-	return {
-		horizon,
-		latestHorizon: Math.max(horizon, quantile(1)),
-		gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1,
-			gaps.filter(([gap]) => gap <= horizon).reduce((sum, [, weight]) => sum + weight, 0) / total)),
-	};
-}
-
-function combineWeightedGaps(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {
 	const combined = new Map<number, number>();
 	for (const pattern of patterns) {
 		for (const [gap, weight] of weightedGaps(pattern, settings, clock)) {
@@ -2222,7 +2201,20 @@ function combineWeightedGaps(patterns: ReadonlyArray<MutablePattern>, settings: 
 			combined.set(gap, (combined.get(gap) ?? 0) + weight);
 		}
 	}
-	return [...combined.entries()].sort(([left], [right]) => left - right);
+	const gaps = [...combined.entries()].sort(([left], [right]) => left - right);
+	const total = gaps.reduce((sum, [, weight]) => sum + weight, 0);
+	const target = total * settings.futureGapCoverage;
+	const latestHorizon = gaps.at(-1)?.[0] ?? 0;
+	let horizon = latestHorizon, covered = 0;
+	for (const [gap, weight] of gaps) {
+		covered += weight;
+		if (covered >= target) { horizon = gap; break; }
+	}
+	return {
+		horizon,
+		latestHorizon,
+		gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)),
+	};
 }
 
 function weightedGaps(pattern: MutablePattern, settings: PatternAwareSettings, clock: number) {

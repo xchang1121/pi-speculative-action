@@ -293,12 +293,14 @@ describe("PatternAware", () => {
 		expect(candidate).toMatchObject({ horizon: 1, latestHorizon: 1 });
 	});
 
-	test("separates eventual probability from weighted gap timing and retains the observed deadline", () => {
-		const gapSettings = settings({ maxFutureGap: 8, futureGapCoverage: 0.8 });
+	test.each([1, 1000])("retains the observed deadline after gap decay at sequence %s", (lastSeenSequence) => {
+		const gapSettings = settings({ maxFutureGap: 8, futureGapCoverage: 0.8, decayHalfLifeEvents: 10 });
 		const store = new PatternAwareStore(gapSettings);
 		const immediate = new PatternAwareStore(gapSettings);
-		const pattern = acceptPattern(store, { "0": 9, "5": 1 });
-		acceptPattern(immediate, { "0": 10 });
+		const pattern = acceptPattern(store, { "0": 9, "5": 1 }, {
+			lastSeenSequence, gapLastSeen: { "0": lastSeenSequence, "5": 1 },
+		});
+		acceptPattern(immediate, { "0": 10 }, { lastSeenSequence, gapLastSeen: { "0": lastSeenSequence } });
 
 		store.observe(input("probe", "grep", { pattern: "TODO" }));
 		immediate.observe(input("probe", "grep", { pattern: "TODO" }));
