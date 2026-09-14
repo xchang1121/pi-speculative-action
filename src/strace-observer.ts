@@ -323,24 +323,19 @@ export async function observeStrace(
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if (MODELED_METADATA_SYSCALLS.has(syscall)) {
-				if (syscallSucceeded(line)) {
-					const metadataPaths = metadataSyscallPaths(line, syscall, cwd);
-					const digest = statObservationDigest(line.args[syscall === "newfstatat" ? 2 : 1] ?? "");
-					if (!metadataPaths.length || !digest) {
-						if (syscall === "fstat" && descriptorTarget(line)) taints.add("descriptor_observation");
-						else {
-							taints.add("unsupported_syscall");
-							incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
-						}
+			if (MODELED_METADATA_SYSCALLS.has(syscall) && syscallSucceeded(line)) {
+				const metadataPaths = syscallPaths(line, syscall, cwd);
+				const digest = statObservationDigest(line.args[syscall === "newfstatat" ? 2 : 1] ?? "");
+				if (!metadataPaths.length || !digest) {
+					if (syscall === "fstat" && descriptorTarget(line)) taints.add("descriptor_observation");
+					else {
+						taints.add("unsupported_syscall");
+						incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
 					}
-					if (digest) {
-						for (const observed of metadataPaths) observeMetadata(observed.path, observed.followSymlinks, digest);
-					}
-				} else {
-					for (const observed of syscallPaths(line, syscall, cwd)) {
-						if (paths.get(observed) !== "executable") paths.set(observed, "input");
-					}
+				}
+				if (digest) {
+					const followSymlinks = syscall !== "lstat" && !(syscall === "newfstatat" && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[3] ?? ""));
+					for (const observed of metadataPaths) observeMetadata(observed, followSymlinks, digest);
 				}
 				continue;
 			}
@@ -596,15 +591,6 @@ function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly s
 function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {
 	const target = /^(?:\d+|AT_FDCWD)<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
 	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(decodeCString(target)) : undefined;
-}
-
-function metadataSyscallPaths(
-	line: TraceLine,
-	syscall: string,
-	cwd: string,
-): readonly { readonly path: string; readonly followSymlinks: boolean }[] {
-	const followSymlinks = syscall !== "lstat" && !(syscall === "newfstatat" && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[3] ?? ""));
-	return syscallPaths(line, syscall, cwd).map((observedPath) => ({ path: observedPath, followSymlinks }));
 }
 
 /** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
