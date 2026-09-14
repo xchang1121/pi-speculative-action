@@ -1,4 +1,4 @@
-import type { Stats } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -82,12 +82,11 @@ export async function captureWorkspaceStructure(
 	const maxFiles = Math.max(1, options.maxFiles ?? 100_000);
 	let files = 0;
 	let complete = true;
-	const rootStat = await lstat(absoluteRoot);
-	entries.set("", await captureExistingWorkspaceStructureEntry(absoluteRoot, rootStat, [...excludes]));
-
-	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
-		if (!complete) return;
-		const children = await readdir(directory, { withFileTypes: true });
+	const visit = async (directory: string, relativeDirectory: string, stat: Stats): Promise<void> => {
+		const children = !relativeDirectory || stat.isDirectory() ? await readdir(directory, { withFileTypes: true }) : [];
+		entries.set(relativeDirectory, await captureExistingWorkspaceStructureEntry(
+			directory, stat, relativeDirectory ? [] : [...excludes], children,
+		));
 		for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
 			const relative = relativeDirectory ? path.join(relativeDirectory, child.name) : child.name;
 			if (!relativeDirectory && excludes.has(child.name)) continue;
@@ -97,12 +96,11 @@ export async function captureWorkspaceStructure(
 				complete = false;
 				return;
 			}
-			entries.set(relative, await captureExistingWorkspaceStructureEntry(target, stat));
-			if (stat.isDirectory()) await visit(target, relative);
+			await visit(target, relative, stat);
 		}
 	};
 
-	await visit(absoluteRoot, "");
+	await visit(absoluteRoot, "", await lstat(absoluteRoot));
 	return Object.freeze({ root: absoluteRoot, entries, files, bytesRead: 0, complete });
 }
 
@@ -125,26 +123,26 @@ async function captureExistingWorkspaceStructureEntry(
 	target: string,
 	stat: Stats,
 	excludeEntries: readonly string[] = [],
+	children?: readonly Dirent[],
 ): Promise<WorkspaceStructureEntry> {
+	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: stat.ctimeMs };
 	if (stat.isSymbolicLink()) {
 		const linkTarget = await readlink(target);
 		return {
 			kind: "symlink",
 			target: linkTarget,
 			targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")),
-			changeDigest: statChangeDigest(stat),
-			changeTimeMs: stat.ctimeMs,
+			...change,
 		};
 	}
 	if (stat.isDirectory()) {
 		const excluded = new Set(excludeEntries);
-		const entries = (await readdir(target, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name));
+		const entries = (children ?? await readdir(target, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name));
 		return {
 			kind: "directory",
 			entriesDigest: directoryEntriesDigest(entries),
 			metadataDigest: filesystemMetadataDigest(stat),
-			changeDigest: statChangeDigest(stat),
-			changeTimeMs: stat.ctimeMs,
+			...change,
 			mode: stat.mode & 0o777,
 			uid: stat.uid,
 			gid: stat.gid,
@@ -154,8 +152,7 @@ async function captureExistingWorkspaceStructureEntry(
 		return {
 			kind: "file",
 			metadataDigest: filesystemMetadataDigest(stat),
-			changeDigest: statChangeDigest(stat),
-			changeTimeMs: stat.ctimeMs,
+			...change,
 			mode: stat.mode & 0o777,
 			size: stat.size,
 			links: stat.nlink,
@@ -164,8 +161,7 @@ async function captureExistingWorkspaceStructureEntry(
 	return {
 		kind: "unsupported",
 		type: filesystemEntryType(stat),
-		changeDigest: statChangeDigest(stat),
-		changeTimeMs: stat.ctimeMs,
+		...change,
 	};
 }
 
