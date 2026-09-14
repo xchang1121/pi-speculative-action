@@ -110,8 +110,10 @@ export class LinuxHeldExecBoundary {
 			: path.join(os.tmpdir(), `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const boundary = new LinuxHeldExecBoundary(binary, socketPath);
 		await listenUnixSocket(boundary.server, socketPath);
-		await chmod(socketPath, 0o600);
-		return boundary;
+		try {
+			await chmod(socketPath, 0o600);
+			return boundary;
+		} catch (error) { await boundary.close(); throw error; }
 	}
 
 	executor(
