@@ -149,19 +149,24 @@ describe("PlanRuntime", () => {
 		}
 	});
 
-	it("keeps an execution-blocked node matchable without making it launchable", () => {
+	it.each([false, true])("keeps preparation matchable and owns the execution decision: blocked=%s", (blocked) => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("bash")]), 0);
 		const key = buildPiActionKey("bash", { command: "npm test" }, "/workspace")!;
 
 		expect(plan.bindActionKey("plan", "bash", key)).toBe(true);
-		const blocked = cause("execution", "isolation_unavailable");
-		expect(plan.markExecutionBlocked("plan", "bash", blocked)).toBe(true);
-		expect(plan.markExecutionBlocked("plan", "bash", blocked)).toBe(false);
 		expect(plan.launchable()).toEqual([]);
-		expect(plan.matchable(1)).toMatchObject([
-			{ actionKey: key, execution: { status: "execution_blocked", cause: blocked } },
-		]);
+		expect(plan.takeReady(1)).toEqual([]);
+		expect(plan.promote("plan", "bash")).toEqual({ status: "already_dispatched" });
+		expect(plan.attachExecution("plan", "bash", "unprepared", new CandidateExecution("shared"))).toBe(false);
+		expect(plan.matchable(1)).toMatchObject([{ actionKey: key, execution: { status: "preparing" } }]);
+		const identity = plan.get("plan", "bash")!.identity, failure = blocked ? cause("execution", "isolation_unavailable") : undefined;
+		expect(plan.finishPreparation({ ...identity, id: "retired" }, failure)).toBe(false);
+		expect(plan.finishPreparation(identity, failure)).toBe(true);
+		expect(plan.finishPreparation(identity, failure)).toBe(false);
+		expect(plan.matchable(1)).toMatchObject([{ actionKey: key, execution: blocked
+			? { status: "execution_blocked", cause: failure } : { status: "deferred" } }]);
+		expect(plan.launchable()).toHaveLength(blocked ? 0 : 1);
 	});
 
 	it.each(["succeeded", "failed", "cancelled"] as const)("queries current dependencies independently of %s execution and Actor settlement", (status) => {
@@ -283,7 +288,8 @@ describe("PlanRuntime", () => {
 		const child = action("child", { dependsOn: [dependency, dependency, { actionID: second }] });
 		plan.apply(proposal([action(first), action(second), child, action("leaf", { dependsOn: [{ actionID: "child" }] })]), 0);
 		const key = buildPiActionKey("read", child.input, "/workspace")!, execution = new CandidateExecution<string>("shared");
-		plan.bindActionKey("plan", "child", key); execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
+		plan.bindActionKey("plan", "child", key); plan.finishPreparation(plan.get("plan", "child")!.identity);
+		execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
 		for (const id of [first, second, "child"]) plan.attachExecution("plan", id, id, execution);
 		const original = plan.get("plan", "child")!, leaf = plan.get("plan", "leaf")!.identity;
 		expect(original.action.dependsOn![0]).not.toBe(original.action.dependsOn![1]);

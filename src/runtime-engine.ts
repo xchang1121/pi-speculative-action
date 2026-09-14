@@ -1147,6 +1147,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
+		if (!session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction)) return;
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
 		if (slot?.active && slot.requestKind === "proposal" &&
@@ -1190,14 +1191,11 @@ export function makeStructuralSpeculativeActionRuntime<
 				failUnlaunchable(session, node, admission.cause);
 				return;
 			}
-			session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction);
-			if (!session.plan.markExecutionBlocked(node.proposalID, node.action.id, admission.cause)) {
-				failUnlaunchable(session, node, cause("plan", "execution_route_state_invalid"));
-			}
+			session.plan.finishPreparation(node.identity, admission.cause);
 			return;
 		}
 		context.executionRoute = admission.route;
-		session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction);
+		session.plan.finishPreparation(node.identity);
 	};
 
 	const releaseActionContext = (session: Session, id: string, keepContinuation = false): void => {
@@ -1224,7 +1222,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const settleBlockedPlanActions = (session: Session): void => {
 		for (const node of session.plan.drainBlocked()) {
 			const failure = cause("plan", "dependency_impossible");
-			if (node.execution.status === "deferred" || node.execution.status === "scheduled") {
+			if (node.execution.status === "deferred" || node.execution.status === "preparing" || node.execution.status === "scheduled") {
 				const work = new CandidateExecution<never>("shared");
 				work.fail(failure, performance.now(), 0);
 				session.plan.attachExecution(node.proposalID, node.action.id, `blocked:${node.identity.id}`, work);
@@ -1995,11 +1993,12 @@ export function makeStructuralSpeculativeActionRuntime<
 			}
 			const ranked = rankCandidates(state.session, actualKey, previewCandidateID);
 			const blockedPrediction = matchingPredictions.find(
-				({ node }) => node.execution.status === "execution_blocked",
+				({ node }) => node.execution.status === "execution_blocked" || node.execution.status === "preparing",
 			)?.node;
 			actorAction.setFallback(
 				blockedPrediction?.execution.status === "execution_blocked"
 					? blockedPrediction.execution.cause
+					: blockedPrediction?.execution.status === "preparing" ? cause("admission", "preparation_pending")
 					: cause("matching", ranked.length ? "candidate_unavailable" : "no_candidate"),
 			);
 			await selectActorCandidate({
@@ -2738,7 +2737,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		state.lifecycle = "closing";
 		state.generation.expire(input.failure);
 		for (const node of state.session.plan.pending()) {
-			if (!node.actionKey && state.session.actionContexts.get(node.identity.id)?.admissionSignal.aborted)
+			if ((!node.actionKey || node.execution.status === "preparing") &&
+				state.session.actionContexts.get(node.identity.id)?.admissionSignal.aborted)
 				failUnlaunchable(state.session, node, cause("source", "generation_expired"));
 		}
 		for (const preview of state.actorPreviews.values()) {
@@ -2892,7 +2892,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				(total, session) => total + session.pendingSourceRequests + session.pendingAdmissions,
 				0,
 			),
-			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred").length,
+			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred" || node.execution.status === "preparing").length,
 			activePlanActions: planNodes.filter(
 				(node) =>
 					node.execution.status === "scheduled" ||
