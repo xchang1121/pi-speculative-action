@@ -43,6 +43,10 @@ describe("Linux process ExecutionWorld", () => {
 		execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
+			const permissions = new Error("socket permission failure"), retained = await filesystem.readdir(root);
+			vi.mocked(filesystem.chmod).mockResolvedValueOnce().mockRejectedValueOnce(permissions);
+			await expect(LinuxHeldExecBoundary.open({ storeRoot: root, binary })).rejects.toBe(permissions);
+			expect(await filesystem.readdir(root)).toEqual(retained);
 			const completed = path.join(root, "descendant-completed"), pidFile = path.join(root, "descendant-pid");
 			const command = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 0.1; echo done > ${completed}' </dev/null >/dev/null 2>&1 & exit 7`;
 			expect(childProcess.spawnSync(binary, ["/bin/bash", "-c", command]).status).toBe(7);
