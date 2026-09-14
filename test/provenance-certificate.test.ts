@@ -29,7 +29,7 @@ const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
-	it("validates complete filesystem evidence and detects file, directory and negative lookup changes", async () => {
+	it("owns validation inputs and detects filesystem changes", async () => {
 		const root = await workspace();
 		await mkdir(path.join(root, "lib"));
 		for (const [name, content] of [
@@ -65,10 +65,12 @@ describe("process provenance certificates", () => {
 			},
 			result: { replayProfile: "buffered_noninteractive", observedProcessMs: 1250.5, journal: [], exit: { kind: "code", code: 0 } },
 		});
-		const validate = () => validateProcessCertificate(certificate, {
+		const validate = (value = certificate) => validateProcessCertificate(value, {
 			resolvePath: (logical) => path.join(root, path.posix.relative("/workspace", logical)),
 		});
-		const validation = await validate();
+		const mutable = structuredClone(certificate), validating = validate(mutable);
+		Object.assign(mutable, { weakKey: certificate.id, strongKey: certificate.id });
+		const validation = await validating;
 		expect(validation).toMatchObject({ status: "valid", filesRead: 3 });
 		expect(certificate.strongKey).toBe(
 			validation.status === "valid" ? validation.strongKey : undefined,
@@ -76,7 +78,10 @@ describe("process provenance certificates", () => {
 		expect(certificate.result.observedProcessMs).toBe(1250.5);
 
 		await writeFile(path.join(root, "input.txt"), "changed");
-		expect(await validate()).toMatchObject({ status: "stale", changed: ["/workspace/input.txt"] });
+		const changed = structuredClone(certificate), stale = validate(changed);
+		Object.assign(changed.dependencyCertificate.dependencies.find(d => d.kind === "file")!, { contentDigest: sha256Digest("changed") });
+		Object.assign(changed.dependencyCertificate.dependencies, { length: 0 });
+		expect(await stale).toMatchObject({ status: "stale", changed: ["/workspace/input.txt"] });
 		await writeFile(path.join(root, "lib", "new.txt"), "new");
 		await writeFile(path.join(root, "missing.txt"), "appeared");
 		expect(await validate()).toMatchObject({
