@@ -13,7 +13,7 @@ import {
 	speculativeCacheValue,
 } from "./candidate-stores.ts";
 import { candidateToolNames, clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
-import { nonNegativeFinite as finiteMetric } from "./number-utils.ts";
+import { nonNegativeFinite as finiteMetric, positiveCount } from "./number-utils.ts";
 import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
@@ -98,8 +98,7 @@ function reservationAvailable(reservation: CandidateReservation): boolean {
 }
 
 function concurrentLimit(settings: SpeculativeActionSettings): number {
-	const value = settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions;
-	return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+	return positiveCount(settings.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions);
 }
 
 function cacheEntryLimit(settings: SpeculativeActionSettings): number {
@@ -314,7 +313,6 @@ function candidateExecutionProjection<Output>(
 ): CandidateExecutionProjection | undefined {
 	const state = candidate.work.execution;
 	if (state.status === "queued") return undefined;
-	if (state.status === "running") return { status: "running", startedAt: state.startedAt };
 	if (state.status === "succeeded") {
 		return {
 			status: "succeeded",
@@ -322,13 +320,7 @@ function candidateExecutionProjection<Output>(
 			executionMs: state.executionMs,
 		};
 	}
-	return {
-		status: state.status,
-		cause: state.cause,
-		...(state.startedAt !== undefined ? { startedAt: state.startedAt } : {}),
-		completedAt: state.completedAt,
-		executionMs: state.executionMs,
-	};
+	return { ...state };
 }
 
 function candidateCacheValue<Output>(
@@ -581,16 +573,13 @@ export function makeStructuralSpeculativeActionRuntime<
 		sourcesByID.set(source.id, source);
 	}
 	const projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], semantics);
-	const runtimeState = Object.freeze({
-		semantics, sources, sourcesByID, projectionRules,
-		candidates: new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue),
-		sessions: new Map<SessionID, Session>(),
-	});
+	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue);
+	const sessionStates = new Map<SessionID, Session>();
 	let masterEnabled: boolean | undefined;
 	const masterDisabled = () => masterEnabled === false;
 
 	const sessionFor = (sessionID: SessionID, settings: SpeculativeActionSettings): Session => {
-		const current = runtimeState.sessions.get(sessionID);
+		const current = sessionStates.get(sessionID);
 		if (current) return current;
 		const created: Session = {
 			id: sessionID,
@@ -614,20 +603,20 @@ export function makeStructuralSpeculativeActionRuntime<
 			pendingSourceRequests: 0,
 			pendingAdmissions: 0,
 		};
-		runtimeState.sessions.set(sessionID, created);
+		sessionStates.set(sessionID, created);
 		return created;
 	};
 	const turnContext = ({ startInput, data, settings }: RuntimeTurnContext<StartInput, StateData>) =>
 		({ startInput, data, settings });
 
 	const removeCandidate = (sessionID: SessionID, candidate: Candidate): void => {
-		runtimeState.candidates.delete(sessionID, candidate);
+		candidateStore.delete(sessionID, candidate);
 		candidate.resultViews?.clear();
-		runtimeState.sessions.get(sessionID)?.lifecycle.release(candidateBranch(candidate));
+		sessionStates.get(sessionID)?.lifecycle.release(candidateBranch(candidate));
 	};
 
 	const acquireCandidate = (session: Session, candidate: Candidate, owner: string) =>
-		runtimeState.candidates.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
+		candidateStore.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
 
 	const createCandidate = (
 		session: Session,
@@ -666,18 +655,18 @@ export function makeStructuralSpeculativeActionRuntime<
 	): Promise<void> => {
 		let rejected: Set<Candidate> | undefined;
 		while (active()) {
-			const { entry: candidate, inserted } = runtimeState.candidates.getOrCreate(session.id, input.key, create, (existing, match) => {
+			const { entry: candidate, inserted } = candidateStore.getOrCreate(session.id, input.key, create, (existing, match) => {
 					const execution = existing.work.execution;
 					return !rejected?.has(existing) && activeExecution(existing) && candidateWorld(existing) === input.worldParent &&
 						(sameSpeculativeExecutionRoute(existing.route, input.route) ||
 							(existing.route.reuse === "shared_result" && input.route.reuse === "shared_result" && execution.status === "succeeded" &&
 								session.scheduler.assessCompatibility(execution.output.compatibility, input.key.executionFingerprint).compatible)) &&
 						(match.kind === "exact" || (existing.route.reuse === "shared_result" || execution.status !== "succeeded") &&
-							actionKeyCovers(existing.key, input.key, runtimeState.projectionRules));
+							actionKeyCovers(existing.key, input.key, projectionRules));
 				});
 			if (!inserted && candidate.work.execution.status === "succeeded") {
 				const validation = await validateCandidate(candidate);
-				if (validation.status !== "valid" || !runtimeState.candidates.has(session.id, candidate)) {
+				if (validation.status !== "valid" || !candidateStore.has(session.id, candidate)) {
 					(rejected ??= new Set()).add(candidate);
 					if (validation.status === "stale") invalidateCandidates(session, [candidate], validation.cause);
 					continue;
@@ -707,7 +696,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		if (signal?.aborted) return;
 		const definitions = adapter.definitions(input);
-		const names = candidateToolNames(settings, runtimeState.semantics);
+		const names = candidateToolNames(settings, semantics);
 		if (!definitions.length) return;
 		const session = sessionFor(input.sessionID, settings);
 		await session.lifecycle.run(async () => {
@@ -845,7 +834,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const launchSourceRequests = (state: Turn): void => {
 		if (!state.candidateNames.length) return;
-		for (const source of runtimeState.sources) {
+		for (const source of sources) {
 			if (!source.enabled(state.settings)) continue;
 			const count = clampCandidateLimit(source.proposalCount?.(state.settings));
 			for (let index = 0; index < count; index++) {
@@ -1020,7 +1009,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const concrete = asConcreteInput(node.action.input);
-		if (!concrete || !context.settings.enabled || !candidateToolNames(context.settings, runtimeState.semantics).includes(node.action.tool)) {
+		if (!concrete || !context.settings.enabled || !candidateToolNames(context.settings, semantics).includes(node.action.tool)) {
 			failUnlaunchable(session, node, cause("admission", concrete ? "tool_disabled" : "invalid_input"));
 			return;
 		}
@@ -1051,7 +1040,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
 		if (slot && session.sourceSlots.has(slot) && slot.request.kind === "proposal" &&
-			runtimeState.sourcesByID.get(node.source)?.concurrentProposalPolicy?.(context.settings) === "first_produced")
+			sourcesByID.get(node.source)?.concurrentProposalPolicy?.(context.settings) === "first_produced")
 			cancelCompetingProposals(session, slot);
 		const onCandidateMaterialized = adapter.onCandidateMaterialized;
 		if (onCandidateMaterialized) {
@@ -1257,7 +1246,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const startQueuedCandidates = (session: Session, preferred?: Candidate): void => {
 		if (session.lifecycle.sealed) return;
 		if (preferred) return launchCandidateBatch(session, preferred);
-		if (session.pendingLaunch || !runtimeState.candidates.pending(session.id).some((candidate) => candidate.work.execution.status === "queued")) return;
+		if (session.pendingLaunch || !candidateStore.pending(session.id).some((candidate) => candidate.work.execution.status === "queued")) return;
 		session.pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
 			session.pendingLaunch = undefined;
 			if (!session.lifecycle.sealed && !masterDisabled()) launchCandidateBatch(session);
@@ -1266,7 +1255,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const launchCandidateBatch = (session: Session, preferred?: Candidate): void => {
 		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
-		const queued = (preferred ? [preferred] : runtimeState.candidates.pending(session.id))
+		const queued = (preferred ? [preferred] : candidateStore.pending(session.id))
 			.filter(
 				(candidate) =>
 					candidate.work.execution.status === "queued" &&
@@ -1348,7 +1337,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				candidate: publicCandidate(candidate),
 			});
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
-			candidate.projectionCoverage = captureCoverage(candidate.key, output, runtimeState.projectionRules);
+			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
 			const completedAt = performance.now();
 			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt), completedAt - startedAt)) {
@@ -1359,7 +1348,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				actionTimingIdentity(candidate.key),
 				completedAt - startedAt,
 			);
-			runtimeState.candidates.settle(session.id, candidate, candidate.work.reservation.kind === "shared");
+			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared");
 			queueCandidateContinuations(
 				session,
 				session.plan.consumers(candidate.id),
@@ -1395,7 +1384,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
 		signal?: AbortSignal,
 	): Promise<void> => {
-		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
+		const state = sessionStates.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) return;
 		state.actorToolHints.add(input.tool);
 		await Promise.all(
@@ -1416,7 +1405,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const previewActorCall = (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
-		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
+		const state = sessionStates.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) {
 			return Promise.resolve();
 		}
@@ -1471,9 +1460,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			try {
 				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
 				const projected = await projectOutput(candidate, action, execution.output.output, match,
-					runtimeState.projectionRules, { action, args: action.input, callID: actualCall.id!,
+					projectionRules, { action, args: action.input, callID: actualCall.id!,
 						signal: signal ?? state.generation.signal });
-				if (projected.ok && active() && runtimeState.candidates.get(state.sessionID, candidate.id) === candidate &&
+				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate &&
 					retainResultView(candidate, action, projected, state.settings)) trimResults(state.session, state.settings);
 			} finally {
 				lease.release();
@@ -1535,7 +1524,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const current = record.state;
 		record.state = { status: "cancelled" };
 		if (current.status !== "candidate") return;
-		const candidate = runtimeState.candidates.get(state.sessionID, current.candidateID);
+		const candidate = candidateStore.get(state.sessionID, current.candidateID);
 		if (!candidate) return;
 		candidate.previews?.delete(record);
 		retireUndemandedCandidate(state.session, candidate, failure);
@@ -1732,7 +1721,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					actualKey,
 					branch.output,
 					choice.match,
-					runtimeState.projectionRules,
+					projectionRules,
 					{ action: actualKey, args: actualCall.input, callID: actualCall.id ?? actualKey.hash,
 						signal: signal ?? state.generation.signal },
 				);
@@ -1768,7 +1757,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				} else {
 					if (preview) candidate.previews?.delete(preview);
 					const retained = retainResultView(candidate, actualKey, projection, state.settings);
-					runtimeState.candidates.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
+					candidateStore.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 					if (retained) trimResults(state.session, state.settings);
 				}
 				actorAction.select({
@@ -1794,7 +1783,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<PreparedActorCall<Output> | undefined> => {
 		const actorArrivedAt = performance.now();
-		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
+		const state = sessionStates.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled())
 			return undefined;
 		const actualCall = adapter.actual(input);
@@ -1931,7 +1920,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				executionBlockedAttemptLead(state.session, matchingPredictions, actorArrivedAt),
 			);
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
-			const effect = runtimeState.semantics.effect(actualKey);
+			const effect = semantics.effect(actualKey);
 			preemptForActor(state.session, state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			if (adapter.captureAuthoritativeResult && effect === "observation") {
@@ -1987,13 +1976,13 @@ export function makeStructuralSpeculativeActionRuntime<
 				attemptStartedAt: toolExecution.startedAt,
 				expectedDurationMs: durationMs,
 				estimatedBytes: estimateValueBytes(output) + branch.capturedBytes,
-				projectionCoverage: captureCoverage(action, output, runtimeState.projectionRules),
+				projectionCoverage: captureCoverage(action, output, projectionRules),
 			});
 			candidate.work.start(toolExecution.startedAt);
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
-			runtimeState.candidates.settle(state.sessionID, candidate);
+			candidateStore.settle(state.sessionID, candidate);
 			retained = true;
 			trimResults(state.session, state.settings);
 		} catch {
@@ -2081,7 +2070,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			}
 			if (event) state.session.events.enqueue(event);
 			const concrete = asConcreteInput(actualCall.input) ?? {};
-			for (const source of runtimeState.sources) {
+			for (const source of sources) {
 				if (!source.observe || !source.enabled(state.settings)) continue;
 				try {
 					const updates = await source.observe({
@@ -2142,7 +2131,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const predictionSettled = (session: Session, node: PlanRuntimeNode, settlement: PredictionSettlement): void => {
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
-		const source = runtimeState.sourcesByID.get(context.identity.source);
+		const source = sourcesByID.get(context.identity.source);
 		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: "prediction",
 			...eventEnvelope(session, context.startInput.turnID, context.settings),
@@ -2180,7 +2169,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			settlement.match.adoption.status === "adopted";
 		releaseActionContext(session, node.identity.id, adopted);
 		if ("candidateID" in node.execution && node.execution.candidateID) {
-			const candidate = runtimeState.candidates.get(session.id, node.execution.candidateID);
+			const candidate = candidateStore.get(session.id, node.execution.candidateID);
 			if (candidate) retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
 		}
 	};
@@ -2214,7 +2203,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const current = session.plan.get(node.proposalID, node.action.id);
 		if (current?.identity.id !== node.identity.id) return;
 		const context = session.actionContexts.get(node.identity.id);
-		const source = context ? runtimeState.sourcesByID.get(context.identity.source) : undefined;
+		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (context && source?.continuationBatch && trigger === "execution_succeeded") {
 			try { queuePeerContinuations(session, current, context, source); } catch { /* Producer feedback is advisory. */ }
 		}
@@ -2271,7 +2260,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const queuePeerContinuations = (
 		session: Session, node: PlanRuntimeNode, context: PlanActionContext<StartInput, StateData>, source: Source,
 	): void => {
-		const peers = runtimeState.sources.filter((peer) => peer.id !== source.id && peer.continueFrom &&
+		const peers = sources.filter((peer) => peer.id !== source.id && peer.continueFrom &&
 			peer.enabled(context.settings) && peer.multiStepEnabled?.(context.settings) !== false);
 		if (!peers.length) return;
 		const ids = source.continuationBatch!({ proposalID: node.proposalID, actionID: node.action.id, feedback: context.feedback });
@@ -2284,7 +2273,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			if (!parent || !owner || owner.admissionSignal.aborted || parent.predictionState.status !== "pending" ||
 				parent.expectedDecisionSeq !== session.decisionSequence + 1 || parent.action.dependsOn?.length ||
 				parent.execution.status !== "succeeded") return;
-			const candidate = runtimeState.candidates.get(session.id, parent.execution.candidateID);
+			const candidate = candidateStore.get(session.id, parent.execution.candidateID);
 			if (candidate?.work.execution.status !== "succeeded") return;
 			batch.push({ identity: parent.identity, candidate: predictionCandidate(candidate, parent), output: candidate.work.execution.output.output });
 			parents.push(owner);
@@ -2335,7 +2324,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const dependency of node.action.dependsOn ?? []) {
 			const parentNode = session.plan.dependency(node.proposalID, dependency);
 			if (!parentNode || !("candidateID" in parentNode.execution) || !parentNode.execution.candidateID) continue;
-			const candidate = runtimeState.candidates.get(session.id, parentNode.execution.candidateID);
+			const candidate = candidateStore.get(session.id, parentNode.execution.candidateID);
 			if (!candidate) continue;
 			const parent = unresolvedWorld(candidate);
 			if (parent) parents.add(parent);
@@ -2409,7 +2398,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		preferred?: string,
 	) => {
 		const now = performance.now();
-		return runtimeState.candidates.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded")
+		return candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded")
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				if (!activeExecution(candidate) || candidateWorld(candidate) !== undefined) return [];
@@ -2457,7 +2446,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		decisionSequence: number,
 	): readonly { readonly node: PlanRuntimeNode; readonly relation: ActionKeyMatch }[] =>
 		nearestPredictions(session, decisionSequence, (node) => {
-			const relation = actionKeyMatch(node.actionKey!, action, runtimeState.projectionRules, true);
+			const relation = actionKeyMatch(node.actionKey!, action, projectionRules, true);
 			return relation ? { node, relation } : undefined;
 		});
 
@@ -2505,7 +2494,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause): void => {
 		let invalidated = false;
 		for (const candidate of new Set(candidates)) {
-			if (runtimeState.candidates.get(session.id, candidate.id) !== candidate) continue;
+			if (candidateStore.get(session.id, candidate.id) !== candidate) continue;
 			discardCandidate(session, candidate, failure, false);
 			session.plan.rearmExecution(candidate.id);
 			invalidated = true;
@@ -2515,7 +2504,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const reconcileStores = async (state: Turn): Promise<void> => {
 		const available = new Set(state.definitions.map((definition) => definition.name));
-		for (const candidate of runtimeState.candidates.values(state.sessionID)) {
+		for (const candidate of candidateStore.values(state.sessionID)) {
 			if (!available.has(candidate.key.tool) ||
 				(candidate.work.execution.status === "queued" && !state.candidateNames.includes(candidate.key.tool)))
 				discardCandidate(state.session, candidate, cause("control", "tool_disabled"));
@@ -2524,7 +2513,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const trimResults = (session: Session, settings: SpeculativeActionSettings): void => {
-		for (const candidate of runtimeState.candidates.trim(
+		for (const candidate of candidateStore.trim(
 			session.id,
 			cacheLimits(settings),
 			(entry) => !entry.previews?.size && reservationAvailable(entry.work.reservation),
@@ -2539,7 +2528,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const authoritativeMutationResources = (action: ActionKey, adopted?: Candidate): readonly string[] => {
-		if (runtimeState.semantics.effect(action) === "observation") return [];
+		if (semantics.effect(action) === "observation") return [];
 		if (adopted?.work.reservation.kind === "shared") return [];
 		return adopted ? (candidateBranch(adopted)?.resources ?? action.resources) : action.resources;
 	};
@@ -2547,7 +2536,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const reconcileAuthoritativeEffects = (session: Session, action: ActionKey, adopted?: Candidate): void => {
 		const changed = authoritativeMutationResources(action, adopted);
 		if (!changed.length) return;
-		const candidates = runtimeState.candidates.values(session.id);
+		const candidates = candidateStore.values(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
 			if (candidate === adopted || (adopted && descendsFrom(candidate, adopted))) continue;
@@ -2631,7 +2620,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const flushSources = async (): Promise<void> => {
-		for (const source of runtimeState.sources) {
+		for (const source of sources) {
 			try {
 				await source.flush?.();
 			} catch {
@@ -2663,7 +2652,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		for (const state of session.turns.values()) clearActorActions(state);
 		session.turns.clear();
 
-		for (const candidate of runtimeState.candidates.values(session.id)) {
+		for (const candidate of candidateStore.values(session.id)) {
 			if (!terminal || candidate.work.reservation.kind === "exclusive") {
 				discardCandidate(session, candidate, planFailure);
 			}
@@ -2692,7 +2681,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
-		const session = runtimeState.sessions.get(input.sessionID);
+		const session = sessionStates.get(input.sessionID);
 		if (!session) return;
 		await session.lifecycle.run(() => {
 			if (input.terminal === true) return closeSessionState(session, "terminal", input.turnID);
@@ -2705,38 +2694,38 @@ export function makeStructuralSpeculativeActionRuntime<
 		masterEnabled = settings.enabled;
 		if (settings.enabled) return;
 		await Promise.all(
-			[...runtimeState.sessions.keys()].map((sessionID) => disableSession(sessionID)),
+			[...sessionStates.keys()].map((sessionID) => disableSession(sessionID)),
 		);
 	};
 
 	const disableSession = async (sessionID: SessionID): Promise<void> => {
-		const session = runtimeState.sessions.get(sessionID);
+		const session = sessionStates.get(sessionID);
 		if (!session) return;
 		await session.lifecycle.run(() => closeSessionState(session, "disabled"));
 	};
 
 	const disposeSession = async (sessionID: SessionID): Promise<void> => {
-		const session = runtimeState.sessions.get(sessionID);
+		const session = sessionStates.get(sessionID);
 		if (!session) return;
 		await session.lifecycle.close(async () => {
 			await closeSessionState(session, "disposed");
 			await session.effects.close();
 			await session.events.close({ drain: false });
-			runtimeState.sessions.delete(sessionID);
+			sessionStates.delete(sessionID);
 		});
 	};
 
 	const dispose = async (): Promise<void> => {
-		await Promise.all([...runtimeState.sessions.keys()].map((sessionID) => disposeSession(sessionID)));
+		await Promise.all([...sessionStates.keys()].map((sessionID) => disposeSession(sessionID)));
 	};
 
 	const inspect = (sessionID?: SessionID): SpeculativeRuntimeInspection => {
 		const selectedSessions =
-			sessionID === undefined ? [...runtimeState.sessions.values()] : maybe(runtimeState.sessions.get(sessionID));
+			sessionID === undefined ? [...sessionStates.values()] : maybe(sessionStates.get(sessionID));
 		const candidates =
 			sessionID === undefined
-				? runtimeState.candidates.allValues()
-				: runtimeState.candidates.values(sessionID);
+				? candidateStore.allValues()
+				: candidateStore.values(sessionID);
 		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
 		const telemetry = selectedSessions.map((session) => session.events.snapshot());
 		return {
@@ -2763,8 +2752,8 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const cacheSnapshot = (session: Session, settings: SpeculativeActionSettings): SpeculativeCacheSnapshot => {
-		const candidates = runtimeState.candidates.values(session.id);
-		const segments = runtimeState.candidates.snapshot(session.id);
+		const candidates = candidateStore.values(session.id);
+		const segments = candidateStore.snapshot(session.id);
 		const resultEntries = segments.coldEntries + segments.hotEntries;
 		let exclusiveCandidates = 0, branchEntries = 0, branchBytes = 0;
 		for (const candidate of candidates) {
@@ -2835,7 +2824,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		previewActorCall,
 		prepareActorCall: (input, signal) => {
 			const task = prepareActorCall(input, signal);
-			return runtimeState.sessions.get(input.sessionID)?.lifecycle.track(task) ?? task;
+			return sessionStates.get(input.sessionID)?.lifecycle.track(task) ?? task;
 		},
 		finishTurn,
 		settingsChanged,
