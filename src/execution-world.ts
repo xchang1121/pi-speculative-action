@@ -14,10 +14,14 @@ export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "wo
 export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
 export type ExecutionWorldScope = "runtime" | "fallback";
 
-/** Correlation scope carried through every execution world without affecting cache identity. */
+/** Logical session and turn for execution ownership, separate from reusable action identity. */
 export interface ExecutionScope {
 	readonly sessionID: string;
 	readonly turnID: string;
+}
+
+export function snapshotExecutionScope(scope: ExecutionScope | undefined): ExecutionScope | undefined {
+	return scope ? Object.freeze({ sessionID: scope.sessionID, turnID: scope.turnID }) : undefined;
 }
 
 /** Tool effects are resolved independently from K(a) and prediction source. */

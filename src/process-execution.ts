@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { errorMessage } from "./error-utils.ts";
+import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 /** One process launch as observed at the generic tool-execution outlet. */
@@ -9,6 +10,7 @@ export interface ProcessExecutionRequest {
 	readonly environment: Readonly<Record<string, string | undefined>>;
 	readonly timeout?: number;
 	readonly signal?: AbortSignal;
+	readonly scope?: ExecutionScope;
 	readonly onData: (data: Buffer) => void;
 }
 
@@ -88,6 +90,12 @@ export class ProcessExecutionCoordinator {
 		// Overlap Actor readiness with actual production; its generation owns preparation through retirement.
 		if (!this.disposed && this.actorRoute?.enabled()) this.scope.exit(() => this.prepareActorRoute(true));
 		return this.scope.run(executor, operation);
+	}
+
+	/** Own the Actor scope before tool binding, reuse, and process preparation can yield. */
+	runActor<Value>(scope: ExecutionScope | undefined, operation: () => Promise<Value>): Promise<Value> {
+		const captured = snapshotExecutionScope(scope);
+		return this.scope.run({ execute: (request) => this.executeActor({ ...request, scope: captured }) }, operation);
 	}
 
 	private async executeActor(request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {

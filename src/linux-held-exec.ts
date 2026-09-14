@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
+import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
 const HELPER_PROTOCOL_VERSION = 5;
 const WIRE_PROTOCOL_VERSION = 1;
@@ -25,6 +26,7 @@ export interface HeldExecProcess {
 	readonly pid: number;
 	readonly tracerPid: number;
 	readonly sourceRoot: string;
+	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
 }
 
@@ -57,6 +59,7 @@ export interface LinuxHeldExecOptions {
 
 interface ActiveExecution {
 	readonly sourceRoot: string;
+	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
 	readonly pending: Set<Promise<void>>;
@@ -128,6 +131,7 @@ export class LinuxHeldExecBoundary {
 				let finished!: () => void;
 				const active: ActiveExecution = {
 					sourceRoot: options.sourceRoot,
+					scope: snapshotExecutionScope(request.scope),
 					decide: options.decide,
 					pending: new Set<Promise<void>>(), controller,
 					completion: new Promise<void>((resolve) => { finished = resolve; }),
@@ -183,6 +187,7 @@ export class LinuxHeldExecBoundary {
 				pid: request.pid,
 				tracerPid: request.tracer,
 				sourceRoot: active.sourceRoot,
+				scope: active.scope,
 				...(active.signal ? { signal: active.signal } : {}),
 			});
 			if (decision.kind === "continue") {

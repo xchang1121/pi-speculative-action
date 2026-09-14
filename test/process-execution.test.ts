@@ -10,6 +10,10 @@ describe("ProcessExecutionCoordinator", () => {
 			let enabled = false, retired = false, active = 0;
 			const executor = (label: string): ProcessExecutor => ({ execute: async (request) => {
 				calls.push(`${label}:${request.command}`);
+				if (["first", "second"].includes(request.command)) {
+					expect(request.scope).toEqual({ sessionID: "session", turnID: request.command });
+					expect(Object.isFrozen(request.scope)).toBe(true);
+				}
 				if (label === "reuse") {
 					if (++active === 2) executing.resolve();
 					await finish.promise;
@@ -41,7 +45,11 @@ describe("ProcessExecutionCoordinator", () => {
 				})).toEqual({ exitCode: 0 }); // Prediction completes while Actor preparation is still held.
 			});
 			if (warm) expect(prepare).toHaveBeenCalledOnce();
-			const first = invoke("first"), second = invoke("second");
+			const delayed = barrier(), logicalScope = { sessionID: "session", turnID: "first" };
+			const first = coordinator.runActor(logicalScope, async () => { await delayed.promise; return invoke("first"); });
+			logicalScope.turnID = "second";
+			const second = coordinator.runActor(logicalScope, async () => { await delayed.promise; return invoke("second"); });
+			logicalScope.turnID = "later"; delayed.resolve();
 			const started = Promise.allSettled([first, second]); // Capture boundary exceptions without unhandled rejections.
 			await probing.promise;
 			if (phase === "executing") {
