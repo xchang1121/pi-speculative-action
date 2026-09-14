@@ -67,6 +67,19 @@ export class TaskTimeline {
 	}
 }
 
+/** Reconstructs a no-overlap baseline from distinct computations in one authoritative timeline. */
+export function measureSpeculativeTask(input: {
+	readonly startedAt: number;
+	readonly completedAt: number;
+	readonly actorPhases: readonly TimelineInterval[];
+	readonly authoritativeTools: readonly TimelineInterval[];
+}): SpeculativeTaskTiming {
+	const timeline = new TaskTimeline(input.startedAt);
+	for (const interval of input.actorPhases) timeline.recordActor(interval.startedAt, interval.completedAt);
+	for (const interval of input.authoritativeTools) timeline.recordTool(interval);
+	return timeline.measure(input.completedAt);
+}
+
 function nonNegativeDifference(left: number, right: number): number {
 	const difference = left - right;
 	const tolerance = Number.EPSILON * Math.max(1, left, right) * 16;
