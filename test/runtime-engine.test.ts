@@ -10,14 +10,11 @@ import {
 	type WorldBranch,
 } from "../src/execution-world.ts";
 import type {
-	AuthoritativeResultCapture,
-	CandidatePreflight,
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
+	SpeculativeActionRuntimeAdapter,
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
-	SpeculativeDraftCandidate,
-	SpeculativePlanSource,
 } from "../src/runtime.ts";
 import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
 import { CandidateStore } from "../src/candidate-stores.ts";
@@ -63,7 +60,8 @@ const MUTATION_ROUTE: SpeculativeExecutionRoute = {
 	fingerprint: "test-world:v1",
 };
 
-type Source<SessionID = string> = SpeculativePlanSource<SessionID, string, Start<SessionID>, Call<SessionID>, { readonly cwd: string }>;
+type TestAdapter<SessionID = string> = SpeculativeActionRuntimeAdapter<SessionID, string, Start<SessionID>, Call<SessionID>, { readonly cwd: string }>;
+type Source<SessionID = string> = NonNullable<TestAdapter<SessionID>["sources"]>[number];
 
 function planSource(source: Omit<Source, "id" | "enabled"> & Partial<Pick<Source, "enabled">>): Source {
 	return { id: "source", enabled: () => true, ...source };
@@ -128,11 +126,12 @@ function validResource() {
 	return { status: "valid" as const, metrics: zeroValidationMetrics() };
 }
 
-function harness<SessionID = string>(input: {
+function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
+	"settings" | "stateData" | "actionKey" | "resolveExecution" | "captureAuthoritativeResult" |
+	"preflightCandidate" | "authorizeCandidate" | "onCandidateMaterialized" | "onTurnFinished" | "rejectCandidateOutput"
+>> & {
 	readonly source: Source<SessionID>;
 	readonly peers?: readonly Source<SessionID>[];
-	readonly settings?: () => SpeculativeActionSettings;
-	readonly stateData?: (input: Start<SessionID>) => Promise<{ readonly cwd: string }>;
 	readonly execute?: (
 		tool: string,
 		input: Readonly<Record<string, unknown>>,
@@ -142,23 +141,8 @@ function harness<SessionID = string>(input: {
 	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
-	readonly preflight?: (signal: AbortSignal, candidate: SpeculativeDraftCandidate) => CandidatePreflight | Promise<CandidatePreflight>;
-	readonly authorize?: () => CandidatePreflight | Promise<CandidatePreflight>;
 	readonly projection?: ActionProjectionRule<string>;
-	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => void | Promise<void>;
-	readonly onTurnFinished?: (input: { readonly startInput: Start<SessionID>; readonly terminal: boolean; readonly durationMs: number }) => void | Promise<void>;
-	readonly onEvent?: false | ((event: SpeculativeActionEvent<SessionID>) => void | Promise<void>);
-	readonly actionKey?: (
-		tool: string,
-		args: unknown,
-		context: { readonly type: "start" | "consume" },
-	) => ReturnType<typeof buildPiActionKey> | Promise<ReturnType<typeof buildPiActionKey>>;
-	readonly resolveExecution?: (tool: string) => SpeculativeExecutionRoute | undefined | Promise<SpeculativeExecutionRoute | undefined>;
-	readonly captureAuthoritativeResult?: (
-		action: NonNullable<ReturnType<typeof buildPiActionKey>>,
-		signal: AbortSignal,
-	) => AuthoritativeResultCapture<string> | undefined | Promise<AuthoritativeResultCapture<string> | undefined>;
-	readonly rejectCandidateOutput?: (output: string) => string | undefined;
+	readonly onEvent?: false | TestAdapter<SessionID>["onEvent"];
 }) {
 	const events: SpeculativeActionEvent<SessionID>[] = [];
 	let executions = 0;
@@ -168,20 +152,12 @@ function harness<SessionID = string>(input: {
 		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
 		stateData: input.stateData ?? (() => ({ cwd: "/workspace" })),
 		actionKey: input.actionKey ?? ((tool, args) => buildPiActionKey(tool, args, "/workspace")),
-		resolveExecution: ({ tool }) =>
-			input.resolveExecution
-				? input.resolveExecution(tool)
-				: tool === "read"
-					? RESOURCE_ROUTE
-					: tool === "write"
-						? MUTATION_ROUTE
-						: undefined,
-		captureAuthoritativeResult: input.captureAuthoritativeResult
-			? ({ action, signal }) => input.captureAuthoritativeResult!(action, signal) : undefined,
-		rejectCandidateOutput: input.rejectCandidateOutput ? ({ output }) => input.rejectCandidateOutput!(output) : undefined,
+		resolveExecution: input.resolveExecution ?? (({ tool }) => tool === "read" ? RESOURCE_ROUTE : tool === "write" ? MUTATION_ROUTE : undefined),
+		captureAuthoritativeResult: input.captureAuthoritativeResult,
+		rejectCandidateOutput: input.rejectCandidateOutput,
 		actual: (call) => call,
-		preflightCandidate: ({ signal, candidate }) => input.preflight?.(signal, candidate) ?? { ok: true },
-		authorizeCandidate: input.authorize,
+		preflightCandidate: input.preflightCandidate ?? (() => ({ ok: true })),
+		authorizeCandidate: input.authorizeCandidate,
 		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
 			const version =
@@ -329,7 +305,7 @@ describe("structural speculative runtime", () => {
 		const closed: unknown[] = [], disposed: string[] = [];
 		const { runtime } = harness<unknown>({ source: { id: "none", enabled: () => false, propose: () => undefined },
 			onTurnFinished: ({ startInput }) => { closed.push(startInput.sessionID); },
-			captureAuthoritativeResult: (action) => ({ route: RESOURCE_ROUTE, dispose: () => {},
+			captureAuthoritativeResult: ({ action }) => ({ route: RESOURCE_ROUTE, dispose: () => {},
 				seal: (output) => world(output, { executionFingerprint: action.executionFingerprint, validate: async () => validResource(),
 					onDispose: () => { disposed.push(output); } }) }) });
 		try {
@@ -382,7 +358,7 @@ describe("structural speculative runtime", () => {
 		for (const order of [[0, 1], [1, 0]]) {
 			const seals: [unknown, string][] = [], disposals: unknown[] = [];
 			const { runtime, events } = harness({ source: { id: "none", enabled: () => false, propose: () => undefined },
-				captureAuthoritativeResult: (action) => {
+				captureAuthoritativeResult: ({ action }) => {
 					const dispose = () => { disposals.push(action.input.path); };
 					return { route: RESOURCE_ROUTE, dispose, seal: (output) => {
 						seals.push([action.input.path, output]);
@@ -883,8 +859,8 @@ describe("structural speculative runtime", () => {
 			execute: () => { now += 6; return world(`fresh:${version}`, {
 				executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
 				validate: async () => (validResource()) }); },
-			authorize: () => ({ ok: mode !== "denied", reason: "permission_changed" }),
-			captureAuthoritativeResult: (action) => {
+			authorizeCandidate: () => ({ ok: mode !== "denied", reason: "permission_changed" }),
+			captureAuthoritativeResult: ({ action }) => {
 				captures++; const captured = version;
 				return { route: RESOURCE_ROUTE, dispose: () => {}, seal: async (output) => {
 					seals++;
@@ -947,7 +923,7 @@ describe("structural speculative runtime", () => {
 		});
 		const { runtime, events, executions: executionCount } = harness({
 			source,
-			preflight: async () => {
+			preflightCandidate: async () => {
 				admissionEntered.arrive();
 				await admission.promise;
 				return { ok: true };
@@ -1113,7 +1089,7 @@ describe("structural speculative runtime", () => {
 			source: planSource({
 				propose: () => plan("projection", { path: "README.md", offset: 1, limit: 100 }) }),
 			projection,
-			authorize: () => { authorized.arrive(); return { ok: true }; },
+			authorizeCandidate: () => { authorized.arrive(); return { ok: true }; },
 			execute: async () => { started.arrive(); if (running) await completion.promise;
 				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
@@ -1188,7 +1164,7 @@ describe("structural speculative runtime", () => {
 		let now = 1, cost = 20;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const { runtime } = harness({ source: { id: "none", enabled: () => false, propose: () => undefined },
-			captureAuthoritativeResult: (action) => {
+			captureAuthoritativeResult: ({ action }) => {
 				now += captureMs / 2;
 				return { route: RESOURCE_ROUTE, dispose: () => {}, seal: (output) => {
 					now += captureMs / 2;
@@ -1280,7 +1256,7 @@ describe("structural speculative runtime", () => {
 		const { runtime } = harness({
 			source: planSource({ propose: () => plan("inputs", { path: "README.md", offset: 1, limit: 1 }) }),
 			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
-			authorize: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
+			authorizeCandidate: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
 			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
 				...world("1", { executionFingerprint: "bound", onDispose: disposed, onCommit: committed,
 					validate: async () => (validResource()) }),
@@ -1509,7 +1485,7 @@ describe("structural speculative runtime", () => {
 					return PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: identity });
 				},
 				resolveExecution,
-				captureAuthoritativeResult: (action) => { captured = action; return undefined; },
+				captureAuthoritativeResult: ({ action }) => { captured = action; return undefined; },
 			});
 			const turnID = `in-flight-key:${formalPath}:${settlePreview}`;
 			await runtime.startTurn(start(turnID));
@@ -1553,7 +1529,7 @@ describe("structural speculative runtime", () => {
 					const proposal = plan(`${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
 					return mode === "future-prediction" ? { ...proposal, actions: proposal.actions.map((action) => ({ ...action, horizon: 3, expectedDurationMs: 10 })) } : proposal;
 				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } }),
-			preflight: async (_signal, draft) => {
+			preflightCandidate: async ({ candidate: draft }) => {
 				if (draft.source === "actor_preview" && (mode === "late-prediction" || dual)) {
 					if (++admissions === (dual ? 2 : 1)) admitted.arrive(); await admissionGate.promise;
 				}
@@ -1637,7 +1613,7 @@ describe("structural speculative runtime", () => {
 				if (phase === "binding" && context.type === "consume") { entered.arrive(); await gate.promise; }
 				return buildPiActionKey(tool, args, "/workspace");
 			},
-			authorize: async () => {
+			authorizeCandidate: async () => {
 				if (phase === "selection" && authorizations++ === 0) { entered.arrive(); await gate.promise; return { ok: false, reason: "first_rejected" }; }
 				return { ok: true };
 			},
@@ -1675,7 +1651,7 @@ describe("structural speculative runtime", () => {
 		const second = { ...actor, id: "second-effect" };
 		const { runtime, executions: executionCount } = harness({
 			source: { id: "disabled", enabled: () => false, propose: () => undefined },
-			resolveExecution: (tool) => independent || tool === "write" ? MUTATION_ROUTE : undefined,
+			resolveExecution: ({ tool }) => independent || tool === "write" ? MUTATION_ROUTE : undefined,
 			execute: async () => {
 				started.arrive(); await gate.promise;
 				return world("count:1", {
@@ -1795,12 +1771,12 @@ describe("structural speculative runtime", () => {
 						dependsOn: [{ actionID, condition: "execution_succeeded" }] }] }),
 				onSettled: ({ settlement }) => { settlements.push(settlement); },
 			}),
-			resolveExecution: async (tool) => {
+			resolveExecution: async ({ tool }) => {
 				if (tool === "read") return RESOURCE_ROUTE;
 				if (phase === "route") await hold();
 				return MUTATION_ROUTE;
 			},
-			preflight: async (_signal, candidate) => {
+			preflightCandidate: async ({ candidate }) => {
 				if (phase === "preflight" && candidate.tool === child.tool) await hold();
 				return { ok: true };
 			},
@@ -1851,7 +1827,7 @@ describe("structural speculative runtime", () => {
 				}
 				return buildPiActionKey(tool, args, "/workspace");
 			},
-			preflight: async (signal, candidate) => {
+			preflightCandidate: async ({ signal, candidate }) => {
 				const candidatePath = (candidate.input as { path: string }).path;
 				preflighted.push(candidatePath);
 				if (phase === "preflight" && candidatePath === "child.ts") {
@@ -2099,7 +2075,7 @@ describe("structural speculative runtime", () => {
 		});
 		const { runtime, events } = harness({
 			source,
-			preflight: (_signal, candidate) => {
+			preflightCandidate: ({ candidate }) => {
 				if (candidate.dependsOn?.length) {
 					dependencyChange = Reflect.set(candidate.dependsOn[0]!, "condition", "actor_adopted");
 					childPrepared.arrive();
