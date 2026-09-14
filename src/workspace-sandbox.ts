@@ -148,6 +148,7 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 	readonly transactionClockLinks: 0 | 1;
 	/** Native roots whose timestamp domain is projected through the workspace view. */
 	readonly transactionClockRoots: readonly string[];
+	readonly gitWorkspace?: PreparedGitWorkspace;
 	readonly overlay?: LinuxOverlayfsMount;
 	readonly overlayStorageRoot?: string;
 	readonly sharedBaseline?: SharedOverlayBaseline;
@@ -189,13 +190,10 @@ interface PreparedGitWorkspace {
 	readonly processRoot: string;
 	readonly commit: string;
 	readonly gitDirectory: string;
+	readonly dispose: () => Promise<void>;
 }
 
-interface SharedOverlayBaseline {
-	readonly root: string;
-	readonly privateRoot: string;
-	readonly gitDirectory: string;
-	readonly commit: string;
+interface SharedOverlayBaseline extends PreparedGitWorkspace {
 	structure?: Promise<WorkspaceStructureSnapshot>;
 	active: number;
 }
@@ -1157,18 +1155,18 @@ async function createPrivateSandboxWorkspace(
 				mkdtemp(path.join(pool.parent, "overlay-storage-")),
 			]);
 			const mounted = await mountLinuxOverlayfs({
-				lowerRoot: sharedBaseline.root,
+				lowerRoot: sharedBaseline.sandboxRoot,
 				privateRoot: overlayStorageRoot,
 				options: overlayOptions,
 				capabilityRegistry: state.overlayfsCapabilities,
 			});
 			overlay = mounted;
 			sandboxRoot = mounted.root;
-			baselineRoot = sharedBaseline.root;
+			baselineRoot = sharedBaseline.sandboxRoot;
 			gitDirectory = sharedBaseline.gitDirectory;
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot);
 			transactionClockLinks = 0;
-			transactionClockRoots = Object.freeze([sharedBaseline.root, mounted.upperRoot, mounted.workRoot]);
+			transactionClockRoots = Object.freeze([sharedBaseline.sandboxRoot, mounted.upperRoot, mounted.workRoot]);
 		} else {
 			const prepared = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit));
 			attached = prepared;
@@ -1220,6 +1218,7 @@ async function createPrivateSandboxWorkspace(
 			openTransactionClock,
 			transactionClockLinks,
 			transactionClockRoots,
+			...(attached ? { gitWorkspace: attached } : {}),
 			...(overlay ? { overlay } : {}),
 			...(overlayStorageRoot ? { overlayStorageRoot } : {}),
 			...(sharedBaseline ? { sharedBaseline } : {}),
@@ -1240,7 +1239,7 @@ async function createPrivateSandboxWorkspace(
 			if (processRoot && !attached) await rm(processRoot, { recursive: true, force: true }).catch(() => undefined);
 			if (overlayStorageRoot) await rm(overlayStorageRoot, { recursive: true, force: true }).catch(() => undefined);
 			if (sharedBaseline) releaseOverlayBaseline(sharedBaseline);
-			if (attached) await discardPreparedSandbox(pool, attached).catch(() => undefined);
+			await attached?.dispose().catch(() => undefined);
 			releaseSandboxRepository(pool);
 		} else {
 			quarantineSandboxRepository(pool);
@@ -1451,7 +1450,7 @@ async function ensurePreparedSandbox(repository: PooledGitRepository, commit: st
 		return;
 	}
 	const stale = await takePreparedSandbox(repository);
-	if (stale) await discardPreparedSandbox(repository, stale);
+	await stale?.dispose();
 	throwIfAborted(signal);
 	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, commit) };
 	try {
@@ -1473,7 +1472,7 @@ async function takePreparedSandbox(
 	try {
 		const prepared = await pending.workspace;
 		if (commit === undefined || prepared.commit === commit) return prepared;
-		await discardPreparedSandbox(repository, prepared);
+		await prepared.dispose();
 	} catch {
 		// A failed or stale warm-up falls back to a fresh per-action workspace.
 	}
@@ -1495,8 +1494,17 @@ async function attachSandboxWorkspace(
 		)
 			.toString("utf8")
 			.trim();
-		if (!path.isAbsolute(gitDirectory)) throw new Error("private Git directory is unavailable");
-		return { sandboxRoot, processRoot, commit, gitDirectory };
+		if (!path.isAbsolute(gitDirectory)
+			|| filesystemPathKey(path.dirname(processRoot)) !== filesystemPathKey(repository.parent)
+			|| filesystemPathKey(path.dirname(gitDirectory)) !== filesystemPathKey(path.join(repository.parent, "snapshot.git", "worktrees"))) {
+			throw new Error("private Git workspace ownership is unavailable");
+		}
+		let disposal: Promise<void> | undefined;
+		return { sandboxRoot, processRoot, commit, gitDirectory, dispose: () => disposal ??= (async () => {
+			// Keep the Git name reserved until its workspace is gone. A retired owner must never delete a reused name.
+			await rm(processRoot, { recursive: true, force: true });
+			await rm(gitDirectory, { recursive: true, force: true });
+		})() };
 	} catch (error) {
 		await repository.git(["worktree", "remove", "--force", sandboxRoot]).catch(() => undefined);
 		if (!ownedProcessRoot) await rm(processRoot, { recursive: true, force: true }).catch(() => undefined);
@@ -1514,7 +1522,7 @@ async function acquireOverlayBaseline(
 			const candidate = await pending.catch(() => undefined);
 			if (!candidate || candidate.active > 0) continue;
 			repository.overlayBaselines.delete(candidateCommit);
-			await discardOverlayBaseline(repository, candidate).catch(() => undefined);
+			await candidate.dispose().catch(() => undefined);
 		}
 		let pending = repository.overlayBaselines.get(commit);
 		if (!pending) {
@@ -1536,17 +1544,11 @@ async function createOverlayBaseline(
 ): Promise<SharedOverlayBaseline> {
 	const privateRoot = path.join(repository.parent, `overlay-baseline-${commit}`);
 	const prepared = await attachSandboxWorkspace(repository, commit, privateRoot);
-	return {
-		root: prepared.sandboxRoot,
-		privateRoot,
-		gitDirectory: prepared.gitDirectory,
-		commit,
-		active: 0,
-	};
+	return { ...prepared, active: 0 };
 }
 
 function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<WorkspaceStructureSnapshot> {
-	baseline.structure ??= captureWorkspaceStructure(baseline.root, {
+	baseline.structure ??= captureWorkspaceStructure(baseline.sandboxRoot, {
 		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
 		exclude: SNAPSHOT_EXCLUDES,
 	});
@@ -1555,20 +1557,6 @@ function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<Work
 
 function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void {
 	baseline.active = Math.max(0, baseline.active - 1);
-}
-
-async function discardOverlayBaseline(
-	repository: PooledGitRepository,
-	baseline: SharedOverlayBaseline,
-): Promise<void> {
-	if (baseline.active > 0) throw new Error("cannot discard an active OverlayFS lower directory");
-	await repository.git(["worktree", "remove", "--force", baseline.root]).catch(() => undefined);
-	await rm(baseline.privateRoot, { recursive: true, force: true });
-}
-
-async function discardPreparedSandbox(repository: PooledGitRepository, workspace: PreparedGitWorkspace): Promise<void> {
-	await repository.git(["worktree", "remove", "--force", workspace.sandboxRoot]).catch(() => undefined);
-	await rm(workspace.processRoot, { recursive: true, force: true });
 }
 
 async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
@@ -1668,7 +1656,7 @@ function closeSandboxRepository(repository: PooledGitRepository): Promise<void> 
 		if (repository.quarantined) return;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
 		const prepared = await takePreparedSandbox(repository);
-		if (prepared) await discardPreparedSandbox(repository, prepared).catch(() => undefined);
+		await prepared?.dispose().catch(() => undefined);
 		repository.baseline?.version.release();
 		repository.baseline = undefined;
 		repository.versions.close();
@@ -1791,11 +1779,10 @@ async function cleanupPrivateSandboxWorkspace(workspace: PrivateSandboxWorkspace
 			safeToRelease = false;
 			failures.push(error);
 		}
-	} else {
-		await workspace.pool.git(["worktree", "remove", "--force", workspace.sandboxRoot], { cwd: workspace.processRoot }).catch(() => undefined);
 	}
 	if (safeToRelease) {
-		await rm(workspace.processRoot, { recursive: true, force: true }).catch((error) => failures.push(error));
+		await (workspace.gitWorkspace?.dispose() ?? rm(workspace.processRoot, { recursive: true, force: true }))
+			.catch((error) => failures.push(error));
 		if (workspace.overlayStorageRoot) {
 			await rm(workspace.overlayStorageRoot, { recursive: true, force: true }).catch((error) => failures.push(error));
 		}
