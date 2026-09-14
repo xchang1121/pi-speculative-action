@@ -631,10 +631,18 @@ describe("PatternAware", () => {
 			first.observe(input(`read-${index}`, "grep"));
 			first.observe(input(`read-${index}`, "read", { path: "README.md" }));
 		}
+		await first.flush();
+		const previous = await fs.readFile(file);
 		for (let index = 0; index < 2; index++) {
 			first.observe(input(`bash-${index}`, "grep"));
 			first.observe(input(`bash-${index}`, "bash", { command: "npm test" }));
 		}
+		const fault = new Error("injected replacement failure"), rename = vi.spyOn(fs, "rename").mockRejectedValue(fault);
+		try {
+			expect(await Promise.allSettled([first.flush(), first.flush()])).toEqual(Array(2).fill({ status: "rejected", reason: fault }));
+			expect(await fs.readFile(file)).toEqual(previous);
+			expect(await fs.readdir(path.dirname(file))).toEqual([path.basename(file)]);
+		} finally { rename.mockRestore(); }
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));

@@ -1,6 +1,6 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { writeJsonFile } from "./filesystem-evidence.ts";
 import { isDeepStrictEqual } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
@@ -28,7 +28,7 @@ export class SpeculativeActionSettingsStore {
 	private global: SettingsOverlay | undefined;
 	private project: SettingsOverlay | undefined;
 	private scopeValue: SpeculativeSettingsScope = "global";
-	private writeQueue: Promise<PromiseSettledResult<void>> = Promise.resolve({ status: "fulfilled", value: undefined });
+	private writeQueue: Promise<void> = Promise.resolve();
 
 	readonly cwd: string;
 	readonly agentDirectory: string;
@@ -72,18 +72,14 @@ export class SpeculativeActionSettingsStore {
 	}
 
 	private persistSelected(): void {
-		const value = this.scopeValue === "project" ? this.project : this.global;
+		const snapshot = structuredClone(this.scopeValue === "project" ? this.project : this.global);
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
-		const snapshot = structuredClone(value);
-		this.writeQueue = this.writeQueue.then(() => writeSettings(target, snapshot)).then(
-			(value) => ({ status: "fulfilled", value }),
-			(reason: unknown) => ({ status: "rejected", reason }),
-		);
+		this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeJsonFile(target, snapshot, 2));
+		void this.writeQueue.catch(() => undefined);
 	}
 
-	async flush(): Promise<void> {
-		const result = await this.writeQueue;
-		if (result.status === "rejected") throw result.reason;
+	flush(): Promise<void> {
+		return this.writeQueue;
 	}
 
 	private get globalPath(): string {
@@ -102,21 +98,6 @@ async function readSettings(file: string): Promise<SettingsOverlay | undefined> 
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
 		throw error;
-	}
-}
-
-async function writeSettings(file: string, value: SettingsOverlay | undefined): Promise<void> {
-	if (!value) {
-		await rm(file, { force: true });
-		return;
-	}
-	await mkdir(path.dirname(file), { recursive: true });
-	const temporary = `${file}.${randomUUID()}.tmp`;
-	try {
-		await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-		await rename(temporary, file);
-	} finally {
-		await rm(temporary, { force: true }).catch(() => undefined);
 	}
 }
 
