@@ -73,14 +73,16 @@ describe("ProcessHandoffRegistry", () => {
 	});
 
 	it("retains the selected physical producer when identical evidence is published during validation", async () => {
-		const scope = { ...SCOPE }, first = await producer(false, undefined, 0, scope);
+		const scope = { ...SCOPE }, pending = producer(false, undefined, 0, scope);
+		scope.turnID = OTHER_SCOPE.turnID;
+		const first = await pending;
 		const second = await producer(false, first.registry, 0, OTHER_SCOPE), entered = deferred(), release = deferred();
 		expect(second.certificate.id).toBe(first.certificate.id);
 		expect(second.work).not.toBe(first.work);
 		await first.publish();
 		const actor = acquireActor(first, async live => { entered.resolve(); await release.promise; return livePlan(live); });
 		await entered.promise;
-		scope.turnID = OTHER_SCOPE.turnID;
+		scope.turnID = "later";
 		await second.publish(); release.resolve();
 		const result = await actor;
 		expect(result).toMatchObject({ kind: "hit", plan: { certificate: first.certificate }, producer: { scope: SCOPE } });
@@ -199,9 +201,11 @@ describe("ProcessHandoffRegistry", () => {
 		expect(waitForRunning).not.toHaveBeenCalled();
 
 		const lookup = vi.fn(livePlan);
-		const actor = acquireActor(fixture, lookup, waitForRunning, scope);
+		const requestScope = { ...scope };
+		const actor = acquireActor(fixture, lookup, waitForRunning, requestScope);
 		await waitEntered.promise;
 		expect(waitForRunning.mock.calls[0]![0]).toBe(scope === SCOPE ? fixture.work : parallelProducer.work);
+		requestScope.turnID = scope === SCOPE ? OTHER_SCOPE.turnID : SCOPE.turnID;
 		await fixture.publish();
 		releaseWait.resolve();
 		const transferable = !oneShot || scope === SCOPE;

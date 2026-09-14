@@ -50,13 +50,11 @@ export type ProcessHandoffLookup<Plan> = (
 	excludedCertificates?: ReadonlySet<Sha256Digest>,
 ) => Promise<Plan | undefined>;
 
-interface AcquireBase<Plan> {
+type AcquireOptions<Plan> = {
 	readonly key: Sha256Digest;
 	readonly scope?: ExecutionScope;
 	readonly lookup: ProcessHandoffLookup<Plan>;
-}
-
-type AcquireOptions<Plan> = AcquireBase<Plan> & (
+} & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership }
 	| {
 			readonly role: "actor";
@@ -82,42 +80,43 @@ export class ProcessHandoffRegistry {
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean { return this.byKey.size > 0; }
 
-	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>(options: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
+	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
+		scope = snapshotExecutionScope(scope);
 		let joined = false, historyChecked = false;
 		const considered = new Map<HandoffRecord, Sha256Digest>();
 		while (true) {
 			if (this.disposed) return { kind: "miss", joined };
-			const records = this.byKey.get(options.key) ?? [];
+			const records = this.byKey.get(request.key) ?? [];
 			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
 				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
 				const oneShot = state.candidate.dependencyCertificate.taints.length > 0;
-				return oneShot && (!sameScope(record.scope, options.scope) || record.ownership.wholeClaimed)
+				return oneShot && (!sameScope(record.scope, scope) || record.ownership.wholeClaimed)
 					? [] : [{ record, state, candidate: state.candidate, oneShot }];
 			});
 			if (completed.length) {
-				const plan = await options.lookup(completed.map(({ candidate }) => candidate));
+				const plan = await request.lookup(completed.map(({ candidate }) => candidate));
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
-				if (plan && selected && selected.record.state === selected.state && this.byKey.get(options.key)?.includes(selected.record) &&
+				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
-					if (selected.oneShot) this.remove(options.key, selected.record);
+					if (selected.oneShot) this.remove(request.key, selected.record);
 					return { kind: "hit", plan, joined, producer: selected.record };
 				}
 				continue;
 			}
 			if (!historyChecked) {
 				// A failed live attempt also rules out its immutable disk copy for this acquisition.
-				const plan = await options.lookup(undefined, new Set(considered.values()));
+				const plan = await request.lookup(undefined, new Set(considered.values()));
 				if (plan && !this.disposed) return { kind: "hit", plan, joined };
 				historyChecked = true;
 				continue; // A candidate may have completed while history was being read.
 			}
-			if (options.role === "producer") return { kind: "work", work: this.reserve(options.key, options.ownership, options.scope), joined };
+			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.ownership, scope), joined };
 			// Waiting grants no transfer authority; only repeatable sealed evidence may cross turns.
-			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, options.scope)) ??
-				records.find((record) => record.state.status === "running" && options.scope && record.scope?.sessionID === options.scope.sessionID);
-			if (!running || (await options.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
+			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, scope)) ??
+				records.find((record) => record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
+			if (!running || (await request.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
 			joined = true;
 			historyChecked = false;
 		}
@@ -162,7 +161,7 @@ export class ProcessHandoffRegistry {
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const record: HandoffRecord = {
 			completion,
-			scope: snapshotExecutionScope(scope),
+			scope,
 			ownership,
 			startedAt: performance.now(),
 			state: { status: "running" },
