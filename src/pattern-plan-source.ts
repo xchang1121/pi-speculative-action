@@ -67,7 +67,7 @@ export function createPatternPlanSource(input: {
 
 	const queueAnalysis = (analysis: () => void | Promise<void>): void => {
 		analysisTail = analysisTail
-			.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+			.then(() => new Promise<void>(setImmediate))
 			.then(analysis)
 			.catch(() => {
 				// Optional learning cannot poison later observations or the Actor lifecycle.
