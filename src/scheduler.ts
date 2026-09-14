@@ -197,21 +197,16 @@ export class SpeculationScheduler<Job extends object> {
 		canPreempt: (job: Job) => boolean = () => true,
 	): readonly Job[] {
 		const remaining = [...this.entries.values()];
-		const victims: SchedulerEntry<Job>[] = [];
-		while (
-			!fitsResourceBudget(
-				remaining.filter((entry) => !victims.includes(entry)),
-				resourceUnits,
-				capacity,
-			)
-		) {
+		const victims: Job[] = [];
+		while (!fitsResourceBudget(remaining, resourceUnits, capacity)) {
 			const victim = remaining
-				.filter((entry) => !victims.includes(entry) && canPreempt(entry.job))
+				.filter((entry) => canPreempt(entry.job))
 				.sort(compareVictim)[0];
 			if (!victim) break;
-			victims.push(victim);
+			remaining.splice(remaining.indexOf(victim), 1);
+			victims.push(victim.job);
 		}
-		return victims.map((entry) => entry.job);
+		return victims;
 	}
 
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
