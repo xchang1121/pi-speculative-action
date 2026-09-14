@@ -1,4 +1,4 @@
-import type { ExecutionScope } from "./execution-world.ts";
+import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 
@@ -41,7 +41,7 @@ interface HandoffRecord extends ProcessHandoff {
 }
 
 export type ProcessHandoffAcquisition<Plan> =
-	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean }
+	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff }
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
 
@@ -102,7 +102,7 @@ export class ProcessHandoffRegistry {
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(options.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
 					if (selected.oneShot) this.remove(options.key, selected.record);
-					return { kind: "hit", plan, joined };
+					return { kind: "hit", plan, joined, producer: selected.record };
 				}
 				continue;
 			}
@@ -162,7 +162,7 @@ export class ProcessHandoffRegistry {
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const record: HandoffRecord = {
 			completion,
-			scope,
+			scope: snapshotExecutionScope(scope),
 			ownership,
 			startedAt: performance.now(),
 			state: { status: "running" },

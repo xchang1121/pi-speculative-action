@@ -54,7 +54,7 @@ describe("ProcessHandoffRegistry", () => {
 
 			const lookup = vi.fn(livePlan);
 			const actor = await acquireActor(fixture, lookup, undefined, scope);
-			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
+			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate }, producer: fixture.work });
 			expect(fixture.registry.hasResults).toBe(true);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
 
@@ -70,6 +70,27 @@ describe("ProcessHandoffRegistry", () => {
 			expect(fixture.registry.hasResults).toBe(false);
 			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
 		}
+	});
+
+	it("retains the selected physical producer when identical evidence is published during validation", async () => {
+		const scope = { ...SCOPE }, first = await producer(false, undefined, 0, scope);
+		const second = await producer(false, first.registry, 0, OTHER_SCOPE), entered = deferred(), release = deferred();
+		expect(second.certificate.id).toBe(first.certificate.id);
+		expect(second.work).not.toBe(first.work);
+		await first.publish();
+		const actor = acquireActor(first, async live => { entered.resolve(); await release.promise; return livePlan(live); });
+		await entered.promise;
+		scope.turnID = OTHER_SCOPE.turnID;
+		await second.publish(); release.resolve();
+		const result = await actor;
+		expect(result).toMatchObject({ kind: "hit", plan: { certificate: first.certificate }, producer: { scope: SCOPE } });
+		if (result.kind !== "hit") throw new Error("expected completed handoff");
+		expect(result.producer).toBe(first.work);
+		expect(Object.isFrozen(result.producer!.scope)).toBe(true);
+		first.registry.clearCompleted();
+		await expect(acquireActor(first, async () => ({ certificate: first.certificate })))
+			.resolves.toEqual({ kind: "hit", plan: { certificate: first.certificate }, joined: false });
+		first.registry.dispose();
 	});
 
 	it.each(([
@@ -213,12 +234,12 @@ describe("ProcessHandoffRegistry", () => {
 	});
 });
 
-async function producer(oneShot = false, registry = new ProcessHandoffRegistry(8), exitCode = 0) {
+async function producer(oneShot = false, registry = new ProcessHandoffRegistry(8), exitCode = 0, scope = SCOPE) {
 	const ownership = new ProcessHandoffOwnership(), certificate = processCertificate(oneShot, exitCode);
 	const key = certificate.weakKey;
 	const acquired = await registry.acquire({
 		key,
-		scope: SCOPE,
+		scope,
 		role: "producer",
 		ownership,
 		lookup: async () => undefined,
