@@ -1,5 +1,6 @@
 import { deferred } from "./async.ts";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_BENEFIT_GATE_POLICY } from "../src/fork-benefit-gate.ts";
 import {
 	type CandidateJoinRequest,
 	type PredictionForecast,
@@ -11,6 +12,45 @@ import {
 afterEach(() => vi.useRealTimers());
 
 describe("SpeculationScheduler", () => {
+	it("scopes failed work to its producer and recovers retained candidates without inflating dispatch probes", () => {
+		const scheduler = new SpeculationScheduler<object>(), retained = {};
+		const identity = { tool: "read", executionFingerprint: "backend", actionKeyHash: "producer" };
+		const consumers = ["query-a", "query-b"].map(actionKeyHash => forecast({ ...identity, actionKeyHash }));
+		const admit = (job: object, executionIdentity: ServiceTimingIdentity | undefined = identity, role: "producer" | "actor" = "producer", capacity = 8) =>
+			scheduler.admit(job, consumers, capacity, role, undefined, executionIdentity);
+		for (const duration of [80, 160]) scheduler.observeSpeculativeService(identity, duration);
+		for (let failure = 0; failure < DEFAULT_BENEFIT_GATE_POLICY.failureThreshold; failure++)
+			scheduler.observeSpeculativeService(identity, 1, true);
+		expect(scheduler.evaluate([forecast(identity)]).expectedDurationMs).toBe(80);
+		const probes: boolean[] = [];
+		for (let decision = 1; decision <= 3 * DEFAULT_BENEFIT_GATE_POLICY.probeInterval; decision++) {
+			scheduler.observeActorTiming(50, 50);
+			const allowed = admit(retained).admitted;
+			probes.push(allowed); scheduler.complete(retained);
+			for (let dispatch = 0; dispatch < 12; dispatch++) {
+				expect(admit(retained).admitted).toBe(allowed);
+				scheduler.complete(retained);
+			}
+		}
+		expect(probes).toEqual(probes.map((_, index) => (index + 1) % DEFAULT_BENEFIT_GATE_POLICY.probeInterval === 0));
+		for (const other of [{ ...identity, actionKeyHash: "other" }, { ...identity, executionFingerprint: "other" },
+			{ ...identity, actionKeyHash: undefined }]) {
+			const job = {};
+			expect(admit(job, other).admitted).toBe(true); scheduler.complete(job);
+		}
+		const actor = {}, preview = {};
+		expect(admit(actor, identity, "actor", 1).admitted).toBe(true);
+		expect(scheduler.admit(preview, consumers, 1)).toMatchObject({ admitted: false, reason: "budget_exhausted" });
+		scheduler.complete(actor);
+		expect(scheduler.admit(preview, consumers, 1).admitted).toBe(true); scheduler.complete(preview);
+		const blocked = {};
+		expect(admit(blocked)).toMatchObject({ admitted: false, reason: "failure_circuit" });
+		scheduler.observeSpeculativeService(identity, 0);
+		expect(admit(blocked).admitted).toBe(true); scheduler.complete(blocked);
+		expect(scheduler.evaluate([forecast(identity)]).expectedDurationMs).toBe(80);
+		expect(scheduler.snapshot()).toEqual([]);
+	});
+
 	it.each(["resolve", "reject", "pre-abort", "abort", "deadline", "late resolve", "late reject"] as const)(
 		"settles candidate waits on %s and cleans every losing path",
 		async (winner) => {
@@ -160,6 +200,8 @@ describe("SpeculationScheduler", () => {
 			})).toMatchObject({ allowed: true, expectedActorMs: 110, expectedAdoptionMs });
 		}
 
+		for (let failure = 0; failure < DEFAULT_BENEFIT_GATE_POLICY.failureThreshold; failure++)
+			scheduler.observeSpeculativeService(identity, 1, true);
 		for (let index = 0; index < 1100; index++) {
 			const newer = { ...identity, executionFingerprint: `world-${index}` };
 			scheduler.observeActorService(newer, 1);
@@ -167,6 +209,7 @@ describe("SpeculationScheduler", () => {
 			scheduler.observeAdoption(newer, 3);
 		}
 		expect(joinDecision(scheduler, identity)).toMatchObject({ actorSamples: 0, speculativeSamples: 0, adoptionSamples: 0 });
+		expect(scheduler.admit({}, [forecast(identity)], 1, "producer", undefined, identity).admitted).toBe(true);
 	});
 
 	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {

@@ -233,6 +233,62 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it.each(["call", "preview"] as const)("backs off shared failed work and immediately serves an Actor %s", async (mode) => {
+		const materialized = [barrier(), barrier(), barrier()], failed = [barrier(), barrier()], recovered = barrier();
+		const seen = [0, 0, 0], feedback: PredictionSettlement[] = [];
+		let turn = 0, healthy = false;
+		const attempted = deferred<ReturnType<SpeculationScheduler<object>["admit"]>>();
+		const admit = SpeculationScheduler.prototype.admit;
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, ...args) {
+			const result = admit.apply(this, args);
+			if (turn === 2) attempted.resolve(result);
+			return result;
+		});
+		const source = (id: string): Source => ({ id, enabled: () => true,
+			propose: ({ startInput }) => ({ ...plan(`${id}:${startInput.turnID}`, { path: "flaky.txt" }), source: id }),
+			onSettled: ({ settlement }) => { feedback.push(settlement); },
+		});
+		const fixture = harness({ source: source("source"), peers: [source("peer")],
+			onCandidateMaterialized: ({ turnID }) => {
+				const index = Number(turnID);
+				seen[index] = seen[index]! + 1;
+				if (seen[index] === 2) materialized[index]!.arrive();
+			},
+			execute: async () => {
+				await materialized[turn]!.promise;
+				if (!healthy) throw new Error("temporary execution failure");
+				return "recovered";
+			},
+			onEvent: (event) => {
+				if (event.type !== "candidate") return;
+				if (event.state.status === "failed") failed[Number(event.turnID)]?.arrive();
+				if (event.state.status === "succeeded") recovered.arrive();
+			},
+		});
+		try {
+			for (; turn < 2; turn++) {
+				await fixture.runtime.startTurn(start(String(turn))); await failed[turn]!.promise;
+				const other = call(String(turn), { path: "other.txt" });
+				await runFallback(fixture, other, 1000);
+				await fixture.runtime.finishTurn(other);
+			}
+			const actor = call("2", { path: "flaky.txt" });
+			await fixture.runtime.startTurn(actor); await materialized[2]!.promise;
+			expect(await attempted.promise).toMatchObject({ admitted: false, reason: "failure_circuit" });
+			expect(fixture.executions()).toBe(2);
+			healthy = true;
+			if (mode === "preview") { await fixture.runtime.previewActorCall(actor); await recovered.promise; }
+			expect((await fixture.runtime.prepareActorCall(actor))?.output).toBe("recovered");
+			await fixture.runtime.finishTurn({ ...actor, terminal: true });
+			expect(fixture.executions()).toBe(3);
+			expect(feedback).toHaveLength(6);
+			expect(feedback.slice(-2)).toEqual(expect.arrayContaining(["source", "peer"].map(source =>
+				expect.objectContaining({ prediction: expect.objectContaining({ source }), observation: "observed",
+					match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }))));
+		} finally { for (const ready of materialized) ready.arrive(); admission.mockRestore(); await fixture.runtime.dispose(); }
+		expect(fixture.runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 0, sharedCandidates: 0 });
+	});
+
 	it.each(["absent", "normal", "failed", "blocked"] as const)("owns settlement and task epochs independently of %s diagnostics", async (mode) => {
 		const delivery = barrier(), completed = [barrier(), barrier()], feedback: PredictionSettlement[] = [], observed: string[] = [];
 		const snapshots = vi.spyOn(CandidateStore.prototype, "snapshot"), timing = vi.spyOn(TaskTimeline.prototype, "recordTool");
@@ -969,6 +1025,7 @@ describe("structural speculative runtime", () => {
 			const executed: string[] = [], aborted: string[] = [];
 			const busyStarted = barrier(), stop = barrier(), stopped = barrier(), cleanup = barrier(), released = barrier();
 			const targetStarted = barrier(), targetGate = barrier(), targetQueued = barrier();
+			const service = vi.spyOn(SpeculationScheduler.prototype, "observeSpeculativeService");
 			const original = SpeculationScheduler.prototype.admit;
 			const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
 				const result = original.call(this, job, forecasts, ...rest);
@@ -1010,7 +1067,11 @@ describe("structural speculative runtime", () => {
 				expect(await consumed).toBe("target");
 				expect(executed).toEqual(["busy.ts", "target.ts"]);
 				expect(aborted).toEqual(mode === "running" ? [] : ["busy.ts"]);
-			} finally { stopped.arrive(); released.arrive(); targetGate.arrive(); await fixture.runtime.dispose(); admission.mockRestore(); }
+			} finally {
+				stopped.arrive(); released.arrive(); targetGate.arrive(); await fixture.runtime.dispose();
+				const failures = service.mock.calls.filter(([, , failed]) => failed);
+				service.mockRestore(); admission.mockRestore(); expect(failures).toEqual([]);
+			}
 		}
 	});
 

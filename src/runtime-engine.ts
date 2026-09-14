@@ -1410,6 +1410,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				concurrentLimit(session.settings),
 				reservationAvailable(candidate.work.reservation) ? "producer" : "actor",
 				work,
+				candidate.previews?.size ? undefined : actionTimingIdentity(candidate.key),
 			);
 			if (!admission.admitted && admission.reason === "budget_exhausted" && !work.background) {
 				for (const victim of session.scheduler.preemptFor(
@@ -1491,6 +1492,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			const settled = candidate.work.controller.signal.aborted
 				? candidate.work.cancel(failure, completedAt, completedAt - startedAt)
 				: candidate.work.fail(failure, completedAt, completedAt - startedAt);
+			if (settled && candidate.work.execution.status === "failed")
+				session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), completedAt - startedAt, true);
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
 		} finally {

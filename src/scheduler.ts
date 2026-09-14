@@ -129,7 +129,7 @@ export type SchedulerAdmission =
 	| {
 			readonly admitted: false;
 			readonly work: ScheduledWork;
-			readonly reason: "budget_exhausted" | "not_profitable";
+			readonly reason: "budget_exhausted" | "not_profitable" | "failure_circuit";
 	  };
 
 export type WorldCompatibilityDecision =
@@ -156,6 +156,7 @@ export class SpeculationScheduler<Job extends object> {
 	private readonly actorCycles = new SampleWindow();
 	private readonly candidateJoinPolicy: CandidateJoinPolicy;
 	private sequence = 0;
+	private decisionSequence = 0;
 
 	constructor(options: { readonly candidateJoinPolicy?: Partial<CandidateJoinPolicy> } = {}) {
 		this.candidateJoinPolicy = normalizeCandidateJoinPolicy(options.candidateJoinPolicy);
@@ -168,6 +169,8 @@ export class SpeculationScheduler<Job extends object> {
 		role: "producer" | "actor" = "producer",
 		/** Ranking may supply its estimate from the same synchronous admission pass. */
 		work: ScheduledWork = this.evaluate(forecasts),
+		/** Physical producer identity; consumer forecasts can describe projected actions. Omit for confirmed Actor previews. */
+		executionIdentity?: ServiceTimingIdentity,
 	): SchedulerAdmission {
 		const budget = normalizeBudget(capacity);
 		if (role === "producer") {
@@ -175,6 +178,9 @@ export class SpeculationScheduler<Job extends object> {
 				return { admitted: false, work, reason: "not_profitable" };
 			if (!fits([...this.entries.values()], work.resource, budget))
 				return { admitted: false, work, reason: "budget_exhausted" };
+			if (executionIdentity?.actionKeyHash &&
+				this.speculativeServiceTimes.get(timingKeys(executionIdentity)[0]!)?.allowExecution(job, this.decisionSequence) === false)
+				return { admitted: false, work, reason: "failure_circuit" };
 		}
 		this.entries.set(job, { job, work, sequence: this.sequence++ });
 		return { admitted: true, work };
@@ -258,12 +264,19 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	observeActorTiming(decisionDurationMs: number, cycleDurationMs?: number): void {
+		this.decisionSequence++;
 		this.actorDecisionDurations.observe(decisionDurationMs);
 		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
 	}
 
-	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number): void {
-		this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
+	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed = false): void {
+		if (!failed) this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
+		else if (identity.actionKeyHash) {
+			// Failed attempts cannot stand in for successful service or affect unrelated actions in the timing class.
+			const key = timingKeys(identity)[0]!, samples = this.speculativeServiceTimes.get(key) ?? new SampleWindow();
+			samples.observeFailure();
+			this.speculativeServiceTimes.set(key, samples);
+		}
 	}
 
 	observeActorService(identity: ServiceTimingIdentity, durationMs: number): void {
@@ -452,17 +465,38 @@ interface TimingEstimate {
 class SampleWindow {
 	private readonly values: number[] = [];
 	private suppressedSinceProbe = 0;
+	private failures?: {
+		readonly count: number;
+		readonly decisions: WeakMap<object, { readonly sequence: number; readonly allowed: boolean }>;
+	};
 
 	get count(): number {
 		return this.values.length;
 	}
 
 	observe(value: number): void {
+		this.failures = undefined;
 		const normalized = finite(value);
 		if (normalized <= 0) return;
 		this.suppressedSinceProbe = 0;
 		this.values.push(normalized);
 		if (this.values.length > 64) this.values.shift();
+	}
+
+	observeFailure(): void {
+		this.failures = { count: (this.failures?.count ?? 0) + 1, decisions: new WeakMap() };
+		this.suppressedSinceProbe = 0;
+	}
+
+	/** Dispatch repeats do not consume probes; retained work can probe again after the next Actor decision. */
+	allowExecution(job: object, sequence: number): boolean {
+		if (!this.failures || this.failures.count < DEFAULT_BENEFIT_GATE_POLICY.failureThreshold) return true;
+		let decision = this.failures.decisions.get(job);
+		if (!decision || decision.sequence !== sequence) {
+			decision = { sequence, allowed: this.allowProbe() };
+			this.failures.decisions.set(job, decision);
+		}
+		return decision.allowed;
 	}
 
 	/** The same bounded evidence owns recovery, including decisions made before a probe settles. */
