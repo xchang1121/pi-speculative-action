@@ -1213,21 +1213,13 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const failUnlaunchable = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
-		const work = new CandidateExecution<never>("shared");
-		work.fail(failure, performance.now(), 0);
-		session.plan.attachExecution(node.proposalID, node.action.id, `rejected:${node.identity.id}`, work);
+		session.plan.rejectExecution(node.identity, failure);
 		settleUnobserved(session, node, failure);
 	};
 
 	const settleBlockedPlanActions = (session: Session): void => {
 		for (const node of session.plan.drainBlocked()) {
-			const failure = cause("plan", "dependency_impossible");
-			if (node.execution.status === "deferred" || node.execution.status === "preparing" || node.execution.status === "scheduled") {
-				const work = new CandidateExecution<never>("shared");
-				work.fail(failure, performance.now(), 0);
-				session.plan.attachExecution(node.proposalID, node.action.id, `blocked:${node.identity.id}`, work);
-			}
-			settleUnobserved(session, node, failure);
+			failUnlaunchable(session, node, cause("plan", "dependency_impossible"));
 		}
 	};
 
