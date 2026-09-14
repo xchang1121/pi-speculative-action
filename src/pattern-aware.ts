@@ -5,14 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
-import {
-	patternSessionBudgets,
-	type PatternPendingValidation,
-	type PatternRecurrentAction,
-	PatternSessionRegistry,
-	type PatternSessionState,
-} from "./pattern-session-state.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { asRecord, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
@@ -293,7 +287,8 @@ export class PatternAwareStore {
 	private readonly bindingAnalysis = new PatternBindingAnalysis();
 	private readonly pools = new Map<string, PatternPool>();
 	private readonly controlOpportunitiesByContext = new Map<string, Map<string, number>>();
-	private readonly sessions: PatternSessionRegistry<PatternAwareEvent>;
+	private readonly sessions: BoundedRecencyMap<string, PatternSessionState<PatternAwareEvent>>;
+	private readonly sessionBudgets: ReturnType<typeof patternSessionBudgets>;
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
 	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
@@ -317,7 +312,8 @@ export class PatternAwareStore {
 		actionSemantics?: PatternAwareActionSemantics,
 	) {
 		this.settings = settings;
-		this.sessions = new PatternSessionRegistry(patternSessionBudgets(settings.maxPatterns));
+		this.sessionBudgets = patternSessionBudgets(settings.maxPatterns);
+		this.sessions = new BoundedRecencyMap(this.sessionBudgets.sessions);
 		this.resolvedActionKeys = new BoundedRecencyMap(settings.maxPatterns);
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
@@ -396,8 +392,12 @@ export class PatternAwareStore {
 				...(batchID ? { batchID, batchIndex: index, batchSize: inputs.length } : {}),
 			}),
 		);
-		const { state: session, evicted } = this.sessions.ensure(first.sessionID);
-		if (evicted) this.finishSessionState(evicted);
+		let session = this.sessions.get(first.sessionID);
+		if (!session) {
+			session = { history: [], pending: [], recurrentActions: new BoundedRecencyMap(this.sessionBudgets.recurrentActionsPerSession) };
+			const evicted = this.sessions.set(first.sessionID, session)?.value;
+			if (evicted) this.finishSessionState(evicted);
+		}
 		const history = session.history;
 		this.resolvePendingBatch(session, events);
 		const learningTargets = events.filter((event) => event.learnTarget !== false);
@@ -422,8 +422,11 @@ export class PatternAwareStore {
 	}
 
 	finishSession(sessionID: string) {
-		const session = this.sessions.finish(sessionID);
-		if (session) this.finishSessionState(session);
+		const session = this.sessions.get(sessionID);
+		if (session) {
+			this.sessions.delete(sessionID);
+			this.finishSessionState(session);
+		}
 		this.persist();
 	}
 
@@ -1147,11 +1150,18 @@ export class PatternAwareStore {
 	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
 		for (const patternID of pool.patternIDs ?? []) {
 			if (retained.has(patternID)) continue;
-			if (this.patterns.delete(patternID)) this.indexDirty = true;
-			this.patternSupportSessions.delete(patternID);
-			this.sessions.removePattern(patternID);
+			this.removePattern(patternID);
 		}
 		pool.patternIDs = [...retained];
+	}
+
+	private removePattern(patternID: string) {
+		if (this.patterns.delete(patternID)) this.indexDirty = true;
+		this.patternSupportSessions.delete(patternID);
+		for (const session of this.sessions.values()) {
+			if (session.pending.some(item => item.patternID === patternID))
+				session.pending = session.pending.filter(item => item.patternID !== patternID);
+		}
 	}
 
 	private resolvePendingBatch(
@@ -1187,7 +1197,7 @@ export class PatternAwareStore {
 			item.remaining--;
 			remaining.push(item);
 		}
-		session.replacePending(remaining);
+		session.pending = remaining;
 	}
 
 	private startPending(
@@ -1209,12 +1219,12 @@ export class PatternAwareStore {
 				remaining: groupGapTiming([pattern], this.settings, this.clock).latestHorizon,
 			});
 		}
-		session.replacePending(pending);
+		session.pending = pending.slice(-this.sessionBudgets.pendingValidationsPerSession);
 	}
 
 	private finishSessionState(session: PatternSessionState<PatternAwareEvent>) {
 		for (const item of session.pending) this.recordValidation(item.patternID, false);
-		session.replacePending([]);
+		session.pending = [];
 	}
 
 	private recordValidation(patternID: string, matched: boolean) {
@@ -1254,12 +1264,7 @@ export class PatternAwareStore {
 					left.lastSeenSequence - right.lastSeenSequence,
 			)
 			.slice(0, this.patterns.size - limit);
-		for (const pattern of evicted) {
-			this.patterns.delete(pattern.id);
-			this.patternSupportSessions.delete(pattern.id);
-			this.sessions.removePattern(pattern.id);
-		}
-		if (evicted.length) this.indexDirty = true;
+		for (const pattern of evicted) this.removePattern(pattern.id);
 	}
 
 	private persist() {
