@@ -1501,7 +1501,7 @@ class PatternBindingAnalysis {
 	private valueIndex<Location>(
 		value: unknown,
 		key: string,
-		entries: () => ReadonlyArray<readonly [Location, unknown]>,
+		entries: () => Iterable<readonly [Location, unknown]>,
 	): ReadonlyMap<string, ReadonlyArray<Location>> {
 		return this.memo(value, key, () => {
 			const index = new Map<string, Location[]>();
@@ -1781,21 +1781,18 @@ class PatternBindingAnalysis {
 	}
 
 	indexedCollections(value: unknown, target: unknown): ReadonlyArray<CollectionLocation> {
-		return this.valueIndex(value, "collection-index", () => this.collectionEntries(value).map(
-			({ path, itemPath, value }) => [{ path, itemPath }, value] as const,
-		)).get(stableStringify(target)) ?? [];
+		return this.valueIndex(value, "collection-index", () => this.collectionEntries(value)).get(stableStringify(target)) ?? [];
 	}
 
-	collectionEntries(value: unknown): ReadonlyArray<CollectionEntry> {
-		return this.memo(value, "collections", () => {
-			if (Array.isArray(value)) return value.flatMap((item) =>
-				this.leaves(item).map(([itemPath, candidate]) => ({ path: [], itemPath, value: candidate })),
-			);
-			const record = asRecord(value);
-			return record ? Object.entries(record).flatMap(([key, item]) => this.collectionEntries(item).map(
-				(entry) => ({ ...entry, path: [key, ...entry.path] }),
-			)) : [];
-		});
+	*collectionEntries(value: unknown, path: PatternAwarePath = []): Generator<readonly [CollectionLocation, unknown], undefined> {
+		if (Array.isArray(value)) {
+			for (const item of value) for (const [itemPath, candidate] of this.leaves(item)) {
+				yield [{ path: [...path], itemPath }, candidate];
+			}
+			return;
+		}
+		const record = asRecord(value);
+		if (record) for (const [key, item] of Object.entries(record)) yield* this.collectionEntries(item, [...path, key]);
 	}
 
 	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
@@ -1951,12 +1948,6 @@ function* collectionBindings(
 		yield { type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath };
 	}
 }
-
-type CollectionEntry = {
-	readonly path: PatternAwarePath;
-	readonly itemPath: PatternAwarePath;
-	readonly value: unknown;
-};
 
 function structuredOutput(value: unknown): unknown {
 	const record = asRecord(value);
