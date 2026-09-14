@@ -513,14 +513,11 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	pendingLaunch?: Promise<void>;
 }
 
-interface TurnState<SessionID, Output, StartInput, StateData> {
+interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
 	readonly session: SessionState<SessionID, Output, StartInput, StateData>;
 	readonly sessionID: SessionID;
 	readonly turnID: string;
-	readonly startInput: StartInput;
 	readonly startedAt: number;
-	readonly data: StateData;
-	readonly settings: SpeculativeActionSettings;
 	readonly definitions: readonly DrafterToolDefinition[];
 	readonly candidateNames: readonly string[];
 	readonly generation: SourceGeneration;
@@ -552,77 +549,6 @@ type ProjectionResult<Output> =
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
-
-/** Explicit owner for runtime-wide capabilities, stores, sessions, turns, and branch disposal. */
-class StructuralRuntimeState<
-	SessionID,
-	Output,
-	StartInput extends TurnInput<SessionID>,
-	ConsumeInput extends TurnInput<SessionID>,
-	StateData,
-> {
-	readonly semantics: ActionSemanticsRegistry;
-	readonly sources: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
-	readonly sourcesByID = new Map<
-		string,
-		SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>
-	>();
-	readonly projectionRules: readonly ActionProjectionRule<Output>[];
-	readonly candidates: CandidateStore<SessionID, CandidateRecord<Output, StartInput, StateData>>;
-	readonly sessions = new Map<SessionID, SessionState<SessionID, Output, StartInput, StateData>>();
-	masterEnabled: boolean | undefined;
-
-	private readonly emitEvent: (event: SpeculativeActionEvent<SessionID>) => void | Promise<void>;
-
-	constructor(adapter: SpeculativeActionRuntimeAdapter<SessionID, Output, StartInput, ConsumeInput, StateData>) {
-		this.semantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
-		this.sources = adapter.sources ?? [];
-		for (const source of this.sources) {
-			if (!source.id || source.id.trim() !== source.id) throw new Error(`invalid speculative plan source ${source.id}`);
-			if (this.sourcesByID.has(source.id)) throw new Error(`duplicate speculative plan source ${source.id}`);
-			this.sourcesByID.set(source.id, source);
-		}
-		this.projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], this.semantics);
-		this.candidates = new CandidateStore(this.projectionRules, candidateCacheValue);
-		this.emitEvent = (event) => adapter.onEvent?.(event);
-	}
-
-	masterDisabled(): boolean {
-		return this.masterEnabled === false;
-	}
-
-	sessionFor(
-		sessionID: SessionID,
-		settings: SpeculativeActionSettings,
-	): SessionState<SessionID, Output, StartInput, StateData> {
-		const current = this.sessions.get(sessionID);
-		if (current) return current;
-		const created: SessionState<SessionID, Output, StartInput, StateData> = {
-			id: sessionID,
-			lifecycle: new RuntimeLifecycleLane(),
-			plan: new PlanRuntime(),
-			scheduler: new SpeculationScheduler<CandidateRecord<Output, StartInput, StateData>>(),
-			effects: new PostSettlementQueue(),
-			events: new BoundedEventQueue(RUNTIME_EVENT_QUEUE_CAPACITY, this.emitEvent),
-			actionContexts: new Map(),
-			launchTimers: new Map(),
-			sourceSlots: new Set(),
-			sourceTasks: new Set(),
-			turns: new Map(),
-			planAdmissionTails: new Map(),
-			settings,
-			sequence: 0,
-			decisionSequence: 0,
-			tokenTotal: 0,
-			candidateSequence: 0,
-			sourceRequestSequence: 0,
-			pendingSourceRequests: 0,
-			pendingAdmissions: 0,
-		};
-		this.sessions.set(sessionID, created);
-		return created;
-	}
-}
 
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
 export function makeStructuralSpeculativeActionRuntime<
@@ -658,7 +584,53 @@ export function makeStructuralSpeculativeActionRuntime<
 		readonly signal?: AbortSignal;
 	};
 
-	const runtimeState = new StructuralRuntimeState(adapter);
+	const semantics = adapter.actionSemantics ?? PI_ACTION_SEMANTICS;
+	const sources = adapter.sources ?? [];
+	const sourcesByID = new Map<string, Source>();
+	for (const source of sources) {
+		if (!source.id || source.id.trim() !== source.id) throw new Error(`invalid speculative plan source ${source.id}`);
+		if (sourcesByID.has(source.id)) throw new Error(`duplicate speculative plan source ${source.id}`);
+		sourcesByID.set(source.id, source);
+	}
+	const projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], semantics);
+	const runtimeState = Object.freeze({
+		semantics, sources, sourcesByID, projectionRules,
+		candidates: new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue),
+		sessions: new Map<SessionID, Session>(),
+	});
+	let masterEnabled: boolean | undefined;
+	const masterDisabled = () => masterEnabled === false;
+
+	const sessionFor = (sessionID: SessionID, settings: SpeculativeActionSettings): Session => {
+		const current = runtimeState.sessions.get(sessionID);
+		if (current) return current;
+		const created: Session = {
+			id: sessionID,
+			lifecycle: new RuntimeLifecycleLane(),
+			plan: new PlanRuntime(),
+			scheduler: new SpeculationScheduler<Candidate>(),
+			effects: new PostSettlementQueue(),
+			events: new BoundedEventQueue(RUNTIME_EVENT_QUEUE_CAPACITY, (event) => adapter.onEvent?.(event)),
+			actionContexts: new Map(),
+			launchTimers: new Map(),
+			sourceSlots: new Set(),
+			sourceTasks: new Set(),
+			turns: new Map(),
+			planAdmissionTails: new Map(),
+			settings,
+			sequence: 0,
+			decisionSequence: 0,
+			tokenTotal: 0,
+			candidateSequence: 0,
+			sourceRequestSequence: 0,
+			pendingSourceRequests: 0,
+			pendingAdmissions: 0,
+		};
+		runtimeState.sessions.set(sessionID, created);
+		return created;
+	};
+	const turnContext = ({ startInput, data, settings }: RuntimeTurnContext<StartInput, StateData>) =>
+		({ startInput, data, settings });
 
 	const removeCandidate = (sessionID: SessionID, candidate: Candidate): void => {
 		runtimeState.candidates.delete(sessionID, candidate);
@@ -671,7 +643,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const createCandidate = (
 		session: Session,
-		context: Pick<Candidate["owner"], "startInput" | "data" | "settings">,
+		context: RuntimeTurnContext<StartInput, StateData>,
 		draft: SpeculativeDraftCandidate,
 		input: Pick<Candidate, "origin" | "key" | "route" | "attemptStartedAt" | "expectedDurationMs"> & Partial<Pick<Candidate,
 			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "estimatedBytes" | "projectionCoverage">>,
@@ -681,7 +653,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			id: `${input.origin === "prediction" ? "spec" : input.origin === "actor_preview" ? "actor" : input.origin}_${sequence}_${input.key.hash.slice(0, 12)}`,
 			work: new CandidateExecution<WorldBranch<Output>>(input.origin !== "actor_result" && input.route.reuse === "exclusive_branch" ? "exclusive" : "shared"),
 			actorAdopted: input.origin === "actor_result",
-			owner: { startInput: context.startInput, data: context.data, settings: context.settings, draft, index: sequence - 1 },
+			owner: { ...turnContext(context), draft, index: sequence - 1 },
 			createdAt: Date.now(),
 			predictionLatencyMs: 0,
 			draftTokens: 0,
@@ -741,7 +713,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
 		const settings = await adapter.settings();
-		if (!settings.enabled || runtimeState.masterDisabled()) {
+		if (!settings.enabled || masterDisabled()) {
 			await disableSession(input.sessionID);
 			return;
 		}
@@ -749,13 +721,13 @@ export function makeStructuralSpeculativeActionRuntime<
 		const definitions = adapter.definitions(input);
 		const names = candidateToolNames(settings, runtimeState.semantics);
 		if (!definitions.length) return;
-		const session = runtimeState.sessionFor(input.sessionID, settings);
+		const session = sessionFor(input.sessionID, settings);
 		await session.lifecycle.run(async () => {
-			if (signal?.aborted || runtimeState.masterDisabled()) return;
+			if (signal?.aborted || masterDisabled()) return;
 			const previous = session.turns.get(input.turnID);
 			if (previous) await closeTurn(previous);
 			const data = await adapter.stateData(input);
-			if (signal?.aborted || runtimeState.masterDisabled() || session.lifecycle.sealed) return;
+			if (signal?.aborted || masterDisabled() || session.lifecycle.sealed) return;
 			session.settings = settings;
 			const generation = new SourceGeneration(signal);
 			const startedAt = performance.now();
@@ -918,9 +890,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					timeoutMs: source.timeoutMs?.(state.settings),
 					produce: (requestSignal) =>
 						trackSourceTask(state.session, Promise.resolve(source.propose({
-							startInput: state.startInput,
-							data: state.data,
-							settings: state.settings,
+							...turnContext(state),
 							definitions: state.definitions,
 							candidateNames: state.candidateNames,
 							proposalIndex: index,
@@ -932,9 +902,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					sourceRequestFinished(
 						{
 							session: state.session,
-							startInput: state.startInput,
-							data: state.data,
-							settings: state.settings,
+							...turnContext(state),
 							signal: generation.signal,
 							slot,
 						},
@@ -1030,9 +998,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					identity: node.identity,
 					opportunity: session.plan.opportunity(node.proposalID, node.action.id)!,
 					feedback: action.feedback,
-					startInput: scope.startInput,
-					data: scope.data,
-					settings: scope.settings,
+					...turnContext(scope),
 					attemptStartedAt: request?.startedAt ?? performance.now(),
 					predictionLatencyMs: request?.durationMs ?? 0,
 					draftTokens,
@@ -1061,29 +1027,14 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (!materializations.length) dispatchReady(session);
 	};
 
-	const executionRouteFor = async (input: RuntimeTurnContext<StartInput, StateData> & {
-		readonly draft: SpeculativeDraftCandidate;
-		readonly action: ActionKey;
-		readonly concrete: Record<string, unknown>;
-		readonly callID: string;
-		readonly index: number;
-		readonly signal: AbortSignal;
-	}): Promise<
+	const executionRouteFor = async (input: Omit<Parameters<typeof adapter.preflightCandidate>[0], "route">): Promise<
 		| { readonly ok: true; readonly route: SpeculativeExecutionRoute }
 		| { readonly ok: false; readonly cause: ResolutionCause }
 	> => {
 		let route: SpeculativeExecutionRoute | undefined;
 		try {
-			route = await adapter.resolveExecution({
-				startInput: input.startInput,
-				data: input.data,
-				settings: input.settings,
-				candidate: input.draft,
-				tool: input.action.tool,
-				concrete: input.concrete,
-				action: input.action,
-				signal: input.signal,
-			});
+			const { callID, index, ...request } = input;
+			route = await adapter.resolveExecution(request);
 		} catch {
 			route = undefined;
 		}
@@ -1095,19 +1046,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			};
 		}
 		try {
-			const preflight = await adapter.preflightCandidate({
-				startInput: input.startInput,
-				data: input.data,
-				settings: input.settings,
-				candidate: input.draft,
-				tool: input.action.tool,
-				concrete: input.concrete,
-				action: input.action,
-				route,
-				callID: input.callID,
-				index: input.index,
-				signal: input.signal,
-			});
+			const preflight = await adapter.preflightCandidate({ ...input, route });
 			if (!preflight.ok) return { ok: false, cause: cause("admission", preflight.reason, preflight.detail) };
 		} catch (error) {
 			return { ok: false, cause: cause("admission", "preflight_failed", errorDetail(error)) };
@@ -1176,10 +1115,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			);
 		}
 		const admission = await executionRouteFor({
-			startInput: context.startInput,
-			data: context.data,
-			settings: context.settings,
-			draft: context.draft,
+			...turnContext(context),
+			candidate: context.draft,
+			tool: predictedAction.tool,
 			action: predictedAction,
 			concrete: executionInput,
 			callID: `spec_${session.candidateSequence + 1}`,
@@ -1361,7 +1299,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		if (session.pendingLaunch || !runtimeState.candidates.pending(session.id).some((candidate) => candidate.work.execution.status === "queued")) return;
 		session.pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
 			session.pendingLaunch = undefined;
-			if (!session.lifecycle.sealed && !runtimeState.masterDisabled()) launchCandidateBatch(session);
+			if (!session.lifecycle.sealed && !masterDisabled()) launchCandidateBatch(session);
 		}));
 	};
 
@@ -1413,7 +1351,7 @@ export function makeStructuralSpeculativeActionRuntime<
 							(work.decisionBatchesUntilCall === other.decisionBatchesUntilCall && work.priorityMs > other.priorityMs);
 					},
 				)) {
-					cancelCandidate(session, victim, cause("admission", "scheduler_preempted"), false);
+					discardCandidate(session, victim, cause("admission", "scheduler_preempted"), false);
 				}
 				// Only executor completion, after cleanup, can admit the next batch.
 			}
@@ -1497,7 +1435,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		signal?: AbortSignal,
 	): Promise<void> => {
 		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
-		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) return;
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) return;
 		state.actorToolHints.add(input.tool);
 		await Promise.all(
 			nearestPredictions(state.session, state.decisionSequence, (node) => node.action.tool === input.tool ? { node } : undefined).map(
@@ -1518,7 +1456,7 @@ export function makeStructuralSpeculativeActionRuntime<
 
 	const previewActorCall = (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
 		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
-		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false) {
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) {
 			return Promise.resolve();
 		}
 		const actualCall = adapter.actual(input);
@@ -1548,7 +1486,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			record?.state.status !== "cancelled" &&
 			state.lifecycle === "active" &&
 			state.session.turns.get(state.turnID) === state &&
-			runtimeState.masterEnabled !== false;
+			!masterDisabled();
 		const action = await (record?.actionKey ?? actorActionKey(input, actualCall));
 		if (!action || !active()) return;
 		await Promise.all(
@@ -1594,10 +1532,9 @@ export function makeStructuralSpeculativeActionRuntime<
 			source: "actor_preview",
 		};
 		const admission = await executionRouteFor({
-			startInput: state.startInput,
-			data: state.data,
-			settings: state.settings,
-			draft,
+			...turnContext(state),
+			candidate: draft,
+			tool: action.tool,
 			action,
 			concrete,
 			callID: actualCall.id ?? callKey(state.turnID, actualCall.tool),
@@ -1667,10 +1604,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		let capture: AuthoritativeResultCapture<Output> | undefined;
 		try {
 			capture = await adapter.captureAuthoritativeResult({
-				startInput: state.startInput,
-				data: state.data,
+				...turnContext(state),
 				consumeInput: input,
-				settings: state.settings,
 				tool: actualCall.tool,
 				concrete,
 				action,
@@ -1686,7 +1621,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			captureSignal.aborted ||
 			state.lifecycle !== "active" ||
 			state.session.turns.get(state.turnID) !== state ||
-			runtimeState.masterEnabled === false ||
+			masterDisabled() ||
 			!state.actorActions.has(actorAction) ||
 			!actorAction.capture(capture)
 		) {
@@ -1702,7 +1637,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const stopCandidate = (candidate: Candidate): boolean => {
 			const failure = signal?.aborted
 				? cause("control", "actor_aborted")
-				: runtimeState.masterEnabled === false ||
+				: masterDisabled() ||
 					state.lifecycle !== "active" ||
 					state.session.turns.get(state.turnID) !== state
 					? cause("control", "disabled")
@@ -1901,7 +1836,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<PreparedActorCall<Output> | undefined> => {
 		const actorArrivedAt = performance.now();
 		const state = runtimeState.sessions.get(input.sessionID)?.turns.get(input.turnID);
-		if (!state || state.lifecycle !== "active" || signal?.aborted || runtimeState.masterEnabled === false)
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled())
 			return undefined;
 		const actualCall = adapter.actual(input);
 		let preview = actualCall.id ? state.actorPreviews.get(actualCall.id) : undefined;
@@ -1928,7 +1863,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		const sequence = ++state.session.sequence;
 		const actualKey = await actorActionKey(input, actualCall);
 		if (state.lifecycle !== "active" || state.session.turns.get(state.turnID) !== state ||
-			signal?.aborted || runtimeState.masterDisabled()) {
+			signal?.aborted || masterDisabled()) {
 			abandonActorPreview(state, preview, cause("control", signal?.aborted ? "actor_aborted" : "disabled"));
 			return undefined;
 		}
@@ -2084,7 +2019,7 @@ export function makeStructuralSpeculativeActionRuntime<
 		}
 		let retained = false;
 		try {
-			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || runtimeState.masterDisabled()) return;
+			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || masterDisabled()) return;
 			const candidate = createCandidate(state.session, state,
 				{ type: "tool_call", tool: action.tool, input: action.input, source: "actor_result" }, {
 				origin: "actor_result",
@@ -2195,9 +2130,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				if (!source.observe || !source.enabled(state.settings)) continue;
 				try {
 					const updates = await source.observe({
-						startInput: state.startInput,
-						data: state.data,
-						settings: state.settings,
+						...turnContext(state),
 						consumeInput: input,
 						...(key ? { action: key } : {}),
 						tool: actorAction.tool,
@@ -2214,8 +2147,7 @@ export function makeStructuralSpeculativeActionRuntime<
 					if (state.lifecycle === "active") {
 						// Preserve observation order; only session retirement drains optional binding and route preparation.
 						void trackSourceTask(state.session, admitUpdates(
-							{ session: state.session, startInput: state.startInput, data: state.data,
-								settings: state.settings, signal: state.generation.signal },
+							{ ...turnContext(state), session: state.session, signal: state.generation.signal },
 							source, updates,
 						));
 					}
@@ -2353,7 +2285,7 @@ export function makeStructuralSpeculativeActionRuntime<
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) return undefined;
 				return source.continue!({
-					startInput: context.startInput, data: context.data, settings: context.settings,
+					...turnContext(context),
 					candidate: predictionCandidate(candidate, node), ...(adoptedAction ? { adoptedAction } : {}),
 					proposalID: node.proposalID, actionID: node.action.id, revision,
 					feedback: context.feedback, output, trigger, signal,
@@ -2389,7 +2321,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal))),
 			count: (value) => asUpdates(value).length,
 		});
-		await sourceRequestFinished({ session, startInput: context.startInput, data: context.data, settings: context.settings,
+		await sourceRequestFinished({ ...turnContext(context), session,
 			signal: slot.generation.signal, slot }, context.startInput.turnID, source, slot, request);
 	};
 
@@ -2421,8 +2353,7 @@ export function makeStructuralSpeculativeActionRuntime<
 			const pending = requestContinuation(session, peer, parents, node.expectedDecisionSeq + 1, async (requestSignal) => {
 				const signal = AbortSignal.any([requestSignal, ...parents.map((parent) => parent.admissionSignal)]);
 				if (signal.aborted) return undefined;
-				const update = await peer.continueFrom!({ startInput: context.startInput, data: context.data,
-					settings: context.settings, batch, signal });
+				const update = await peer.continueFrom!({ ...turnContext(context), batch, signal });
 				return signal.aborted ? undefined : update;
 			}).catch(() => { /* Peer prediction cannot revoke the completed parent batch. */ });
 			trackSourceTask(session, pending);
@@ -2607,23 +2538,8 @@ export function makeStructuralSpeculativeActionRuntime<
 			concurrentLimit(settings),
 			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
 		)) {
-			cancelCandidate(session, candidate, cause("admission", "preempted_by_actor"));
+			discardCandidate(session, candidate, cause("admission", "preempted_by_actor"));
 		}
-	};
-
-	const cancelCandidate = (
-		session: Session,
-		candidate: Candidate,
-		failure: ResolutionCause,
-		dispatch = true,
-	): void => {
-		const state = candidate.work.execution;
-		const startedAt = state.status === "running" ? state.startedAt : performance.now();
-		const completedAt = performance.now();
-		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
-		removeCandidate(session.id, candidate);
-		if (settled) queueCandidateEvent(session, candidate);
-		if (dispatch) dispatchReady(session);
 	};
 
 	const discardCandidate = (
@@ -2632,11 +2548,17 @@ export function makeStructuralSpeculativeActionRuntime<
 		failure: ResolutionCause,
 		dispatch = true,
 	): void => {
-		if (candidate.work.execution.status === "queued" || candidate.work.execution.status === "running") {
-			cancelCandidate(session, candidate, failure, dispatch);
+		const state = candidate.work.execution;
+		if (state.status !== "queued" && state.status !== "running") {
+			removeCandidate(session.id, candidate);
 			return;
 		}
+		const startedAt = state.status === "running" ? state.startedAt : performance.now();
+		const completedAt = performance.now();
+		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
 		removeCandidate(session.id, candidate);
+		if (settled) queueCandidateEvent(session, candidate);
+		if (dispatch) dispatchReady(session);
 	};
 
 	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause): void => {
@@ -2839,7 +2761,7 @@ export function makeStructuralSpeculativeActionRuntime<
 	};
 
 	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
-		runtimeState.masterEnabled = settings.enabled;
+		masterEnabled = settings.enabled;
 		if (settings.enabled) return;
 		await Promise.all(
 			[...runtimeState.sessions.keys()].map((sessionID) => disableSession(sessionID)),

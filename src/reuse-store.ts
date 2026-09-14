@@ -103,7 +103,20 @@ export class ArtifactCAS {
 			if (!value) return undefined;
 			values.set(reference.digest, value);
 		}
-		return new LoadedArtifactClosure(values);
+		return Object.freeze({
+			artifacts: values.size,
+			bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
+			read: (reference: ArtifactReference): Buffer => {
+				if (!isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
+					throw new Error("invalid artifact reference");
+				}
+				const value = values.get(reference.digest);
+				if (!value || value.byteLength !== reference.size) {
+					throw new Error(`artifact is outside the verified closure: ${reference.digest}`);
+				}
+				return value;
+			},
+		});
 	}
 
 	private artifactPath(digest: Sha256Digest): string {
@@ -117,30 +130,6 @@ export interface VerifiedArtifactClosure {
 	readonly bytes: number;
 	/** Borrow verified bytes. Trusted replay consumers must treat the returned buffer as read-only. */
 	readonly read: (reference: ArtifactReference) => Buffer;
-}
-
-class LoadedArtifactClosure implements VerifiedArtifactClosure {
-	readonly artifacts: number;
-	readonly bytes: number;
-	private readonly values: ReadonlyMap<Sha256Digest, Buffer>;
-
-	constructor(values: ReadonlyMap<Sha256Digest, Buffer>) {
-		this.values = new Map(values);
-		this.artifacts = values.size;
-		this.bytes = [...values.values()].reduce((total, value) => total + value.byteLength, 0);
-		Object.freeze(this);
-	}
-
-	readonly read = (reference: ArtifactReference): Buffer => {
-		if (!isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) {
-			throw new Error("invalid artifact reference");
-		}
-		const value = this.values.get(reference.digest);
-		if (!value || value.byteLength !== reference.size) {
-			throw new Error(`artifact is outside the verified closure: ${reference.digest}`);
-		}
-		return value;
-	};
 }
 
 /** Persistent certificate/pathset index kept separate from the Runtime's live ResultCache. */
