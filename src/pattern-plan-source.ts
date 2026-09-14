@@ -22,6 +22,7 @@ import {
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
@@ -58,7 +59,8 @@ export function createPatternPlanSource(input: {
 		projectors: input.projectionRules,
 	};
 	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
-	let disposal: Promise<void> | undefined;
+	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
+	const lifecycle = new RuntimeLifecycleLane();
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
@@ -66,7 +68,7 @@ export function createPatternPlanSource(input: {
 	let analysisTail: Promise<void> = Promise.resolve();
 
 	const queueAnalysis = (analysis: () => void | Promise<void>): void => {
-		if (disposal) return;
+		if (lifecycle.sealed) return;
 		analysisTail = analysisTail
 			.then(() => new Promise<void>(setImmediate))
 			.then(analysis)
@@ -83,24 +85,38 @@ export function createPatternPlanSource(input: {
 		return revision;
 	};
 	const resolveStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
-		if (disposal) throw new Error("Pattern source is disposed");
 		if (input.store) return input.store;
 		const patternSettings = sourceSettings(settings);
 		const configurationKey = patternAwareAnalyzerKey(patternSettings);
 		if (!openedStore || openedStore.key !== configurationKey) {
 			const previous = openedStore;
+			const retained = ownedStores.get(configurationKey);
 			const opening = { key: configurationKey, lease: Promise.resolve().then(async () => {
-				if (previous) await previous.lease.then(async (lease) => {
-					try { lease.store.finishSession(input.sessionID); } finally { await lease.release(); }
-				}).catch(() => undefined); // Failed persistence or loading cannot poison the next analyzer.
-				return acquirePatternAwareStore(input.workspaceIdentity ?? input.cwd, patternSettings,
+				if (previous) await previous.lease.then(({ store }) => store.finishSession(input.sessionID))
+					.catch(() => undefined); // Failed loading cannot poison the next analyzer.
+				return retained ?? acquirePatternAwareStore(input.workspaceIdentity ?? input.cwd, patternSettings,
 					input.stateDirectory, patternActionSemantics);
 			}) };
-			// Publish the owner before retiring its predecessor; concurrent requests share this lease.
+			// Predictions retain their analyzer for late feedback, including after returning to this configuration.
+			if (!retained) ownedStores.set(configurationKey, opening.lease);
 			openedStore = opening;
-			void opening.lease.catch(() => { if (openedStore === opening) openedStore = undefined; });
+			void opening.lease.catch(() => {
+				if (ownedStores.get(configurationKey) === opening.lease) ownedStores.delete(configurationKey);
+				if (openedStore === opening) openedStore = undefined;
+			});
 		}
 		return (await openedStore.lease).store;
+	};
+	const flushStores = async (finish = false): Promise<void> => {
+		await analysisTail;
+		const stores = input.store ? [Promise.resolve(input.store)] : [...ownedStores.values()].map(async lease => (await lease).store);
+		const results = await Promise.allSettled(stores.map(async pending => {
+			const store = await pending;
+			if (finish) store.finishSession(input.sessionID);
+			await store.flush();
+		}));
+		const failure = results.find(result => result.status === "rejected");
+		if (failure) throw failure.reason;
 	};
 	const predictedEvent = (startInput: AgentStartInput, action: Pick<SpeculativeCandidate, "key" | "input">,
 		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
@@ -114,10 +130,10 @@ export function createPatternPlanSource(input: {
 
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
-		enabled: (settings) => !disposal && sourceSettings(settings).enabled,
+		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
-		propose: async ({ startInput, data, settings, signal }) => {
+		propose: ({ startInput, data, settings, signal }) => lifecycle.admit(async () => {
 			const patternSettings = sourceSettings(settings);
 			if (!patternSettings.enabled) return undefined;
 			await analysisTail;
@@ -137,8 +153,8 @@ export function createPatternPlanSource(input: {
 					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
 				),
 			};
-		},
-		continueFrom: async ({ startInput, data, settings, batch, signal }) => {
+		}),
+		continueFrom: ({ startInput, data, settings, batch, signal }) => lifecycle.admit(async () => {
 			await analysisTail;
 			if (signal.aborted) return undefined;
 			const store = await resolveStore(settings);
@@ -154,8 +170,8 @@ export function createPatternPlanSource(input: {
 				identity: identity.id, condition: "execution_succeeded" as const }));
 			return { id, source: "pattern_aware", revision: 0, actions: candidates.map((candidate) =>
 				patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity), dependencies)) };
-		},
-		continue: async ({
+		}),
+		continue: ({
 			startInput,
 			data,
 			settings,
@@ -168,7 +184,7 @@ export function createPatternPlanSource(input: {
 			output,
 			trigger,
 			signal,
-		}) => {
+		}) => lifecycle.admit(async () => {
 			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
@@ -191,8 +207,8 @@ export function createPatternPlanSource(input: {
 					]),
 				),
 			};
-		},
-		observe: async ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => {
+		}),
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => lifecycle.admit(async () => {
 			const patternSettings = sourceSettings(settings);
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
@@ -240,28 +256,27 @@ export function createPatternPlanSource(input: {
 				revision: nextRevision(consumeInput.sessionID, consumeInput.turnID),
 				actions,
 			};
-		},
+		}),
 		onAdmitted: ({ feedback }) => {
+			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
 			if (context) predictionBatches.get(context)?.pending.delete(context);
 		},
 		onIssued: ({ feedback }) => {
+			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
 			if (context) context.store.issued(context.continuation);
 			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
 		},
 		onSettled: ({ feedback, settlement }) => {
+			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
 			if (context) context.store.settled(context.continuation, settlement);
 			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
-		flush: async () => {
-			await analysisTail;
-			if (openedStore) await (await openedStore.lease).store.flush();
-			if (input.store) await (await input.store).flush();
-		},
+		flush: () => lifecycle.run(() => flushStores()),
 	};
 
 	return {
@@ -299,35 +314,28 @@ export function createPatternPlanSource(input: {
 				if (terminal) store.finishSession(startInput.sessionID);
 			});
 		},
-		finishSession: async () => {
+		finishSession: () => lifecycle.run(async () => {
+			await lifecycle.drain();
 			revisions.clear();
 			carriedPredictions.clear();
 			clearAuthoritativeSession(authoritativeBatches, input.sessionID);
-			await analysisTail;
-			const store = input.store
-				? await input.store
-				: openedStore
-					? (await openedStore.lease).store
-					: undefined;
-			if (!store) return;
-			store.finishSession(input.sessionID);
 			try {
-				await store.flush();
+				await flushStores(true);
 			} catch {
 				// Persistence failure must not change Agent lifecycle semantics.
 			}
-		},
-		dispose: () => disposal ??= (async () => {
+		}),
+		dispose: () => lifecycle.close(async () => {
 			await analysisTail;
-			const current = openedStore;
+			await lifecycle.drain();
+			const leases = [...ownedStores.values()];
+			ownedStores.clear();
 			openedStore = undefined;
-			if (!current) return;
-			try {
-				await (await current.lease).release();
-			} catch {
-				// Persistence failure must not change Agent uninstall semantics.
-			}
-		})(),
+			authoritativeBatches.clear();
+			revisions.clear();
+			carriedPredictions.clear();
+			await Promise.allSettled(leases.map(async lease => (await lease).release()));
+		}),
 	};
 }
 
