@@ -188,6 +188,12 @@ describe("zero-modification Pi extension", () => {
 			await command("off");
 			expect(dispose).toHaveBeenCalledTimes(2);
 			for (const tool of piTools.PI_CLOSED_SEARCH_TOOLS) expect(await fixture.resolveInvocation(tool, {})).toBeUndefined();
+			await command("on");
+			vi.spyOn(fixture.store, "flush").mockRejectedValueOnce(new Error("settings persistence failed"));
+			const closeHost = vi.spyOn(fixture.host, "dispose");
+			await fixture.emit("session_shutdown");
+			expect(closeHost).toHaveBeenCalledOnce();
+			expect(dispose).toHaveBeenCalledTimes(3);
 		} finally {
 			await fixture.emit("session_shutdown");
 			prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs();

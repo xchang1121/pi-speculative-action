@@ -287,8 +287,7 @@ export function createSpeculativeActionExtension(
 			controller?.observeActorOutput(event.assistantMessageEvent);
 			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
 				if (preview.type === "tool") {
-					if (controller?.registeredTools().has(preview.tool))
-						controller.previewActorTool(preview.tool, ctx.signal);
+					controller?.previewActorTool(preview.tool, ctx.signal);
 				} else {
 					controller?.previewActorCall(preview.call.name, preview.call.id, preview.call.arguments, ctx.signal);
 				}
@@ -665,20 +664,15 @@ async function installController(
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
-		dispose: async () => {
+		dispose: () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
-			await settingsStore.flush();
-			await processCoordinator.dispose().catch(() => undefined);
-			try {
-				await host.dispose();
-			} finally {
-				try {
-					await workspaceSandbox.dispose();
-				} finally {
-					await Promise.all([selfSpeculation.dispose(), resetSearch()]);
-				}
-			}
+			return Promise.resolve().then(() => settingsStore.flush())
+				.finally(() => processCoordinator.dispose().catch(() => undefined))
+				.finally(() => host.dispose())
+				.finally(() => workspaceSandbox.dispose())
+				.finally(() => selfSpeculation.dispose())
+				.finally(resetSearch);
 		},
 	} as const;
 	for (const definition of baseDefinitions.values())
