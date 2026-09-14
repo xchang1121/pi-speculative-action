@@ -3,11 +3,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ptrace.h>
@@ -30,9 +33,19 @@ struct output_event {
 	unsigned char *data;
 };
 
+struct decision_job {
+	pthread_t thread;
+	pid_t pid;
+	const char *socket_path, *token, *execution_id;
+	int channel[2], connection, outputs[3], result;
+	struct output_event *events;
+	unsigned count;
+};
+
 struct traced_process {
 	pid_t pid;
-	int fd;
+	int fd, armed;
+	struct decision_job *job;
 	struct traced_process *next;
 };
 
@@ -205,61 +218,107 @@ static int open_tracee_output(pid_t pid, unsigned fd) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
-	return open(path, O_WRONLY | O_CLOEXEC);
+	/* This fallback opens a new description; never change flags on a pidfd duplicate. */
+	int output = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+	if (output < 0) return -1;
+	int flags = fcntl(output, F_GETFL);
+	if (flags >= 0 && fcntl(output, F_SETFL, flags & ~O_NONBLOCK) >= 0) return output;
+	close(output);
+	return -1;
+}
+
+/* Only the tracer thread may mutate a held image. Each job owns its reply channel. */
+static int request_exit(struct decision_job *job, unsigned code) {
+	char reply;
+	return transfer(job->channel[1], &code, sizeof(code), 1) < 0 ||
+		transfer(job->channel[1], &reply, 1, 0) < 0 || reply != 'Y' ? -1 : 0;
 }
 
 /* A nonnegative return keeps the connection until the continued tracee exits. */
-static int actor_decision(pid_t pid, const char *socket_path, const char *token, const char *execution_id) {
-	int connection = -1, outputs[3] = {-1, -1, -1}, observer = -1;
-	struct output_event *events = NULL;
-	unsigned count = 0, code = 125;
+static int actor_decision(struct decision_job *job) {
+	unsigned code = 125;
 	size_t total = 0;
 	char line[MAX_LINE];
-	if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
-	connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (strlen(job->socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
+	int connection = job->connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (connection < 0) return -1;
 	struct sockaddr_un address = {.sun_family = AF_UNIX};
-	strcpy(address.sun_path, socket_path);
-	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) goto done;
+	strcpy(address.sun_path, job->socket_path);
+	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) return -1;
 	int request_length = snprintf(line, sizeof(line),
 		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld}\n",
-		token, execution_id, (long)pid, (long)getpid());
+		job->token, job->execution_id, (long)job->pid, (long)getpid());
 	if (request_length < 0 || request_length >= (int)sizeof(line) ||
-		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) goto done;
-	if (!strcmp(line, "C")) goto done;
-	if (!strcmp(line, "F")) { observer = -2; goto done; }
-	if (!strcmp(line, "O")) { observer = connection; connection = -1; goto done; }
-	if (sscanf(line, "P %u %u %zu", &code, &count, &total) != 3 || code > 255 ||
-		count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) goto done;
-	events = calloc(count ? count : 1, sizeof(*events));
-	if (!events) goto done;
+		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) return -1;
+	if (!strcmp(line, "C")) return -1;
+	if (!strcmp(line, "F")) return -2;
+	if (!strcmp(line, "O")) return connection;
+	if (sscanf(line, "P %u %u %zu", &code, &job->count, &total) != 3 || code > 255 ||
+		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) return -1;
+	job->events = calloc(job->count ? job->count : 1, sizeof(*job->events));
+	if (!job->events) return -1;
 	size_t received = 0;
-	for (unsigned index = 0; index < count; index++) {
+	for (unsigned index = 0; index < job->count; index++) {
 		size_t length;
 		unsigned fd;
 		if (read_line(connection, line, sizeof(line)) < 0 || sscanf(line, "O %u %zu", &fd, &length) != 2 ||
-			(fd != 1 && fd != 2) || length > total - received) goto done;
-		events[index].fd = fd;
-		events[index].length = length;
-		if (outputs[fd] < 0 && (outputs[fd] = open_tracee_output(pid, fd)) < 0) goto done;
-		if (length && (!(events[index].data = malloc(length)) || transfer(connection, events[index].data, length, 0) < 0)) goto done;
+			(fd != 1 && fd != 2) || length > total - received) return -1;
+		struct output_event *event = &job->events[index];
+		event->fd = fd;
+		event->length = length;
+		if (job->outputs[fd] < 0) {
+			/* Publish acquired descriptors before a cancellation point can retire the job. */
+			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+			job->outputs[fd] = open_tracee_output(job->pid, fd);
+			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+			if (job->outputs[fd] < 0) return -1;
+		}
+		if (length && (!(event->data = malloc(length)) || transfer(connection, event->data, length, 0) < 0)) return -1;
 		received += length;
 	}
-	if (received != total) goto done;
-	observer = -2; /* From the first text mutation onward, failure terminates the entire trace tree. */
-	if (replace_with_exit(pid, 125) < 0) goto done;
-	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) goto done;
-	for (unsigned index = 0; index < count; index++) {
-		if (transfer(outputs[events[index].fd], events[index].data, events[index].length, 1) < 0) goto done;
+	if (received != total) return -1;
+	/* From the first text mutation onward, failure terminates the entire trace tree. */
+	if (request_exit(job, 125) < 0) return -2;
+	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) return -2;
+	for (unsigned index = 0; index < job->count; index++) {
+		struct output_event *event = &job->events[index];
+		if (transfer(job->outputs[event->fd], event->data, event->length, 1) < 0) return -2;
 	}
-	if (replace_with_exit(pid, code) < 0) goto done;
-	if (transfer(connection, "D\n", 2, 1) < 0) goto done;
-	observer = -1;
-done:
-	if (connection >= 0) close(connection);
-	for (unsigned fd = 1; fd <= 2; fd++) if (outputs[fd] >= 0) close(outputs[fd]);
-	free_events(events, count);
-	return observer;
+	if (request_exit(job, code) < 0 || transfer(connection, "D\n", 2, 1) < 0) return -2;
+	return -1;
+}
+
+static void *decide_process(void *argument) {
+	struct decision_job *job = argument;
+	sigset_t blocked;
+	sigemptyset(&blocked); sigaddset(&blocked, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+	job->result = actor_decision(job);
+	shutdown(job->channel[1], SHUT_WR);
+	return NULL;
+}
+
+static void free_job(struct decision_job *job) {
+	close(job->channel[0]); close(job->channel[1]); close(job->connection);
+	for (unsigned fd = 1; fd <= 2; fd++) close(job->outputs[fd]);
+	free_events(job->events, job->count);
+	free(job);
+}
+
+static int start_decision(struct traced_process *process, const char *socket_path,
+	const char *token, const char *execution_id) {
+	struct decision_job *job = calloc(1, sizeof(*job));
+	if (!job) return -1;
+	*job = (struct decision_job){ .pid = process->pid, .socket_path = socket_path,
+		.token = token, .execution_id = execution_id, .channel = {-1, -1},
+		.connection = -1, .outputs = {-1, -1, -1}, .result = -1 };
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, job->channel) < 0 ||
+		pthread_create(&job->thread, NULL, decide_process, job) != 0) {
+		free_job(job);
+		return -1;
+	}
+	process->job = job;
+	return 0;
 }
 
 static int track_process(struct traced_process **processes, pid_t pid) {
@@ -276,6 +335,11 @@ static void release_process(struct traced_process **processes, pid_t pid) {
 		struct traced_process *observer = *cursor;
 		if (observer->pid != pid) { cursor = &observer->next; continue; }
 		*cursor = observer->next;
+		if (observer->job) {
+			pthread_cancel(observer->job->thread);
+			pthread_join(observer->job->thread, NULL);
+			free_job(observer->job);
+		}
 		size_t sent = 0;
 		while (observer->fd >= 0 && sent < 2) {
 			ssize_t moved = send(observer->fd, "D\n" + sent, 2 - sent, MSG_NOSIGNAL);
@@ -290,6 +354,11 @@ static void release_process(struct traced_process **processes, pid_t pid) {
 
 static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
 	int skip, unsigned skip_code) {
+	sigset_t blocked, original;
+	sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD);
+	if (pthread_sigmask(SIG_BLOCK, &blocked, &original) != 0) return 70;
+	int signals = signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK);
+	if (signals < 0) return 70;
 	int gate[2];
 	if (pipe2(gate, O_CLOEXEC) < 0) return 70;
 	pid_t root = fork();
@@ -299,6 +368,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		close(gate[1]);
 		if (transfer(gate[0], &ready, 1, 0) < 0) _exit(71);
 		close(gate[0]);
+		if (pthread_sigmask(SIG_SETMASK, &original, NULL) != 0) _exit(71);
 		execvp(command[0], command);
 		_exit(errno == ENOENT ? 127 : 126);
 	}
@@ -313,16 +383,55 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	int status = 0, root_status = -1;
 	unsigned exec_events = 0;
 	struct traced_process *processes = NULL;
+	struct pollfd *polling = NULL;
+	size_t capacity = 0;
 	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); goto fatal; }
 	for (;;) {
-		pid_t pid = waitpid(-1, &status, __WALL);
+		struct signalfd_siginfo notification;
+		while (read(signals, &notification, sizeof(notification)) > 0) {}
+		size_t count = 1;
+		for (struct traced_process *item = processes; item; item = item->next) {
+			struct decision_job *job = item->job;
+			if (!job) continue;
+			unsigned code;
+			ssize_t received = recv(job->channel[0], &code, sizeof(code), MSG_DONTWAIT);
+			if (received == sizeof(code)) {
+				item->armed = 1;
+				char reply = replace_with_exit(item->pid, code) < 0 ? 'N' : 'Y';
+				if (send(job->channel[0], &reply, 1, MSG_NOSIGNAL) != 1) goto fatal;
+			} else if (received == 0) {
+				pthread_join(job->thread, NULL);
+				int result = job->result;
+				if (result >= 0) { close(item->fd); item->fd = result; job->connection = -1; }
+				free_job(job); item->job = NULL; item->armed = 0;
+				if (result == -2 || (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH)) goto fatal;
+				continue;
+			} else if (received > 0 || (errno != EAGAIN && errno != EINTR)) goto fatal;
+			count++;
+		}
+		pid_t pid = waitpid(-1, &status, __WALL | WNOHANG);
 		if (pid < 0) {
 			if (errno == EINTR) continue;
 			if (errno == ECHILD) break;
 			goto fatal;
 		}
+		if (pid == 0) {
+			if (count > capacity) {
+				struct pollfd *grown = realloc(polling, count * sizeof(*polling));
+				if (!grown) goto fatal;
+				polling = grown; capacity = count;
+			}
+			polling[0] = (struct pollfd){.fd = signals, .events = POLLIN};
+			count = 1;
+			for (struct traced_process *item = processes; item; item = item->next)
+				if (item->job) polling[count++] = (struct pollfd){.fd = item->job->channel[0], .events = POLLIN};
+			if (poll(polling, count, -1) < 0 && errno != EINTR) goto fatal;
+			continue;
+		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
 			if (pid == root) root_status = status;
+			for (struct traced_process *item = processes; item; item = item->next)
+				if (item->pid == pid && item->armed) goto fatal;
 			release_process(&processes, pid);
 			continue;
 		}
@@ -340,16 +449,17 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
 			if (socket_path) {
-				int observer = actor_decision(pid, socket_path, token, execution_id);
-				if (observer == -2) goto fatal;
 				for (struct traced_process *item = processes; item; item = item->next)
-					if (item->pid == pid && observer >= 0) { close(item->fd); item->fd = observer; }
+					if (item->pid == pid && start_decision(item, socket_path, token, execution_id) == 0) goto held;
 			}
 		}
 		if (event != 0) delivered = 0;
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
+	held:;
 	}
 	while (processes) release_process(&processes, processes->pid);
+	free(polling); close(signals);
+	pthread_sigmask(SIG_SETMASK, &original, NULL);
 	if (root_status < 0) return 125;
 	if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
 	signal(WTERMSIG(root_status), SIG_DFL);
@@ -359,6 +469,7 @@ fatal:
 	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
 	while (waitpid(-1, &status, __WALL) > 0 || errno == EINTR) {}
 	while (processes) release_process(&processes, processes->pid);
+	free(polling); close(signals);
 	return 125;
 }
 

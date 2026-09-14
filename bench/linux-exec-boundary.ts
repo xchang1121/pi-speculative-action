@@ -37,7 +37,7 @@ try {
 	await compileBenchmarkHelper(root, {
 		source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)),
 		output: path.basename(tracer),
-		arguments: ["-Werror"],
+		arguments: ["-Werror", "-pthread"],
 	});
 	const equivalence: Command = ["/bin/bash", "-c", "printf out; printf err >&2; exit 7"];
 	assertSame(await run(equivalence), await run([tracer, ...equivalence]));

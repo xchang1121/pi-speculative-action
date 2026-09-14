@@ -40,7 +40,7 @@ describe("Linux process ExecutionWorld", () => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
 		const binary = path.join(root, "helper");
-		execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
+		execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
 			const completed = path.join(root, "descendant-completed"), pidFile = path.join(root, "descendant-pid");
@@ -71,14 +71,54 @@ describe("Linux process ExecutionWorld", () => {
 				if (pid) try { process.kill(-pid, "SIGKILL"); } catch { /* Already reaped. */ }
 				await stopped;
 			}
-			for (const disposition of [undefined, "recoverable", "poisoned"] as const) {
+			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
+			for (const killed of [false, true]) {
+				const waiting = deferred(), nativeDone = deferred();
+				let callbacks = 0, observed = 0, output = "", heldPid = 0;
+				const concurrent = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
+					sourceRoot: root, realShell: "/bin/bash", decide: async process => {
+						if (++callbacks === 1) { heldPid = process.pid; await waiting.promise; }
+						return { kind: "continue", observeCompletion: () => { observed++; } };
+					},
+				});
+				const siblings = concurrent.execute({
+					command: `/bin/true & while [[ ! -e start-second-${killed} ]]; do :; done; /bin/echo sibling; wait`,
+					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); },
+				});
+				try {
+					await vi.waitFor(() => expect(callbacks).toBe(1));
+					await writeFile(path.join(root, `start-second-${killed}`), "ready");
+					await vi.waitFor(() => { expect(output).toBe("sibling\n"); expect(observed).toBe(1); });
+					expect(callbacks).toBe(2);
+					if (killed) { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
+					waiting.resolve(); expect(await siblings).toEqual({ exitCode: 0 }); expect(observed).toBe(killed ? 1 : 2);
+				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
+			}
+			let output = "";
+			const committed = vi.fn(async () => { await writeFile(path.join(root, "producer-armed"), "ready"); });
+			const delivery = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async process => {
+				if (path.basename(await filesystem.readlink(`/proc/${process.pid}/exe`)) === "true")
+					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(2 * 1024 * 1024, 97) }], commit: committed };
+				return { kind: "continue" };
+			} });
+			expect(await delivery.execute({
+				command: "/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)",
+				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); },
+			})).toEqual({ exitCode: 0 });
+			expect(output).toBe("2097152\n"); expect(committed).toHaveBeenCalledOnce();
+			for (const disposition of [undefined, "recoverable", "poisoned", "killed"] as const) {
 				const after = path.join(root, `after-${disposition}`);
 				const scope = { sessionID: "session", turnID: "original" };
+				const nativeDone = deferred();
+				let heldPid = 0;
 				const commit = vi.fn(async () => {
-					if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
+					if (disposition === "killed") { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
+					else if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
 				});
-				const decide = vi.fn(async (_process: HeldExecProcess) => ({ kind: "replay" as const, output: [], exitCode: 0, commit }));
-				const executor = boundary.executor(adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary })), {
+				const decide = vi.fn(async (process: HeldExecProcess) => {
+					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit };
+				});
+				const executor = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
 					sourceRoot: root, realShell: "/bin/bash",
 					decide,
 				});
