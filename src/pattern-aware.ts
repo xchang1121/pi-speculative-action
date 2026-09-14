@@ -611,7 +611,7 @@ export class PatternAwareStore {
 			}
 			contextEvidence.set(pattern.context.length, gaps);
 		}
-		const predictions = [...groups.entries()].map(([identity, group]) => {
+		const predictions = new Map([...groups.entries()].map(([identity, group]) => {
 			const ordered = [...group].sort(
 				(left, right) =>
 					right.pattern.context.length - left.pattern.context.length ||
@@ -647,10 +647,11 @@ export class PatternAwareStore {
 				const feedback = feedbackEvidence(pattern, this.clock, settings.decayHalfLifeEvents);
 				return pattern.occurrences < settings.minOccurrences || feedback.mismatched > feedback.matched;
 			});
-			return {
+			const actionIdentity = hash(identity);
+			return [actionIdentity, {
 				background,
 				recurrentFeedback: undefined as MutablePatternFeedback | undefined,
-				actionIdentity: hash(identity),
+				actionIdentity,
 				type: "tool_call" as const,
 				tool: representative.pattern.targetTool,
 				input: representative.input,
@@ -670,8 +671,8 @@ export class PatternAwareStore {
 				ppmEstimate,
 				mapperConfidence,
 				expectedLatencyBenefitMs,
-			};
-		});
+			}] as const;
+		}));
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
 		for (const recurrent of authoritative ? this.recurrentPredictions(
 			activeSessionID,
@@ -680,12 +681,11 @@ export class PatternAwareStore {
 			continuation,
 			settings,
 		) : []) {
-			const index = predictions.findIndex((prediction) => prediction.actionIdentity === recurrent.actionIdentity);
-			if (index < 0) {
-				predictions.push(recurrent);
+			const existing = predictions.get(recurrent.actionIdentity);
+			if (!existing) {
+				predictions.set(recurrent.actionIdentity, recurrent);
 				continue;
 			}
-			const existing = predictions[index]!;
 			const preferred =
 				recurrent.background !== existing.background
 					? recurrent.background
@@ -694,41 +694,40 @@ export class PatternAwareStore {
 					: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs
 						? recurrent
 						: existing;
-			predictions[index] = {
+			predictions.set(recurrent.actionIdentity, {
 				...preferred,
 				recurrentFeedback: recurrent.recurrentFeedback,
 				background: existing.background && recurrent.background,
 				supportingPatternIDs: [...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs])],
-			};
+			});
 		}
-		const comparePredictions = (left: (typeof predictions)[number], right: (typeof predictions)[number]) =>
+		const ranked = [...predictions.values()].sort((left, right) =>
 			Number(left.background) - Number(right.background) ||
 			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 			right.empiricalProbability - left.empiricalProbability ||
 			right.conditionalProbability - left.conditionalProbability ||
 			left.horizon - right.horizon ||
 			left.patternID.localeCompare(right.patternID) ||
-			left.actionIdentity.localeCompare(right.actionIdentity);
-		const selected = perToolBeam(
-			predictions.sort(comparePredictions),
-			settings.beamWidth,
-			(prediction) => prediction.tool,
-		);
-		const continuationHistory = selected.length ? structuredClone(history) : [];
+			left.actionIdentity.localeCompare(right.actionIdentity));
+		const beamWidth = settings.beamWidth;
+		const selected: PatternAwareCandidate[] = [];
+		let continuationHistory: typeof history | undefined;
 		const emittedPerTool = new Map<string, number>();
-		return selected.map((prediction): PatternAwareCandidate => {
+		for (const prediction of ranked) {
+			const count = emittedPerTool.get(prediction.tool) ?? 0;
+			if (count >= beamWidth) continue;
+			const beamRank = count + 1;
+			emittedPerTool.set(prediction.tool, beamRank);
 			const { input, dependencies, background, context, recurrentFeedback, ppmEstimate,
 				mapperConfidence, variantProbability, gapCoverage, replayProbability, ...candidate } = prediction;
 			const { type: _type, actionIdentity: _identity, supportingPatternIDs, ...diagnostic } = candidate;
-			const beamRank = (emittedPerTool.get(prediction.tool) ?? 0) + 1;
-			emittedPerTool.set(prediction.tool, beamRank);
 			const nextContinuation: PatternAwareContinuation = {
-				history: continuationHistory,
+				history: continuationHistory ??= structuredClone(history),
 				visitedPatternIDs: [...continuation.visitedPatternIDs, prediction.patternID],
 				pathProbability: prediction.empiricalProbability,
 			};
 			if (recurrentFeedback) this.recurrentFeedback.set(nextContinuation, recurrentFeedback);
-			return {
+			selected.push({
 				...candidate,
 				source: "pattern_aware",
 				input: structuredClone(input),
@@ -760,8 +759,9 @@ export class PatternAwareStore {
 					null,
 					2,
 				),
-			};
-		});
+			});
+		}
+		return selected;
 	}
 
 	private recurrentPredictions(
@@ -2393,17 +2393,6 @@ function patternAdoptionProbability(patterns: ReadonlyArray<Pick<MutablePattern,
 function recencyWeight(lastSeen: number, clock: number, halfLife: number) {
 	if (halfLife <= 0) return 1;
 	return 2 ** (-Math.max(0, clock - lastSeen) / halfLife);
-}
-
-function perToolBeam<Value>(values: readonly Value[], width: number, tool: (value: Value) => string) {
-	const counts = new Map<string, number>();
-	return values.filter((value) => {
-		const name = tool(value);
-		const count = counts.get(name) ?? 0;
-		if (count >= width) return false;
-		counts.set(name, count + 1);
-		return true;
-	});
 }
 
 function readonlyPattern(pattern: MutablePattern, clock: number, halfLife: number): PatternAwarePattern {
