@@ -41,26 +41,15 @@ describe("Linux OverlayFS workspace substrate", () => {
 
 	it("fails the registry closed instead of evicting degraded driver identities", async () => {
 		const registry = new LinuxOverlayfsCapabilityRegistry({ degradedCapacity: 1 });
-		registry.markDegraded(
-			{
+		for (const [id, detail] of [["one", "first unsafe mount"], ["two", "second unsafe mount"]]) {
+			registry.markDegraded({
 				available: true,
-				binary: "/driver/one",
-				fusermountBinary: "/unmount/one",
-				fingerprint: "one",
+				binary: `/driver/${id}`,
+				fusermountBinary: `/unmount/${id}`,
+				fingerprint: id,
 				detail: "ready",
-			},
-			"first unsafe mount",
-		);
-		registry.markDegraded(
-			{
-				available: true,
-				binary: "/driver/two",
-				fusermountBinary: "/unmount/two",
-				fingerprint: "two",
-				detail: "ready",
-			},
-			"second unsafe mount",
-		);
+			}, detail);
+		}
 
 		expect(registry.inspect()).toMatchObject({ degradedEntries: 0, disabled: true });
 		await expect(registry.capability()).resolves.toMatchObject({
@@ -70,7 +59,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 		registry.dispose();
 	});
 
-	it("proves copy-on-write isolation and visibility in descendant namespaces", async ({ skip }) => {
+	it.for(["normal", "recovered"])("proves copy-on-write isolation and namespace visibility through %s unmount", async (mode, { skip }) => {
 		const capability = await linuxOverlayfsCapability();
 		if (!capability.available) return skip(capability.detail);
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-test-"));
@@ -78,7 +67,21 @@ describe("Linux OverlayFS workspace substrate", () => {
 		const privateRoot = path.join(root, "private");
 		await Promise.all([mkdir(lowerRoot), mkdir(privateRoot)]);
 		await writeFile(path.join(lowerRoot, "value.txt"), "lower\n", "utf8");
-		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot });
+		const wrapper = path.join(root, "fusermount-transient-failure");
+		const options = mode === "recovered" ? { fusermountBinary: wrapper } : {};
+		if (mode === "recovered") {
+			const probeUnmounted = path.join(root, "probe-unmounted");
+			const failureInjected = path.join(root, "failure-injected");
+			await writeFile(
+				wrapper,
+				`#!/bin/sh\nif [ ! -e ${shellQuote(probeUnmounted)} ]; then\n  : > ${shellQuote(probeUnmounted)}\n  exec ${shellQuote(capability.fusermountBinary)} "$@"\nfi\nif [ ! -e ${shellQuote(failureInjected)} ]; then\n  : > ${shellQuote(failureInjected)}\n  exit 42\nfi\nexec ${shellQuote(capability.fusermountBinary)} "$@"\n`,
+				"utf8",
+			);
+			await chmod(wrapper, 0o755);
+			const probed = await linuxOverlayfsCapability(options);
+			expect(probed.available).toBe(true);
+		}
+		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot, options });
 		try {
 			await writeFile(path.join(mounted.root, "value.txt"), "copy-up\n", "utf8");
 			expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
@@ -95,45 +98,16 @@ describe("Linux OverlayFS workspace substrate", () => {
 					path.join(mounted.root, "value.txt"),
 				]),
 			).toBe("copy-up\n");
+			await mounted.close();
+			if (mode === "recovered") {
+				const demoted = await linuxOverlayfsCapability(options);
+				expect(demoted.available).toBe(false);
+				expect(demoted.detail).toMatch(/unmount/i);
+				expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
+			}
 		} finally {
 			await mounted.close();
 			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("demotes the driver after a recovered unmount failure", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const host = await linuxOverlayfsCapability();
-		if (!host.available) return skip(host.detail);
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-health-test-"));
-		const lowerRoot = path.join(root, "lower");
-		const privateRoot = path.join(root, "private");
-		const probeUnmounted = path.join(root, "probe-unmounted");
-		const failureInjected = path.join(root, "failure-injected");
-		const wrapper = path.join(root, "fusermount-transient-failure");
-		await Promise.all([mkdir(lowerRoot), mkdir(privateRoot)]);
-		await writeFile(path.join(lowerRoot, "value.txt"), "lower\n", "utf8");
-		await writeFile(
-			wrapper,
-			`#!/bin/sh\nif [ ! -e ${shellQuote(probeUnmounted)} ]; then\n  : > ${shellQuote(probeUnmounted)}\n  exec ${shellQuote(host.fusermountBinary)} "$@"\nfi\nif [ ! -e ${shellQuote(failureInjected)} ]; then\n  : > ${shellQuote(failureInjected)}\n  exit 42\nfi\nexec ${shellQuote(host.fusermountBinary)} "$@"\n`,
-			"utf8",
-		);
-		await chmod(wrapper, 0o755);
-		const options = { fusermountBinary: wrapper };
-		const probed = await linuxOverlayfsCapability(options);
-		expect(probed.available).toBe(true);
-		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot, options });
-		let safelyClosed = false;
-		try {
-			await writeFile(path.join(mounted.root, "value.txt"), "copy-up\n", "utf8");
-			await mounted.close();
-			safelyClosed = true;
-			const demoted = await linuxOverlayfsCapability(options);
-			expect(demoted.available).toBe(false);
-			expect(demoted.detail).toMatch(/unmount/i);
-			expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
-		} finally {
-			if (safelyClosed) await rm(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -17,6 +17,7 @@ import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { advanceFilesystemClock } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
+import { waitForCandidate } from "./scheduler.ts";
 import { positiveInteger as positiveCapacity, nonNegativeNumber as nonNegativeDuration } from "./setting-input.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
@@ -459,7 +460,7 @@ async function waitForMount(
 	processError: () => Error | undefined,
 	diagnostics: () => string,
 ): Promise<void> {
-	const deadline = Date.now() + OVERLAY_READY_TIMEOUT_MS;
+	const deadline = performance.now() + OVERLAY_READY_TIMEOUT_MS;
 	for (;;) {
 		if (await mountedAsFuseOverlayfs(mountRoot)) return;
 		const failure = processError();
@@ -469,7 +470,7 @@ async function waitForMount(
 		if (child.exitCode !== null || child.signalCode !== null) {
 			throw new Error(`fuse-overlayfs exited before mount was ready: ${diagnostics().trim()}`);
 		}
-		if (Date.now() >= deadline) throw new Error(`fuse-overlayfs mount timed out: ${diagnostics().trim()}`);
+		if (performance.now() >= deadline) throw new Error(`fuse-overlayfs mount timed out: ${diagnostics().trim()}`);
 		await new Promise<void>((resolve) => setTimeout(resolve, 10));
 	}
 }
@@ -492,11 +493,11 @@ async function closeMount(
 		}
 	}
 	child.stdin.end();
-	const exited = await waitForProcessClose(processClosed);
+	const waitForClose = () => waitForCandidate(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
 	let processShutdownDegraded = false;
-	if (!exited) {
+	if ((await waitForClose()).status !== "completed") {
 		child.kill("SIGKILL");
-		processShutdownDegraded = !(await waitForProcessClose(processClosed));
+		processShutdownDegraded = (await waitForClose()).status !== "completed";
 	}
 	if (unmountError && (await mountedAsFuseOverlayfs(mountRoot))) {
 		try {
@@ -521,18 +522,11 @@ async function closeMount(
 	return degraded.length ? degraded.join("; ") : undefined;
 }
 
-async function waitForProcessClose(processClosed: Promise<void>): Promise<boolean> {
-	return Promise.race([
-		processClosed.then(() => true),
-		new Promise<false>((resolve) => setTimeout(() => resolve(false), OVERLAY_EXIT_TIMEOUT_MS)),
-	]);
-}
-
 async function waitForUnmount(mountRoot: string): Promise<boolean> {
-	const deadline = Date.now() + OVERLAY_EXIT_TIMEOUT_MS;
+	const deadline = performance.now() + OVERLAY_EXIT_TIMEOUT_MS;
 	for (;;) {
 		if (!(await mountedAsFuseOverlayfs(mountRoot))) return true;
-		if (Date.now() >= deadline) return false;
+		if (performance.now() >= deadline) return false;
 		await new Promise<void>((resolve) => setTimeout(resolve, 10));
 	}
 }
