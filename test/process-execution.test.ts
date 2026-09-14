@@ -4,7 +4,7 @@ import { ProcessExecutionCoordinator, type PreparedProcessExecutionRoute, type P
 
 describe("ProcessExecutionCoordinator", () => {
 	test.each(["preparing", "executing", "rejected", "thrown"] as const)("owns route retirement while %s", async (phase) => {
-		for (const dispose of [false, true]) {
+		for (const dispose of [false, true]) for (const warm of [false, true]) {
 			const calls: string[] = [], prepared = barrier<PreparedProcessExecutionRoute>(), probing = barrier();
 			const executing = barrier(), finish = barrier(), resetting = barrier(), close = barrier();
 			let enabled = false, retired = false, active = 0;
@@ -20,17 +20,27 @@ describe("ProcessExecutionCoordinator", () => {
 			const prepare = vi.fn(() => {
 				probing.resolve();
 				if (phase === "thrown") throw new Error("helper unavailable");
-				return phase === "rejected" ? Promise.reject(new Error("helper unavailable")) : prepared.promise;
+				return phase === "rejected" ? Promise.reject(new Error("helper unavailable")) : (async () => {
+					enabled = false;
+					try { await invoke("probe"); } finally { enabled = true; }
+					return prepared.promise;
+				})();
 			});
 			const reset = vi.fn(async () => { retired = true; resetting.resolve(); await close.promise; });
 			const coordinator = new ProcessExecutionCoordinator(executor("raw"), { enabled: () => enabled, prepare, reset });
 			const invoke = (command: string) => coordinator.operations.exec(command, "/work", { onData: () => {}, env: { PATH: "/bin" } });
 			expect(coordinator.actorDiagnostics().state).toBe("disabled");
 			await invoke("disabled");
-			await coordinator.runWith(executor("world"), async () => { await Promise.resolve(); await invoke("scoped"); });
-			expect(prepare).not.toHaveBeenCalled();
-			enabled = true;
-			expect(coordinator.actorDiagnostics().state).toBe("idle");
+			await coordinator.runWith(executor("world"), async () => {
+				await Promise.resolve(); await invoke("scoped");
+				expect(prepare).not.toHaveBeenCalled();
+				enabled = true;
+				expect(coordinator.actorDiagnostics().state).toBe("idle");
+				if (warm) expect(await coordinator.runWith(executor("nested"), async () => {
+					await Promise.resolve(); return invoke("prediction");
+				})).toEqual({ exitCode: 0 }); // Prediction completes while Actor preparation is still held.
+			});
+			if (warm) expect(prepare).toHaveBeenCalledOnce();
 			const first = invoke("first"), second = invoke("second");
 			const started = Promise.allSettled([first, second]); // Capture boundary exceptions without unhandled rejections.
 			await probing.promise;
@@ -43,10 +53,12 @@ describe("ProcessExecutionCoordinator", () => {
 				expect(coordinator.actorDiagnostics()).toEqual({ state: "unavailable", detail: "helper unavailable" });
 			}
 			expect(prepare).toHaveBeenCalledOnce();
-			expect(prepare).toHaveBeenCalledWith(false);
+			expect(prepare).toHaveBeenCalledWith(warm);
 			const retire = () => dispose ? coordinator.dispose() : coordinator.refreshActorRoute();
 			const retiredCalls = Promise.allSettled([retire(), retire()]);
 			const during = Promise.allSettled([invoke("during")]);
+			await coordinator.runWith(executor("world"), async () => invoke("retiring"));
+			expect(prepare).toHaveBeenCalledOnce();
 			prepared.resolve({ state: "ready", detail: "ready", executor: executor("reuse") });
 			finish.resolve();
 			await resetting.promise;
@@ -59,11 +71,16 @@ describe("ProcessExecutionCoordinator", () => {
 			expect(coordinator.actorDiagnostics().state).toBe(dispose ? "unavailable" : "degraded");
 			if (!dispose) expect(prepare).toHaveBeenLastCalledWith(true);
 			await invoke("after");
+			const preparations = prepare.mock.calls.length;
+			await coordinator.runWith(executor("world"), async () => invoke("after-prediction"));
+			expect(prepare).toHaveBeenCalledTimes(preparations);
 			expect(calls).toContain("raw:during");
 			expect(calls.slice(0, 2)).toEqual(["raw:disabled", "world:scoped"]);
+			if (warm) expect(calls).toContain("nested:prediction");
+			if (phase === "preparing" || phase === "executing") expect(calls.filter(call => call.endsWith(":probe"))).toEqual(["raw:probe"]);
 			for (const command of ["first", "second"]) expect(calls.filter((call) => call.endsWith(`:${command}`)))
 				.toEqual([`${phase === "executing" ? "reuse" : "raw"}:${command}`]);
-			expect(calls.at(-1)).toBe(`${dispose ? "raw" : "fresh"}:after`);
+			expect(calls.slice(-2)).toEqual([`${dispose ? "raw" : "fresh"}:after`, "world:after-prediction"]);
 			await coordinator.dispose();
 		}
 	});
