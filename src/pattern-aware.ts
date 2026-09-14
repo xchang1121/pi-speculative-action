@@ -1107,36 +1107,37 @@ export class PatternAwareStore {
 			if (dependencies.length === 0) {
 				this.patternSupportSessions.set(id, new Set(support.map((sample) => sample.target.sessionID)));
 			} else this.patternSupportSessions.delete(id);
-			const historicalOpportunities = this.controlOpportunities(pool);
-			const lastSeenSequence = Math.max(...support.map((sample) => sample.target.sequence));
+			const observed = {
+				bindings,
+				dependencies,
+				gapCounts: {} as Record<string, number>,
+				gapLastSeen: {} as Record<string, number>,
+				occurrences: support.length,
+				replayMatches: support.length,
+				averageDurationMs: 0,
+				lastSeenSequence: -Infinity,
+			};
+			for (const { gap, target } of support) {
+				observed.gapCounts[gap] = (observed.gapCounts[gap] ?? 0) + 1;
+				observed.gapLastSeen[gap] = Math.max(observed.gapLastSeen[gap] ?? 0, target.sequence);
+				observed.lastSeenSequence = Math.max(observed.lastSeenSequence, target.sequence);
+				observed.averageDurationMs += target.outcome === "success" ? Math.max(0, target.durationMs) : 0;
+			}
+			observed.averageDurationMs /= Math.max(1, support.length);
 			const existing = this.patterns.get(id);
 			if (existing) {
-				existing.bindings = bindings;
-				existing.dependencies = dependencies;
-				existing.occurrences = support.length;
-				existing.replayMatches = support.length;
-				existing.gapCounts = sampleGapCounts(support);
-				existing.gapLastSeen = sampleGapLastSeen(support);
-				existing.averageDurationMs = averageTargetDuration(support);
-				existing.lastSeenSequence = lastSeenSequence;
+				Object.assign(existing, observed);
 				continue;
 			}
 			this.patterns.set(id, {
 				id,
 				context: signatures,
 				targetTool: target.tool,
-				bindings,
-				dependencies,
+				...observed,
 				...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
-				gapCounts: sampleGapCounts(support),
-				gapLastSeen: sampleGapLastSeen(support),
-				occurrences: support.length,
-				replayMatches: support.length,
-				historicalOpportunities,
+				historicalOpportunities: this.controlOpportunities(pool),
 				historicalMatches: controlOpportunityCount(support),
-				feedback: emptyPatternFeedback(lastSeenSequence),
-				averageDurationMs: averageTargetDuration(support),
-				lastSeenSequence,
+				feedback: emptyPatternFeedback(observed.lastSeenSequence),
 			});
 			this.indexDirty = true;
 		}
@@ -2655,30 +2656,6 @@ function controlOpportunityCount(samples: ReadonlyArray<PatternSample>) {
 
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
 	return Math.max(settings.minOccurrences * 4, settings.maxContextLength * 4);
-}
-
-function sampleGapCounts(samples: ReadonlyArray<PatternSample>) {
-	const counts: Record<string, number> = {};
-	for (const sample of samples) counts[String(sample.gap)] = (counts[String(sample.gap)] ?? 0) + 1;
-	return counts;
-}
-
-function sampleGapLastSeen(samples: ReadonlyArray<PatternSample>) {
-	const lastSeen: Record<string, number> = {};
-	for (const sample of samples) {
-		const gap = String(sample.gap);
-		lastSeen[gap] = Math.max(lastSeen[gap] ?? 0, sample.target.sequence);
-	}
-	return lastSeen;
-}
-
-function averageTargetDuration(samples: ReadonlyArray<PatternSample>) {
-	return (
-		samples.reduce(
-			(total, sample) => total + (sample.target.outcome === "success" ? Math.max(0, sample.target.durationMs) : 0),
-			0,
-		) / Math.max(1, samples.length)
-	);
 }
 
 function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {
