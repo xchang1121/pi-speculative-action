@@ -51,24 +51,11 @@ export async function validateProcessCertificate(
 	certificate: ProcessProvenanceCertificate,
 	context: ProvenanceValidationContext = {},
 ): Promise<ProvenanceValidation> {
+	const { weakKey, strongKey: expectedKey } = certificate;
 	const validation = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, context);
 	if (validation.status !== "valid") return validation;
-	const dependencyCertificate: DynamicDependencyCertificate = {
-		complete: true,
-		dependencies: validation.dependencies,
-		taints: [],
-	};
-	const strongKey = processStrongKey(certificate.weakKey, dependencyCertificate);
-	if (strongKey !== certificate.strongKey) {
-		return {
-			status: "stale",
-			changed: Object.freeze(["strong_key"]),
-			dependencies: validation.dependencies,
-			filesRead: validation.filesRead,
-			bytesRead: validation.bytesRead,
-			durationMs: validation.durationMs,
-		};
-	}
+	const strongKey = processStrongKey(weakKey, { complete: true, dependencies: validation.dependencies, taints: [] });
+	if (strongKey !== expectedKey) return { ...validation, status: "stale", changed: Object.freeze(["strong_key"]) };
 	return { ...validation, strongKey };
 }
 
@@ -96,7 +83,7 @@ export async function validateDynamicDependencyCertificate(
 
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];
-	for (const expected of certificate.dependencies) {
+	for (const expected of structuredClone(certificate.dependencies)) {
 		try {
 			if (expected.kind === "fd") {
 				const descriptor = context.fileDescriptors?.get(expected.fd);
@@ -109,7 +96,9 @@ export async function validateDynamicDependencyCertificate(
 				continue;
 			}
 
-			const physicalPath = resolveEvidencePath(expected.path, context);
+			const physicalPath = context.resolvePath
+				? context.resolvePath(expected.path)
+				: path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
 			if (!physicalPath) return indeterminate(`path_unmapped:${expected.path}`, startedAt, filesRead, bytesRead);
 			switch (expected.kind) {
 				case "file": {
@@ -192,18 +181,8 @@ export async function validateDynamicDependencyCertificate(
 		}
 	}
 
-	if (changed.length) {
-		return {
-			status: "stale",
-			changed: Object.freeze([...new Set(changed)]),
-			dependencies: Object.freeze(current),
-			filesRead,
-			bytesRead,
-			durationMs: elapsed(startedAt),
-		};
-	}
 	return {
-		status: "valid",
+		...(changed.length ? { status: "stale", changed: Object.freeze([...new Set(changed)]) } : { status: "valid" }),
 		dependencies: Object.freeze(current),
 		filesRead,
 		bytesRead,
@@ -311,11 +290,6 @@ export async function captureSymlinkDependency(
 		target,
 		targetDigest: sha256Digest(Buffer.from(target, "utf8")),
 	};
-}
-
-function resolveEvidencePath(logicalPath: string, context: ProvenanceValidationContext): string | undefined {
-	if (context.resolvePath) return context.resolvePath(logicalPath);
-	return path.isAbsolute(logicalPath) ? path.resolve(logicalPath) : undefined;
 }
 
 function indeterminate(
