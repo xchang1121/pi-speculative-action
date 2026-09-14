@@ -36,14 +36,10 @@ type CountNode = {
 export class PpmCountTrie {
 	private root = node();
 	private populatedContexts = 0;
-	private order: number;
+	private readonly order: number;
 
 	constructor(maxOrder: number) {
 		this.order = nonNegativeInteger(maxOrder);
-	}
-
-	get maxOrder(): number {
-		return this.order;
 	}
 
 	get size(): number {
@@ -84,15 +80,6 @@ export class PpmCountTrie {
 		current.total = safeTotal(current.total + normalizedCount - previous);
 		current.lastSeen = Math.max(current.lastSeen, nonNegativeInteger(lastSeen));
 		if (wasEmpty && current.total > 0) this.populatedContexts++;
-	}
-
-	estimate(
-		history: readonly string[],
-		target: string,
-		sequence = 0,
-		halfLife = 0,
-	): PpmProbabilityEstimate | undefined {
-		return target ? this.distribution(history, sequence, halfLife).get(target) : undefined;
 	}
 
 	/** Compute the suffix evidence once for every competing target in this prediction frontier. */
@@ -138,10 +125,6 @@ export class PpmCountTrie {
 		return estimates;
 	}
 
-	probability(history: readonly string[], target: string, sequence = 0, halfLife = 0): number | undefined {
-		return this.estimate(history, target, sequence, halfLife)?.probability;
-	}
-
 	snapshot(maxContexts = Number.POSITIVE_INFINITY): readonly PpmCountTrieRow[] {
 		const limit = Number.isFinite(maxContexts) ? Math.max(1, Math.floor(maxContexts)) : Number.POSITIVE_INFINITY;
 		return this.rankedContexts().slice(0, limit).map(({ node, context }) => ({
@@ -163,12 +146,6 @@ export class PpmCountTrie {
 				this.setCount(row.context, target, count, row.lastSeen);
 			}
 		}
-	}
-
-	reconfigure(maxOrder: number, maxContexts: number): void {
-		const rows = this.snapshot(maxContexts).filter((row) => row.context.length <= nonNegativeInteger(maxOrder));
-		this.order = nonNegativeInteger(maxOrder);
-		this.restore(rows);
 	}
 
 	trim(maxContexts: number): void {
