@@ -261,21 +261,6 @@ export class PlanRuntime {
 		return revision;
 	}
 
-	takeReady(
-		settledDecisionSeq: number,
-		shouldLaunch: (node: PlanRuntimeNode) => boolean = (node) => node.expectedDecisionSeq <= settledDecisionSeq + 1,
-	): readonly PlanRuntimeNode[] {
-		const ready = this.mutableValues()
-			.filter(({ plan, node }) => {
-				if (node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
-				const snapshot = this.snapshot(plan, node);
-				return snapshot.readiness === "ready" && shouldLaunch(snapshot);
-			})
-			.sort(compareMutableNodes);
-		for (const { node } of ready) node.execution = { status: "scheduled" };
-		return ready.map(({ plan, node }) => this.snapshot(plan, node));
-	}
-
 	launchable(): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.execution.status === "deferred" && node.opportunity.state.status !== "settled", "ready");
 	}
@@ -702,18 +687,6 @@ function executionProjection(execution: MutableNodeExecution): PlanNodeExecution
 		cause: state.cause,
 		candidateID: execution.candidateID,
 	};
-}
-
-function compareMutableNodes(
-	left: { readonly plan: MutablePlan; readonly node: MutableNode },
-	right: { readonly plan: MutablePlan; readonly node: MutableNode },
-): number {
-	return (
-		left.node.expectedDecisionSeq - right.node.expectedDecisionSeq ||
-		right.node.criticalPathMs - left.node.criticalPathMs ||
-		left.plan.id.localeCompare(right.plan.id) ||
-		left.node.action.id.localeCompare(right.node.action.id)
-	);
 }
 
 function planSnapshot(plan: MutablePlan): MaterializedPlan {

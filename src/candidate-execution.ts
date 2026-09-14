@@ -100,29 +100,29 @@ export class CandidateExecution<Output> {
 		return changed;
 	}
 
-	reserve(turnID: string): boolean {
-		if (this.executionValue.status === "failed" || this.executionValue.status === "cancelled") return false;
-		if (this.reservationValue.kind === "shared") {
-			if (this.reservationValue.owners.includes(turnID)) return false;
+	acquire(owner: string): CandidateReservationLease | undefined {
+		if (this.executionValue.status === "failed" || this.executionValue.status === "cancelled") return undefined;
+		const reservation = this.reservationValue;
+		if (reservation.kind === "shared") {
+			if (reservation.owners.includes(owner)) return undefined;
 			this.reservationValue = Object.freeze({
 				kind: "shared",
-				owners: Object.freeze([...this.reservationValue.owners, turnID]),
+				owners: Object.freeze([...reservation.owners, owner]),
 			});
-			return true;
+		} else {
+			if (reservation.status !== "available") return undefined;
+			this.reservationValue = Object.freeze({ kind: "exclusive", status: "reserved", turnID: owner });
 		}
-		if (this.reservationValue.status !== "available") return false;
-		this.reservationValue = Object.freeze({ kind: "exclusive", status: "reserved", turnID });
-		return true;
-	}
-
-	acquire(owner: string): CandidateReservationLease | undefined {
-		if (!this.reserve(owner)) return undefined;
-		const kind = this.reservationValue.kind;
+		const kind = reservation.kind;
 		let state: CandidateReservationLeaseState = "active";
 		const settle = (adopt: boolean) => {
 			if (state !== "active") return false;
 			const consumed = adopt && kind === "exclusive";
-			if (!(consumed ? this.consume(owner) : this.release(owner))) return false;
+			if (consumed && this.executionValue.status !== "succeeded") return false;
+			const current = this.reservationValue;
+			this.reservationValue = Object.freeze(current.kind === "shared"
+				? { kind: "shared", owners: Object.freeze(current.owners.filter((value) => value !== owner)) }
+				: { kind: "exclusive", status: consumed ? "consumed" : "available" });
 			state = consumed ? "consumed" : "released";
 			return true;
 		};
@@ -134,39 +134,6 @@ export class CandidateExecution<Output> {
 			release: () => settle(false),
 			adopt: () => settle(true),
 		};
-	}
-
-	release(turnID: string): boolean {
-		if (this.reservationValue.kind === "shared") {
-			if (!this.reservationValue.owners.includes(turnID)) return false;
-			this.reservationValue = Object.freeze({
-				kind: "shared",
-				owners: Object.freeze(this.reservationValue.owners.filter((owner) => owner !== turnID)),
-			});
-			return true;
-		}
-		if (
-			this.reservationValue.kind !== "exclusive" ||
-			this.reservationValue.status !== "reserved" ||
-			this.reservationValue.turnID !== turnID
-		) {
-			return false;
-		}
-		this.reservationValue = Object.freeze({ kind: "exclusive", status: "available" });
-		return true;
-	}
-
-	consume(turnID: string): boolean {
-		if (
-			this.executionValue.status !== "succeeded" ||
-			this.reservationValue.kind !== "exclusive" ||
-			this.reservationValue.status !== "reserved" ||
-			this.reservationValue.turnID !== turnID
-		) {
-			return false;
-		}
-		this.reservationValue = Object.freeze({ kind: "exclusive", status: "consumed" });
-		return true;
 	}
 
 	private finish(

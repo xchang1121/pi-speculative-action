@@ -49,7 +49,7 @@ describe("PlanRuntime", () => {
 	it("schedules at the expected horizon and retains the prediction until its latest horizon", () => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("future", { horizon: 0, latestHorizon: 2 })]), 4);
-		plan.takeReady(4);
+		expect(plan.promote("plan", "future").status).toBe("scheduled");
 		const execution = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "future", "candidate", execution);
 		execution.cancel(cause("admission", "scheduler_preempted"), 1, 0);
@@ -156,7 +156,6 @@ describe("PlanRuntime", () => {
 
 		expect(plan.bindActionKey("plan", "bash", key)).toBe(true);
 		expect(plan.launchable()).toEqual([]);
-		expect(plan.takeReady(1)).toEqual([]);
 		expect(plan.promote("plan", "bash")).toEqual({ status: "already_dispatched" });
 		expect(plan.attachExecution("plan", "bash", "unprepared", new CandidateExecution("shared"))).toBe(false);
 		expect(plan.matchable(1)).toMatchObject([{ actionKey: key, execution: { status: "preparing" } }]);
@@ -182,7 +181,7 @@ describe("PlanRuntime", () => {
 			expect(Reflect.set(exposed, "condition", "execution_succeeded")).toBe(false);
 			expect(Object.isFrozen(exposed)).toBe(true);
 			expect(Object.isFrozen(dependency)).toBe(false);
-			expect(ids(plan.takeReady(0))).toEqual(["parent"]);
+			expect(ids(plan.launchable())).toEqual(["parent"]);
 			const execution = new CandidateExecution<string>("shared");
 			plan.attachExecution("plan", "parent", "candidate", execution);
 			const queued = plan.get("plan", "parent")!;
@@ -226,7 +225,8 @@ describe("PlanRuntime", () => {
 			expect(ids(plan.launchable())).toEqual(ready);
 			expect(ids(plan.matchable(2))).toEqual(ready);
 			expect(ids(plan.drainBlocked())).toEqual([...(status === "succeeded" ? [] : ["succeeded"]), ...(outcome === "adopted" ? [] : ["confirmed"])]);
-			expect(ids(plan.takeReady(1))).toEqual([...ready].sort());
+			for (const node of plan.launchable()) expect(plan.promote(node.proposalID, node.action.id).status).toBe("scheduled");
+			expect(plan.launchable()).toEqual([]);
 		}
 	});
 
@@ -246,7 +246,7 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 6, expectedDecisionSeq: 6, latestDecisionSeq: 10, criticalPathMs: 81 });
 		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
 		const identity = plan.get("plan", "child")!.identity;
-		expect(plan.takeReady(4).map((node) => node.action.id)).toEqual(["critical", "short"]);
+		expect(ids(plan.launchable()).sort()).toEqual(["critical", "short"]);
 
 		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
 		const opportunity = plan.claimMatch("plan", "critical", actor, { kind: "exact", distance: 0 })!;

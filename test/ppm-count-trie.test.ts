@@ -14,7 +14,7 @@ describe("PpmCountTrie", () => {
 			] : []),
 		]);
 		expect(model.size).toBe(order + 1);
-		expect(model.estimate(["old", "recent", "latest"], "read")?.order).toBe(Math.min(order, 1));
+		expect(model.distribution(["old", "recent", "latest"]).get("read")?.order).toBe(Math.min(order, 1));
 	});
 
 	it("uses the longest matching suffix to disambiguate a shared unigram", () => {
@@ -22,11 +22,11 @@ describe("PpmCountTrie", () => {
 		for (let index = 0; index < 8; index++) model.observe(["grep", "success"], "read", index);
 		for (let index = 0; index < 8; index++) model.observe(["edit", "success"], "bash", index + 8);
 
-		expect(model.probability(["grep", "success"], "read")).toBeGreaterThan(0.8);
-		expect(model.probability(["grep", "success"], "read")).toBeGreaterThan(
-			model.probability(["grep", "success"], "bash") ?? 1,
+		expect(model.distribution(["grep", "success"]).get("read")?.probability).toBeGreaterThan(0.8);
+		expect(model.distribution(["grep", "success"]).get("read")?.probability).toBeGreaterThan(
+			model.distribution(["grep", "success"]).get("bash")?.probability ?? 1,
 		);
-		expect(model.estimate(["grep", "success"], "read")?.order).toBe(2);
+		expect(model.distribution(["grep", "success"]).get("read")?.order).toBe(2);
 	});
 
 	it("starts at the shortest deterministic suffix instead of a sparse extension", () => {
@@ -34,8 +34,8 @@ describe("PpmCountTrie", () => {
 		for (let index = 0; index < 8; index++) model.observe(["stable"], "read", index);
 		model.observe(["rare", "stable"], "read", 8);
 
-		expect(model.estimate(["rare", "stable"], "read")?.order).toBe(1);
-		expect(model.probability(["rare", "stable"], "read")).toBe(model.probability(["new", "stable"], "read"));
+		expect(model.distribution(["rare", "stable"]).get("read")?.order).toBe(1);
+		expect(model.distribution(["rare", "stable"]).get("read")?.probability).toBe(model.distribution(["new", "stable"]).get("read")?.probability);
 	});
 
 	it("escapes from an unseen long context to a shorter suffix", () => {
@@ -43,7 +43,7 @@ describe("PpmCountTrie", () => {
 		for (let index = 0; index < 6; index++) model.observe(["grep"], "read", index);
 		for (let index = 0; index < 4; index++) model.observe(["other", "grep"], "bash", index + 6);
 
-		const estimate = model.estimate(["new", "grep"], "read");
+		const estimate = model.distribution(["new", "grep"]).get("read");
 		expect(estimate).toMatchObject({ order: 1, evidence: 6 });
 		expect(estimate?.probability).toBeGreaterThan(0);
 		expect(estimate?.escapeMass).toBeGreaterThanOrEqual(0);
@@ -56,19 +56,19 @@ describe("PpmCountTrie", () => {
 			model.setCount(context, "read", 10, 10);
 			model.setCount(context, "find", 4, 28);
 		}
-		const rawRead = model.probability(["shift"], "read")!;
-		const rawFind = model.probability(["shift"], "find")!;
+		const rawRead = model.distribution(["shift"]).get("read")?.probability!;
+		const rawFind = model.distribution(["shift"]).get("find")?.probability!;
 		expect(rawRead).toBeGreaterThan(rawFind);
-		expect(model.probability(["shift"], "read", 30, 0)).toBe(rawRead);
-		expect(model.probability(["shift"], "find", 30, 8)).toBeGreaterThan(
-			model.probability(["shift"], "read", 30, 8) ?? 1,
+		expect(model.distribution(["shift"], 30, 0).get("read")?.probability).toBe(rawRead);
+		expect(model.distribution(["shift"], 30, 8).get("find")?.probability).toBeGreaterThan(
+			model.distribution(["shift"], 30, 8).get("read")?.probability ?? 1,
 		);
 		model.setCount(["stationary"], "read", 8, 30);
 		model.setCount(["stationary"], "find", 4, 30);
-		expect(model.probability(["stationary"], "read", 34, 8)).toBeGreaterThan(
-			model.probability(["stationary"], "find", 34, 8) ?? 1,
+		expect(model.distribution(["stationary"], 34, 8).get("read")?.probability).toBeGreaterThan(
+			model.distribution(["stationary"], 34, 8).get("find")?.probability ?? 1,
 		);
-		expect(model.estimate(["shift"], "bash", 30, 8)).toBeUndefined();
+		expect(model.distribution(["shift"], 30, 8).get("bash")).toBeUndefined();
 	});
 
 	it("does not refresh a stale count bucket when one old target recurs", () => {
@@ -80,8 +80,8 @@ describe("PpmCountTrie", () => {
 		const oldCount = model.snapshot().find((row) => row.context[0] === "context")?.counts.old;
 		expect(oldCount).toBeLessThan(3);
 		for (let sequence = 289; sequence < 292; sequence++) model.observe(["context"], "new", sequence, 64);
-		expect(model.probability(["context"], "new", 292, 64)).toBeGreaterThan(
-			model.probability(["context"], "old", 292, 64) ?? 1,
+		expect(model.distribution(["context"], 292, 64).get("new")?.probability).toBeGreaterThan(
+			model.distribution(["context"], 292, 64).get("old")?.probability ?? 1,
 		);
 	});
 
@@ -91,12 +91,12 @@ describe("PpmCountTrie", () => {
 		model.setCount([], "bash", Number.MAX_SAFE_INTEGER, 1);
 		model.setCount(["grep"], "read", 0.5, 2);
 
-		const probability = model.probability(["grep"], "read");
+		const probability = model.distribution(["grep"]).get("read")?.probability;
 		expect(probability).toBeTypeOf("number");
 		expect(Number.isFinite(probability)).toBe(true);
 		expect(probability).toBeGreaterThanOrEqual(0);
 		expect(probability).toBeLessThanOrEqual(1);
-		expect(model.probability([], "read")).toBeCloseTo(0.5);
+		expect(model.distribution([]).get("read")?.probability).toBeCloseTo(0.5);
 		expect(model.snapshot()[0]).toEqual({
 			context: [],
 			counts: { bash: Number.MAX_SAFE_INTEGER, read: Number.MAX_SAFE_INTEGER },
@@ -131,11 +131,7 @@ describe("PpmCountTrie", () => {
 
 		expect(model.snapshot()).toEqual(restored.snapshot());
 		expect(model.snapshot().map((row) => row.context)).toEqual([[], ["ancestor", "leaf"]]);
-		for (const target of ["read", "bash", "grep"]) {
-			expect(model.distribution(["ancestor", "leaf"], 8, 2).get(target)).toEqual(
-				restored.estimate(["ancestor", "leaf"], target, 8, 2),
-			);
-		}
+		expect(model.distribution(["ancestor", "leaf"], 8, 2)).toEqual(restored.distribution(["ancestor", "leaf"], 8, 2));
 		model.observe(["ancestor", "leaf"], "read", 10, 2);
 		restored.observe(["ancestor", "leaf"], "read", 10, 2);
 		model.trim(2);
@@ -143,15 +139,13 @@ describe("PpmCountTrie", () => {
 		expect(model.snapshot()).toEqual(restored.snapshot());
 	});
 
-	it("reconfigures to a shorter order without losing retained suffix evidence", () => {
+	it("restores a shorter order without losing retained suffix evidence", () => {
 		const model = new PpmCountTrie(3);
 		model.observe(["a", "b", "c"], "read", 1);
-
-		model.reconfigure(1, 8);
-
-		expect(model.maxOrder).toBe(1);
-		expect(model.snapshot().map((row) => row.context)).toEqual([[], ["c"]]);
-		expect(model.probability(["a", "b", "c"], "read")).toBeGreaterThan(0);
+		const restored = new PpmCountTrie(1);
+		restored.restore(model.snapshot(8));
+		expect(restored.snapshot().map((row) => row.context)).toEqual([[], ["c"]]);
+		expect(restored.distribution(["a", "b", "c"]).get("read")?.probability).toBeGreaterThan(0);
 	});
 
 	it("orders equal-count snapshot rows deterministically", () => {
