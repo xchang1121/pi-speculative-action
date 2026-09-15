@@ -12,7 +12,7 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "../src/effect-model.ts";
-import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore, projectPatternAwareObservation } from "../src/pattern-aware.ts";
+import { patternAwareActionSemantics, PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, PatternAwareStore, projectPatternAwareObservation } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -317,8 +317,7 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 }
 
 function patternStore(cwd: string, settings: PatternAwareSettings): PatternAwareStore {
-	return new PatternAwareStore(settings, undefined, { namespace: "pi-action-semantics",
-		actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash), projectors: [] });
+	return new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
 }
 
 async function workspace(): Promise<string> {

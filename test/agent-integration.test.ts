@@ -16,7 +16,7 @@ import { ActionSemanticsRegistry, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
-import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
+import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -108,8 +108,7 @@ function patternRequest(
 }
 
 function patternStoreLease(cwd: string, configuration: ReturnType<typeof patternAwareSettings>) {
-	return acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics",
-		actionKey: (name, args, schema) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] });
+	return acquirePatternAwareStore(cwd, configuration, cwd, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
 }
 
 async function temporaryWorkspace(base?: string): Promise<string> {
@@ -700,6 +699,33 @@ describe("speculative action host", () => {
 			} });
 		} finally { executionGate.release(); await host.dispose(); }
 		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it.each(["shared", "epoch", "directory", "projection"])("owns Pattern contracts and partitions %s learning", async (partition) => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), configuration = patternAwareSettings({ enabled: true });
+		const canonicalize = vi.fn(PI_ACTION_SEMANTICS.definition("read")!.canonicalize);
+		const registry = (epoch: string) => new ActionSemanticsRegistry([{ ...PI_ACTION_SEMANTICS.definition("read")!, epoch, canonicalize }]);
+		const input = { sessionID: "first", cwd, stateDirectory: cwd, workspaceIdentity: cwd,
+			actionSemantics: registry("original.read"), projectionRules: [] as typeof PI_READ_RANGE_PROJECTION_RULE[] };
+		const peer = { ...input, sessionID: "peer", cwd: partition === "directory" ? path.join(cwd, "nested") : cwd,
+			actionSemantics: registry(partition === "epoch" ? "peer.read" : "original.read"),
+			projectionRules: partition === "projection" ? [PI_READ_RANGE_PROJECTION_RULE] : [] };
+		const controllers = [createPatternPlanSource(input), createPatternPlanSource(peer)];
+		const predict = vi.spyOn(PatternAwareStore.prototype, "predict"), stores: PatternAwareStore[] = [];
+		Object.assign(input, { actionSemantics: registry("replaced.read"), cwd: path.join(cwd, "replaced") });
+		input.projectionRules.push(PI_READ_RANGE_PROJECTION_RULE);
+		try {
+			for (const [index, controller] of controllers.entries()) {
+				await controller.source.propose(patternRequest(tool, configuration, String(index)));
+				stores.push(predict.mock.contexts.at(-1) as PatternAwareStore);
+			}
+			expect(stores[0] === stores[1]).toBe(partition === "shared");
+			stores[0]!.observe({ sessionID: "learned", turnID: "read", tool: "read", input: { path: "notes.txt" }, outcome: "success", durationMs: 1 });
+			expect(canonicalize).toHaveBeenCalledWith({ path: "notes.txt" }, cwd);
+			expect(stores[1]!.recent("learned")).toHaveLength(partition === "shared" ? 1 : 0);
+		} finally { await Promise.all(controllers.map(controller => controller.dispose())); }
+		const reopened = await acquirePatternAwareStore(cwd, configuration, cwd, patternAwareActionSemantics(registry("original.read"), cwd));
+		try { expect(reopened.store).not.toBe(stores[0]); } finally { await reopened.release(); }
 	});
 
 	it("owns an admitted Pattern learning configuration and batch through immediate disposal", async () => {
