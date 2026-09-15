@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { deferred, gated, nextTurn } from "./async.ts";
 import fs from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
@@ -638,7 +638,7 @@ describe("PatternAware", () => {
 		expect(second.snapshot().some((item) => item.targetTool === "read")).toBe(true);
 	});
 
-	test("persists PPM counts so beam ordering survives a process restart", async () => {
+	test.each(["failure", "updates"])("persists PPM counts across concurrent %s and a process restart", async (mode) => {
 		const file = await patternFile();
 		const configured = settings({ beamWidth: 1 });
 		const first = new PatternAwareStore(configured, file);
@@ -653,15 +653,28 @@ describe("PatternAware", () => {
 			first.observe(input(`bash-${index}`, "grep"));
 			first.observe(input(`bash-${index}`, "bash", { command: "npm test" }));
 		}
-		const fault = new Error("injected replacement failure"), rename = vi.spyOn(fs, "rename").mockRejectedValue(fault);
+		const gate = gated(), renameFile = fs.rename, pending: Promise<void>[] = [];
+		const fault = new Error("injected replacement failure"), rename = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+			if (rename.mock.calls.length === 1) await gate.wait();
+			if (mode === "failure") throw fault;
+			return renameFile(...args);
+		});
 		try {
-			expect(await Promise.allSettled([first.flush(), first.flush()])).toEqual(Array(2).fill({ status: "rejected", reason: fault }));
-			expect(await fs.readFile(file)).toEqual(previous);
+			pending.push(first.flush(), first.flush());
+			await gate.entered;
+			const patternID = first.snapshot()[0]!.id;
+			for (let index = 0; index < 4; index++) { first.issued(patternID); pending.push(first.flush()); }
+			const results = Promise.allSettled(pending); gate.release();
+			expect(await results).toEqual(Array(pending.length).fill(mode === "failure"
+				? { status: "rejected", reason: fault } : { status: "fulfilled", value: undefined }));
+			expect(rename).toHaveBeenCalledTimes(mode === "failure" ? 1 : 2);
+			if (mode === "failure") expect(await fs.readFile(file)).toEqual(previous);
 			expect(await fs.readdir(path.dirname(file))).toEqual([path.basename(file)]);
-		} finally { rename.mockRestore(); }
+		} finally { gate.release(); await Promise.allSettled(pending); rename.mockRestore(); }
 		await first.flush();
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+		expect(persisted.patterns).toEqual(first.snapshot());
 		expect(persisted.version).toBe(20);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
