@@ -147,9 +147,8 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 	readonly transactionClockLinks: 0 | 1;
 	/** Native roots whose timestamp domain is projected through the workspace view. */
 	readonly transactionClockRoots: readonly string[];
-	readonly gitWorkspace?: PreparedGitWorkspace;
+	readonly dispose: () => Promise<void>;
 	readonly overlay?: LinuxOverlayfsMount;
-	readonly overlayStorageRoot?: string;
 	readonly sharedBaseline?: SharedOverlayBaseline;
 }
 
@@ -813,11 +812,30 @@ async function createPrivateSandboxWorkspace(
 	let attached: PreparedGitWorkspace | undefined;
 	let sharedBaseline: SharedOverlayBaseline | undefined;
 	let overlay: LinuxOverlayfsMount | undefined;
-	let processRoot: string | undefined;
 	let overlayStorageRoot: string | undefined;
+	let workspace!: PrivateSandboxWorkspace;
+	let disposal: Promise<void> | undefined;
+	const dispose = (unsafe = false): Promise<void> => disposal ??= (async () => {
+		const failures: unknown[] = [];
+		await workspace?.transactions.dispose().catch((error) => failures.push(error));
+		await overlay?.close().catch((error) => { unsafe = true; failures.push(error); });
+		if (unsafe) {
+			// A live mount retains upper/work/lower storage; quarantine it rather than recycling its roots.
+			quarantineSandboxRepository(pool);
+		} else {
+			await attached?.dispose().catch((error) => failures.push(error));
+			if (overlayStorageRoot) {
+				await rm(overlayStorageRoot, { recursive: true, force: true }).catch((error) => failures.push(error));
+			}
+			if (sharedBaseline) releaseOverlayBaseline(sharedBaseline);
+			releaseSandboxRepository(pool);
+		}
+		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
+	})();
 	try {
 		const commit = await acquireSandboxBaseline(pool);
 		let sandboxRoot: string;
+		let processRoot: string;
 		let gitDirectory: string;
 		let openTransactionClock: () => Promise<FileHandle>;
 		let transactionClockLinks: 0 | 1;
@@ -825,10 +843,9 @@ async function createPrivateSandboxWorkspace(
 		const observationExcludes: readonly string[] = SNAPSHOT_EXCLUDES;
 		if (driver === "overlayfs") {
 			sharedBaseline = await acquireOverlayBaseline(pool, commit);
-			[processRoot, overlayStorageRoot] = await Promise.all([
-				mkdtemp(path.join(pool.parent, "action-")),
-				mkdtemp(path.join(pool.parent, "overlay-storage-")),
-			]);
+			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
+			processRoot = path.join(overlayStorageRoot, "process");
+			await mkdir(processRoot);
 			const mounted = await mountLinuxOverlayfs({
 				lowerRoot: sharedBaseline.sandboxRoot,
 				privateRoot: overlayStorageRoot,
@@ -860,7 +877,6 @@ async function createPrivateSandboxWorkspace(
 			transactionClockRoots = Object.freeze([prepared.sandboxRoot, prepared.processRoot]);
 		}
 		const baselineFrontier = new Map<string, RegularFileState | undefined>();
-		let workspace!: PrivateSandboxWorkspace;
 		const structure: WorkspaceStructureDriver = {
 			capture: () => {
 				if (!workspace.overlay) {
@@ -890,34 +906,16 @@ async function createPrivateSandboxWorkspace(
 			openTransactionClock,
 			transactionClockLinks,
 			transactionClockRoots,
-			...(attached ? { gitWorkspace: attached } : {}),
+			dispose,
 			...(overlay ? { overlay } : {}),
-			...(overlayStorageRoot ? { overlayStorageRoot } : {}),
 			...(sharedBaseline ? { sharedBaseline } : {}),
 		};
 		return workspace;
 	} catch (error) {
-		let safeToRelease = !(error instanceof LinuxOverlayfsUnsafeCleanupError);
-		let closeError: unknown;
-		if (overlay) {
-			try {
-				await overlay.close();
-			} catch (failure) {
-				safeToRelease = false;
-				closeError = failure;
-			}
-		}
-		if (safeToRelease) {
-			if (processRoot && !attached) await rm(processRoot, { recursive: true, force: true }).catch(() => undefined);
-			if (overlayStorageRoot) await rm(overlayStorageRoot, { recursive: true, force: true }).catch(() => undefined);
-			if (sharedBaseline) releaseOverlayBaseline(sharedBaseline);
-			await attached?.dispose().catch(() => undefined);
-			releaseSandboxRepository(pool);
-		} else {
-			quarantineSandboxRepository(pool);
-		}
-		if (closeError) {
-			throw new AggregateError([error, closeError], "sandbox creation and safe OverlayFS cleanup both failed");
+		try {
+			await dispose(error instanceof LinuxOverlayfsUnsafeCleanupError);
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "sandbox creation and cleanup both failed");
 		}
 		throw error;
 	}
@@ -1542,7 +1540,7 @@ async function withPrivateSandboxWorkspace<T>(
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);
 	} finally {
-		await cleanupPrivateSandboxWorkspace(workspace);
+		await workspace.dispose();
 	}
 }
 
@@ -1581,38 +1579,6 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 			}
 		}
 	}
-}
-
-async function cleanupPrivateSandboxWorkspace(workspace: PrivateSandboxWorkspace): Promise<void> {
-	let safeToRelease = true;
-	const failures: unknown[] = [];
-	try {
-		await workspace.transactions.dispose();
-	} catch (error) {
-		failures.push(error);
-	}
-	if (workspace.overlay) {
-		try {
-			await workspace.overlay.close();
-		} catch (error) {
-			safeToRelease = false;
-			failures.push(error);
-		}
-	}
-	if (safeToRelease) {
-		await (workspace.gitWorkspace?.dispose() ?? rm(workspace.processRoot, { recursive: true, force: true }))
-			.catch((error) => failures.push(error));
-		if (workspace.overlayStorageRoot) {
-			await rm(workspace.overlayStorageRoot, { recursive: true, force: true }).catch((error) => failures.push(error));
-		}
-		if (workspace.sharedBaseline) releaseOverlayBaseline(workspace.sharedBaseline);
-		releaseSandboxRepository(workspace.pool);
-	} else {
-		quarantineSandboxRepository(workspace.pool);
-	}
-	// A still-mounted FUSE view retains direct references to upper/work/lower. Leak those
-	// resources deliberately rather than deleting or recycling storage under a live mount.
-	if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 }
 
 async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promise<readonly SandboxFileChange[]> {

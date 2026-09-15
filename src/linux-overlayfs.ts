@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { advanceFilesystemClock } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, mapFilesystem } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
 import { waitForCandidate } from "./scheduler.ts";
 import { positiveInteger as positiveCapacity, nonNegativeNumber as nonNegativeDuration } from "./setting-input.ts";
@@ -221,11 +221,7 @@ export async function mountLinuxOverlayfs(input: {
 	const upperRoot = path.join(input.privateRoot, "upper");
 	const workRoot = path.join(input.privateRoot, "work");
 	const root = path.join(input.privateRoot, "workspace");
-	await Promise.all([
-		mkdir(upperRoot, { recursive: true }),
-		mkdir(workRoot, { recursive: true }),
-		mkdir(root, { recursive: true }),
-	]);
+	await mapFilesystem([upperRoot, workRoot, root], (directory) => mkdir(directory, { recursive: true }));
 	const [lower, upper, work] = await Promise.all([lstat(input.lowerRoot), lstat(upperRoot), lstat(workRoot)]);
 	if (
 		!lower.isDirectory() ||
@@ -262,12 +258,10 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 	let degradedDetail: string | undefined;
 	let outcome: LinuxOverlayfsCapability;
 	try {
-		await Promise.all([mkdir(lowerRoot), mkdir(privateRoot)]);
-		await Promise.all([mkdir(upperRoot), mkdir(workRoot), mkdir(root)]);
-		await Promise.all([
-			writeFile(path.join(lowerRoot, "copy-up.txt"), `${marker}\n`, "utf8"),
-			writeFile(path.join(lowerRoot, "whiteout.txt"), "remove\n", "utf8"),
-		]);
+		await mapFilesystem([lowerRoot, privateRoot], (directory) => mkdir(directory));
+		await mapFilesystem([upperRoot, workRoot, root], (directory) => mkdir(directory));
+		await mapFilesystem([["copy-up.txt", `${marker}\n`], ["whiteout.txt", "remove\n"]],
+			([name, content]) => writeFile(path.join(lowerRoot, name), content, "utf8"));
 		await mkdir(path.join(lowerRoot, "replaced"));
 		await writeFile(path.join(lowerRoot, "replaced", "lower.txt"), "lower\n", "utf8");
 		mounted = await startLinuxOverlayfs({
@@ -284,11 +278,11 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== `${marker}\n`) {
 			throw new Error("OverlayFS lower view did not preserve file content");
 		}
-		await Promise.all([
-			writeFile(path.join(root, "copy-up.txt"), "changed\n", "utf8"),
-			rm(path.join(root, "whiteout.txt")),
-			writeFile(path.join(root, "created.txt"), "created\n", "utf8"),
-		]);
+		await mapFilesystem([
+			() => writeFile(path.join(root, "copy-up.txt"), "changed\n", "utf8"),
+			() => rm(path.join(root, "whiteout.txt")),
+			() => writeFile(path.join(root, "created.txt"), "created\n", "utf8"),
+		], (change) => change());
 		await rm(path.join(root, "replaced"), { recursive: true });
 		await mkdir(path.join(root, "replaced"));
 		await writeFile(path.join(root, "replaced", "created.txt"), "created\n", "utf8");

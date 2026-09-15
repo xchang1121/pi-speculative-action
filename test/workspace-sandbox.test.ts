@@ -17,7 +17,7 @@ import {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
-import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
+import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
@@ -292,6 +292,45 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(branch.commit()).resolves.toEqual(settlement("done"));
 		expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		await Promise.all([branch.dispose(), child.dispose()]);
+	});
+
+	it.each(["storage", "mount"])("owns partial OverlayFS %s preparation until every admitted allocation settles", async (phase) => {
+		const root = await temporaryRoot(), gate = gated(), fault = new Error("private allocation failed"), owned: string[] = [];
+		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+		const capability = vi.spyOn(LinuxOverlayfsCapabilityRegistry.prototype, "capability").mockResolvedValue({
+			available: true, binary: "unreachable-overlay-driver", fusermountBinary: "unreachable-unmount", fingerprint: "allocation-only", detail: "fixture" });
+		let action: Promise<unknown> | undefined, directory: ReturnType<typeof mkdir> | undefined, settled = false;
+		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
+			if (phase === "storage" && String(prefix).endsWith("overlay-storage-")) { await action; throw fault; }
+			const pending = fs.mkdtemp(prefix, options).then(value => {
+				if (/\b(?:action|overlay-storage)-$/.test(String(prefix))) owned.push(String(value));
+				return value;
+			});
+			if (String(prefix).endsWith(`${path.sep}action-`)) action = pending;
+			return pending;
+		});
+		vi.mocked(mkdir).mockImplementation(async (target, options) => {
+			if (path.basename(String(target)) === "upper") { await gate.entered; throw fault; }
+			if (path.basename(String(target)) === "work") return directory = gate.wait().then(() => fs.mkdir(target, options));
+			return fs.mkdir(target, options);
+		});
+		const execute = vi.fn(async () => settlement("unexpected execution"));
+		const pending = sandbox.fork({ cwd: root, driver: "overlayfs", action: requiredAction("write", { path: "value", content: "next" }, root), execute })
+			.then(value => value, error => error).finally(() => { settled = true; });
+		try {
+			if (phase === "mount") {
+				await gate.entered; await nextTurn();
+				expect({ settled, removing: vi.mocked(rm).mock.calls.some(([target]) => owned.includes(String(target))) }).toEqual({ settled: false, removing: false });
+				gate.release();
+			}
+			expect(await pending).toBe(fault);
+			expect(execute).not.toHaveBeenCalled();
+			for (const target of owned) await expect(stat(target)).rejects.toThrow();
+		} finally {
+			gate.release(); await Promise.allSettled([pending, action, directory]); capability.mockRestore();
+			vi.mocked(mkdir).mockImplementation(fs.mkdir); vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp);
+			await sandbox.closePools([root]);
+		}
 	});
 
 	it("seals copy-ups, creations, and whiteouts from the typed OverlayFS frontier", async ({ skip }) => {
@@ -870,7 +909,8 @@ describe("workspace-branch ExecutionWorld", () => {
 			return fs.rm(target, options);
 		});
 		const execution = sandbox.withWorkspace(root, async (workspace) => {
-			owned = Reflect.get(workspace, "gitWorkspace");
+			owned = { processRoot: workspace.processRoot, dispose: Reflect.get(workspace, "dispose"),
+				gitDirectory: (await readFile(path.join(workspace.sandboxRoot, ".git"), "utf8")).trim().slice(8) };
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "private\n");
 		}).then(() => { settled = true; }, error => { settled = true; throw error; });
 		try {
@@ -887,10 +927,10 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(removed).toEqual(failure === "workspace" ? [owned!.processRoot] : [owned!.processRoot, owned!.gitDirectory]);
 			vi.mocked(rm).mockImplementation(fs.rm);
 			if (failure === "none") await sandbox.withWorkspace(root, async (workspace) => {
-				const next = Reflect.get(workspace, "gitWorkspace");
-				expect(next.gitDirectory).toBe(owned!.gitDirectory);
+				const next = (await readFile(path.join(workspace.sandboxRoot, ".git"), "utf8")).trim().slice(8);
+				expect(next).toBe(owned!.gitDirectory);
 				await owned!.dispose();
-				expect((await stat(next.gitDirectory)).isDirectory()).toBe(true);
+				expect((await stat(next)).isDirectory()).toBe(true);
 				expect(await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8")).toBe("before\n");
 			});
 			await sandbox.closePools([root]);
