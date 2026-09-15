@@ -892,26 +892,47 @@ describe("PatternAware", () => {
 		expect(child?.empiricalProbability).toBeGreaterThan(0.8);
 	});
 
-	test("allocates collection variants by observed actor choice frequency", () => {
-		const store = patternStore();
+	test.each([
+		["raw collection frequency", "filePath", ["src/likely.ts", "src/unlikely.ts"], false, 2],
+		["path aliases", "path", ["src/a.ts", "./src/a.ts"], true, 1],
+		["default offset", "offset", [undefined, 1], true, 1],
+		["projectable ranges", "limit", [10, 20], true, 2],
+		["unkeyed aliases", "path", ["src/a.ts", "./src/a.ts"], false, 2],
+	] as const)("conserves alternative mass and independent evidence for %s", (_name, field, values, keyed, count) => {
+		const store = patternStore({ decayHalfLifeEvents: 0 }, undefined, keyed ? piActionSemantics() : undefined);
+		const base = field === "offset" || field === "limit" ? { path: "src/a.ts" } : {};
 		const pattern = acceptPattern(store, { "0": 10 }, {
 			id: "ranked-results",
-			bindings: collectionBindings({ "0": 9, "1": 1 }),
+			bindings: { ...constantBindings(base), ...collectionBindings({ "0": 9, "1": 1 }, field) },
+			feedback: patternFeedback({ recentAdoptedWeight: 2, recentRejectedWeight: 1 }),
 		});
-
-		store.observe(
-			input("probe", "grep", { pattern: "source" }, {
-				output: { results: [{ path: "src/likely.ts" }, { path: "src/unlikely.ts" }] },
-			}),
-		);
-		const candidates = store.predict("probe").filter((item) => item.tool === "read");
-		const likely = candidates.find((item) => item.input.filePath === "src/likely.ts");
-		const unlikely = candidates.find((item) => item.input.filePath === "src/unlikely.ts");
-
-		expect(likely?.conditionalProbability).toBeGreaterThan(unlikely?.conditionalProbability ?? 1);
-		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeLessThanOrEqual(1);
-		expect(candidates).toHaveLength(2);
-		store.observe(input("probe", "read", { filePath: "src/unlikely.ts" }));
+		store.observe(input("probe", "grep", { pattern: "source" }, { output: { results: values.map((path) => ({ path })) } }));
+		const before = store.snapshot(), candidates = store.predict("probe");
+		expect(candidates).toHaveLength(count);
+		expect(candidates.reduce((sum, item) => sum + item.conditionalProbability, 0)).toBeCloseTo(21 / 22);
+		if (count === 2) {
+			const likely = candidates.find((item) => item.input[field] === values[0]);
+			const unlikely = candidates.find((item) => item.input[field] === values[1]);
+			expect(likely?.conditionalProbability).toBeGreaterThan(unlikely?.conditionalProbability ?? 1);
+		}
+		for (const candidate of candidates) {
+			expect(candidate.supportingPatternIDs).toEqual(["ranked-results"]);
+			expect(candidate.adoptionProbability).toBe(3 / 4);
+			expect(candidate.expectedDurationMs).toBe(100);
+		}
+		expect(store.snapshot()).toEqual(before);
+		if (count === 1) {
+			acceptPattern(store, { "0": 30 }, { id: "independent", bindings: constantBindings({ path: "src/a.ts" }),
+				occurrences: 30, replayMatches: 30, historicalOpportunities: 30, historicalMatches: 15, averageDurationMs: 300,
+				feedback: patternFeedback({ recentRejectedWeight: 3 }),
+			});
+			const [merged] = store.predict("probe");
+			expect(merged?.supportingPatternIDs).toEqual(["independent", "ranked-results"]);
+			expect(merged?.conditionalProbability).toBeCloseTo(1 / 2);
+			expect(merged?.expectedDurationMs).toBe(250);
+			expect(merged?.adoptionProbability).toBe(3 / 7);
+		}
+		store.observe(input("probe", "read", { ...base, [field]: values[1] }));
 		expect(store.snapshot().find((item) => item.id === pattern.id)).toMatchObject({
 			historicalOpportunities: pattern.historicalOpportunities + 1, historicalMatches: pattern.historicalMatches + 1,
 		});
@@ -1637,9 +1658,10 @@ function constantBindings(input: Readonly<Record<string, unknown>>): ValidatedPa
 
 function collectionBindings(
 	variantCounts?: Readonly<Record<string, number>>,
+	field = "filePath",
 ): ValidatedPattern["bindings"] {
 	return {
-		'["filePath"]': {
+		[JSON.stringify([field])]: {
 			type: "each",
 			relativeEvent: -1,
 			field: "output",
