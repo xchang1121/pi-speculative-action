@@ -4,6 +4,7 @@ import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
 import type { StableFileCapture } from "./filesystem-evidence.ts";
+import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
 import {
 	digestObject,
@@ -81,27 +82,27 @@ export async function captureWorkspaceStructure(
 	const entries = new Map<string, WorkspaceStructureEntry>();
 	const excludes = new Set(options.exclude ?? [".git"]);
 	const maxFiles = Math.max(1, options.maxFiles ?? 100_000);
-	let files = 0;
-	let complete = true;
-	const visit = async (directory: string, relativeDirectory: string, stat: Stats): Promise<void> => {
-		const children = !relativeDirectory || stat.isDirectory() ? await readdir(directory, { withFileTypes: true }) : [];
-		entries.set(relativeDirectory, await captureExistingWorkspaceStructureEntry(
-			directory, stat, relativeDirectory ? [] : [...excludes], children,
-		));
-		for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
-			const relative = relativeDirectory ? path.join(relativeDirectory, child.name) : child.name;
-			if (!relativeDirectory && excludes.has(child.name)) continue;
-			const target = path.join(directory, child.name);
-			const stat = await lstat(target);
-			if (++files > maxFiles) {
-				complete = false;
-				return;
+	const pending = [""];
+	let files = 0, complete = true;
+	for (let cursor = 0; cursor < pending.length;) {
+		const batch = pending.slice(cursor, cursor + FILESYSTEM_CONCURRENCY);
+		cursor += batch.length;
+		const captured = await mapFilesystem(batch, async (relative) => {
+			const target = path.join(absoluteRoot, relative), stat = await lstat(target);
+			const children = !relative || stat.isDirectory() ? await readdir(target, { withFileTypes: true }) : [];
+			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
+			return { relative, entry, children };
+		});
+		for (const { relative, entry, children } of captured) {
+			entries.set(relative, entry);
+			for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
+				if (!relative && excludes.has(child.name)) continue;
+				if (files + 1 > maxFiles) { complete = false; continue; }
+				files++;
+				pending.push(path.join(relative, child.name));
 			}
-			await visit(target, relative, stat);
 		}
-	};
-
-	await visit(absoluteRoot, "", await lstat(absoluteRoot));
+	}
 	return Object.freeze({ root: absoluteRoot, entries, files, bytesRead: 0, complete });
 }
 
