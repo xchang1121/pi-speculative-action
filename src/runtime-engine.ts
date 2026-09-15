@@ -20,7 +20,7 @@ import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transactio
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
 import { type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
-import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type RetiredPlanNode } from "./plan-runtime.ts";
+import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { cloneSharedData } from "./stable-json.ts";
@@ -2256,14 +2256,15 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const retirePlanAction = (session: Session, retired: RetiredPlanNode, failure: ResolutionCause): void => {
-		const timer = session.launchTimers.get(retired.node.identity.id);
+	const retirePlanAction = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
+		const timer = session.launchTimers.get(node.identity.id);
 		if (timer) clearTimeout(timer);
-		session.launchTimers.delete(retired.node.identity.id);
-		if (retired.opportunity.state.status === "matching") return;
-		const finalized = retired.opportunity.unobserve(failure);
-		if (finalized) predictionSettled(session, retired.node, finalized);
-		else releaseActionContext(session, retired.node.identity.id);
+		session.launchTimers.delete(node.identity.id);
+		const opportunity = session.actionContexts.get(node.identity.id)?.opportunity;
+		if (opportunity?.state.status === "matching") return;
+		const finalized = opportunity?.unobserve(failure);
+		if (finalized) predictionSettled(session, node, finalized);
+		else releaseActionContext(session, node.identity.id);
 	};
 
 	const descendsFrom = (candidate: Candidate, ancestor: Candidate): boolean => {

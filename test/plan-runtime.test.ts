@@ -324,7 +324,7 @@ describe("PlanRuntime", () => {
 		const changed = { actionID: second, condition: "execution_succeeded" as const };
 		for (const [index, dependsOn] of [[changed, dependency, dependency], [changed, changed, dependency]].entries()) {
 			expect(plan.apply({ proposalID: "plan", source: "source", revision: 3 + index, upsert: [{ ...child, dependsOn }] }, 0))
-				.toMatchObject({ accepted: true, retired: [{ node: { action: { id: "child" } } }, { node: { action: { id: "leaf" } } }] });
+				.toMatchObject({ accepted: true, retired: [{ action: { id: "child" } }, { action: { id: "leaf" } }] });
 			expect(plan.get("plan", "child")!.actionKey).toBeUndefined();
 		}
 	});
@@ -356,7 +356,7 @@ describe("PlanRuntime", () => {
 		);
 
 		const replaced = mode === "ancestor" ? ["parent", "middle", "target", "leaf"] : ["target"];
-		expect(update).toMatchObject({ accepted: true, retired: replaced.map((id) => ({ node: { action: { id } } })) });
+		expect(update).toMatchObject({ accepted: true, retired: replaced.map((id) => ({ action: { id } })) });
 		if (!update.accepted) throw new Error(update.reason);
 		expect(Object.isFrozen(update.upserted)).toBe(true);
 		expect(update.upserted.map((action) => action.id)).toEqual(replaced);
