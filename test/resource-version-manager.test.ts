@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -161,17 +161,17 @@ describe("speculative action resource versions", () => {
 			const handle = await fs.open(path.join(root, "value"), "r"), broken = phase === "pending" ? undefined : await fs.open(path.join(root, "broken"), "r");
 			const read = handle.read.bind(handle), failure = new Error("injected read failure");
 			let settled = false;
-			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: resume } = deferred();
+			const gate = gated();
 			const { promise: failed, resolve: fail } = deferred();
 			const nativeOpen = fs.open.bind(fs);
 			const open = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => !isDataOpen(flags) ? nativeOpen(file, flags, mode)
 				: await fs.realpath(file) === path.join(root, "value") ? handle : broken!);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (...args: Parameters<typeof handle.read>) => {
-				enter(); await gate; return read(...args);
+				await gate.wait(); return read(...args);
 			}) as typeof handle.read);
 			if (broken) {
 				const close = broken.close.bind(broken);
-				vi.spyOn(broken, "read").mockImplementationOnce(async () => { await entered; throw failure; });
+				vi.spyOn(broken, "read").mockImplementationOnce(async () => { await gate.entered; throw failure; });
 				vi.spyOn(broken, "close").mockImplementationOnce(async () => { await close(); fail(); });
 			}
 			const token = phase === "pending" ? await manager.capture(undefined, 8192) : undefined;
@@ -181,7 +181,7 @@ describe("speculative action resource versions", () => {
 					[{ path: "value", scope: "content" }, { path: "broken", scope: "content" }], 8192).then((token) => token.release(), (error: unknown) => error))
 				.finally(() => { settled = true; });
 			try {
-				await entered;
+				await gate.entered;
 				if (token) {
 					expect((await manager.seal(token)).expired).toBe(true);
 					release = token.release(); expect(token.release()).toBe(release);
@@ -190,11 +190,11 @@ describe("speculative action resource versions", () => {
 				else await failed;
 				await nextTurn();
 				expect({ settled, released: idle.mock.calls.length, reading: handle.fd >= 0 }, phase).toEqual({ settled: false, released: 0, reading: true });
-				resume();
+				gate.release();
 				if (token) expect(await pending).toEqual(["rejected", "rejected"]); else expect(await pending).toBe(failure);
 				await release;
 				expect([handle.fd, broken?.fd ?? -1, idle.mock.calls.length, open.mock.calls.filter(([, flags]) => isDataOpen(flags)).length]).toEqual([-1, -1, 1, token ? 1 : 2]);
-			} finally { resume(); await pending; await token?.release(); await Promise.all([handle.close(), broken?.close()]); open.mockRestore(); manager.close(); }
+			} finally { gate.release(); await pending; await token?.release(); await Promise.all([handle.close(), broken?.close()]); open.mockRestore(); manager.close(); }
 		}
 	});
 

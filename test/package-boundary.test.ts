@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, nextTurn } from "./async.ts";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -92,7 +92,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					finally { for (const [name, value] of Object.entries(environment)) if (value === undefined) delete process.env[name]; else process.env[name] = value; }
 				})();
 				const { pool, invocations } = await bound;
-				const { promise: started, resolve: reached } = deferred(), { promise: paused, resolve: resume } = deferred();
+				const gate = gated(2);
 				try {
 					if (phase === "preparation") {
 						const find = invocations.get("find")!;
@@ -125,21 +125,21 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					let entered = 0, retired = false;
 					const executions = Promise.allSettled((["actor", "producer"] as const).map((role) => pool.run(role, async (worker, signal) => {
 						if (phase === "cleanup") await worker.dispose(); // A closed worker must not erase its still-active cleanup owner.
-						if (++entered === 2) reached();
-						await paused; signal.throwIfAborted();
+						entered++;
+						await gate.wait(); signal.throwIfAborted();
 						return { result: { content: [], details: undefined }, isError: false };
 					})));
-					await Promise.race([started, executions]); expect(entered).toBe(2);
+					await Promise.race([gate.entered, executions]); expect(entered).toBe(2);
 					const retirement = pool.dispose(); expect(pool.dispose()).toBe(retirement);
 					void retirement.then(() => { retired = true; });
 					await nextTurn(); expect(retired, phase).toBe(false);
-					resume();
+					gate.release();
 					const results = await executions;
 					expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
 					expect(results[1]).toMatchObject({ reason: new Error("worker disposed") });
 					await retirement;
 					await expect(pool.run("actor", async () => { throw new Error("unexpected admission"); })).rejects.toThrow("search pool retired");
-				} finally { resume(); await pool.dispose(); }
+				} finally { gate.release(); await pool.dispose(); }
 			}
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });

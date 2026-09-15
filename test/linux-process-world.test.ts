@@ -143,21 +143,20 @@ describe("Linux process ExecutionWorld", () => {
 				expect(Object.isFrozen(decide.mock.calls[0]![0].scope)).toBe(true);
 			}
 			let closed = false;
-			const { promise: entered, resolve: started } = deferred();
-			const { promise: completion, resolve: release } = deferred();
+			const gate = gated();
 			const executor = boundary.executor({ execute: async () => {
-				started(); await completion; return { exitCode: 0 };
+				await gate.wait(); return { exitCode: 0 };
 			} }, { sourceRoot: root, realShell: "/bin/bash", decide: async () => ({ kind: "continue" }) });
 			const running = executor.execute({ command: ":", cwd: root, environment: {}, onData: () => {} });
-			await entered;
+			await gate.entered;
 			const closing = boundary.close().then(() => { closed = true; });
 			try {
 				await nextTurn();
 				expect(closed, "close must wait for the owned executor and concurrent callers").toBe(false);
 				const concurrent = boundary.close().then(() => { expect(closed).toBe(true); });
-				release();
+				gate.release();
 				await Promise.all([closing, concurrent, running]);
-			} finally { release(); await Promise.allSettled([closing, running]); }
+			} finally { gate.release(); await Promise.allSettled([closing, running]); }
 		} finally {
 			await boundary.close();
 			await rm(root, { recursive: true, force: true });

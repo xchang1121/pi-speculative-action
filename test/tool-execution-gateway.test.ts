@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -16,9 +16,9 @@ describe("ToolExecutionGateway", () => {
 	it("seals one admission lifetime and drains Actor, preparation and world work before disposal", async () => {
 		for (const phase of ["actor", "actor_failed", "prepare", "fork", "fork_failed", "seal_failed", "capture", "diagnostics"]) {
 			let probing = false;
-			const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: release } = deferred();
+			const gate = gated();
 			const dispose = vi.fn(), failure = new Error("admitted execution failed");
-			const borrow = async () => { enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (phase.endsWith("failed")) throw failure; };
+			const borrow = async () => { await gate.wait(); expect(dispose).not.toHaveBeenCalled(); if (phase.endsWith("failed")) throw failure; };
 			const world: TestWorld = { id: "workspace", scope: "fallback", isolation: "workspace_branch", dispose,
 				speculation: { tools: ["custom_process"], capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
 					prepare: async () => { if (probing && ["prepare", "diagnostics"].includes(phase)) await borrow(); },
@@ -41,7 +41,7 @@ describe("ToolExecutionGateway", () => {
 				: phase.startsWith("fork") || phase === "seal_failed" ? gateway.executeSpeculative(operation, route, context)
 				: phase === "capture" ? gateway.captureAuthoritativeResult(requirement, preparation, context)
 				: phase === "diagnostics" ? gateway.diagnostics({ ...preparation, refresh: true }) : gateway.resolve(requirement, preparation);
-			const outcome = Promise.allSettled([pending]); await entered;
+			const outcome = Promise.allSettled([pending]); await gate.entered;
 			const retirement = Promise.all([gateway.dispose(), gateway.dispose()]);
 			try {
 				await nextTurn();
@@ -51,7 +51,7 @@ describe("ToolExecutionGateway", () => {
 				await expect(gateway.executeSpeculative(operation, route, context)).rejects.toThrow("closed");
 				await expect(gateway.captureAuthoritativeResult(requirement, preparation, context)).rejects.toThrow("closed");
 				await expect(gateway.diagnostics({ ...preparation, refresh: true })).rejects.toThrow("closed");
-			} finally { release(); await outcome; await retirement; }
+			} finally { gate.release(); await outcome; await retirement; }
 			expect((await outcome)[0]?.status).toBe(phase.endsWith("failed") ? "rejected" : "fulfilled");
 			expect(dispose).toHaveBeenCalledOnce();
 		}

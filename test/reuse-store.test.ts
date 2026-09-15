@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { unlink, utimes } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype, processCertificate, SPECULATIVE_PRODUCER } from "./process-fixture.ts";
@@ -85,11 +85,11 @@ describe("persistent provenance store", () => {
 		const { readdir, rm: remove } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		let armed = true, suspended: Promise<unknown> | undefined;
 		const failure = new Error("maintenance IO failure");
-		const { promise: entered, resolve: enter } = deferred(), { promise: gate, resolve: resume } = deferred();
+		const gate = gated();
 		const { promise: failureStarted, resolve: rejectEntered } = deferred();
-		const fail = async () => { await entered; rejectEntered(); throw failure; };
+		const fail = async () => { await gate.entered; rejectEntered(); throw failure; };
 		const hold = <Value,>(operation: () => Promise<Value>): Promise<Value> => {
-			armed = false; enter(); const task = gate.then(operation); suspended = task; return task;
+			armed = false; const task = gate.wait().then(operation); suspended = task; return task;
 		};
 		const certificateRoot = path.join(root, "certificates"), certificateHex = certificate.id.slice("sha256:".length);
 		const enumeration = vi.spyOn(filesystem, "readdir").mockImplementation((...args) => {
@@ -108,7 +108,7 @@ describe("persistent provenance store", () => {
 		const publication = gateway.executeAuthoritative({ tool: "certificate", input: {} }, publish);
 		let retirement: Promise<void> | undefined, collection: ReturnType<typeof store.gc> | undefined;
 		try {
-			await entered; collection = collect.mock.results[0]!.value;
+			await gate.entered; collection = collect.mock.results[0]!.value;
 			retirement = Promise.all([gateway.dispose(), gateway.dispose()]).then(() => { closed(); });
 			if (phase !== "held") await failureStarted;
 			await nextTurn();
@@ -116,7 +116,7 @@ describe("persistent provenance store", () => {
 			expect(publish).toHaveBeenCalledOnce(); expect(collect).toHaveBeenCalledOnce();
 			expect(closed).not.toHaveBeenCalled();
 		} finally {
-			resume(); await Promise.allSettled([publication, retirement ?? gateway.dispose(), suspended]);
+			gate.release(); await Promise.allSettled([publication, retirement ?? gateway.dispose(), suspended]);
 			await store.stats().finally(() => { enumeration.mockRestore(); removal.mockRestore(); collect.mockRestore(); });
 		}
 		expect(await publication).toBe(true); expect(closed).toHaveBeenCalledOnce(); expect(publish).toHaveBeenCalledOnce();

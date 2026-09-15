@@ -97,12 +97,11 @@ describe("EffectTransactionCoordinator", () => {
 
 	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
 		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
-			const { promise: gate, resolve: release } = deferred();
-			const { promise: entered, resolve: enter } = deferred();
+			const gate = gated();
 			const failure = new Error("borrow failed"), dispose = vi.fn();
 			const borrow = async () => {
 				if (closing === "callback") void transaction.abort();
-				enter(); await gate; expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure;
+				await gate.wait(); expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure;
 			};
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
@@ -116,13 +115,13 @@ describe("EffectTransactionCoordinator", () => {
 			if (phase === "committed") await transaction.commit();
 			const invoke = () => phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
 			const operations = Promise.allSettled(Array.from({ length: closing === "external" && phase !== "committing" ? 2 : 1 }, invoke));
-			await entered;
+			await gate.entered;
 			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
 			const late = Promise.allSettled([transaction.validate(), transaction.reconstruct!(request)]);
 			try {
 				await nextTurn();
 				expect(dispose).not.toHaveBeenCalled();
-			} finally { release(); await operations; await aborts; }
+			} finally { gate.release(); await operations; await aborts; }
 			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" ? "rejected" : "fulfilled");
 			expect(await late).toMatchObject([{ status: "fulfilled", value: { status: "indeterminate" } }, { status: "fulfilled", value: undefined }]);
 			expect(dispose).toHaveBeenCalledOnce();
