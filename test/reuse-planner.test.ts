@@ -61,7 +61,7 @@ describe("ProcessReusePlanner", () => {
 		await mkdir(path.dirname(file), { recursive: true }); await mkdir(index, { recursive: true });
 		const bytes = JSON.stringify(legacy);
 		await writeFile(file, bytes); await writeFile(path.join(index, `${id}.ref`), "");
-		const planner = new ProcessReusePlanner({ store }), request = { weakKey: processWeakKey(certificate.prototype), contract: contract() };
+		const planner = new ProcessReusePlanner({ store }), request = { weakKey: processWeakKey(certificate.prototype), executablePath: certificate.prototype.executablePath, contract: contract() };
 		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 } });
 		expect(await readFile(file, "utf8")).toBe(bytes);
 		await expect(store.get(legacy.id)).rejects.toThrow("certificate integrity check failed");
@@ -131,7 +131,7 @@ describe("ProcessReusePlanner", () => {
 			expect(await planner.plan({ ...request, weakKey: unrelatedKey, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
 				kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 },
 			});
-			expect(find).toHaveBeenCalledOnce(); expect(find).toHaveBeenCalledWith(unrelatedKey, undefined);
+			expect(find).toHaveBeenCalledOnce(); expect(find).toHaveBeenCalledWith(unrelatedKey, request.executablePath, undefined);
 			await writeFile(fixture.input, "changed");
 			expect(await planner.plan({ ...request, live: { certificate: live, acceptedTaints: ["clock"] } })).toMatchObject({
 				kind: "miss", reasons: ["dependency_changed"],
@@ -154,7 +154,7 @@ describe("ProcessReusePlanner", () => {
 		const registry = new ProcessHandoffRegistry(3), scope = { sessionID: "test", turnID: "test" };
 		if (handoff) for (const certificate of certificates.slice(0, 2)) {
 			const work = await registry.acquire({ key: request.weakKey, scope, role: "producer",
-				ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
+				executablePath: request.executablePath, ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
 			if (work.kind !== "work") throw new Error("expected work");
 			await registry.publish(request.weakKey, work.work, certificate, async () => false);
 		}
@@ -220,7 +220,7 @@ async function fixtureWithCertificate(
 		certificates.unshift(certificate);
 		await store.put(certificate);
 	}
-	const request = { weakKey: processWeakKey(prototype), contract: contract(), validation: { resolvePath: () => input } };
+	const request = { weakKey: processWeakKey(prototype), executablePath: prototype.executablePath, contract: contract(), validation: { resolvePath: () => input } };
 	return { certificate: certificates[0]!, certificates, input, prototype, store, request, planner: new ProcessReusePlanner({ store }) };
 }
 

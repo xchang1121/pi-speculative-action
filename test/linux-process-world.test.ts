@@ -15,7 +15,8 @@ import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
-import { ProcessHandoffOwnership } from "../src/process-handoff.ts";
+import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
+import { sha256Digest } from "../src/provenance-certificate.ts";
 import { validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
@@ -167,10 +168,13 @@ describe("Linux process ExecutionWorld", () => {
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");
 		const host = { execute: vi.fn(async () => ({ exitCode: 0 })) };
 		const held = { execute: vi.fn(async () => ({ exitCode: 0 })) }, close = vi.fn(async () => {});
+		let decide!: Parameters<LinuxHeldExecBoundary["executor"]>[1]["decide"];
 		const { promise: pending, resolve: release } = deferred();
 		const opening = vi.spyOn(LinuxHeldExecBoundary, "open").mockImplementation(async () => {
 			await pending;
-			return { shellPath: fixture.shellPath, executor: () => held, close } as unknown as LinuxHeldExecBoundary;
+			return { shellPath: fixture.shellPath, executor: (_host: unknown, options: Parameters<LinuxHeldExecBoundary["executor"]>[1]) => {
+				decide = options.decide; return held;
+			}, close } as unknown as LinuxHeldExecBoundary;
 		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
 		const observed = vi.spyOn(SpeculationScheduler.prototype, "observeActorService");
@@ -238,6 +242,33 @@ describe("Linux process ExecutionWorld", () => {
 			gates[0]!.resolve(); await producers[0]; await invoke();
 			expect(held.execute, "one closed or failed producer cannot retire its live sibling").toHaveBeenCalledTimes(4);
 			gates[1]!.resolve(); await producers[1]; await invoke(); expect(host.execute).toHaveBeenCalledTimes(5);
+
+			const executable = path.join(fixture.workspace, "lookup-worker"), key = sha256Digest("different execution identity");
+			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
+			const scan = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess").mockResolvedValue({
+				executable, cwd: fixture.workspace, argv: [executable], environment: {},
+				context: { key: "lookup", umask: 0o22, descriptorTypes: ["device", "pipe", "pipe"] },
+			});
+			const image = vi.spyOn(await import("../src/filesystem-evidence.ts"), "hashExecutableFile").mockRejectedValue(new Error("image proof required"));
+			const inspect = () => decide({ pid: process.pid, tracerPid: process.pid, sourceRoot: fixture.workspace });
+			let work: ProcessHandoff | undefined;
+			const history = vi.spyOn(fixture.backend.store, "mayHaveCertificates");
+			try {
+				await expect(inspect()).resolves.toEqual({ kind: "continue" }); expect(image).not.toHaveBeenCalled();
+				history.mockImplementationOnce(async () => {
+					const result = await handoffs.acquire({ key, executablePath: executable, role: "producer",
+						ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
+					if (result.kind !== "work") throw new Error("expected concurrent producer registration");
+					work = result.work; return false;
+				});
+				await expect(inspect()).resolves.toEqual({ kind: "continue" });
+				expect(history).toHaveBeenLastCalledWith(executable);
+				expect(image).toHaveBeenCalledExactlyOnceWith(`/proc/${process.pid}/exe`);
+				expect(fixture.backend.actorMetrics().hits).toBe(0);
+			} finally {
+				if (work) handoffs.complete(key, work);
+				history.mockRestore(); image.mockRestore(); scan.mockRestore();
+			}
 
 			const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
 			const forking = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(options => fork({ ...options,
