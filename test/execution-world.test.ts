@@ -84,8 +84,12 @@ describe("ExecutionWorldRouter", () => {
 				}),
 			]),
 		);
-		vi.mocked(unavailable.dispose!).mockImplementation(() => { throw new Error("cleanup failed"); });
-		await router.dispose();
+		const failures = [new Error("runtime cleanup failed"), new Error("resource cleanup failed")];
+		vi.mocked(unavailable.dispose!).mockImplementation(() => { throw failures[0]; });
+		vi.mocked(resource.dispose!).mockRejectedValue(failures[1]);
+		const closing = router.dispose();
+		expect(router.dispose()).toBe(closing);
+		await expect(closing).rejects.toMatchObject({ message: "Execution world cleanup failed", errors: failures });
 		expect(unavailable.dispose).toHaveBeenCalledOnce();
 		expect(resource.dispose).toHaveBeenCalledOnce();
 
