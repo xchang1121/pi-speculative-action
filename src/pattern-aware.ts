@@ -1,5 +1,5 @@
 import { clampProbability, nonNegativeFinite } from "./number-utils.ts";
-import { createHash } from "node:crypto";
+import { hash as cryptoHash } from "node:crypto";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -2652,7 +2652,7 @@ function normalizePath(value: string) {
 }
 
 function hash(value: string) {
-	return createHash("sha256").update(value).digest("hex").slice(0, 32);
+	return cryptoHash("sha256", value).slice(0, 32);
 }
 
 function isObject(value: unknown): value is object {

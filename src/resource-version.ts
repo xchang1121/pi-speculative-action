@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { hash } from "node:crypto";
 import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -738,7 +738,7 @@ function statStamp(stat: BigIntStats): string {
 }
 
 function digest(value: unknown): string {
-	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	return hash("sha256", JSON.stringify(value));
 }
 
 function assertInside(realRoot: string, target: string): void {

@@ -1,5 +1,5 @@
 import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
-import { createHash } from "node:crypto";
+import { hash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 
 export const PROCESS_CERTIFICATE_VERSION = 7 as const;
@@ -375,7 +375,7 @@ export function certificateReplayable(
 }
 
 export function sha256Digest(value: string | Uint8Array): Sha256Digest {
-	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+	return `sha256:${hash("sha256", value)}`;
 }
 
 export function digestObject(value: unknown): Sha256Digest {
