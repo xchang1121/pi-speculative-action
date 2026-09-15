@@ -1619,39 +1619,34 @@ class PatternBindingAnalysis {
 		for (const [encoded, binding] of Object.entries(bindings)) {
 			const targetPath = decodePath(encoded);
 			if (!targetPath.length || targetPath.some(unsafePathSegment)) return [];
-			const values = this.weightedBindingValues(binding, context);
+			const values = this.bindingValues(binding, context);
 			if (!values.length) return [];
 			if (values.length === 1) {
 				for (const variant of variants) {
-					variant.input = withPath(variant.input, targetPath, values[0]!.value);
-					variant.probability *= values[0]!.probability;
+					variant.input = withPath(variant.input, targetPath, values[0]);
 				}
 				continue;
 			}
-			const ranked = variants.flatMap((variant) => values.map((value) => ({
-				variant, value: value.value, probability: variant.probability * value.probability,
-			})));
-			variants = ranked.sort((left, right) => right.probability - left.probability).slice(0, limit)
+			const counts = binding.variantCounts, smoothing = 0.5;
+			const denominator = counts
+				? values.reduce<number>((sum, _, index) => sum + variantCount(counts, index), 0) + smoothing * values.length
+				: values.length;
+			const probabilities = values.map((_, index) => counts
+				? (variantCount(counts, index) + smoothing) / denominator : 1 / denominator);
+			const end = Math.trunc(limit) || 0;
+			const retained = end < 0 ? Math.max(0, variants.length * values.length + end) : end;
+			const rank = (left: { probability: number }, right: { probability: number }) => right.probability - left.probability;
+			const ranked = variants.flatMap((variant) => {
+				const expanded = values.map((value, index) => ({
+					variant, value, probability: variant.probability * probabilities[index]!,
+				}));
+				// A row cannot contribute more than the global beam; stable product ordering preserves ties and underflow.
+				return expanded.length <= retained ? expanded : expanded.sort(rank).slice(0, retained);
+			});
+			variants = ranked.sort(rank).slice(0, retained)
 				.map(({ variant, value, probability }) => ({ input: withPath(variant.input, targetPath, value), probability }));
 		}
 		return variants;
-	}
-
-	weightedBindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>) {
-		const values = this.bindingValues(binding, context);
-		if (values.length <= 1) return values.map((value) => ({ value, probability: 1 }));
-		const counts = binding.variantCounts;
-		if (!counts) {
-			const probability = 1 / values.length;
-			return values.map((value) => ({ value, probability }));
-		}
-		const smoothing = 0.5;
-		const total = values.reduce<number>((sum, _, index) => sum + variantCount(counts, index), 0);
-		const denominator = total + smoothing * values.length;
-		return values.map((value, index) => ({
-			value,
-			probability: (variantCount(counts, index) + smoothing) / denominator,
-		}));
 	}
 
 	candidateBindings(
