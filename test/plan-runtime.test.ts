@@ -46,7 +46,7 @@ describe("PlanRuntime", () => {
 		expect(plan.apply({ ...peer, revision: 1 }, 4)).toMatchObject({ accepted: false, reason: "invalid_dependency" });
 	});
 
-	it("schedules at the expected horizon and retains the prediction until its latest horizon", () => {
+	it("schedules at the expected horizon and retains the prediction until its latest horizon", async () => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("future", { horizon: 0, latestHorizon: 2 })]), 4);
 		expect(plan.promote("plan", "future").status).toBe("scheduled");
@@ -62,6 +62,8 @@ describe("PlanRuntime", () => {
 			predictionState: { status: "pending" },
 		});
 		expect(plan.rearmExecution("candidate")).toBe(true);
+		await execution.completion;
+		expect(plan.get("plan", "future")!.execution).toEqual({ status: "deferred" });
 		const retry = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "future", "retry", retry);
 		retry.cancel(cause("freshness", "resource_changed"), 2, 0);
@@ -176,7 +178,8 @@ describe("PlanRuntime", () => {
 		expect(plan.attachExecution("plan", "bash", "late", new CandidateExecution("shared"))).toBe(false);
 	});
 
-	it.each(["succeeded", "failed", "cancelled"] as const)("queries current dependencies independently of %s execution and Actor settlement", (status) => {
+	it.each([false, true].flatMap(drained => (["succeeded", "failed", "cancelled"] as const).map(status => ({ status, drained }))))(
+		"queries dependencies for $status execution with completion drained=$drained", async ({ status, drained }) => {
 		for (const outcome of ["adopted", "rejected", "miss", "unobserved"] as const) {
 			const plan = new PlanRuntime(), dependency = { actionID: "parent", condition: "actor_adopted" as const };
 			plan.apply(proposal([action("parent"),
@@ -189,6 +192,7 @@ describe("PlanRuntime", () => {
 			expect(Reflect.set(exposed, "condition", "execution_succeeded")).toBe(false);
 			expect(Object.isFrozen(exposed)).toBe(true);
 			expect(Object.isFrozen(dependency)).toBe(false);
+			expect(Reflect.set(plan.get("plan", "parent")!.execution, "status", "scheduled")).toBe(false);
 			expect(ids(plan.launchable())).toEqual(["parent"]);
 			const execution = new CandidateExecution<string>("shared");
 			plan.attachExecution("plan", "parent", "candidate", execution);
@@ -198,6 +202,10 @@ describe("PlanRuntime", () => {
 			expect(plan.launchable()).toEqual([]);
 			if (status === "succeeded") execution.succeed("output", new TimelineInterval(0, 1), 1);
 			else execution[status === "failed" ? "fail" : "cancel"](cause("execution", "tool_failed"), 1, 1);
+			if (drained) {
+				await execution.completion;
+				Object.defineProperty(execution, "execution", { get() { throw new Error("retired execution was read"); } });
+			}
 			const runnable = ["settled", ...(status === "succeeded" ? ["succeeded"] : [])];
 			expect(ids(plan.matchable(1))).toEqual(["parent"]);
 			expect(ids(plan.matchable(2))).toEqual(["parent", ...runnable]);
