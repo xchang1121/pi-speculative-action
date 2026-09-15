@@ -16,6 +16,7 @@ import {
 	type PatternAwareSettings,
 	type PatternAwareStore,
 	type PatternAwareStoreLease,
+	patternAwareActionSemantics,
 	patternAwareAnalyzerKey,
 	patternAwareRuntimeContext,
 	patternAwareSettings,
@@ -43,7 +44,9 @@ export interface PatternPlanSourceController {
 	readonly dispose: () => Promise<void>;
 }
 
-export function createPatternPlanSource(input: {
+export function createPatternPlanSource({
+	sessionID, cwd, actionSemantics, projectionRules, stateDirectory, workspaceIdentity, store: providedStore,
+}: {
 	readonly sessionID: string;
 	readonly cwd: string;
 	readonly actionSemantics: ActionSemanticsRegistry;
@@ -52,12 +55,8 @@ export function createPatternPlanSource(input: {
 	readonly workspaceIdentity?: string;
 	readonly store?: PatternAwareStore | Promise<PatternAwareStore>;
 }): PatternPlanSourceController {
-	const patternActionSemantics = {
-		namespace: "pi-action-semantics",
-		actionKey: (tool: string, actionInput: Readonly<Record<string, unknown>>, schemaHash?: string) =>
-			input.actionSemantics.buildKey(tool, actionInput, input.cwd, schemaHash),
-		projectors: input.projectionRules,
-	};
+	cwd = path.resolve(cwd);
+	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules);
 	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
 	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
 	const lifecycle = new RuntimeLifecycleLane();
@@ -84,16 +83,16 @@ export function createPatternPlanSource(input: {
 		return revision;
 	};
 	const resolveStore = async (patternSettings: PatternAwareSettings): Promise<PatternAwareStore> => {
-		if (input.store) return input.store;
+		if (providedStore) return providedStore;
 		const configurationKey = patternAwareAnalyzerKey(patternSettings);
 		if (!openedStore || openedStore.key !== configurationKey) {
 			const previous = openedStore;
 			const retained = ownedStores.get(configurationKey);
 			const opening = { key: configurationKey, lease: Promise.resolve().then(async () => {
-				if (previous) await previous.lease.then(({ store }) => store.finishSession(input.sessionID))
+				if (previous) await previous.lease.then(({ store }) => store.finishSession(sessionID))
 					.catch(() => undefined); // Failed loading cannot poison the next analyzer.
-				return retained ?? acquirePatternAwareStore(input.workspaceIdentity ?? input.cwd, patternSettings,
-					input.stateDirectory, patternActionSemantics);
+				return retained ?? acquirePatternAwareStore(workspaceIdentity ?? cwd, patternSettings,
+					stateDirectory, patternActionSemantics);
 			}) };
 			// Predictions retain their analyzer for late feedback, including after returning to this configuration.
 			if (!retained) ownedStores.set(configurationKey, opening.lease);
@@ -107,10 +106,10 @@ export function createPatternPlanSource(input: {
 	};
 	const flushStores = async (finish = false): Promise<void> => {
 		await analysisTail;
-		const stores = input.store ? [Promise.resolve(input.store)] : [...ownedStores.values()].map(async lease => (await lease).store);
+		const stores = providedStore ? [Promise.resolve(providedStore)] : [...ownedStores.values()].map(async lease => (await lease).store);
 		const results = await Promise.allSettled(stores.map(async pending => {
 			const store = await pending;
-			if (finish) store.finishSession(input.sessionID);
+			if (finish) store.finishSession(sessionID);
 			await store.flush();
 		}));
 		const failure = results.find(result => result.status === "rejected");
@@ -120,7 +119,7 @@ export function createPatternPlanSource(input: {
 		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
 		sessionID: startInput.sessionID, turnID: startInput.turnID, tool: action.key.tool,
 		input: structuredClone(action.input), outcome: output.isError ? "failure" : "success",
-		...projectPatternAwareObservation(output.result, extractOutputPaths(action.key.tool, action.input, output.result), input.cwd),
+		...projectPatternAwareObservation(output.result, extractOutputPaths(action.key.tool, action.input, output.result), cwd),
 		durationMs, schemaHash: action.key.schemaHash,
 		...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
 		learnTarget: false,
@@ -211,7 +210,7 @@ export function createPatternPlanSource(input: {
 			const observation = projectPatternAwareObservation(
 				output?.result,
 				extractOutputPaths(tool, concrete, output?.result),
-				input.cwd,
+				cwd,
 			);
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
@@ -225,7 +224,7 @@ export function createPatternPlanSource(input: {
 				durationMs,
 				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
 				...(schemaHash === undefined ? {} : { schemaHash }),
-				learnTarget: candidateToolNames(settings, input.actionSemantics).includes(tool),
+				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
 			};
 			batch.set(order, event);
 			authoritativeBatches.set(key, batch);
@@ -311,7 +310,7 @@ export function createPatternPlanSource(input: {
 			await lifecycle.drain();
 			revisions.clear();
 			carriedPredictions.clear();
-			clearAuthoritativeSession(authoritativeBatches, input.sessionID);
+			clearAuthoritativeSession(authoritativeBatches, sessionID);
 			try {
 				await flushStores(true);
 			} catch {

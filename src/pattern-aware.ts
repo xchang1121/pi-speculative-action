@@ -4,7 +4,7 @@ import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { type ActionKey, type ActionKeyProjector, actionKeyCovers } from "./action-semantics.ts";
+import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, actionKeyCovers, ownActionKeyProjector } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
@@ -37,8 +37,8 @@ export type PatternAwareEventInput = {
 };
 
 export type PatternAwareActionSemantics = {
-	/** Stable persistence namespace for the action-key contract. */
-	readonly namespace?: string;
+	/** Equal namespaces promise the same canonicalization and projection contract, including captured inputs. */
+	readonly namespace: string;
 	/** Deterministic K(a) projection for one namespace; repeated inputs may be memoized. */
 	readonly actionKey: (
 		tool: string,
@@ -47,6 +47,19 @@ export type PatternAwareActionSemantics = {
 	) => ActionKey | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
 };
+
+export function patternAwareActionSemantics(
+	registry: ActionSemanticsRegistry, cwd: string, projectors: readonly ActionKeyProjector[] = [],
+): PatternAwareActionSemantics {
+	cwd = path.resolve(cwd);
+	const rules = Object.freeze(projectors.map(ownActionKeyProjector));
+	return Object.freeze({
+		namespace: stableStringify([cwd,
+			[...registry.toolNames()].sort().map(tool => [tool, registry.definition(tool)!.epoch]), rules.map(rule => rule.id).sort()]),
+		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) => registry.buildKey(tool, input, cwd, schemaHash),
+		projectors: rules,
+	});
+}
 
 export type PatternAwareEvent = PatternAwareEventInput & {
 	readonly sequence: number;
@@ -325,13 +338,15 @@ export class PatternAwareStore {
 		persistenceFile?: string,
 		actionSemantics?: PatternAwareActionSemantics,
 	) {
+		settings = { ...settings };
 		this.settings = settings;
 		this.sessionBudgets = patternSessionBudgets(settings.maxPatterns);
 		this.sessions = new BoundedRecencyMap(this.sessionBudgets.sessions);
 		this.resolvedActionKeys = new BoundedRecencyMap(settings.maxPatterns);
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
-		this.actionSemantics = actionSemantics;
+		this.actionSemantics = actionSemantics && { ...actionSemantics,
+			projectors: actionSemantics.projectors?.map(ownActionKeyProjector) };
 	}
 
 	async load() {
@@ -1359,8 +1374,13 @@ export async function acquirePatternAwareStore(
 	stateDirectory?: string,
 	actionSemantics?: PatternAwareActionSemantics,
 ): Promise<PatternAwareStoreLease> {
+	settings = { ...settings };
+	actionSemantics = actionSemantics && { ...actionSemantics };
 	const analyzerKey = patternAwareAnalyzerKey(settings);
-	const semanticsKey = patternSemanticsKey(actionSemantics);
+	if (actionSemantics && (typeof actionSemantics.namespace !== "string" || !actionSemantics.namespace)) {
+		throw new Error("Pattern action semantics require an explicit namespace");
+	}
+	const semanticsKey = actionSemantics ? JSON.stringify(actionSemantics.namespace) : "default";
 	const file = configuredPersistenceFile(
 		patternAwarePersistenceFile(workspace, stateDirectory),
 		analyzerKey,
@@ -1408,19 +1428,6 @@ export function patternAwareAnalyzerKey(settings: PatternAwareSettings): string 
 		minBindingReplayProbability: settings.minBindingReplayProbability,
 		maxPatterns: settings.maxPatterns,
 	});
-}
-
-function patternSemanticsKey(semantics: PatternAwareActionSemantics | undefined): string {
-	if (!semantics) return "default";
-	return (
-		semantics.namespace ??
-		hash(
-			stableStringify({
-				actionKey: semantics.actionKey.toString(),
-				projectors: (semantics.projectors ?? []).map((projector) => projector.id).sort(),
-			}),
-		)
-	);
 }
 
 function configuredPersistenceFile(file: string, analyzerKey: string, semanticsKey: string): string {

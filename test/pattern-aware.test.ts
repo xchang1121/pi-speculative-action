@@ -4,10 +4,11 @@ import { temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { buildPiActionKey } from "../src/action-semantics.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { BoundedRecencyMap } from "../src/bounded-recency-map.ts";
 import {
 	acquirePatternAwareStore,
+	patternAwareActionSemantics,
 	applyBindings,
 	inferBindings,
 	PATTERN_AWARE_DEFAULTS,
@@ -1117,12 +1118,15 @@ describe("PatternAware", () => {
 		expect(after?.historicalMatches).toBe(pattern.historicalMatches + (name === "covered" ? 1 : 0));
 	});
 
-	test("deduplicates canonical K(a) variants and memoizes resolution, including misses", () => {
+	test("owns the analyzer and action contract while deduplicating and memoizing K(a), including misses", () => {
 		const semantics = piActionSemantics();
 		let resolutions = 0;
-		const store = patternStore({}, undefined, { ...semantics,
-			actionKey: (...args) => { resolutions++; return semantics.actionKey(...args); },
-		});
+		const contract = { ...semantics, projectors: [...semantics.projectors!],
+			actionKey: (...args: Parameters<typeof semantics.actionKey>) => { resolutions++; return semantics.actionKey(...args); } };
+		const configuration = settings(), store = new PatternAwareStore(configuration, undefined, contract);
+		configuration.maxPatterns = 1;
+		contract.actionKey = () => undefined;
+		contract.projectors.length = 0;
 		for (const [id, bindings] of [
 			["default-implicit", constantBindings({ path: "src/index.ts" })],
 			["default-offset-explicit", constantBindings({ path: "src/index.ts", offset: 1 })],
@@ -1586,11 +1590,7 @@ async function patternFile(): Promise<string> {
 }
 
 function piActionSemantics() {
-	return {
-		actionKey: (tool: string, actionInput: Readonly<Record<string, unknown>>, schemaHash?: string) =>
-			buildPiActionKey(tool, actionInput, "/workspace", schemaHash),
-		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
-	};
+	return patternAwareActionSemantics(PI_ACTION_SEMANTICS, "/workspace", [READ_RANGE_ACTION_KEY_PROJECTOR]);
 }
 
 type ValidatedPattern = Parameters<PatternAwareStore["registerValidatedPattern"]>[0];
