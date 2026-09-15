@@ -946,11 +946,9 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		contaminated: boolean;
 		readonly before?: WorkspaceStructureSnapshot;
 	}
-	const baselineTree = (await workspace.pool.git(["rev-parse", `${workspace.commit}^{tree}`], { cwd: workspace.processRoot })).toString("utf8").trim();
-	if (!baselineTree) throw new Error("Git workspace transaction baseline is unavailable");
-	let lastStructure = await workspace.structure.capture();
-	const { baselineGit: git, sandboxRoot, openTransactionClock: openClock,
+	const { baselineGit: git, commit, sandboxRoot, openTransactionClock: openClock,
 		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
+	let lastStructure = await workspace.structure.capture();
 	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() };
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
@@ -1143,7 +1141,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 				? frontier.get(relativePath)
 				: await readGitTreeRegularState(
 						git,
-						baselineTree,
+						commit,
 						relativePath,
 						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
 					);
