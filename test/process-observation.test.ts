@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
+import { captureStableFile } from "../src/filesystem-evidence.ts";
 import {
 	captureWorkspaceStructure,
 	diffWorkspaceStructures,
@@ -18,6 +19,7 @@ describe("process observation", () => {
 		const afterBytes = Buffer.alloc(beforeBytes.byteLength, 0x42);
 		await fs.writeFile(target, beforeBytes);
 		const before = await captureWorkspaceStructure(workspace);
+		const captured = await captureStableFile(target);
 		await fs.writeFile(target, afterBytes);
 		const after = await captureWorkspaceStructure(workspace);
 		const beforeEntry = before.entries.get("value.bin");
@@ -43,6 +45,8 @@ describe("process observation", () => {
 		expect(diff.effects[0]).toMatchObject({ logicalPath: projection.toLogical(target), relativePath: "value.bin" });
 		expect(diff.effects[0]?.change).toBe(delta);
 		const input = hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
+		expect(hydrateWorkspaceFileEntry(beforeEntry, captured)).toEqual(input);
+		expect(hydrateWorkspaceFileEntry(beforeEntry, await captureStableFile(target))).toBeUndefined();
 		expect(input).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		const parentEntry = before.entries.get("");
 		if (parentEntry?.kind !== "directory") throw new Error("workspace root structure missing");

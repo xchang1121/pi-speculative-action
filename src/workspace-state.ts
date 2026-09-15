@@ -13,7 +13,6 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 			readonly mode: number;
 			readonly size: number;
 			readonly links: number;
-			readonly content?: Buffer;
 	  }
 	| {
 			readonly kind: "directory";
@@ -34,15 +33,13 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 	  });
 
 export type WorkspaceStructureEntry =
-	| Omit<Extract<WorkspaceTreeEntry, { readonly kind: "file" }>, "digest" | "content">
+	| Omit<Extract<WorkspaceTreeEntry, { readonly kind: "file" }>, "digest">
 	| Exclude<WorkspaceTreeEntry, { readonly kind: "file" }>;
 
-interface WorkspaceSnapshot<Entry> {
+export interface WorkspaceStructureSnapshot {
 	readonly root: string;
-	readonly entries: ReadonlyMap<string, Entry>;
+	readonly entries: ReadonlyMap<string, WorkspaceStructureEntry>;
 	readonly files: number;
 	readonly bytesRead: number;
 	readonly complete: boolean;
 }
-
-export interface WorkspaceStructureSnapshot extends WorkspaceSnapshot<WorkspaceStructureEntry> {}

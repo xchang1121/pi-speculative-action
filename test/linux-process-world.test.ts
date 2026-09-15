@@ -440,13 +440,13 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	}, 15_000);
 
-	test.for(["trace", "transaction", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
+	test.for(["trace", "transaction", "dependency", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-");
 		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
-		const error = new Error(`injected ${failure} capture failure`);
+		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt" : `injected ${failure} capture failure`);
 		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
 		let processContext = {};
 		let restoreTransactions: (() => void) | undefined;
@@ -458,6 +458,11 @@ describe("Linux process ExecutionWorld", () => {
 				const capture = await begin();
 				if (failure === "publication") return capture;
 				return { abort: capture.abort, finish: async () => {
+					if (failure === "dependency") {
+						const result = await capture.finish(), next = await begin();
+						await writeFile(path.join(input.workspace.sandboxRoot, "input.txt"), "changed-once");
+						await next.finish(); failed.resolve(); await gate.promise; return result;
+					}
 					if (failure === "trace") { entered.resolve(); await gate.promise; return capture.finish(); }
 					await entered.promise; await capture.abort(); failed.resolve(); throw error;
 				} };
@@ -468,7 +473,7 @@ describe("Linux process ExecutionWorld", () => {
 		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
 			if (String(args[0]).includes("/trace-")) {
 				traceRoot = path.dirname(String(args[0]));
-				if (failure === "publication") return readTrace(...args);
+				if (failure === "publication" || failure === "dependency") return readTrace(...args);
 				if (failure === "trace") { await entered.promise; failed.resolve(); throw error; }
 				entered.resolve(); await gate.promise;
 			}
@@ -494,13 +499,12 @@ describe("Linux process ExecutionWorld", () => {
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
-			if (failure === "publication") {
-				await writeFile(path.join(fixture.workspace, "emit.c"), '#include <unistd.h>\nint main(void) { return write(1, "capture-once", 12) == 12 ? 0 : 1; }\n');
-				await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit" });
-				await commitBenchmarkFixture(fixture.workspace, "Process publication failure");
-			}
+			await writeFile(path.join(fixture.workspace, "input.txt"), "capture-once");
+			await writeFile(path.join(fixture.workspace, "emit.c"), '#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open("input.txt", O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n');
+			await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit" });
+			await commitBenchmarkFixture(fixture.workspace, "Process capture failure");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			running = forkReusableBash(fixture, { command: failure === "publication" ? "emit" : "/usr/bin/printf capture-once", label: failure,
+			running = forkReusableBash(fixture, { command: "emit", label: failure,
 				actionNamespace: "capture-owners", executionFingerprint });
 			void running.then(() => { returned = true; }, () => { returned = true; });
 			await Promise.race([failed.promise, running.then(() => { throw new Error(`failure injection was not reached: ${JSON.stringify(fixture.backend.metrics())}`); })]);
@@ -515,7 +519,7 @@ describe("Linux process ExecutionWorld", () => {
 			expect(lastError).toContain(error.message);
 			const detail = JSON.parse(lastError.split("; process=")[1]!);
 			expect(detail).toMatchObject({ ...processContext, requestID: 1,
-				stage: failure === "publication" ? "history_publication" : `${failure}_capture` });
+				stage: failure === "publication" ? "history_publication" : failure === "dependency" ? "dependencies" : `${failure}_capture` });
 			expect(detail.weakKey).toMatch(/^sha256:[a-f0-9]{64}$/);
 			const validation = await branch.validate?.();
 			if (failure === "publication") {
