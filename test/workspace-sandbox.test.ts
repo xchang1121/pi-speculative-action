@@ -1,5 +1,5 @@
 import { temporaryDirectories } from "./filesystem.ts";
-import { gated, deferred, nextTurn } from "./async.ts";
+import { gated, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
@@ -50,26 +50,26 @@ describe("workspace-branch ExecutionWorld", () => {
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
 			const root = await temporaryRoot(), controller = new AbortController();
 			let workspaces = 0, captures = 0;
-			const { promise: started, resolve: entered } = deferred(), { promise: gate, resolve: release } = deferred();
+			const gate = gated();
 			const capture = ResourceVersionManager.prototype.capture;
 			const observer = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementation(async function (this: ResourceVersionManager, ...args) {
 				captures++;
 				const token = await capture.apply(this, args);
-				if (phase === "baseline") { entered(); await gate; }
+				if (phase === "baseline") await gate.wait();
 				return token;
 			});
 			vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
 				const directory = await fs.mkdtemp(prefix, options);
 				if (String(prefix).endsWith(`${path.sep}action-`)) workspaces++;
-				if (phase === "repository" && String(prefix).includes("pi-speculative-action-pool-")) { entered(); await gate; }
+				if (phase === "repository" && String(prefix).includes("pi-speculative-action-pool-")) await gate.wait();
 				return directory;
 			});
 			const pending = sandbox.prepare(root, { driver: "git", signal: controller.signal });
 			try {
-				await Promise.race([started, pending.then(() => { throw new Error("Preparation did not reach the held stage"); })]);
+				await Promise.race([gate.entered, pending.then(() => { throw new Error("Preparation did not reach the held stage"); })]);
 				const other = owner === "none" ? Promise.resolve() : sandbox.prepare(root,
 					{ driver: "git", ...(owner === "cancelled" ? { signal: controller.signal } : {}) });
-				controller.abort(new Error("owner closed")); release();
+				controller.abort(new Error("owner closed")); gate.release();
 				const [cancelled, live] = await Promise.allSettled([pending, other]);
 				expect(cancelled).toMatchObject({ status: "rejected", reason: { message: "owner closed" } });
 				expect(live.status).toBe(owner === "cancelled" ? "rejected" : "fulfilled");
@@ -80,7 +80,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				await branch.commit(); await branch.dispose();
 				expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("live owner\n");
 			} finally {
-				release(); await pending.catch(() => undefined); observer.mockRestore(); vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp);
+				gate.release(); await pending.catch(() => undefined); observer.mockRestore(); vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp);
 				await sandbox.closePools([root]);
 			}
 		}
@@ -703,13 +703,9 @@ describe("workspace-branch ExecutionWorld", () => {
 				before: { ...directoryState! }, after: { ...directoryState! },
 			}],
 		}));
-		let releaseBlock!: () => void;
-		const { promise: entered, resolve: enterBlock } = deferred();
-		const blocker = withFileMutationQueue(target, () => {
-			enterBlock();
-			return new Promise<void>((resolve) => (releaseBlock = resolve));
-		});
-		await entered;
+		const gate = gated();
+		const blocker = withFileMutationQueue(target, gate.wait);
+		await gate.entered;
 		const pending = Promise.allSettled(deltas.map((delta) => sandbox.commitDelta(delta)));
 		for (const delta of deltas) {
 			const file = delta.changes[0] as SandboxFileChange, directoryChange = delta.changes[1]!;
@@ -723,7 +719,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		expect(
 			await Promise.race([retirement.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))]),
 		).toBe(false);
-		releaseBlock();
+		gate.release();
 		const results = await pending;
 		await Promise.all([blocker, retirement]);
 		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -1050,20 +1046,20 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(sandbox.prepare(root, { signal: controller.signal })).rejects.toThrow("cancelled");
 			for (const cancelled of [false, true]) {
 				await fs.writeFile(target, "before");
-				const { promise: entered, resolve: enter } = deferred(), { promise: release, resolve: unblock } = deferred();
+				const gate = gated();
 				const abort = new AbortController();
 				let outlet: Parameters<NonNullable<ToolInvocation["filesystem"]>>[0];
 				vi.mocked(writeFile).mockImplementation(async (file, data, options) => {
-					if (String(file).endsWith("held.txt") && String(file) !== target) { enter(); await release; }
+					if (String(file).endsWith("held.txt") && String(file) !== target) await gate.wait();
 					return fs.writeFile(file, data, options);
 				});
 				let settled = false;
 				const pending = world.speculation.execute({ ...boundContext(root, async (view) => {
 					outlet = view; void view.writeFile!(target, "after"); return settlement("done");
 				}), signal: abort.signal }).finally(() => { settled = true; });
-				await Promise.race([entered, pending.then(() => { throw new Error("File request did not reach the held write"); })]);
+				await Promise.race([gate.entered, pending.then(() => { throw new Error("File request did not reach the held write"); })]);
 				try { expect(settled).toBe(false); if (cancelled) abort.abort(new Error("cancelled")); }
-				finally { unblock(); }
+				finally { gate.release(); }
 				if (cancelled) await expect(pending).rejects.toThrow("cancelled");
 				else { const branch = await pending; await branch.commit(); await branch.dispose(); }
 				await expect(outlet!.writeFile!(target, "late")).rejects.toThrow("execution lifetime is closed");
