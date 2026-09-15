@@ -422,6 +422,7 @@ describe("speculative action resource versions", () => {
 				try { expect((await metadata.view!.stat(target, "entry")).type).toBe(target === root ? "directory" : "special"); }
 				finally { metadata.release(); }
 				await expect(captureStableFile(target)).rejects.toThrow("not_regular_file");
+				await expect(hashExecutableFile(target)).rejects.toThrow("not_regular_file");
 				await expect(manager.capture([{ path: target, scope: "content" }])).rejects.toThrow("unsupported_resource_type:");
 			}
 			expect(open.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(0);
