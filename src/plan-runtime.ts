@@ -2,7 +2,7 @@ import { nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from 
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
-import type { CandidateExecutionState } from "./candidate-execution.ts";
+import type { CandidateExecution } from "./candidate-execution.ts";
 import type {
 	MaterializedPlan,
 	PlanAction,
@@ -20,7 +20,8 @@ import type {
 } from "./settlement.ts";
 
 type PlanNodeExecution =
-	| Exclude<MutableNodeExecution, { readonly status: "attached" }>
+	| { readonly status: "deferred" | "preparing" | "scheduled" }
+	| { readonly status: "execution_blocked" | "failed"; readonly cause: ResolutionCause }
 	| { readonly status: "queued" | "running" | "succeeded"; readonly candidateID: string }
 	| { readonly status: "failed" | "cancelled"; readonly cause: ResolutionCause; readonly candidateID: string };
 
@@ -160,14 +161,10 @@ type MutablePlan = {
 
 type PlanGraph = { readonly plans: Set<MutablePlan>; ordered: readonly MutableNode[] };
 
-interface PlanExecutionOwner {
-	readonly execution: CandidateExecutionState<unknown>;
-}
+type PlanExecutionOwner = Pick<CandidateExecution<unknown>, "execution" | "completion">;
 
 type MutableNodeExecution =
-	| { readonly status: "deferred" | "preparing" }
-	| { readonly status: "execution_blocked" | "failed"; readonly cause: ResolutionCause }
-	| { readonly status: "scheduled" }
+	| PlanNodeExecution
 	| {
 			readonly status: "attached";
 			readonly candidateID: string;
@@ -279,7 +276,7 @@ export class PlanRuntime {
 		let rearmed = false;
 		for (const { node } of this.mutableValues()) {
 			if (
-				node.execution.status !== "attached" ||
+				!("candidateID" in node.execution) ||
 				node.execution.candidateID !== candidateID ||
 				node.opportunity.state.status !== "pending" ||
 				!executionSettled(executionProjection(node.execution))
@@ -310,7 +307,11 @@ export class PlanRuntime {
 	attachExecution(proposalID: string, actionID: string, candidateID: string, owner: PlanExecutionOwner): boolean {
 		const node = this.mutable(proposalID, actionID)?.node;
 		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "scheduled")) return false;
-		node.execution = { status: "attached", candidateID, owner };
+		const attachment = { status: "attached" as const, candidateID, owner };
+		node.execution = attachment;
+		void owner.completion.then(state => {
+			if (node.execution === attachment) node.execution = projectExecution(state, candidateID);
+		});
 		return true;
 	}
 
@@ -389,7 +390,7 @@ export class PlanRuntime {
 
 	consumers(candidateID: string): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status !== "settled" &&
-			node.execution.status === "attached" && node.execution.candidateID === candidateID);
+			"candidateID" in node.execution && node.execution.candidateID === candidateID);
 	}
 
 	due(settledDecisionSeq: number): readonly PlanRuntimeNode[] {
@@ -675,16 +676,12 @@ function executionSettled(execution: PlanNodeExecution): boolean {
 }
 
 function executionProjection(execution: MutableNodeExecution): PlanNodeExecution {
-	if (execution.status !== "attached") return execution;
-	const state = execution.owner.execution;
-	if (state.status === "queued") return { status: "queued", candidateID: execution.candidateID };
-	if (state.status === "running") return { status: "running", candidateID: execution.candidateID };
-	if (state.status === "succeeded") return { status: "succeeded", candidateID: execution.candidateID };
-	return {
-		status: state.status,
-		cause: state.cause,
-		candidateID: execution.candidateID,
-	};
+	return execution.status === "attached" ? projectExecution(execution.owner.execution, execution.candidateID) : Object.freeze(execution);
+}
+
+function projectExecution(state: PlanExecutionOwner["execution"], candidateID: string): PlanNodeExecution {
+	return Object.freeze(state.status === "failed" || state.status === "cancelled"
+		? { status: state.status, cause: state.cause, candidateID } : { status: state.status, candidateID });
 }
 
 function planSnapshot(plan: MutablePlan): MaterializedPlan {
