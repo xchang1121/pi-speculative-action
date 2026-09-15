@@ -252,18 +252,9 @@ export class ResourceVersionManager {
 			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
 				const normalized = normalizeDependencies(this.root, requested).filter((dependency) => !observations.has(dependencyKey(dependency)));
 				if (!normalized.length) return;
-				// A leaf's identity does not prove its name stayed bound through ancestor A→B→A.
-				const ancestors = dependencies ? normalized.map((dependency) => dependency.path) : [];
-				while (ancestors.length) {
-					const target = ancestors.pop()!, dependency = { path: target, scope: "binding" as const };
-					if (observations.has(dependencyKey(dependency))) continue;
-					const binding = await fingerprintBinding(dependency);
-					observations.set(dependencyKey(dependency), binding);
-					if (path.dirname(target) !== target) ancestors.push(path.dirname(target));
-					if (binding.link !== undefined) ancestors.push(path.resolve(path.dirname(target), binding.link));
-				}
 				if (dependencies && this.reliable) precise = this.acquirePreciseWatches(normalized);
-				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view)) observations.set(dependencyKey(observation), observation);
+				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
+					dependencies ? { root: this.root, observations } : undefined)) observations.set(dependencyKey(observation), observation);
 			};
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
 			if (dependencies) await capture(dependencies);
@@ -505,8 +496,36 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	return true;
 }
 
-async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView) {
-	const context = { realRoot, excludes, view, nearestExisting: missingResourceResolver(realRoot) };
+async function fingerprintDependencies(
+	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
+	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
+) {
+	const context: FingerprintContext = { realRoot, excludes, view, nearestExisting: missingResourceResolver(realRoot),
+		capture: (target) => fingerprintIO(() => captureFilesystemEntry(target)) };
+	if (bindings) {
+		// One eager capture owns the namespace evidence shared by every dependency and recursive child.
+		const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
+		const capture = (target: string) => {
+			const key = filesystemPathKey(target), previous = entries.get(key);
+			if (previous) return previous;
+			const pending = fingerprintIO(() => captureFilesystemEntry(target)).then((entry) => {
+				// File and missing fingerprints own their leaf identity; binding evidence owns the namespace.
+				if (entry.info.isDirectory() || entry.link !== undefined) {
+					const dependency = { path: target, scope: "binding" as const };
+					bindings.observations.set(dependencyKey(dependency), { ...dependency, fingerprint: "binding", stamp: digest([statStamp(entry.info), entry.link]) });
+				}
+				return entry;
+			});
+			entries.set(key, pending); return pending;
+		};
+		await capture(bindings.root);
+		context.capture = async (target, scope) => {
+			for await (const entry of walkFilesystemPath(target, { capture, followFinal: scope !== "entry" })) {
+				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
+			}
+			return capture(target);
+		};
+	}
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
 		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, context);
@@ -515,16 +534,15 @@ async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDepen
 }
 
 async function fingerprintBinding(dependency: ResourceDependency) {
-	let stamp: string | undefined, link: string | undefined;
+	let stamp: string;
 	try {
-		const captured = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity"));
-		link = captured.link;
-		stamp = digest([statStamp(captured.info), link]);
+		const { info, link } = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity"));
+		stamp = digest([statStamp(info), link]);
 	} catch (error) {
 		if (!missingResource(error)) throw error;
 		stamp = errorCode(error);
 	}
-	return { ...dependency, fingerprint: "binding", stamp, link, bytesRead: 0, filesRead: 0 };
+	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
 }
 
 type FingerprintResult = {
@@ -539,6 +557,7 @@ type FingerprintContext = {
 	readonly excludes: ReadonlySet<string>;
 	readonly nearestExisting: (target: string) => Promise<string>;
 	readonly view?: ResourceReadView;
+	capture: (target: string, scope: ResourceDependency["scope"]) => ReturnType<typeof captureFilesystemEntry>;
 };
 
 async function fingerprintPath(
@@ -551,7 +570,7 @@ async function fingerprintPath(
 	const { realRoot, excludes, nearestExisting, view } = context;
 	let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 	try {
-		captured = await fingerprintIO(() => captureFilesystemEntry(target));
+		captured = await context.capture(target, scope);
 	} catch (error) {
 		if (!missingResource(error)) throw error;
 		view?.capture(target, { type: "missing" });

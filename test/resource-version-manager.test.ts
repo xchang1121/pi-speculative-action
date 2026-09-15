@@ -368,6 +368,8 @@ describe("speculative action resource versions", () => {
 		const type = directory ? process.platform === "win32" ? "junction" : "dir" : "file";
 		if (relative) await fs.symlink("nested/deep", path.join(root, "parts"), "dir");
 		await fs.symlink(relative ? "parts/../deep/.git" : target, link, type); await fs.symlink(link, alias, type);
+		const query = path.join(root, "query");
+		if (relative) { await fs.mkdir(query); await fs.symlink(alias, path.join(query, "alias")); }
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture([{ path: alias, scope: directory ? "tree_content" : "content" }], 8192);
 		const snapshot = new ResourceVersionManager(root, { watch: false, snapshotExcludes: [".git"] });
@@ -396,17 +398,21 @@ describe("speculative action resource versions", () => {
 					view.seal(); expect((await manager.validate(lazy)).expired).toBe(false);
 				} finally { await lazy.release(); }
 			}
-			const leaf = directory ? path.join(alias, "value.txt") : alias, parked = path.join(root, "parked");
-			const observed = await manager.capture([{ path: leaf, scope: "content" }]);
-			await fs.rename(link, parked);
-			try {
-				await fs.symlink(directory ? outside : path.join(outside, "value.txt"), link, type);
-				expect(await fs.readFile(leaf, "utf8")).toBe("external"); // Actual Actor sees B, not the captured A.
-			} finally { await fs.rm(link, { force: true }); await fs.rename(parked, link); }
-			try {
-				expect(await fs.readFile(leaf, "utf8")).toBe("before");
-				expect((await manager.seal(observed)).expired).toBe(true); // Restoring the SAME junction can preserve Windows inode/ctime.
-			} finally { observed.release(); }
+			const leaf = directory ? path.join(alias, "value.txt") : alias;
+			for (const requested of [leaf, ...(relative ? [query] : [])]) for (const replaced of [link, ...(relative ? [path.dirname(target)] : [])]) {
+				const observed = await manager.capture([{ path: requested, scope: requested === query ? "tree_content" : "content" }]);
+				const parked = path.join(path.dirname(replaced), "parked");
+				await fs.rename(replaced, parked);
+				try {
+					if (replaced === link) await fs.symlink(directory ? outside : path.join(outside, "value.txt"), link, type);
+					else { await fs.mkdir(replaced); await fs.writeFile(path.join(replaced, ".git"), "external"); }
+					expect(await fs.readFile(leaf, "utf8")).toBe("external"); // Actor sees B while the original leaf and links remain intact.
+				} finally { await fs.rm(replaced, { force: true, recursive: replaced !== link }); await fs.rename(parked, replaced); }
+				try {
+					expect(await fs.readFile(leaf, "utf8")).toBe("before");
+					expect((await manager.seal(observed)).expired).toBe(true); // Restoring the same directory or junction cannot certify the window.
+				} finally { await observed.release(); }
+			}
 			expect((await snapshot.validate(baseline)).expired).toBe(false);
 			await fs.writeFile(content, "after!");
 			expect((await snapshot.validate(baseline)).expired).toBe(true); // Visible aliases retain their excluded targets' evidence.

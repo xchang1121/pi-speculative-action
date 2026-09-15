@@ -141,25 +141,30 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 }
 
 /** Resolve link targets component by component, retaining each stable namespace observation. */
-export async function* walkFilesystemPath(target: string, start = path.parse(target).root) {
+export async function* walkFilesystemPath(target: string, options: {
+	readonly start?: string;
+	readonly followFinal?: boolean;
+	readonly capture?: typeof captureFilesystemEntry;
+} = {}) {
+	const start = options.start ?? path.parse(target).root;
 	let current = start, links = 0;
 	const pending = target.slice(start.length).split(path.sep).filter(Boolean);
 	for (;;) {
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>> | undefined;
-		try { captured = await captureFilesystemEntry(current); }
+		try { captured = await (options.capture ?? captureFilesystemEntry)(current); }
 		catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
-		const { info, link } = captured ?? {}, terminal = link === undefined && pending.length === 0;
+		const { info, link } = captured ?? {}, terminal = pending.length === 0 && (link === undefined || options.followFinal === false);
 		if (links && (!info || terminal)) {
 			// Magic links name kernel handles; their displayed pathname need not identify that object.
-			const actual = await fs.stat(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+			const actual = await (options.followFinal === false ? fs.lstat : fs.stat)(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "ENOENT") throw error;
 			});
 			if (info ? !actual || !sameFilesystemIdentity(info, actual) : actual) throw new Error("filesystem_link_resolution_changed");
 		}
 		yield { path: current, info, link, terminal };
-		if (!info) return;
+		if (!info || terminal) return;
 		if (link !== undefined) {
 			if (++links > 40) throw new Error(`resource_symlink_cycle:${target}`);
 			const root = path.parse(link).root;
@@ -177,7 +182,7 @@ export async function* walkFilesystemPath(target: string, start = path.parse(tar
 export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
 	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target);
 	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
-	for await (const entry of walkFilesystemPath(resolvedTarget, resolvedRoot)) {
+	for await (const entry of walkFilesystemPath(resolvedTarget, { start: resolvedRoot })) {
 		const first = entry.path === resolvedRoot, info = entry.info;
 		if (!info) {
 			if (first) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`);
