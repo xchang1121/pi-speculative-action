@@ -145,14 +145,21 @@ export async function* walkFilesystemPath(target: string, start = path.parse(tar
 	let current = start, links = 0;
 	const pending = target.slice(start.length).split(path.sep).filter(Boolean);
 	for (;;) {
-		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
+		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>> | undefined;
 		try { captured = await captureFilesystemEntry(current); }
 		catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			yield { path: current }; return;
 		}
-		const { info, link } = captured;
-		yield { path: current, info, link, terminal: link === undefined && pending.length === 0 };
+		const { info, link } = captured ?? {}, terminal = link === undefined && pending.length === 0;
+		if (links && (!info || terminal)) {
+			// Magic links name kernel handles; their displayed pathname need not identify that object.
+			const actual = await fs.stat(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ENOENT") throw error;
+			});
+			if (info ? !actual || !sameFilesystemIdentity(info, actual) : actual) throw new Error("filesystem_link_resolution_changed");
+		}
+		yield { path: current, info, link, terminal };
+		if (!info) return;
 		if (link !== undefined) {
 			if (++links > 40) throw new Error(`resource_symlink_cycle:${target}`);
 			const root = path.parse(link).root;

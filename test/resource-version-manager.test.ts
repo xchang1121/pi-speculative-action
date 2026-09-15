@@ -322,10 +322,11 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
-	test.runIf(process.platform === "linux")("hashes the pinned image through aliases after its pathname changes", async () => {
+	test.runIf(process.platform === "linux")("distinguishes pinned images from pathname snapshots after alias targets change", async () => {
 		for (const change of ["replace", "unlink", "rewrite"]) {
 			const root = await workspace({ image: "old" }), file = path.join(root, "image"), handle = await fs.open(file, "r");
 			const alias = `/proc/self/fd/${handle.fd}`, digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+			const manager = new ResourceVersionManager(path.parse(root).root, { watch: false });
 			try {
 				expect(await hashExecutableFile(alias)).toBe(digest("old"));
 				if (change === "replace") { await fs.rename(file, path.join(root, "old")); await fs.writeFile(file, "new"); }
@@ -333,7 +334,24 @@ describe("speculative action resource versions", () => {
 				else await fs.writeFile(file, "new");
 				expect(await hashExecutableFile(alias)).toBe(digest(change === "rewrite" ? "new" : "old"));
 				await expect(captureStableFile(alias)).rejects.toThrow("not_regular_file");
-			} finally { await handle.close(); }
+				for (const decoy of change === "unlink" ? [false, true] : [false]) {
+					if (decoy) {
+						const displayed = await fs.readlink(alias); expect(path.dirname(displayed)).toBe(root);
+						await fs.writeFile(displayed, "decoy");
+					}
+					const metadata = await manager.capture([{ path: alias, scope: "entry" }], 8192), lazy = await manager.capture(undefined, 8192);
+					const open = vi.spyOn(fs, "open");
+					try {
+						expect((await manager.validate(metadata)).expired).toBe(false);
+						expect((await metadata.view!.stat(alias, "entry")).type).toBe("symlink");
+						if (change === "unlink") {
+							await expect(manager.capture([{ path: alias, scope: "content" }], 8192)).rejects.toThrow("filesystem_link_resolution_changed");
+							await expect(lazy.view!.readFile(alias)).rejects.toThrow("filesystem_link_resolution_changed");
+							expect(open).not.toHaveBeenCalled();
+						} else expect((await lazy.view!.readFile(alias)).toString()).toBe(change === "rewrite" ? "new" : "old");
+					} finally { open.mockRestore(); await metadata.release(); await lazy.release(); }
+				}
+			} finally { manager.close(); await handle.close(); }
 		}
 	});
 
