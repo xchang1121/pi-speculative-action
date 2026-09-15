@@ -54,11 +54,6 @@ export interface PlanRuntimeNode {
 	readonly predictionState: PredictionOpportunityState;
 }
 
-export interface RetiredPlanNode {
-	readonly node: PlanRuntimeNode;
-	readonly opportunity: PredictionOpportunity;
-}
-
 export type PlanRuntimePromotion =
 	| { readonly status: "scheduled"; readonly node: PlanRuntimeNode }
 	| { readonly status: "waiting" | "blocked" | "settled" | "already_dispatched" | "missing" };
@@ -69,7 +64,7 @@ export type PlanRuntimeUpdateResult =
 			readonly plan: MaterializedPlan;
 			readonly upserted: readonly PlanAction[];
 			readonly removed: readonly string[];
-			readonly retired: readonly RetiredPlanNode[];
+			readonly retired: readonly PlanRuntimeNode[];
 	  }
 	| {
 			readonly accepted: false;
@@ -421,16 +416,11 @@ export class PlanRuntime {
 		}
 		const removed = current ? [...current.nodes.keys()].filter((id) => !input.actions.has(id)) : [];
 		const retiredIDs = new Set([...removed, ...replaced]);
-		const retired: RetiredPlanNode[] = [];
+		const retired: PlanRuntimeNode[] = [];
 		if (current) {
 			for (const id of retiredIDs) {
 				const node = current.nodes.get(id);
-				if (node) {
-					retired.push({
-						node: this.snapshot(current, node),
-						opportunity: node.opportunity,
-					});
-				}
+				if (node) retired.push(this.snapshot(current, node));
 			}
 		}
 
