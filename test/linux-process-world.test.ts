@@ -582,7 +582,7 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test.for([false, true])("shares PATH alias probes while preserving mappings and owned cancellation (cancel=%s)", { timeout: 15_000 }, async (cancel, { skip }) => {
+	test.for([false, true])("replenishes shared PATH alias probes while preserving mappings and owned cancellation (cancel=%s)", { timeout: 15_000 }, async (cancel, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-interposition-cancel-");
 		const { realpath: resolvePath } = await vi.importActual<typeof filesystem>("node:fs/promises");
@@ -623,6 +623,7 @@ describe("Linux process ExecutionWorld", () => {
 				actionNamespace: "cancel-interposition", executionFingerprint, signal: controller.signal });
 			void running.then(() => { returned = true; }, () => { returned = true; });
 			await Promise.race([entered.promise, running]); if (cancel) controller.abort(); await nextTurn();
+			if (!cancel) await expect.poll(() => probes.size, { timeout: 1000 }).toBe(33);
 			expect({ returned, owned: existsSync(activeRoot!) }).toEqual({ returned: false, owned: true });
 			gate.resolve();
 			if (cancel) await expect(running).rejects.toThrow();
