@@ -429,7 +429,7 @@ export class LinuxProcessReuseBackend {
 					timing = processTimingIdentity(prototype, weakKey);
 					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded", expectedSpeculativeDurationMs: 1 });
 					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
-					const plan = await this.plan(weakKey, projection, acceptProducer);
+					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
 					if (!plan) return this.actorReplayMiss(host, request, timing);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
@@ -638,6 +638,7 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandRequests");
 		const plan = await this.plan(
 			processWeakKey(prototype),
+			prototype.executablePath,
 			session.projection,
 			(candidate) => compatibleProducer(session.producer, candidate),
 			session,
@@ -807,10 +808,10 @@ export class LinuxProcessReuseBackend {
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
 			weakKey,
-			(live, excluded) => this.plan(weakKey, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
+			(live, excluded) => this.plan(weakKey, prototype.executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
 			session.signal,
 			session.scope,
-			{ ownership: session.ownership },
+			{ ownership: session.ownership, executablePath: prototype.executablePath },
 		);
 		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired);
 		if (!acquired.work) throw new Error("process work reservation failed");
@@ -827,7 +828,7 @@ export class LinuxProcessReuseBackend {
 		lookup: ProcessHandoffLookup<CompletedProcessPlan>,
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
-		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership },
+		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
 		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
@@ -853,7 +854,7 @@ export class LinuxProcessReuseBackend {
 					throwIfAborted(signal);
 					return "miss";
 				},
-			} : { role: "producer" as const, ownership: participant.ownership }),
+			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
 		});
 		return {
 			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer } : {}),
@@ -866,6 +867,7 @@ export class LinuxProcessReuseBackend {
 
 	private async plan(
 		weakKey: Sha256Digest,
+		executablePath: string,
 		projection: ExecutionPathProjection,
 		acceptProducer: (producer: ProcessProducerProof) => boolean,
 		session?: ActiveSession,
@@ -874,6 +876,7 @@ export class LinuxProcessReuseBackend {
 	): Promise<CompletedProcessPlan | undefined> {
 		const plan = await this.planner.plan({
 			weakKey,
+			executablePath,
 			acceptProducer,
 			excludedCertificates,
 			contract: {
@@ -940,6 +943,12 @@ export class LinuxProcessReuseBackend {
 				return { kind: "continue" };
 			}
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
+			const executablePath = projection.toLogical(snapshot.executable);
+			if (!this.handoffs.mayHaveExecutable(executablePath) && !(await this.store.mayHaveCertificates(executablePath)) &&
+				!this.handoffs.mayHaveExecutable(executablePath)) {
+				this.addActor("misses");
+				return { kind: "continue" };
+			}
 			const prototype = bufferedProcessPrototype(
 				snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`),
 				await this.resolvePlatformFingerprint(),
@@ -950,7 +959,7 @@ export class LinuxProcessReuseBackend {
 				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(
 				weakKey,
-				(live, excluded) => this.plan(weakKey, projection, accepted, undefined, live, excluded),
+				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded),
 				process.signal,
 				scope,
 				{ timing },

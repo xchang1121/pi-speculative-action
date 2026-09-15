@@ -41,6 +41,8 @@ describe("ProcessHandoffRegistry", () => {
 		for (const scope of [SCOPE, OTHER_SCOPE]) for (const [stored, failure] of [[false, undefined], [undefined, new Error("store unavailable")]] as const) {
 			const fixture = await producer();
 			expect(fixture.registry.hasResults).toBe(true);
+			expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(true);
+			expect(fixture.registry.mayHaveExecutable("/unrelated/executable")).toBe(false);
 			const persistenceStarted = deferred<void>();
 			const persistence = deferred<boolean>();
 			const publishing = fixture.publish(() => {
@@ -66,6 +68,7 @@ describe("ProcessHandoffRegistry", () => {
 			await expect(acquireActor(fixture, lookup, undefined, scope)).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
 			fixture.registry.clearCompleted();
 			expect(fixture.registry.hasResults).toBe(false);
+			expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
 			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
 		}
 	});
@@ -179,6 +182,7 @@ describe("ProcessHandoffRegistry", () => {
 		const fixture = await producer(oneShot);
 		const parallelProducer = await fixture.registry.acquire({
 			key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: async () => undefined,
+			executablePath: fixture.certificate.prototype.executablePath,
 		});
 		if (parallelProducer.kind !== "work") throw new Error("independent producers must not wait for each other");
 		const waitGate = gated();
@@ -239,6 +243,7 @@ async function producer(oneShot = false, registry = new ProcessHandoffRegistry(8
 		key,
 		scope,
 		role: "producer",
+		executablePath: certificate.prototype.executablePath,
 		ownership,
 		lookup: async () => undefined,
 	});

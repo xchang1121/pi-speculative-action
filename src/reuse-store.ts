@@ -176,7 +176,7 @@ export class ProvenanceCertificateStore {
 				Buffer.from(stableStringify(owned), "utf8"),
 			);
 			if ((await this.get(owned.id))?.id !== owned.id) throw new Error("certificate publication failed");
-			await publishImmutable(this.weakReferencePath(owned.weakKey, owned.id), new Uint8Array());
+			await publishImmutable(this.weakReferencePath(owned), new Uint8Array());
 			return published;
 		});
 		if (Date.now() >= this.gcDueAt) {
@@ -200,10 +200,11 @@ export class ProvenanceCertificateStore {
 		return certificate;
 	}
 
-	async findByWeakKey(weakKey: Sha256Digest, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
+	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
 		let names: string[];
+		const directory = this.weakIndexDirectory(weakKey, executablePath);
 		try {
-			names = await readdir(this.weakIndexDirectory(weakKey));
+			names = await readdir(directory);
 		} catch (error) {
 			if (missing(error)) return [];
 			throw error;
@@ -214,7 +215,7 @@ export class ProvenanceCertificateStore {
 			if (!match) continue;
 			const id: Sha256Digest = `sha256:${match[1]}`;
 			if (excludedCertificates?.has(id)) continue;
-			const reference = path.join(this.weakIndexDirectory(weakKey), name);
+			const reference = path.join(directory, name);
 			const certificate = await this.get(id);
 			if (certificate?.weakKey === weakKey) certificates.push(certificate);
 			else await rm(reference, { force: true });
@@ -224,8 +225,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	/** Cheap conservative hint: empty shards and IO uncertainty still retain the replay route. */
-	async mayHaveCertificates(): Promise<boolean> {
-		try { return (await readdir(this.managedPath("certificates"))).length > 0; }
+	async mayHaveCertificates(executablePath?: string): Promise<boolean> {
+		try { return (await readdir(executablePath === undefined ? this.managedPath("certificates") : this.executableIndexDirectory(executablePath))).length > 0; }
 		catch (error) { return !missing(error); }
 	}
 
@@ -287,7 +288,7 @@ export class ProvenanceCertificateStore {
 			...removed.map((record) => rm(record.path, { force: true })),
 			...removed.flatMap((record) =>
 				record.certificate
-					? [rm(this.weakReferencePath(record.certificate.weakKey, record.certificate.id), { force: true })]
+					? [rm(this.weakReferencePath(record.certificate), { force: true })]
 					: [],
 			),
 			...orphans.map((artifact) => rm(artifact.path, { force: true })),
@@ -348,13 +349,16 @@ export class ProvenanceCertificateStore {
 		return path.join(this.root, "certificates", hex.slice(0, 2), `${hex.slice(2)}.json`);
 	}
 
-	private weakIndexDirectory(weakKey: Sha256Digest): string {
-		const hex = digestHex(weakKey);
-		return path.join(this.root, "indexes", "weak", hex.slice(0, 2), hex.slice(2));
+	private executableIndexDirectory(executablePath: string): string {
+		return path.join(this.root, "indexes", "executable", digestHex(sha256Digest(executablePath)));
 	}
 
-	private weakReferencePath(weakKey: Sha256Digest, id: Sha256Digest): string {
-		return path.join(this.weakIndexDirectory(weakKey), `${digestHex(id)}.ref`);
+	private weakIndexDirectory(weakKey: Sha256Digest, executablePath: string): string {
+		return path.join(this.executableIndexDirectory(executablePath), digestHex(weakKey));
+	}
+
+	private weakReferencePath(certificate: ProcessProvenanceCertificate): string {
+		return path.join(this.weakIndexDirectory(certificate.weakKey, certificate.prototype.executablePath), `${digestHex(certificate.id)}.ref`);
 	}
 
 	private managedPath(segment: typeof STORE_SEGMENTS[number]): string {

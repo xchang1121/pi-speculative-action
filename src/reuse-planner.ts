@@ -26,6 +26,8 @@ export interface ReplayObservationContract {
 export interface ProcessReuseRequest {
 	/** Static exec identity already derived from the caller's bound invocation; not replay authority. */
 	readonly weakKey: Sha256Digest;
+	/** Coarse index partition; the full weak key and current evidence still authorize reuse. */
+	readonly executablePath: string;
 	readonly contract: ReplayObservationContract;
 	readonly validation?: ProvenanceValidationContext;
 	/** Optional host policy for accepting proof produced under a different execution authority. */
@@ -112,7 +114,7 @@ export class ProcessReusePlanner {
 			...(request.validation?.acceptedTaints ?? []),
 			...(live.length ? request.live!.acceptedTaints : []),
 		])];
-		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.excludedCertificates);
+		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
 		candidateCertificates = certificates.length;
 		if (!certificates.length) {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };

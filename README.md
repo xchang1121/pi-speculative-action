@@ -64,6 +64,8 @@ npm run setup:linux
 
 安装器构建并验证固定版本的后端；Runtime 使用前仍会自检。可选 fuse-overlayfs 通过完整资格后用于大型工作区，不可用时保留 Git。WSL checkout 应放在 Linux 原生文件系统中。
 
+持久进程缓存按可执行文件路径组织索引；旧目录布局的缓存需清空后重新预热。路径检索只用于排除未命中，复用仍验证完整执行身份、当前依赖和效果闭包。
+
 ### Actor probe
 
 `selfSpeculation` 默认关闭，只对权威 Actor 流生效。`sidecar` 需要实现 `/self-speculation/fork`、`candidates`、`clear` 的服务；`provider` 需要真正支持相应 SPORK 协议和概率证据的推理端，普通兼容 API 不因此获得自投机能力。

@@ -36,6 +36,7 @@ type HandoffState =
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
+	readonly executablePath: string;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly settle: () => void;
 }
@@ -55,7 +56,7 @@ type AcquireOptions<Plan> = {
 	readonly scope?: ExecutionScope;
 	readonly lookup: ProcessHandoffLookup<Plan>;
 } & (
-	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership }
+	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
 	| {
 			readonly role: "actor";
 			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss">;
@@ -79,6 +80,12 @@ export class ProcessHandoffRegistry {
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean { return this.byKey.size > 0; }
+
+	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
+	mayHaveExecutable(executablePath: string): boolean {
+		for (const records of this.byKey.values()) if (records.some(record => record.executablePath === executablePath)) return true;
+		return false;
+	}
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
@@ -112,7 +119,7 @@ export class ProcessHandoffRegistry {
 				historyChecked = true;
 				continue; // A candidate may have completed while history was being read.
 			}
-			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.ownership, scope), joined };
+			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
 			// Waiting grants no transfer authority; only repeatable sealed evidence may cross turns.
 			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, scope)) ??
 				records.find((record) => record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
@@ -155,12 +162,13 @@ export class ProcessHandoffRegistry {
 		this.byKey.clear();
 	}
 
-	private reserve(key: Sha256Digest, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): ProcessHandoff {
+	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): ProcessHandoff {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const record: HandoffRecord = {
 			completion,
+			executablePath,
 			scope,
 			ownership,
 			startedAt: performance.now(),

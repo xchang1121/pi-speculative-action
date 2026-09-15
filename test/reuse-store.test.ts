@@ -33,6 +33,8 @@ describe("persistent provenance store", () => {
 		expect(duplicateArtifact).toEqual(first);
 		expect(await initial.mayHaveCertificates()).toBe(false);
 		const certificate = completed(first, 123);
+		const executablePath = certificate.prototype.executablePath;
+		expect(await initial.mayHaveCertificates(executablePath)).toBe(false);
 		const duplicate = completed(first, 456, "test", 999);
 		expect(duplicate.id).toBe(certificate.id);
 		const { id: _id, ...legacyBody } = certificate;
@@ -47,12 +49,16 @@ describe("persistent provenance store", () => {
 		expect(await initial.mayHaveCertificates()).toBe(true);
 
 		const reopened = new ProvenanceCertificateStore(root);
+		expect(await reopened.mayHaveCertificates(executablePath)).toBe(true);
+		expect(await reopened.mayHaveCertificates("/unrelated/executable")).toBe(false);
 		expect(await reopened.artifacts.get(first)).toEqual(Buffer.from("output bytes"));
 		expect(await reopened.get(certificate.id)).toEqual(certificate);
 		const get = vi.spyOn(reopened, "get");
-		expect(await reopened.findByWeakKey(certificate.weakKey, new Set([certificate.id]))).toEqual([]);
+		expect(await reopened.findByWeakKey(certificate.weakKey, executablePath, new Set([certificate.id]))).toEqual([]);
 		expect(get).not.toHaveBeenCalled();
-		expect(await reopened.findByWeakKey(certificate.weakKey)).toEqual([certificate]);
+		expect(await reopened.findByWeakKey(certificate.weakKey, "/unrelated/executable")).toEqual([]);
+		expect(get).not.toHaveBeenCalled();
+		expect(await reopened.findByWeakKey(certificate.weakKey, executablePath)).toEqual([certificate]);
 		expect(get).toHaveBeenCalledOnce(); get.mockRestore();
 		const cachedStats = await reopened.stats();
 		expect(cachedStats).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0 });
@@ -133,10 +139,13 @@ describe("persistent provenance store", () => {
 		await store.clear();
 		expect(await store.stats()).toMatchObject({ certificates: 0, artifacts: 0, totalBytes: 0 });
 		expect(await store.mayHaveCertificates()).toBe(false);
+		expect(await store.mayHaveCertificates(executablePath)).toBe(false);
 		await filesystem.mkdir(path.join(root, "certificates", "00"), { recursive: true });
 		expect(await store.mayHaveCertificates()).toBe(true);
-		const unavailable = vi.spyOn(filesystem, "readdir").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
-		try { expect(await store.mayHaveCertificates()).toBe(true); } finally { unavailable.mockRestore(); }
+		for (const partition of [undefined, executablePath]) {
+			const unavailable = vi.spyOn(filesystem, "readdir").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+			try { expect(await store.mayHaveCertificates(partition)).toBe(true); } finally { unavailable.mockRestore(); }
+		}
 		expect(closure?.read(secondArtifact).toString("utf8")).toBe("second");
 	});
 
