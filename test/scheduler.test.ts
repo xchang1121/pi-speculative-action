@@ -287,9 +287,11 @@ describe("SpeculationScheduler", () => {
 		expect(joinDecision(scheduler, first)).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25, expectedNetBenefitMs: 99 });
 
 		const cold = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
-		cold.observeSpeculativeService(first, 900);
-		expect(joinDecision(cold, second)).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
-		expect(cold.evaluate([forecast({ ...second, expectedDurationMs: 200 })])).toMatchObject({ expectedDurationMs: 900 });
+		for (const [duration, count] of [[900, 1], [900, 63], [450, 64], [1800, 64]] as const) {
+			for (let sample = 0; sample < count; sample++) cold.observeSpeculativeService(first, duration);
+			expect(joinDecision(cold, second)).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
+			expect(cold.evaluate([forecast({ ...second, expectedDurationMs: 200 })])).toMatchObject({ expectedDurationMs: duration });
+		}
 	});
 
 	it("promotes shared work on foreground evidence and lets background work yield", () => {

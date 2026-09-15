@@ -49,12 +49,6 @@ export interface CandidateJoinPolicy {
 	readonly durationSlack: number;
 }
 
-const DEFAULT_CANDIDATE_JOIN_POLICY: CandidateJoinPolicy = Object.freeze({
-	minNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
-	warmupWaitMs: 25,
-	durationSlack: 1.25,
-});
-
 export interface CandidateJoinRequest {
 	/** Producer service; omitted consumer/adoption identities preserve exact-replay callers. */
 	readonly identity: ServiceTimingIdentity;
@@ -153,7 +147,13 @@ export class SpeculationScheduler<Job extends object> {
 	private decisionSequence = 0;
 
 	constructor(options: { readonly candidateJoinPolicy?: Partial<CandidateJoinPolicy> } = {}) {
-		this.candidateJoinPolicy = normalizeCandidateJoinPolicy(options.candidateJoinPolicy);
+		const policy = options.candidateJoinPolicy;
+		this.candidateJoinPolicy = Object.freeze({
+			minNetBenefitMs: finite(policy?.minNetBenefitMs ?? DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs),
+			...(policy?.uncalibratedWaitMs === undefined ? {} : { uncalibratedWaitMs: finite(policy.uncalibratedWaitMs) }),
+			warmupWaitMs: finite(policy?.warmupWaitMs ?? 25),
+			durationSlack: Math.max(1, finite(policy?.durationSlack ?? 1.25)),
+		});
 	}
 
 	admit(
@@ -443,6 +443,7 @@ interface TimingEstimate {
 
 class SampleWindow {
 	private readonly values: number[] = [];
+	private sortedValues?: number[];
 	private suppressedSinceProbe = 0;
 	private failures?: {
 		readonly count: number;
@@ -458,6 +459,7 @@ class SampleWindow {
 		const normalized = finite(value);
 		if (normalized <= 0) return;
 		this.suppressedSinceProbe = 0;
+		this.sortedValues = undefined;
 		this.values.push(normalized);
 		if (this.values.length > 64) this.values.shift();
 	}
@@ -487,7 +489,7 @@ class SampleWindow {
 
 	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
 		if (!this.values.length) return undefined;
-		const sorted = [...this.values].sort((left, right) => left - right);
+		const sorted = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
 		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
 		return sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!;
 	}
@@ -499,15 +501,6 @@ function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
 	const group = [identity.tool, identity.executionFingerprint ?? "", identity.operation ?? ""];
 	return [...(identity.actionKeyHash ? [JSON.stringify(["action", ...group, identity.actionKeyHash])] : []),
 		JSON.stringify(["class", ...group])];
-}
-
-function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | undefined): CandidateJoinPolicy {
-	return Object.freeze({
-		minNetBenefitMs: finite(policy?.minNetBenefitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.minNetBenefitMs),
-		...(policy?.uncalibratedWaitMs === undefined ? {} : { uncalibratedWaitMs: finite(policy.uncalibratedWaitMs) }),
-		warmupWaitMs: finite(policy?.warmupWaitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.warmupWaitMs),
-		durationSlack: Math.max(1, finite(policy?.durationSlack ?? DEFAULT_CANDIDATE_JOIN_POLICY.durationSlack)),
-	});
 }
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
