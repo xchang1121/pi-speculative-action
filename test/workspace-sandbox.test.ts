@@ -260,6 +260,8 @@ describe("workspace-branch ExecutionWorld", () => {
 			action,
 			execute: async (workspace) => {
 				await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "after\n", "utf8");
+				const metadata = path.join(workspace.sandboxRoot, ".git");
+				await rm(metadata, { force: true }); await writeFile(metadata, "gitdir: missing\n");
 				return boundary === "execute" ? { output: settlement("done"), changes: [
 					retained = fileTransition(root, "value.txt", "before\n", "after\n"),
 				] } : settlement("done");
