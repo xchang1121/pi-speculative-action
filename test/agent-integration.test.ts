@@ -1,5 +1,5 @@
 import { textResult } from "./result.ts";
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -124,12 +124,12 @@ describe("speculative action host", () => {
 		await writeFile(path.join(cwd, "other.txt"), "different content");
 		for (const ids of ["unique", "duplicate", "absent"]) for (const order of [[0, 1], [1, 0]]) {
 			const gates = [0, 1].map(() => ({ entered: deferred(), done: deferred() })), feedback: number[] = [];
-			const binding = deferred(), bindingEntered = deferred();
+			const binding = gated();
 			const identities: object[] = [], sameIdentity: boolean[] = [];
 			const complete = vi.fn(async () => { throw new Error("unexpected inference"); });
 			const host = createSpeculativeActionHost("session", { cwd, complete, executionWorlds: [],
 				resolveInvocation: async (_tool, input) => {
-					if ((input as { path: string }).path === "notes.txt") { bindingEntered.resolve(); await binding.promise; }
+					if ((input as { path: string }).path === "notes.txt") { await binding.wait(); }
 					return undefined;
 				},
 				getSettings: () => ({ ...settings(), drafterEnabled: false }),
@@ -150,13 +150,13 @@ describe("speculative action host", () => {
 							gates[index]!.entered.resolve(); await gates[index]!.done.promise; return output;
 						}));
 				}
-				await bindingEntered.promise;
+				await binding.entered;
 				const deadline = deferred<boolean>(), timer = setTimeout(() => deadline.resolve(false), 2000);
 				try {
 					expect(await Promise.race([gates[1]!.entered.promise.then(() => true), deadline.promise])).toBe(true);
 				} finally { clearTimeout(timer); }
 				expect(native.mock.calls).toEqual([[1]]);
-				binding.resolve(); await Promise.all(gates.map(({ entered }) => entered.promise));
+				binding.release(); await Promise.all(gates.map(({ entered }) => entered.promise));
 				for (const index of order) {
 					gates[index]!.done.resolve();
 					expect(await results[index]).toEqual(await tool.execute("oracle", inputs[index]!));
@@ -166,7 +166,7 @@ describe("speculative action host", () => {
 				expect(sameIdentity).toEqual([true, true]);
 				expect(native.mock.calls).toEqual([[1], [0]]); expect(complete).not.toHaveBeenCalled();
 			} finally {
-				binding.resolve();
+				binding.release();
 				for (const gate of gates) gate.done.resolve();
 				await Promise.allSettled(results); await host.dispose();
 			}
@@ -549,12 +549,12 @@ describe("speculative action host", () => {
 				environment: { PROFILE: "initial" }, shellArgs: ["--initial"] };
 			const descriptor = structuredClone(metadata);
 			const problem = new Error("selected executor unavailable");
-			const bindingStarted = deferred<void>(), releaseBinding = deferred<void>();
+			const bindingGate = gated();
 			const actor = vi.fn(async () => textResult("built"));
 			const settled = vi.fn();
 			const resolveInvocation = vi.fn(async () => {
 				const invocation = { executor: profile, identity: metadata, process: metadata };
-				bindingStarted.resolve(); await releaseBinding.promise;
+				await bindingGate.wait();
 				if (mode === "binding-error") throw problem;
 				return invocation;
 			});
@@ -584,13 +584,13 @@ describe("speculative action host", () => {
 					return actor();
 				});
 				const outcome = mode === "binding-error" ? expect(pending).rejects.toBe(problem) : expect(pending).resolves.toHaveProperty("content.0.text", "built");
-				await bindingStarted.promise; profile = "next"; mutableArgs.command = "changed during binding";
-				releaseBinding.resolve();
+				await bindingGate.entered; profile = "next"; mutableArgs.command = "changed during binding";
+				bindingGate.release();
 				await outcome;
 				await host.finishTurn("turn-1", true);
 				expect(resolveInvocation).toHaveBeenCalledOnce(); expect(actor).toHaveBeenCalledTimes(mode === "binding-error" ? 0 : 1);
 				if (keyed) { expect(settled).toHaveBeenCalledOnce(); expect(settled.mock.calls[0][0].action).toBe(boundKey); }
-			} finally { releaseBinding.resolve(); await host.dispose(); }
+			} finally { bindingGate.release(); await host.dispose(); }
 		}
 	});
 
@@ -651,12 +651,12 @@ describe("speculative action host", () => {
 	it.each(["running", "completed"].flatMap((phase) =>
 		(phase === "running" ? ["suffix", "preflight", "missing", "recheck"] : ["suffix", "preflight", "recheck"]).map((mode) => [phase, mode])))
 	("keeps %s Bash on exactly one Actor fallback when %s rejects reuse", async (phase, mode) => {
-		const cwd = await temporaryWorkspace(), started = deferred<void>(), finish = deferred<void>(), completed = deferred<void>();
+		const cwd = await temporaryWorkspace(), executionGate = gated(), completed = deferred<void>();
 		const actor = vi.fn(async () => textResult("tail arguments: -n 2"));
 		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor };
 		const dispose = vi.fn();
 		const sandbox = mockRuntimeWorld(async () => {
-			started.resolve(); await finish.promise;
+			await executionGate.wait();
 			return { result: textResult("tail arguments: -n 3"), isError: false };
 		}, dispose);
 		let allowed = mode !== "preflight";
@@ -679,7 +679,7 @@ describe("speculative action host", () => {
 		try {
 			await host.startTurn(startInput(tool));
 			if (["preflight", "missing"].includes(mode!)) await completed.promise;
-			else { await started.promise; if (phase === "completed") { finish.resolve(); await completed.promise; } }
+			else { await executionGate.entered; if (phase === "completed") { executionGate.release(); await completed.promise; } }
 			if (mode === "recheck") allowed = false;
 			const output = await host.execute({ turnID: "turn-1", id: "actor-bash", tool: "bash",
 				args: { command: `printf data 2>&1 | tail -n ${mode === "suffix" ? 2 : 3}` }, tools: [tool] }, undefined, actor);
@@ -693,7 +693,7 @@ describe("speculative action host", () => {
 			if (mode === "preflight") expect(events.find((event) => event.type === "prediction")).toMatchObject({ settlement: {
 				cause: { stage: "admission", code: phase === "running" ? "permission_or_policy" : "host_denied" },
 			} });
-		} finally { finish.resolve(); await host.dispose(); }
+		} finally { executionGate.release(); await host.dispose(); }
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
@@ -778,12 +778,12 @@ describe("speculative action host", () => {
 		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 });
 		const newer = patternAwareSettings({ ...older, maxContextLength: 3 });
 		const replacing = phase.startsWith("replaced"), newest = replacing ? patternAwareSettings({ ...older, maxContextLength: 4 }) : newer;
-		const loading = deferred(), resume = deferred();
+		const loading = gated();
 		const load = PatternAwareStore.prototype.load;
 		const observer = vi.spyOn(PatternAwareStore.prototype, "load").mockImplementation(async function (this: PatternAwareStore) {
 			stores.push(this);
 			if (stores.length === 2) {
-				loading.resolve(); await resume.promise;
+				await loading.wait();
 				if (phase.includes("load failure")) throw new Error("load failed");
 			}
 			return load.call(this);
@@ -796,7 +796,7 @@ describe("speculative action host", () => {
 			await propose(older);
 			if (phase === "flush failure") vi.spyOn(stores[0]!, "flush").mockRejectedValueOnce(new Error("flush failed"));
 			pending = Promise.allSettled([propose(newer), propose(newest)]);
-			await loading.promise;
+			await loading.entered;
 			if (phase === "closing") {
 				let closed = false;
 				closing = controller.dispose(); void closing.then(() => { closed = true; });
@@ -804,21 +804,21 @@ describe("speculative action host", () => {
 				expect(closed).toBe(false);
 				expect(controller.dispose()).toBe(closing);
 			}
-			resume.resolve();
+			loading.release();
 			expect((await pending).map(result => result.status)).toEqual([
 				phase.includes("load failure") ? "rejected" : "fulfilled", phase === "load failure" ? "rejected" : "fulfilled",
 			]);
 			if (phase !== "closing") {
 				await expect(propose(newest)).resolves.toBeUndefined();
-				const entered = deferred(), release = deferred(), store = stores.at(-1)!, flush = store.flush.bind(store);
+				const gate = gated(), store = stores.at(-1)!, flush = store.flush.bind(store);
 				if (phase === "flush failure") vi.spyOn(store, "flush").mockImplementationOnce(async () => {
-					entered.resolve(); await release.promise; await flush();
+					await gate.wait(); await flush();
 				});
 				let finished = false;
 				const finishing = controller.finishSession().then(() => { finished = true; });
 				try {
-					if (phase === "flush failure") { await entered.promise; await nextTurn(); expect(finished).toBe(false); }
-				} finally { release.resolve(); await finishing; }
+					if (phase === "flush failure") { await gate.entered; await nextTurn(); expect(finished).toBe(false); }
+				} finally { gate.release(); await finishing; }
 			}
 			await controller.dispose();
 			await expect(propose(newest)).rejects.toThrow("closed");
@@ -830,7 +830,7 @@ describe("speculative action host", () => {
 				try { expect(retired).not.toContain(fresh.store); } finally { await fresh.release(); }
 			}
 		} finally {
-			resume.resolve(); await pending; await closing; await controller.dispose();
+			loading.release(); await pending; await closing; await controller.dispose();
 			observer.mockRestore(); await Promise.allSettled(stores.map(store => store.flush()));
 		}
 	});
@@ -918,7 +918,7 @@ describe("speculative action host", () => {
 
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
 		const cwd = await temporaryWorkspace();
-		const permissionEntered = deferred<void>(), permissionReleased = deferred<void>();
+		const permissionGate = gated();
 		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
 		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
 		const events: SpeculativeActionEvent<string>[] = [];
@@ -993,7 +993,7 @@ describe("speculative action host", () => {
 			complete: async () => assistant([], "stop"),
 			preflight: async ({ args }) => {
 				if ((args as { path: string }).path === "notes.txt.sibling") {
-					permissionEntered.resolve(); await permissionReleased.promise;
+					await permissionGate.wait();
 				}
 				return true;
 			},
@@ -1027,10 +1027,10 @@ describe("speculative action host", () => {
 
 		await triggerFork("fork-hit");
 		try {
-			await permissionEntered.promise;
+			await permissionGate.entered;
 			await waitFor(() => events.some((event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "succeeded"));
 			expect(events.filter((event) => event.type === "candidate" && event.turnID === "fork-hit" && event.state.status === "running")).toHaveLength(1);
-		} finally { permissionReleased.resolve(); }
+		} finally { permissionGate.release(); }
 		await waitFor(
 			() => materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation").length === 2,
 		);
@@ -1107,23 +1107,23 @@ describe("speculative action host", () => {
 
 	it.each(["tools", "context", "model", "options", "empty", "invalid", "rejected"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
-		const entered = deferred<void>(), release = deferred<void>(), settled = deferred<void>();
+		const gate = gated(), settled = deferred<void>();
 		const rejected = phase === "invalid" || phase === "rejected", warms = phase === "empty" || rejected;
 		const complete = vi.fn(async () => {
-			if (warms) await entered.promise;
+			if (warms) await gate.entered;
 			if (phase === "empty") return assistant([], "stop");
 			return drafterCall(phase === "invalid" ? {} : { path: "notes.txt" });
 		});
 		const tool = createReadTool(cwd);
 		const world = toolRuntimeWorld(), prepare = vi.fn(async (_input: { signal?: AbortSignal }) => {
-			if (warms && prepare.mock.calls.length === 1) { entered.resolve(); await release.promise; }
+			if (warms && prepare.mock.calls.length === 1) { await gate.wait(); }
 		});
 		const getDraftOptions = vi.fn(async () => {
-			if (phase === "options") { entered.resolve(); await release.promise; }
+			if (phase === "options") { await gate.wait(); }
 			return {};
 		});
 		const draftModel = vi.fn(async () => {
-			if (phase === "model") { entered.resolve(); await release.promise; }
+			if (phase === "model") { await gate.wait(); }
 			return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
 		});
 		const host = createSpeculativeActionHost("session", {
@@ -1144,7 +1144,7 @@ describe("speculative action host", () => {
 			});
 			if (phase === "context" || phase === "tools") await settled.promise;
 			else {
-				await entered.promise;
+				await gate.entered;
 				if (warms) {
 					await settled.promise; await nextTurn();
 					expect(prepare.mock.calls[0]![0].signal?.aborted, "unusable results retire preparation before Actor arrival").toBe(true);
@@ -1152,17 +1152,17 @@ describe("speculative action host", () => {
 				closing = host.dispose().then(() => { closed = true; });
 				await nextTurn();
 				expect(closed).toBe(false);
-				release.resolve(); await closing;
+				gate.release(); await closing;
 			}
 			expect(complete).toHaveBeenCalledTimes(warms ? 1 : 0);
 			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 2 : warms ? 1 : 0);
 			expect(draftModel).toHaveBeenCalledTimes(phase === "tools" ? 0 : 1);
 			expect(getDraftOptions).toHaveBeenCalledTimes(["model", "tools", "context"].includes(phase) ? 0 : 1);
-		} finally { release.resolve(); await closing; await host.dispose(); }
+		} finally { gate.release(); await closing; await host.dispose(); }
 		if (phase === "context" || phase === "tools" || warms) return;
 
-		const sharing = deferred(), resume = deferred(), owners = [new AbortController(), new AbortController()];
-		const waitStage = async (stage: string) => { if (stage === phase) { sharing.resolve(); await resume.promise; } };
+		const sharing = gated(), owners = [new AbortController(), new AbortController()];
+		const waitStage = async (stage: string) => { if (stage === phase) { await sharing.wait(); } };
 		const selectModel = vi.fn(async () => { await waitStage("model"); return model("draft"); });
 		const options = vi.fn(async ({ signal }: { signal: AbortSignal }) => {
 			await waitStage("options"); signal.throwIfAborted(); return {};
@@ -1176,9 +1176,9 @@ describe("speculative action host", () => {
 		});
 		const proposals = owners.map((owner, index) => propose(owner, index));
 		try {
-			await sharing.promise; owners[0]!.abort();
+			await sharing.entered; owners[0]!.abort();
 			if (phase === "options") expect(options.mock.calls[0]![0].signal.aborted).toBe(false);
-			resume.resolve();
+			sharing.release();
 			const [cancelled, surviving] = await Promise.all(proposals);
 			expect(cancelled).toBeUndefined(); expect(surviving).toMatchObject({ actions: [{ tool: "read" }] });
 			expect(selectModel).toHaveBeenCalledOnce(); expect(options).toHaveBeenCalledOnce(); expect(complete).toHaveBeenCalledOnce();
@@ -1190,21 +1190,21 @@ describe("speculative action host", () => {
 			expect(prepareExecution).toHaveBeenCalledTimes(2);
 			later[0]!.abort(); expect(warming.aborted).toBe(false);
 			later[1]!.abort(); expect(warming.aborted).toBe(true);
-			const pending = deferred(), finish = deferred(), peer = new AbortController();
+			const completionGate = gated(), peer = new AbortController();
 			const peers = [peer, phase === "model" ? peer : new AbortController()];
 			complete.mockImplementationOnce(async () => assistant([], "stop"));
-			complete.mockImplementationOnce(async () => { pending.resolve(); await finish.promise; return drafterCall({ path: "notes.txt" }); });
+			complete.mockImplementationOnce(async () => { await completionGate.wait(); return drafterCall({ path: "notes.txt" }); });
 			const next = peers.map((owner, index) => propose(owner, index, "turn-3"));
 			try {
-				await pending.promise; expect(await next[0]).toBeUndefined();
+				await completionGate.entered; expect(await next[0]).toBeUndefined();
 				const warming = prepareExecution.mock.calls.at(-1)![1] as AbortSignal;
 				expect(warming.aborted, "an empty response cannot retire its live peer").toBe(false);
-				finish.resolve(); expect(await next[1]).toMatchObject({ actions: [{ tool: "read" }] });
+				completionGate.release(); expect(await next[1]).toMatchObject({ actions: [{ tool: "read" }] });
 				expect(warming.aborted).toBe(false);
 				shared.finishTurn("shared", "turn-3"); expect(warming.aborted).toBe(true);
-			} finally { finish.resolve(); peers.forEach(owner => owner.abort()); await Promise.allSettled(next); }
+			} finally { completionGate.release(); peers.forEach(owner => owner.abort()); await Promise.allSettled(next); }
 		} finally {
-			resume.resolve(); owners.forEach(owner => owner.abort()); shared.finishSession(); await Promise.allSettled(proposals);
+			sharing.release(); owners.forEach(owner => owner.abort()); shared.finishSession(); await Promise.allSettled(proposals);
 		}
 	});
 

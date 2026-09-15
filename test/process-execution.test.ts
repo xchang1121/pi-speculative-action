@@ -1,4 +1,4 @@
-import { deferred as barrier } from "./async.ts";
+import { gated, deferred as barrier } from "./async.ts";
 import { describe, expect, test, vi } from "vitest";
 import { ProcessExecutionCoordinator, type PreparedProcessExecutionRoute, type ProcessExecutor } from "../src/process-execution.ts";
 
@@ -6,7 +6,7 @@ describe("ProcessExecutionCoordinator", () => {
 	test.each(["preparing", "executing", "rejected", "thrown"] as const)("owns route retirement while %s", async (phase) => {
 		for (const dispose of [false, true]) for (const warm of [false, true]) {
 			const calls: string[] = [], prepared = barrier<PreparedProcessExecutionRoute>(), probing = barrier();
-			const executing = barrier(), finish = barrier(), resetting = barrier(), close = barrier();
+			const executing = barrier(), finish = barrier(), resetGate = gated();
 			let enabled = false, retired = false, active = 0;
 			const executor = (label: string): ProcessExecutor => ({ execute: async (request) => {
 				calls.push(`${label}:${request.command}`);
@@ -30,7 +30,7 @@ describe("ProcessExecutionCoordinator", () => {
 					return prepared.promise;
 				})();
 			});
-			const reset = vi.fn(async () => { retired = true; resetting.resolve(); await close.promise; });
+			const reset = vi.fn(async () => { retired = true; await resetGate.wait(); });
 			const coordinator = new ProcessExecutionCoordinator(executor("raw"), { enabled: () => enabled, prepare, reset });
 			const invoke = (command: string) => coordinator.operations.exec(command, "/work", { onData: () => {}, env: { PATH: "/bin" } });
 			expect(coordinator.actorDiagnostics().state).toBe("disabled");
@@ -69,9 +69,9 @@ describe("ProcessExecutionCoordinator", () => {
 			expect(prepare).toHaveBeenCalledOnce();
 			prepared.resolve({ state: "ready", detail: "ready", executor: executor("reuse") });
 			finish.resolve();
-			await resetting.promise;
+			await resetGate.entered;
 			prepare.mockResolvedValue({ state: "degraded", detail: "fresh", executor: executor("fresh") });
-			close.resolve();
+			resetGate.release();
 			expect(await started).toEqual([{ status: "fulfilled", value: { exitCode: 0 } }, { status: "fulfilled", value: { exitCode: 0 } }]);
 			expect((await during)[0]?.status).toBe("fulfilled");
 			expect((await retiredCalls).every((result) => result.status === "fulfilled")).toBe(true);

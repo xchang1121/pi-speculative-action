@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -57,12 +57,12 @@ describe("EffectTransactionCoordinator", () => {
 
 	it.each(["sealed", "reserved", "committed"] as const)("owns each validation window across %s adoption", async (phase) => {
 		for (const reuse of ["shared_result", "exclusive_branch"] as const) for (const changed of [false, true]) {
-			const entered = deferred(), gate = deferred();
+			const gate = gated();
 			let version = "A", hold = false;
 			const commit = vi.fn(async () => "sealed"), dispose = vi.fn();
 			const validate = vi.fn(async () => {
 				const captured = version;
-				if (hold) { hold = false; entered.resolve(); await gate.promise; }
+				if (hold) { hold = false; await gate.wait(); }
 				return captured === "A" ? { status: "valid" as const, metrics: metrics() }
 					: { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: metrics() };
 			});
@@ -71,12 +71,12 @@ describe("EffectTransactionCoordinator", () => {
 				async () => branch({ validate, commit, dispose }));
 			if (phase === "committed") { await transaction.validate(); await transaction.commit(); }
 			hold = true;
-			const first = transaction.validate(); await entered.promise;
+			const first = transaction.validate(); await gate.entered;
 			if (changed) version = "B";
 			const second = transaction.validate();
 			const adoption = phase === "reserved" ? Promise.allSettled([transaction.commit(), transaction.commit()]) : undefined;
 			const late = phase === "reserved" ? transaction.validate() : undefined;
-			gate.resolve();
+			gate.release();
 			try {
 				expect((await first).status).toBe("valid");
 				expect((await second).status).toBe(changed ? "stale" : "valid");
@@ -90,7 +90,7 @@ describe("EffectTransactionCoordinator", () => {
 				else await expect(transaction.commit()).resolves.toBe("sealed");
 				expect(validate).toHaveBeenCalledTimes(2 + Number(phase === "committed" || (phase === "reserved" && !changed)));
 				expect(commit).toHaveBeenCalledTimes(Number(phase === "committed" || !changed));
-			} finally { gate.resolve(); await Promise.allSettled([first, second, adoption, late]); await transaction.dispose(); }
+			} finally { gate.release(); await Promise.allSettled([first, second, adoption, late]); await transaction.dispose(); }
 			expect(dispose).toHaveBeenCalledOnce();
 		}
 	});

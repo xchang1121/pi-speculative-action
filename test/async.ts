@@ -12,3 +12,10 @@ export function barrier(expected = 1) {
 	const done = deferred();
 	return { promise: done.promise, arrive: () => { if (expected > 0 && --expected === 0) done.resolve(); } };
 }
+
+/** Observe callback entry and release it without introducing another promise turn. */
+export function gated(expected = 1) {
+	const entered = barrier(expected), released = barrier();
+	return { entered: entered.promise, release: released.arrive,
+		wait: () => { entered.arrive(); return released.promise; } };
+}
