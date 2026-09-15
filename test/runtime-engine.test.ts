@@ -405,7 +405,7 @@ describe("structural speculative runtime", () => {
 
 	it.each(["requests", "single", "batch", "revisions", "observed", "observed-terminal", "observed-disabled", "observed-disposed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
 		const slow = gated(), executed: string[] = [];
-		const independentStarted = barrier(mode === "single" ? 1 : 2);
+		const independentStarted = barrier(mode === "single" || mode === "revisions" || mode === "observed" ? 1 : 2);
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
 		const keyed: string[] = [];
 		const replacements: MaterializedSpeculativeCandidate<string>[] = [];
@@ -416,8 +416,10 @@ describe("structural speculative runtime", () => {
 			] },
 			plan("proposal:1", { path: "other-plan.ts" }),
 		];
-		const revisions = [proposals[0]!, { ...plan("proposal:0", { path: "replacement.ts" }), revision: 1 }, proposals[1]!];
-		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, remove: ["slow"],
+		const revisions = [proposals[0]!, { ...proposals[0]!, revision: 1 },
+			{ ...plan("proposal:0", { path: "replacement.ts" }), revision: 2 }, proposals[1]!];
+		const observed = [proposals[0]!, { proposalID: "proposal:0", source: "source", revision: 1, upsert: proposals[0]!.actions },
+			{ proposalID: "proposal:0", source: "source", revision: 2, remove: ["slow"],
 			upsert: [readAction("same-plan", { path: "replacement.ts" })] }, proposals[1]!];
 		const revised = mode === "revisions" || mode === "observed";
 		const observation = mode.startsWith("observed"), retiring = observation && !revised;
@@ -426,12 +428,20 @@ describe("structural speculative runtime", () => {
 			propose: ({ proposalIndex }) => observation ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
 			observe: ({ concrete }) => observation && concrete.path === "seed.ts" ? retiring ? proposals : observed : undefined,
 		});
-		const { runtime } = harness({
+		const { runtime, events } = harness({
 			source,
 			actionKey: async (tool, args, context) => {
 				if (context.type === "start") {
 					keyed.push(String((args as { path?: unknown }).path));
-					if (keyed.at(-1) === "slow.ts") { await slow.wait(); }
+					if (keyed.at(-1) === "slow.ts") {
+						if (revised) {
+							const revision = mode === "revisions" ? revisions[2]! : observed[2]!;
+							Object.assign(revision, { [mode === "revisions" ? "id" : "proposalID"]: "proposal:1", revision: 3 });
+							const replacement = "actions" in revision ? revision.actions![0]! : revision.upsert![0]!;
+							replacement.id = "drifted"; replacement.input.path = "drifted-replacement.ts";
+						}
+						await slow.wait();
+					}
 				}
 				return buildPiActionKey(tool, args, "/workspace");
 			},
@@ -451,23 +461,17 @@ describe("structural speculative runtime", () => {
 				await runFallback(runtime, seed, 1, "Actor");
 			}
 			await slow.entered; await independentStarted.promise;
-			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), "same-plan.ts"]);
-			expect(keyed).not.toContain("replacement.ts");
+			if (revised) {
+				expect(keyed).toContain("replacement.ts"); await replacementReady.promise;
+				expect(keyed.filter(path => path === "slow.ts")).toHaveLength(1);
+				expect(keyed).not.toContain("drifted-replacement.ts");
+			} else expect(keyed).not.toContain("replacement.ts");
+			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), revised ? "replacement.ts" : "same-plan.ts"]);
 			if (retiring) {
 				let closed = false;
 				const closing = runtime.finishTurn(call(turnID)).then(() => { closed = true; });
 				await nextTurn(); expect(closed).toBe(true); await closing;
 				turnID = "next-decision"; await runtime.startTurn(start(turnID));
-			}
-			if (revised) {
-				const revision = mode === "revisions" ? revisions[1]! : observed[1]!;
-				Object.assign(revision, { [mode === "revisions" ? "id" : "proposalID"]: "proposal:1", revision: 2 });
-				const replacement = "actions" in revision ? revision.actions![0]! : revision.upsert![0]!;
-				replacement.id = "drifted";
-				replacement.input.path = "drifted-replacement.ts";
-				slow.release(); await replacementReady.promise;
-				expect(keyed).toContain("replacement.ts");
-				expect(keyed).not.toContain("drifted-replacement.ts");
 			}
 			if (mode === "observed") {
 				slow.release(); await runtime.finishTurn({ ...call(turnID), terminal: false });
@@ -493,6 +497,11 @@ describe("structural speculative runtime", () => {
 			slow.release();
 			await runtime.finishTurn({ ...call(turnID), terminal: true }); await runtime.dispose();
 		}
+		const settlements = events.filter(event => event.type === "prediction").map(event => event.settlement);
+		expect(new Set(settlements.map(settlement => settlement.prediction.id)).size).toBe(settlements.length);
+		if (revised) expect(settlements.filter(s => s.prediction.proposalID === "proposal:0" && s.observation === "observed"))
+			.toMatchObject([{ prediction: { actionID: mode === "revisions" ? "next" : "same-plan" },
+				match: { matched: true, adoption: { status: "adopted" } } }]);
 	});
 
 	it("settles matched and adopted as orthogonal facts exactly once", async () => {

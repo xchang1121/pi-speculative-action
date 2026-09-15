@@ -486,7 +486,6 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly sourceSlots: Set<SourceRequestSlot>;
 	readonly sourceTasks: Set<Promise<unknown>>;
 	readonly turns: Map<string, TurnState<SessionID, Output, StartInput, StateData>>;
-	readonly planAdmissionTails: Map<string, Promise<void>>;
 	settings: SpeculativeActionSettings;
 	timeline?: TaskTimeline;
 	lastActorArrivedAt?: number;
@@ -593,7 +592,6 @@ export function makeSpeculativeActionRuntime<
 			sourceSlots: new Set(),
 			sourceTasks: new Set(),
 			turns: new Map(),
-			planAdmissionTails: new Map(),
 			settings,
 			sequence: 0,
 			decisionSequence: 0,
@@ -826,12 +824,6 @@ export function makeSpeculativeActionRuntime<
 		return task;
 	};
 
-	const waitForSourceTasks = async (session: Session): Promise<void> => {
-		while (session.sourceTasks.size || session.planAdmissionTails.size) {
-			await Promise.allSettled([...session.sourceTasks, ...session.planAdmissionTails.values()]);
-		}
-	};
-
 	const launchSourceRequests = (state: Turn): void => {
 		if (!state.candidateNames.length) return;
 		for (const source of sources) {
@@ -903,22 +895,14 @@ export function makeSpeculativeActionRuntime<
 		await Promise.allSettled(asUpdates(updates).map(async (update) => {
 			const captured = PlanRuntime.capture(update, source.multiStepEnabled?.(scope.settings) !== false);
 			if (!("update" in captured)) return;
-			update = captured.update;
-			const key = "actions" in update ? update.id : update.proposalID;
-			const previous = session.planAdmissionTails.get(key) ?? Promise.resolve();
 			session.pendingAdmissions++;
-			let admission!: Promise<void>;
-			admission = previous
-				.then(() => applyUpdate(scope, source, update, request))
-				.catch(() => {
-					// One malformed proposal cannot poison later independent admissions.
-				})
-				.finally(() => {
-					session.pendingAdmissions = Math.max(0, session.pendingAdmissions - 1);
-					if (session.planAdmissionTails.get(key) === admission) session.planAdmissionTails.delete(key);
-				});
-			session.planAdmissionTails.set(key, admission);
-			await admission;
+			try {
+				// Capture the batch before binding callbacks can mutate producer input.
+				await Promise.resolve();
+				await applyUpdate(scope, source, captured.update, request);
+			} finally {
+				session.pendingAdmissions--;
+			}
 		}));
 	};
 
@@ -940,7 +924,8 @@ export function makeSpeculativeActionRuntime<
 		for (const action of applied.upserted) {
 			const node = session.plan.get(applied.plan.id, action.id);
 			if (!node || node.predictionState.status !== "pending") continue;
-			const issued = !session.actionContexts.has(node.identity.id);
+			const context = session.actionContexts.get(node.identity.id);
+			const issued = !context;
 			if (issued) {
 				const admissionController = new AbortController();
 				scope.slot?.owners.add(node.identity.id);
@@ -962,7 +947,6 @@ export function makeSpeculativeActionRuntime<
 					continuationTail: Promise.resolve(),
 				});
 			} else {
-				const context = session.actionContexts.get(node.identity.id)!;
 				context.feedback = action.feedback;
 				context.draft = planActionDraft(node);
 			}
@@ -971,7 +955,7 @@ export function makeSpeculativeActionRuntime<
 					proposalID: node.identity.proposalID, actionID: node.identity.actionID, feedback: action.feedback,
 				}));
 			}
-			materializations.push(materializeAction(session, node).finally(() => dispatchReady(session)));
+			if (issued) materializations.push(materializeAction(session, node).finally(() => dispatchReady(session)));
 		}
 		await Promise.allSettled(materializations);
 		if (!materializations.length) dispatchReady(session);
@@ -1036,7 +1020,7 @@ export function makeSpeculativeActionRuntime<
 			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
 			return;
 		}
-		if (!session.plan.bindActionKey(node.proposalID, node.action.id, predictedAction)) return;
+		if (!session.plan.bindActionKey(node.identity, predictedAction)) return;
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
 		if (slot && session.sourceSlots.has(slot) && slot.request.kind === "proposal" &&
@@ -2155,7 +2139,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const settleUnobserved = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
-		const settlement = session.plan.unobserve(node.proposalID, node.action.id, failure);
+		const settlement = session.actionContexts.get(node.identity.id)?.opportunity.unobserve(failure);
 		if (settlement) predictionSettled(session, node, settlement);
 	};
 
@@ -2626,7 +2610,7 @@ export function makeSpeculativeActionRuntime<
 		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
 		clearLaunchTimers(session);
 		session.plan.clear();
-		await waitForSourceTasks(session);
+		while (session.sourceTasks.size) await Promise.allSettled(session.sourceTasks);
 		await session.effects.flush();
 		for (const closure of closures) await completeTurnClosure(closure);
 		for (const state of session.turns.values()) clearActorActions(state);

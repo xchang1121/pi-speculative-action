@@ -130,8 +130,9 @@ describe("PlanRuntime", () => {
 		if (kind === "delta") expect(plan.get("plan", "retained")).toBeDefined();
 		expect(Object.isFrozen(offered)).toBe(false);
 		const key = buildPiActionKey("read", { path: "keyed.ts" }, "/workspace")!;
-		expect(plan.bindActionKey("plan", "keyed", key)).toBe(true);
-		expect(plan.bindActionKey("plan", "keyed", { ...key, hash: "other" })).toBe(false);
+		const identity = plan.get("plan", "keyed")!.identity;
+		expect(plan.bindActionKey(identity, key)).toBe(true);
+		expect(plan.bindActionKey(identity, { ...key, hash: "other" })).toBe(false);
 		expect(plan.get("plan", "keyed")?.actionKey).toBe(key);
 		expect(plan.get("plan", "keyed")?.action.input).toEqual({ path: "keyed.ts" });
 		expect(Object.isFrozen(plan.get("plan", "keyed")?.action.input)).toBe(true);
@@ -156,12 +157,13 @@ describe("PlanRuntime", () => {
 		plan.apply(proposal([action("bash")]), 0);
 		const key = buildPiActionKey("bash", { command: "npm test" }, "/workspace")!;
 
-		expect(plan.bindActionKey("plan", "bash", key)).toBe(true);
+		const identity = plan.get("plan", "bash")!.identity;
+		expect(plan.bindActionKey(identity, key)).toBe(true);
 		expect(plan.launchable()).toEqual([]);
 		expect(plan.promote("plan", "bash")).toEqual({ status: "already_dispatched" });
 		expect(plan.attachExecution("plan", "bash", "unprepared", new CandidateExecution("shared"))).toBe(false);
 		expect(plan.matchable(1)).toMatchObject([{ actionKey: key, execution: { status: "preparing" } }]);
-		const identity = plan.get("plan", "bash")!.identity, failure = blocked ? cause("execution", "isolation_unavailable") : undefined;
+		const failure = blocked ? cause("execution", "isolation_unavailable") : undefined;
 		expect(plan.finishPreparation({ ...identity, id: "retired" }, failure)).toBe(false);
 		expect(plan.finishPreparation(identity, failure)).toBe(true);
 		expect(plan.finishPreparation(identity, failure)).toBe(false);
@@ -171,6 +173,8 @@ describe("PlanRuntime", () => {
 		expect(plan.apply({ proposalID: "plan", source: "source", revision: 2, upsert: [action("bash", { input: { path: "replacement.ts" } })] }, 0))
 			.toMatchObject({ accepted: true });
 		const replacement = plan.get("plan", "bash")!.identity, rejected = cause("admission", "not_permitted");
+		expect(plan.bindActionKey(identity, key)).toBe(false);
+		expect(plan.bindActionKey(replacement, key)).toBe(true);
 		expect(plan.rejectExecution(identity, rejected)).toBe(false);
 		expect(plan.rejectExecution(replacement, rejected)).toBe(true);
 		expect(plan.rejectExecution(replacement, rejected)).toBe(false);
@@ -218,7 +222,7 @@ describe("PlanRuntime", () => {
 				expect(plan.claimMatch("plan", "parent", second, relation)).toBeUndefined();
 				expect(ids(plan.pending())).toEqual(["settled", "succeeded", "confirmed"]);
 				expect(plan.unsettled()).toHaveLength(4);
-				expect(plan.unobserve("plan", "parent", cause("control", "shutdown"))).toBeUndefined();
+				expect(opportunity.unobserve(cause("control", "shutdown"))).toBeUndefined();
 				expect(opportunity.state.status).toBe("matching");
 				expect(plan.confirm(opportunity, second, { status: "rejected", cause: cause("matching", "wrong_actor") })).toBeUndefined();
 				const adoption = outcome === "adopted" ? { status: outcome, candidateID: "candidate" }
@@ -229,8 +233,8 @@ describe("PlanRuntime", () => {
 				expect(plan.confirm(opportunity, second, { status: "adopted", candidateID: "candidate" })).toBeUndefined();
 			} else if (outcome === "miss") {
 				expect(plan.miss("plan", "parent", actor)).toMatchObject({ observation: "observed", match: { matched: false } });
-			} else expect(plan.unobserve("plan", "parent", cause("control", "turn_aborted"))).toMatchObject({ observation: "unobserved" });
-			expect(plan.unobserve("plan", "parent", cause("control", "late"))).toBeUndefined();
+			} else expect(opportunity.unobserve(cause("control", "turn_aborted"))).toMatchObject({ observation: "unobserved" });
+			expect(opportunity.unobserve(cause("control", "late"))).toBeUndefined();
 			expect(plan.get("plan", "parent")).toMatchObject({ execution: { status }, predictionState: { status: "settled", settlement: opportunity.settlement } });
 			expect(queued.execution.status).toBe("queued");
 			expect(plan.values()).toHaveLength(4);
@@ -304,7 +308,7 @@ describe("PlanRuntime", () => {
 		const child = action("child", { dependsOn: [dependency, dependency, { actionID: second }] });
 		plan.apply(proposal([action(first), action(second), child, action("leaf", { dependsOn: [{ actionID: "child" }] })]), 0);
 		const key = buildPiActionKey("read", child.input, "/workspace")!, execution = new CandidateExecution<string>("shared");
-		plan.bindActionKey("plan", "child", key); plan.finishPreparation(plan.get("plan", "child")!.identity);
+		plan.bindActionKey(plan.get("plan", "child")!.identity, key); plan.finishPreparation(plan.get("plan", "child")!.identity);
 		execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
 		for (const id of [first, second, "child"]) plan.attachExecution("plan", id, id, execution);
 		const original = plan.get("plan", "child")!, leaf = plan.get("plan", "leaf")!.identity;

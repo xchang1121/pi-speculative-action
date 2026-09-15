@@ -191,7 +191,7 @@ const capturedUpdates = new WeakSet<PlanUpdate>();
 export class PlanRuntime {
 	private readonly plans = new Map<string, MutablePlan>();
 
-	/** Capture once at handoff, before an update waits behind an earlier revision. */
+	/** Capture once at handoff, before asynchronous binding can invoke producer callbacks. */
 	static capture(update: PlanUpdate, multiStep = true): { readonly update: PlanUpdate } | Extract<PlanRuntimeUpdateResult, { accepted: false }> {
 		const captured = capturedUpdates.has(update);
 		if (captured && multiStep) return { update };
@@ -289,9 +289,9 @@ export class PlanRuntime {
 		return rearmed;
 	}
 
-	bindActionKey(proposalID: string, actionID: string, actionKey: ActionKey): boolean {
-		const node = this.mutable(proposalID, actionID)?.node;
-		if (!node || node.actionKey || node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
+	bindActionKey(identity: PlanActionIdentity, actionKey: ActionKey): boolean {
+		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		if (node?.identity.id !== identity.id || node.actionKey || node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
 		node.actionKey = actionKey;
 		node.execution = { status: "preparing" };
 		return true;
@@ -350,11 +350,6 @@ export class PlanRuntime {
 	miss(proposalID: string, actionID: string, actorAction: ActorActionIdentity): PredictionSettlement | undefined {
 		const value = this.mutable(proposalID, actionID);
 		return value?.node.opportunity.miss(actorAction);
-	}
-
-	unobserve(proposalID: string, actionID: string, cause: ResolutionCause): PredictionSettlement | undefined {
-		const value = this.mutable(proposalID, actionID);
-		return value?.node.opportunity.unobserve(cause);
 	}
 
 	get(proposalID: string, actionID: string): PlanRuntimeNode | undefined {
