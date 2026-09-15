@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
 import { access, chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +14,7 @@ import type {
 	WorldCommitMetrics,
 	WorldExecutionMetrics,
 } from "./execution-world.ts";
-import { advanceFilesystemClock, assertNoSymlinkPath, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import {
@@ -85,7 +85,7 @@ export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
 interface RegularFileState {
 	readonly content: Uint8Array;
 	readonly mode: number;
-	readonly identity?: import("node:fs").BigIntStats;
+	readonly identity?: BigIntStats;
 }
 
 export interface SandboxExecutionDelta {
@@ -952,7 +952,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() };
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
-	let clock: { readonly handle: FileHandle; readonly identity: import("node:fs").Stats } | undefined;
+	let clock: { readonly handle: FileHandle; readonly identity: Stats } | undefined;
 	let disposed = false;
 
 	if (!poisonReason) {
@@ -1164,7 +1164,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 			afterBytes += current?.content.byteLength ?? 0;
 			retainedBytes += current?.content.byteLength ?? 0;
 			frontier.set(relativePath, current);
-			if (!sameOptionalState(previous, current)) {
+			if (!sameSandboxState(previous, current)) {
 				changes.push({
 					relativePath,
 					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
@@ -1725,7 +1725,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promis
 		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
 		const before = await readBaselineState(workspace, resource);
 		const after = await readRegularState(sandboxTarget);
-		if (!sameOptionalState(before, after)) {
+		if (!sameSandboxState(before, after)) {
 			changes.push({
 				root: workspace.sourceRoot,
 				target,
@@ -1982,56 +1982,39 @@ async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFIN
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
 export async function readSandboxDirectoryState(target: string): Promise<SandboxDirectoryState | undefined> {
-	let before: import("node:fs").BigIntStats;
 	try {
-		before = await lstat(target, { bigint: true });
+		const { info, entries } = await captureFilesystemEntry(target, "directory");
+		if (!entries) throw new Error(`sandbox resource is not a real directory: ${target}`);
+		return { entriesDigest: directoryEntriesDigest(entries), mode: Number(info.mode & 0o777n), uid: Number(info.uid), gid: Number(info.gid) };
 	} catch (error) {
 		if (isMissing(error)) return undefined;
 		throw error;
 	}
-	if (before.isSymbolicLink() || !before.isDirectory()) {
-		throw new Error(`sandbox resource is not a real directory: ${target}`);
-	}
-	const entries = await readdir(target, { withFileTypes: true });
-	const after = await lstat(target, { bigint: true });
-	if (!after.isDirectory() || after.isSymbolicLink() || !sameFilesystemIdentity(before, after)) {
-		throw new Error(`sandbox directory changed while being captured: ${target}`);
-	}
-	return {
-		entriesDigest: directoryEntriesDigest(entries),
-		mode: Number(before.mode & 0o777n),
-		uid: Number(before.uid),
-		gid: Number(before.gid),
-	};
 }
 
 
-function sameDirectoryState(
-	left: SandboxDirectoryState | undefined,
-	right: SandboxDirectoryState | undefined,
+function sameSandboxState(
+	left: RegularFileState | SandboxDirectoryState | undefined,
+	right: RegularFileState | SandboxDirectoryState | undefined,
 ): boolean {
 	if (!left || !right) return left === right;
-	return (
-		left.entriesDigest === right.entriesDigest &&
-		left.mode === right.mode &&
-		left.uid === right.uid &&
-		left.gid === right.gid
-	);
+	if ("content" in left || "content" in right) return "content" in left && "content" in right &&
+		Buffer.compare(left.content, right.content) === 0 && (right.mode === 0 || sameExecutableMode(left.mode, right.mode));
+	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
 function sameSandboxBaseline(
 	current: RegularFileState | SandboxDirectoryState | undefined,
 	change: SandboxWorkspaceChange,
 ): boolean {
-	return change.kind === "directory"
-		? change.validationOnly ? Boolean(current) === Boolean(change.before) : sameDirectoryState(current as SandboxDirectoryState | undefined, change.before)
-		: sameOptionalState(current as RegularFileState | undefined, change.before === undefined
-			? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
+	if (change.kind === "directory" && change.validationOnly) return Boolean(current) === Boolean(change.before);
+	return sameSandboxState(current, change.kind === "directory" ? change.before : change.before === undefined
+		? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
 }
 
 async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange): Promise<boolean> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
-	return change.operation ? (await lstat(target)).isDirectory() : sameDirectoryState(await readSandboxDirectoryState(target), change.after);
+	return change.operation ? (await lstat(target)).isDirectory() : sameSandboxState(await readSandboxDirectoryState(target), change.after);
 }
 
 function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
@@ -2039,11 +2022,7 @@ function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
 	if (!change.validationOnly && change.before === undefined) throw new Error("Created input permissions require authoritative execution");
 }
 
-function sameOptionalState(left: RegularFileState | undefined, right: RegularFileState | undefined): boolean {
-	if (!left || !right) return left === right;
-	if (Buffer.compare(left.content, right.content) !== 0) return false;
-	return right.mode === 0 || sameExecutableMode(left.mode, right.mode);
-}
+
 
 function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number {
 	return !change || change.kind === "directory" ? 0 : (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0);
@@ -2067,7 +2046,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
 		if (previous.kind === "directory" && change.kind === "directory") {
-			if (!sameDirectoryState(previous.before, change.before)) {
+			if (!sameSandboxState(previous.before, change.before)) {
 				throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 			}
 			result.set(key, { ...change, before: previous.before, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
@@ -2136,11 +2115,7 @@ async function restoreChanges(
 				change.kind === "directory"
 					? await readSandboxDirectoryState(change.target)
 					: await readRegularState(change.target);
-			if (
-				change.kind === "directory"
-					? !sameDirectoryState(current as SandboxDirectoryState | undefined, baseline as SandboxDirectoryState | undefined)
-					: !sameOptionalState(current as RegularFileState | undefined, baseline as RegularFileState | undefined)
-			) {
+			if (!sameSandboxState(current, baseline)) {
 				throw new Error(`sandbox rollback did not restore: ${change.resource}`);
 			}
 		} catch (error) {

@@ -337,13 +337,16 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
-	test.for(["file", "directory"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
-		if (kind === "file" && process.platform === "win32") return skip("file symlinks require Windows privileges");
-		const directory = kind === "directory", root = await workspace({ [directory ? ".git/value.txt" : ".git"]: "before" }), outside = await workspace({ "value.txt": "external" });
-		const target = path.join(root, ".git"), alias = path.join(root, "alias"), link = path.join(root, "input");
+	test.for(["file", "directory", "relative"] as const)("resolves sealed %s link chains without granting unproven paths", async (kind, { skip }) => {
+		if (kind !== "directory" && process.platform === "win32") return skip("file symlinks require Windows privileges");
+		const directory = kind === "directory", relative = kind === "relative", resource = relative ? "nested/deep/.git" : ".git";
+		const root = await workspace({ [directory ? resource + "/value.txt" : resource]: "before", ...(relative ? { "deep/.git": "lexical decoy" } : {}) });
+		const outside = await workspace({ "value.txt": "external" });
+		const target = path.join(root, resource), alias = path.join(root, "alias"), link = path.join(root, "input");
 		const content = directory ? path.join(target, "value.txt") : target;
 		const type = directory ? process.platform === "win32" ? "junction" : "dir" : "file";
-		await fs.symlink(target, link, type); await fs.symlink(link, alias, type);
+		if (relative) await fs.symlink("nested/deep", path.join(root, "parts"), "dir");
+		await fs.symlink(relative ? "parts/../deep/.git" : target, link, type); await fs.symlink(link, alias, type);
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture([{ path: alias, scope: directory ? "tree_content" : "content" }], 8192);
 		const snapshot = new ResourceVersionManager(root, { watch: false, snapshotExcludes: [".git"] });

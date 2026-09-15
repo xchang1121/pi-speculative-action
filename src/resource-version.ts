@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { type FSWatcher, watch } from "node:fs";
+import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -8,7 +8,7 @@ import {
 	PI_ACTION_SEMANTICS,
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
-import { captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 import type { ToolFilesystemStat } from "./tool-settlement.ts";
 
@@ -51,7 +51,7 @@ export type ResourceVersionToken = {
 type CapturedResource = (
 	| { readonly type: "file"; readonly content?: Buffer; readonly size?: number }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
-	| { readonly type: "alias"; readonly target: string; readonly link: string }
+	| { readonly type: "alias"; readonly target?: string; readonly link: string }
 	| { readonly type: "special" }
 	| { readonly type: "missing" }) & { readonly realPath?: string };
 
@@ -90,7 +90,7 @@ export class ResourceReadView {
 	capture(target: string, entry: CapturedResource): void {
 		if (!this.reserve(Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target) + Buffer.byteLength(entry.link) : 0))) return;
+			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
@@ -166,12 +166,12 @@ export class ResourceReadView {
 		while (!visited.has(current) && visited.size <= this.entries.size) {
 			visited.add(current);
 			const exact = this.entries.get(current);
-			if (exact?.type === "alias" && follow) { current = exact.target; continue; }
+			if (exact?.type === "alias" && follow) { if (!exact.target) break; current = exact.target; continue; }
 			if (exact) return exact;
 			let parent = path.dirname(current);
 			while (parent !== path.dirname(parent) && this.entries.get(parent)?.type !== "alias") parent = path.dirname(parent);
 			const alias = this.entries.get(parent);
-			if (alias?.type !== "alias") break;
+			if (alias?.type !== "alias" || !alias.target) break;
 			current = filesystemPathKey(path.resolve(alias.target, path.relative(parent, current)));
 		}
 	}
@@ -522,10 +522,9 @@ async function fingerprintDependencies(dependencies: ReadonlyArray<ResourceDepen
 async function fingerprintBinding(dependency: ResourceDependency) {
 	let stamp: string | undefined, link: string | undefined;
 	try {
-		const before = await fingerprintIO(() => fs.lstat(dependency.path, { bigint: true }));
-		if (before.isSymbolicLink()) link = await fingerprintIO(() => fs.readlink(dependency.path));
-		const after = await fingerprintIO(() => fs.lstat(dependency.path, { bigint: true }));
-		stamp = sameFilesystemIdentity(before, after) ? digest([statStamp(after), link]) : undefined;
+		const captured = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity"));
+		link = captured.link;
+		stamp = digest([statStamp(captured.info), link]);
 	} catch (error) {
 		if (!missingResource(error)) throw error;
 		stamp = errorCode(error);
@@ -555,9 +554,9 @@ async function fingerprintPath(
 	descend = true,
 ): Promise<FingerprintResult> {
 	const { realRoot, excludes, nearestExisting, view } = context;
-	let info: import("node:fs").BigIntStats;
+	let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 	try {
-		info = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
+		captured = await fingerprintIO(() => captureFilesystemEntry(target));
 	} catch (error) {
 		if (!missingResource(error)) throw error;
 		view?.capture(target, { type: "missing" });
@@ -568,6 +567,7 @@ async function fingerprintPath(
 			filesRead: 0,
 		};
 	}
+	const { info, link } = captured;
 	const realTarget = info.isSymbolicLink()
 		? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
 		: await fingerprintIO(() => fs.realpath(target));
@@ -575,23 +575,25 @@ async function fingerprintPath(
 	const identity = filesystemPathKey(realTarget);
 	if (ancestors.has(identity)) throw new Error(`resource_symlink_cycle:${target}`);
 	if (info.isSymbolicLink()) {
-		const link = await fingerprintIO(() => fs.readlink(target));
-		const after = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
-		if (!after.isSymbolicLink() || !sameFilesystemIdentity(info, after)) {
-			throw new Error(`resource_symlink_changed:${target}`);
-		}
-		const source = path.resolve(path.dirname(target), link);
-		const followed = scope === "entry" ? undefined : await fingerprintPath(source, scope, context, new Set(ancestors).add(identity), descend);
-		view?.capture(target, { type: "alias", target: filesystemPathKey(source), link, realPath: realTarget });
+		let source: string | undefined;
+		const links: unknown[] = [];
+		if (scope !== "entry") await fingerprintIO(async () => {
+			for await (const entry of walkFilesystemPath(target)) {
+				source = entry.path;
+				if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
+			}
+		});
+		const followed = source === undefined ? undefined : await fingerprintPath(source, scope, context, new Set(ancestors).add(identity), descend);
+		view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget });
 		return {
 			value: {
 				type: "symlink",
 				link,
-				mode: Number(after.mode),
+				mode: Number(info.mode),
 				resolved: identity,
 				target: followed?.value,
 			},
-			stamp: digest(["symlink", link, statStamp(after), followed?.stamp]),
+			stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
 			bytesRead: followed?.bytesRead ?? 0,
 			filesRead: followed?.filesRead ?? 0,
 		};
@@ -658,7 +660,7 @@ async function fingerprintPath(
 
 async function stableEntry(
 	target: string,
-	before: import("node:fs").BigIntStats,
+	before: BigIntStats,
 	resolved: string,
 	scope: ResourceDependency["scope"],
 ): Promise<FingerprintResult> {
@@ -678,7 +680,7 @@ function entryIdentity(entry: import("node:fs").Dirent): string {
 	return `${specialFileType(entry)}\0${entry.name}`;
 }
 
-function specialFileType(value: import("node:fs").Stats | import("node:fs").BigIntStats | import("node:fs").Dirent) {
+function specialFileType(value: Stats | BigIntStats | import("node:fs").Dirent) {
 	if (value.isFile()) return "file";
 	if (value.isDirectory()) return "directory";
 	if (value.isSymbolicLink()) return "symlink";
@@ -716,7 +718,7 @@ function missingResourceResolver(realRoot: string): (target: string) => Promise<
 	return resolve;
 }
 
-function statStamp(stat: import("node:fs").BigIntStats): string {
+function statStamp(stat: BigIntStats): string {
 	return [stat.dev, stat.ino, stat.mode, stat.nlink, stat.rdev, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs]
 		.join(":");
 }

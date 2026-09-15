@@ -482,8 +482,8 @@ describe("Linux process ExecutionWorld", () => {
 		});
 		const probing = vi.spyOn(filesystem, "lstat").mockImplementation(async (...args) => {
 			const info = await readStat(...args);
-			if (failure === "host_parent" && String(args[0]) === "/etc" && typeof info.mode === "number") {
-				failed.resolve(); await gate.promise; info.mode |= 0o022;
+			if (failure === "host_parent" && String(args[0]) === "/etc" && typeof info.mode === "bigint") {
+				failed.resolve(); await gate.promise; info.mode |= 0o022n;
 			}
 			return info;
 		});
