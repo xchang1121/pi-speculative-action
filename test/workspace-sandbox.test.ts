@@ -875,7 +875,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("defers observation until a transaction and captures exact deltas after an aborted interval", async () => {
+	it("defers observation and retains its baseline across warm-up and aborted intervals", async () => {
 		const root = await temporaryRoot();
 		await writeFile(path.join(root, "changed.txt"), "before\n", "utf8");
 		await writeFile(path.join(root, "deleted.txt"), "deleted\n", "utf8");
@@ -883,7 +883,10 @@ describe("workspace-branch ExecutionWorld", () => {
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const clock = path.join(workspace.processRoot, "workspace-transaction.clock");
 			await expect(stat(clock)).rejects.toThrow();
+			await writeFile(path.join(root, "changed.txt"), "next baseline\n", "utf8");
+			await sandbox.prepare(root, { driver: "git" });
 			const initial = await workspace.transactions.begin();
+			Reflect.set(workspace, "commit", "0".repeat(40));
 			expect((await stat(clock)).isFile()).toBe(true);
 			await initial.abort();
 			const capture = await workspace.transactions.begin();
