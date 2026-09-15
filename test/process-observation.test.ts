@@ -18,6 +18,9 @@ describe("process observation", () => {
 		const beforeBytes = Buffer.alloc(2 * 1024 * 1024, 0x41);
 		const afterBytes = Buffer.alloc(beforeBytes.byteLength, 0x42);
 		await fs.writeFile(target, beforeBytes);
+		await fs.mkdir(path.join(workspace, "nested"));
+		const limited = await captureWorkspaceStructure(workspace, { maxFiles: 1 });
+		expect([limited.complete, limited.files, limited.entries.size]).toEqual([false, 1, 2]);
 		const before = await captureWorkspaceStructure(workspace);
 		const captured = await captureStableFile(target);
 		await fs.writeFile(target, afterBytes);
