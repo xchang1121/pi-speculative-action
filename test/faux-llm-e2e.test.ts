@@ -317,7 +317,7 @@ function drafterSettings(): SpeculativeAgentSettingsInput {
 }
 
 function patternStore(cwd: string, settings: PatternAwareSettings): PatternAwareStore {
-	return new PatternAwareStore(settings, undefined, { namespace: "pi-action-semantics-v1",
+	return new PatternAwareStore(settings, undefined, { namespace: "pi-action-semantics",
 		actionKey: (tool, input, schemaHash) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash), projectors: [] });
 }
 

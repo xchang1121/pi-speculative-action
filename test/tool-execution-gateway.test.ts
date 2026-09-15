@@ -103,5 +103,5 @@ describe("ToolExecutionGateway", () => {
 });
 
 function branch(backend: string, output: string) {
-	return testBranch(output, { backend, executionFingerprint: `${backend}:v1` });
+	return testBranch(output, { backend, executionFingerprint: `${backend}` });
 }

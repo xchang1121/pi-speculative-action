@@ -1150,7 +1150,7 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 function actionIdentity(key: string): string {
-	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
+	return `action:${createHash("sha256").update(key).digest("hex")}`;
 }
 
 function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
@@ -1175,7 +1175,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 }
 
 function sidecarActionBatchID(fingerprint: string): string {
-	return `fork:v1:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 32)}`;
+	return `fork:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 32)}`;
 }
 
 function uniqueStrings(value: unknown): string[] {

@@ -53,7 +53,7 @@ export function createPatternPlanSource(input: {
 	readonly store?: PatternAwareStore | Promise<PatternAwareStore>;
 }): PatternPlanSourceController {
 	const patternActionSemantics = {
-		namespace: "pi-action-semantics-v1",
+		namespace: "pi-action-semantics",
 		actionKey: (tool: string, actionInput: Readonly<Record<string, unknown>>, schemaHash?: string) =>
 			input.actionSemantics.buildKey(tool, actionInput, input.cwd, schemaHash),
 		projectors: input.projectionRules,

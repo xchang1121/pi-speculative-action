@@ -62,6 +62,7 @@ export function resolvePiToolInvocation(
 		const cwd = options.cwd;
 		const autoResizeImages = options.autoResizeImages ?? true;
 		const modelSupportsImages = options.modelSupportsImages ?? true;
+		// Shared with the ThinkThread runner's binding check.
 		const executor = "pi.filesystem.local.v2";
 		return {
 			executor,
@@ -97,7 +98,7 @@ export function resolvePiToolInvocation(
 	const record = input as Record<string, unknown>;
 	if (typeof record.command !== "string") return undefined;
 	const shell = getShellConfig(options.shellPath);
-	const executor = "pi.bash.local.v2";
+	const executor = "pi.bash.local";
 	const commandTransport = shell.commandTransport ?? "argv";
 	return {
 		executor,

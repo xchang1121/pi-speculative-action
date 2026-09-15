@@ -171,7 +171,7 @@ describe("SpeculationScheduler", () => {
 
 	it("separates producer, consumer, and adoption work while retaining exact/class quantiles and bounded history", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		const identity = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "producer" };
+		const identity = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "producer" };
 		const actorIdentity = { ...identity, actionKeyHash: "consumer" };
 		const exact = { ...actorIdentity, operation: "route:exact" }, inputs = { ...actorIdentity, operation: "route:inputs" };
 		scheduler.observeActorService(identity, 380);
@@ -214,7 +214,7 @@ describe("SpeculationScheduler", () => {
 	});
 
 	it("uses measured net latency to retain heavy hits and reject noise-boundary waits", () => {
-		const identity = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "measured-action" };
+		const identity = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "measured-action" };
 		for (const [actorMs, speculativeMs, adoptionMs, state, netMs, allowed] of [
 			[2687, 936, 70, "running", 1681, true],
 			[994, 973, 0, "running", 21, false],
@@ -275,7 +275,7 @@ describe("SpeculationScheduler", () => {
 		const scheduler = new SpeculationScheduler<object>({
 			candidateJoinPolicy: { warmupWaitMs: 17 },
 		});
-		const first = { tool: "bash", executionFingerprint: "linux-world:v1", actionKeyHash: "parent-a" };
+		const first = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "parent-a" };
 		const second = { ...first, actionKeyHash: "parent-b" };
 		expect(joinDecision(scheduler, first)).toMatchObject({
 			allowed: true,

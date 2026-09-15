@@ -261,7 +261,7 @@ const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
-const GIT_WORKSPACE_FINGERPRINT = "git-worktree:v2";
+const GIT_WORKSPACE_FINGERPRINT = "git-worktree";
 // Small-tree gains remain host-sensitive and carry one-time FUSE preparation cost, while the
 // 500/1,000-file A/B is material. Use a conservative power-of-two boundary and exact baseline.
 const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
@@ -382,7 +382,7 @@ async function resolveWorkspaceDriver(
 		if (requested === "overlayfs") throw new Error(capability.detail);
 		return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 	}
-	const overlay = { driver: "overlayfs", fingerprint: `linux-overlayfs:v2:${capability.fingerprint}` } as const;
+	const overlay = { driver: "overlayfs", fingerprint: `linux-overlayfs:${capability.fingerprint}` } as const;
 	if (requested === "overlayfs") return overlay;
 	if (!sourceRoot) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 

@@ -1,8 +1,8 @@
 import { createExecPrototype, sealProcessCertificate, sha256Digest, type ExecPrototype, type ProcessPrototypeInput, type ProcessProducerProof } from "../src/provenance-certificate.ts";
 
 export const SPECULATIVE_PRODUCER: ProcessProducerProof = {
-	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
-	execution: { authority: "speculative", confinement: { provider: "test", fingerprint: sha256Digest("confinement-v1") } },
+	observer: { provider: "test", fingerprint: "sha256:4f3ffc55e1940cebb5c92e16fe7d6e6091f561562fb8b0e044910473356abc2c" },
+	execution: { authority: "speculative", confinement: { provider: "test", fingerprint: "sha256:9f1019cefff9d81735701d03105338cf8ef2f7ff0b21b2abedce983d883a8786" } },
 };
 
 export function processPrototype(overrides: Partial<ProcessPrototypeInput> = {}) {

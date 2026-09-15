@@ -96,7 +96,7 @@ describe("speculative action common", () => {
 		const base = buildActionKey(input);
 		expect(buildActionKey({ ...input, input: { beta: 2, alpha: 1 } }).key).toBe(base.key);
 		expect(new Set([
-			base.key, buildActionKey({ ...input, semanticsEpoch: "custom.v2" }).key,
+			base.key, buildActionKey({ ...input, semanticsEpoch: "custom-other" }).key,
 			buildActionKey({ ...input, schemaHash: "schema-b" }).key,
 		]).size).toBe(3);
 		expect(buildActionKey({ ...input, schemaHash: undefined }).key).toBe(buildActionKey({ ...input, schemaHash: "" }).key);

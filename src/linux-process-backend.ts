@@ -103,9 +103,9 @@ import {
 import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-v21";
-const POLICY_ID = "sandlock-virtual-root-transparent-exec-v14";
-const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-v3";
+const BACKEND_EPOCH = "pi-linux-process";
+const POLICY_ID = "sandlock-virtual-root-transparent-exec";
+const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
@@ -1829,8 +1829,8 @@ async function createProcessInterposition(input: {
 			throwIfAborted(input.signal);
 			await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
 			await writeFile(
-				path.join(directory.view, ".pi-spec-dispatch-v1"),
-				["PI_SPEC_DISPATCH_V1", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
+				path.join(directory.view, ".pi-spec-dispatch"),
+				["PI_SPEC_DISPATCH", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
 				{ mode: 0o600 },
 			);
 		}
@@ -1845,7 +1845,7 @@ async function createProcessInterposition(input: {
 		for (let start = 0; start < entries.length; start += 16) {
 			throwIfAborted(input.signal);
 			await Promise.all(entries.slice(start, start + 16).map(async (name) => {
-				if (!name || name === ".pi-spec-dispatch-v1" || name.includes("/") || name.includes("\0")) return;
+				if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
 				const sourceEntry = path.join(source, name);
 				try {
 					const resolved = await realpath(sourceEntry);
@@ -2237,7 +2237,7 @@ function routedExecutionContext(context: DispatcherExecutionContext, route: Outp
 		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
 		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
 	};
-	const routed = { ...semantic, executionDomain: "ptrace-v1", signals, descriptors };
+	const routed = { ...semantic, executionDomain: "ptrace", signals, descriptors };
 	return {
 		...context,
 		key: JSON.stringify(routed),
@@ -2302,7 +2302,7 @@ async function topLevelProcessPrototype(
 				uid: process.getuid?.(), euid: process.geteuid?.(), gid: process.getgid?.(), egid: process.getegid?.(), groups: process.getgroups?.(),
 			},
 			scheduler: { cpuCount: os.availableParallelism(), timeout: request.timeout ?? null },
-			signals: "node-default-v1",
+			signals: "node-default",
 		}),
 		stdin:
 			invocation.commandTransport === "stdin"

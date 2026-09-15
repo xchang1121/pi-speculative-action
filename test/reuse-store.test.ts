@@ -1,7 +1,7 @@
 import { deferred, nextTurn } from "./async.ts";
 import { unlink, utimes } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
-import { processPrototype, processCertificate } from "./process-fixture.ts";
+import { processPrototype, processCertificate, SPECULATIVE_PRODUCER } from "./process-fixture.ts";
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,7 +17,7 @@ vi.mock("node:fs/promises", { spy: true });
 
 const { create: temporaryRoot, dispose } = temporaryDirectories("pi-reuse-store-");
 const PRODUCER = {
-	observer: { provider: "test", fingerprint: sha256Digest("observer-v1") },
+	observer: SPECULATIVE_PRODUCER.observer,
 	execution: { authority: "actor" as const },
 };
 

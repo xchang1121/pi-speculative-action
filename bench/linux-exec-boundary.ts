@@ -86,7 +86,7 @@ async function conversionAblation(heldExecBinary: string) {
 		straceBinary: "/pi-dependency-disabled/strace",
 	});
 	try {
-		await writeFile(path.join(fixture.workspace, "input.txt"), "v1\n");
+		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
 #include <fcntl.h>
 #include <sys/random.h>
@@ -136,7 +136,7 @@ int main(int argc, char **argv) {
 		await commitBenchmarkFixture(fixture.workspace, "Pi Held Exec Benchmark");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 		const produce = (label: string, command: string) => forkReusableBash(fixture, {
-			label, command, actionNamespace: "pi-held-exec-production.v1", executionFingerprint,
+			label, command, actionNamespace: "pi-held-exec-production", executionFingerprint,
 		});
 		async function withProducer<Value>(label: string, command: string,
 			inspect: (production: ReturnType<typeof produce>) => Value | Promise<Value>) {
@@ -233,7 +233,7 @@ int main(int argc, char **argv) {
 		});
 
 		await Promise.all([
-			writeFile(path.join(fixture.workspace, "input.txt"), "v2\n"),
+			writeFile(path.join(fixture.workspace, "input.txt"), "after\n"),
 			rm(path.join(fixture.workspace, "result.txt")),
 		]);
 		const joinBefore = fixture.backend.metrics();
@@ -244,8 +244,8 @@ int main(int argc, char **argv) {
 			const result = await measureActor(fixture.backend, joiningActor, "held-joining", "printf 'actor-join\\n'; worker joined.txt");
 			const joiningBranch = await production;
 			assert(!joiningBranch.output.isError, `joining producer failed: ${textOutput(joiningBranch.output.result)}`);
-			assert(textOutput(result.output) === "actor-join\nworker:v2\n", "Actor child output was lost or executed more than once");
-			assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:v2\n", "joined child changed workspace result");
+			assert(textOutput(result.output) === "actor-join\nworker:after\n", "Actor child output was lost or executed more than once");
+			assert((await readFile(path.join(fixture.workspace, "joined.txt"))).toString() === "artifact:after\n", "joined child changed workspace result");
 			const metrics = result.metrics;
 			assert(metrics.requests === 1 && metrics.hits === 1 && metrics.joinedHits === 1 &&
 				metrics.actorTimedHits === 0 && metrics.actorBaselineMs === 0 && metrics.reusedProcessMs > 0,
@@ -253,7 +253,7 @@ int main(int argc, char **argv) {
 			return result;
 		});
 		const { output: miss, totalMs: missMs, metrics: missMetrics } = await measureActor(fixture.backend, joiningActor, "held-stale", actorCommand);
-		assert(textOutput(miss).includes("worker:v2"), "changed-input miss did not execute the Actor child");
+		assert(textOutput(miss).includes("worker:after"), "changed-input miss did not execute the Actor child");
 		assert(missMetrics.hits === 0 && missMetrics.misses >= 1, "changed input was incorrectly reused");
 
 		const completedChild = "worker completed.txt volatile";
@@ -266,8 +266,8 @@ int main(int argc, char **argv) {
 				`completed child did not remain ephemeral: ${JSON.stringify(completedProduced)}`);
 			const { output: completedActor, metrics: completedMetrics } = await measureActor(
 				fixture.backend, joiningActor, "held-completed", `printf 'actor-completed\n'; ${completedChild}`);
-			assert(textOutput(completedActor).includes("actor-completed\nworker:v2"), "completed child transfer changed Actor output");
-			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:v2\n", "completed child transfer changed its effect");
+			assert(textOutput(completedActor).includes("actor-completed\nworker:after"), "completed child transfer changed Actor output");
+			assert((await readFile(path.join(fixture.workspace, "completed.txt"))).toString() === "artifact:after\n", "completed child transfer changed its effect");
 			assert(completedMetrics.hits === 1 && completedMetrics.joinedHits === 0 && completedMetrics.sameTurnHits === 1,
 				`Actor did not claim completed same-turn work: ${JSON.stringify(completedMetrics)}`);
 			assert(await completedBranch.commit().then(() => false, (error) =>
@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
 			const laterActor = await heldActor(fixture, fixture.backend, () => ({ sessionID: "benchmark", turnID: "later" }));
 			const rejectCrossTurn = async (callID: string) => {
 				const { output, metrics } = await measureActor(fixture.backend, laterActor, callID, lateChild);
-				assert(textOutput(output).includes("worker:v2") && metrics.hits === 0 && metrics.joinedHits === 0 && metrics.misses >= 1,
+				assert(textOutput(output).includes("worker:after") && metrics.hits === 0 && metrics.joinedHits === 0 && metrics.misses >= 1,
 					`${callID} crossed its turn boundary: ${JSON.stringify(metrics)}`);
 			};
 			await rejectCrossTurn("held-late-running");

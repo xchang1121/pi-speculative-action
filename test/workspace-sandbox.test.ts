@@ -194,20 +194,20 @@ describe("workspace-branch ExecutionWorld", () => {
 		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot();
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v2");
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
 		await Promise.all(
 			Array.from({ length: 100 }, (_value, index) =>
 				writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
 			),
 		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree:v2");
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
 		await Promise.all(
 			Array.from({ length: 160 }, (_value, index) => {
 				const ordinal = index + 100;
 				return writeFile(path.join(root, `${ordinal.toString().padStart(4, "0")}.txt`), `${ordinal}\n`, "utf8");
 			}),
 		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:v2:/);
+		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:/);
 	});
 
 	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {

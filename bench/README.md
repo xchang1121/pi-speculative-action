@@ -48,7 +48,7 @@ npm run bench:overlay-probe
 npm run bench:tape -- --tape /private/path/tape.json --actor-model actor-id --drafter-model draft-id
 ```
 
-入口分析 Chat Completions SSE，保留请求 payload、完整工具批次、usage 及失败记录，按请求累加服务耗时，按相同 messages 和工具定义比较动作参数。相同上下文只表示可比较，不证明候选归属或实际采纳。tape v1 的时间是请求内相对时间，因此不从中推算到达顺序、领先时间、策略收益或主加速比；这些证据来自完整运行报告。
+入口分析 Chat Completions SSE，保留请求 payload、完整工具批次、usage 及失败记录，按请求累加服务耗时，按相同 messages 和工具定义比较动作参数。相同上下文只表示可比较，不证明候选归属或实际采纳。录制格式的时间是请求内相对时间，因此不从中推算到达顺序、领先时间、策略收益或主加速比；这些证据来自完整运行报告。
 
 真实模型套件需要显式提供 `DEEPSEEK_API_KEY`，会产生网络和 API 成本：
 
