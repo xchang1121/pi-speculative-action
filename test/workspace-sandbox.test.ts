@@ -753,15 +753,18 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(stat(path.join(root, "created.txt"))).rejects.toThrow();
 	});
 
-	it.each(["stat-cache", "attributes", "encoding"])("preserves exact bytes across %s changes and parallel workspaces", async (setting) => {
+	it.each(["stat-cache", "attributes", "encoding", "delayed-events", "partial-events", "uncertain-events"])("preserves exact bytes across %s changes and parallel workspaces", async (setting) => {
 		const root = await temporaryRoot();
 		const encoding = setting === "encoding" ? "utf16le" : "utf8";
 		const stable = Buffer.from("$Id$\r\n", encoding), timestamp = new Date("2020-01-01T00:00:00Z");
 		await writeFile(path.join(root, "value1.txt"), stable);
-		if (setting !== "stat-cache") await writeFile(path.join(root, ".gitattributes"),
+		if (setting === "attributes" || setting === "encoding") await writeFile(path.join(root, ".gitattributes"),
 			`*.txt text eol=lf ident${setting === "encoding" ? " working-tree-encoding=UTF-16LE" : ""}\n`);
 		const signal = new AbortController().signal, captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		const events = vi.spyOn(ResourceVersionManager.prototype, "changesSince");
 		try {
+			if (setting.endsWith("-events")) events.mockReturnValue({ uncertain: setting === "uncertain-events",
+				paths: setting === "partial-events" ? [path.join(root, "value1.txt")] : [] });
 			vi.stubEnv("GIT_CONFIG_COUNT", "1");
 			vi.stubEnv("GIT_CONFIG_KEY_0", "core.trustctime");
 			vi.stubEnv("GIT_CONFIG_VALUE_0", "false");
@@ -784,7 +787,24 @@ describe("workspace-branch ExecutionWorld", () => {
 				expect(await readFile(path.join(root, "value[1].txt"))).toEqual(baseline);
 				for (const workspace of roots) await expect(stat(workspace)).rejects.toThrow();
 			}
-		} finally { captures.mockRestore(); vi.unstubAllEnvs(); }
+		} finally { captures.mockRestore(); events.mockRestore(); vi.unstubAllEnvs(); }
+	});
+
+	it("repairs staged bytes that changed between source capture and validation", async () => {
+		const root = await temporaryRoot(), target = path.join(root, "value.txt"), content = "before\n";
+		await writeFile(target, content);
+		const capture = ResourceVersionManager.prototype.capture, validate = ResourceVersionManager.prototype.validate;
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementationOnce(async function (this: ResourceVersionManager, ...args) {
+			const token = await capture.apply(this, args); await writeFile(target, "temporarily copied bytes\n"); return token;
+		});
+		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate").mockImplementationOnce(async function (this: ResourceVersionManager, token) {
+			await writeFile(target, content); return validate.call(this, token);
+		});
+		try {
+			await sandbox.prepare(root, { driver: "git" });
+			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8"))).toBe(content);
+			expect(await readFile(target, "utf8")).toBe(content);
+		} finally { captures.mockRestore(); validations.mockRestore(); }
 	});
 
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
