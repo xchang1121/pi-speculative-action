@@ -422,10 +422,10 @@ export function createSpeculativeActionHost(
 								return prepared?.output?.result;
 							},
 							settled: async (settlement) => {
-								await prepared?.settle(settlement.durationMs,
+								await prepared?.settle(settlement.toolExecution,
 									settlement.status === "succeeded"
 											? { result: settlement.output, isError: false }
-											: toolErrorSettlement(settlement.error), settlement.toolExecution);
+											: toolErrorSettlement(settlement.error));
 							},
 						}
 					: {}),

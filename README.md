@@ -95,6 +95,8 @@ Linux x86_64 alpha4 的 `read/ls/edit` 有采纳验证；新文件 `write` 的�
 
 程序接入使用 `./core`、`./process-reuse`、`./pattern-aware`、`./extension` 等窄入口。自定义执行环境通过 Host 的 `executionWorlds` 注册，并由所属会话调用 `host.dispose()`；自定义工具未经明确绑定不会自动获得投机资格。
 
+计时使用 `TaskTimeline` 累积 Actor 阶段和已记录的 `TimelineInterval`，端点取自同一单调时钟。Runtime 回退通过 `prepared.settle(toolExecution, output)` 结算，耗时从该区间计算；重复采纳共享同一个计算区间对象。
+
 ## 计时与验证
 
 任务主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`：反事实保留实际开销，只移除权威计算的重叠，并按计算身份去重。无重叠为 1×，有重叠大于 1×；开启投机不另跑一条真实 Actor 串行路径来生成主基线。

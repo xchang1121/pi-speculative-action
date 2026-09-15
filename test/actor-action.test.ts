@@ -34,7 +34,7 @@ describe("ActorAction", () => {
 			expect(action.rejectCandidate("fresh", exact, cause("execution", "late"))).toBe(false);
 			expect(action.setFallback(cause("control", "late"))).toBe(false);
 			expect(action.deferToFallback()).toBeUndefined();
-			expect(action.settleActor(100, false)).toBeUndefined();
+			expect(action.settleActor(selection.toolExecution, false)).toBeUndefined();
 			expect(action.settleSelection([{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }], provider))
 				.toEqual(provider === "preview" ? { status: "rejected", candidateID: "fresh", cause: cause("control", "actor_preview_provider") }
 					: { status: "adopted", candidateID: "fresh" });
@@ -47,12 +47,13 @@ describe("ActorAction", () => {
 			}
 			expect(action.select(selection)).toBe(false);
 			expect(action.settleSelection([], provider)).toBeUndefined();
-			expect(action.settleActor(100, false)).toBeUndefined();
+			expect(action.settleActor(selection.toolExecution, false)).toBeUndefined();
 		}
 	});
 
 	it("spans interception and exactly one Actor fallback completion", () => {
 		for (const mode of ["empty", "rejected", "interrupted"]) {
+			const execution = new TimelineInterval(0, 0);
 			const action = new ActorAction({ identity, tool: "bash", fallback: cause("matching", "no_candidate") });
 			if (mode !== "empty") {
 				const failure = cause("execution", "tool_failed");
@@ -63,23 +64,23 @@ describe("ActorAction", () => {
 			action.deferToFallback();
 			expect(action.state.status).toBe("awaiting_fallback");
 			expect(action.rejectCandidate("late", exact, cause("execution", "late"))).toBe(false);
-			expect(action.settleActor(Number.NaN, true)).toMatchObject({
+			expect(action.settleActor(execution, true)).toMatchObject({
 				rejections: mode === "rejected" ? [{ candidateID: "failed" }] : [],
 				provider: { kind: "actor", durationMs: 0, isError: true },
 			});
-			expect(action.settleActor(1, false)).toBeUndefined();
+			expect(action.settleActor(execution, false)).toBeUndefined();
 		}
 	});
 
 	it("settles isolation-blocked benefit without moving a completed computation into later Actor work", () => {
-		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs] of [[80, 80, 40], [200, 120, 0]]) for (const legacy of [false, true]) {
+		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs] of [[80, 80, 40], [200, 120, 0]]) {
 			const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
 			const action = new ActorAction({ identity, tool: "bash", actionKey,
 				fallback: cause("execution", "isolation_unavailable") });
 			expect(action.deferToFallback([], attemptLeadMs)?.status).toBe("rejected");
-			expect(action.settleActor(120, false, legacy ? 220 : execution)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
+			expect(action.settleActor(execution, false)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
 				executionBlockedTiming: { attemptLeadMs, executionAheadMs, hitLatencyMs } } });
-			if (!legacy) expect(action.settlement?.provider.toolExecution).toBe(execution);
+			expect(action.settlement?.provider.toolExecution).toBe(execution);
 			timeline.recordActor(0, 100); timeline.recordActor(220, 500);
 			timeline.recordTool(action.settlement!.provider.toolExecution);
 			expect(timeline.measure(500)).toMatchObject({ serializedMs: 500, toolExecutionMs: 120, hiddenLatencyMs: 0 });
