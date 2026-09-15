@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import fs from "node:fs/promises";
+import { constants, type BigIntStats, type Stats } from "node:fs";
+import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 
@@ -29,22 +29,22 @@ export type StableFileCapture = {
 	readonly hash: string;
 	readonly bytesRead: number;
 	readonly realPath: string;
-	readonly stat: import("node:fs").BigIntStats;
+	readonly stat: BigIntStats;
 	readonly content?: Buffer;
 };
 
 export function sameFilesystemIdentity(
-	left: import("node:fs").BigIntStats,
-	right: import("node:fs").BigIntStats,
+	left: BigIntStats,
+	right: BigIntStats,
 ): boolean {
 	return IDENTITY_FIELDS.every((field) => left[field] === right[field]);
 }
 
 /** Fence workspace timestamps with a private descriptor; elapsed budgets must not use wall time. */
 export async function advanceFilesystemClock(
-	clock: import("node:fs/promises").FileHandle,
+	clock: FileHandle,
 	boundary: number,
-	identity: Pick<import("node:fs").Stats, "dev" | "ino" | "nlink">,
+	identity: Pick<Stats, "dev" | "ino" | "nlink">,
 ): Promise<void> {
 	const deadline = performance.now() + 100;
 	const stamp = async () => {
@@ -90,7 +90,7 @@ async function captureFile(
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
-	let handle: import("node:fs/promises").FileHandle | undefined;
+	let handle: FileHandle | undefined;
 	try {
 		const before = binding ? await binding.stat({ bigint: true })
 			: observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
@@ -130,35 +130,55 @@ async function captureFile(
 	}
 }
 
+/** Own a directory listing or link target together with its stable entry identity. */
+export async function captureFilesystemEntry(target: string, read?: "directory" | "identity") {
+	const before = await fs.lstat(target, { bigint: true });
+	const link = before.isSymbolicLink() ? await fs.readlink(target) : undefined;
+	const entries = read === "directory" && before.isDirectory() ? await fs.readdir(target, { withFileTypes: true }) : undefined;
+	const info = link !== undefined || read !== undefined ? await fs.lstat(target, { bigint: true }) : before;
+	if (!sameFilesystemIdentity(before, info)) throw new Error(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
+	return { info, link, entries };
+}
+
+/** Resolve link targets component by component, retaining each stable namespace observation. */
+export async function* walkFilesystemPath(target: string, start = path.parse(target).root) {
+	let current = start, links = 0;
+	const pending = target.slice(start.length).split(path.sep).filter(Boolean);
+	for (;;) {
+		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
+		try { captured = await captureFilesystemEntry(current); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			yield { path: current }; return;
+		}
+		const { info, link } = captured;
+		yield { path: current, info, link, terminal: link === undefined && pending.length === 0 };
+		if (link !== undefined) {
+			if (++links > 40) throw new Error(`resource_symlink_cycle:${target}`);
+			const root = path.parse(link).root;
+			pending.unshift(...link.slice(root.length).split(path.sep));
+			current = root || path.dirname(current);
+			continue;
+		}
+		const component = pending.shift();
+		if (component === undefined) return;
+		if (!info.isDirectory()) throw new Error("filesystem path component is not a directory");
+		current = path.resolve(current, component);
+	}
+}
+
 export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
-	const resolvedRoot = path.resolve(root);
-	const resolvedTarget = path.resolve(target);
-	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) {
-		throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
-	}
-	try {
-		const rootInfo = await fs.lstat(resolvedRoot);
-		if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
-			throw new Error("sandbox workspace root must be a real directory");
+	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target);
+	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
+	for await (const entry of walkFilesystemPath(resolvedTarget, resolvedRoot)) {
+		const first = entry.path === resolvedRoot, info = entry.info;
+		if (!info) {
+			if (first) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`);
+			break;
 		}
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`, { cause: error });
-		throw error;
-	}
-	const relative = path.relative(resolvedRoot, resolvedTarget);
-	let current = resolvedRoot;
-	for (const segment of relative === "" ? [] : relative.split(path.sep)) {
-		current = path.join(current, segment);
-		try {
-			const stats = await fs.lstat(current);
-			if (stats.isSymbolicLink()) {
-				throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, current))}`);
-			}
-			if (!stats.isFile() && !stats.isDirectory()) throw new Error("sandbox path contains a special file");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
-			throw error;
-		}
+		if (first && (info.isSymbolicLink() || !info.isDirectory())) throw new Error("sandbox workspace root must be a real directory");
+		if (info.isSymbolicLink()) throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, entry.path))}`);
+		if (!info.isFile() && !info.isDirectory()) throw new Error("sandbox path contains a special file");
 	}
 }
 

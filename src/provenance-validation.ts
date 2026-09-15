@@ -1,12 +1,11 @@
-import { lstat, readdir, readlink, stat } from "node:fs/promises";
+import { directoryEntriesDigest } from "./process-observation.ts";
+import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureFilesystemEntry, captureStableFile } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import {
 	type DynamicDependency,
 	type DynamicDependencyCertificate,
-	digestObject,
-	filesystemEntryType,
 	filesystemMetadataDigest,
 	filesystemObservationDigest,
 	type ProcessProvenanceCertificate,
@@ -231,20 +230,13 @@ export async function captureDirectoryDependency(
 	excludedEntries: readonly string[] = [],
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
 	const excluded = new Set(excludedEntries);
-	const before = await lstat(physicalPath, { bigint: true });
-	if (!before.isDirectory()) throw new Error("not_directory");
-	const entries = await readdir(physicalPath, { withFileTypes: true });
-	const after = await lstat(physicalPath, { bigint: true });
-	if (!sameFilesystemIdentity(before, after)) throw new Error("directory_changed_during_capture");
-	const normalized = entries
-		.filter((entry) => !excluded.has(entry.name))
-		.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
-		.sort();
+	const { info, entries } = await captureFilesystemEntry(physicalPath, "directory");
+	if (!entries) throw new Error("not_directory");
 	return {
 		kind: "directory",
 		path: logicalPath,
-		entriesDigest: digestObject(normalized),
-		...(includeMetadata ? { metadataDigest: filesystemMetadataDigest(after) } : {}),
+		entriesDigest: directoryEntriesDigest(entries.filter((entry) => !excluded.has(entry.name))),
+		...(includeMetadata ? { metadataDigest: filesystemMetadataDigest(info) } : {}),
 		...(excluded.size ? { excludedEntries: Object.freeze([...excluded].sort()) } : {}),
 	};
 }
@@ -277,19 +269,9 @@ export async function captureSymlinkDependency(
 	physicalPath: string,
 	logicalPath: string,
 ): Promise<Extract<DynamicDependency, { kind: "symlink" }>> {
-	const before = await lstat(physicalPath, { bigint: true });
-	if (!before.isSymbolicLink()) throw new Error("not_symlink");
-	const target = await readlink(physicalPath);
-	const after = await lstat(physicalPath, { bigint: true });
-	if (!after.isSymbolicLink() || !sameFilesystemIdentity(before, after)) {
-		throw new Error("symlink_changed_during_capture");
-	}
-	return {
-		kind: "symlink",
-		path: logicalPath,
-		target,
-		targetDigest: sha256Digest(Buffer.from(target, "utf8")),
-	};
+	const { link: target } = await captureFilesystemEntry(physicalPath);
+	if (target === undefined) throw new Error("not_symlink");
+	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(Buffer.from(target, "utf8")) };
 }
 
 function indeterminate(

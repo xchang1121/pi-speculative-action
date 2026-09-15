@@ -44,7 +44,6 @@ import {
 	captureAbsenceDependency,
 	captureDirectoryDependency,
 	captureFileDependency,
-	captureSymlinkDependency,
 	validateDynamicDependencyCertificate,
 } from "./provenance-validation.ts";
 import {
@@ -65,7 +64,7 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { captureStableFile, hashExecutableFile } from "./filesystem-evidence.ts";
+import { captureStableFile, hashExecutableFile, walkFilesystemPath } from "./filesystem-evidence.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -1538,40 +1537,20 @@ async function captureHostPath(
 	role: Exclude<ObservedProcessPath["role"], "metadata">,
 ): Promise<readonly DynamicDependency[] | undefined> {
 	const dependencies: DynamicDependency[] = [];
-	const normalized = path.resolve(physicalPath);
-	let current = path.parse(normalized).root, links = 0;
-	const pending = normalized.slice(current.length).split(path.sep).filter(Boolean);
-	for (;;) {
+	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath))) {
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp", "/home"].some((root) => pathContains(root, current))) return undefined;
-		let info;
-		try { info = await lstat(current); }
-		catch (error) {
-			if (!missing(error)) throw error;
+		if (!info) {
 			const absence = await captureAbsenceDependency(current, slash(current), true);
 			if (!absence) throw new Error("host dependency changed during capture");
 			return [...dependencies, absence];
 		}
-		if (info.uid !== 0 || (!info.isSymbolicLink() && (info.mode & 0o022) !== 0)) return undefined;
-		if (info.isSymbolicLink()) {
-			if (++links > 40) throw new Error("host dependency symlink limit");
-			const link = await captureSymlinkDependency(current, slash(current));
-			dependencies.push(link);
-			const root = path.parse(link.target).root;
-			pending.unshift(...link.target.slice(root.length).split(path.sep));
-			current = root || path.dirname(current);
-			continue;
-		}
-		const component = pending.shift();
-		if (component !== undefined) {
-			if (!info.isDirectory()) throw new Error("unsupported host dependency");
-			current = path.resolve(current, component);
-			continue;
-		}
-		if (info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
-		else if (info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), true));
-		else throw new Error("unsupported host dependency");
-		return dependencies;
+		if (info.uid !== 0n || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
+		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(Buffer.from(link, "utf8")) });
+		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
+		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), true));
+		else if (!info.isFile() && !info.isDirectory()) throw new Error("unsupported host dependency");
 	}
+	return dependencies;
 }
 
 
