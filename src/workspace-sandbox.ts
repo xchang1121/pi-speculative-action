@@ -256,7 +256,6 @@ function stateMapBytes(states: ReadonlyMap<string, RegularFileState | undefined>
 // replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
-const GIT_PATHSPEC_BATCH_BYTES = 32 * 1024;
 const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
@@ -1262,23 +1261,9 @@ async function acquireSandboxBaseline(
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			try {
 				throwIfAborted(signal);
-				const changes = baseline ? repository.versions.changesSince(baseline.version) : undefined;
-				const indexed = baseline ? await sandboxIndexChanges(repository) : [];
-				const changedPaths = [...new Set([...(changes?.paths ?? []), ...indexed])];
-				const changedPathspecs =
-					changes && !changes.uncertain
-						? incrementalPathspecs(repository.sourceRoot, changedPaths)
-						: undefined;
-				if (baseline && changedPathspecs) {
-					// Preserve matching entries' stat data without touching the source workspace.
-					await repository.index(["read-tree", "-m", "-i", baseline.commit]);
-					if (changedPathspecs.length) {
-						await stageSandboxPaths(repository, changedPathspecs);
-					}
-				} else {
-					await repository.index(["read-tree", "--empty"]);
-					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
-				}
+				// Events and Git stat data can both miss changes. A changed baseline owns a fresh index.
+				await repository.index(["read-tree", "--empty"]);
+				await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				throwIfAborted(signal);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				const commit = tree === baseline?.tree ? baseline.commit : (await repository.git(
@@ -1302,53 +1287,6 @@ async function acquireSandboxBaseline(
 async function countGitBaselineEntries(repository: PooledGitRepository, commit: string): Promise<number> {
 	const tree = await repository.git(["ls-tree", "-r", "-z", "--name-only", commit]);
 	return parseNullList(tree).length;
-}
-
-async function stageSandboxPaths(repository: PooledGitRepository, pathspecs: readonly string[]): Promise<void> {
-	const options = { environment: { GIT_LITERAL_PATHSPECS: "1" } };
-	for (const batch of batchPathspecs(pathspecs)) {
-		// Resource changes revoke cached Git stat data, even when a writer restores mtime and size.
-		await repository.index(["rm", "-r", "-f", "--cached", "--ignore-unmatch", "--", ...batch], options);
-		let pending = batch;
-		for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
-			pending = (
-				await Promise.all(
-					pending.map(async (pathspec) =>
-						(await exists(path.join(repository.sourceRoot, pathspec)))
-							? pathspec
-							: undefined,
-					),
-				)
-			).filter((pathspec): pathspec is string => pathspec !== undefined);
-			if (!pending.length) break;
-			try {
-				await repository.index(["add", "-f", "-A", "--", ...pending], options);
-				break;
-			} catch (error) {
-				if (!(error instanceof Error) || !error.message.includes("did not match any files") || attempt === 2) {
-					throw error;
-				}
-			}
-		}
-	}
-}
-
-function batchPathspecs(pathspecs: readonly string[]): string[][] {
-	const batches: string[][] = [];
-	let batch: string[] = [];
-	let bytes = 0;
-	for (const pathspec of pathspecs) {
-		const size = Buffer.byteLength(pathspec) + 1;
-		if (batch.length && bytes + size > GIT_PATHSPEC_BATCH_BYTES) {
-			batches.push(batch);
-			batch = [];
-			bytes = 0;
-		}
-		batch.push(pathspec);
-		bytes += size;
-	}
-	if (batch.length) batches.push(batch);
-	return batches;
 }
 
 async function ensurePreparedSandbox(repository: PooledGitRepository, commit: string, signal?: AbortSignal): Promise<void> {
@@ -1583,18 +1521,6 @@ async function waitForSandboxRepositoryIdle(repository: PooledGitRepository): Pr
 function throwIfAborted(signal?: AbortSignal): void {
 	if (!signal?.aborted) return;
 	throw signal.reason instanceof Error ? signal.reason : new Error("sandbox preparation aborted");
-}
-
-function incrementalPathspecs(root: string, changedPaths: readonly string[]): string[] | undefined {
-	const result = new Set<string>();
-	for (const changedPath of changedPaths) {
-		const nativeRelative = relativeFilesystemPath(root, changedPath);
-		if (!nativeRelative) return undefined;
-		const relative = slash(nativeRelative);
-		if (isSnapshotExcluded(relative)) continue;
-		result.add(relative);
-	}
-	return [...result].sort();
 }
 
 function snapshotPathspecs(): string[] {
@@ -2244,16 +2170,6 @@ function withCommitLocks<T>(
 ): Promise<T> {
 	const target = targets[index];
 	return target ? withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
-}
-
-async function exists(target: string): Promise<boolean> {
-	try {
-		await lstat(target);
-		return true;
-	} catch (error) {
-		if (isMissing(error)) return false;
-		throw error;
-	}
 }
 
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
