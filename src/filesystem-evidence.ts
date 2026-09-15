@@ -66,72 +66,68 @@ export async function advanceFilesystemClock(
 }
 
 /** One regular-file identity owns admission, descriptor reads, and the final path proof. */
-export async function captureStableFile(
+export function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
 	observed?: Pick<StableFileCapture, "stat" | "realPath">,
 ): Promise<StableFileCapture> {
-	// Linux O_PATH pins the inode without opening a raced-in FIFO or device for I/O.
-	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
-		? await fs.open(target, 0x200000 | constants.O_NOFOLLOW) : undefined;
-	let handle: import("node:fs/promises").FileHandle | undefined;
-	try {
-		const before = binding ? await binding.stat({ bigint: true }) : observed?.stat ?? await fs.lstat(target, { bigint: true });
-		if (!before.isFile()) throw new Error("not_regular_file");
-		if (observed && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
-		const beforePath = observed?.realPath ?? await fs.realpath(target);
-		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
-			throw new Error(`file_too_large:${before.size}`);
-		}
-		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
-			constants.O_RDONLY | (binding ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
-		const capture = await captureDescriptor(handle, before, maxBytes, retainContent);
-		const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
-		if (beforePath !== afterPath || !sameFilesystemIdentity(capture.stat, pathStat)) {
-			throw new Error("file_changed_during_capture");
-		}
-		return { ...capture, realPath: afterPath };
-	} finally {
-		try { await handle?.close(); } finally { await binding?.close(); }
-	}
+	return captureFile(target, maxBytes, retainContent, true, observed);
 }
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
 export async function hashExecutableFile(target: string): Promise<`sha256:${string}`> {
-	const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
-	try {
-		const before = await handle.stat({ bigint: true });
-		if (!before.isFile()) throw new Error("not_regular_file");
-		return `sha256:${(await captureDescriptor(handle, before, Infinity, false)).hash}`;
-	} finally { await handle.close(); }
+	return `sha256:${(await captureFile(target, Infinity, false, false)).hash}`;
 }
 
-async function captureDescriptor(
-	handle: import("node:fs/promises").FileHandle,
-	before: import("node:fs").BigIntStats,
+async function captureFile(
+	target: string,
 	maxBytes: number,
 	retainContent: boolean,
-): Promise<Omit<StableFileCapture, "realPath">> {
-	const hash = createHash("sha256");
-	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
-	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
-	let bytesRead = 0;
-	for (;;) {
-		const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
-		const { bytesRead: size } = await handle.read(chunk);
-		if (size === 0) break;
-		bytesRead += size;
-		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-		hash.update(chunk.subarray(0, size));
+	verifyPath: boolean,
+	observed?: Pick<StableFileCapture, "stat" | "realPath">,
+): Promise<StableFileCapture> {
+	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
+	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
+		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
+	let handle: import("node:fs/promises").FileHandle | undefined;
+	try {
+		const before = binding ? await binding.stat({ bigint: true })
+			: observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
+		if (!before.isFile()) throw new Error("not_regular_file");
+		if (observed && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
+		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
+		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
+			throw new Error(`file_too_large:${before.size}`);
+		}
+		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
+			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+		const hash = createHash("sha256");
+		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
+		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
+		let bytesRead = 0;
+		for (;;) {
+			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
+			const { bytesRead: size } = await handle.read(chunk);
+			if (size === 0) break;
+			bytesRead += size;
+			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
+			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+			hash.update(chunk.subarray(0, size));
+		}
+		const after = await handle.stat({ bigint: true });
+		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
+			throw new Error("file_changed_during_capture");
+		}
+		if (verifyPath) {
+			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
+			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
+		}
+		return { hash: hash.digest("hex"), bytesRead, stat: after, realPath: beforePath, ...(content ? { content } : {}) };
+	} finally {
+		try { await handle?.close(); } finally { await binding?.close(); }
 	}
-	const after = await handle.stat({ bigint: true });
-	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
-		throw new Error("file_changed_during_capture");
-	}
-	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}) };
 }
 
 export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
