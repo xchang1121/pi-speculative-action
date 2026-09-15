@@ -642,7 +642,6 @@ export class SelfSpeculationCoordinator {
 				(candidate) => this.candidateCalibration(state, candidate),
 			).slice(0, settings.maxCandidates);
 			if (!candidates.length) continue;
-			const legacyFormat = legacyDraftFormat(settings);
 			const receipt = await this.post(
 				settings.candidatePath,
 				{
@@ -650,12 +649,8 @@ export class SelfSpeculationCoordinator {
 					request_id: state.requestID,
 					model: modelPayload(state.model),
 					max_draft_tokens: settings.maxDraftTokens,
-					...(legacyFormat
-						? { format: legacyFormat }
-						: {
-							actor_profile: settings.actorProfile,
-							...(settings.draftFormat === "auto" ? {} : { format: settings.draftFormat }),
-						}),
+					actor_profile: settings.actorProfile,
+					...(settings.draftFormat === "auto" ? {} : { format: settings.draftFormat }),
 					...(settings.draftBoundary === "auto" ? {} : { boundary: settings.draftBoundary }),
 					candidates: candidates.map((candidate) =>
 						candidatePayload(candidate, this.candidateCalibration(state, candidate)),
@@ -846,19 +841,14 @@ function providerPayload(
 		[settings.requestIDField]: requestID,
 	};
 	if (settings.forkTransport === "sidecar") return identified;
-	const legacyFormat = legacyDraftFormat(settings);
 	return {
 		...identified,
 		self_speculation: {
-			version: legacyFormat ? 1 : 2,
+			version: 2,
 			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
-			...(legacyFormat
-				? { draft_format: legacyFormat }
-				: {
-					actor_profile: settings.actorProfile,
-					...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
-				}),
+			actor_profile: settings.actorProfile,
+			...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
 			max_draft_tokens: settings.maxDraftTokens,
 			...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 			fork_max_tokens: settings.forkMaxTokens,
@@ -880,14 +870,9 @@ function providerPayload(
 }
 
 function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
-	const legacyFormat = legacyDraftFormat(settings);
 	return {
-		...(legacyFormat
-			? { draft_format: legacyFormat }
-			: {
-				actor_profile: settings.actorProfile,
-				...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
-			}),
+		actor_profile: settings.actorProfile,
+		...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
 		max_tokens: settings.forkMaxTokens,
 		temperature: settings.forkTemperature,
 		decoder: settings.forkDecoder,
@@ -897,11 +882,6 @@ function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string,
 		...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
 		fork_gate: forkGatePayload(settings),
 	};
-}
-
-function legacyDraftFormat(settings: SelfSpeculationSettings): string | undefined {
-	if (settings.actorProfile !== "tagged_json") return undefined;
-	return settings.draftFormat === "auto" ? "tagged_json" : settings.draftFormat;
 }
 
 function forkGatePayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {

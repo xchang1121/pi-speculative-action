@@ -1018,7 +1018,7 @@ function openActorForkSettings(
 			actions.set(`Candidates sent per decision: ${self.maxCandidates}`, () => edit("maxCandidates"));
 			actions.set(`Draft-token limit per candidate: ${self.maxDraftTokens}`, () => edit("maxDraftTokens"));
 			actions.set(`Actor Profile: ${self.actorProfile}`, () => edit("actorProfile"));
-			actions.set(`Legacy tool-call format: ${self.draftFormat}`, () => edit("draftFormat"));
+			actions.set(`Tool-call format override: ${self.draftFormat}`, () => edit("draftFormat"));
 			actions.set(`Tool-call boundary: ${syntaxSettingLabel(self.draftBoundary)}`, () => edit("draftBoundary"));
 		} else {
 			actions.set(`Pause forks that stop saving time: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled }));

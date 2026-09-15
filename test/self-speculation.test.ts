@@ -86,9 +86,9 @@ describe("self-speculation control plane", () => {
 			version: 2,
 			request_id: "actor-request",
 			max_draft_tokens: SELF_SPECULATION_DEFAULTS.maxDraftTokens,
-			format: "tagged_json",
+			actor_profile: "tagged_json",
 		});
-		expect(bundle?.body).not.toHaveProperty("actor_profile");
+		expect(bundle?.body).not.toHaveProperty("format");
 		expect(bundle?.body).not.toHaveProperty("boundary");
 		expect(bundle?.body.candidates).toEqual(covering ? ["predicted-a", "predicted-b"].map((key) => expect.objectContaining({
 			id: actionIdentity(key),
@@ -126,9 +126,9 @@ describe("self-speculation control plane", () => {
 		expect(actor.request_id).toBe("actor-request");
 		expect(actor.self_speculation).toEqual(
 			expect.objectContaining({
-				version: 1,
+				version: 2,
 				fork: true,
-				draft_format: "tagged_json",
+				actor_profile: "tagged_json",
 				d2: {
 					confidence_metric: "minimum_tool_name_probability",
 					confidence_threshold: 0.9,
@@ -139,20 +139,20 @@ describe("self-speculation control plane", () => {
 		);
 		expect(actor.self_speculation).not.toHaveProperty("role");
 		expect(actor.self_speculation).not.toHaveProperty("draft_profile");
-		expect(actor.self_speculation).not.toHaveProperty("actor_profile");
+		expect(actor.self_speculation).not.toHaveProperty("draft_format");
 		expect(actor.self_speculation).not.toHaveProperty("draft_boundary");
 		expect(actor.self_speculation).not.toHaveProperty("fork_forced_prefix");
 		expect(secondActor).toEqual({ model: "actor-retry" });
 		await coordinator.dispose();
 	});
 
-	it.each(["legacy format", "explicit Profile", "automatic Profile"] as const)("preserves control-path contracts (%s)", async (mode) => {
+	it.each(["format override", "explicit Profile", "automatic Profile"] as const)("preserves control-path contracts (%s)", async (mode) => {
 		const requests: CapturedRequest[] = [];
 		const explicit = mode === "explicit Profile", automatic = mode === "automatic Profile";
 		const coordinator = coordinatorFixture(
 			requests,
 			explicit ? { actorProfile: "qwen35_xml", forkTransport: "sidecar" }
-				: { forkEnabled: false, ...(automatic ? { actorProfile: "auto" } : { draftFormat: "qwen_xml" }) },
+				: { forkEnabled: false, actorProfile: automatic ? "auto" : "qwen35_xml", ...(automatic ? {} : { draftFormat: "qwen_xml" }) },
 			["actor-request"],
 			explicit ? (request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath
 				? forkReceipt("read", { path: "a.txt" }, undefined, "qwen35_xml")
@@ -177,8 +177,8 @@ describe("self-speculation control plane", () => {
 			expect(candidateRequest?.body).not.toHaveProperty("format");
 		} else {
 			expect(actor.self_speculation.draft_format).toBe("qwen_xml");
-			expect(actor.self_speculation.version).toBe(1);
-			expect(actor.self_speculation).not.toHaveProperty("actor_profile");
+			expect(actor.self_speculation).toMatchObject({ version: 2, actor_profile: "qwen35_xml" });
+			expect(candidateRequest?.body.actor_profile).toBe("qwen35_xml");
 			expect(candidateRequest?.body.format).toBe("qwen_xml");
 		}
 	});
@@ -403,11 +403,11 @@ describe("self-speculation control plane", () => {
 				chunk_count: 1,
 			},
 			options: {
-				draft_format: "tagged_json",
+				actor_profile: "tagged_json",
 				decoder: "auto",
 			},
 		});
-		expect(forks[0]?.body.options).not.toHaveProperty("actor_profile");
+		expect(forks[0]?.body.options).not.toHaveProperty("draft_format");
 		expect(forks[0]?.body.options).not.toHaveProperty("forced_prefix");
 		expect(forks[0]?.body.options).not.toHaveProperty("draft_boundary");
 		expect(coordinator.snapshot()).toEqual(
