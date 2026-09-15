@@ -531,7 +531,7 @@ type ProjectionResult<Output> =
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
 
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
-export function makeStructuralSpeculativeActionRuntime<
+export function makeSpeculativeActionRuntime<
 	SessionID,
 	Output,
 	StartInput extends TurnInput<SessionID>,
@@ -2808,7 +2808,6 @@ export function makeStructuralSpeculativeActionRuntime<
 		},
 		finishTurn,
 		settingsChanged,
-		releaseSession: disposeSession,
 		disposeSession,
 		dispose,
 		inspect,

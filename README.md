@@ -95,6 +95,8 @@ Linux x86_64 alpha4 的 `read/ls/edit` 有采纳验证；新文件 `write` 的�
 
 程序接入使用 `./core`、`./process-reuse`、`./pattern-aware`、`./extension` 等窄入口。自定义执行环境通过 Host 的 `executionWorlds` 注册，并由所属会话调用 `host.dispose()`；自定义工具未经明确绑定不会自动获得投机资格。
 
+直接使用核心 Runtime 时，以 `disposeSession(sessionID)` 清理单个会话，以 `dispose()` 清理全部会话。
+
 计时使用 `TaskTimeline` 累积 Actor 阶段和已记录的 `TimelineInterval`，端点取自同一单调时钟。Runtime 回退通过 `prepared.settle(toolExecution, output)` 结算，耗时从该区间计算；重复采纳共享同一个计算区间对象。
 
 ## 计时与验证
