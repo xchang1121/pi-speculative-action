@@ -2199,8 +2199,12 @@ function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSet
 function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: PatternAwareSettings, clock: number) {
 	const combined = new Map<number, number>();
 	for (const pattern of patterns) {
-		for (const [gap, weight] of weightedGaps(pattern, settings, clock)) {
-			if (gap > settings.maxFutureGap) continue;
+		for (const [value, count] of Object.entries(pattern.gapCounts)) {
+			const parsed = Number.parseInt(value, 10);
+			const gap = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+			const lastSeen = pattern.gapLastSeen[value] ?? pattern.lastSeenSequence;
+			const weight = Math.max(0, count) * recencyWeight(lastSeen, clock, settings.decayHalfLifeEvents);
+			if (!(weight > 0) || gap > settings.maxFutureGap) continue;
 			combined.set(gap, (combined.get(gap) ?? 0) + weight);
 		}
 	}
@@ -2218,20 +2222,6 @@ function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: Patte
 		latestHorizon,
 		gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)),
 	};
-}
-
-function weightedGaps(pattern: MutablePattern, settings: PatternAwareSettings, clock: number) {
-	return Object.entries(pattern.gapCounts)
-		.map(([value, count]) => {
-			const gap = Number.parseInt(value, 10);
-			const lastSeen = pattern.gapLastSeen[value] ?? pattern.lastSeenSequence;
-			return [
-				Number.isFinite(gap) ? Math.max(0, gap) : 0,
-				Math.max(0, count) * recencyWeight(lastSeen, clock, settings.decayHalfLifeEvents),
-			] as const;
-		})
-		.filter(([, weight]) => weight > 0)
-		.sort(([left], [right]) => left - right);
 }
 
 function ownBatch(inputs: ReadonlyArray<PatternAwareEventInput>, sessionID?: string) {
