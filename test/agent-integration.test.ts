@@ -107,6 +107,11 @@ function patternRequest(
 	};
 }
 
+function patternStoreLease(cwd: string, configuration: ReturnType<typeof patternAwareSettings>) {
+	return acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics-v1",
+		actionKey: (name, args, schema) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] });
+}
+
 async function temporaryWorkspace(base?: string): Promise<string> {
 	const root = await directories.create(base);
 	await writeFile(path.join(root, "notes.txt"), "one\ntwo\nthree\nfour", "utf8");
@@ -697,28 +702,27 @@ describe("speculative action host", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it("drains an admitted Pattern learning batch when disposal starts immediately", async () => {
+	it("owns an admitted Pattern learning configuration and batch through immediate disposal", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const store = new PatternAwareStore(patternAware), request = patternRequest(tool, patternAware, "session", { read: "schema" });
-		const controller = createPatternPlanSource({ sessionID: "session", cwd, store,
+		const lease = await patternStoreLease(cwd, patternAware), request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		try {
 			await controller.source.observe!({ ...request,
 				consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: { path: "notes.txt" }, tools: [tool] },
 				tool: "read", concrete: { path: "notes.txt" }, output: { result: textResult("one"), isError: false }, durationMs: 1, order: 0 });
 			controller.turnFinished(request.startInput, request.settings, false);
+			request.settings.sourceConfig.patternAware = patternAwareSettings({ ...patternAware, maxContextLength: 3 });
 			await controller.dispose();
-			expect(store.recent("session")).toMatchObject([{ tool: "read", input: { path: "notes.txt" }, outcome: "success", schemaHash: "schema" }]);
-		} finally { await controller.dispose(); }
+			expect(lease.store.recent("session")).toMatchObject([{ tool: "read", input: { path: "notes.txt" }, outcome: "success", schemaHash: "schema" }]);
+		} finally { await controller.dispose(); await lease.release(); }
 	});
 
 	it.each([false, true])("owns late Pattern feedback across configuration replacement and return=%s", async (returning) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 }), newer = patternAwareSettings({ ...older, maxContextLength: 3 });
-		const semantics = { namespace: "pi-action-semantics-v1",
-			actionKey: (name: string, args: Readonly<Record<string, unknown>>, schema?: string) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] };
-		const bootstrap = await acquirePatternAwareStore(cwd, older, cwd, semantics), oldStore = bootstrap.store;
+		const bootstrap = await patternStoreLease(cwd, older), oldStore = bootstrap.store;
 		const controller = createPatternPlanSource({ sessionID: "probe", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		const propose = (patternAware: typeof older) => controller.source.propose(patternRequest(tool, patternAware, "probe", { read: "schema" }));
@@ -738,7 +742,7 @@ describe("speculative action host", () => {
 			await controller.source.onIssued!(feedback); await bootstrap.release(); await propose(newer);
 			if (returning) {
 				await propose(older);
-				const active = await acquirePatternAwareStore(cwd, older, cwd, semantics);
+				const active = await patternStoreLease(cwd, older);
 				try { expect(active.store).toBe(oldStore); } finally { await active.release(); }
 			}
 			const before = oldStore.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed;
@@ -749,7 +753,7 @@ describe("speculative action host", () => {
 			const closed = oldStore.snapshot();
 			await controller.source.onIssued!(feedback); await controller.source.onSettled!({ ...feedback, settlement });
 			expect(oldStore.snapshot()).toEqual(closed);
-			const fresh = await acquirePatternAwareStore(cwd, older, cwd, semantics);
+			const fresh = await patternStoreLease(cwd, older);
 			try {
 				expect(fresh.store).not.toBe(oldStore);
 				expect(fresh.store.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed).toBe(before + 1);
@@ -790,10 +794,15 @@ describe("speculative action host", () => {
 		});
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const propose = (patternAware: typeof older) => controller.source.propose(patternRequest(tool, patternAware));
+		const propose = (patternAware: typeof older) => {
+			const configuration = { ...patternAware }, pending = controller.source.propose(patternRequest(tool, configuration));
+			Object.assign(configuration, { enabled: false, maxContextLength: 99 });
+			return pending;
+		};
 		let pending: Promise<PromiseSettledResult<unknown>[]> | undefined, closing: Promise<void> | undefined;
 		try {
 			await propose(older);
+			expect(stores).toHaveLength(1);
 			if (phase === "flush failure") vi.spyOn(stores[0]!, "flush").mockRejectedValueOnce(new Error("flush failed"));
 			pending = Promise.allSettled([propose(newer), propose(newest)]);
 			await loading.entered;
@@ -825,8 +834,7 @@ describe("speculative action host", () => {
 			expect(stores).toHaveLength(replacing || phase === "load failure" ? 3 : 2);
 			const retired = [...stores];
 			for (const configuration of new Set([older, newer, newest])) {
-				const fresh = await acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics-v1",
-					actionKey: (name, args, schema) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] });
+				const fresh = await patternStoreLease(cwd, configuration);
 				try { expect(retired).not.toContain(fresh.store); } finally { await fresh.release(); }
 			}
 		} finally {

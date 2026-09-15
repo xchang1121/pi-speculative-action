@@ -67,26 +67,24 @@ export function createPatternPlanSource(input: {
 	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
 	let analysisTail: Promise<void> = Promise.resolve();
 
-	const queueAnalysis = (analysis: () => void | Promise<void>): void => {
-		if (lifecycle.sealed) return;
-		analysisTail = analysisTail
-			.then(() => new Promise<void>(setImmediate))
-			.then(analysis)
-			.catch(() => {
-				// Optional learning cannot poison later observations or the Actor lifecycle.
-			});
-	};
 	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
 		patternAwareSettings(settings.sourceConfig?.patternAware);
+	const admit = <Value>(settings: SpeculativeActionSettings,
+		operation: (settings: PatternAwareSettings) => Promise<Value>): Promise<Value> => {
+		try {
+			// Capture before admission yields; a sealed owner must not read caller configuration.
+			const patternSettings = lifecycle.sealed ? undefined : sourceSettings(settings);
+			return lifecycle.admit(() => operation(patternSettings!));
+		} catch (error) { return Promise.reject(error); }
+	};
 	const nextRevision = (sessionID: string, turnID: string): number => {
 		const key = agentBatchKey(sessionID, turnID);
 		const revision = (revisions.get(key) ?? -1) + 1;
 		revisions.set(key, revision);
 		return revision;
 	};
-	const resolveStore = async (settings: SpeculativeActionSettings): Promise<PatternAwareStore> => {
+	const resolveStore = async (patternSettings: PatternAwareSettings): Promise<PatternAwareStore> => {
 		if (input.store) return input.store;
-		const patternSettings = sourceSettings(settings);
 		const configurationKey = patternAwareAnalyzerKey(patternSettings);
 		if (!openedStore || openedStore.key !== configurationKey) {
 			const previous = openedStore;
@@ -133,12 +131,11 @@ export function createPatternPlanSource(input: {
 		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
-		propose: ({ startInput, data, settings, signal }) => lifecycle.admit(async () => {
-			const patternSettings = sourceSettings(settings);
+		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
 			await analysisTail;
 			if (signal.aborted) return undefined;
-			const store = await resolveStore(settings);
+			const store = await resolveStore(patternSettings);
 			if (signal.aborted) return undefined;
 			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
 			const signature = patternPredictionSignature(candidates);
@@ -154,15 +151,15 @@ export function createPatternPlanSource(input: {
 				),
 			};
 		}),
-		continueFrom: ({ startInput, data, settings, batch, signal }) => lifecycle.admit(async () => {
+		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
 			await analysisTail;
 			if (signal.aborted) return undefined;
-			const store = await resolveStore(settings);
+			const store = await resolveStore(patternSettings);
 			if (signal.aborted) return undefined;
 			const id = `pattern:peer:${stableValueHash(batch.map(({ identity }) => identity.id))}`;
 			const candidates = store.predictAfterBatch(startInput.sessionID,
 				batch.map(({ candidate, output }) => predictedEvent(startInput, candidate, output, candidateExecutionMs(candidate))),
-				data.schemaHashes, sourceSettings(settings),
+				data.schemaHashes, patternSettings,
 				// No calibrated joint confidence is supplied for the foreign batch; use a neutral prior.
 				{ visitedPatternIDs: [id], pathProbability: 0.5 });
 			if (!candidates.length) return undefined;
@@ -184,7 +181,7 @@ export function createPatternPlanSource(input: {
 			output,
 			trigger,
 			signal,
-		}) => lifecycle.admit(async () => {
+		}) => admit(settings, async (patternSettings) => {
 			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (!context) return undefined;
@@ -194,7 +191,7 @@ export function createPatternPlanSource(input: {
 				predictedEvent(startInput, action, output, candidateExecutionMs(candidate)),
 				data.schemaHashes,
 				trigger === "actor_adopted",
-				sourceSettings(settings),
+				patternSettings,
 			);
 			if (!next.length) return undefined;
 			return {
@@ -208,8 +205,7 @@ export function createPatternPlanSource(input: {
 				),
 			};
 		}),
-		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => lifecycle.admit(async () => {
-			const patternSettings = sourceSettings(settings);
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const observation = projectPatternAwareObservation(
@@ -235,7 +231,7 @@ export function createPatternPlanSource(input: {
 			authoritativeBatches.set(key, batch);
 			if (!patternSettings.multiStepEnabled) return undefined;
 			await analysisTail;
-			const store = await resolveStore(settings);
+			const store = await resolveStore(patternSettings);
 			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
 			const candidates = store.predictAfterBatch(
 				consumeInput.sessionID,
@@ -279,41 +275,38 @@ export function createPatternPlanSource(input: {
 		flush: () => lifecycle.run(() => flushStores()),
 	};
 
-	return {
-		source,
-		turnStarted: (startInput, settings) => {
-			const key = agentBatchKey(startInput.sessionID, startInput.turnID);
-			authoritativeBatches.delete(key);
-			revisions.delete(key);
-			if (!settings.enabled || !sourceSettings(settings).enabled) {
-				carriedPredictions.delete(startInput.sessionID);
-				return;
-			}
-			queueAnalysis(async () => {
-				const store = await resolveStore(settings);
-				store.observeTurn();
-			});
-		},
-		turnFinished: (startInput, settings, terminal) => {
-			const key = agentBatchKey(startInput.sessionID, startInput.turnID);
-			const batch = authoritativeBatches.get(key);
-			authoritativeBatches.delete(key);
-			revisions.delete(key);
-			if (terminal) carriedPredictions.delete(startInput.sessionID);
-			if (!settings.enabled || !sourceSettings(settings).enabled) {
-				carriedPredictions.delete(startInput.sessionID);
-				return;
-			}
-			const events = batch?.size
-				? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
-				: [];
-			queueAnalysis(async () => {
-				const store = await resolveStore(settings);
+	const observeTurn = (startInput: AgentStartInput, settings: SpeculativeActionSettings, terminal?: boolean): void => {
+		if (lifecycle.sealed) return;
+		const key = agentBatchKey(startInput.sessionID, startInput.turnID);
+		const batch = authoritativeBatches.get(key);
+		authoritativeBatches.delete(key);
+		revisions.delete(key);
+		if (terminal) carriedPredictions.delete(startInput.sessionID);
+		const patternSettings = settings.enabled ? sourceSettings(settings) : undefined;
+		if (!patternSettings?.enabled || lifecycle.sealed) {
+			carriedPredictions.delete(startInput.sessionID);
+			return;
+		}
+		// Only a completed turn contributes its authoritative batch; entry discards any stale batch.
+		const events = terminal !== undefined && batch?.size
+			? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
+			: [];
+		analysisTail = analysisTail
+			.then(() => new Promise<void>(setImmediate))
+			.then(async () => {
+				const store = await resolveStore(patternSettings);
 				if (events.length) store.observeBatch(events);
 				store.observeTurn();
 				if (terminal) store.finishSession(startInput.sessionID);
+			})
+			.catch(() => {
+				// Optional learning cannot poison later observations or the Actor lifecycle.
 			});
-		},
+	};
+	return {
+		source,
+		turnStarted: observeTurn,
+		turnFinished: observeTurn,
 		finishSession: () => lifecycle.run(async () => {
 			await lifecycle.drain();
 			revisions.clear();
