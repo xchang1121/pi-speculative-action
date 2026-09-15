@@ -1827,8 +1827,8 @@ export function makeStructuralSpeculativeActionRuntime<
 		state.actorObservation ??= actualKey ? identity : null;
 		let capturePreparationMs = 0;
 		const prepared: { output?: Output; settle: PreparedActorCall<Output>["settle"] } = {
-			settle: (durationMs, output, toolExecution) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, durationMs, output, capturePreparationMs, toolExecution)),
+			settle: (toolExecution, output) => state.session.lifecycle.track(
+				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution)),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -1997,30 +1997,25 @@ export function makeStructuralSpeculativeActionRuntime<
 		input: ConsumeInput,
 		actualCall: ActualToolCall,
 		actorAction: ActorAction<Candidate, Output>,
-		duration: number,
 		output: Output | undefined,
 		capturePreparationMs: number,
-		toolExecution?: TimelineInterval,
+		toolExecution: TimelineInterval,
 	): Promise<void> => {
 		if (!state.actorActions.delete(actorAction)) return;
 		const settlementStartedAt = performance.now();
 		const capture = actorAction.takeCapture();
-		const durationMs = finiteMetric(duration);
-		if (!actorAction.settleActor(durationMs, outputIsError(output), toolExecution)) {
+		const settlement = actorAction.settleActor(toolExecution, outputIsError(output));
+		if (!settlement) {
 			state.session.lifecycle.release(capture);
 			return;
 		}
+		const execution = settlement.provider.toolExecution, durationMs = execution.completedAt - execution.startedAt;
 		const key = actorAction.actionKey;
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output);
 		if (capture && key && output !== undefined && !outputIsError(output)) {
-			const provider = actorAction.settlement?.provider;
-			if (provider?.kind === "actor") {
-				await promoteAuthoritativeResult(state, key, output, durationMs, provider.toolExecution, capture);
-			} else {
-				state.session.lifecycle.release(capture);
-			}
+			await promoteAuthoritativeResult(state, key, output, durationMs, execution, capture);
 		} else if (capture) {
 			state.session.lifecycle.release(capture);
 		}

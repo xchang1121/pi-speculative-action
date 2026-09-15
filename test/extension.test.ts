@@ -145,7 +145,7 @@ describe("zero-modification Pi extension", () => {
 			tool: "read", args: { path: "notes.txt" },
 		}), undefined);
 		if (mode === "cache") expect(fixture.settle).not.toHaveBeenCalled();
-		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(Number), { result, isError: false }, expect.any(TimelineInterval));
+		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(TimelineInterval), { result, isError: false });
 	});
 
 	it("binds only prepared searches, quietly retains native Actor otherwise, and retires on refresh or disable", async () => {
@@ -493,7 +493,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	const resolveInvocation: NonNullable<CreateSpeculativeActionHostOptions["resolveInvocation"]> = (tool, input) => hostOptions?.resolveInvocation?.(tool, input);
 	const host = createSpeculativeActionHost("session", { cwd, complete: vi.fn(), resolveInvocation, executionWorlds: [] });
 	hosts.push(host);
-	const settle = vi.fn(async (_durationMs: number, _output?: ToolSettlement) => undefined);
+	const settle = vi.fn(async (_execution: TimelineInterval, _output?: ToolSettlement) => undefined);
 	vi.spyOn(host.runtime, "prepareActorCall").mockResolvedValue({ settle, ...(options.reuse ? { output: options.reuse } : {}) });
 	vi.spyOn(host.runtime, "settingsChanged").mockResolvedValue();
 	for (const method of ["startTurn", "previewActorTool", "previewActorCall", "finishTurn"] as const) vi.spyOn(host, method).mockResolvedValue();

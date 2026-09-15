@@ -195,11 +195,16 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	return { runtime, events, executions: () => executions, ready };
 }
 
+function simulatedExecution(durationMs: number): TimelineInterval {
+	// Protocol fixtures supply synthetic service spans; clock-sensitive cases record their own endpoints.
+	return new TimelineInterval(0, durationMs);
+}
+
 async function runFallback(runtime: ReturnType<typeof harness<string>>["runtime"], actor: Call, durationMs = 1, output = "actor"): Promise<void> {
 	const prepared = await runtime.prepareActorCall(actor);
 	expect(prepared).toBeDefined();
 	expect(prepared?.output).toBeUndefined();
-	await prepared?.settle(durationMs, output);
+	await prepared?.settle(simulatedExecution(durationMs), output);
 }
 
 function start(turnID: string): Start {
@@ -315,7 +320,7 @@ describe("structural speculative runtime", () => {
 				await runtime.startTurn(actor);
 				const prepared = await runtime.prepareActorCall(actor);
 				expect(prepared).toBeDefined(); expect(prepared?.output).toBeUndefined();
-				await prepared?.settle(500, `session-${index}`);
+				await prepared?.settle(simulatedExecution(500), `session-${index}`);
 			}
 			expect(closed).toEqual([]);
 			expect(calls.map(({ sessionID }) => runtime.inspect(sessionID).activeTurns)).toEqual([1, 1]);
@@ -376,8 +381,8 @@ describe("structural speculative runtime", () => {
 				expect(prepared[0]).not.toBe(prepared[1]);
 				for (const handle of prepared) { expect(handle?.output).toBeUndefined(); expect(Object.isFrozen(handle)).toBe(true); }
 				for (const index of order) {
-					await prepared[index]?.settle(100, `content:${calls[index]!.input.path}:${index}`);
-					await prepared[index]?.settle(100, "duplicate report");
+					await prepared[index]?.settle(simulatedExecution(100), `content:${calls[index]!.input.path}:${index}`);
+					await prepared[index]?.settle(simulatedExecution(100), "duplicate report");
 				}
 				expect(seals).toEqual(order.map((index) => [calls[index]!.input.path, `content:${calls[index]!.input.path}:${index}`]));
 				const unfinished = await runtime.prepareActorCall({ ...calls[0]!, input: { path: "unfinished" } });
@@ -388,9 +393,9 @@ describe("structural speculative runtime", () => {
 				await runtime.startTurn(calls[0]!);
 				const fresh = await runtime.prepareActorCall({ ...calls[0]!, input: { path: "C" } });
 				expect(fresh?.output).toBeUndefined();
-				await prepared[0]?.settle(100, "previous turn");
-				await unfinished?.settle(100, "late previous turn");
-				await fresh?.settle(100, "content:C");
+				await prepared[0]?.settle(simulatedExecution(100), "previous turn");
+				await unfinished?.settle(simulatedExecution(100), "late previous turn");
+				await fresh?.settle(simulatedExecution(100), "content:C");
 				expect(seals.at(-1)).toEqual(["C", "content:C"]);
 				expect(seals).toHaveLength(3);
 			} finally { await runtime.dispose(); }
@@ -518,7 +523,7 @@ describe("structural speculative runtime", () => {
 
 		const prepared = await runtime.prepareActorCall(call("turn"));
 		expect(prepared?.output).toBeUndefined();
-		await prepared?.settle(4, "actor");
+		await prepared?.settle(simulatedExecution(4), "actor");
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 
 		expect(settlements).toHaveLength(1);
@@ -605,7 +610,7 @@ describe("structural speculative runtime", () => {
 
 		gate.release();
 		await candidateReady.promise;
-		await prepared?.settle(100, "actor");
+		await prepared?.settle(simulatedExecution(100), "actor");
 		await runtime.finishTurn({ ...call("prediction"), terminal: false });
 		expect(
 			events.find(
@@ -749,7 +754,7 @@ describe("structural speculative runtime", () => {
 					const prepared = await runtime.prepareActorCall(call("turn"));
 					expect(prepared?.output).toBeUndefined();
 					if (phase !== "capture") {
-						observed = prepared!.settle(1, "actor");
+						observed = prepared!.settle(simulatedExecution(1), "actor");
 						if (phase === "promotion") await observed; else await started.promise;
 					}
 				} else if (sourceWork) await producerStarted.promise;
@@ -873,7 +878,7 @@ describe("structural speculative runtime", () => {
 			expect(original?.output).toBeUndefined(); now += 4;
 			const execution = new TimelineInterval(now - 4, now);
 			now += 50; // Observation may arrive after the executor has completed.
-			await original?.settle(4, "actor:1", execution);
+			await original?.settle(execution, "actor:1");
 			await runtime.finishTurn({ ...first, terminal: false });
 			now += 2;
 			if (mode === "stale-before") version++;
@@ -884,7 +889,7 @@ describe("structural speculative runtime", () => {
 			await runtime.previewActorCall(second);
 			const prepared = await runtime.prepareActorCall(second);
 			expect(prepared?.output).toBe(fallback ? undefined : outputs[0]);
-			if (fallback) { now += 2; await prepared?.settle(2, "actor:2"); }
+			if (fallback) { now += 2; await prepared?.settle(new TimelineInterval(now - 2, now), "actor:2"); }
 			else expect((await runtime.prepareActorCall(second))?.output).toBe(mode === "exclusive" ? "actor:1" : outputs[0]);
 			expect(captures).toBe(fallback ? 2 : 1); expect(seals).toBe(captures);
 			await runtime.finishTurn({ ...second, terminal: true });
@@ -939,7 +944,7 @@ describe("structural speculative runtime", () => {
 				(event) => event.type === "source_request" && event.request.settlement.status === "aborted",
 			),
 		).toHaveLength(1);
-		await prepared?.settle(1, "actor");
+		await prepared?.settle(simulatedExecution(1), "actor");
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 		expect(runtime.inspect().pendingPredictions).toBe(0);
 	});
@@ -1169,7 +1174,7 @@ describe("structural speculative runtime", () => {
 				const actor = call(`${prefix}-${index}`); await runtime.startTurn(actor);
 				const prepared = await runtime.prepareActorCall(actor); expect(prepared).toBeDefined();
 				reused.push(prepared?.output !== undefined);
-				if (prepared?.output === undefined) { now += 2; await prepared?.settle(2, "actor"); }
+				if (prepared?.output === undefined) { now += 2; await prepared?.settle(new TimelineInterval(now - 2, now), "actor"); }
 				else expect(prepared.output).toBe("actor");
 				await runtime.finishTurn(actor);
 			}
@@ -1273,7 +1278,7 @@ describe("structural speculative runtime", () => {
 				let prepared: PreparedActorCall<string> | undefined;
 				const delivered = gateway.executeAuthoritative({ tool: formal.tool, input: formal.input }, actor, {
 					reuse: async () => { prepared = await runtime.prepareActorCall(formal); return prepared?.output; }, settled: async (result) => {
-						if (result.status === "succeeded") await prepared?.settle(result.durationMs, result.output);
+						if (result.status === "succeeded") await prepared?.settle(result.toolExecution, result.output);
 					},
 				});
 				expect(await delivered).toBe(phase === "input" ? "20" : "Actor");
@@ -1365,7 +1370,7 @@ describe("structural speculative runtime", () => {
 			let prepared: PreparedActorCall<string> | undefined;
 			await expect(gateway.executeAuthoritative({ tool: actor.tool, input: actor.input }, executeActor, {
 				reuse: async () => { prepared = await runtime.prepareActorCall(actor); return prepared?.output; }, settled: async (settlement) => {
-					if (settlement.status === "succeeded") await prepared?.settle(settlement.durationMs, settlement.output);
+					if (settlement.status === "succeeded") await prepared?.settle(settlement.toolExecution, settlement.output);
 				},
 			})).resolves.toBe("Actor");
 			expect(executeActor).toHaveBeenCalledOnce();
@@ -1433,7 +1438,7 @@ describe("structural speculative runtime", () => {
 			const mutationCall = await runtime.prepareActorCall(mutation);
 			expect(mutationCall?.output).toBeUndefined();
 			if (phase === "sealed stale" || phase === "running") version++;
-			await mutationCall?.settle(1, "Actor");
+			await mutationCall?.settle(simulatedExecution(1), "Actor");
 			gate.arrive(); if (phase === "running") await ready.promise;
 			expect(executions).toBe(phase === "running" ? 2 : 1);
 			expect(settlements).toHaveLength(0);
@@ -1442,7 +1447,7 @@ describe("structural speculative runtime", () => {
 			const actor = call("turn-2", { path: "future.ts" }), hit = !["sealed stale", "sealed unproven"].includes(phase);
 			const prepared = await runtime.prepareActorCall(actor);
 			expect(prepared?.output).toBe(hit ? `future:${phase === "running" ? 2 : 1}` : undefined);
-			if (!hit) await prepared?.settle(1, "Actor");
+			if (!hit) await prepared?.settle(simulatedExecution(1), "Actor");
 			expect(commits).toHaveBeenCalledTimes(hit ? 1 : 0);
 			await runtime.finishTurn({ ...actor, terminal: true });
 			expect(settlements).toHaveLength(1);
@@ -1489,7 +1494,7 @@ describe("structural speculative runtime", () => {
 			expect(captured?.input.path).toBe(formalPath);
 			expect(actionKeys).toBe(2);
 			expect(resolveExecution, String(settlePreview)).toHaveBeenCalledTimes(settlePreview === true ? 1 : 0);
-			await (await consumed)?.settle(1, "actor");
+			await (await consumed)?.settle(simulatedExecution(1), "actor");
 			await runtime.finishTurn({ ...actorCall, terminal: true });
 		}
 	});
@@ -1659,7 +1664,7 @@ describe("structural speculative runtime", () => {
 				if (independent) {
 					const prepared = await runtime.prepareActorCall(second);
 					expect(prepared?.output).toBeUndefined();
-					native++; await prepared?.settle(1, `count:${++effects}`);
+					native++; await prepared?.settle(simulatedExecution(1), `count:${++effects}`);
 					expect({ effects, native }).toEqual({ effects: 2, native: 1 });
 				}
 				await runtime.finishTurn({ ...actor, terminal: true });
@@ -1720,7 +1725,7 @@ describe("structural speculative runtime", () => {
 			const prepared = await runtime.prepareActorCall(firstCall);
 			expect(prepared?.output).toBeUndefined();
 			expect.soft(project).toHaveBeenCalledTimes(projected ? actionCount : 0);
-			await prepared?.settle(2, "actor-built");
+			await prepared?.settle(simulatedExecution(2), "actor-built");
 			await runtime.finishTurn({ ...firstCall, terminal: true });
 			const matched = settlements.filter((settlement) => settlement.observation === "observed" && settlement.match.matched);
 			expect(matched).toMatchObject(proposalIDs.map((proposalID) => ({
@@ -1771,7 +1776,7 @@ describe("structural speculative runtime", () => {
 			const prepared = await runtime.prepareActorCall(child);
 			expect(prepared?.output).toBeUndefined();
 			expect(executionCount()).toBe(1);
-			await prepared?.settle(1, "actor");
+			await prepared?.settle(simulatedExecution(1), "actor");
 			preparation.release();
 			await runtime.finishTurn({ ...child, terminal: true });
 			expect(settlements.filter(({ prediction }) => prediction.actionID === "child")).toMatchObject([{
@@ -2075,7 +2080,7 @@ describe("structural speculative runtime", () => {
 			await childReady.promise;
 			const prepared = await runtime.prepareActorCall(call("miss", { path: "other.ts" }));
 			expect(prepared?.output).toBeUndefined();
-			await prepared?.settle(1, "actor");
+			await prepared?.settle(simulatedExecution(1), "actor");
 			await runtime.finishTurn({ ...call("miss"), terminal: false });
 
 			enabled = false;

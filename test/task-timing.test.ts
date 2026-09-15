@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { measureSpeculativeTask, TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 
 describe("single-run serialized counterfactual timing", () => {
 	it.each([
@@ -19,9 +19,10 @@ describe("single-run serialized counterfactual timing", () => {
 		{ name: "clip tools and reject empty intervals", start: 100, end: 200, actor: [], tools: [[150, 250], [200, 220], [140, 120]],
 			expected: { toolExecutionMs: 50, authoritativeToolCount: 1, serializedMs: 100, hiddenLatencyMs: 0 } },
 	])("measures $name", ({ start, end, actor, tools, expected }) => {
-		const intervals = (pairs: number[][]) => pairs.map(([startedAt, completedAt]) => ({ startedAt: startedAt!, completedAt: completedAt! }));
-		expect(measureSpeculativeTask({ startedAt: start, completedAt: end, actorPhases: intervals(actor), authoritativeTools: intervals(tools) }))
-			.toMatchObject(expected);
+		const timeline = new TaskTimeline(start);
+		for (const [from, to] of actor) timeline.recordActor(from!, to!);
+		for (const [from, to] of tools) timeline.recordTool(new TimelineInterval(from!, to!));
+		expect(timeline.measure(end)).toMatchObject(expected);
 	});
 
 	it("counts the computation once across adoption and snapshots endpoints independently of mutable input", () => {

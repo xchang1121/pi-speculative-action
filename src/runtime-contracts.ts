@@ -305,7 +305,7 @@ export interface SpeculativeRuntimeInspection {
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
 export interface PreparedActorCall<Output> {
 	readonly output?: Output;
-	readonly settle: (durationMs: number, output?: Output, toolExecution?: TimelineInterval) => Promise<void>;
+	readonly settle: (toolExecution: TimelineInterval, output?: Output) => Promise<void>;
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {

@@ -162,14 +162,12 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	}
 
 	settleActor(
-		durationMs: number,
+		execution: TimelineInterval,
 		isError: boolean,
-		execution: number | TimelineInterval = performance.now(),
 	): ActorActionSettlement | undefined {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
-		const duration = finite(durationMs);
-		const toolExecution = typeof execution === "number"
-			? new TimelineInterval(finite(execution) - duration, execution) : TimelineInterval.from(execution);
+		const toolExecution = TimelineInterval.from(execution);
+		const duration = toolExecution.completedAt - toolExecution.startedAt;
 		const executionBlockedTiming =
 			this.stateValue.executionBlockedAttemptLeadMs === undefined
 				? undefined
