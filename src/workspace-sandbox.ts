@@ -170,7 +170,6 @@ interface PooledGitRepository {
 	readonly git: ReturnType<typeof bindGit>;
 	readonly index: ReturnType<typeof bindGit>;
 	readonly versions: ResourceVersionManager;
-	readonly baselinePreparations: WeakMap<AbortSignal, Promise<string>>;
 	baseline?: { readonly commit: string; readonly tree: string; readonly version: ResourceVersionToken };
 	active: number;
 	readonly idleWaiters: Set<() => void>;
@@ -391,7 +390,7 @@ async function resolveWorkspaceDriver(
 	const repository = acquiredRepository ?? ownedRepository;
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
-		const commit = await acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT);
+		const commit = await acquireSandboxBaseline(repository);
 		const cached = repository.autoDriverDecision;
 		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) {
 			return cached.resolved;
@@ -680,22 +679,11 @@ async function prepareSandboxWorkspaceFor(
 	const repository = await acquireSandboxRepository(state, sourceRoot, options.gitBinary ?? "git");
 	try {
 		throwIfAborted(options.signal);
-		const concreteOptions =
-			options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" as const } : options;
-		const resolved = await resolveWorkspaceDriver(state, concreteOptions, sourceRoot, repository);
+		const resolved = await resolveWorkspaceDriver(
+			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
+		);
 		throwIfAborted(options.signal);
-		// Only overlapping warm-ups from one generation share evidence work; actual forks always revalidate.
-		let preparing = options.signal && repository.baselinePreparations.get(options.signal);
-		if (!preparing) {
-			preparing = acquireSandboxBaseline(repository, SANDBOX_AUTHOR_ENVIRONMENT, options.signal);
-			if (options.signal) {
-				const signal = options.signal;
-				repository.baselinePreparations.set(signal, preparing);
-				const settled = () => { repository.baselinePreparations.delete(signal); };
-				void preparing.then(settled, settled);
-			}
-		}
-		const commit = await preparing;
+		const commit = await acquireSandboxBaseline(repository, options.signal, true);
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -829,7 +817,7 @@ async function createPrivateSandboxWorkspace(
 	let processRoot: string | undefined;
 	let overlayStorageRoot: string | undefined;
 	try {
-		const commit = await acquireSandboxBaseline(pool, SANDBOX_AUTHOR_ENVIRONMENT);
+		const commit = await acquireSandboxBaseline(pool);
 		let sandboxRoot: string;
 		let baselineRoot: string;
 		let gitDirectory: string;
@@ -1228,7 +1216,6 @@ async function createSandboxRepository(
 			git,
 			index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
 			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES }),
-			baselinePreparations: new WeakMap(),
 			active: 0,
 			idleWaiters: new Set(),
 			lock: Promise.resolve(),
@@ -1243,13 +1230,16 @@ async function createSandboxRepository(
 
 async function acquireSandboxBaseline(
 	repository: PooledGitRepository,
-	authorEnvironment: Readonly<Record<string, string>>,
 	signal?: AbortSignal,
+	warmup = false,
 ): Promise<string> {
 	return withWorkspaceLock(repository, async () => {
 		throwIfAborted(signal);
 		const baseline = repository.baseline;
 		if (baseline) {
+			// Quiet notifications may reuse preparation work; every actual fork still checks exact evidence below.
+			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
+			if (changes && !changes.uncertain && !changes.paths.length) return baseline.commit;
 			const [current, indexed] = await Promise.all([
 				repository.versions.validate(baseline.version),
 				sandboxIndexChanges(repository),
@@ -1268,7 +1258,7 @@ async function acquireSandboxBaseline(
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				const commit = tree === baseline?.tree ? baseline.commit : (await repository.git(
 					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
-					{ environment: authorEnvironment },
+					{ environment: SANDBOX_AUTHOR_ENVIRONMENT },
 				)).toString("utf8").trim();
 				if ((await repository.versions.validate(version)).expired) continue;
 				throwIfAborted(signal);
