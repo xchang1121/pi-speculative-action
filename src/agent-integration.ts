@@ -441,7 +441,7 @@ export function createSpeculativeActionHost(
 		},
 		dispose: async () => {
 			try {
-				await runtime.releaseSession(sessionID);
+				await runtime.disposeSession(sessionID);
 				drafterPlans.finishSession();
 				await patternPlans.finishSession();
 			} finally {

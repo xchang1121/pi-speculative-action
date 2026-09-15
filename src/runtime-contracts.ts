@@ -320,7 +320,6 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly prepareActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<PreparedActorCall<Output> | undefined>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
 	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
-	readonly releaseSession: (sessionID: SessionID) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
 	readonly inspect: (sessionID?: SessionID) => SpeculativeRuntimeInspection;

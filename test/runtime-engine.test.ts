@@ -16,7 +16,7 @@ import type {
 	SpeculativeActionEvent,
 	SpeculativeActionSettings,
 } from "../src/runtime.ts";
-import { makeStructuralSpeculativeActionRuntime } from "../src/runtime-engine.ts";
+import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
 import { CandidateStore } from "../src/candidate-stores.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
@@ -147,7 +147,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	const events: SpeculativeActionEvent<SessionID>[] = [];
 	const ready = candidateSucceeded<SessionID>();
 	let executions = 0;
-	const runtime = makeStructuralSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
+	const runtime = makeSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
 		sources: [input.source, ...(input.peers ?? [])],
 		settings: input.settings ?? (() => settings),
 		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
