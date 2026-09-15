@@ -373,7 +373,9 @@ export class ExecutionWorldRouter<Context, Output> {
 	dispose(): Promise<void> {
 		return this.lifecycle.close(async () => {
 			await this.lifecycle.drain();
-			await Promise.allSettled([...this.worldsByID.values()].map(async (world) => world.dispose?.()));
+			const closed = await Promise.allSettled([...this.worldsByID.values()].map(async (world) => world.dispose?.()));
+			const failures = closed.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+			if (failures.length) throw new AggregateError(failures, "Execution world cleanup failed");
 		});
 	}
 
