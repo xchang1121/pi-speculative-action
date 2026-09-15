@@ -95,6 +95,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const firstSibling = first.createExecutionWorld({ driver: "git" });
 		const secondWorld = second.createExecutionWorld({ driver: "git" });
 		const signal = new AbortController().signal, validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
+		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince");
 		const gate = gated(), schedule = globalThis.setTimeout;
 		let expire: (() => void) | undefined, pool: string | undefined, closed = false;
 		const removals = new Map<string, number>();
@@ -110,12 +111,14 @@ describe("workspace-branch ExecutionWorld", () => {
 				firstSibling.speculation.prepare?.({ cwd: root, signal }),
 				secondWorld.speculation.prepare?.({ cwd: root, signal }),
 			]);
-			expect(validations).toHaveBeenCalledTimes(2); // Shared warm-up inside one service; separate owners retain separate evidence.
+			await firstSibling.speculation.prepare?.({ cwd: root, signal: new AbortController().signal });
+			expect(validations).toHaveBeenCalledTimes(2); // One initial validation per service, shared across warm generations.
+			changes.mockReturnValue({ uncertain: true, paths: [] });
 			const failure = new Error("baseline validation failed");
 			validations.mockRejectedValueOnce(failure);
 			await expect(firstWorld.speculation.prepare?.({ cwd: root, signal })).rejects.toBe(failure);
 			await firstSibling.speculation.prepare?.({ cwd: root, signal });
-			expect(validations).toHaveBeenCalledTimes(4); // Failure retires the shared work; the same live generation can retry.
+			expect(validations).toHaveBeenCalledTimes(4); // Failed warm-up does not poison retry.
 			const abandoned = await firstWorld.speculation.execute(
 				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
 			);
@@ -148,7 +151,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		} finally {
 			gate.release(); timers.mockRestore(); vi.mocked(rm).mockImplementation(fs.rm);
-			validations.mockRestore();
+			validations.mockRestore(); changes.mockRestore();
 			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
 		}
 	});
@@ -763,12 +766,12 @@ describe("workspace-branch ExecutionWorld", () => {
 		const signal = new AbortController().signal, captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		const events = vi.spyOn(ResourceVersionManager.prototype, "changesSince");
 		try {
-			if (setting.endsWith("-events")) events.mockReturnValue({ uncertain: setting === "uncertain-events",
+			events.mockReturnValue({ uncertain: setting !== "delayed-events" && setting !== "partial-events",
 				paths: setting === "partial-events" ? [path.join(root, "value1.txt")] : [] });
 			vi.stubEnv("GIT_CONFIG_COUNT", "1");
 			vi.stubEnv("GIT_CONFIG_KEY_0", "core.trustctime");
 			vi.stubEnv("GIT_CONFIG_VALUE_0", "false");
-			for (const text of ["before\r\n", "after!\r\n", "after!\r\n"]) {
+			for (const [iteration, text] of ["before\r\n", "after!\r\n", "after!\r\n"].entries()) {
 				const baseline = Buffer.from(text, encoding);
 				await writeFile(path.join(root, "value[1].txt"), baseline);
 				await utimes(path.join(root, "value[1].txt"), timestamp, timestamp);
@@ -782,7 +785,7 @@ describe("workspace-branch ExecutionWorld", () => {
 						expect(await readFile(path.join(sandboxRoot, "value[1].txt"), "utf8")).toBe(content);
 						return sandboxRoot;
 					})));
-				expect(captures.mock.calls.length).toBe(count);
+				expect(captures.mock.calls.length).toBe(count + Number(setting === "delayed-events" && iteration === 1));
 				expect(new Set(roots).size).toBe(2);
 				expect(await readFile(path.join(root, "value[1].txt"))).toEqual(baseline);
 				for (const workspace of roots) await expect(stat(workspace)).rejects.toThrow();
@@ -811,6 +814,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot(), gate = gated();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<void>[] = [];
+		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockReturnValue({ uncertain: true, paths: [] });
 		let heldRoot: string | undefined, removals = 0;
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
 			const directory = await fs.mkdtemp(prefix, options);
@@ -842,7 +846,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))
 				.toBe("after\n");
 		} finally {
-			gate.release(); await Promise.allSettled(pending); validations.mockRestore();
+			gate.release(); await Promise.allSettled(pending); validations.mockRestore(); changes.mockRestore();
 			vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp); vi.mocked(rm).mockImplementation(fs.rm);
 		}
 	});
