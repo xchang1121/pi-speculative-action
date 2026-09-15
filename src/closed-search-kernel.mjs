@@ -10,7 +10,7 @@ import { serialize } from "node:v8";
 
 // Explicit shared Actor/producer semantics, NOT equivalence with ambient native fd.
 export const CLOSED_SEARCH_PROFILE = Object.freeze({
-	id: "pi.captured-search.v5", pi: "0.84.1", platform: process.platform, node: process.version,
+	id: "pi.captured-search", pi: "0.84.1", platform: process.platform, node: process.version,
 	find: Object.freeze({ minimatch: "10.2.5", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
 		platform: "linux", nocase: false, dot: true, matchBase: true, nocomment: true, nonegate: true, braceExpandMax: 10_000 }),
 	grep: Object.freeze({ versions: Object.freeze({ "win32:x64": "15.2.0", "linux:x64": "14.1.0" }), flags: Object.freeze(["--no-config", "--sort=path", "--no-ignore-global"]),

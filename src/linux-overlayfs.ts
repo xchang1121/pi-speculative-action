@@ -20,7 +20,7 @@ import { errorMessage, isMissing } from "./error-utils.ts";
 import { waitForCandidate } from "./scheduler.ts";
 import { positiveInteger as positiveCapacity, nonNegativeNumber as nonNegativeDuration } from "./setting-input.ts";
 
-const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow-v4";
+const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
 const OVERLAY_EXIT_TIMEOUT_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;

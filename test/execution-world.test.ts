@@ -320,7 +320,7 @@ function world(
 		isolation,
 		speculation: {
 			capabilities,
-			fingerprint: () => `${id}:v1`,
+			fingerprint: () => `${id}`,
 			execute: async ({ value }: { readonly value: string }) => testBranch(value, { backend: id, executionFingerprint: "executor" }),
 		},
 		dispose,

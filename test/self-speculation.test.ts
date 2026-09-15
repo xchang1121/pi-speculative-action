@@ -723,7 +723,7 @@ function candidate(
 }
 
 function actionIdentity(key: string): string {
-	return `action:v1:${createHash("sha256").update(key).digest("hex")}`;
+	return `action:${createHash("sha256").update(key).digest("hex")}`;
 }
 
 function predictionFeedback(source: string, adopted: boolean, sequence: number): PredictionFeedback<string> {

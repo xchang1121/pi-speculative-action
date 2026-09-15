@@ -21,7 +21,7 @@ interface TapeToolCall {
 	readonly arguments: unknown;
 }
 
-/** Recorded Chat Completions evidence. Tape v1 has request durations, not a shared arrival clock. */
+/** Recorded Chat Completions evidence. The recorded format has request durations, not a shared arrival clock. */
 export function analyzeTape(tape: LlmTape, actorModel: string, drafterModel: string) {
 	if (actorModel === drafterModel) throw new Error("Distinct model IDs are required to identify Actor and Drafter requests");
 	const sequences = new Set<number>();

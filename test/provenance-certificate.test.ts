@@ -164,7 +164,7 @@ describe("process provenance certificates", () => {
 			exclusionCopies: frozenValues.filter((value) => Array.isArray(value) && value[0] === ".git" && value[1] === ".pi").length,
 		}).toEqual({ prototypeCopies: 1, exclusionCopies: 3 });
 		const second = seal([b, a]);
-		expect(first.id).toBe(id); // Golden v7 identities from the pre-refactor implementation.
+		expect(first.id).toBe(id); // Recorded certificate identities, including exact Unicode spelling.
 		expect(dependencyPathsetKey(first.dependencyCertificate)).toBe(dependencyPathsetKey(second.dependencyCertificate));
 		expect(first).toEqual(second);
 		expect(first.prototype).toBe(semantic);
@@ -190,7 +190,7 @@ describe("process provenance certificates", () => {
 		const speculative = processCertificate(semantic);
 		const actor = processCertificate(semantic, {
 			producer: {
-				observer: { provider: "test", fingerprint: sha256Digest("observer-v2") },
+				observer: { provider: "test", fingerprint: sha256Digest("observer-other") },
 				execution: { authority: "actor" },
 			},
 		});

@@ -1424,9 +1424,6 @@ function patternSemanticsKey(semantics: PatternAwareActionSemantics | undefined)
 }
 
 function configuredPersistenceFile(file: string, analyzerKey: string, semanticsKey: string): string {
-	if (analyzerKey === patternAwareAnalyzerKey(PATTERN_AWARE_DEFAULTS) && semanticsKey === "pi-action-semantics-v1") {
-		return file;
-	}
 	const parsed = path.parse(file);
 	return path.join(parsed.dir, `${parsed.name}.${hash(`${semanticsKey}\0${analyzerKey}`).slice(0, 12)}${parsed.ext}`);
 }

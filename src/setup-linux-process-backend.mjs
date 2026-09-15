@@ -111,8 +111,8 @@ async function qualifySandlock(binary) {
 		await copyFile(heldExec, image);
 		await chmod(image, 0o755);
 		await writeFile(
-			path.join(view, ".pi-spec-dispatch-v1"),
-			["PI_SPEC_DISPATCH_V1", "/bin/true", "/bin/true", "/dev/null", "/bin", "/bin", ""].join("\n"),
+			path.join(view, ".pi-spec-dispatch"),
+			["PI_SPEC_DISPATCH", "/bin/true", "/bin/true", "/dev/null", "/bin", "/bin", ""].join("\n"),
 			{ mode: 0o600 },
 		);
 		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"]);
@@ -124,7 +124,7 @@ async function qualifySandlock(binary) {
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
 	const content = await readFile(source);
-	const sourceDigest = sha256("static-pthread-v1", content);
+	const sourceDigest = sha256("static-pthread", content);
 	const target = heldExec;
 	const stamp = `${target}.sha256`;
 	try {

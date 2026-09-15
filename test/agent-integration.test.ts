@@ -108,7 +108,7 @@ function patternRequest(
 }
 
 function patternStoreLease(cwd: string, configuration: ReturnType<typeof patternAwareSettings>) {
-	return acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics-v1",
+	return acquirePatternAwareStore(cwd, configuration, cwd, { namespace: "pi-action-semantics",
 		actionKey: (name, args, schema) => PI_ACTION_SEMANTICS.buildKey(name, args, cwd, schema), projectors: [] });
 }
 
@@ -629,7 +629,7 @@ describe("speculative action host", () => {
 				const binding = context.action.executionContext as { identity?: { value: unknown }; process?: { value: unknown } };
 				return { result: result(inspect(boundary === "input" ? (context.args as { value: unknown }).value : binding[boundary]!.value)), isError: false };
 			});
-			const resolveInvocation = vi.fn(() => boundary === "input" ? undefined : { executor: "fixture.v1", ...(boundary === "identity"
+			const resolveInvocation = vi.fn(() => boundary === "input" ? undefined : { executor: "fixture", ...(boundary === "identity"
 				? { identity: { value: make(profile) } } : { process: { command: "inspect", cwd, environment: {}, shell: process.execPath,
 					shellArgs: [], commandTransport: "argv" as const, value: make(profile) } }) });
 			const host = createSpeculativeActionHost("shapes", { cwd, actionSemantics,
@@ -1228,7 +1228,7 @@ function mockRuntimeWorld(
 		isolation: "runtime_sandbox",
 		speculation: {
 			capabilities: "all",
-			fingerprint: () => "runtime:v1",
+			fingerprint: () => "runtime",
 			execute: async (context) => {
 				const output = await execute(context);
 				return testBranch(output, {

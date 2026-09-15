@@ -432,12 +432,12 @@ describe("PatternAware", () => {
 
 	test("continues only schema-compatible learned targets", () => {
 		const store = patternStore();
-		trainGrepRead(store, "one", "src/a.ts", "read-v1");
-		trainGrepRead(store, "two", "src/b.ts", "read-v1");
+		trainGrepRead(store, "one", "src/a.ts", "read-base");
+		trainGrepRead(store, "two", "src/b.ts", "read-base");
 		store.observe(input("three", "grep", {}, { outputPaths: ["src/c.ts"] }));
 
-		expect(store.predict("three", { read: "read-v2" }).filter((item) => item.tool === "read")).toHaveLength(0);
-		expect(store.predict("three", { read: "read-v1" })).toContainEqual(
+		expect(store.predict("three", { read: "read-other" }).filter((item) => item.tool === "read")).toHaveLength(0);
+		expect(store.predict("three", { read: "read-base" })).toContainEqual(
 			expect.objectContaining({
 				type: "tool_call",
 				source: "pattern_aware",
@@ -1164,11 +1164,11 @@ describe("PatternAware", () => {
 			const first = tool === "bash" ? { command: "npm test" } : { path: "src/a.ts" };
 			const inputs = [first, tool === "read" ? { ...first, offset: 1 } : first];
 			for (const [index, value] of inputs.entries()) {
-				store.observe(input(mode, tool, value, { schemaHash: "v1", learnTarget: mode !== "non-learning",
+				store.observe(input(mode, tool, value, { schemaHash: "schema-base", learnTarget: mode !== "non-learning",
 					outcome: index === 0 ? "failure" : "success", durationMs: index === 0 ? 500 : 700 }));
 				for (let noise = 0; noise < 3; noise++)
 					store.observe(input(mode, "read", { path: `noise-${index}-${noise}.ts` }));
-				const recurrent = store.predict(mode, { [tool]: mode === "stale schema" ? "v2" : "v1" })
+				const recurrent = store.predict(mode, { [tool]: mode === "stale schema" ? "schema-other" : "schema-base" })
 					.find((candidate) => candidate.patternID.startsWith("action-backoff:") && !candidate.background);
 				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
 				else {
@@ -1178,7 +1178,7 @@ describe("PatternAware", () => {
 					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
 					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
 					// Inspect demoted samples even when competing reads displace them from the default beam.
-					const forecast = () => store.predict(mode, { [tool]: "v1" }, { ...config, beamWidth: 16 })
+					const forecast = () => store.predict(mode, { [tool]: "schema-base" }, { ...config, beamWidth: 16 })
 						.find((candidate) => candidate.actionIdentity === recurrent!.actionIdentity)!;
 					const learned = store.snapshot(), history = store.recent(mode), before = forecast();
 					const settle = (settlement: Parameters<PatternAwareStore["settled"]>[1]) => {

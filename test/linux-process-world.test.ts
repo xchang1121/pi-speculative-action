@@ -334,7 +334,7 @@ describe("Linux process ExecutionWorld", () => {
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
 				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; printf '%32768s:end' ''",
-				actionNamespace: "process-concurrency-test.v1",
+				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
@@ -501,7 +501,7 @@ describe("Linux process ExecutionWorld", () => {
 			}
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			running = forkReusableBash(fixture, { command: failure === "publication" ? "emit" : "/usr/bin/printf capture-once", label: failure,
-				actionNamespace: "capture-owners.v1", executionFingerprint });
+				actionNamespace: "capture-owners", executionFingerprint });
 			void running.then(() => { returned = true; }, () => { returned = true; });
 			await Promise.race([failed.promise, running.then(() => { throw new Error(`failure injection was not reached: ${JSON.stringify(fixture.backend.metrics())}`); })]);
 			await nextTurn();
@@ -666,7 +666,7 @@ describe("Linux process ExecutionWorld", () => {
 			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { workspaceDriver: "overlayfs", includeWorkspaceFingerprint: true });
 			branch = await forkReusableBash(fixture, { command: "mv source moved", label: "driver-semantics-test",
-				actionNamespace: "driver-semantics-test.v1", executionFingerprint });
+				actionNamespace: "driver-semantics-test", executionFingerprint });
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const validation = await branch.validate?.();
 			expect(validation?.status).toBe("indeterminate");

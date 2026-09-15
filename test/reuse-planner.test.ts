@@ -46,10 +46,10 @@ describe("ProcessReusePlanner", () => {
 		});
 	});
 
-	it("misses the v6 weak namespace and rewarms v7 without accepting legacy certificate identities", async () => {
+	it("rejects obsolete certificate identities and rewarms the current weak namespace", async () => {
 		const root = await temporaryRoot(), store = new ProvenanceCertificateStore(root);
 		const certificate = processCertificate(processPrototype(), { createdAt: 123 });
-		// Golden v6 hashes from 48bd3b6, with the same prototype, producer, dependencies, result, and timestamp.
+		// Recorded incompatible hashes, with the same prototype, producer, dependencies, result, and timestamp.
 		const legacy = { ...certificate, version: 6,
 			weakKey: "sha256:063acac52cc249aa186e4f796eb0cb8dc3d1656c13c185912724042764cc325c" as const,
 			strongKey: "sha256:80149901d114aae4530bf0dd5e9dedd8d7ca7320f6c5d78ec2829e786c2a4ac7" as const,

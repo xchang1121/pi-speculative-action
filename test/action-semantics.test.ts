@@ -58,7 +58,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(implicit?.key).toBe(explicit?.key);
 		expect(implicit).toMatchObject({
 			tool: "ls",
-			semanticsEpoch: "pi.ls.v3",
+			semanticsEpoch: "pi.ls",
 			resources: ["."],
 			input: { path: ".", limit: 500 },
 		});
@@ -73,12 +73,12 @@ describe("ActionSemanticsRegistry", () => {
 	});
 
 	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
-		const implicit = buildPiActionKey("read", { path: "src/a.ts" }, "/workspace", "schema-v1");
+		const implicit = buildPiActionKey("read", { path: "src/a.ts" }, "/workspace", "schema-base");
 		const explicit = buildPiActionKey(
 			"read",
 			{ path: "src/a.ts", offset: 1, limit: 2000 },
 			"/workspace",
-			"schema-v1",
+			"schema-base",
 		);
 
 		expect(implicit?.key).not.toBe(explicit?.key);
@@ -86,13 +86,13 @@ describe("ActionSemanticsRegistry", () => {
 		expect(relation).toMatchObject({ kind: "projected", projector: "read.range" });
 		expect(implicit).toMatchObject({
 			tool: "read",
-			semanticsEpoch: "pi.read.v3",
-			schemaHash: "schema-v1",
+			semanticsEpoch: "pi.read",
+			schemaHash: "schema-base",
 			resources: ["src/a.ts"],
 		});
 		expect(implicit?.input).not.toHaveProperty("limit");
 		expect(explicit?.input).toHaveProperty("limit", 2000);
-		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read.v3"');
+		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read"');
 		expect(Object.isFrozen(implicit)).toBe(true);
 		expect(Object.isFrozen(implicit?.input)).toBe(true);
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);
@@ -117,9 +117,9 @@ describe("ActionSemanticsRegistry", () => {
 			tool: "read",
 			resources: ["a.ts"],
 			input: { path: "a.ts", offset: 1, fields: { "\u00e9": 2, "e\u0301": 1 } },
-			semanticsEpoch: "read.v1",
-			schemaHash: "schema.v1",
-			executionFingerprint: "executor.v1",
+			semanticsEpoch: "read-base",
+			schemaHash: "schema-base",
+			executionFingerprint: "executor-base",
 		});
 		expect(actionKeyMatch(base, buildActionKey({
 			...base, input: { ...base.input, fields: { "e\u0301": 1, "\u00e9": 2 } },
@@ -138,8 +138,8 @@ describe("ActionSemanticsRegistry", () => {
 		expect(actionKeyCovers(base, sameEnvelope, [permissive, covering])).toBe(true);
 		expect(actionKeyMatch(base, sameEnvelope, [permissive, covering], true)).toMatchObject({ kind: "projected", projector: "covering" });
 
-		for (const [field, value, reason] of [["tool", "grep", "different_tool"], ["semanticsEpoch", "read.v2", "different_semantics"],
-			["schemaHash", "schema.v2", "different_schema"], ["executionFingerprint", "executor.v2", "different_executor"]]) {
+		for (const [field, value, reason] of [["tool", "grep", "different_tool"], ["semanticsEpoch", "read-other", "different_semantics"],
+			["schemaHash", "schema-other", "different_schema"], ["executionFingerprint", "executor-other", "different_executor"]]) {
 			for (const input of [base.input, { path: "a.ts", offset: 2 }]) {
 				const actor = buildActionKey({ ...base, [field!]: value, input });
 				expect(actionKeyMatch(base, actor, [permissive])).toBeUndefined();
@@ -150,22 +150,22 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("binds the selected profile before canonicalization without mutating the native registry", () => {
 		for (const tool of ["grep", "find"]) for (const scope of ["tree_content", "captured_inputs"] as const) {
-			const profile = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed.v1",
+			const profile = { ...PI_ACTION_SEMANTICS.definition(tool)!, epoch: "closed-base",
 				effect: "observation", requirements: { capabilities: [...RESOURCE_OBSERVATION_EFFECTS.capabilities] }, resourceScope: scope } satisfies ActionSemanticsDefinition;
-			const context = {}, execution = { fingerprint: "profile.v1", context, semantics: profile as ActionSemanticsDefinition };
+			const context = {}, execution = { fingerprint: "profile-base", context, semantics: profile as ActionSemanticsDefinition };
 			const canonicalize = profile.canonicalize;
 			profile.canonicalize = function (input, cwd) {
-				profile.epoch = "closed.v2";
+				profile.epoch = "closed-other";
 				profile.requirements.capabilities.push("filesystem.write");
 				(profile as { resourceScope: string }).resourceScope = "entries";
-				execution.fingerprint = "profile.v2"; execution.context = { changed: true };
+				execution.fingerprint = "profile-other"; execution.context = { changed: true };
 				execution.semantics = { ...profile, canonicalize: () => undefined };
 				return canonicalize(input, cwd);
 			};
 			const args = { pattern: "needle", path: "." };
 			const native = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace")!;
 			const closed = PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", execution)!;
-			expect(closed).toMatchObject({ semanticsEpoch: "closed.v1", executionFingerprint: "profile.v1", semantics: { resourceScope: scope } });
+			expect(closed).toMatchObject({ semanticsEpoch: "closed-base", executionFingerprint: "profile-base", semantics: { resourceScope: scope } });
 			expect(closed.executionContext).toBe(context);
 			expect(closed.semantics?.requirements).toEqual(RESOURCE_OBSERVATION_EFFECTS);
 			expect(PI_ACTION_SEMANTICS.definition(native)?.effect).toBe("unbounded");
@@ -179,13 +179,13 @@ describe("ActionSemanticsRegistry", () => {
 			expect(Object.isFrozen(closed.semantics?.requirements)).toBe(true);
 			expect(PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", execution)).toBeUndefined();
 			expect(PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", { ...execution, semantics: profile }))
-				.toMatchObject({ semanticsEpoch: "closed.v2", executionFingerprint: "profile.v2", semantics: { resourceScope: "entries" } });
+				.toMatchObject({ semanticsEpoch: "closed-other", executionFingerprint: "profile-other", semantics: { resourceScope: "entries" } });
 		}
 	});
 
 	it("supports a new host tool with one semantics definition", () => {
 		const registry = new ActionSemanticsRegistry([
-			{ ...resourceDefinition("stat", "host.stat.v1", (input) => {
+			{ ...resourceDefinition("stat", "host.stat", (input) => {
 				if (!input || typeof input !== "object" || !("path" in input) || typeof input.path !== "string") {
 					return undefined;
 				}
@@ -200,7 +200,7 @@ describe("ActionSemanticsRegistry", () => {
 			tool: "stat",
 			input: { path: "a.ts" },
 			resources: ["a.ts"],
-			semanticsEpoch: "host.stat.v1",
+			semanticsEpoch: "host.stat",
 		});
 		expect(registry.buildKey("unknown", {}, "/workspace")).toBeUndefined();
 	});
@@ -209,18 +209,18 @@ describe("ActionSemanticsRegistry", () => {
 		const cycle: Record<string, unknown> = {}; cycle.self = cycle;
 		const child = { value: 0 };
 		for (const value of [new Date(0), new Map([["value", 0]]), new Set([0]), cycle, -0, NaN, { omitted: undefined }, { left: child, right: child }]) {
-			const input = { value }, contract = resourceDefinition("opaque", "opaque.v1", () => ({ input, resources: [] }));
+			const input = { value }, contract = resourceDefinition("opaque", "opaque", () => ({ input, resources: [] }));
 			expect(() => buildActionKey({ tool: "opaque", input, resources: [] })).toThrow("immutable data identity");
 			expect(new ActionSemanticsRegistry([contract]).buildKey("opaque", {}, "/workspace")).toBeUndefined();
 		}
 		const registry = new ActionSemanticsRegistry([
-			resourceDefinition("reject", "reject.v1", () => undefined),
-			resourceDefinition("throw", "throw.v1", () => {
+			resourceDefinition("reject", "reject", () => undefined),
+			resourceDefinition("throw", "throw", () => {
 				throw new Error("bad normalizer");
 			}),
 			resourceDefinition(
 				"malformed",
-				"malformed.v1",
+				"malformed",
 				() =>
 					({ input: {}, resources: [42] }) as unknown as {
 						input: Record<string, never>;
@@ -235,7 +235,7 @@ describe("ActionSemanticsRegistry", () => {
 	});
 
 	it("rejects duplicate tools and incoherent effect evidence", () => {
-		const definition = resourceDefinition("read", "read.v1", () => ({ input: {}, resources: ["."] }));
+		const definition = resourceDefinition("read", "read-base", () => ({ input: {}, resources: ["."] }));
 		expect(() => new ActionSemanticsRegistry([definition, definition])).toThrow("duplicate action semantics for read");
 		for (const [override, message] of [
 			[{ tool: "write", effect: "workspace_mutation" }, "non-observation action write cannot declare resource evidence"],
@@ -252,7 +252,7 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("owns immutable definitions and shares registered projectors without duplicate input relations", () => {
 		const projectors = [projector("kept")];
-		const source = { ...resourceDefinition("one", "one.v1", canonicalEmpty), projectors };
+		const source = { ...resourceDefinition("one", "one", canonicalEmpty), projectors };
 		const registry = new ActionSemanticsRegistry([source, { ...source, tool: "two" }]);
 		const registered = registry.projectors()[0]!;
 		expect(() => new ActionSemanticsRegistry([source, { ...source, tool: "conflict", projectors: [projector("kept")] }]))
@@ -263,7 +263,7 @@ describe("ActionSemanticsRegistry", () => {
 		const names = registry.toolNames() as string[];
 		names.push("outside");
 
-		expect(registry.definition("one")?.epoch).toBe("one.v1");
+		expect(registry.definition("one")?.epoch).toBe("one");
 		expect(registry.projectors()).toEqual([registered, RESOURCE_INPUT_ACTION_KEY_PROJECTOR]);
 		expect(registered.id).toBe("kept");
 		expect(Object.isFrozen(registered)).toBe(true);

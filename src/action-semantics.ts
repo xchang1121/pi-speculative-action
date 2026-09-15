@@ -230,7 +230,7 @@ const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...U
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	{
 		tool: "read",
-		epoch: "pi.read.v3",
+		epoch: "pi.read",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "content",
@@ -239,21 +239,21 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "grep",
-		epoch: "pi.grep.v4",
+		epoch: "pi.grep",
 		effect: "unbounded",
 		requirements: HOST_PROCESS_EFFECTS,
 		canonicalize: canonicalGrep,
 	},
 	{
 		tool: "find",
-		epoch: "pi.find.v4",
+		epoch: "pi.find",
 		effect: "unbounded",
 		requirements: HOST_PROCESS_EFFECTS,
 		canonicalize: canonicalFind,
 	},
 	{
 		tool: "ls",
-		epoch: "pi.ls.v3",
+		epoch: "pi.ls",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "entries",
@@ -261,21 +261,21 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
 	},
 	{
 		tool: "bash",
-		epoch: "pi.bash.v3",
+		epoch: "pi.bash",
 		effect: "unbounded",
 		requirements: UNRESTRICTED_PROCESS_EFFECTS,
 		canonicalize: canonicalBash,
 	},
 	{
 		tool: "write",
-		epoch: "pi.write.v2",
+		epoch: "pi.write",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
-		epoch: "pi.edit.v2",
+		epoch: "pi.edit",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
 		canonicalize: canonicalEdit,

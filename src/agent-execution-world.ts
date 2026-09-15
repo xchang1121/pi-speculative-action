@@ -46,7 +46,7 @@ export function createResourceSnapshotExecutionWorld(
 	const canObserve = process.platform !== "win32";
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-		fingerprint: () => "resource-version:v3",
+		fingerprint: () => "resource-version",
 		diagnostics: () => ({
 			state: "ready" as const,
 			detail: "Sealed file inputs; host reads may update access times (not an OS snapshot)",

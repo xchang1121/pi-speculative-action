@@ -49,7 +49,7 @@ const RESOURCE_ROUTE: SpeculativeExecutionRoute = {
 	reuse: "shared_result",
 	scope: "fallback",
 	backend: "resource_version",
-	fingerprint: "resource-version:v1",
+	fingerprint: "resource-version",
 };
 
 const MUTATION_ROUTE: SpeculativeExecutionRoute = {
@@ -57,7 +57,7 @@ const MUTATION_ROUTE: SpeculativeExecutionRoute = {
 	reuse: "exclusive_branch",
 	scope: "fallback",
 	backend: "test_world",
-	fingerprint: "test-world:v1",
+	fingerprint: "test-world",
 };
 
 type TestAdapter<SessionID = string> = SpeculativeActionRuntimeAdapter<SessionID, string, Start<SessionID>, Call<SessionID>, { readonly cwd: string }>;
@@ -856,7 +856,7 @@ describe("structural speculative runtime", () => {
 				propose: ({ startInput }) => startInput.turnID === "second" ? plan("recall") : undefined,
 				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } }),
 			resolveExecution: () => mode === "exclusive" ? MUTATION_ROUTE : mode === "same" ? RESOURCE_ROUTE
-				: { ...RESOURCE_ROUTE, isolation: "runtime_sandbox", scope: "runtime", backend: "alternate", fingerprint: "alternate:v1" },
+				: { ...RESOURCE_ROUTE, isolation: "runtime_sandbox", scope: "runtime", backend: "alternate", fingerprint: "alternate" },
 			execute: () => { now += 6; return world(`fresh:${version}`, {
 				executionFingerprint: buildPiActionKey("read", { path: "README.md" }, "/workspace")!.executionFingerprint,
 				validate: async () => (validResource()) }); },

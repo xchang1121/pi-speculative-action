@@ -9,7 +9,7 @@ import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transactio
 import type { ProcessExecutor } from "./process-execution.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 5;
+const HELPER_PROTOCOL_VERSION = 6;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -305,7 +305,7 @@ export async function inspectHeldExecProcess(pid: number): Promise<HeldExecSnaps
 	if (!groups.includes(gid[1]!)) groups.push(gid[1]!);
 	groups.sort((left, right) => left - right);
 	const semantic = {
-		executionDomain: "ptrace-v1",
+		executionDomain: "ptrace",
 		rlimits: limits.split("\n").slice(1).map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
 		systemMetadata: statIdentity(await stat("/bin/sh")),

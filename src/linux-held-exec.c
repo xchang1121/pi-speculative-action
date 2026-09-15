@@ -155,7 +155,7 @@ static int image_dispatch(int argc, char **argv) {
 	if (!separator || !separator[1]) return -1;
 	char *name = separator + 1;
 	*separator = 0;
-	if (snprintf(sidecar, sizeof(sidecar), "%s/.pi-spec-dispatch-v1", image) >= (int)sizeof(sidecar)) return 70;
+	if (snprintf(sidecar, sizeof(sidecar), "%s/.pi-spec-dispatch", image) >= (int)sizeof(sidecar)) return 70;
 	FILE *file = fopen(sidecar, "re");
 	if (!file) return errno == ENOENT ? -1 : 70;
 	struct stat state;
@@ -167,7 +167,7 @@ static int image_dispatch(int argc, char **argv) {
 		if (getline(&line, &capacity, file) < 0) goto done;
 		line[strcspn(line, "\r\n")] = 0;
 		if (index == 0) {
-			if (strcmp(line, "PI_SPEC_DISPATCH_V1")) goto done;
+			if (strcmp(line, "PI_SPEC_DISPATCH")) goto done;
 		} else if (*line != '/' || !(fields[index - 1] = strdup(line))) goto done;
 	}
 	fclose(file); file = NULL;
@@ -477,7 +477,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("5");
+		puts("6");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {

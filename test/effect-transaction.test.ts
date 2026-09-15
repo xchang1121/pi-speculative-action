@@ -14,7 +14,7 @@ const route: SpeculativeExecutionRoute = {
 	reuse: "exclusive_branch",
 	scope: "runtime",
 	backend: "test",
-	fingerprint: "test:v1",
+	fingerprint: "test",
 };
 
 describe("EffectTransactionCoordinator", () => {
