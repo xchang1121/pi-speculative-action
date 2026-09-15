@@ -210,16 +210,36 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
-		if (forecasts.length === 0) return emptyWork();
-		const evaluated = forecasts.map((forecast) => this.evaluateOne(forecast));
-		return {
-			expectedDurationMs: Math.max(...evaluated.map((item) => item.expectedDurationMs)),
-			resourceUnits: Math.max(...evaluated.map((item) => item.resourceUnits)),
-			decisionBatchesUntilCall: Math.min(...evaluated.map((item) => item.decisionBatchesUntilCall)),
-			criticalPathMs: Math.max(...evaluated.map((item) => item.criticalPathMs)),
-			priorityMs: Math.max(...evaluated.map((item) => item.priorityMs)),
-			background: evaluated.every((item) => item.background),
-		};
+		let remaining = forecasts.length;
+		const work = forecasts.reduce((work, forecast) => {
+			remaining--;
+			const expectedDurationMs = this.duration(forecast) ?? 1;
+			const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
+			const runwayMs = this.actorRunway(forecast);
+			const benefitDurationMs = positive(forecast.expectedDurationMs, expectedDurationMs);
+			const runwayScale = runwayMs === undefined ? 1 : Math.min(1, runwayMs / benefitDurationMs);
+			work.expectedDurationMs = Math.max(work.expectedDurationMs, expectedDurationMs);
+			work.resourceUnits = Math.max(work.resourceUnits, units(forecast.resourceDemand));
+			work.decisionBatchesUntilCall = Math.min(work.decisionBatchesUntilCall, sequence(forecast.decisionBatchesUntilCall));
+			work.criticalPathMs = Math.max(work.criticalPathMs, criticalPathMs);
+			work.priorityMs = Math.max(work.priorityMs, forecast.expectedLatencyBenefitMs === undefined
+				? criticalPathMs : finite(forecast.expectedLatencyBenefitMs) * runwayScale);
+			work.background = forecast.background === true && work.background;
+			return work;
+		}, {
+			expectedDurationMs: 0,
+			resourceUnits: 1,
+			decisionBatchesUntilCall: remaining ? Infinity : 0,
+			criticalPathMs: 0,
+			priorityMs: 0,
+			background: remaining > 0,
+		});
+		// Missing slots leave the numerical forecast indeterminate.
+		if (remaining) {
+			work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall =
+				work.criticalPathMs = work.priorityMs = NaN;
+		}
+		return work;
 	}
 
 	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
@@ -347,25 +367,6 @@ export class SpeculationScheduler<Job extends object> {
 		return [...this.entries.values()]
 			.sort((left, right) => left.sequence - right.sequence)
 			.map(({ job, work }) => ({ job, work }));
-	}
-
-	private evaluateOne(forecast: PredictionForecast): ScheduledWork {
-		const expectedDurationMs = this.duration(forecast) ?? 1;
-		const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
-		const runwayMs = this.actorRunway(forecast);
-		const benefitDurationMs = positive(forecast.expectedDurationMs, expectedDurationMs);
-		const runwayScale = runwayMs === undefined ? 1 : Math.min(1, runwayMs / benefitDurationMs);
-		return {
-			expectedDurationMs,
-			resourceUnits: units(forecast.resourceDemand),
-			decisionBatchesUntilCall: sequence(forecast.decisionBatchesUntilCall),
-			criticalPathMs,
-			priorityMs:
-				forecast.expectedLatencyBenefitMs === undefined
-					? criticalPathMs
-					: finite(forecast.expectedLatencyBenefitMs) * runwayScale,
-			background: forecast.background === true,
-		};
 	}
 
 	/** With exact Actor evidence and an explicit forecast, avoid launching work its consumer would reject. */
@@ -507,17 +508,6 @@ function normalizeCandidateJoinPolicy(policy: Partial<CandidateJoinPolicy> | und
 		warmupWaitMs: finite(policy?.warmupWaitMs ?? DEFAULT_CANDIDATE_JOIN_POLICY.warmupWaitMs),
 		durationSlack: Math.max(1, finite(policy?.durationSlack ?? DEFAULT_CANDIDATE_JOIN_POLICY.durationSlack)),
 	});
-}
-
-function emptyWork(): ScheduledWork {
-	return {
-		expectedDurationMs: 0,
-		resourceUnits: 1,
-		decisionBatchesUntilCall: 0,
-		criticalPathMs: 0,
-		priorityMs: 0,
-		background: false,
-	};
 }
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {

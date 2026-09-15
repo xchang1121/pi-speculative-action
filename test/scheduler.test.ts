@@ -94,14 +94,14 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([first]);
 	});
 
-	it("merges duplicate K(a) forecasts without source-count inflation", () => {
+	it.each([2, 131_072])("merges %i duplicate K(a) forecasts without source-count inflation", (count) => {
 		const scheduler = new SpeculationScheduler<object>();
 		const one = scheduler.evaluate([
 			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120, resourceDemand: 2 }),
 		]);
 		const duplicate = scheduler.evaluate([
 			forecast({ expectedDurationMs: 100, decisionBatchesUntilCall: 3, criticalPathMs: 120, resourceDemand: 2 }),
-			forecast({ expectedDurationMs: 80, decisionBatchesUntilCall: 4, criticalPathMs: 100 }),
+			...Array.from({ length: count - 1 }, () => forecast({ expectedDurationMs: 80, decisionBatchesUntilCall: 4, criticalPathMs: 100 })),
 		]);
 		expect(duplicate).toEqual({ ...one, resourceUnits: 2 });
 		expect(scheduler.admit({}, [forecast({ resourceDemand: 2 })], 1).admitted).toBe(false);
