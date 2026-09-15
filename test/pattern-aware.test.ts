@@ -10,6 +10,7 @@ import {
 	acquirePatternAwareStore,
 	patternAwareActionSemantics,
 	applyBindings,
+	applyBindingsVariants,
 	inferBindings,
 	PATTERN_AWARE_DEFAULTS,
 	PatternAwareStore,
@@ -64,7 +65,7 @@ describe("PatternAware", () => {
 		expect(replay("src", "nested/file.ts")).toEqual({ path: "src/nested/file.ts" });
 	});
 
-	test("merges bindings that share nested object and array paths", () => {
+	test("merges nested binding paths and rejects incomplete or unsafe mappings", () => {
 		const context = [event("one", "seed", { oldText: "before" })];
 		const target = {
 			range: { start: 1, end: 2 },
@@ -79,6 +80,15 @@ describe("PatternAware", () => {
 			expect(bindings['["value"]']).toEqual(0 in items
 				? { type: "event", relativeEvent: -1, field: "input", path: ["items", 0] }
 				: { type: "constant", value: undefined });
+		}
+		const valid = inferBindings(context, target);
+		const invalid: Parameters<typeof applyBindings>[0][] = [
+			{ '["missing"]': { type: "event", relativeEvent: -2, field: "input", path: ["value"] } },
+			...['[]', '["__proto__"]', '["nested","prototype"]', '["constructor","value"]']
+				.map(path => ({ [path]: { type: "constant" as const, value: "unsafe" } })),
+		];
+		for (const missing of invalid) for (const bindings of [{ ...valid, ...missing }, { ...missing, ...valid }]) {
+			expect(applyBindingsVariants(bindings, context)).toEqual([]);
 		}
 	});
 

@@ -590,8 +590,7 @@ export class PatternAwareStore {
 			)
 				continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
-			for (const applied of this.bindingAnalysis.applyBindingsPartialWeightedVariants(pattern.bindings, context)) {
-				if (applied.missing.length) continue;
+			for (const applied of this.bindingAnalysis.applyWeightedBindings(pattern.bindings, context)) {
 				const action = this.resolveActionKey(
 					pattern.targetTool,
 					applied.input,
@@ -1012,7 +1011,7 @@ export class PatternAwareStore {
 				) ?? null;
 			this.observedActionKeys.set(sample.target, actor);
 		}
-		return this.bindingAnalysis.applyBindingsVariants(bindings, sample.context).some((input) => {
+		return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
 			const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
 			if (!speculative || !actor) return sameValue(input, sample.target.input);
 			return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
@@ -1239,7 +1238,7 @@ export class PatternAwareStore {
 			pending.push({
 				patternID: pattern.id,
 				triggerSequence,
-				expectedInputs: this.bindingAnalysis.applyBindingsVariants(pattern.bindings, context),
+				expectedInputs: this.bindingAnalysis.applyWeightedBindings(pattern.bindings, context).map(({ input }) => input),
 				remaining: groupGapTiming([pattern], this.settings, this.clock).latestHorizon,
 			});
 		}
@@ -1611,41 +1610,26 @@ class PatternBindingAnalysis {
 		};
 	}
 
-	applyBindingsVariants(
-		bindings: Readonly<Record<string, PatternAwareBinding>>,
-		context: ReadonlyArray<PatternAwareEvent>,
-		limit = MAX_BINDING_VARIANTS,
-	): ReadonlyArray<Record<string, unknown>> {
-		return this.applyBindingsPartialWeightedVariants(bindings, context, limit)
-			.filter((variant) => variant.missing.length === 0)
-			.map((variant) => variant.input);
-	}
-
-	applyBindingsPartialWeightedVariants(
+	applyWeightedBindings(
 		bindings: Readonly<Record<string, PatternAwareBinding>>,
 		context: ReadonlyArray<PatternAwareEvent>,
 		limit = MAX_BINDING_VARIANTS,
 	): ReadonlyArray<{
 		readonly input: Record<string, unknown>;
-		readonly missing: ReadonlyArray<PatternAwarePath>;
 		readonly probability: number;
 	}> {
-		let variants: Array<{ input: Record<string, unknown>; missing: PatternAwarePath[]; probability: number }> = [
-			{ input: {}, missing: [], probability: 1 },
+		let variants: Array<{ input: Record<string, unknown>; probability: number }> = [
+			{ input: {}, probability: 1 },
 		];
 		for (const [encoded, binding] of Object.entries(bindings)) {
 			const targetPath = decodePath(encoded);
+			if (!targetPath.length || targetPath.some(unsafePathSegment)) return [];
 			const values = this.weightedBindingValues(binding, context);
-			if (!values.length) {
-				for (const variant of variants) variant.missing.push(targetPath);
-				continue;
-			}
+			if (!values.length) return [];
 			if (values.length === 1) {
 				for (const variant of variants) {
-					const input = withPath(variant.input, targetPath, values[0]!.value);
-					variant.input = input ?? variant.input;
+					variant.input = withPath(variant.input, targetPath, values[0]!.value);
 					variant.probability *= values[0]!.probability;
-					if (!input) variant.missing.push(targetPath);
 				}
 				continue;
 			}
@@ -1653,11 +1637,7 @@ class PatternBindingAnalysis {
 				variant, value: value.value, probability: variant.probability * value.probability,
 			})));
 			variants = ranked.sort((left, right) => right.probability - left.probability).slice(0, limit)
-				.map(({ variant, value, probability }) => {
-					const input = withPath(variant.input, targetPath, value);
-					return { input: input ?? variant.input, probability,
-						missing: input ? [...variant.missing] : [...variant.missing, targetPath] };
-				});
+				.map(({ variant, value, probability }) => ({ input: withPath(variant.input, targetPath, value), probability }));
 		}
 		return variants;
 	}
@@ -1839,7 +1819,7 @@ export function applyBindingsVariants(
 	context: ReadonlyArray<PatternAwareEvent>,
 	limit = MAX_BINDING_VARIANTS,
 ): ReadonlyArray<Record<string, unknown>> {
-	return new PatternBindingAnalysis().applyBindingsVariants(bindings, context, limit);
+	return new PatternBindingAnalysis().applyWeightedBindings(bindings, context, limit).map(({ input }) => input);
 }
 
 function requiresProvenance(targetPath: PatternAwarePath, value: unknown): boolean {
@@ -2157,8 +2137,7 @@ function withPath(
 	target: Readonly<Record<string, unknown>>,
 	segments: PatternAwarePath,
 	value: unknown,
-): Record<string, unknown> | undefined {
-	if (!segments.length || segments.some(unsafePathSegment)) return undefined;
+): Record<string, unknown> {
 	const update = (current: unknown, index: number): Record<string, unknown> | unknown[] => {
 		const segment = segments[index]!;
 		const container: Record<string, unknown> | unknown[] =
