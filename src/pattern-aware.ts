@@ -572,7 +572,7 @@ export class PatternAwareStore {
 			Array<{
 				readonly pattern: MutablePattern;
 				readonly input: Record<string, unknown>;
-				readonly variantProbability: number;
+				variantProbability: number;
 			}>
 		>();
 		this.ensureIndex();
@@ -605,11 +605,10 @@ export class PatternAwareStore {
 							input: applied.input,
 						});
 				const group = groups.get(identity) ?? [];
-				group.push({
-					pattern,
-					input: applied.input,
-					variantProbability: applied.probability,
-				});
+				// A pattern emits its variants together; aliases share one evidence weight.
+				const support = group.at(-1);
+				if (support?.pattern === pattern) support.variantProbability += applied.probability;
+				else group.push({ pattern, input: applied.input, variantProbability: applied.probability });
 				groups.set(identity, group);
 			}
 		}
@@ -627,7 +626,7 @@ export class PatternAwareStore {
 			contextEvidence.set(pattern.context.length, gaps);
 		}
 		const predictions = new Map([...groups.entries()].map(([identity, group]) => {
-			const ordered = [...group].sort(
+			const ordered = group.sort(
 				(left, right) =>
 					right.pattern.context.length - left.pattern.context.length ||
 					right.pattern.occurrences - left.pattern.occurrences,
@@ -671,7 +670,7 @@ export class PatternAwareStore {
 				tool: representative.pattern.targetTool,
 				input: representative.input,
 				patternID: representative.pattern.id,
-				supportingPatternIDs: [...new Set(ordered.map((item) => item.pattern.id))],
+				supportingPatternIDs: patterns.map((pattern) => pattern.id),
 				context: representative.pattern.context,
 				dependencies: representative.pattern.dependencies,
 				horizon,
