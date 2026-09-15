@@ -325,7 +325,7 @@ export class PatternAwareStore {
 	private sequenceModel: PpmCountTrie;
 	private indexDirty = true;
 	private clock = 0;
-	private write: Promise<void> = Promise.resolve();
+	private write?: Promise<void>;
 	private dirty = false;
 	private persistTimer?: ReturnType<typeof setTimeout>;
 	private loaded = false;
@@ -901,14 +901,25 @@ export class PatternAwareStore {
 	}
 
 	async flush(): Promise<void> {
+		const target = this.persistenceFile;
+		if (!target || !this.loaded) return;
 		while (true) {
 			if (this.persistTimer) {
 				clearTimeout(this.persistTimer);
 				this.persistTimer = undefined;
 			}
-			this.enqueuePersist();
+			if (!this.write && !this.dirty) return;
+			this.write ??= Promise.resolve().then(async () => {
+				this.dirty = false;
+				await writeJsonFile(target, {
+					version: PERSISTENCE_VERSION,
+					patterns: this.snapshot(),
+					...this.persistedLearningState(),
+					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
+				} satisfies PersistedState);
+			}).catch((error) => { this.dirty = true; throw error; })
+				.finally(() => { this.write = undefined; });
 			await this.write;
-			if (!this.dirty) return;
 		}
 	}
 
@@ -1296,25 +1307,9 @@ export class PatternAwareStore {
 		if (this.persistTimer) return;
 		this.persistTimer = setTimeout(() => {
 			this.persistTimer = undefined;
-			this.enqueuePersist();
+			void this.flush().catch(() => undefined);
 		}, PERSIST_CHECKPOINT_INTERVAL_MS);
 		this.persistTimer.unref?.();
-	}
-
-	private enqueuePersist() {
-		if (!this.persistenceFile || !this.loaded || !this.dirty) return;
-		this.dirty = false;
-		const learning = this.persistedLearningState();
-		const state: PersistedState = {
-			version: PERSISTENCE_VERSION,
-			patterns: this.snapshot(),
-			events: learning.events,
-			pools: learning.pools,
-			sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
-		};
-		const target = this.persistenceFile;
-		this.write = this.write.catch(() => undefined).then(() => writeJsonFile(target, state));
-		void this.write.catch(() => { this.dirty = true; });
 	}
 
 	private persistedLearningState(): {
