@@ -52,6 +52,7 @@ import {
 } from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import {
 	nonEmptyTextInput,
 	nonNegativeIntegerInput,
@@ -341,10 +342,11 @@ async function installController(
 		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
 	});
 	const settings = () => currentSettings;
+	const lifecycle = new RuntimeLifecycleLane();
 	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
 	type SearchRoute = { ready: Promise<SearchProfile | undefined>; profile?: SearchProfile };
 	let search: SearchRoute | undefined;
-	const closedSearchEnabled = () => currentSettings.enabled && currentSettings.searchExecution !== "native";
+	const closedSearchEnabled = () => !lifecycle.sealed && currentSettings.enabled && currentSettings.searchExecution !== "native";
 	const prepareSearch = (): Promise<SearchProfile | undefined> => {
 		if (search) return search.ready;
 		const entry: SearchRoute = { ready: createClosedSearchProfile(context.cwd).then(
@@ -517,7 +519,7 @@ async function installController(
 			renderFooter();
 		},
 	});
-	const refreshExecutionDiagnostics = async (refresh = false): Promise<void> => {
+	const refreshExecutionDiagnostics = (refresh = false): Promise<void> => lifecycle.admit(async () => {
 		if (refresh) await resetSearch();
 		if (closedSearchEnabled()) await prepareSearch();
 		const [, diagnostics] = await Promise.all([
@@ -527,7 +529,7 @@ async function installController(
 		executionDiagnostics = diagnostics;
 		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 		renderFooter();
-	};
+	});
 
 	const controller = {
 		settings,
@@ -667,12 +669,12 @@ async function installController(
 		dispose: () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
-			return Promise.resolve().then(() => settingsStore.flush())
+			return lifecycle.close(() => Promise.resolve().then(() => settingsStore.flush())
 				.finally(() => processCoordinator.dispose().catch(() => undefined))
 				.finally(() => host.dispose())
 				.finally(() => workspaceSandbox.dispose())
 				.finally(() => selfSpeculation.dispose())
-				.finally(resetSearch);
+				.finally(resetSearch));
 		},
 	} as const;
 	for (const definition of baseDefinitions.values())

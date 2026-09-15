@@ -1,5 +1,5 @@
 import { textResult } from "./result.ts";
-import { deferred } from "./async.ts";
+import { deferred, nextTurn } from "./async.ts";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel } from "./model.ts";
@@ -165,13 +165,7 @@ describe("zero-modification Pi extension", () => {
 			expect(await fixture.tools.get("find")!.execute("missing", { pattern: "x" }, undefined, undefined, fixture.context)).toEqual(textResult("native find"));
 			expect(native).toHaveBeenCalledOnce();
 			expect(prepare).toHaveBeenCalledOnce();
-			const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
-			const dispose = vi.fn(async () => {});
-			const profile = { profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 }, grep: { versions: {}, flags: [] } },
-				pool: { run: authoritative, dispose }, invocations: new Map(["find"].map((tool) => [tool, {
-					executor: "test-search", authoritative, filesystem: authoritative,
-					semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" as const },
-				}])) };
+			const profile = searchProfile(), { run: authoritative, dispose } = profile.pool;
 			prepare.mockResolvedValue(profile);
 			await command("status"); // Refresh retires the old executor generation, not its captured inputs.
 			expect((await fixture.tools.get("find")!.execute("bound", { pattern: "x" }, undefined, undefined, fixture.context)).content).toEqual(textResult("selected search").content);
@@ -197,6 +191,39 @@ describe("zero-modification Pi extension", () => {
 		} finally {
 			await fixture.emit("session_shutdown");
 			prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs();
+		}
+	});
+
+	it("joins an admitted search refresh during shutdown without reopening its retired owner", async () => {
+		const fixture = await createFixture({ settings: { enabled: true, searchExecution: "captured" } });
+		const profiles: ReturnType<typeof searchProfile>[] = [];
+		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockImplementation(async () => {
+			const profile = searchProfile(); profiles.push(profile); return profile;
+		});
+		const entered = deferred<void>(), release = deferred<void>();
+		const closeHost = vi.spyOn(fixture.host, "dispose");
+		let refresh: Promise<unknown> | undefined, shutdown: Promise<void> | undefined;
+		try {
+			await fixture.emit("session_start");
+			profiles[0]!.pool.dispose.mockImplementationOnce(async () => { entered.resolve(); await release.promise; });
+			refresh = Promise.resolve(fixture.commands.get("speculative-action")!.handler("status", fixture.context as ExtensionCommandContext));
+			await entered.promise;
+			let closed = false;
+			shutdown = fixture.emit("session_shutdown").then(() => { closed = true; });
+			await nextTurn();
+			const closedWhileRetiring = closed;
+			const closeStartedWhileRetiring = closeHost.mock.calls.length === 1;
+			release.resolve();
+			await Promise.all([refresh, shutdown]);
+			expect({ closedWhileRetiring, closeStartedWhileRetiring, prepared: prepare.mock.calls.length,
+				disposals: profiles.map((profile) => profile.pool.dispose.mock.calls.length),
+			}).toEqual({ closedWhileRetiring: false, closeStartedWhileRetiring: true, prepared: 1, disposals: [1] });
+		} finally {
+			release.resolve();
+			await Promise.allSettled([refresh, shutdown]);
+			await fixture.emit("session_shutdown");
+			for (const profile of profiles) await profile.pool.dispose();
+			prepare.mockRestore();
 		}
 	});
 
@@ -454,6 +481,15 @@ describe("zero-modification Pi extension", () => {
 		);
 	});
 });
+
+function searchProfile() {
+	const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
+	return { profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 }, grep: { versions: {}, flags: [] } },
+		pool: { run: authoritative, dispose: vi.fn(async () => {}) }, invocations: new Map(["find"].map((tool) => [tool, {
+			executor: "test-search", authoritative, filesystem: authoritative,
+			semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" as const },
+		}])) };
+}
 
 interface FixtureOptions {
 	readonly reuse?: ToolSettlement;
