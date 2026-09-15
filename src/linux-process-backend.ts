@@ -65,7 +65,7 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { captureStableFile, hashExecutableFile, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { captureStableFile, hashExecutableFile, mapFilesystem, walkFilesystemPath } from "./filesystem-evidence.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -1750,33 +1750,31 @@ async function createProcessInterposition(input: {
 		}
 		// Each physical entry is probed once; aliases retain independent exec-only mappings.
 		// Bound preparation and settle every alias link before capturing directory evidence.
-		for (let start = 0; start < entries.length; start += 16) {
+		await mapFilesystem(entries, async (name) => {
 			throwIfAborted(input.signal);
-			await Promise.all(entries.slice(start, start + 16).map(async (name) => {
-				if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
-				const sourceEntry = path.join(source, name);
+			if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
+			const sourceEntry = path.join(source, name);
+			try {
+				const resolved = await realpath(sourceEntry);
+				const resolvedStat = await lstat(resolved);
+				if (!resolvedStat.isFile() || excluded.has(resolved)) return;
+				await access(sourceEntry, fsConstants.X_OK);
+			} catch {
+				return; // Unproved entries remain visible through the original directory.
+			}
+			for (const directory of aliases) {
+				const viewEntry = path.join(directory.view, name);
 				try {
-					const resolved = await realpath(sourceEntry);
-					const resolvedStat = await lstat(resolved);
-					if (!resolvedStat.isFile() || excluded.has(resolved)) return;
-					await access(sourceEntry, fsConstants.X_OK);
+					await link(launcher, viewEntry);
+					const intercepted = path.join(directory.target, name);
+					executables.push([intercepted, path.join(directory.shadow, name)]);
+					executables.push([viewEntry, path.join(directory.shadow, name)]);
+					execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
 				} catch {
-					return; // Unproved entries remain visible through the original directory.
+					// One unavailable view cannot suppress another alias's mapping.
 				}
-				for (const directory of aliases) {
-					const viewEntry = path.join(directory.view, name);
-					try {
-						await link(launcher, viewEntry);
-						const intercepted = path.join(directory.target, name);
-						executables.push([intercepted, path.join(directory.shadow, name)]);
-						executables.push([viewEntry, path.join(directory.shadow, name)]);
-						execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
-					} catch {
-						// One unavailable view cannot suppress another alias's mapping.
-					}
-				}
-			}));
-		}
+			}
+		});
 		throwIfAborted(input.signal);
 		dependencies.push(
 			await captureDirectoryDependency(
