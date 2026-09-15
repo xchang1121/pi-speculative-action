@@ -22,6 +22,7 @@ import path from "node:path";
 import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
+import { stableEqual } from "./stable-json.ts";
 import {
 	createExecPrototype,
 	digestObject,
@@ -2258,7 +2259,7 @@ function assertInvocationMatches(invocation: ToolProcessInvocation, request: Pro
 		throw new Error("process cwd differs from the action execution context");
 	}
 	if (request.timeout !== invocation.timeout) throw new Error("process timeout differs from the action execution context");
-	if (digestObject(definedProcessEnvironment(request.environment)) !== digestObject(invocation.environment)) {
+	if (!stableEqual(definedProcessEnvironment(request.environment), invocation.environment)) {
 		throw new Error("process environment differs from the action execution context");
 	}
 }
@@ -2310,7 +2311,6 @@ function mergeDependencyEvidence(
 	mutatedDirectories: ReadonlySet<string> = new Set(),
 ): DynamicDependencyCertificate {
 	const dependencies = new Map<string, DynamicDependency>();
-	const encodings = new Map<string, Sha256Digest>();
 	const taints = new Set<ProvenanceTaint>();
 	let complete = certificates.length > 0;
 	for (const certificate of certificates) {
@@ -2327,13 +2327,10 @@ function mergeDependencyEvidence(
 			) {
 				if (existing.role !== "executable" && dependency.role === "executable") {
 					dependencies.set(identity, dependency);
-					encodings.set(identity, digestObject(dependency));
 				}
 				continue;
 			}
-			const encoding = digestObject(dependency);
-			const previous = encodings.get(identity);
-			if (previous && previous !== encoding) {
+			if (existing && !stableEqual(existing, dependency)) {
 				if (dependency.kind === "directory" && mutatedDirectories.has(dependency.path.replaceAll("\\", "/"))) {
 					continue;
 				}
@@ -2342,7 +2339,6 @@ function mergeDependencyEvidence(
 				continue;
 			}
 			dependencies.set(identity, dependency);
-			encodings.set(identity, encoding);
 		}
 	}
 	return {

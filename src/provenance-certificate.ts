@@ -630,7 +630,7 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 			if (!validLogicalPath(event.path)) throw new Error("invalid effect path");
 			const before = normalizeWorkspaceEffectState(event.before, artifactSizes);
 			const after = normalizeWorkspaceEffectState(event.after, artifactSizes);
-			if (before.kind === after.kind && stableStringify(before) === stableStringify(after)) {
+			if (before.kind === after.kind && stableEqual(before, after)) {
 				throw new Error("workspace effect does not change state");
 			}
 			journal[index] = { ...event, before, after };
