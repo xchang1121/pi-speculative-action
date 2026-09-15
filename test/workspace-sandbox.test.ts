@@ -1,5 +1,5 @@
 import { temporaryDirectories } from "./filesystem.ts";
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
@@ -95,7 +95,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const firstSibling = first.createExecutionWorld({ driver: "git" });
 		const secondWorld = second.createExecutionWorld({ driver: "git" });
 		const signal = new AbortController().signal, validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
-		const entered = deferred(), release = deferred(), schedule = globalThis.setTimeout;
+		const gate = gated(), schedule = globalThis.setTimeout;
 		let expire: (() => void) | undefined, pool: string | undefined, closed = false;
 		const removals = new Map<string, number>();
 		const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, ms, ...args) => {
@@ -123,20 +123,20 @@ describe("workspace-branch ExecutionWorld", () => {
 			vi.mocked(rm).mockImplementation(async (target, options) => {
 				if (path.dirname(String(target)) === path.resolve(os.tmpdir()) && path.basename(String(target)).startsWith("pi-speculative-action-pool-")) {
 					pool = String(target); removals.set(pool, (removals.get(pool) ?? 0) + 1);
-					entered.resolve(); await release.promise;
+					await gate.wait();
 				}
 				return fs.rm(target, options);
 			});
 			if (retirement !== "explicit") {
-				expect(expire).toBeDefined(); expire!(); await entered.promise;
+				expect(expire).toBeDefined(); expire!(); await gate.entered;
 			}
 			if (retirement === "idle-replaced") await first.prepare(root, { driver: "git" });
 			const closing = Promise.all([firstWorld.dispose?.(), firstSibling.dispose?.(), first.dispose()]).then(() => { closed = true; });
-			await entered.promise;
+			await gate.entered;
 			await nextTurn();
 			expect(closed).toBe(false);
 			expect((await stat(pool!)).isDirectory()).toBe(true);
-			release.resolve(); await closing;
+			gate.release(); await closing;
 			expect([...removals.values()]).toEqual(retirement === "idle-replaced" ? [1, 1] : [1]);
 			for (const directory of removals.keys()) await expect(stat(directory)).rejects.toThrow();
 			await expect(first.prepare(root, { driver: "git" })).rejects.toThrow("service is disposed");
@@ -147,7 +147,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await branch.commit();
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("after\n");
 		} finally {
-			release.resolve(); timers.mockRestore(); vi.mocked(rm).mockImplementation(fs.rm);
+			gate.release(); timers.mockRestore(); vi.mocked(rm).mockImplementation(fs.rm);
 			validations.mockRestore();
 			await Promise.allSettled([first.dispose(), secondWorld.dispose?.(), second.dispose()]);
 		}
@@ -601,13 +601,13 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot(), target = path.join(root, "control");
 		await writeFile(target, "control");
 		const observer = await open(target, "r"), sync = observer.sync;
-		const entered = deferred(), release = deferred(), handles: FileHandle[] = [];
+		const gate = gated(), handles: FileHandle[] = [];
 		let returned = false, closed = false, active = 0, peak = 0;
 		const syncing = vi.spyOn(Object.getPrototypeOf(observer), "sync").mockImplementation(async function (this: FileHandle) {
 			const index = handles.push(this) - 1;
 			peak = Math.max(peak, ++active);
 			try {
-				if (index === 0) { entered.resolve(); await release.promise; }
+				if (index === 0) { await gate.wait(); }
 				else if (index === 1 && failure) throw new Error("injected staging sync failure");
 				await sync.call(this);
 			} finally { active--; }
@@ -617,14 +617,14 @@ describe("workspace-branch ExecutionWorld", () => {
 			output => { returned = true; return { output }; }, error => { returned = true; return { error }; });
 		let retirement: Promise<void> | undefined;
 		try {
-			await entered.promise;
+			await gate.entered;
 			await vi.waitFor(() => expect(handles.length).toBeGreaterThan(1));
 			retirement = sandbox.dispose().then(() => { closed = true; });
 			await nextTurn();
 			expect({ returned, closed }).toEqual({ returned: false, closed: false });
 			for (const change of changes) await expect(stat(change.target)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
-			release.resolve(); await Promise.allSettled([pending, retirement ?? sandbox.dispose()]);
+			gate.release(); await Promise.allSettled([pending, retirement ?? sandbox.dispose()]);
 			syncing.mockRestore(); await observer.close();
 		}
 		expect(peak).toBeGreaterThan(1); expect(peak).toBeLessThanOrEqual(12);
@@ -788,14 +788,14 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
-		const root = await temporaryRoot(), entered = deferred(), release = deferred();
+		const root = await temporaryRoot(), gate = gated();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<void>[] = [];
 		let heldRoot: string | undefined, removals = 0;
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
 			const directory = await fs.mkdtemp(prefix, options);
 			if (!heldRoot && String(prefix).endsWith(`${path.sep}action-`)) {
-				heldRoot = directory; entered.resolve(); await release.promise;
+				heldRoot = directory; await gate.wait();
 			}
 			return directory;
 		});
@@ -806,7 +806,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			await writeFile(path.join(root, "value.txt"), "before\n");
 			pending.push(sandbox.prepare(root, { driver: "git" }));
-			await entered.promise;
+			await gate.entered;
 			const repository = await Reflect.get(sandbox, "state").repositories.values().next().value;
 			const previous = repository.baseline.commit;
 			await writeFile(path.join(root, "value.txt"), "after\n");
@@ -817,18 +817,18 @@ describe("workspace-branch ExecutionWorld", () => {
 			pending.push(sandbox.prepare(root, { driver: "git" }));
 			await vi.waitFor(() => expect(validations.mock.calls.length).toBeGreaterThan(count));
 			await repository.lock; await nextTurn();
-			release.resolve(); await Promise.all(pending);
+			gate.release(); await Promise.all(pending);
 			expect(removals).toBe(1);
 			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))
 				.toBe("after\n");
 		} finally {
-			release.resolve(); await Promise.allSettled(pending); validations.mockRestore();
+			gate.release(); await Promise.allSettled(pending); validations.mockRestore();
 			vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp); vi.mocked(rm).mockImplementation(fs.rm);
 		}
 	});
 
 	it.each(["none", "workspace", "registration"])("owns workspace removal and %s cleanup failure before returning", async (failure) => {
-		const root = await temporaryRoot(), entered = deferred(), release = deferred();
+		const root = await temporaryRoot(), gate = gated();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		await writeFile(path.join(root, "value.txt"), "before\n");
 		let owned: { processRoot: string; gitDirectory: string; dispose: () => Promise<void> } | undefined, settled = false;
@@ -837,7 +837,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			if (owned && [owned.processRoot, owned.gitDirectory].includes(String(target))) {
 				removed.push(String(target));
 				if (String(target) === (failure === "registration" ? owned.gitDirectory : owned.processRoot)) {
-					entered.resolve(); await release.promise;
+					await gate.wait();
 					if (failure !== "none") throw fault;
 				}
 			}
@@ -848,11 +848,11 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "private\n");
 		}).then(() => { settled = true; }, error => { settled = true; throw error; });
 		try {
-			await entered.promise; await nextTurn();
+			await gate.entered; await nextTurn();
 			expect(settled).toBe(false);
 			expect((await stat(owned!.gitDirectory)).isDirectory()).toBe(true);
 			expect(await readFile(path.join(root, "value.txt"), "utf8")).toBe("before\n");
-			release.resolve();
+			gate.release();
 			if (failure === "none") await execution;
 			else await expect(execution).rejects.toMatchObject({ errors: [fault] });
 			const disposal = owned!.dispose();
@@ -871,7 +871,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(stat(owned!.processRoot)).rejects.toThrow();
 			await expect(stat(owned!.gitDirectory)).rejects.toThrow();
 		} finally {
-			release.resolve(); await execution.catch(() => undefined); vi.mocked(rm).mockImplementation(fs.rm);
+			gate.release(); await execution.catch(() => undefined); vi.mocked(rm).mockImplementation(fs.rm);
 		}
 	});
 

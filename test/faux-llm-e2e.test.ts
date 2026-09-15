@@ -1,5 +1,5 @@
 import { textResult } from "./result.ts";
-import { deferred as barrier } from "./async.ts";
+import { gated, deferred as barrier } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -50,7 +50,7 @@ describe("faux LLM speculative action end to end", () => {
 		const cwd = await workspace();
 		await writeFile(path.join(cwd, "target.txt"), "target", "utf8");
 		for (const drafterMaxDepth of [0, 1]) {
-			const started = barrier(), arrived = barrier(), childReady = barrier(), order: string[] = [];
+			const producerGate = gated(), childReady = barrier(), order: string[] = [];
 			const sessionID = "in-flight-" + drafterMaxDepth;
 			const respond: FauxResponseStep = (context) => {
 				const ownDraft = context.messages.some((message) => message.role === "assistant" && message.provider === "drafter-" + sessionID);
@@ -63,15 +63,15 @@ describe("faux LLM speculative action end to end", () => {
 				cwd, sessionID, settings: { ...drafterSettings(), drafterMaxDepth },
 				tools: [fileRead(cwd, async (file) => {
 					if (file !== "notes.txt") return;
-					order.push("producer started"); started.resolve();
-					await arrived.promise;
+					order.push("producer started");
+					await producerGate.wait();
 					order.push("producer released");
 				})],
-				actorTurns: [turn(fauxToolCall("read", { path: "notes.txt" }), started.promise),
+				actorTurns: [turn(fauxToolCall("read", { path: "notes.txt" }), producerGate.entered),
 					turn(fauxToolCall("read", { path: "target.txt" }), drafterMaxDepth ? childReady.promise : undefined), turn("done")],
 				draftTurns: Array.from({ length: 5 }, () => respond),
 				onActorActionMaterialized: (action) => {
-					if (action.input.path === "notes.txt") { order.push("Actor arrived"); arrived.resolve(); }
+					if (action.input.path === "notes.txt") { order.push("Actor arrived"); producerGate.release(); }
 				},
 				onEvent: (event) => {
 					if (event.type === "candidate" && event.candidate.depth === 1 && event.state.status === "succeeded") childReady.resolve();

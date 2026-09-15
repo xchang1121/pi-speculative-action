@@ -1,4 +1,4 @@
-import { deferred, nextTurn } from "./async.ts";
+import { gated, deferred, nextTurn } from "./async.ts";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
@@ -193,7 +193,7 @@ describe("Linux process ExecutionWorld", () => {
 			reset: () => fixture.backend.resetActorReplay(),
 		});
 		const invoke = () => coordinator.operations.exec(":", fixture.workspace, { env: fixture.environment, onData: () => {} });
-		const gates = [deferred(), deferred()], sessionsReady = deferred(), captureEntered = deferred(), captureReleased = deferred();
+		const gates = [deferred(), deferred()], sessionsReady = deferred(), captureGate = gated();
 		const producers: Promise<unknown>[] = [];
 		let sessions = 0;
 		let calls: Promise<unknown> | undefined, refreshing: Promise<unknown> | undefined;
@@ -242,7 +242,7 @@ describe("Linux process ExecutionWorld", () => {
 			const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
 			const forking = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(options => fork({ ...options,
 				afterCapture: async (workspace, capture) => {
-					captureEntered.resolve(); await captureReleased.promise;
+					await captureGate.wait();
 					return options.afterCapture!(workspace, capture); // The process is closed; final evidence can still be published.
 				},
 			}));
@@ -250,17 +250,17 @@ describe("Linux process ExecutionWorld", () => {
 				const producing = forkReusableBash(fixture, { command: ":", label: "sealing", actionNamespace: "readiness", executionFingerprint: "readiness" })
 					.then(async branch => { try { expect(branch.output.isError).toBe(false); } finally { await branch.dispose(); } });
 				producers.push(producing);
-				await Promise.race([captureEntered.promise, producing]); await invoke();
+				await Promise.race([captureGate.entered, producing]); await invoke();
 				expect(held.execute, "outer evidence capture still owns possible publication").toHaveBeenCalledTimes(5);
-				captureReleased.resolve(); await producing;
-			} finally { captureReleased.resolve(); forking.mockRestore(); }
+				captureGate.release(); await producing;
+			} finally { captureGate.release(); forking.mockRestore(); }
 			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(6);
 			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
 			await coordinator.refreshActorRoute();
 			expect(coordinator.actorDiagnostics()).toMatchObject({ state: "degraded", detail: expect.stringContaining("functional probe failed") });
 			await invoke(); expect(host.execute).toHaveBeenCalledTimes(7);
 		} finally {
-			release(); gates.forEach(gate => gate.resolve()); captureReleased.resolve();
+			release(); gates.forEach(gate => gate.resolve()); captureGate.release();
 			await Promise.allSettled([calls, refreshing, ...producers]);
 			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore(); observed.mockRestore();
 			await fixture.dispose();
@@ -629,20 +629,20 @@ describe("Linux process ExecutionWorld", () => {
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				expect(branch.commitMetrics).toBeDefined();
 				expect(ownership.claimChild()).toBe(false);
-				const entered = deferred(), released = deferred();
+				const gate = gated();
 				const clock = vi.spyOn(performance, "now").mockReturnValue(0);
 				const execute = vi.spyOn(world.speculation, "execute").mockResolvedValue(branch);
-				const dispose = vi.spyOn(branch, "dispose").mockImplementation(() => { entered.resolve(); return released.promise; });
+				const dispose = vi.spyOn(branch, "dispose").mockImplementation(gate.wait);
 				let delivered = false;
 				const measured = executeReusableBash({ backend, world, workspace: root, environment: {}, shellPath: invocation.process!.shell,
 					tool: createBashTool(root) }, { label: "cleanup", command: "opaque", actionNamespace: "", executionFingerprint: "fake-process" })
 					.then(result => { delivered = true; return result; });
 				try {
-					await Promise.race([entered.promise, measured]); await nextTurn(); expect(delivered).toBe(false);
-					clock.mockReturnValue(100); released.resolve();
+					await Promise.race([gate.entered, measured]); await nextTurn(); expect(delivered).toBe(false);
+					clock.mockReturnValue(100); gate.release();
 					expect((await measured).measurement.totalMs).toBe(100);
 				} finally {
-					released.resolve(); await measured.catch(() => undefined); clock.mockRestore(); execute.mockRestore(); dispose.mockRestore();
+					gate.release(); await measured.catch(() => undefined); clock.mockRestore(); execute.mockRestore(); dispose.mockRestore();
 				}
 			}
 			finally { await branch.dispose(); }

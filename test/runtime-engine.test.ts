@@ -1,5 +1,5 @@
 import type { PlanAction } from "../src/plan-proposal.ts";
-import { deferred, barrier, nextTurn } from "./async.ts";
+import { gated, deferred, barrier, nextTurn } from "./async.ts";
 import { testBranch as world } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
@@ -333,18 +333,18 @@ describe("structural speculative runtime", () => {
 	});
 
 	it("serializes replacement with registration and closes the previous generation before launching another", async () => {
-		const calls = [call("same-turn"), call("same-turn")], preparing = barrier(), gate = barrier();
+		const calls = [call("same-turn"), call("same-turn")], gate = gated();
 		const closed: Start[] = [], predicted: Start[] = [], prediction = barrier();
 		const { runtime } = harness({
 			source: planSource({ propose: ({ startInput }) => {
 				predicted.push(startInput); prediction.arrive(); return undefined;
 			} }),
-			stateData: async (input) => { if (input === calls[0]) { preparing.arrive(); await gate.promise; } return { cwd: "/workspace" }; },
+			stateData: async (input) => { if (input === calls[0]) { await gate.wait(); } return { cwd: "/workspace" }; },
 			onTurnFinished: ({ startInput }) => { closed.push(startInput); },
 		});
 		try {
-			const first = runtime.startTurn(calls[0]!); await preparing.promise;
-			const second = runtime.startTurn(calls[1]!); gate.arrive();
+			const first = runtime.startTurn(calls[0]!); await gate.entered;
+			const second = runtime.startTurn(calls[1]!); gate.release();
 			await Promise.all([first, second]);
 			expect(closed.map((input) => calls.findIndex((call) => call === input))).toEqual([0]);
 			await prediction.promise;
@@ -353,7 +353,7 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn(calls[1]!);
 			expect(closed.map((input) => calls.findIndex((call) => call === input))).toEqual([0, 1]);
 			expect(runtime.inspect().activeTurns).toBe(0);
-		} finally { gate.arrive(); await runtime.dispose(); }
+		} finally { gate.release(); await runtime.dispose(); }
 	});
 
 	it.each(["unique", "duplicate", "absent", "same-input"] as const)("keeps result evidence with its execution handle through repeated and late settlement: %s", async (ids) => {
@@ -399,7 +399,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["requests", "single", "batch", "revisions", "observed", "observed-terminal", "observed-disabled", "observed-disposed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
-		const slow = barrier(), slowStarted = barrier(), executed: string[] = [];
+		const slow = gated(), executed: string[] = [];
 		const independentStarted = barrier(mode === "single" ? 1 : 2);
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
 		const keyed: string[] = [];
@@ -426,7 +426,7 @@ describe("structural speculative runtime", () => {
 			actionKey: async (tool, args, context) => {
 				if (context.type === "start") {
 					keyed.push(String((args as { path?: unknown }).path));
-					if (keyed.at(-1) === "slow.ts") { slowStarted.arrive(); await slow.promise; }
+					if (keyed.at(-1) === "slow.ts") { await slow.wait(); }
 				}
 				return buildPiActionKey(tool, args, "/workspace");
 			},
@@ -445,7 +445,7 @@ describe("structural speculative runtime", () => {
 				const seed = call(turnID, { path: "seed.ts" });
 				await runFallback(runtime, seed, 1, "Actor");
 			}
-			await slowStarted.promise; await independentStarted.promise;
+			await slow.entered; await independentStarted.promise;
 			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), "same-plan.ts"]);
 			expect(keyed).not.toContain("replacement.ts");
 			if (retiring) {
@@ -460,12 +460,12 @@ describe("structural speculative runtime", () => {
 				const replacement = "actions" in revision ? revision.actions![0]! : revision.upsert![0]!;
 				replacement.id = "drifted";
 				replacement.input.path = "drifted-replacement.ts";
-				slow.arrive(); await replacementReady.promise;
+				slow.release(); await replacementReady.promise;
 				expect(keyed).toContain("replacement.ts");
 				expect(keyed).not.toContain("drifted-replacement.ts");
 			}
 			if (mode === "observed") {
-				slow.arrive(); await runtime.finishTurn({ ...call(turnID), terminal: false });
+				slow.release(); await runtime.finishTurn({ ...call(turnID), terminal: false });
 				turnID = "next-decision"; await runtime.startTurn(start(turnID));
 			}
 			if (revised) expect(replacements).toMatchObject([{
@@ -480,12 +480,12 @@ describe("structural speculative runtime", () => {
 					: runtime.finishTurn({ ...call(turnID), terminal: true })).then(() => { closed = true; });
 				await nextTurn(); expect(closed).toBe(false);
 				expect(runtime.inspect().pendingPredictions).toBeGreaterThan(0);
-				slow.arrive(); await closing;
+				slow.release(); await closing;
 				expect(executed).not.toContain("slow.ts");
 				expect(runtime.inspect().pendingPredictions).toBe(0);
 			}
 		} finally {
-			slow.arrive();
+			slow.release();
 			await runtime.finishTurn({ ...call(turnID), terminal: true }); await runtime.dispose();
 		}
 	});
@@ -579,8 +579,7 @@ describe("structural speculative runtime", () => {
 
 	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
 		let enabled = false;
-		const gate = barrier();
-		const executionStarted = barrier();
+		const gate = gated();
 		const source = planSource({
 			enabled: () => enabled,
 			propose: () => plan("bounded-join"),
@@ -588,8 +587,7 @@ describe("structural speculative runtime", () => {
 		const { runtime, events, ready: candidateReady } = harness({
 			source,
 			execute: async () => {
-				executionStarted.arrive();
-				await gate.promise;
+				await gate.wait();
 				return "learned";
 			},
 		});
@@ -601,11 +599,11 @@ describe("structural speculative runtime", () => {
 
 		enabled = true;
 		await runtime.startTurn(start("prediction"));
-		await executionStarted.promise;
+		await gate.entered;
 		const prepared = await runtime.prepareActorCall(call("prediction"));
 		expect(prepared?.output).toBeUndefined();
 
-		gate.arrive();
+		gate.release();
 		await candidateReady.promise;
 		await prepared?.settle(100, "actor");
 		await runtime.finishTurn({ ...call("prediction"), terminal: false });
@@ -632,7 +630,7 @@ describe("structural speculative runtime", () => {
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "late-generation"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
 		const ready = candidateSucceeded(), refreshed = candidateSucceeded(2);
 		const late = mode === "late-generation", validating = barrier(late ? 2 : 1), validationGate = barrier(), secondValidation = barrier();
-		const binding = barrier(), bindingGate = barrier(), continued = barrier(2), outputs: string[] = [];
+		const bindingGate = gated(), continued = barrier(2), outputs: string[] = [];
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const executed: string[] = [];
 		let configured = settings, validations = 0;
@@ -650,7 +648,7 @@ describe("structural speculative runtime", () => {
 			source,
 			settings: () => configured,
 			actionKey: async (tool, args, context) => {
-				if (context.type === "start" && (args as { path: string }).path === "replacement.ts") { binding.arrive(); await bindingGate.promise; }
+				if (context.type === "start" && (args as { path: string }).path === "replacement.ts") { await bindingGate.wait(); }
 				return buildPiActionKey(tool, args, "/workspace");
 			},
 			execute: (tool, concrete) => {
@@ -680,7 +678,7 @@ describe("structural speculative runtime", () => {
 				expect(outputs).toEqual(["generation:2", "generation:2"]);
 			} else if (mode === "replaced") {
 				const replacement = call("turn-2", { path: "replace.ts" });
-				await runFallback(runtime, replacement); await binding.promise;
+				await runFallback(runtime, replacement); await bindingGate.entered;
 			} else if (mode === "evicted") {
 				await runtime.finishTurn({ ...call("turn-2"), terminal: false });
 				configured = { ...settings, resourceCacheMaxBytes: 1 };
@@ -694,7 +692,7 @@ describe("structural speculative runtime", () => {
 				if (mode !== "terminal") expect(closed).toBe(false);
 			}
 			validationGate.arrive(); await nextTurn();
-			bindingGate.arrive(); await closing; await nextTurn();
+			bindingGate.release(); await closing; await nextTurn();
 			if (refreshes) await refreshed.promise;
 			expect(executed).toEqual(["README.md", ...(refreshes ? [mode === "replaced" ? "replacement.ts" : "README.md"] : [])]);
 			if (refreshes) {
@@ -705,16 +703,16 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall(call(late || mode === "refresh" ? "turn-2" : "turn-3",
 					{ path: mode === "replaced" ? "replacement.ts" : "README.md" })))?.output).toBe("generation:2");
 			}
-		} finally { validationGate.arrive(); secondValidation.arrive(); bindingGate.arrive(); await closing; await runtime.dispose(); }
+		} finally { validationGate.arrive(); secondValidation.arrive(); bindingGate.release(); await closing; await runtime.dispose(); }
 		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 
 	it.each(["prediction", "continuation", "running", "sealed", "capture", "promotion", "sealing"] as const)("drains %s work before retiring its session", async (phase) => {
 		const sourceWork = phase === "prediction" || phase === "continuation";
 		for (const mode of sourceWork ? ["disabled", "disposed", "terminal"] as const : ["disabled", "disposed"] as const) {
-			const started = barrier(), producerStarted = barrier(), expired = barrier(), finish = barrier(), cancelled = barrier(), releasing = barrier(), release = barrier();
+			const started = barrier(), producerStarted = barrier(), expired = barrier(), finish = barrier(), cancelled = barrier(), releaseGate = gated();
 			const ready = candidateSucceeded(); let released = false, observed = Promise.resolve();
-			const cleanup = vi.fn(async () => { releasing.arrive(); await release.promise; released = true; });
+			const cleanup = vi.fn(async () => { await releaseGate.wait(); released = true; });
 			const observing = !sourceWork && phase !== "running" && phase !== "sealed";
 			let production: Promise<ReturnType<typeof plan>> | undefined;
 			const produce = (signal: AbortSignal) => production = (async () => {
@@ -765,13 +763,13 @@ describe("structural speculative runtime", () => {
 				const outcome = Promise.allSettled([closing]);
 				if (phase === "running" || sourceWork) await cancelled.promise;
 				if (phase === "sealing") await nextTurn();
-				finish.arrive(); await releasing.promise;
+				finish.arrive(); await releaseGate.entered;
 				await nextTurn(); // Let the close continuation run; no elapsed-time race.
-				release.arrive();
+				releaseGate.release();
 				expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]); await observed;
 				expect(cleanup).toHaveBeenCalledOnce(); expect(executionCount()).toBe(executions);
 				expect(runtime.inspect().sharedCandidates).toBe(mode === "terminal" && phase === "continuation" ? 1 : 0);
-			} finally { finish.arrive(); release.arrive(); await production?.catch(() => {}); await runtime.dispose(); }
+			} finally { finish.arrive(); releaseGate.release(); await production?.catch(() => {}); await runtime.dispose(); }
 		}
 	});
 
@@ -904,8 +902,7 @@ describe("structural speculative runtime", () => {
 	it("expires both pending and admitting next-action requests when the Actor intent arrives", async () => {
 		let entered = 0;
 		const proposalsEntered = barrier(2);
-		const admissionEntered = barrier();
-		const admission = barrier();
+		const admission = gated();
 		const requestsSettled = barrier(2);
 		const source = planSource({
 			requestLifetime: "actor_decision",
@@ -922,8 +919,7 @@ describe("structural speculative runtime", () => {
 		const { runtime, events, executions: executionCount } = harness({
 			source,
 			preflightCandidate: async () => {
-				admissionEntered.arrive();
-				await admission.promise;
+				await admission.wait();
 				return { ok: true };
 			},
 			onEvent: (event) => {
@@ -931,11 +927,11 @@ describe("structural speculative runtime", () => {
 			},
 		});
 		await runtime.startTurn(start("turn"));
-		await Promise.all([proposalsEntered.promise, admissionEntered.promise]);
+		await Promise.all([proposalsEntered.promise, admission.entered]);
 
 		const prepared = await runtime.prepareActorCall(call("turn"));
 		expect(prepared?.output).toBeUndefined();
-		admission.arrive();
+		admission.release();
 		await requestsSettled.promise;
 		expect(executionCount()).toBe(0);
 		expect(
@@ -996,8 +992,8 @@ describe("structural speculative runtime", () => {
 	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
 		for (const mode of ["producer", "preview", "queued", "running"] as const) {
 			const executed: string[] = [], aborted: string[] = [];
-			const busyStarted = barrier(), stop = barrier(), stopped = barrier(), cleanup = barrier(), released = barrier();
-			const targetStarted = barrier(), targetGate = barrier(), targetQueued = barrier();
+			const busyStarted = barrier(), stop = barrier(), stopped = barrier(), cleanupGate = gated();
+			const targetGate = gated(), targetQueued = barrier();
 			const service = vi.spyOn(SpeculationScheduler.prototype, "observeSpeculativeService");
 			const original = SpeculationScheduler.prototype.admit;
 			const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
@@ -1017,31 +1013,31 @@ describe("structural speculative runtime", () => {
 				actionKey: async (tool, args) => { if ((args as { path: string }).path === "target.ts") await busyStarted.promise; return buildPiActionKey(tool, args, "/workspace"); },
 				execute: async (_tool, input, signal) => {
 					const path = String(input.path); executed.push(path);
-					if (path === "target.ts") { targetStarted.arrive(); await targetGate.promise; return "target"; }
+					if (path === "target.ts") { await targetGate.wait(); return "target"; }
 					signal.addEventListener("abort", () => { aborted.push(path); stop.arrive(); }, { once: true }); busyStarted.arrive();
 					await stop.promise; await stopped.promise;
-					return world("busy", { onDispose: async () => { cleanup.arrive(); await released.promise; } });
+					return world("busy", { onDispose: async () => { await cleanupGate.wait(); } });
 				},
 			});
 			try {
 				await runtime.startTurn(start("turn")); await busyStarted.promise;
 				if (mode === "preview") await runtime.previewActorCall(call("turn", { path: "target.ts" }));
-				if (mode === "running") await targetStarted.promise;
+				if (mode === "running") await targetGate.entered;
 				if (mode === "queued") await targetQueued.promise;
 				if (speculative) {
 					await stop.promise; await nextTurn();
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
-					stopped.arrive(); await cleanup.promise; await nextTurn();
+					stopped.arrive(); await cleanupGate.entered; await nextTurn();
 					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
-					released.arrive(); await targetStarted.promise;
+					cleanupGate.release(); await targetGate.entered;
 				}
 				const consumed = runtime.prepareActorCall(call("turn", { path: "target.ts" })).then(prepared => prepared?.output);
-				await targetStarted.promise; targetGate.arrive();
+				await targetGate.entered; targetGate.release();
 				expect(await consumed).toBe("target");
 				expect(executed).toEqual(["busy.ts", "target.ts"]);
 				expect(aborted).toEqual(mode === "running" ? [] : ["busy.ts"]);
 			} finally {
-				stopped.arrive(); released.arrive(); targetGate.arrive(); await runtime.dispose();
+				stopped.arrive(); cleanupGate.release(); targetGate.release(); await runtime.dispose();
 				const failures = service.mock.calls.filter(([, , failed]) => failed);
 				service.mockRestore(); admission.mockRestore(); expect(failures).toEqual([]);
 			}
@@ -1055,7 +1051,7 @@ describe("structural speculative runtime", () => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed");
-		const entered = barrier(), release = barrier(), controller = new AbortController();
+		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
 		const succeeds = ["valid", "running-covered", "output-valid", "output-preferred", "input-lookup"].includes(scenario);
@@ -1077,7 +1073,7 @@ describe("structural speculative runtime", () => {
 			} };
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async (request) => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
-			entered.arrive(); await release.promise;
+			await gate.wait();
 			if (scenario === "rejected") throw new Error("evaluation failed");
 			return scenario === "uncovered" ? undefined : "narrow";
 		});
@@ -1101,20 +1097,20 @@ describe("structural speculative runtime", () => {
 		else { evidence.complete = true; evidence.view.text = "changed by producer"; }
 		const preparation = preview ? runtime.previewActorCall(actor, controller.signal) : Promise.resolve();
 		if (preview) {
-			if (!running && !outputOnly && scenario !== "legacy-miss") await entered.promise;
+			if (!running && !outputOnly && scenario !== "legacy-miss") await gate.entered;
 			else await preparation;
 			expect(validate).not.toHaveBeenCalled(); expect(commit).not.toHaveBeenCalled();
-			if (["valid", "input-lookup"].includes(scenario)) { release.arrive(); await preparation; }
+			if (["valid", "input-lookup"].includes(scenario)) { gate.release(); await preparation; }
 		}
 		const consumed = runtime.prepareActorCall(actor, controller.signal).then(prepared => prepared?.output);
 		try {
 			if (running) {
 				expect(await Promise.race([consumed, authorized.promise.then(() => "joined")])).toBe(succeeds ? "joined" : undefined);
-				completion.arrive(); release.arrive();
+				completion.arrive(); gate.release();
 			} else if (scenario !== "legacy-miss" && !outputOnly) {
-				await entered.promise; changed = scenario === "changed";
+				await gate.entered; changed = scenario === "changed";
 				if (scenario === "aborted") controller.abort();
-				release.arrive();
+				gate.release();
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
@@ -1143,7 +1139,7 @@ describe("structural speculative runtime", () => {
 						...(preview || ["input-lookup", "output-valid"].includes(scenario) ? ["retained"] : [])]) });
 			}
 		} finally {
-			completion.arrive(); release.arrive(); await Promise.all([preparation, consumed]);
+			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
 			await runtime.finishTurn({ ...actor, terminal: true });
 			admission.mockRestore(); adoption.mockRestore();
 		}
@@ -1242,7 +1238,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["input", "executor", "denied", "closing"])("keeps prepared intent non-authoritative through %s", async (phase) => {
-		const entered = barrier(), release = barrier();
+		const gate = gated();
 		const disposed = vi.fn(), committed = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
 		const gateway = new ToolExecutionGateway<unknown, string>([]), actor = vi.fn(async () => "Actor");
 		let executor = "bound", allowed = true;
@@ -1256,7 +1252,7 @@ describe("structural speculative runtime", () => {
 					validate: async () => (validResource()) }),
 				reconstruct: async ({ args }) => {
 					const offset = (args as { offset: number }).offset;
-					if (offset === 10) { entered.arrive(); await release.promise; }
+					if (offset === 10) { await gate.wait(); }
 					return String(offset);
 				},
 			})),
@@ -1264,7 +1260,7 @@ describe("structural speculative runtime", () => {
 		let preparation: Promise<void> | undefined, closing: Promise<void> | undefined;
 		try {
 			await runtime.startTurn(start("turn")); await ready.promise;
-			preparation = runtime.previewActorCall(query); await entered.promise;
+			preparation = runtime.previewActorCall(query); await gate.entered;
 			expect(committed).not.toHaveBeenCalled();
 			if (phase === "closing") {
 				closing = runtime.dispose();
@@ -1285,7 +1281,7 @@ describe("structural speculative runtime", () => {
 				expect(committed).toHaveBeenCalledTimes(phase === "input" ? 1 : 0);
 			}
 		} finally {
-			release.arrive(); await Promise.all([preparation, closing]);
+			gate.release(); await Promise.all([preparation, closing]);
 			await runtime.dispose(); await gateway.dispose();
 		}
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
@@ -1293,11 +1289,11 @@ describe("structural speculative runtime", () => {
 
 	it.each(["poisoned", "terminal", "disposed"] as const)("preserves claimed Actor commit ownership through %s", async (phase) => {
 		const poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
-		const entered = barrier(), release = barrier();
+		const gate = gated();
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const continuation = vi.fn(() => undefined), settlements: PredictionSettlement[] = [];
 		const commit = vi.fn(async () => {
-			entered.arrive(); await release.promise;
+			await gate.wait();
 			if (phase === "poisoned") throw poisoned;
 			return "speculative";
 		});
@@ -1317,11 +1313,11 @@ describe("structural speculative runtime", () => {
 		let consuming: Promise<string | undefined> | undefined, closing: Promise<void> | undefined;
 		try {
 			await runtime.startTurn(start("turn")); await candidateReady.promise;
-			consuming = runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output); await entered.promise;
+			consuming = runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output); await gate.entered;
 			if (phase !== "poisoned") closing = phase === "disposed" ? runtime.dispose()
 				: runtime.finishTurn({ ...call("turn"), terminal: true });
 			await nextTurn();
-			release.arrive();
+			gate.release();
 			if (phase === "poisoned") await expect(consuming).rejects.toBe(poisoned);
 			else expect(await consuming).toBe("speculative");
 			await closing; await runtime.dispose();
@@ -1330,7 +1326,7 @@ describe("structural speculative runtime", () => {
 			if (phase !== "poisoned") expect(settlements).toEqual([expect.objectContaining({
 				match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }),
 			})]);
-		} finally { release.arrive(); await Promise.allSettled([consuming, closing]); await runtime.dispose(); }
+		} finally { gate.release(); await Promise.allSettled([consuming, closing]); await runtime.dispose(); }
 	});
 
 	it.each(["indeterminate", "compatibility_drift", "classified", "unclassified"] as const)("preserves %s rejection through the transaction and Actor fallback", async (scenario) => {
@@ -1458,7 +1454,7 @@ describe("structural speculative runtime", () => {
 		for (const [formalPath, settlePreview] of [
 			["preview.ts", false], ["formal.ts", false], ["preview.ts", true], ["preview.ts", "next-event"],
 		] as const) {
-			const gate = barrier(), firstKeyStarted = barrier();
+			const gate = gated();
 			const resolveExecution = vi.fn(() => undefined);
 			let executor = "preview", actionKeys = 0, captured: ActionKey | undefined;
 			const { runtime } = harness({
@@ -1467,8 +1463,7 @@ describe("structural speculative runtime", () => {
 					const identity = executor;
 					actionKeys++;
 					if (actionKeys === 1) {
-						firstKeyStarted.arrive();
-						await gate.promise;
+						await gate.wait();
 					}
 					return PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: identity });
 				},
@@ -1479,16 +1474,16 @@ describe("structural speculative runtime", () => {
 			await runtime.startTurn(start(turnID));
 			const previewCall = call(turnID, { path: "preview.ts" });
 			const preview = runtime.previewActorCall(previewCall);
-			await firstKeyStarted.promise;
+			await gate.entered;
 			if (settlePreview === true) {
-				gate.arrive();
+				gate.release();
 				await preview;
 			}
 			executor = "actor";
 			const actorCall = { ...previewCall, input: { path: formalPath } };
 			const consumed = settlePreview === "next-event"
 				? nextTurn().then(() => runtime.prepareActorCall(actorCall)) : runtime.prepareActorCall(actorCall);
-			gate.arrive(); await preview;
+			gate.release(); await preview;
 			expect((await consumed)?.output).toBeUndefined();
 			expect(captured?.executionFingerprint).toBe("actor");
 			expect(captured?.input.path).toBe(formalPath);
@@ -1503,8 +1498,8 @@ describe("structural speculative runtime", () => {
 		"coalesces candidate admission across producer entrances: %s", async (mode) => {
 		const dual = mode === "two-previews" || mode === "cancel-owner", distinct = mode === "different-routes";
 		const sourceCount = dual ? 0 : distinct ? 2 : mode === "parallel-predictions" ? 8 : 1;
-		const offered = barrier(), admitted = barrier(), admissionGate = barrier(), continued = barrier(sourceCount);
-		const proposed = barrier(sourceCount), keyed = barrier(sourceCount), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
+		const admitted = barrier(), admissionGate = barrier(), continued = barrier(sourceCount);
+		const proposalGate = gated(sourceCount), keyed = barrier(sourceCount), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
 		const ready = candidateSucceeded(distinct ? 2 : 1), nextReady = candidateSucceeded(2), disposed = vi.fn();
 		const settlements: PredictionSettlement[] = [];
 		const filtered = mode.startsWith("feedback-");
@@ -1513,7 +1508,7 @@ describe("structural speculative runtime", () => {
 			source: planSource({ enabled: () => !dual, proposalCount: () => sourceCount,
 				continueOn: filtered ? () => { continued.arrive(); if (mode === "feedback-error") throw new Error("feedback failure"); return false; } : ["execution_succeeded"],
 				propose: async ({ startInput, proposalIndex }) => {
-					proposals++; proposed.arrive(); await offered.promise;
+					proposals++; await proposalGate.wait();
 					const proposal = plan(`${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
 					return mode === "future-prediction" ? { ...proposal, actions: proposal.actions.map((action) => ({ ...action, horizon: 3, expectedDurationMs: 10 })) } : proposal;
 				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } }),
@@ -1537,23 +1532,23 @@ describe("structural speculative runtime", () => {
 			await runtime.startTurn(actor);
 			if (mode === "parallel-predictions" || distinct) {
 				if (!distinct) expect(proposals).toBe(0);
-				await proposed.promise; offered.arrive();
+				await proposalGate.entered; proposalGate.release();
 				if (distinct) { await executing.promise; executionGate.arrive(); }
 				await continued.promise;
 			} else {
-				if (mode === "prediction-first" || filtered) { offered.arrive(); await continued.promise; }
-				if (mode === "future-prediction") { offered.arrive(); await keyed.promise; expect(runtime.inspect().deferredPlanActions).toBe(1); expect(executionCount()).toBe(0); }
+				if (mode === "prediction-first" || filtered) { proposalGate.release(); await continued.promise; }
+				if (mode === "future-prediction") { proposalGate.release(); await keyed.promise; expect(runtime.inspect().deferredPlanActions).toBe(1); expect(executionCount()).toBe(0); }
 				const previews = [runtime.previewActorCall(actor)];
 				if (dual) previews.push(runtime.previewActorCall(second));
 				if (mode === "late-prediction" || dual) {
 					await admitted.promise;
-					if (!dual) { offered.arrive(); await continued.promise; }
+					if (!dual) { proposalGate.release(); await continued.promise; }
 					admissionGate.arrive();
 				}
 				await Promise.all(previews);
 			}
 			await ready.promise;
-			if (mode === "preview-first") { offered.arrive(); await continued.promise; }
+			if (mode === "preview-first") { proposalGate.release(); await continued.promise; }
 			expect(executionCount()).toBe(distinct ? 2 : 1);
 			if (distinct) { expect(runtime.inspect().sharedCandidates).toBe(2); expect(routes).toBe(2); }
 			expect(settlements).toEqual([]); expect(events.some((event) => event.type === "actor_action")).toBe(false);
@@ -1586,23 +1581,23 @@ describe("structural speculative runtime", () => {
 				expect(events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
 			}
 			expect(executionCount()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
-		} finally { offered.arrive(); admissionGate.arrive(); executionGate.arrive(); await runtime.dispose(); }
+		} finally { proposalGate.release(); admissionGate.arrive(); executionGate.arrive(); await runtime.dispose(); }
 		expect(disposed).toHaveBeenCalledTimes(executionCount());
 	});
 
 	it.each(["binding", "selection"] as const)("does not acquire a retired result after Actor %s waits", async (phase) => {
-		const entered = barrier(), gate = barrier(), ready = candidateSucceeded(), refreshed = candidateSucceeded(2), disposed = barrier(), commit = vi.fn();
+		const gate = gated(), ready = candidateSucceeded(), refreshed = candidateSucceeded(2), disposed = barrier(), commit = vi.fn();
 		let configured = settings, executions = 0, authorizations = 0, allowOld = false;
 		const { runtime } = harness({
 			source: planSource({
 				propose: ({ startInput }) => startInput.turnID.startsWith("producer") ? plan(startInput.turnID) : undefined }),
 			settings: () => configured,
 			actionKey: async (tool, args, context) => {
-				if (phase === "binding" && context.type === "consume") { entered.arrive(); await gate.promise; }
+				if (phase === "binding" && context.type === "consume") { await gate.wait(); }
 				return buildPiActionKey(tool, args, "/workspace");
 			},
 			authorizeCandidate: async () => {
-				if (phase === "selection" && authorizations++ === 0) { entered.arrive(); await gate.promise; return { ok: false, reason: "first_rejected" }; }
+				if (phase === "selection" && authorizations++ === 0) { await gate.wait(); return { ok: false, reason: "first_rejected" }; }
 				return { ok: true };
 			},
 			execute: () => {
@@ -1624,16 +1619,16 @@ describe("structural speculative runtime", () => {
 				await runtime.finishTurn({ ...other, terminal: false });
 				actor = call("producer:2"); await runtime.startTurn(actor); await refreshed.promise; allowOld = true;
 			}
-			const consumed = runtime.prepareActorCall(actor).then(prepared => prepared?.output); await entered.promise;
+			const consumed = runtime.prepareActorCall(actor).then(prepared => prepared?.output); await gate.entered;
 			configured = { ...settings, resourceCacheMaxBytes: 1 };
 			await runtime.startTurn(call("pressure")); await disposed.promise;
-			gate.arrive(); expect(await consumed).toBeUndefined(); expect(commit).not.toHaveBeenCalled();
-		} finally { gate.arrive(); await runtime.dispose(); }
+			gate.release(); expect(await consumed).toBeUndefined(); expect(commit).not.toHaveBeenCalled();
+		} finally { gate.release(); await runtime.dispose(); }
 	});
 
 	it.each(["expiry", "inflight", "independent"] as const)("owns isolated preview execution through %s", async (mode) => {
 		let effects = 0, native = 0;
-		const started = barrier(), gate = barrier(), disposed = vi.fn(), independent = mode === "independent";
+		const gate = gated(), disposed = vi.fn(), independent = mode === "independent";
 		const actor: Call = { ...call(mode), tool: independent ? "bash" : "write",
 			input: independent ? { command: "increment-counter" } : { path: "preview.txt", content: mode } };
 		const second = { ...actor, id: "second-effect" };
@@ -1641,7 +1636,7 @@ describe("structural speculative runtime", () => {
 			source: { id: "disabled", enabled: () => false, propose: () => undefined },
 			resolveExecution: ({ tool }) => independent || tool === "write" ? MUTATION_ROUTE : undefined,
 			execute: async () => {
-				started.arrive(); await gate.promise;
+				await gate.wait();
 				return world("count:1", {
 					executionFingerprint: buildPiActionKey(actor.tool, actor.input, "/workspace")!.executionFingerprint,
 					checkpoint: { backend: "test", id: "preview", lineage: "preview", depth: 0 }, resources: ["."],
@@ -1652,14 +1647,14 @@ describe("structural speculative runtime", () => {
 			await runtime.startTurn(actor);
 			const previews = [runtime.previewActorCall(actor)];
 			if (independent) previews.push(runtime.previewActorCall(second));
-			await Promise.all(previews); await started.promise;
+			await Promise.all(previews); await gate.entered;
 			if (!independent) await runtime.previewActorCall({ ...actor, id: "unsupported", tool: "bash", input: { command: "echo preview" } });
 			if (mode === "expiry") {
-				gate.arrive(); await ready.promise; await runtime.finishTurn({ ...actor, terminal: false });
+				gate.release(); await ready.promise; await runtime.finishTurn({ ...actor, terminal: false });
 				expect(effects).toBe(0); expect(disposed).toHaveBeenCalledOnce();
 				expect(runtime.inspect("session").exclusiveCandidates).toBe(0);
 			} else {
-				const consumed = runtime.prepareActorCall(actor).then(prepared => prepared?.output); expect(executionCount()).toBe(1); gate.arrive();
+				const consumed = runtime.prepareActorCall(actor).then(prepared => prepared?.output); expect(executionCount()).toBe(1); gate.release();
 				expect(await consumed).toBe("count:1"); expect(effects).toBe(1);
 				if (independent) {
 					const prepared = await runtime.prepareActorCall(second);
@@ -1670,7 +1665,7 @@ describe("structural speculative runtime", () => {
 				await runtime.finishTurn({ ...actor, terminal: true });
 			}
 			expect(executionCount()).toBe(1);
-		} finally { gate.arrive(); await runtime.dispose(); }
+		} finally { gate.release(); await runtime.dispose(); }
 		expect(disposed).toHaveBeenCalledTimes(1);
 	});
 
@@ -1746,9 +1741,9 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["route", "preflight"] as const)("matches a continuation during pending %s without authorizing execution", async (phase) => {
-		const preparing = barrier(), resume = barrier(), settlements: PredictionSettlement[] = [];
+		const preparation = gated(), settlements: PredictionSettlement[] = [];
 		const child = { ...call("child"), tool: "write", input: { path: "child.ts", content: "next" } };
-		const hold = async () => { preparing.arrive(); await resume.promise; };
+		const hold = async () => { await preparation.wait(); };
 		const { runtime, executions: executionCount } = harness({
 			source: planSource({
 				propose: ({ startInput }) => startInput.turnID === "parent" ? plan("root") : undefined,
@@ -1769,7 +1764,7 @@ describe("structural speculative runtime", () => {
 			},
 		});
 		try {
-			await runtime.startTurn(start("parent")); await preparing.promise;
+			await runtime.startTurn(start("parent")); await preparation.entered;
 			expect((await runtime.prepareActorCall(call("parent")))?.output).toBe("speculative");
 			await runtime.finishTurn(call("parent"));
 			await runtime.startTurn(child);
@@ -1777,19 +1772,19 @@ describe("structural speculative runtime", () => {
 			expect(prepared?.output).toBeUndefined();
 			expect(executionCount()).toBe(1);
 			await prepared?.settle(1, "actor");
-			resume.arrive();
+			preparation.release();
 			await runtime.finishTurn({ ...child, terminal: true });
 			expect(settlements.filter(({ prediction }) => prediction.actionID === "child")).toMatchObject([{
 				observation: "observed", match: { matched: true, relation: { kind: "exact" },
 					adoption: { status: "rejected", cause: { stage: "admission", code: "preparation_pending" } } },
 			}]);
-		} finally { resume.arrive(); await runtime.dispose(); }
+		} finally { preparation.release(); await runtime.dispose(); }
 		expect(executionCount()).toBe(1);
 		expect(runtime.inspect()).toMatchObject({ pendingPredictions: 0, deferredPlanActions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
 	});
 
 	it.each(["binding", "preflight"] as const)("retires a peer's pending %s when its parent disappears", async (phase) => {
-		const preparing = barrier(), resume = barrier(), retired = barrier();
+		const preparation = gated(), retired = barrier();
 		const materialized: string[] = [], preflighted: string[] = [];
 		let preparationSignal: AbortSignal | undefined;
 		const { runtime, executions: executionCount } = harness({
@@ -1810,7 +1805,7 @@ describe("structural speculative runtime", () => {
 			}],
 			actionKey: async (tool, args, context) => {
 				if (phase === "binding" && context.type === "start" && (args as { path: string }).path === "child.ts") {
-					preparing.arrive(); await resume.promise;
+					await preparation.wait();
 				}
 				return buildPiActionKey(tool, args, "/workspace");
 			},
@@ -1818,28 +1813,28 @@ describe("structural speculative runtime", () => {
 				const candidatePath = (candidate.input as { path: string }).path;
 				preflighted.push(candidatePath);
 				if (phase === "preflight" && candidatePath === "child.ts") {
-					preparationSignal = signal; preparing.arrive(); await resume.promise;
+					preparationSignal = signal; await preparation.wait();
 				}
 				return { ok: true };
 			},
 			onCandidateMaterialized: (candidate) => { materialized.push(String(candidate.input.path)); },
 		});
 		try {
-			await runtime.startTurn(start("parent")); await preparing.promise;
+			await runtime.startTurn(start("parent")); await preparation.entered;
 			expect((await runtime.prepareActorCall(call("parent", { path: "parent.ts" })))?.output).toBe("speculative");
 			await retired.promise;
 			if (phase === "preflight") expect(preparationSignal?.aborted).toBe(true);
-			resume.arrive(); await nextTurn();
+			preparation.release(); await nextTurn();
 			expect(materialized).toEqual(phase === "binding" ? ["parent.ts"] : ["parent.ts", "child.ts"]);
 			expect(preflighted).toEqual(materialized);
-		} finally { resume.arrive(); await runtime.dispose(); }
+		} finally { preparation.release(); await runtime.dispose(); }
 		expect(executionCount()).toBe(1);
 		expect(runtime.inspect()).toMatchObject({ pendingPredictions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
 	});
 
 	it.each(["complete", "arrived", "closed", "failed", "disabled"] as const)("shares only a complete root batch with a peer: %s", async (mode) => {
 		const first = barrier(), secondReady = candidateSucceeded(1, "second.ts"), parentsReady = barrier(2);
-		const peerStarted = barrier(), peerGate = barrier(), childReady = candidateSucceeded(1, "child.ts");
+		const peerGate = gated(), childReady = candidateSucceeded(1, "child.ts");
 		const settlements: PredictionSettlement[] = [], materialized: string[] = [];
 		let peerSignal: AbortSignal | undefined;
 		const continueFrom = vi.fn<NonNullable<Source["continueFrom"]>>(async ({ batch, signal }) => {
@@ -1847,7 +1842,7 @@ describe("structural speculative runtime", () => {
 			expect(batch.map(({ candidate, output }) => [candidate.input.path, output])).toEqual([
 				["first.ts", "first.ts:output"], ["second.ts", "second.ts:output"],
 			]);
-			peerStarted.arrive(); await peerGate.promise;
+			await peerGate.wait();
 			return { id: "peer", source: "peer", revision: 0, actions: [readAction("child", { path: "child.ts" }, {
 				dependsOn: batch.map(({ identity }) => ({ actionID: identity.actionID, proposalID: identity.proposalID,
 					identity: identity.id, condition: "execution_succeeded" })),
@@ -1878,7 +1873,7 @@ describe("structural speculative runtime", () => {
 			expect(continueFrom).not.toHaveBeenCalled();
 			first.arrive(); await parentsReady.promise;
 			if (mode === "failed" || mode === "disabled") { expect(continueFrom).not.toHaveBeenCalled(); return; }
-			await peerStarted.promise;
+			await peerGate.entered;
 			if (mode === "arrived") expect((await runtime.prepareActorCall(call("parent", { path: "first.ts" })))?.output).toBe("first.ts:output");
 			if (mode === "closed") {
 				let drained = false;
@@ -1886,7 +1881,7 @@ describe("structural speculative runtime", () => {
 				await nextTurn(); expect(drained).toBe(false);
 			}
 			expect(peerSignal?.aborted).toBe(mode !== "complete");
-			peerGate.arrive();
+			peerGate.release();
 			if (mode === "complete") {
 				await childReady.promise;
 				for (const name of ["second", "first"]) expect((await runtime.prepareActorCall({
@@ -1899,7 +1894,7 @@ describe("structural speculative runtime", () => {
 				expect(settlements.every((settlement) => settlement.observation === "observed" && settlement.match.matched &&
 					settlement.match.adoption.status === "adopted")).toBe(true);
 			}
-		} finally { first.arrive(); peerGate.arrive(); await closing; await runtime.dispose(); }
+		} finally { first.arrive(); peerGate.release(); await closing; await runtime.dispose(); }
 		expect(continueFrom).toHaveBeenCalledTimes(1);
 		expect(materialized).toEqual(["first.ts", "second.ts", ...(mode === "complete" ? ["child.ts"] : [])]);
 		expect(executionCount()).toBe(mode === "complete" ? 3 : 2);
@@ -1907,9 +1902,8 @@ describe("structural speculative runtime", () => {
 	});
 
 	it("keeps a next-decision continuation alive across parallel tools in one Actor decision", async () => {
-		const gate = barrier();
 		const parentReady = barrier();
-		const continuationStarted = barrier();
+		const gate = gated();
 		const childReady = candidateSucceeded(1, "child.ts");
 		const settlements: PredictionSettlement[] = [];
 		const source = planSource({
@@ -1918,8 +1912,7 @@ describe("structural speculative runtime", () => {
 			propose: () => plan("parallel-continuation", { path: "parent.ts" }),
 			continue: async ({ proposalID, revision, trigger }) => {
 				if (trigger !== "actor_adopted") return undefined;
-				continuationStarted.arrive();
-				await gate.promise;
+				await gate.wait();
 				return {
 					proposalID,
 					source: "source",
@@ -1953,12 +1946,12 @@ describe("structural speculative runtime", () => {
 			input: { path: "parent.ts" },
 		};
 		expect((await runtime.prepareActorCall(parent))?.output).toBe("parent.ts:output");
-		await continuationStarted.promise;
+		await gate.entered;
 
 		const sibling = { ...parent, id: "sibling-call", input: { path: "sibling.ts" } };
 		await runFallback(runtime, sibling, 1_000);
 
-		gate.arrive();
+		gate.release();
 		await childReady.promise;
 		const sameBatchChild = { ...parent, id: "same-batch-child", input: { path: "child.ts" } };
 		expect((await runtime.prepareActorCall(sameBatchChild))?.output).toBe("child.ts:output");
@@ -1977,8 +1970,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each(["retained", "retry", "expired", "replaced", "terminal"] as const)("keeps queued continuation authority %s across plan and turn boundaries", async (phase) => {
-		const gate = barrier();
-		const continuationStarted = barrier();
+		const gate = gated();
 		const retained = phase === "retained" || phase === "retry", nextChild = phase === "retry" ? "late-child" : "child";
 		const childReady = candidateSucceeded(1, `${nextChild}.ts`);
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
@@ -1995,7 +1987,7 @@ describe("structural speculative runtime", () => {
 				if (String(candidate.input.path) !== "parent.ts") return undefined;
 				continuations.push(trigger);
 				if (trigger === "execution_succeeded") {
-					continuationStarted.arrive(); await gate.promise;
+					await gate.wait();
 					if (phase === "retry") return undefined;
 				}
 				const child = trigger === "execution_succeeded" ? "child" : "late-child";
@@ -2017,20 +2009,20 @@ describe("structural speculative runtime", () => {
 		let closing: Promise<void> | undefined;
 		try {
 			await runtime.startTurn(start("parent-turn"));
-			await continuationStarted.promise;
+			await gate.entered;
 			expect((await runtime.prepareActorCall(call("parent-turn", { path: "parent.ts" })))?.output).toBe("parent.ts:output");
 			if (phase === "terminal") closing = runtime.finishTurn({ ...call("parent-turn"), terminal: true });
 			else if (phase === "replaced") {
 				const replacement = { ...call("parent-turn", { path: "replace.ts" }), id: "replace-parent" };
 				await runFallback(runtime, replacement);
 				await replacementReady.promise;
-				gate.arrive();
+				gate.release();
 			} else {
 				await runtime.finishTurn({ ...call("parent-turn"), terminal: false });
 				expect(runtime.inspect()).toMatchObject({ activeTurns: 0, pendingPredictions: 1 });
 				await runtime.startTurn(start("child-turn"));
 				expect(proposals).toBe(1);
-				if (retained) { gate.arrive(); await childReady.promise; }
+				if (retained) { gate.release(); await childReady.promise; }
 				else {
 					const unrelated = call("child-turn", { path: "other.ts" });
 					await runFallback(runtime, unrelated);
@@ -2043,7 +2035,7 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall(call("child-turn", { path: `${nextChild}.ts` })))?.output).toBe(`${nextChild}.ts:output`);
 				await runtime.finishTurn({ ...call("child-turn"), terminal: true });
 			}
-		} finally { gate.arrive(); await closing; await runtime.dispose(); }
+		} finally { gate.release(); await closing; await runtime.dispose(); }
 	});
 
 	it("adopts a target-state-valid child after its parent prediction misses", async () => {
@@ -2110,7 +2102,7 @@ describe("structural speculative runtime", () => {
 		const aliasOutputs: string[] = [];
 		const childrenReady = candidateSucceeded(2, '"content":"child"');
 		const parentReady = candidateSucceeded(1, "parent-new"), validationStarted = barrier(), validationGate = barrier();
-		const parentBinding = barrier(), parentGate = barrier(), aliasReady = barrier(), cleanup = vi.fn(), transactions = new EffectTransactionCoordinator<string>();
+		const parentGate = gated(), aliasReady = barrier(), cleanup = vi.fn(), transactions = new EffectTransactionCoordinator<string>();
 		const parentAction = (content: string) => ({ id: "parent", type: "tool_call" as const, tool: "write", input: { path: `${content}.txt`, content } });
 		const childAction = { id: "child", type: "tool_call" as const, tool: "write", input: { path: "child.txt", content: "child" },
 			expectedDurationMs: 1_000, dependsOn: [{ actionID: "parent", condition: "execution_succeeded" as const }] };
@@ -2147,7 +2139,7 @@ describe("structural speculative runtime", () => {
 				},
 			}],
 			actionKey: async (tool, input, context) => {
-				if (context.type === "start" && (input as { content?: string }).content === "parent-new") { parentBinding.arrive(); await parentGate.promise; }
+				if (context.type === "start" && (input as { content?: string }).content === "parent-new") { await parentGate.wait(); }
 				return buildPiActionKey(tool, input, "/workspace");
 			},
 			execute: (tool, input, _signal, parentWorld) => {
@@ -2188,12 +2180,12 @@ describe("structural speculative runtime", () => {
 				await (claimed ? aliasReady : validationStarted).promise;
 				if (mode === "replaced") {
 					const replacement = call("parent", { path: "replace.ts" });
-					await runFallback(runtime, replacement); await parentBinding.promise;
+					await runFallback(runtime, replacement); await parentGate.entered;
 				} else if (mode === "adopted") expect((await runtime.prepareActorCall(parentCall))?.output).toBe(expectedParent);
 				holdReuse = false; if (!claimed) validationGate.arrive(); await nextTurn();
 				expect(aliasOutputs).toEqual(mode === "replaced" ? [] : ["child:parent-0"]);
 				if (mode === "replaced") {
-					parentGate.arrive(); await parentReady.promise; await replacementChild.promise;
+					parentGate.release(); await parentReady.promise; await replacementChild.promise;
 					expect(childParents).toEqual(["parent-0", "parent-1", "parent-new"]);
 				} else expect(childParents.filter((parent) => parent === "parent-0")).toEqual(["parent-0"]);
 			}
@@ -2206,7 +2198,7 @@ describe("structural speculative runtime", () => {
 			if (claimed) {
 				await validationStarted.promise;
 				const replacement = call("child", { path: "replace.ts" });
-				await runFallback(runtime, replacement); await parentBinding.promise;
+				await runFallback(runtime, replacement); await parentGate.entered;
 				if (mode === "cancelled") actorController.abort();
 				holdReuse = false; validationGate.arrive();
 			}
@@ -2214,7 +2206,7 @@ describe("structural speculative runtime", () => {
 			expect(workspaceVersion).toBe(mode === "cancelled" ? 1 : 2);
 			await nextTurn();
 			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(1);
-			parentGate.arrive();
+			parentGate.release();
 			await runtime.finishTurn({ ...childCall, terminal: true });
 			const predictions = events.filter((event) => event.type === "prediction").map((event) => event.settlement);
 			expect(new Set(predictions.map((settlement) => settlement.prediction.id)).size).toBe(predictions.length);
@@ -2227,7 +2219,7 @@ describe("structural speculative runtime", () => {
 			}
 			expect(events.filter((event) => event.type === "actor_action" && event.settlement.actorAction.id === childCall.id))
 				.toHaveLength(mode === "cancelled" ? 0 : 1);
-		} finally { validationGate.arrive(); parentGate.arrive(); await runtime.dispose(); }
+		} finally { validationGate.arrive(); parentGate.release(); await runtime.dispose(); }
 		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 });
