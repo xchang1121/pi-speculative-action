@@ -53,6 +53,7 @@ import {
 	hydrateWorkspaceFileEntry,
 	snapshotDependency,
 	type WorkspaceStructureSnapshot,
+	type WorkspaceTransactionDiff,
 	type WorkspaceTreeEntry,
 } from "./process-observation.ts";
 import {
@@ -64,7 +65,7 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { hashExecutableFile } from "./filesystem-evidence.ts";
+import { captureStableFile, hashExecutableFile } from "./filesystem-evidence.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -100,7 +101,6 @@ import {
 	type SandboxWorkspaceChange,
 	type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
-import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process";
@@ -1102,7 +1102,7 @@ export class LinuxProcessReuseBackend {
 				stage = "dependencies";
 				const evidence = await captureDependencies(
 					session,
-					transactionDependencySource(before, delta.changes),
+					transactionDependencySource(before, effects),
 					observation.paths,
 					effects.effects,
 				);
@@ -1111,17 +1111,11 @@ export class LinuxProcessReuseBackend {
 				}
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				for (const taint of evidence.taints) taints.add(taint);
-				if (!effects.complete) taints.add("unsupported_syscall");
-				if (!before.complete || !after.complete || !observation.complete) {
+				if (!observation.complete) {
 					taints.add("trace_incomplete");
 				}
 				dependencyCertificate = {
-					complete:
-						before.complete &&
-						after.complete &&
-						observation.complete &&
-						effects.complete &&
-						evidence.complete,
+					complete: observation.complete && evidence.complete,
 					dependencies: evidence.dependencies,
 					taints: [...taints],
 				};
@@ -1321,14 +1315,13 @@ async function sealSessionEvidence(
 		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 		throw new Error("top-level workspace capture is missing");
 	}
-	const fileChanges = changes.filter((change): change is SandboxFileChange => change.kind !== "directory");
-	const regularDeltas: WorkspaceRegularDelta[] = fileChanges.map((change) => ({
+	const regularDeltas = changes.flatMap((change) => change.kind === "directory" ? [] : [{
 		relativePath: change.resource,
-		...(change.before ? { before: change.before } : {}),
-		...(change.after ? { after: change.after } : {}),
-		...(change.beforeMode !== undefined ? { beforeMode: change.beforeMode } : {}),
-		...(change.afterMode !== undefined ? { afterMode: change.afterMode } : {}),
-	}));
+		before: change.before,
+		after: change.after,
+		beforeMode: change.beforeMode,
+		afterMode: change.afterMode,
+	}]);
 	const effects = diffWorkspaceStructures(
 		capture.before,
 		capture.after,
@@ -1344,7 +1337,7 @@ async function sealSessionEvidence(
 	try {
 		const evidence = await captureDependencies(
 			session,
-			transactionDependencySource(capture.before, regularDeltas),
+			transactionDependencySource(capture.before, effects),
 			capture.observation.paths,
 			effects.effects,
 		);
@@ -1352,11 +1345,7 @@ async function sealSessionEvidence(
 		session.topLevelEvidence = mergeDependencyEvidence(
 			[
 				{
-					complete:
-						capture.before.complete &&
-						capture.after.complete &&
-						capture.observation.complete &&
-						evidence.complete,
+					complete: capture.observation.complete && evidence.complete,
 					dependencies: evidence.dependencies,
 					taints: [...new Set([...capture.observation.taints, ...evidence.taints])],
 				},
@@ -1419,43 +1408,26 @@ function sameDirectoryStateValue(
 
 function transactionDependencySource(
 	snapshot: WorkspaceStructureSnapshot,
-	changes: readonly WorkspaceRegularDelta[],
+	effects: WorkspaceTransactionDiff,
 ) {
-	const deltas = new Map<string, WorkspaceRegularDelta>();
-	for (const change of changes) {
-		const relative = path.normalize(change.relativePath);
-		if (deltas.has(relative)) throw new Error(`duplicate transaction delta: ${change.relativePath}`);
-		deltas.set(relative, change);
-	}
+	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
+	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) =>
+		change.kind === "directory" ? [] : [[relativePath, change] as const]));
 	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
-	const entry = (physicalPath: string): Promise<WorkspaceTreeEntry | undefined> => {
+	return (physicalPath: string) => {
 		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
 		if (relative === undefined) {
 			return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
 		}
-		const existing = cached.get(relative);
-		if (existing) return existing;
-		const pending = (async () => {
+		if (!cached.has(relative)) cached.set(relative, (async () => {
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
-			const delta = deltas.get(relative);
-			if (delta && delta.before === undefined) {
-				throw new Error(`transaction baseline is missing file bytes: ${delta.relativePath}`);
-			}
-			const bytes = delta?.before ?? (await readFile(path.resolve(snapshot.root, relative)));
-			const hydrated = hydrateWorkspaceFileEntry(structure, bytes);
-			if (!hydrated) throw new Error(`transaction baseline size changed: ${relative}`);
+			const content = deltas.get(relative)?.before ?? await captureStableFile(path.resolve(snapshot.root, relative), structure.size);
+			const hydrated = hydrateWorkspaceFileEntry(structure, content);
+			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
 			return hydrated;
-		})();
-		cached.set(relative, pending);
-		return pending;
-	};
-	return {
-		entry,
-		parentEntry: (physicalPath: string) =>
-			path.resolve(physicalPath) === path.resolve(snapshot.root)
-				? Promise.resolve(undefined)
-				: entry(path.dirname(physicalPath)),
+		})());
+		return cached.get(relative)!;
 	};
 }
 
@@ -1465,6 +1437,14 @@ async function captureDependencies(
 	observed: readonly ObservedProcessPath[],
 	effects: readonly { readonly logicalPath: string }[],
 ) {
+	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">) => {
+		const [entry, parent] = await Promise.all([before(physical),
+			path.resolve(physical) === path.resolve(session.workspace.sandboxRoot) ? undefined : before(path.dirname(physical))]);
+		return snapshotDependency(logical, entry, parent, role, {
+			excludedEntries: workspaceMetadataExclusions(session, physical),
+			parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
+		});
+	};
 	const dependencies = new Map<string, DynamicDependency>();
 	const taints = new Set<ProvenanceTaint>();
 	const incompleteReasons = new Set<string>();
@@ -1510,20 +1490,7 @@ async function captureDependencies(
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
 		if (session.projection.isWorkspacePhysical(physical)) {
-			const logical = session.projection.toLogical(physical);
-			const [entry, parentEntry] = await Promise.all([before.entry(physical), before.parentEntry(physical)]);
-			add(
-				snapshotDependency(
-					logical,
-					entry,
-					parentEntry,
-					item.role,
-					{
-						excludedEntries: workspaceMetadataExclusions(session, physical),
-						parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
-					},
-				),
-			);
+			add(await workspaceDependency(physical, session.projection.toLogical(physical), item.role));
 			continue;
 		}
 		if (!(await immutableHostPath(physical))) {
@@ -1545,18 +1512,7 @@ async function captureDependencies(
 			incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`);
 			continue;
 		}
-		add(
-			snapshotDependency(
-				effect.logicalPath,
-				await before.entry(physical),
-				await before.parentEntry(physical),
-				"input",
-				{
-					excludedEntries: workspaceMetadataExclusions(session, physical),
-					parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
-				},
-			),
-		);
+		add(await workspaceDependency(physical, effect.logicalPath, "input"));
 	}
 	return {
 		complete,

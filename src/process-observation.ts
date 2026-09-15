@@ -1,8 +1,9 @@
-import type { Dirent, Stats } from "node:fs";
+import type { BigIntStats, Dirent, Stats } from "node:fs";
 import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
+import type { StableFileCapture } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
 import {
 	digestObject,
@@ -265,16 +266,13 @@ function orderWorkspaceTransactionEffects(
 
 export function hydrateWorkspaceFileEntry(
 	entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
-	bytes: Uint8Array,
-	includeContent = false,
+	content: Uint8Array | StableFileCapture,
 ): Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined {
-	if (bytes.byteLength !== entry.size) return undefined;
-	const content = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	return {
-		...entry,
-		digest: sha256Digest(content),
-		...(includeContent ? { content } : {}),
-	};
+	if ("hash" in content) {
+		if (statChangeDigest(content.stat) !== entry.changeDigest) return undefined;
+		return { ...entry, digest: `sha256:${content.hash}` };
+	}
+	return content.byteLength === entry.size ? { ...entry, digest: sha256Digest(content) } : undefined;
 }
 
 function regularDeltaFailure(
@@ -373,8 +371,8 @@ function sameStructureEntry(
 }
 
 function changedRootMetadata(
-	before: WorkspaceTreeEntry | WorkspaceStructureEntry | undefined,
-	after: WorkspaceTreeEntry | WorkspaceStructureEntry | undefined,
+	before: WorkspaceStructureEntry | undefined,
+	after: WorkspaceStructureEntry | undefined,
 ): string | undefined {
 	if (before?.kind !== "directory" || after?.kind !== "directory") return "unsupported_workspace_root_transition";
 	return before.metadataDigest === after.metadataDigest ? undefined : "unsupported_workspace_root_metadata";
@@ -389,15 +387,21 @@ export function directoryEntriesDigest(entries: readonly (FilesystemTypeEvidence
 }
 
 /** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */
-function statChangeDigest(stat: Stats): Sha256Digest {
+function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
+	const milliseconds = (field: "ctime" | "mtime") => {
+		const ns = (stat as BigIntStats)[`${field}Ns`];
+		if (ns === undefined) return stat[`${field}Ms`];
+		const remainder = (ns % 1_000_000_000n + 1_000_000_000n) % 1_000_000_000n;
+		return Number((ns - remainder) / 1_000_000_000n) * 1_000 + Number(remainder) / 1_000_000;
+	};
 	return digestObject({
-		dev: stat.dev,
-		ino: stat.ino,
-		ctimeMs: stat.ctimeMs,
-		mtimeMs: stat.mtimeMs,
-		mode: stat.mode,
-		size: stat.size,
-		links: stat.nlink,
+		dev: Number(stat.dev),
+		ino: Number(stat.ino),
+		ctimeMs: milliseconds("ctime"),
+		mtimeMs: milliseconds("mtime"),
+		mode: Number(stat.mode),
+		size: Number(stat.size),
+		links: Number(stat.nlink),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
 }
