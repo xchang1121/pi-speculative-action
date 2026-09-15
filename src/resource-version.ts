@@ -88,13 +88,13 @@ export class ResourceReadView {
 		return true;
 	}
 	capture(target: string, entry: CapturedResource): void {
-		if (!this.reserve(Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + 64 + (entry.type === "directory"
-			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0))) return;
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
-		if ((entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
-			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined)) return;
+		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
+			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined);
+		if (!this.reserve(redundant ? 0 : Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + 64 + (entry.type === "directory"
+			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
+			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0)) || redundant) return;
 		this.entries.set(key, entry);
 	}
 	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
@@ -283,7 +283,7 @@ export class ResourceVersionManager {
 	private async inspect(token: ResourceVersionToken, sealing: boolean): Promise<ResourceVersionValidation> {
 		const started = performance.now();
 		if (!this.open || token.manager !== this || token.root !== this.root)
-			return validation(started, true, "resource_version_owner_changed", "exact");
+			return validation(started, "resource_version_owner_changed");
 		try {
 			if (sealing) token.view?.seal(); else token.view?.assertComplete(true);
 			if (sealing && this.snapshotExcludes.size) throw new Error("resource_filtered_snapshot_not_observable");
@@ -293,24 +293,20 @@ export class ResourceVersionManager {
 			// Watcher delivery fences host execution windows; future adoption uses the exact fingerprints below.
 			if (sealing) await watcherTurn();
 			const watcherFailure = this.invalidation(token, sealing);
-			if (watcherFailure) return validation(started, true, watcherFailure, "watcher");
+			if (watcherFailure) return validation(started, watcherFailure, "watcher");
 			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot, this.snapshotExcludes);
 			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
-			if (lateFailure) return validation(started, true, lateFailure, "watcher");
+			if (lateFailure) return validation(started, lateFailure, "watcher");
 			const expired = !current.length || current.some((entry) => {
 				const captured = token.observations.get(dependencyKey(entry));
 				return entry.fingerprint !== captured?.fingerprint || (sealing && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp));
 			});
 			const reason = sealing ? "resource_observation_window_changed" : "resource_fingerprint_changed";
-			return {
-				expired,
-				...validationMetrics(started, current.reduce((sum, entry) => sum + entry.bytesRead, 0), current.reduce((sum, entry) => sum + entry.filesRead, 0), "exact"),
-				...(expired ? { reason } : {}),
-			};
+			return validation(started, expired ? reason : undefined, "exact", current);
 		} catch {
 			const reason = sealing ? "resource_observation_window_unprovable" : "resource_validation_failed";
-			return validation(started, true, reason, "exact");
+			return validation(started, reason);
 		}
 	}
 
@@ -437,7 +433,7 @@ export async function captureResourceVersion(
 export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
 	return isResourceVersionToken(token)
 		? token.manager.validate(token)
-		: Promise.resolve(validation(performance.now(), true, "resource_version_missing", "exact"));
+		: Promise.resolve(validation(performance.now(), "resource_version_missing"));
 }
 
 export function releaseResourceVersion(token: unknown): void | Promise<void> {
@@ -496,12 +492,19 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	return true;
 }
 
+type FingerprintResult = {
+	readonly value: unknown;
+	readonly stamp: string;
+	readonly bytesRead: number;
+	readonly filesRead: number;
+};
+
 async function fingerprintDependencies(
 	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
 	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
 ) {
-	const context: FingerprintContext = { realRoot, excludes, view, nearestExisting: missingResourceResolver(realRoot),
-		capture: (target) => fingerprintIO(() => captureFilesystemEntry(target)) };
+	const files = new Map<string, Promise<FingerprintResult>>(), nearestExisting = missingResourceResolver(realRoot);
+	let captureEntry = (target: string, _scope: ResourceDependency["scope"]) => fingerprintIO(() => captureFilesystemEntry(target));
 	if (bindings) {
 		// One eager capture owns the namespace evidence shared by every dependency and recursive child.
 		const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
@@ -519,7 +522,7 @@ async function fingerprintDependencies(
 			entries.set(key, pending); return pending;
 		};
 		await capture(bindings.root);
-		context.capture = async (target, scope) => {
+		captureEntry = async (target, scope) => {
 			for await (const entry of walkFilesystemPath(target, { capture, followFinal: scope !== "entry" })) {
 				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
 			}
@@ -528,9 +531,125 @@ async function fingerprintDependencies(
 	}
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
-		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, context);
+		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope);
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 	});
+
+	async function fingerprintPath(
+		target: string,
+		scope: ResourceDependency["scope"],
+		ancestors: ReadonlySet<string> = new Set(),
+		descend = true,
+	): Promise<FingerprintResult> {
+		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
+		try {
+			captured = await captureEntry(target, scope);
+		} catch (error) {
+			if (!missingResource(error)) throw error;
+			view?.capture(target, { type: "missing" });
+			return {
+				value: { exists: false, error: errorCode(error) },
+				stamp: digest([filesystemPathKey(target), await nearestExisting(target)]),
+				bytesRead: 0,
+				filesRead: 0,
+			};
+		}
+		const { info, link } = captured;
+		const realTarget = info.isSymbolicLink()
+			? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
+			: await fingerprintIO(() => fs.realpath(target));
+		assertInside(realRoot, realTarget);
+		const identity = filesystemPathKey(realTarget);
+		if (ancestors.has(identity)) throw new Error(`resource_symlink_cycle:${target}`);
+		if (info.isSymbolicLink()) {
+			let source: string | undefined;
+			const links: unknown[] = [];
+			if (scope !== "entry") await fingerprintIO(async () => {
+				for await (const entry of walkFilesystemPath(target)) {
+					source = entry.path;
+					if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
+				}
+			});
+			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, new Set(ancestors).add(identity), descend);
+			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget });
+			return {
+				value: {
+					type: "symlink",
+					link,
+					mode: Number(info.mode),
+					resolved: identity,
+					target: followed?.value,
+				},
+				stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
+				bytesRead: followed?.bytesRead ?? 0,
+				filesRead: followed?.filesRead ?? 0,
+			};
+		}
+		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
+			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget,
+				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
+			return stableEntry(target, info, identity, scope);
+		}
+		if (info.isFile()) {
+			const key = JSON.stringify([filesystemPathKey(target), identity, statStamp(info), String(info.uid), String(info.gid)]), existing = files.get(key);
+			if (existing) return { ...await existing, bytesRead: 0, filesRead: 0 };
+			const pending = (async () => {
+				// Join only concurrent reads of this identity; settled captures never authorize a later read.
+				const retain = view?.reserve(Number(info.size)) ?? false;
+				const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
+				assertInside(realRoot, content.realPath);
+				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath });
+				return {
+					value: {
+						type: "file",
+						mode: Number(content.stat.mode),
+						size: content.bytesRead,
+						hash: content.hash,
+						resolved: filesystemPathKey(content.realPath),
+					},
+					stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
+					bytesRead: content.bytesRead,
+					filesRead: 1,
+				};
+			})().finally(() => files.delete(key));
+			files.set(key, pending);
+			return pending;
+		}
+		if (!info.isDirectory() || scope === "content") {
+			throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
+		}
+		const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
+		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
+		const descendants = new Set(ancestors).add(identity);
+		const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
+			const child = await fingerprintPath(path.join(target, entry.name), scope, descendants, scope !== "entries");
+			return { name: entry.name, ...child };
+		});
+		const [afterEntries, after] = await Promise.all([
+			fingerprintIO(() => fs.readdir(target, { withFileTypes: true })),
+			fingerprintIO(() => fs.lstat(target, { bigint: true })),
+		]);
+		if (
+			!after.isDirectory() ||
+			!sameFilesystemIdentity(info, after) ||
+			!sameValues(entries.map(entryIdentity), afterEntries.map(entryIdentity))
+		) {
+			throw new Error(`resource_directory_changed:${target}`);
+		}
+		view?.capture(target, { type: "directory", entries: selected.map((entry) => entry.name), realPath: realTarget });
+		return {
+			value: {
+				type: "directory",
+				mode: Number(after.mode),
+				resolved: identity,
+				order: selected.map((entry) => entry.name),
+				children: children.map((child) => ({ name: child.name, value: child.value })),
+			},
+			stamp: digest([statStamp(after), children.map((child) => [child.name, child.stamp])]),
+			bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
+			filesRead: children.reduce((total, child) => total + child.filesRead, 0),
+		};
+	}
 }
 
 async function fingerprintBinding(dependency: ResourceDependency) {
@@ -543,133 +662,6 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 		stamp = errorCode(error);
 	}
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
-}
-
-type FingerprintResult = {
-	readonly value: unknown;
-	readonly stamp: string;
-	readonly bytesRead: number;
-	readonly filesRead: number;
-};
-
-type FingerprintContext = {
-	readonly realRoot: string;
-	readonly excludes: ReadonlySet<string>;
-	readonly nearestExisting: (target: string) => Promise<string>;
-	readonly view?: ResourceReadView;
-	capture: (target: string, scope: ResourceDependency["scope"]) => ReturnType<typeof captureFilesystemEntry>;
-};
-
-async function fingerprintPath(
-	target: string,
-	scope: ResourceDependency["scope"],
-	context: FingerprintContext,
-	ancestors: ReadonlySet<string> = new Set(),
-	descend = true,
-): Promise<FingerprintResult> {
-	const { realRoot, excludes, nearestExisting, view } = context;
-	let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
-	try {
-		captured = await context.capture(target, scope);
-	} catch (error) {
-		if (!missingResource(error)) throw error;
-		view?.capture(target, { type: "missing" });
-		return {
-			value: { exists: false, error: errorCode(error) },
-			stamp: digest([filesystemPathKey(target), await nearestExisting(target)]),
-			bytesRead: 0,
-			filesRead: 0,
-		};
-	}
-	const { info, link } = captured;
-	const realTarget = info.isSymbolicLink()
-		? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
-		: await fingerprintIO(() => fs.realpath(target));
-	assertInside(realRoot, realTarget);
-	const identity = filesystemPathKey(realTarget);
-	if (ancestors.has(identity)) throw new Error(`resource_symlink_cycle:${target}`);
-	if (info.isSymbolicLink()) {
-		let source: string | undefined;
-		const links: unknown[] = [];
-		if (scope !== "entry") await fingerprintIO(async () => {
-			for await (const entry of walkFilesystemPath(target)) {
-				source = entry.path;
-				if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
-			}
-		});
-		const followed = source === undefined ? undefined : await fingerprintPath(source, scope, context, new Set(ancestors).add(identity), descend);
-		view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget });
-		return {
-			value: {
-				type: "symlink",
-				link,
-				mode: Number(info.mode),
-				resolved: identity,
-				target: followed?.value,
-			},
-			stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
-			bytesRead: followed?.bytesRead ?? 0,
-			filesRead: followed?.filesRead ?? 0,
-		};
-	}
-	if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-		view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget,
-			...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
-		return stableEntry(target, info, identity, scope);
-	}
-	if (info.isFile()) {
-		// Reserve before yielding: concurrent captures cannot each spend the entire token budget.
-		const retain = view?.reserve(Number(info.size)) ?? false;
-		const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
-		assertInside(realRoot, content.realPath);
-		view?.capture(target, { type: "file", content: content.content, realPath: content.realPath });
-		return {
-			value: {
-				type: "file",
-				mode: Number(content.stat.mode),
-				size: content.bytesRead,
-				hash: content.hash,
-				resolved: filesystemPathKey(content.realPath),
-			},
-			stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
-			bytesRead: content.bytesRead,
-			filesRead: 1,
-		};
-	}
-	if (!info.isDirectory() || scope === "content") {
-		throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
-	}
-	const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
-	const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
-	const descendants = new Set(ancestors).add(identity);
-	const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
-		const child = await fingerprintPath(path.join(target, entry.name), scope, context, descendants, scope !== "entries");
-		return { name: entry.name, ...child };
-	});
-	const [afterEntries, after] = await Promise.all([
-		fingerprintIO(() => fs.readdir(target, { withFileTypes: true })),
-		fingerprintIO(() => fs.lstat(target, { bigint: true })),
-	]);
-	if (
-		!after.isDirectory() ||
-		!sameFilesystemIdentity(info, after) ||
-		!sameValues(entries.map(entryIdentity), afterEntries.map(entryIdentity))
-	) {
-		throw new Error(`resource_directory_changed:${target}`);
-	}
-	view?.capture(target, { type: "directory", entries: selected.map((entry) => entry.name), realPath: realTarget });
-	return {
-		value: {
-			type: "directory",
-			mode: Number(after.mode),
-			resolved: identity,
-			order: selected.map((entry) => entry.name),
-			children: children.map((child) => ({ name: child.name, value: child.value })),
-		},
-		stamp: digest([statStamp(after), children.map((child) => [child.name, child.stamp])]),
-		bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
-		filesRead: children.reduce((total, child) => total + child.filesRead, 0),
-	};
 }
 
 async function stableEntry(
@@ -747,20 +739,16 @@ function assertInside(realRoot: string, target: string): void {
 
 function validation(
 	started: number,
-	expired: boolean,
-	reason: string,
-	mode: ResourceValidationMetrics["mode"],
+	reason?: string,
+	mode: ResourceValidationMetrics["mode"] = "exact",
+	observed: ReadonlyArray<Pick<ResourceValidationMetrics, "bytesRead" | "filesRead">> = [],
 ): ResourceVersionValidation {
-	return { expired, reason, ...validationMetrics(started, 0, 0, mode) };
-}
-
-function validationMetrics(
-	started: number,
-	bytesRead: number,
-	filesRead: number,
-	mode: ResourceValidationMetrics["mode"],
-): ResourceValidationMetrics {
-	return { durationMs: Math.max(0, performance.now() - started), bytesRead, filesRead, mode };
+	return {
+		expired: reason !== undefined, ...(reason === undefined ? {} : { reason }),
+		durationMs: Math.max(0, performance.now() - started), mode,
+		bytesRead: observed.reduce((total, entry) => total + entry.bytesRead, 0),
+		filesRead: observed.reduce((total, entry) => total + entry.filesRead, 0),
+	};
 }
 
 function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Value>) {
@@ -789,25 +777,17 @@ function releaseOnce<Result>(release: () => Result): () => Result | undefined {
 	};
 }
 
-class AsyncGate {
-	private active = 0;
-	private readonly waiting: Array<() => void> = [];
-
-	async run<Value>(task: () => Promise<Value>) {
-		if (this.active < FILESYSTEM_CONCURRENCY) this.active++;
-		else await new Promise<void>((resolve) => this.waiting.push(resolve));
-		try {
-			return await task();
-		} finally {
-			const next = this.waiting.shift();
+const fingerprintIO = (() => {
+	let active = 0;
+	const waiting: Array<() => void> = [];
+	return async <Value>(task: () => Promise<Value>): Promise<Value> => {
+		if (active < FILESYSTEM_CONCURRENCY) active++;
+		else await new Promise<void>((resolve) => waiting.push(resolve));
+		try { return await task(); }
+		finally {
+			const next = waiting.shift();
 			if (next) next();
-			else this.active--;
+			else active--;
 		}
-	}
-}
-
-const fingerprintGate = new AsyncGate();
-
-function fingerprintIO<Value>(task: () => Promise<Value>) {
-	return fingerprintGate.run(task);
-}
+	};
+})();

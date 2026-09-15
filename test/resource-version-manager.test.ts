@@ -56,6 +56,7 @@ describe("speculative action resource versions", () => {
 					const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
 					for (const capture of watch ? inputs : inputs.reverse()) await capture();
 					const evidence = [view.bytes, [...token.observations]];
+					view.capture(value, { type: change === "entries" ? "directory" : "file" });
 					const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat"), resolved = vi.spyOn(fs, "realpath");
 					try {
 						expect(await view.exists(value)).toBe(true);
@@ -125,30 +126,31 @@ describe("speculative action resource versions", () => {
 		const root = await workspace({ "value.txt": payload }), file = path.join(root, "value.txt");
 		const manager = new ResourceVersionManager(root, { watch: false });
 		const dependencies = resourceDependencies(action("read", ["value.txt", "missing"]), root);
-		for (const [budget, paths] of [[0, dependencies], [payload.length, dependencies.slice(0, 1)]] as const) {
+		for (const [budget, paths] of [[0, dependencies], [payload.length, dependencies.slice(0, 1)],
+			[3 * 1024 * 1024, [...dependencies, { path: root, scope: "tree_content" }]]] as const) {
 			const opened = vi.spyOn(fs, "open");
-			const observed = await manager.capture(paths, budget);
-			expect(opened.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(1); opened.mockRestore();
-			expect(observed.view).toBeUndefined(); // No partial input authority after either payload or metadata exhaustion.
-			expect((await manager.validate(observed)).expired).toBe(false);
-			observed.release();
+			const token = await manager.capture(paths, budget), view = token.view;
+			const reads = opened.mock.calls.filter(([, flags]) => isDataOpen(flags)).length; opened.mockRestore();
+			expect(reads).toBe(1); // Concurrent scopes share the same content capture and retained allocation.
+			expect(await manager.validate(token)).toMatchObject({ expired: false, filesRead: 1 });
+			expect(Boolean(view)).toBe(budget > payload.length); // Exhaustion revokes all retained input authority.
+			if (!view) { token.release(); continue; }
+			await expect(view.evaluate(async (scope) => {
+				try { await scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
+			})).rejects.toThrow("resource_access_unproven");
+			expect(await view.evaluate((scope) => scope.readFile(file))).toEqual(payload);
+			(await view.readFile(file)).fill(66);
+			await fs.writeFile(file, "B");
+			expect([await view.readFile(file), (await view.stat(file)).size, (await view.stat(file, "type")).size]).toEqual([payload, payload.length, undefined]);
+			expect(await view.exists(path.join(root, "missing"))).toBe(false);
+			for (const type of ["missing", "file"] as const) expect(() => view.capture(file, { type })).toThrow("not_capturing");
+			await expect(view.exists(path.join(root, "unknown"))).rejects.toThrow("resource_access_unproven");
+			expect(() => view.assertComplete()).toThrow("resource_access_unproven");
+			expect((await manager.seal(token)).expired).toBe(true);
+			releaseResourceVersion(token);
+			await expect(view.readFile(file)).rejects.toThrow("disposed");
+			await expect(view.evaluate(async () => "late")).rejects.toThrow("disposed");
 		}
-		const token = await manager.capture(dependencies, 3 * 1024 * 1024), view = token.view!;
-		await expect(view.evaluate(async (scope) => {
-			try { await scope.exists(path.join(root, "unknown")); } catch { /* Tool may swallow a failed stat. */ }
-		})).rejects.toThrow("resource_access_unproven");
-		expect(await view.evaluate((scope) => scope.readFile(file))).toEqual(payload);
-		(await view.readFile(file)).fill(66);
-		await fs.writeFile(file, "B");
-		expect([await view.readFile(file), (await view.stat(file)).size, (await view.stat(file, "type")).size]).toEqual([payload, payload.length, undefined]);
-		expect(await view.exists(path.join(root, "missing"))).toBe(false);
-		expect(() => view.capture(file, { type: "missing" })).toThrow("not_capturing");
-		await expect(view.exists(path.join(root, "unknown"))).rejects.toThrow("resource_access_unproven");
-		expect(() => view.assertComplete()).toThrow("resource_access_unproven");
-		expect((await manager.seal(token)).expired).toBe(true);
-		releaseResourceVersion(token);
-		await expect(view.readFile(file)).rejects.toThrow("disposed");
-		await expect(view.evaluate(async () => "late")).rejects.toThrow("disposed");
 		manager.close();
 	});
 
@@ -283,11 +285,11 @@ describe("speculative action resource versions", () => {
 		} finally { vi.unstubAllEnvs(); }
 	});
 
-	test.for([["empty", "short", "chunks"], ["admission"], ["grow", "shrink", "read-error"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
+	test.for([["empty", "short", "chunks"], ["admission", "settled"], ["grow", "shrink", "read-error"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
 		if (process.platform === "win32" && changes.includes("replace")) return skip("Windows denies replacement of the open destination");
 		for (const change of changes) for (const mode of ["hash", "content", "executable"]) {
 			const executable = mode === "executable", retain = mode === "content";
-			if (executable && ["admission", "seal"].includes(change)) continue; // Only path captures certify pathname stability.
+			if (executable && ["admission", "seal", "settled"].includes(change)) continue; // Only path captures certify pathname stability.
 			const payload = change === "chunks" ? Buffer.alloc(2 * 1024 * 1024 + 7, 43) : Buffer.from(change === "empty" ? "" : "initial contents");
 			const root = await workspace({ value: payload }), file = path.join(root, "value");
 			const nativeOpen = fs.open.bind(fs), handle = await nativeOpen(file, "r"), read = handle.read.bind(handle), stat = handle.stat.bind(handle);
@@ -295,7 +297,7 @@ describe("speculative action resource versions", () => {
 			const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 				if (!isDataOpen(flags)) return nativeOpen(target, flags, mode);
 				if (change === "admission") await fs.appendFile(file, "more");
-				return handle;
+				return handle.fd < 0 ? nativeOpen(target, flags, mode) : handle;
 			});
 			vi.spyOn(handle, "stat").mockImplementation((async (...args: Parameters<typeof handle.stat>) => {
 				const result = await stat(...args);
@@ -309,8 +311,15 @@ describe("speculative action resource versions", () => {
 				if (change === "replace") { const replacement = path.join(root, "new"); await fs.writeFile(replacement, payload); await fs.rename(replacement, file); }
 				return read(buffer, 0, Math.min(3, buffer.byteLength), null);
 			}) as typeof handle.read);
+			const manager = new ResourceVersionManager(root, { watch: false }), nativeReaddir = fs.readdir;
+			const { promise: closed, resolve: finish } = deferred(), close = handle.close.bind(handle);
+			vi.spyOn(handle, "close").mockImplementationOnce(async () => { await close(); finish(); });
+			const readdir = change === "settled" ? vi.spyOn(fs, "readdir").mockImplementation((async (...args: Parameters<typeof fs.readdir>) => {
+				await closed; await fs.appendFile(file, "more"); return nativeReaddir(...args);
+			}) as typeof fs.readdir) : undefined;
 			try {
-				const capture = executable ? hashExecutableFile(file) : captureStableFile(file, Infinity, retain);
+				const capture = change === "settled" ? manager.capture([{ path: file, scope: "content" }, { path: root, scope: "tree_content" }], retain ? 8192 : undefined)
+					: executable ? hashExecutableFile(file) : captureStableFile(file, Infinity, retain);
 				if (["empty", "short", "chunks"].includes(change)) {
 					const hash = createHash("sha256").update(payload).digest("hex");
 					if (executable) expect(await capture).toBe(`sha256:${hash}`);
@@ -321,7 +330,7 @@ describe("speculative action resource versions", () => {
 				} else await expect(capture).rejects.toThrow(change === "read-error" ? "injected read failure" : "file_changed_during_capture");
 				if (change === "admission") expect(handle.read).not.toHaveBeenCalled();
 				expect(handle.fd).toBe(-1);
-			} finally { open.mockRestore(); }
+			} finally { open.mockRestore(); readdir?.mockRestore(); manager.close(); }
 		}
 	});
 
