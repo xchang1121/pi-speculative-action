@@ -139,7 +139,6 @@ export interface PrepareSandboxWorkspaceOptions extends WorkspaceSandboxOptions 
 }
 
 interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
-	readonly baselineGit: ReturnType<typeof bindGit>;
 	readonly indexGit: ReturnType<typeof bindGit>;
 	readonly pool: PooledGitRepository;
 	readonly commit: string;
@@ -819,7 +818,6 @@ async function createPrivateSandboxWorkspace(
 	try {
 		const commit = await acquireSandboxBaseline(pool);
 		let sandboxRoot: string;
-		let baselineRoot: string;
 		let gitDirectory: string;
 		let openTransactionClock: () => Promise<FileHandle>;
 		let transactionClockLinks: 0 | 1;
@@ -839,7 +837,6 @@ async function createPrivateSandboxWorkspace(
 			});
 			overlay = mounted;
 			sandboxRoot = mounted.root;
-			baselineRoot = sharedBaseline.sandboxRoot;
 			gitDirectory = sharedBaseline.gitDirectory;
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot);
 			transactionClockLinks = 0;
@@ -849,7 +846,6 @@ async function createPrivateSandboxWorkspace(
 			attached = prepared;
 			sandboxRoot = prepared.sandboxRoot;
 			processRoot = prepared.processRoot;
-			baselineRoot = prepared.sandboxRoot;
 			gitDirectory = prepared.gitDirectory;
 			const transactionClockPath = path.join(prepared.processRoot, "workspace-transaction.clock");
 			openTransactionClock = () => {
@@ -887,7 +883,6 @@ async function createPrivateSandboxWorkspace(
 			observationExcludes,
 			structure,
 			transactions,
-			baselineGit: bindGit(gitBinary, baselineRoot, ["-C", baselineRoot]),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
 			pool,
 			commit,
@@ -933,7 +928,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		contaminated: boolean;
 		readonly before?: WorkspaceStructureSnapshot;
 	}
-	const { baselineGit: git, commit, sandboxRoot, openTransactionClock: openClock,
+	const { pool: { git }, commit, sandboxRoot, openTransactionClock: openClock,
 		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
 	let lastStructure = await workspace.structure.capture();
 	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
@@ -1804,7 +1799,7 @@ async function collectOverlayChangeResources(
 	const resources = new Set<string>();
 	const addBaselineSubtree = async (resource: string) => {
 		const prefix = resource || ".";
-		const tree = await workspace.baselineGit(
+		const tree = await workspace.pool.git(
 			["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix],
 			{ environment: { GIT_OPTIONAL_LOCKS: "0" } },
 		);
@@ -1833,7 +1828,7 @@ async function readBaselineState(
 	resource: string,
 ): Promise<RegularFileState | undefined> {
 	if (workspace.baselineFrontier.has(resource)) return workspace.baselineFrontier.get(resource);
-	return readGitTreeRegularState(workspace.baselineGit, workspace.commit, resource, 64 * 1024 * 1024);
+	return readGitTreeRegularState(workspace.pool.git, workspace.commit, resource, 64 * 1024 * 1024);
 }
 
 async function readGitTreeRegularState(
