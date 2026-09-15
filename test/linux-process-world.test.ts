@@ -440,13 +440,14 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	}, 15_000);
 
-	test.for(["trace", "transaction", "dependency", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
+	test.for(["trace", "transaction", "dependency", "host_parent", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-");
-		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { readFile: readTrace, rm: removeFile, lstat: readStat } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
-		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt" : `injected ${failure} capture failure`);
+		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt"
+			: failure === "host_parent" ? "tainted:mutable_input" : `injected ${failure} capture failure`);
 		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
 		let processContext = {};
 		let restoreTransactions: (() => void) | undefined;
@@ -456,7 +457,7 @@ describe("Linux process ExecutionWorld", () => {
 			const begin = input.workspace.transactions.begin;
 			const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
 				const capture = await begin();
-				if (failure === "publication") return capture;
+				if (failure === "publication" || failure === "host_parent") return capture;
 				return { abort: capture.abort, finish: async () => {
 					if (failure === "dependency") {
 						const result = await capture.finish(), next = await begin();
@@ -473,11 +474,18 @@ describe("Linux process ExecutionWorld", () => {
 		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
 			if (String(args[0]).includes("/trace-")) {
 				traceRoot = path.dirname(String(args[0]));
-				if (failure === "publication" || failure === "dependency") return readTrace(...args);
+				if (failure === "publication" || failure === "dependency" || failure === "host_parent") return readTrace(...args);
 				if (failure === "trace") { await entered.promise; failed.resolve(); throw error; }
 				entered.resolve(); await gate.promise;
 			}
 			return readTrace(...args);
+		});
+		const probing = vi.spyOn(filesystem, "lstat").mockImplementation(async (...args) => {
+			const info = await readStat(...args);
+			if (failure === "host_parent" && String(args[0]) === "/etc" && typeof info.mode === "number") {
+				failed.resolve(); await gate.promise; info.mode |= 0o022;
+			}
+			return info;
 		});
 		const removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
 			if (String(args[0]) === traceRoot && !released) cleanupBeforeRelease = true;
@@ -517,10 +525,12 @@ describe("Linux process ExecutionWorld", () => {
 			expect({ executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
 			const lastError = branch.executionMetrics.reuse?.lastError ?? "";
 			expect(lastError).toContain(error.message);
-			const detail = JSON.parse(lastError.split("; process=")[1]!);
-			expect(detail).toMatchObject({ ...processContext, requestID: 1,
-				stage: failure === "publication" ? "history_publication" : failure === "dependency" ? "dependencies" : `${failure}_capture` });
-			expect(detail.weakKey).toMatch(/^sha256:[a-f0-9]{64}$/);
+			const detail = failure === "host_parent" ? undefined : JSON.parse(lastError.split("; process=")[1]!);
+			if (failure !== "host_parent") {
+				expect(detail).toMatchObject({ ...processContext, requestID: 1,
+					stage: failure === "publication" ? "history_publication" : failure === "dependency" ? "dependencies" : `${failure}_capture` });
+				expect(detail.weakKey).toMatch(/^sha256:[a-f0-9]{64}$/);
+			}
 			const validation = await branch.validate?.();
 			if (failure === "publication") {
 				await expect(validateDynamicDependencyCertificate(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
@@ -531,12 +541,12 @@ describe("Linux process ExecutionWorld", () => {
 				expect((await fixture.backend.store.stats()).certificates).toBe(0);
 			} else {
 				expect(validation?.status).toBe("indeterminate");
-				expect(JSON.stringify(validation)).toContain(`nested_capture:${error.message}`);
+				expect(JSON.stringify(validation)).toContain(failure === "host_parent" ? "top_evidence:mutable:/etc/ld.so.cache" : `nested_capture:${error.message}`);
 			}
 		} finally {
 			released = true; gate.resolve();
 			await running?.then((branch) => branch.dispose(), () => undefined);
-			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
+			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); probing.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
 			await fixture.dispose();
 		}
 	});

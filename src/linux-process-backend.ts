@@ -103,7 +103,7 @@ import {
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process";
+const BACKEND_EPOCH = "pi-linux-process-protected-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -1493,12 +1493,14 @@ async function captureDependencies(
 			add(await workspaceDependency(physical, session.projection.toLogical(physical), item.role));
 			continue;
 		}
-		if (!(await immutableHostPath(physical))) {
-			taints.add("mutable_input");
-			incompleteReasons.add(`mutable:${physical}`);
-		}
 		try {
-			for (const dependency of await captureHostPath(physical, item.role)) add(dependency);
+			const captured = await captureHostPath(physical, item.role);
+			if (captured) for (const dependency of captured) add(dependency);
+			else {
+				complete = false;
+				taints.add("mutable_input");
+				incompleteReasons.add(`mutable:${physical}`);
+			}
 		} catch (error) {
 			complete = false;
 			taints.add("trace_incomplete");
@@ -1534,83 +1536,44 @@ function workspaceMetadataExclusions(session: ActiveSession, target: string): re
 async function captureHostPath(
 	physicalPath: string,
 	role: Exclude<ObservedProcessPath["role"], "metadata">,
-): Promise<readonly DynamicDependency[]> {
+): Promise<readonly DynamicDependency[] | undefined> {
 	const dependencies: DynamicDependency[] = [];
 	const normalized = path.resolve(physicalPath);
-	let current = path.parse(normalized).root;
-	for (const component of normalized.slice(current.length).split(path.sep).filter(Boolean)) {
-		current = path.join(current, component);
-		try {
-			const stat = await lstat(current);
-			if (stat.isSymbolicLink()) dependencies.push(await captureSymlinkDependency(current, slash(current)));
-		} catch (error) {
+	let current = path.parse(normalized).root, links = 0;
+	const pending = normalized.slice(current.length).split(path.sep).filter(Boolean);
+	for (;;) {
+		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp", "/home"].some((root) => pathContains(root, current))) return undefined;
+		let info;
+		try { info = await lstat(current); }
+		catch (error) {
 			if (!missing(error)) throw error;
-			break;
+			const absence = await captureAbsenceDependency(current, slash(current), true);
+			if (!absence) throw new Error("host dependency changed during capture");
+			return [...dependencies, absence];
 		}
-	}
-	let target = normalized;
-	try {
-		const stat = await lstat(target);
-		if (stat.isSymbolicLink()) target = await realpath(target);
-		const targetStat = await lstat(target);
-		if (targetStat.isFile()) {
-			dependencies.push((await captureFileDependency(target, slash(target), role, { includeMetadata: true })).dependency);
-		} else if (targetStat.isDirectory()) {
-			dependencies.push(await captureDirectoryDependency(target, slash(target), true));
-		} else {
-			throw new Error("unsupported host dependency");
+		if (info.uid !== 0 || (!info.isSymbolicLink() && (info.mode & 0o022) !== 0)) return undefined;
+		if (info.isSymbolicLink()) {
+			if (++links > 40) throw new Error("host dependency symlink limit");
+			const link = await captureSymlinkDependency(current, slash(current));
+			dependencies.push(link);
+			const root = path.parse(link.target).root;
+			pending.unshift(...link.target.slice(root.length).split(path.sep));
+			current = root || path.dirname(current);
+			continue;
 		}
-	} catch (error) {
-		if (!missing(error)) throw error;
-		const missingPath = await nearestMissingPath(target);
-		const absence = await captureAbsenceDependency(missingPath, slash(missingPath), true);
-		if (absence) dependencies.push(absence);
-	}
-	return dependencies;
-}
-
-async function immutableHostPath(target: string): Promise<boolean> {
-	const normalized = path.resolve(target);
-	if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp", "/home"].some((root) => pathContains(root, normalized))) {
-		return false;
-	}
-	try {
-		const stat = await lstat(normalized);
-		if (stat.isSymbolicLink()) {
-			const parent = await lstat(path.dirname(normalized));
-			if (stat.uid !== 0 || parent.uid !== 0 || (parent.mode & 0o022) !== 0) return false;
-			return immutableHostPath(await realpath(normalized));
+		const component = pending.shift();
+		if (component !== undefined) {
+			if (!info.isDirectory()) throw new Error("unsupported host dependency");
+			current = path.resolve(current, component);
+			continue;
 		}
-		return stat.uid === 0 && (stat.mode & 0o022) === 0;
-	} catch (error) {
-		if (!missing(error)) return false;
-		try {
-			const missingPath = await nearestMissingPath(normalized);
-			const parent = await lstat(path.dirname(missingPath));
-			return parent.uid === 0 && (parent.mode & 0o022) === 0;
-		} catch {
-			return false;
-		}
+		if (info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
+		else if (info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), true));
+		else throw new Error("unsupported host dependency");
+		return dependencies;
 	}
 }
 
-/** The first absent component plus its existing parent form a stable negative dependency. */
-async function nearestMissingPath(target: string): Promise<string> {
-	const missingComponents: string[] = [];
-	let current = path.resolve(target);
-	while (true) {
-		try {
-			await lstat(current);
-			return missingComponents.length ? path.join(current, missingComponents.at(-1)!) : target;
-		} catch (error) {
-			if (!missing(error)) throw error;
-			const parent = path.dirname(current);
-			if (parent === current) throw error;
-			missingComponents.push(path.basename(current));
-			current = parent;
-		}
-	}
-}
 
 async function replayFilesystemEffects(
 	owner: WorkspaceSandboxService,
