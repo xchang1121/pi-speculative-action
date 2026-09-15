@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { hash, randomUUID } from "node:crypto";
 import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
@@ -1150,7 +1150,7 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 function actionIdentity(key: string): string {
-	return `action:${createHash("sha256").update(key).digest("hex")}`;
+	return `action:${hash("sha256", key)}`;
 }
 
 function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
@@ -1175,7 +1175,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 }
 
 function sidecarActionBatchID(fingerprint: string): string {
-	return `fork:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 32)}`;
+	return `fork:${hash("sha256", fingerprint).slice(0, 32)}`;
 }
 
 function uniqueStrings(value: unknown): string[] {
