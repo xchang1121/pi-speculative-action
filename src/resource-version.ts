@@ -195,7 +195,7 @@ export class ResourceVersionManager {
 	private references = 0;
 	private watcher?: FSWatcher;
 	private reliable = false;
-	private ready: Promise<void> = Promise.resolve();
+	private ready?: Promise<void>;
 	private open = true;
 	readonly root: string;
 	private readonly snapshotExcludes: ReadonlySet<string>;
@@ -209,18 +209,21 @@ export class ResourceVersionManager {
 		this.root = root;
 		this.snapshotExcludes = new Set(options.snapshotExcludes);
 		this.onIdle = options.onIdle;
-		if (options.watch === false) return;
+		if (options.watch === false) this.ready = Promise.resolve();
+	}
+
+	private async startWatching() {
 		try {
-			this.watcher = watch(root, { recursive: true }, (event, filename) => {
-				const changed = filename ? path.resolve(root, filename) : root;
+			this.watcher = watch(this.root, { recursive: true }, (event, filename) => {
+				const changed = filename ? path.resolve(this.root, filename) : this.root;
 				this.changed(changed, event);
 			});
 			this.watcher.on("error", () => {
 				this.reliable = false;
-				this.changed(root, "unknown");
+				this.changed(this.root, "unknown");
 			});
 			this.reliable = true;
-			this.ready = watcherTurn();
+			await watcherTurn();
 		} catch {
 			this.reliable = false;
 		}
@@ -231,16 +234,20 @@ export class ResourceVersionManager {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
-		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>(), preciseContent: string[] = [];
-		const releases = [this.acquireReference()];
+		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>();
+		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;
+		this.references++;
 		let view: ResourceReadView | undefined;
 		const release = releaseOnce(() => {
-			const finish = () => { observations.clear(); for (const stop of releases.reverse()) stop(); };
+			const finish = () => {
+				observations.clear(); precise?.release();
+				if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.();
+			};
 			const pending = view?.dispose();
 			return pending ? pending.then(finish) : finish();
 		});
 		try {
-			await this.ready;
+			if (dependencies) await (this.ready ??= this.startWatching());
 			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
 			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
 				const normalized = normalizeDependencies(this.root, requested).filter((dependency) => !observations.has(dependencyKey(dependency)));
@@ -255,17 +262,17 @@ export class ResourceVersionManager {
 					if (path.dirname(target) !== target) ancestors.push(path.dirname(target));
 					if (binding.link !== undefined) ancestors.push(path.resolve(path.dirname(target), binding.link));
 				}
-				const precise = this.reliable ? this.acquirePreciseWatches(normalized) : undefined;
-				if (precise) { releases.push(precise.release); preciseContent.push(...precise.paths); }
+				if (dependencies && this.reliable) precise = this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view)) observations.set(dependencyKey(observation), observation);
 			};
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
 			if (dependencies) await capture(dependencies);
-			await watcherTurn();
+			if (dependencies) await watcherTurn();
 			const retained = view?.retained ? view : undefined;
 			if (dependencies) retained?.seal();
 			return {
-				root: this.root, physicalRoot, observations, epoch: this.epoch, watching: this.reliable, preciseContent,
+				root: this.root, physicalRoot, observations, epoch: this.epoch,
+				watching: Boolean(dependencies && this.reliable), preciseContent: Object.freeze(precise?.paths ?? []),
 				manager: this, ...(retained ? { view: retained } : {}), release,
 			};
 		} catch (error) {
@@ -327,7 +334,7 @@ export class ResourceVersionManager {
 	}
 
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
-		if (token.manager !== this || token.root !== this.root || !this.reliable) {
+		if (token.manager !== this || token.root !== this.root || !token.watching || !this.reliable) {
 			return { uncertain: true, paths: [] };
 		}
 		const oldest = this.events[0]?.epoch ?? this.epoch;
@@ -349,14 +356,6 @@ export class ResourceVersionManager {
 		for (const precise of this.preciseWatches.values()) precise.watcher.close();
 		this.preciseWatches.clear();
 		this.events.length = 0;
-	}
-
-	private acquireReference(): () => void {
-		this.references++;
-		return releaseOnce(() => {
-			this.references = Math.max(0, this.references - 1);
-			this.checkIdle();
-		});
 	}
 
 	private changed(changedPath: string, type: ResourceEvent["type"]) {
@@ -406,10 +405,6 @@ export class ResourceVersionManager {
 		};
 	}
 
-	private checkIdle() {
-		if (this.references || this.preciseWatches.size) return;
-		this.onIdle?.();
-	}
 }
 
 const managers = new Map<string, ResourceVersionManager>();

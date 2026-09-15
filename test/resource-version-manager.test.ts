@@ -48,6 +48,8 @@ describe("speculative action resource versions", () => {
 			let token: ResourceVersionToken | undefined;
 			try {
 				token = await manager.capture(onDemand ? undefined : resourceDependencies(action(change === "entries" ? "ls" : "read", target), root), 8192);
+				expect(manager.changesSince(token).uncertain).toBe(!watch || onDemand);
+				expect(Reflect.set(token.preciseContent, 0, "unproven")).toBe(false);
 				if (onDemand) {
 					expect((await manager.validate(token)).expired).toBe(true); // Open capture is never an adoptable certificate.
 					const value = change === "entries" ? root : file, view = token.view!;
@@ -236,7 +238,7 @@ describe("speculative action resource versions", () => {
 		const root = await workspace({ "value.txt": "A" });
 		const file = path.join(root, "value.txt");
 		const key = action("read", ["value.txt"]);
-		const probe = await captureResourceVersion(key, root);
+		const probe = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, 8192);
 		const manager = probe.manager;
 		const world = createResourceSnapshotExecutionWorld();
 		const capture = await world.observation!.capture({
@@ -245,6 +247,7 @@ describe("speculative action resource versions", () => {
 		});
 		const actorOutput = { result: { content: [{ type: "text" as const, text: "A" }], details: {} }, isError: false };
 		const branch = await capture.seal(actorOutput);
+		expect(manager.changesSince(probe).uncertain).toBe(true); // Later watcher startup cannot recover the earlier capture window.
 		await capture.dispose(); // A sealed capture no longer owns the token.
 		expect(await branch.commit()).toBe(actorOutput);
 		await fs.writeFile(file, "B");
