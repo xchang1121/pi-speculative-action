@@ -1385,7 +1385,8 @@ function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void {
 
 async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
 	const [tracked, untracked] = await Promise.all([
-		repository.index(["diff-files", "--name-only", "--no-renames", "-z", "--"]),
+		// Porcelain refreshes stat-only changes; exact resource validation still guards every actual fork.
+		repository.index(["diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", "--"]),
 		repository.index(["ls-files", "--others", "-z", "--"]),
 	]);
 	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
