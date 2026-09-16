@@ -269,6 +269,14 @@ describe("SpeculationScheduler", () => {
 		if (cancelled) {
 			expect(joinDecision(scheduler, identity)).toMatchObject({ speculativeSamples: 0, expectedRemainingMs: 4000 });
 			expect(scheduler.evaluate([forecast({ ...identity, actionKeyHash: "other", expectedDurationMs: undefined })]).expectedDurationMs).toBe(1);
+			const probes = Array.from({ length: 2 * DEFAULT_BENEFIT_GATE_POLICY.probeInterval }, () => {
+				const join = joinDecision(scheduler, identity, { state: "running", elapsedMs: 4500 });
+				expect(join).toMatchObject({ reason: "warmup_probe", speculativeSamples: 0 });
+				expect(join.waitBudgetMs).toBe(join.allowed ? 25 : 0);
+				return join.allowed;
+			});
+			expect(probes).toEqual(probes.map((_, index) => (index + 1) % DEFAULT_BENEFIT_GATE_POLICY.probeInterval === 0));
+			expect(joinDecision(scheduler, identity, { state: "succeeded" })).toMatchObject({ allowed: true, reason: "ready" });
 			expect(scheduler.admit(job, [{ ...request, decisionBatchesUntilCall: 5 }], 1).admitted).toBe(true);
 			scheduler.complete(job);
 			scheduler.observeSpeculativeService(identity, 100);
