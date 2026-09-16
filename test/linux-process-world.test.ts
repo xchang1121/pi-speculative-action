@@ -99,6 +99,33 @@ describe("Linux process ExecutionWorld", () => {
 					waiting.resolve(); expect(await siblings).toEqual({ exitCode: 0 }); expect(observed).toBe(killed ? 1 : 2);
 				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
 			}
+			const threaded = path.join(root, "thread-exec");
+			await writeFile(`${threaded}.c`, `#include <pthread.h>
+#include <unistd.h>
+static void *replace(void *unused) {
+	(void)unused;
+	execl("/bin/true", "true", (char *)0);
+	_exit(127);
+}
+int main(void) {
+	pthread_t worker;
+	if (pthread_create(&worker, 0, replace, 0)) return 70;
+	pthread_exit(0);
+}
+`);
+			execFileSync("cc", ["-pthread", "-Wall", "-Wextra", "-Werror", `${threaded}.c`, "-o", threaded]);
+			for (const command of ["exec /bin/sh -c 'exec /bin/true'", `exec ${threaded}`]) {
+				const visited: string[] = [], completed: string[] = [];
+				const chained = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
+					const image = `${pid}:${await filesystem.readlink(`/proc/${pid}/exe`)}`;
+					visited.push(image);
+					return { kind: "continue", observeCompletion: () => { completed.push(image); } };
+				} });
+				expect(await chained.execute({ command, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} }))
+					.toEqual({ exitCode: 0 });
+				expect(visited).toHaveLength(2);
+				expect(completed.sort(), "every exec image must retain its completion owner through replacement").toEqual(visited.sort());
+			}
 			let output = "";
 			const committed = vi.fn(async () => { await writeFile(path.join(root, "producer-armed"), "ready"); });
 			const delivery = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async process => {

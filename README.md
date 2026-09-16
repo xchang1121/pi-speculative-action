@@ -62,7 +62,7 @@ pi -e /absolute/path/to/pi-speculative-action
 npm run setup:linux
 ```
 
-安装器构建并验证固定版本的后端；Runtime 使用前仍会自检。可选 fuse-overlayfs 通过完整资格后用于大型工作区，不可用时保留 Git。WSL checkout 应放在 Linux 原生文件系统中。
+安装器构建并验证固定版本的后端；Runtime 使用前仍会自检。升级后若提示 helper 协议不匹配，重新运行上述安装命令。可选 fuse-overlayfs 通过完整资格后用于大型工作区，不可用时保留 Git。WSL checkout 应放在 Linux 原生文件系统中。
 
 持久进程缓存按可执行文件路径组织索引；旧目录布局的缓存需清空后重新预热。路径检索只用于排除未命中，复用仍验证完整执行身份、当前依赖和效果闭包。
 
