@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { AsyncResource } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { captureProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -41,11 +42,7 @@ export interface HeldExecSnapshot {
 	readonly argv: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
-	readonly context: {
-		readonly key: string;
-		readonly umask: number;
-		readonly descriptorTypes: readonly ["device" | "other", "pipe" | "socket", "pipe" | "socket"];
-	};
+	readonly context: Pick<ProcessExecutionContext, "key" | "umask" | "descriptorTypes">;
 }
 
 export type HeldExecDecision =
@@ -268,18 +265,14 @@ export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
 /** Inspect an image while PTRACE_EVENT_EXEC guarantees it has not run a user instruction. */
 export async function inspectHeldExecProcess(pid: number, executable: string): Promise<HeldExecSnapshot> {
 	const root = `/proc/${pid}`;
-	const [cwd, command, environmentBytes, status, limits, processStat, descriptorNames] = await Promise.all([
+	const [cwd, command, environmentBytes, descriptorNames] = await Promise.all([
 		readlink(`${root}/cwd`),
 		readFile(`${root}/cmdline`),
 		readFile(`${root}/environ`),
-		readFile(`${root}/status`, "utf8"),
-		readFile(`${root}/limits`, "utf8"),
-		readFile(`${root}/stat`, "utf8"),
 		readdir(`${root}/fd`),
 	]);
-	if (descriptorNames.some((name) => !/^\d+$/.test(name)) || descriptorNames.map(Number).sort((a, b) => a - b).join(",") !== "0,1,2") {
-		throw new Error("held process has unmodeled inherited descriptors");
-	}
+	const context = await captureProcessContext(pid, descriptorNames);
+	if (!validProcessContext(context)) throw new Error("held process descriptors are not replayable");
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
 	const environment: Record<string, string> = {};
@@ -288,69 +281,11 @@ export async function inspectHeldExecProcess(pid: number, executable: string): P
 		if (separator < 1 || Object.hasOwn(environment, entry.slice(0, separator))) throw new Error("held process environment is not canonical");
 		environment[entry.slice(0, separator)] = entry.slice(separator + 1);
 	}
-	const aliases = new Map<string, number>();
-	const descriptors: Array<{ fd: number; type: "regular" | "pipe" | "socket" | "tty" | "device" | "other"; flags: number; alias: number; endpoint: string }> = [];
-	for (const fd of [0, 1, 2]) {
-		const [metadata, endpoint, info] = await Promise.all([
-			stat(`${root}/fd/${fd}`),
-			readlink(`${root}/fd/${fd}`),
-			readFile(`${root}/fdinfo/${fd}`, "utf8"),
-		]);
-		const identity = `${metadata.dev}:${metadata.ino}`;
-		if (!aliases.has(identity)) aliases.set(identity, aliases.size);
-		const encodedFlags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
-		if (!encodedFlags) throw new Error(`held descriptor ${fd} flags unavailable`);
-		descriptors.push({
-			fd,
-			type: metadata.isFile() ? "regular" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
-				metadata.isCharacterDevice() ? (endpoint.startsWith("/dev/pts/") ? "tty" : "device") : "other",
-			flags: Number.parseInt(encodedFlags, 8),
-			alias: aliases.get(identity)!,
-			endpoint,
-		});
-	}
-	if (descriptors[0]!.type !== "device" || !["pipe", "socket"].includes(descriptors[1]!.type) ||
-		!["pipe", "socket"].includes(descriptors[2]!.type)) throw new Error("held process descriptors are not replayable");
-	const uid = numbers(statusField(status, "Uid"));
-	const gid = numbers(statusField(status, "Gid"));
-	if (uid.length !== 4 || gid.length !== 4) throw new Error("held process credentials are incomplete");
-	const groups = numbers(statusField(status, "Groups"));
-	if (!groups.includes(gid[1]!)) groups.push(gid[1]!);
-	groups.sort((left, right) => left - right);
-	const semantic = {
-		executionDomain: "ptrace",
-		rlimits: limits.split("\n").slice(1).map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
-		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
-		systemMetadata: statIdentity(await stat("/bin/sh")),
-		signals: { blocked: statusField(status, "SigBlk"), ignored: statusField(status, "SigIgn") },
-		scheduling: {
-			nice: Number(processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[16]),
-			cpus: statusField(status, "Cpus_allowed_list"),
-			memoryNodes: statusField(status, "Mems_allowed_list"),
-		},
-		descriptors: descriptors.map(({ endpoint, ...value }) => ({
-			...value,
-			flags: value.flags & ~0o2000000,
-			...(value.type === "device" ? { endpoint } : {}),
-		})),
-	};
-	const descriptorTypes: HeldExecSnapshot["context"]["descriptorTypes"] = [
-		"device",
-		descriptors[1]!.type as "pipe" | "socket",
-		descriptors[2]!.type as "pipe" | "socket",
-	];
 	return {
 		executable,
-		outputRoute: descriptors[1]!.alias === descriptors[2]!.alias ? [1, 1] : [1, 2],
-		argv,
-		cwd,
-		environment,
-		context: { key: JSON.stringify(semantic), umask: Number.parseInt(statusField(status, "Umask"), 8), descriptorTypes },
+		outputRoute: context.outputEndpoints[0] === context.outputEndpoints[1] ? [1, 1] : [1, 2],
+		argv, cwd, environment, context,
 	};
-}
-
-function statIdentity(value: Awaited<ReturnType<typeof stat>>): Readonly<Record<string, string>> {
-	return Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map((name) => [name, String(value[name as keyof typeof value])]));
 }
 
 function decodeNullFields(bytes: Buffer): string[] {
@@ -360,19 +295,6 @@ function decodeNullFields(bytes: Buffer): string[] {
 		throw new Error("held process metadata is not valid UTF-8");
 	}
 	return fields;
-}
-
-function statusField(status: string, name: string): string {
-	const match = new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status);
-	if (!match) throw new Error(`held process status lacks ${name}`);
-	const value = match[1]!.trim();
-	return value;
-}
-
-function numbers(value: string): number[] {
-	const result = value ? value.split(/\s+/).map(Number) : [];
-	if (result.some((item) => !Number.isSafeInteger(item) || item < 0)) throw new Error("invalid held process status numbers");
-	return result;
 }
 
 function parseRequest(line: string): WireRequest | undefined {

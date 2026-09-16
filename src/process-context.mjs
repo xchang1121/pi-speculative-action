@@ -1,0 +1,162 @@
+// @ts-check
+import { fstatSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { readFile, readlink, stat } from "node:fs/promises";
+
+/** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
+/** @typedef {{
+ * readonly key: string, readonly launchKey: string, readonly umask: number,
+ * readonly descriptorTypes: readonly [DescriptorType, DescriptorType, DescriptorType],
+ * readonly outputEndpoints: readonly [string, string]
+ * }} ProcessExecutionContext */
+
+/**
+ * Read the same kernel context for a stopped Actor image and the isolated dispatcher.
+ * The caller owns the inherited table: ptrace observes it after exec; the native dispatcher
+ * verifies it before Node opens its private descriptors. Endpoint aliases below describe
+ * buffered stdio routing, not general open-file-description identity.
+ * Capture does not authorize reuse: the dispatcher reports unsupported streams for native fallback.
+ * @param {number | "self"} pid
+ * @param {readonly string[]} inheritedDescriptors
+ * @returns {Promise<ProcessExecutionContext>}
+ */
+export async function captureProcessContext(pid, inheritedDescriptors) {
+	if (inheritedDescriptors.some(name => !/^\d+$/.test(name)) ||
+		inheritedDescriptors.map(Number).sort((a, b) => a - b).join(",") !== "0,1,2") {
+		throw new Error("held process has unmodeled inherited descriptors");
+	}
+	const root = `/proc/${pid}`;
+	// Keep the dispatcher on its original synchronous path; remote inspection stays nonblocking.
+	const statPath = pid === "self" ? statSync : stat;
+	/** @param {string} target */
+	const text = target => pid === "self" ? readFileSync(target, "utf8") : readFile(target, "utf8");
+	const [status, limits, processStat, shell, descriptors] = await Promise.all([
+		text(`${root}/status`),
+		text(`${root}/limits`),
+		text(`${root}/stat`),
+		statPath("/bin/sh", { bigint: true }),
+		Promise.all([0, 1, 2].map(async fd => {
+			const [metadata, endpoint, info] = await Promise.all([
+				// Inside the sandbox inspect the inherited handle, without resolving its proc magic link.
+				pid === "self" ? fstatSync(fd, { bigint: true }) : stat(`${root}/fd/${fd}`, { bigint: true }),
+				descriptorTarget(pid, fd),
+				text(`${root}/fdinfo/${fd}`),
+			]);
+			const flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
+			if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
+			/** @type {DescriptorType} */
+			const type = metadata.isFile() ? "regular" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
+				metadata.isCharacterDevice() ? (endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
+			return {
+				fd, endpoint, type,
+				identity: `${metadata.dev}:${metadata.ino}`,
+				flags: Number.parseInt(flags, 8) & ~0o2000000,
+			};
+		})),
+	]);
+	const [input, output, error] = descriptors;
+	/** @param {string} name */
+	const field = name => {
+		const value = new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status)?.[1];
+		if (value === undefined) throw new Error(`held process status lacks ${name}`);
+		return value.trim();
+	};
+	const uid = numbers(field("Uid")), gid = numbers(field("Gid")), groups = numbers(field("Groups"));
+	if (uid.length !== 4 || gid.length !== 4) throw new Error("held process credentials are incomplete");
+	if (!groups.includes(gid[1])) groups.push(gid[1]);
+	groups.sort((left, right) => left - right);
+	/** @type {Map<string, number>} */
+	const aliases = new Map();
+	const semantic = {
+		executionDomain: "ptrace",
+		rlimits: limits.split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, 2)),
+		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
+		systemMetadata: Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name =>
+			[name, String(shell[/** @type {keyof typeof shell} */ (name)])])),
+		signals: { blocked: field("SigBlk"), ignored: field("SigIgn") },
+		scheduling: {
+			nice: Number(processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[16]),
+			cpus: field("Cpus_allowed_list"), memoryNodes: field("Mems_allowed_list"),
+		},
+		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
+			if (!aliases.has(identity)) aliases.set(identity, aliases.size);
+			return {
+				fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags,
+				alias: aliases.get(identity),
+				...(descriptor.type === "device" ? { endpoint } : {}),
+			};
+		}),
+	};
+	return {
+		...contextKeys(semantic),
+		umask: Number.parseInt(field("Umask"), 8),
+		descriptorTypes: [input.type, output.type, error.type],
+		outputEndpoints: [output.endpoint ?? "", error.endpoint ?? ""],
+	};
+}
+
+/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @returns {ProcessExecutionContext} */
+export function routedProcessContext(context, route) {
+	const semantic = JSON.parse(context.key);
+	if (!semantic.credentials || !semantic.signals ||
+		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
+		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) throw new Error("invalid probed execution context");
+	const descriptors = [
+		semantic.descriptors[0],
+		{ ...semantic.descriptors[route[0]], fd: 1, alias: 1 },
+		{ ...semantic.descriptors[route[1]], fd: 2, alias: route[0] === route[1] ? 1 : 2 },
+	];
+	// libuv resets the signal mask and dispositions for every spawned target.
+	const signals = {
+		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
+		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
+	};
+	return {
+		...context,
+		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
+		descriptorTypes: [context.descriptorTypes[0], context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
+	};
+}
+
+/** @param {unknown} value @returns {value is ProcessExecutionContext} */
+export function validProcessContext(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const context = /** @type {Partial<ProcessExecutionContext>} */ (value);
+	return typeof context.key === "string" && context.key.length > 0 && context.key.length <= 64 * 1024 &&
+		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
+		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
+		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
+		context.descriptorTypes[0] === "device" && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
+		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
+		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
+		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);
+}
+
+/** @param {number | "self"} pid @param {number} fd */
+function descriptorTarget(pid, fd) {
+	const target = `/proc/${pid}/fd/${fd}`;
+	if (pid !== "self") return readlink(target);
+	try {
+		return readlinkSync(target);
+	} catch {
+		return undefined; // The broker rejects missing output endpoints and preserves native fallback.
+	}
+}
+
+/** @param {{ credentials: Record<string, unknown>, [key: string]: unknown }} semantic */
+function contextKeys(semantic) {
+	return {
+		key: JSON.stringify(semantic),
+		launchKey: JSON.stringify({
+			...semantic,
+			credentials: { ...semantic.credentials, groups: "broker-preserved" },
+			signals: "broker-normalized",
+		}),
+	};
+}
+
+/** @param {string} value */
+function numbers(value) {
+	const result = value ? value.split(/\s+/).map(Number) : [];
+	if (result.some(item => !Number.isSafeInteger(item) || item < 0)) throw new Error("invalid held process status numbers");
+	return result;
+}
