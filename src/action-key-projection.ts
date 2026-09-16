@@ -1,4 +1,4 @@
-import type { ActionKey, ActionKeyProjector, ProjectedActionKeyMatch } from "./action-semantics.ts";
+import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, type ProjectedActionKeyMatch, ownActionKeyProjector } from "./action-semantics.ts";
 
 export { READ_RANGE_ACTION_KEY_PROJECTOR, readRangesShareInFlight } from "./action-semantics.ts";
 
@@ -20,6 +20,18 @@ export interface ActionProjectionRule<Output> extends ActionKeyProjector {
 		readonly coverage: unknown;
 		readonly keyMatch: ProjectedActionKeyMatch;
 	}) => Output | undefined | Promise<Output | undefined>;
+}
+
+/** Registered key relations are shared by learning, lookup and feedback; explicit output rules take precedence. */
+export function resolveActionProjectionRules<Output>(
+	rules: readonly ActionProjectionRule<Output>[],
+	semantics: ActionSemanticsRegistry,
+): readonly ActionProjectionRule<Output>[] {
+	const unique = new Map<string, ActionProjectionRule<Output>>();
+	for (const rule of [...rules, ...semantics.projectors()]) {
+		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, ownActionKeyProjector(rule));
+	}
+	return [...unique.values()];
 }
 
 /** In-memory-only metadata; symbol keys never leak into persisted tool-result details. */

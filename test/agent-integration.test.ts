@@ -425,7 +425,7 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it.each(["validation", "reader", "opaque", "closing"])("owns an output-only projection through %s and Actor settlement", async (phase) => {
+	it.each(["validation", "reader", "opaque", "unproven", "closing"])("owns an output-only projection through %s and Actor settlement", async (phase) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const args = { path: "notes.txt", offset: 2, limit: 1 };
 		const expected = await tool.execute("control", args);
@@ -456,7 +456,7 @@ describe("speculative action host", () => {
 		const host = createSpeculativeActionHost("session", {
 			cwd, getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), draftModel: model("draft"),
 			complete: async () => drafterCall({ path: "notes.txt" }), preflight: () => true,
-			projectionRules: [rule], executionWorlds: [world],
+			projectionRules: phase === "unproven" ? undefined : [rule], executionWorlds: [world],
 			onEvent: (event) => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
 		});
 		try {
@@ -479,9 +479,15 @@ describe("speculative action host", () => {
 				const second = await host.execute({ ...call, id: "another-reader" }, undefined, actor);
 				expect(second.content).toEqual(expected.content);
 			}
-			const fallback = phase === "opaque" || phase === "closing";
+			const fallback = phase === "opaque" || phase === "unproven" || phase === "closing";
 			expect(actor).toHaveBeenCalledTimes(fallback ? 1 : 0);
 			expect(committed).toHaveBeenCalledTimes(fallback ? 0 : 1);
+			if (phase === "unproven") {
+				await host.finishTurn("turn-1");
+				expect(events.find(event => event.type === "prediction")).toMatchObject({ settlement: {
+					observation: "observed", match: { matched: true, adoption: { status: "rejected", cause: { code: "coverage_missing" } } },
+				} });
+			}
 			if (!fallback) {
 				expect(rule.captureCoverage(PI_ACTION_SEMANTICS.buildKey("read", args, cwd)!, { result: first, isError: false }))
 					.toMatchObject({ startLine: 2, endLineExclusive: 3, totalLines: 4 });
@@ -918,16 +924,18 @@ describe("speculative action host", () => {
 	});
 
 	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
-		const { cwd, patternSettings, patternStore, grepTool, readTool, materialized } = await patternRebaseFixture();
+		const { cwd, patternSettings, patternStore, grepTool, readTool: learnedReadTool, materialized } = await patternRebaseFixture();
+		const carried = origin === "carried" || origin === "revised";
+		const readTool = carried ? createReadTool(cwd) : learnedReadTool;
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
 		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>(), feedbackGate = deferred<void>();
+		const events: SpeculativeActionEvent<string>[] = [];
 		const actorTool = origin === "actor" ? { ...grepTool, parameters: Type.Object({ ...grepSchema.properties,
 			flags: Type.Optional(Type.String()) }) } : grepTool;
 		let actorSchema = "";
 		let allowRead = origin !== "rejected";
 		const predictAfterBatch = vi.spyOn(patternStore, "predictAfterBatch");
 		const issued = vi.spyOn(patternStore, "issued");
-		const carried = origin === "carried" || origin === "revised";
 		const world = toolRuntimeWorld();
 		const fingerprint = vi.fn<NonNullable<SpeculativeAgentExecutionWorld["speculation"]["fingerprint"]>>(async (request) => {
 			if (origin === "actor") throw new Error("Fixture world unavailable");
@@ -942,11 +950,14 @@ describe("speculative action host", () => {
 			preflight: ({ tool }) => tool.name !== "read" || allowRead,
 			complete: async () => assistant([{ type: "toolCall", id: "draft-grep", name: "grep",
 				arguments: { pattern: "one", path: "." } }], "toolUse"),
-			executionWorlds: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
+			resolveInvocation: (tool, input) => carried && tool === "read" ? resolvePiToolInvocation(tool, input, { cwd, environment: {} }) : undefined,
+			executionWorlds: carried ? [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 })]
+				: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
 			onCandidateMaterialized: (candidate) => { materialized.push(candidate); },
 			onActorActionMaterialized: ({ action }) => { actorSchema = action.schemaHash; },
 			onActorActionSettled: async () => { if (origin === "closing") ready.resolve(); await feedbackGate.promise; },
 			onEvent: (event) => {
+				events.push(event);
 				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
 				if (carried && event.type === "candidate" && event.state.status === "succeeded" ||
 					origin === "rejected" && event.type === "prediction" && event.settlement.observation === "unobserved") ready.resolve();
@@ -994,6 +1005,18 @@ describe("speculative action host", () => {
 					context: { systemPrompt: "system", messages: [], tools }, tools });
 				expect(await nextRequest.promise).toBe(carried ? "empty" : "produced");
 				if (!carried) await waitFor(() => materialized.some((candidate) => candidate.turnID === "next" && candidate.tool === "read"));
+			}
+			if (carried) {
+				const args = { path: "notes.txt", offset: 2, limit: 1 };
+				const native = vi.fn(() => readTool.execute("native", args));
+				expect(await host.execute({ turnID: "next", id: "narrow-read", tool: "read", args, tools }, undefined, native))
+					.toEqual(await readTool.execute("control", args));
+				await host.finishTurn("next");
+				expect(native).not.toHaveBeenCalled();
+				expect(events.filter(event => event.type === "prediction")).toContainEqual(expect.objectContaining({ settlement:
+					expect.objectContaining({ observation: "observed", actorAction: expect.objectContaining({ turnID: "next" }), match:
+						expect.objectContaining({ matched: true, relation: expect.objectContaining({ kind: "projected", projector: "read.range" }),
+							adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
 			}
 		} finally { feedbackGate.resolve(); routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }
 	});
