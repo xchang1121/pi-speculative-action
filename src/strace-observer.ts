@@ -1,4 +1,4 @@
-import { readFile, readdir } from "node:fs/promises";
+import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
@@ -45,6 +45,8 @@ export interface StraceObservation {
 }
 
 export interface StraceObservationOptions {
+	/** Bounded prefix lookup for running work; its evidence is always incomplete. */
+	readonly previewBytes?: number;
 	/** Intercepted path to native target; a direct second exec proves descriptor-preserving bypass. */
 	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
 	/**
@@ -191,7 +193,7 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 }
 
 /**
- * Decode a bounded strace -ff transcript. The parser deliberately fails closed: only the target
+ * Decode a strace -ff transcript. The parser deliberately fails closed: only the target
  * exec and its recursively identified descendants contribute a replayable certificate.
  */
 export async function observeStrace(
@@ -203,11 +205,27 @@ export async function observeStrace(
 	const directory = path.dirname(tracePrefix);
 	const prefix = `${path.basename(tracePrefix)}.`;
 	const files: TraceFile[] = [];
+	let remaining = options.previewBytes;
+	if (remaining !== undefined && (!Number.isSafeInteger(remaining) || remaining < 0)) throw new Error("invalid trace preview budget");
 	for (const name of await readdir(directory)) {
+		if (remaining === 0) break;
 		if (!name.startsWith(prefix)) continue;
 		const pid = Number.parseInt(name.slice(prefix.length), 10);
 		if (!Number.isSafeInteger(pid) || pid <= 0) continue;
-		const contents = await readFile(path.join(directory, name), "utf8");
+		const target = path.join(directory, name);
+		let contents: string;
+		if (remaining === undefined) contents = await readFile(target, "utf8");
+		else {
+			const handle = await open(target, "r");
+			try {
+				const info = await handle.stat();
+				if (!info.isFile()) throw new Error("trace is not a regular file");
+				const buffer = Buffer.allocUnsafe(Math.min(remaining, info.size));
+				const { bytesRead } = await handle.read(buffer);
+				remaining -= bytesRead;
+				contents = buffer.toString("utf8", 0, bytesRead);
+			} finally { await handle.close(); }
+		}
 		files.push({ pid, lines: reassembleSyscalls(contents.split(/\r?\n/), pid),
 			terminated: /(?:^|\n)\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(contents) });
 	}
@@ -227,8 +245,8 @@ export async function observeStrace(
 	const selected = new Map<number, TraceProcess>([[root.file.pid, {
 		...root, cwd: path.posix.resolve(initialCwd), fs: { shared: false, changed: false },
 	}]]);
-	let complete = true;
-	const incompleteReasons = new Set<string>();
+	let complete = options.previewBytes === undefined;
+	const incompleteReasons = new Set<string>(complete ? [] : ["preview_only"]);
 	for (const [pid, process] of selected) {
 		if (!process.file.terminated) {
 			complete = false;
