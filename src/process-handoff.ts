@@ -1,6 +1,7 @@
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
+import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
@@ -30,12 +31,20 @@ export interface ProcessHandoff {
 	readonly startedAt: number;
 }
 
+/** In-memory capability for another isolated execution, never a proof of result equivalence. */
+export interface ProcessExecutionBinding {
+	readonly key: Sha256Digest;
+	readonly certificate: ProcessProvenanceCertificate;
+	readonly scope: ExecutionScope;
+}
+
 type HandoffState =
 	| { readonly status: "running" }
 	| { readonly status: "completed"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
+	binding?: ProcessExecutionBinding;
 	readonly executablePath: string;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly settle: () => void;
@@ -64,18 +73,49 @@ type AcquireOptions<Plan> = {
 );
 
 /** Owns process evidence selection and the scope of one-shot transfers. */
-export class ProcessHandoffRegistry {
+export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, HandoffRecord[]>();
+	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number }>();
 	private maxCompleted: number;
+	private maxBindingBytes: number;
+	private bindingBytes = 0;
 	private disposed = false;
 
-	constructor(maxCompleted: number) {
+	constructor(maxCompleted: number, maxBindingBytes = 0) {
 		this.maxCompleted = maxCompleted;
+		this.maxBindingBytes = maxBindingBytes;
 	}
 
-	configure(maxCompleted: number): void {
+	configure(maxCompleted: number, maxBindingBytes = this.maxBindingBytes): void {
 		this.maxCompleted = maxCompleted;
+		this.maxBindingBytes = maxBindingBytes;
 		this.trim();
+	}
+
+	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
+	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): void {
+		const record = this.byKey.get(key)?.find(candidate => candidate === handoff);
+		if (!record?.scope || record.binding || record.state.status !== "completed" || record.state.candidate?.weakKey !== key ||
+			!record.state.candidate.dependencyCertificate.complete || this.maxBindingBytes <= 0) return;
+		const value = immutableSnapshot(invocation);
+		if (!isImmutableSnapshot(value)) return;
+		const bytes = Buffer.byteLength(JSON.stringify(value));
+		if (bytes > this.maxBindingBytes) return;
+		const binding = Object.freeze({ key, certificate: record.state.candidate, scope: record.scope });
+		this.invocations.set(binding, { value, bytes });
+		record.binding = binding;
+		this.bindingBytes += bytes;
+		this.trim();
+	}
+
+	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
+		return Object.freeze([...this.byKey.values()].flatMap(records => records.flatMap(record =>
+			record.binding?.scope.sessionID === scope.sessionID ? [record.binding] : [])));
+	}
+
+	/** Copying a digest/descriptor cannot mint a capability. Revocation affects subsequent admissions. */
+	resolveBinding(binding: ProcessExecutionBinding, scope: ExecutionScope | undefined): Invocation | undefined {
+		return scope?.sessionID === binding.scope.sessionID ? this.invocations.get(binding)?.value : undefined;
 	}
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
@@ -157,7 +197,10 @@ export class ProcessHandoffRegistry {
 	dispose(): void {
 		this.disposed = true;
 		for (const [key, records] of this.byKey) {
-			for (const record of records) this.complete(key, record);
+			for (const record of records) {
+				this.revokeBinding(record);
+				this.complete(key, record);
+			}
 		}
 		this.byKey.clear();
 	}
@@ -182,6 +225,7 @@ export class ProcessHandoffRegistry {
 	}
 
 	private remove(key: Sha256Digest, record: HandoffRecord): void {
+		this.revokeBinding(record);
 		const retained = this.byKey.get(key)?.filter((candidate) => candidate !== record) ?? [];
 		if (retained.length) this.byKey.set(key, retained);
 		else this.byKey.delete(key);
@@ -189,12 +233,20 @@ export class ProcessHandoffRegistry {
 
 	private trim(limit = this.maxCompleted): void {
 		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status === "completed").length - limit;
-		if (excess <= 0) return;
+		if (excess <= 0 && this.bindingBytes <= this.maxBindingBytes) return;
 		for (const [key, records] of this.byKey) {
-			const retained = records.filter((record) => record.state.status === "running" || excess-- <= 0);
-			if (retained.length) this.byKey.set(key, retained);
-			else this.byKey.delete(key);
+			for (const record of records) {
+				if (record.state.status === "completed" && excess-- > 0) this.remove(key, record);
+				else if (this.bindingBytes > this.maxBindingBytes) this.revokeBinding(record);
+			}
 		}
+	}
+
+	private revokeBinding(record: HandoffRecord): void {
+		if (!record.binding) return;
+		this.bindingBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
+		this.invocations.delete(record.binding);
+		record.binding = undefined;
 	}
 }
 

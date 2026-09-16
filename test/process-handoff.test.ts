@@ -14,6 +14,40 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("owns bounded launch bindings without persisting secrets or granting result adoption", async () => {
+		for (const revoke of ["clear", "count", "bytes", "dispose", "consume"] as const) {
+			const fixture = await producer(revoke === "consume", new ProcessHandoffRegistry<unknown>(8, 100));
+			const invocation = { argv: ["sensitive argument"], environment: { TOKEN: "sensitive value" } };
+			fixture.registry.bind(fixture.key, fixture.work, invocation);
+			expect(fixture.registry.bindings(SCOPE)).toEqual([]); // Unsealed execution is not a binding source.
+			await fixture.publish();
+			fixture.registry.bind(fixture.key, fixture.work, invocation);
+			const [binding] = fixture.registry.bindings(OTHER_SCOPE);
+			expect(binding).toBeDefined();
+			const owned = fixture.registry.resolveBinding(binding!, OTHER_SCOPE);
+			expect(owned).toEqual(invocation);
+			invocation.argv[0] = "changed"; invocation.environment.TOKEN = "changed";
+			expect(JSON.stringify(owned)).toContain("sensitive value");
+			expect(JSON.stringify([binding, fixture.work])).not.toContain("sensitive");
+			expect(fixture.registry.resolveBinding({ ...binding! }, SCOPE)).toBeUndefined();
+			expect(fixture.registry.resolveBinding(binding!, { sessionID: "other", turnID: "turn" })).toBeUndefined();
+			expect(fixture.registry.bindings({ sessionID: "other", turnID: "turn" })).toEqual([]);
+			if (revoke === "clear") fixture.registry.clearCompleted();
+			else if (revoke === "count") fixture.registry.configure(0);
+			else if (revoke === "bytes") {
+				const second = await producer(false, fixture.registry, 1);
+				await second.publish(); fixture.registry.bind(second.key, second.work, invocation);
+				expect(fixture.registry.bindings(SCOPE)).toHaveLength(1);
+				fixture.registry.configure(8, 0);
+			} else if (revoke === "dispose") fixture.registry.dispose();
+			else await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "hit" });
+			expect(fixture.registry.resolveBinding(binding!, SCOPE)).toBeUndefined();
+			expect(fixture.registry.bindings(SCOPE)).toEqual([]);
+			expect(JSON.stringify(owned)).toContain("sensitive value"); // An admitted consumer owns its immutable copy.
+			fixture.registry.dispose();
+		}
+	});
+
 	it("excludes attempted disk copies and still finds a candidate completed during history lookup", async () => {
 		const previous = await producer();
 		await previous.publish();
@@ -236,7 +270,7 @@ describe("ProcessHandoffRegistry", () => {
 	});
 });
 
-async function producer(oneShot = false, registry = new ProcessHandoffRegistry(8), exitCode = 0, scope = SCOPE) {
+async function producer(oneShot = false, registry = new ProcessHandoffRegistry<unknown>(8), exitCode = 0, scope = SCOPE) {
 	const ownership = new ProcessHandoffOwnership(), certificate = processCertificate(oneShot, exitCode);
 	const key = certificate.weakKey;
 	const acquired = await registry.acquire({
