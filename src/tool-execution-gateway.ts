@@ -2,7 +2,7 @@ import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { TimelineInterval } from "./task-timing.ts";
+import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import {
 	EffectTransactionCoordinator,
 	type EffectTransaction,
@@ -60,6 +60,7 @@ export type AuthoritativeExecutionSettlement<Output> = AuthoritativeExecutionOut
 };
 
 export interface AuthoritativeExecutionHooks<Output> {
+	readonly computationDependencies?: () => readonly TimelineDependency[];
 	/** Optional reuse provider. A poisoned commit propagates; non-commit provider failures fall through. */
 	readonly reuse?: () => Promise<Output | undefined>;
 	/** Best-effort authoritative observation. Failure never replaces the Actor result or error. */
@@ -95,7 +96,7 @@ export class ToolExecutionGateway<Context, Output> {
 	}
 
 	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[]) => void): Promise<Value> {
+		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void): Promise<Value> {
 		return this.router.observeOperations(action, scope, execute, observe);
 	}
 
@@ -144,7 +145,10 @@ export class ToolExecutionGateway<Context, Output> {
 			} catch (error) {
 				outcome = { status: "failed", error };
 			}
-			const toolExecution = new TimelineInterval(startedAt, performance.now());
+			const completedAt = performance.now();
+			let toolExecution: TimelineInterval;
+			try { toolExecution = new TimelineInterval(startedAt, completedAt, hooks.computationDependencies?.()); }
+			catch { toolExecution = new TimelineInterval(startedAt, completedAt); } // Accounting cannot replace the Actor outcome.
 			const settlement = Object.freeze({ ...outcome, toolExecution, durationMs: toolExecution.completedAt - toolExecution.startedAt });
 			try { await hooks.settled?.(settlement); }
 			catch { /* Observation cannot replace the original Actor settlement. */ }

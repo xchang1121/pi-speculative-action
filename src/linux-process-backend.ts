@@ -24,6 +24,7 @@ import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
+import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import {
 	createExecPrototype,
 	digestObject,
@@ -154,6 +155,7 @@ type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: 
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	readonly computationDependencies: () => readonly TimelineDependency[];
 	/** Captured exec units in dispatcher arrival order, still speculative until the enclosing branch is adopted. */
 	readonly executionBindings: () => readonly ProcessExecutionBinding[];
 	/** Execute one retained exec unit in this fresh sandbox; its output is not the enclosing tool's result. */
@@ -260,6 +262,7 @@ interface ActiveSession {
 	readonly pending: Set<Promise<unknown>>;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
 	readonly executionBindings: Map<number, ProcessExecutionBinding>;
+	readonly computations: TimelineDependency[];
 	readonly incompleteReasons: Set<string>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
@@ -290,15 +293,19 @@ type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay"
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
-	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; bindings: Map<number, ProcessExecutionBinding> }>();
+	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean;
+		bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
 
 	/** Only acknowledged held-exec adoptions enter the enclosing native call's ordered observations. */
-	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>, observe: (bindings: readonly ProcessExecutionBinding[]) => void): Promise<Value> {
-		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false, bindings: new Map<number, ProcessExecutionBinding>() };
+	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
+		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void): Promise<Value> {
+		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
+			bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
-			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)); }
+			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding),
+				Object.freeze([...observation.computations])); }
 			catch { /* Learning cannot replace the native result or error. */ }
 		}
 	}
@@ -559,6 +566,7 @@ export class LinuxProcessReuseBackend {
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted),
 			nestedEvidence: [],
 			executionBindings: new Map(),
+			computations: [],
 			incompleteReasons: new Set<string>(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
@@ -575,6 +583,7 @@ export class LinuxProcessReuseBackend {
 		};
 		return {
 			ownership: session.ownership,
+			computationDependencies: () => Object.freeze([...session.computations]),
 			executionBindings: () => Object.freeze([...session.executionBindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)),
 			executor: { execute: (request) => execute("tool", () => this.executeTopLevel(session, request)) },
 			executeBinding: (binding) => execute("operation", () => this.executeBinding(session, binding)),
@@ -878,6 +887,7 @@ export class LinuxProcessReuseBackend {
 		);
 		if (acquired.plan) {
 			const result = await this.replay(session, acquired.plan, weakKey, acquired);
+			if (acquired.producer?.computation) session.computations.push({ computation: acquired.producer.computation });
 			const binding = acquired.producer?.binding;
 			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
 			return result;
@@ -888,6 +898,8 @@ export class LinuxProcessReuseBackend {
 			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID);
 		} finally {
 			this.handoffs.complete(weakKey, acquired.work);
+			const computation = acquired.work.computation;
+			if (computation) session.computations.push({ computation, shared: [computation] });
 		}
 	}
 
@@ -897,8 +909,10 @@ export class LinuxProcessReuseBackend {
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
+	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff;
+		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
+		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
 		if (admission && !admission.allowed) {
 			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
@@ -917,7 +931,9 @@ export class LinuxProcessReuseBackend {
 					if (!admission.allowed) return "miss";
 					const waitStarted = performance.now();
 					const finished = await waitForCandidate(running.completion, signal, admission.waitBudgetMs);
-					waitedMs += Math.max(0, performance.now() - waitStarted);
+					const interval = new TimelineInterval(waitStarted, performance.now());
+					waits.push({ handoff: running, interval });
+					waitedMs += interval.completedAt - interval.startedAt;
 					if (finished.status === "completed") return "completed";
 					throwIfAborted(signal);
 					return "miss";
@@ -925,7 +941,8 @@ export class LinuxProcessReuseBackend {
 			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
 		});
 		return {
-			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer } : {}),
+			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer,
+				waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : {}),
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
 			waitedMs,
@@ -1062,9 +1079,13 @@ export class LinuxProcessReuseBackend {
 				},
 				adopted: () => {
 					const binding = acquired.producer?.binding;
-					if (observation && !observation.closed && sameScope(observation.scope, scope) && binding &&
-						this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
-						observation.bindings.set(order, binding);
+					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
+						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
+							observation.bindings.set(order, binding);
+						if (acquired.producer?.computation) observation.computations.push({
+							computation: acquired.producer.computation, shared: acquired.waiting,
+						});
+					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
 					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);

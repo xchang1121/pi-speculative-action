@@ -1343,7 +1343,7 @@ export function makeSpeculativeActionRuntime<
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
 			const completedAt = performance.now();
-			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt), completedAt - startedAt)) {
+			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, branch.computationDependencies), completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
 				return;
 			}

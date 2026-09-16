@@ -68,8 +68,8 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
-		observeOperations: ({ action, scope }, execute, observe) => backend.observeBindings(scope, execute, bindings => {
-			observe(bindings.flatMap(binding => { const operation = describeOperation(binding, action); return operation ? [operation] : []; }));
+		observeOperations: ({ action, scope }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
+			observe(bindings.flatMap(binding => { const operation = describeOperation(binding, action); return operation ? [operation] : []; }), computations);
 		}),
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
@@ -190,6 +190,7 @@ export function createLinuxProcessExecutionWorld(
 				const ownership = session.ownership, commit = branch.commit.bind(branch);
 				const overheadMs = Math.max(0, performance.now() - startedAt - session.metrics().executionMs);
 				Object.assign(branch, {
+					computationDependencies: session.computationDependencies(),
 					operations: Object.freeze(session.executionBindings().map(binding => {
 						const executionMs = binding.certificate.result.observedProcessMs ?? 0;
 						operationCosts.set(binding, overheadMs + executionMs);

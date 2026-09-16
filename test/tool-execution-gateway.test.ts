@@ -8,6 +8,7 @@ import {
 import type { ExecutionWorld } from "../src/execution-world.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway, type ToolOperation, type AuthoritativeExecutionSettlement } from "../src/tool-execution-gateway.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 
 type TestContext = { readonly value: string };
 type TestWorld = ExecutionWorld<TestContext, string>;
@@ -65,6 +66,7 @@ describe("ToolExecutionGateway", () => {
 		const failure = new Error("Actor failure"), poisoned = effectCommitFailure(new Error("rollback failed"), "poisoned");
 		const succeed = async () => { now += 20; return 42; }, fail = () => { now += 20; throw failure; };
 		const observerFailure = new Error("Observer failure"), failObservation = () => { throw observerFailure; };
+		const unreadableComputation = new Proxy(new TimelineInterval(0, 1), { get: failObservation });
 		const observers = [undefined, failObservation, async () => failObservation(), (value: AuthoritativeExecutionSettlement<number>) => {
 			Object.assign(value, { status: "succeeded", output: -1, error: observerFailure });
 		}];
@@ -87,7 +89,8 @@ describe("ToolExecutionGateway", () => {
 				now += 100; await nextTurn();
 				await observe(value);
 			});
-			const execution = gateway.executeAuthoritative(operation, executor, { reuse: row.reuse, settled });
+			const execution = gateway.executeAuthoritative(operation, executor, { reuse: row.reuse, settled,
+				computationDependencies: observe ? () => [{ computation: unreadableComputation }] : failObservation });
 			if ("error" in row) await expect(execution, row.name).rejects.toBe(row.error);
 			else await expect(execution, row.name).resolves.toBe(row.output);
 			expect(executor, row.name).toHaveBeenCalledTimes(row.executions);

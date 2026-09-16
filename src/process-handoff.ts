@@ -2,6 +2,7 @@ import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdo
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
+import { TimelineInterval } from "./task-timing.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
@@ -36,6 +37,7 @@ export class ProcessHandoffOwnership {
 export interface ProcessHandoff {
 	readonly ownership: ProcessHandoffOwnership;
 	readonly binding?: ProcessExecutionBinding;
+	readonly computation?: TimelineInterval;
 	readonly completion: Promise<void>;
 	readonly scope: ExecutionScope | undefined;
 	readonly startedAt: number;
@@ -56,6 +58,7 @@ type HandoffState =
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
 	binding?: ProcessExecutionBinding;
+	computation?: TimelineInterval;
 	readonly executablePath: string;
 	readonly settle: () => void;
 }
@@ -201,6 +204,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const record = this.byKey.get(key)?.find((record) => record === handoff);
 		if (!record || record.state.status !== "running") return false;
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
+		if (candidate) record.computation = new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
 		if (!candidate || !record.scope) this.remove(key, record);
 		else this.trim();

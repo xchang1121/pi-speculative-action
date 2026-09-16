@@ -32,6 +32,7 @@ import {
 	patternAwareSettings,
 } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
+import type { TimelineDependency } from "./task-timing.ts";
 import type {
 	CandidatePreflight,
 	ActorActionFeedback,
@@ -429,11 +430,16 @@ export function createSpeculativeActionHost(
 				: undefined;
 			let prepared: PreparedActorCall<ToolSettlement> | undefined;
 			let operations: ExecutionOperationBinding[] | undefined;
+			const computations: TimelineDependency[] = [];
 			return executionGateway.executeAuthoritative(operation, async () => {
 				const bound = await bind();
 				return bound.action && input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
-					() => executor(bound), bindings => { if (bindings.length) (operations ??= []).push(...bindings); }) : executor(bound);
+					() => executor(bound), (bindings, dependencies) => {
+						if (bindings.length) (operations ??= []).push(...bindings);
+						if (dependencies) computations.push(...dependencies);
+					}) : executor(bound);
 			}, {
+				computationDependencies: () => computations,
 				...(actorCall
 					? {
 							reuse: async () => {
