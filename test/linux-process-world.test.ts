@@ -583,6 +583,10 @@ int main(void) {
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
 			await writeFile(path.join(fixture.workspace, "redirect-worker"), "#!/bin/sh\nprintf 'redirected\\n'\n");
 			await chmod(path.join(fixture.workspace, "redirect-worker"), 0o755);
+			await writeFile(path.join(fixture.workspace, "fd-check.c"), "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n");
+			await compileBenchmarkHelper(fixture.workspace, { source: "fd-check.c", output: "fd-check" });
+			const streamProbes = ["", "0<&-", "1>&-", "2>&-", "0<&- 1>&- 2>&-", "3>&1"].map((redirection) =>
+				"status=0; fd-check " + redirection + " || status=$?; printf 'fds:%s\\n' \"$status\"").join("; ");
 			await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 			const executionFingerprint = await fixture.backend.fingerprint();
 			let allocationFailed = false;
@@ -596,13 +600,13 @@ int main(void) {
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
 				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
-					"/usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; printf '%32768s:end' ''",
+					"/usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const text = branch.output.result.content[0];
-			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nfile-fallback\npipe-fallback\n" + " ".repeat(32768) + ":end");
+			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n" + " ".repeat(32768) + ":end");
 			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
 			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length, nextComplete: nextCapture.complete },
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
