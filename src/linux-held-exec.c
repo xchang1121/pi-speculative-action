@@ -402,7 +402,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			} else if (received == 0) {
 				pthread_join(job->thread, NULL);
 				int result = job->result;
-				if (result >= 0) { close(item->fd); item->fd = result; job->connection = -1; }
+				if (result >= 0) { item->fd = result; job->connection = -1; }
 				free_job(job); item->job = NULL; item->armed = 0;
 				if (result == -2 || (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH)) goto fatal;
 				continue;
@@ -446,11 +446,25 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
 			continue;
 		}
+		if (event == PTRACE_EVENT_EXEC) {
+			unsigned long previous;
+			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &previous) < 0) goto fatal;
+			/* A non-leader exec replaces its TID without a separate death notification. */
+			if ((pid_t)previous != pid) release_process(&processes, (pid_t)previous);
+		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
 			if (socket_path) {
-				for (struct traced_process *item = processes; item; item = item->next)
-					if (item->pid == pid && start_decision(item, socket_path, token, execution_id) == 0) goto held;
+				for (struct traced_process *item = processes; item; item = item->next) {
+					if (item->pid != pid) continue;
+					/* Earlier images still own completion of this process, including later execs. */
+					if (item->fd >= 0) {
+						if (track_process(&processes, pid) < 0) goto fatal;
+						item = processes;
+					}
+					if (start_decision(item, socket_path, token, execution_id) == 0) goto held;
+					break;
+				}
 			}
 		}
 		if (event != 0) delivered = 0;
@@ -477,7 +491,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("6");
+		puts("7");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
