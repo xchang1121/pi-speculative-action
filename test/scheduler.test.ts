@@ -233,6 +233,14 @@ describe("SpeculationScheduler", () => {
 				expectedRemainingMs: state === "running" ? speculativeMs : 0, expectedNetBenefitMs: netMs });
 			if (allowed) expect(decision.waitBudgetMs).toBeGreaterThan(speculativeMs);
 		}
+		const unmeasured = new SpeculationScheduler<object>();
+		unmeasured.observeActorService(identity, 1000);
+		unmeasured.observeAdoption(identity, 50);
+		const pending = { state: "running" as const, elapsedMs: 800, expectedSpeculativeDurationMs: undefined };
+		expect(joinDecision(unmeasured, identity, pending)).toMatchObject({ allowed: true, reason: "warmup_probe",
+			expectedRemainingMs: 200, expectedNetBenefitMs: 750, waitBudgetMs: 925 });
+		unmeasured.observeSpeculativeService(identity, 1000);
+		expect(joinDecision(unmeasured, identity, pending)).toMatchObject({ reason: "profitable", waitBudgetMs: 275 });
 		const cold = new SpeculationScheduler<object>();
 		cold.observeActorService(identity, 30);
 		const run = (cost: number, count: number) => Array.from({ length: count }, () => {

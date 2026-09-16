@@ -55,7 +55,8 @@ export interface CandidateJoinRequest {
 	readonly actorIdentity?: ServiceTimingIdentity;
 	readonly adoptionIdentity?: ServiceTimingIdentity;
 	readonly state: "queued" | "running" | "succeeded";
-	readonly expectedSpeculativeDurationMs: number;
+	/** Omit an unknown forecast; observed producer service still takes precedence. */
+	readonly expectedSpeculativeDurationMs?: number;
 	readonly elapsedMs?: number;
 	/** Forecast lead before the Actor arrives; it is not execution already performed. */
 	readonly leadTimeMs?: number;
@@ -305,7 +306,7 @@ export class SpeculationScheduler<Job extends object> {
 		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
 		const expectedActorMs = actor?.value;
 		const expectedSpeculativeMs =
-			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, 1);
+			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, expectedActorMs ?? 1);
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0;
 		const expectedRemainingMs =
 			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs - finite(request.leadTimeMs));
@@ -354,7 +355,8 @@ export class SpeculationScheduler<Job extends object> {
 			0,
 			expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs,
 		);
-		const estimatedDeadlineMs = expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
+		const estimatedDeadlineMs = !speculative && request.expectedSpeculativeDurationMs === undefined
+			? actorDeadlineMs : expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
 		// A cancelled run supplies no completion sample. Passing that floor does not mean this run is nearly done.
 		const uncalibratedOverrun = speculative?.samples === 0 && request.state === "running" && elapsedMs >= expectedSpeculativeMs;
