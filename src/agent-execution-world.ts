@@ -31,6 +31,7 @@ export interface SpeculativeToolExecutionContext {
 	readonly signal: AbortSignal;
 	readonly executionScope?: ExecutionScope;
 	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+	readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;
 }
