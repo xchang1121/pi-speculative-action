@@ -521,11 +521,13 @@ async function installController(
 	});
 	const refreshExecutionDiagnostics = (refresh = false): Promise<void> => lifecycle.admit(async () => {
 		if (refresh) await resetSearch();
-		if (closedSearchEnabled()) await prepareSearch();
-		const [, diagnostics] = await Promise.all([
+		const preparations = [
+			closedSearchEnabled() ? prepareSearch() : undefined,
 			refresh ? processCoordinator.refreshActorRoute() : undefined,
-			host.executionWorldDiagnostics(refresh && currentSettings.enabled),
-		]);
+			Promise.resolve().then(() => host.executionWorldDiagnostics(refresh && currentSettings.enabled)),
+		] as const;
+		// A failed provider cannot detach preparation from refresh or shutdown ownership.
+		const [, , diagnostics] = await Promise.all(preparations).finally(() => Promise.allSettled(preparations));
 		executionDiagnostics = diagnostics;
 		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
 		renderFooter();

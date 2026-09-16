@@ -1,5 +1,5 @@
 import { textResult } from "./result.ts";
-import { deferred, nextTurn } from "./async.ts";
+import { deferred, gated, nextTurn } from "./async.ts";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel } from "./model.ts";
@@ -194,36 +194,53 @@ describe("zero-modification Pi extension", () => {
 		}
 	});
 
-	it("joins an admitted search refresh during shutdown without reopening its retired owner", async () => {
+	it.each(["retiring", "ready", "rejected", "thrown"] as const)("joins every admitted refresh preparation through shutdown (%s)", async (state) => {
 		const fixture = await createFixture({ settings: { enabled: true, searchExecution: "captured" } });
 		const profiles: ReturnType<typeof searchProfile>[] = [];
 		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockImplementation(async () => {
 			const profile = searchProfile(); profiles.push(profile); return profile;
 		});
-		const entered = deferred<void>(), release = deferred<void>();
+		const searchGate = gated(), actorGate = gated();
+		const actor = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockImplementation(async () => {
+			await actorGate.wait(); return { state: "unavailable", detail: "test route" };
+		});
 		const closeHost = vi.spyOn(fixture.host, "dispose");
 		let refresh: Promise<unknown> | undefined, shutdown: Promise<void> | undefined;
 		try {
 			await fixture.emit("session_start");
-			profiles[0]!.pool.dispose.mockImplementationOnce(async () => { entered.resolve(); await release.promise; });
-			refresh = Promise.resolve(fixture.commands.get("speculative-action")!.handler("status", fixture.context as ExtensionCommandContext));
-			await entered.promise;
-			let closed = false;
+			if (state === "retiring") profiles[0]!.pool.dispose.mockImplementationOnce(searchGate.wait);
+			else prepare.mockImplementationOnce(async () => {
+				await searchGate.wait(); const profile = searchProfile(); profiles.push(profile); return profile;
+			});
+			vi.mocked(fixture.host.executionWorldDiagnostics).mockImplementationOnce(() => {
+				if (state === "thrown") throw new Error("diagnostics failed synchronously");
+				return state === "rejected" ? Promise.reject(new Error("diagnostics rejected")) : Promise.resolve(portableDiagnostics());
+			});
+			let refreshed = false, closed = false;
+			refresh = Promise.resolve(fixture.commands.get("speculative-action")!.handler("status", fixture.context as ExtensionCommandContext))
+				.then(() => { refreshed = true; });
+			await searchGate.entered;
+			await nextTurn();
+			const whileSearchPending = { refreshed, actor: actor.mock.calls.length,
+				diagnostics: vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.length };
 			shutdown = fixture.emit("session_shutdown").then(() => { closed = true; });
 			await nextTurn();
-			const closedWhileRetiring = closed;
-			const closeStartedWhileRetiring = closeHost.mock.calls.length === 1;
-			release.resolve();
+			const whileClosing = { closed, host: closeHost.mock.calls.length };
+			searchGate.release();
+			await nextTurn();
+			if (state !== "retiring") expect({ refreshed, closed }).toEqual({ refreshed: false, closed: false });
+			actorGate.release();
 			await Promise.all([refresh, shutdown]);
-			expect({ closedWhileRetiring, closeStartedWhileRetiring, prepared: prepare.mock.calls.length,
-				disposals: profiles.map((profile) => profile.pool.dispose.mock.calls.length),
-			}).toEqual({ closedWhileRetiring: false, closeStartedWhileRetiring: true, prepared: 1, disposals: [1] });
+			expect(whileSearchPending).toEqual({ refreshed: false, actor: state === "retiring" ? 0 : 1, diagnostics: state === "retiring" ? 1 : 2 });
+			expect(whileClosing).toEqual({ closed: false, host: state === "retiring" ? 1 : 0 });
+			expect(prepare).toHaveBeenCalledTimes(state === "retiring" ? 1 : 2);
+			expect(profiles.map((profile) => profile.pool.dispose.mock.calls.length)).toEqual(state === "retiring" ? [1] : [1, 1]);
 		} finally {
-			release.resolve();
+			searchGate.release(); actorGate.release();
 			await Promise.allSettled([refresh, shutdown]);
 			await fixture.emit("session_shutdown");
 			for (const profile of profiles) await profile.pool.dispose();
-			prepare.mockRestore();
+			prepare.mockRestore(); actor.mockRestore();
 		}
 	});
 
