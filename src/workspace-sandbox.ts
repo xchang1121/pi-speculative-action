@@ -681,7 +681,7 @@ async function prepareSandboxWorkspaceFor(
 			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
 		);
 		throwIfAborted(options.signal);
-		const commit = await acquireSandboxBaseline(repository, options.signal, true);
+		const commit = await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -1223,11 +1223,10 @@ async function createSandboxRepository(
 
 async function acquireSandboxBaseline(
 	repository: PooledGitRepository,
-	signal?: AbortSignal,
 	warmup = false,
 ): Promise<string> {
+	// The pool owns this shared baseline; callers cancel before private workspace allocation.
 	return withWorkspaceLock(repository, async () => {
-		throwIfAborted(signal);
 		const baseline = repository.baseline;
 		if (baseline) {
 			// Quiet notifications may reuse preparation work; every actual fork still checks exact evidence below.
@@ -1240,21 +1239,17 @@ async function acquireSandboxBaseline(
 			if (!current.expired && indexed.length === 0) return baseline.commit;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
-			throwIfAborted(signal);
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			try {
-				throwIfAborted(signal);
 				// Events and Git stat data can both miss changes. A changed baseline owns a fresh index.
 				await repository.index(["read-tree", "--empty"]);
 				await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
-				throwIfAborted(signal);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				const commit = tree === baseline?.tree ? baseline.commit : (await repository.git(
 					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
 					{ environment: SANDBOX_AUTHOR_ENVIRONMENT },
 				)).toString("utf8").trim();
 				if ((await repository.versions.validate(version)).expired) continue;
-				throwIfAborted(signal);
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				repository.baseline = { commit, tree, version };
 				baseline?.version.release();
