@@ -252,10 +252,9 @@ export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
 }
 
 /** Inspect an image while PTRACE_EVENT_EXEC guarantees it has not run a user instruction. */
-export async function inspectHeldExecProcess(pid: number): Promise<HeldExecSnapshot> {
+export async function inspectHeldExecProcess(pid: number, executable: string): Promise<HeldExecSnapshot> {
 	const root = `/proc/${pid}`;
-	const [executable, cwd, command, environmentBytes, status, limits, processStat, descriptorNames] = await Promise.all([
-		realpath(`${root}/exe`),
+	const [cwd, command, environmentBytes, status, limits, processStat, descriptorNames] = await Promise.all([
 		readlink(`${root}/cwd`),
 		readFile(`${root}/cmdline`),
 		readFile(`${root}/environ`),

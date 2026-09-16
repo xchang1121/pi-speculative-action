@@ -937,16 +937,17 @@ export class LinuxProcessReuseBackend {
 		try {
 			throwIfAborted(process.signal);
 			const sourceRoot = path.resolve(process.sourceRoot);
-			const snapshot = await inspectHeldExecProcess(process.pid);
-			if (!pathContains(sourceRoot, snapshot.cwd)) {
-				this.addActor("bypasses");
-				return { kind: "continue" };
-			}
+			const executable = await realpath(`/proc/${process.pid}/exe`);
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
-			const executablePath = projection.toLogical(snapshot.executable);
+			const executablePath = projection.toLogical(executable);
 			if (!this.handoffs.mayHaveExecutable(executablePath) && !(await this.store.mayHaveCertificates(executablePath)) &&
 				!this.handoffs.mayHaveExecutable(executablePath)) {
 				this.addActor("misses");
+				return { kind: "continue" };
+			}
+			const snapshot = await inspectHeldExecProcess(process.pid, executable);
+			if (!pathContains(sourceRoot, snapshot.cwd)) {
+				this.addActor("bypasses");
 				return { kind: "continue" };
 			}
 			const prototype = bufferedProcessPrototype(
