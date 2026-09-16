@@ -97,16 +97,22 @@ async function qualifySandlock(binary) {
 	await run(binary, [
 		"run", "--chroot", "/", "--fs-read", "/", "--", heldExec, "--probe-clean-fds",
 	]);
-	await run(binary, [
-		"run", "--chroot", "/", "--fs-read", "/", "--", process.execPath, "-e",
-		"const fs=require('node:fs');try{fs.openSync('/pi-speculative-action/not/present','r');process.exit(65)}catch(e){process.exit(e.code==='ENOENT'?0:66)}",
-	]);
 	const root = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-dispatch-"));
 	try {
 		const view = path.join(root, "view");
 		const image = path.join(view, "false");
 		await mkdir(view);
 		await writeFile(image, "#!/bin/sh\nexit 42\n", { mode: 0o700 });
+		await run(binary, [
+			"run", "--chroot", "/", "--fs-read", "/", "--", process.execPath, "-e", `
+				const fs = require('node:fs'), assert = require('node:assert/strict');
+				assert.throws(() => fs.openSync('/pi-speculative-action/not/present', 'r'), { code: 'ENOENT' });
+				for (const p of [process.argv[1], require('node:path').dirname(process.argv[1])]) {
+					assert.throws(() => fs.readlinkSync(p), { code: 'EINVAL' });
+					assert.equal(fs.realpathSync.native(p), fs.realpathSync(p));
+				}
+			`, image,
+		]);
 		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"], 42);
 		await copyFile(heldExec, image);
 		await chmod(image, 0o755);
