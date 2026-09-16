@@ -272,12 +272,14 @@ export class SpeculationScheduler<Job extends object> {
 		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
 	}
 
-	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed = false): void {
+	/** Cancelled work supplies an exact-action duration floor, never a successful service sample. */
+	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed: boolean | "cancelled" = false): void {
 		if (!failed) this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
 		else if (identity.actionKeyHash) {
 			// Failed attempts cannot stand in for successful service or affect unrelated actions in the timing class.
 			const key = timingKeys(identity)[0]!, samples = this.speculativeServiceTimes.get(key) ?? new SampleWindow();
-			samples.observeFailure();
+			if (failed === "cancelled") samples.observeLowerBound(durationMs);
+			else samples.observeFailure();
 			this.speculativeServiceTimes.set(key, samples);
 		}
 	}
@@ -369,11 +371,13 @@ export class SpeculationScheduler<Job extends object> {
 			.map(({ job, work }) => ({ job, work }));
 	}
 
-	/** With exact Actor evidence and an explicit forecast, avoid launching work its consumer would reject. */
+	/** With exact Actor evidence and a known cost, avoid launching work its consumer would reject. */
 	private canLaunch(forecast: PredictionForecast, expectedDurationMs: number): boolean {
 		const runway = this.actorRunway(forecast);
-		if (runway === undefined || forecast.expectedDurationMs === undefined || !forecast.actionKeyHash ||
-			!this.actorServiceTimes.get(timingKeys(forecast)[0]!)?.count) return true;
+		if (runway === undefined || !forecast.actionKeyHash) return true;
+		const key = timingKeys(forecast)[0]!;
+		if (!this.actorServiceTimes.get(key)?.count || forecast.expectedDurationMs === undefined &&
+			this.speculativeServiceTimes.get(key)?.estimate(0.9, "upper") === undefined) return true;
 		return this.assessCandidateJoin({
 			identity: forecast,
 			state: "running",
@@ -443,6 +447,7 @@ interface TimingEstimate {
 
 class SampleWindow {
 	private readonly values: number[] = [];
+	private lowerBound = 0;
 	private sortedValues?: number[];
 	private suppressedSinceProbe = 0;
 	private failures?: {
@@ -456,6 +461,7 @@ class SampleWindow {
 
 	observe(value: number): void {
 		this.failures = undefined;
+		this.lowerBound = 0;
 		const normalized = finite(value);
 		if (normalized <= 0) return;
 		this.suppressedSinceProbe = 0;
@@ -463,6 +469,8 @@ class SampleWindow {
 		this.values.push(normalized);
 		if (this.values.length > 64) this.values.shift();
 	}
+
+	observeLowerBound(value: number): void { this.lowerBound = Math.max(this.lowerBound, finite(value)); }
 
 	observeFailure(): void {
 		this.failures = { count: (this.failures?.count ?? 0) + 1, decisions: new WeakMap() };
@@ -488,10 +496,10 @@ class SampleWindow {
 	}
 
 	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
-		if (!this.values.length) return undefined;
+		if (!this.values.length) return this.lowerBound || undefined;
 		const sorted = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
 		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
-		return sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!;
+		return Math.max(this.lowerBound, sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!);
 	}
 }
 

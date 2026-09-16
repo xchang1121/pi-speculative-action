@@ -1102,8 +1102,12 @@ describe("structural speculative runtime", () => {
 				if (mode === "queued") await targetQueued.promise;
 				if (speculative) {
 					await stop.promise; await nextTurn();
+					const cancelled = service.mock.calls.filter(([, , outcome]) => outcome === "cancelled");
+					expect(cancelled).toHaveLength(1);
+					expect(cancelled[0]![1]).toBeGreaterThan(0);
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
 					stopped.arrive(); await cleanupGate.entered; await nextTurn();
+					expect(service.mock.calls.filter(([, , outcome]) => outcome === "cancelled")).toEqual(cancelled);
 					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
 					cleanupGate.release(); await targetGate.entered;
 				}
@@ -1114,7 +1118,7 @@ describe("structural speculative runtime", () => {
 				expect(aborted).toEqual(mode === "running" ? [] : ["busy.ts"]);
 			} finally {
 				stopped.arrive(); cleanupGate.release(); targetGate.release(); await runtime.dispose();
-				const failures = service.mock.calls.filter(([, , failed]) => failed);
+				const failures = service.mock.calls.filter(([, , failed]) => failed === true);
 				service.mockRestore(); admission.mockRestore(); expect(failures).toEqual([]);
 			}
 		}

@@ -2481,6 +2481,8 @@ export function makeSpeculativeActionRuntime<
 		const startedAt = state.status === "running" ? state.startedAt : performance.now();
 		const completedAt = performance.now();
 		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
+		if (settled && state.status === "running")
+			session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), completedAt - startedAt, "cancelled");
 		removeCandidate(session.id, candidate);
 		if (settled) queueCandidateEvent(session, candidate);
 		if (dispatch) dispatchReady(session);
