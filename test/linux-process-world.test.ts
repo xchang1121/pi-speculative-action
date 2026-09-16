@@ -16,7 +16,7 @@ import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
-import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
+import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { sha256Digest } from "../src/provenance-certificate.ts";
 import { validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
@@ -43,9 +43,10 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
-	test.for(["completed", "running"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
+		const native = mode.startsWith("native");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const release = deferred();
 		let restoreJoin: (() => void) | undefined;
@@ -60,57 +61,69 @@ describe("Linux process ExecutionWorld", () => {
 int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
+	for (volatile unsigned long iteration = 0; iteration < ${native ? 50000000 : 0}ul; ++iteration) {}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
-	return size <= 0 || write(1, text, (size_t)size) != size;
+	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
+	return ${mode === "native-merged" ? 'write(2, "stderr\\n", 7) != 7' : "0"};
 }
 `);
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
-			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'";
-			const branch = await forkReusableBash(fixture, { command, label: "recorded", actionNamespace: "binding", executionFingerprint, executionScope: scope });
-			try {
-				expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } });
-				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
-				const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
-				const binding = branch.operations![0]!;
-				for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
-					await expect(fixture.world.speculation.fingerprint!({ effect: "unbounded", requirements: PI_ACTION_SEMANTICS.definition("bash")!.requirements, tool: "bash",
-						action: { ...permission, executionContext: { ...invocation, operation } } })).rejects.toThrow("binding is unavailable");
-				}
-			}
-			finally { await branch.dispose(); }
-			const [binding] = fixture.backend.executionBindings(later);
-			expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
-			expect(binding!.certificate.producer.execution.authority).toBe("speculative");
-			expect(JSON.stringify(binding)).not.toContain("private argument");
-			expect(JSON.stringify(binding)).not.toContain("private value");
-			await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
-			await expect(validateDynamicDependencyCertificate(binding!.certificate.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
-			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
-				try {
-					const result = await session.executeBinding(binding!);
-					expect(result.exit).toEqual({ kind: "code", code: 0 });
-					expect(result.output.map(({ fd, data }) => [fd, data.toString()])).toEqual([[1, "after\n"]]);
-					await session.seal([]);
-					const validation = await session.validate();
-					expect(validation, JSON.stringify({ validation, metrics: session.metrics() })).toMatchObject({ status: "valid" });
-					await expect(session.executeBinding(binding!)).rejects.toThrow("already consumed");
-				} finally { await session.close(); }
-			});
+			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'" + (mode === "native-merged" ? " 2>&1" : "");
 			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
 					executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
-			}, true);
+			}, !native);
 			if (!("executor" in route)) throw new Error(route.detail);
-			let output = "";
-			const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
-				environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
-			expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
-			expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 1, crossTurnHits: 1 });
+			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			let binding: ProcessExecutionBinding | undefined;
+			if (!native) {
+				const branch = await forkReusableBash(fixture, { command, label: "recorded", actionNamespace: "binding", executionFingerprint, executionScope: scope });
+				try {
+					expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } });
+					const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+					const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
+					const binding = branch.operations![0]!;
+					for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
+						await expect(fixture.world.speculation.fingerprint!({ effect: "unbounded", requirements: PI_ACTION_SEMANTICS.definition("bash")!.requirements, tool: "bash",
+							action: { ...permission, executionContext: { ...invocation, operation } } })).rejects.toThrow("binding is unavailable");
+					}
+				}
+				finally { await branch.dispose(); }
+				[binding] = fixture.backend.executionBindings(later);
+				expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
+				const [certificate] = await fixture.backend.store.findByWeakKey(binding!.key, path.join(fixture.workspace, "worker"));
+				expect(certificate!.producer.execution.authority).toBe("speculative");
+				expect(JSON.stringify(binding)).not.toContain("private argument");
+				expect(JSON.stringify(binding)).not.toContain("private value");
+				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
+				await expect(validateDynamicDependencyCertificate(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
+
+				await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+					try {
+						const result = await session.executeBinding(binding!);
+						expect(result.exit).toEqual({ kind: "code", code: 0 });
+						expect(result.output.map(({ fd, data }) => [fd, data.toString()])).toEqual([[1, "after\n"]]);
+						await session.seal([]);
+						const validation = await session.validate();
+						expect(validation, JSON.stringify({ validation, metrics: session.metrics() })).toMatchObject({ status: "valid" });
+						await expect(session.executeBinding(binding!)).rejects.toThrow("already consumed");
+					} finally { await session.close(); }
+				});
+
+				let output = "";
+				const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
+					environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
+				expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
+				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 1, crossTurnHits: 1 });
+			} else {
+				expect(fixture.backend.executionBindings(later)).toEqual([]);
+				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
+			}
+
 			const patternSettings = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
 			const patternStore = new PatternAwareStore(patternSettings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
 			const events: SpeculativeActionEvent<string>[] = [], tools = [fixture.tool];
@@ -130,16 +143,23 @@ int main(int argc, char **argv) {
 				await host.finishTurn(turnID);
 			}
 			await start("seed");
-			await host.previewActorCall(call("seed", command));
-			await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
-				event.candidate.origin === "actor_preview" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
-			expect(patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common"]);
+			if (!native) {
+				await host.previewActorCall(call("seed", command));
+				await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
+					event.candidate.origin === "actor_preview" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+			}
+
+			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common"]);
 			const seedFallback = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { ...scope, turnID: "seed" } }) }, () => fixture.tool.execute("seed", { command })));
-			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: "parent\nafter\n" }]);
+			const suffix = mode === "native-merged" ? "stderr\n" : "";
+			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
 			await host.finishTurn("seed");
 			expect(seedFallback).toHaveBeenCalledOnce(); // The whole Bash metadata proof remains rejected; the child can still be adopted.
-			expect(fixture.backend.actorMetrics().hits).toBe(2);
+			expect(fixture.backend.actorMetrics().hits).toBe(native ? 0 : 2);
+			binding ??= fixture.backend.executionBindings(later).at(-1);
+			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
+			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
 			let sealing = false, joining: boolean | undefined;
@@ -173,7 +193,7 @@ int main(int argc, char **argv) {
 				expect(joining).toBe(true);
 				await nextTurn(); release.resolve();
 			}
-			expect((await nativeExecution).content).toEqual([{ type: "text", text: "automatic-parent\nnewest\n" }]);
+			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\nnewest\n${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
 			expect(fixture.backend.actorMetrics().joinedHits).toBe(Number(mode === "running"));
 			await host.finishTurn("prepared");
@@ -240,11 +260,13 @@ int main(int argc, char **argv) {
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
-				let callbacks = 0, observed = 0, output = "", heldPid = 0;
+				let callbacks = 0, observed = 0, closed = 0, output = "", heldPid = 0;
 				const concurrent = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
 					sourceRoot: root, realShell: "/bin/bash", decide: async process => {
 						if (++callbacks === 1) { heldPid = process.pid; await waiting.promise; }
-						return { kind: "continue", observeCompletion: () => { observed++; } };
+						return { kind: "continue", observeCompletion: async durationMs => {
+							await nextTurn(); closed++; if (durationMs !== undefined) observed++;
+						} };
 					},
 				});
 				const siblings = concurrent.execute({
@@ -258,6 +280,7 @@ int main(int argc, char **argv) {
 					expect(callbacks).toBe(2);
 					if (killed) { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
 					waiting.resolve(); expect(await siblings).toEqual({ exitCode: 0 }); expect(observed).toBe(killed ? 1 : 2);
+					expect(closed, "native return must drain both successful and interrupted observations").toBe(2);
 				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
 			}
 			const threaded = path.join(root, "thread-exec");
@@ -396,7 +419,8 @@ int main(void) {
 		let sessions = 0;
 		let calls: Promise<unknown> | undefined, refreshing: Promise<unknown> | undefined;
 		try {
-			await invoke();
+			await fixture.backend.observeBindings({ sessionID: "session", turnID: "turn" }, invoke,
+				bindings => { expect(bindings).toEqual([]); }, false);
 			expect(host.execute).toHaveBeenCalledOnce();
 			expect(invocation).not.toHaveBeenCalled(); expect(opening).not.toHaveBeenCalled(); expect(observed).not.toHaveBeenCalled();
 			expect(coordinator.actorDiagnostics().state).toBe("degraded");

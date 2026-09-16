@@ -46,14 +46,14 @@ export interface ProcessHandoff {
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
 export interface ProcessExecutionBinding {
 	readonly key: Sha256Digest;
-	readonly certificate: ProcessProvenanceCertificate;
+	readonly executionMs: number;
 	readonly scope: ExecutionScope;
 	readonly available: boolean;
 }
 
 type HandoffState =
 	| { readonly status: "running" }
-	| { readonly status: "completed" | "consumed"; readonly candidate?: ProcessProvenanceCertificate };
+	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
@@ -108,14 +108,30 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
 	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): ProcessExecutionBinding | undefined {
 		const record = this.byKey.get(key)?.find(candidate => candidate === handoff);
-		if (!record?.scope || record.binding || record.state.status === "running" || record.state.candidate?.weakKey !== key ||
-			!record.state.candidate.dependencyCertificate.complete || this.maxBindingBytes <= 0) return;
+		if (!record || record.state.status === "running" || record.state.candidate?.weakKey !== key ||
+			!record.state.candidate.dependencyCertificate.complete) return;
+		return this.retainBinding(key, record, invocation, record.state.candidate.result.observedProcessMs ?? 0);
+	}
+
+	/** A completed native launch teaches preparation only; it has no result or adoption authority. */
+	observe(key: Sha256Digest, executablePath: string, scope: ExecutionScope, invocation: Invocation, executionMs: number): ProcessExecutionBinding | undefined {
+		if (this.disposed || !Number.isFinite(executionMs) || executionMs < 0) return;
+		const record = this.reserve(key, executablePath, new ProcessHandoffOwnership(), snapshotExecutionScope(scope));
+		record.state = { status: "retained" };
+		record.settle();
+		let binding: ProcessExecutionBinding | undefined;
+		try { return binding = this.retainBinding(key, record, invocation, executionMs); }
+		finally { if (!binding) this.remove(key, record); }
+	}
+
+	private retainBinding(key: Sha256Digest, record: HandoffRecord, invocation: Invocation, executionMs: number): ProcessExecutionBinding | undefined {
+		if (!record.scope || record.binding || this.maxBindingBytes <= 0) return;
 		const value = immutableSnapshot(invocation);
 		if (!isImmutableSnapshot(value)) return;
 		const bytes = Buffer.byteLength(JSON.stringify(value));
 		if (bytes > this.maxBindingBytes) return;
 		const owner = new WeakRef(this.invocations);
-		const binding = Object.freeze({ key, certificate: record.state.candidate, scope: record.scope,
+		const binding = Object.freeze({ key, executionMs, scope: record.scope,
 			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
 		this.invocations.set(binding, { value, bytes });
 		record.binding = binding;
@@ -136,13 +152,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean {
-		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "consumed")) return true;
+		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "retained")) return true;
 		return false;
 	}
 
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {
-		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "consumed" && record.executablePath === executablePath)) return true;
+		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "retained" && record.executablePath === executablePath)) return true;
 		return false;
 	}
 
@@ -167,7 +183,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
 					// Retain bounded launch parameters without granting another transfer of this result.
-					if (selected.oneShot) selected.record.state = { ...selected.state, status: "consumed" };
+					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
 					return { kind: "hit", plan, joined, producer: selected.record };
 				}
 				continue;
@@ -226,7 +242,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.byKey.clear();
 	}
 
-	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): ProcessHandoff {
+	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): HandoffRecord {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });

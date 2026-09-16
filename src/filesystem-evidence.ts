@@ -76,8 +76,10 @@ export function captureStableFile(
 }
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
-export async function hashExecutableFile(target: string): Promise<`sha256:${string}`> {
-	return `sha256:${(await captureFile(target, Infinity, false, false)).hash}`;
+export async function hashExecutableFile(target: string, observation?: {
+	readonly pinned: () => void; readonly signal: AbortSignal;
+}): Promise<`sha256:${string}`> {
+	return `sha256:${(await captureFile(target, Infinity, false, false, undefined, observation)).hash}`;
 }
 
 async function captureFile(
@@ -86,6 +88,7 @@ async function captureFile(
 	retainContent: boolean,
 	verifyPath: boolean,
 	observed?: Pick<StableFileCapture, "stat" | "realPath">,
+	observation?: { readonly pinned: () => void; readonly signal: AbortSignal },
 ): Promise<StableFileCapture> {
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
@@ -103,11 +106,13 @@ async function captureFile(
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+		observation?.pinned();
 		const hash = createHash("sha256");
 		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
 		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
 		let bytesRead = 0;
 		for (;;) {
+			observation?.signal.throwIfAborted();
 			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
 			const { bytesRead: size } = await handle.read(chunk);
 			if (size === 0) break;
@@ -117,6 +122,7 @@ async function captureFile(
 			hash.update(chunk.subarray(0, size));
 		}
 		const after = await handle.stat({ bigint: true });
+		observation?.signal.throwIfAborted();
 		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
 			throw new Error("file_changed_during_capture");
 		}

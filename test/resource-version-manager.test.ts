@@ -285,11 +285,13 @@ describe("speculative action resource versions", () => {
 		} finally { vi.unstubAllEnvs(); }
 	});
 
-	test.for([["empty", "short", "chunks"], ["admission", "settled"], ["grow", "shrink", "read-error"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
+	test.for([["empty", "short", "chunks"], ["admission", "settled"], ["grow", "shrink", "read-error", "cancel-pinned", "cancel-reading"], ["replace"], ["seal"]])("owns the file identity through %j", async (changes, { skip }) => {
 		if (process.platform === "win32" && changes.includes("replace")) return skip("Windows denies replacement of the open destination");
 		for (const change of changes) for (const mode of ["hash", "content", "executable"]) {
 			const executable = mode === "executable", retain = mode === "content";
 			if (executable && ["admission", "seal", "settled"].includes(change)) continue; // Only path captures certify pathname stability.
+			if (change.startsWith("cancel-") && !executable) continue;
+			const controller = new AbortController(), cancelled = new Error("cancelled observation");
 			const payload = change === "chunks" ? Buffer.alloc(2 * 1024 * 1024 + 7, 43) : Buffer.from(change === "empty" ? "" : "initial contents");
 			const root = await workspace({ value: payload }), file = path.join(root, "value");
 			const nativeOpen = fs.open.bind(fs), handle = await nativeOpen(file, "r"), read = handle.read.bind(handle), stat = handle.stat.bind(handle);
@@ -305,6 +307,7 @@ describe("speculative action resource versions", () => {
 				return result;
 			}) as typeof handle.stat);
 			vi.spyOn(handle, "read").mockImplementationOnce((async (buffer: Buffer) => {
+				if (change === "cancel-reading") controller.abort(cancelled);
 				if (change === "read-error") throw new Error("injected read failure");
 				if (change === "grow") await fs.appendFile(file, "more");
 				if (change === "shrink") await fs.truncate(file, 1);
@@ -319,7 +322,10 @@ describe("speculative action resource versions", () => {
 			}) as typeof fs.readdir) : undefined;
 			try {
 				const capture = change === "settled" ? manager.capture([{ path: file, scope: "content" }, { path: root, scope: "tree_content" }], retain ? 8192 : undefined)
-					: executable ? hashExecutableFile(file) : captureStableFile(file, Infinity, retain);
+					: executable ? hashExecutableFile(file, { signal: controller.signal, pinned: () => {
+						expect(inspections).toBe(1); // The opened image identity was checked before native execution can resume.
+						if (change === "cancel-pinned") controller.abort(cancelled);
+					} }) : captureStableFile(file, Infinity, retain);
 				if (["empty", "short", "chunks"].includes(change)) {
 					const hash = createHash("sha256").update(payload).digest("hex");
 					if (executable) expect(await capture).toBe(`sha256:${hash}`);
@@ -327,8 +333,9 @@ describe("speculative action resource versions", () => {
 					if (!retain) for (const [buffer] of vi.mocked(handle.read).mock.calls) {
 						expect(Buffer.isBuffer(buffer) ? buffer.byteLength : Infinity).toBeLessThanOrEqual(1024 * 1024);
 					}
-				} else await expect(capture).rejects.toThrow(change === "read-error" ? "injected read failure" : "file_changed_during_capture");
-				if (change === "admission") expect(handle.read).not.toHaveBeenCalled();
+				} else await expect(capture).rejects.toThrow(change.startsWith("cancel-") ? cancelled.message : change === "read-error" ? "injected read failure" : "file_changed_during_capture");
+				if (change === "admission" || change === "cancel-pinned") expect(handle.read).not.toHaveBeenCalled();
+				if (change === "cancel-reading") expect(handle.read).toHaveBeenCalledOnce();
 				expect(handle.fd).toBe(-1);
 			} finally { open.mockRestore(); readdir?.mockRestore(); manager.close(); }
 		}

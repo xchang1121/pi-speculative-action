@@ -437,7 +437,7 @@ export function createSpeculativeActionHost(
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);
-					}) : executor(bound);
+					}, prepared?.observeOperations) : executor(bound);
 			}, {
 				computationDependencies: () => computations,
 				...(actorCall

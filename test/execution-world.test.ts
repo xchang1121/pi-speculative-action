@@ -145,10 +145,20 @@ describe("ExecutionWorldRouter", () => {
 		const split: TestWorld = {
 			...world,
 			observation: { capabilities: "all", capture },
+			observeOperations: async ({ learn }, execute) => { observations.push(learn); return execute(); },
 		};
-		let speculationEnabled = true;
-		const router = new ExecutionWorldRouter([split], () => speculationEnabled);
+		const observations: Array<boolean | undefined> = [];
+		let speculationEnabled: boolean | undefined = true;
+		const router = new ExecutionWorldRouter([split], () => {
+			if (speculationEnabled === undefined) throw new Error("policy unavailable");
+			return speculationEnabled;
+		});
 		const observationRequest = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
+		const action = buildPiActionKey("read", { path: "file" }, preparation.cwd)!;
+		const observe = (learn: boolean) => router.observeOperations(action, { sessionID: "session", turnID: "turn" },
+			async () => "native once", () => {}, learn);
+		await expect(observe(true)).resolves.toBe("native once");
+		await expect(observe(false)).resolves.toBe("native once");
 
 		const route = await router.resolve(observationRequest, preparation);
 		expect(route).toBeDefined();
@@ -170,6 +180,10 @@ describe("ExecutionWorldRouter", () => {
 			capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 			observation: { capabilities: "all" },
 		});
+		await expect(observe(true)).resolves.toBe("native once");
+		speculationEnabled = undefined;
+		await expect(observe(true)).resolves.toBe("native once");
+		expect(observations).toEqual([true, false, false, false]);
 	});
 
 	it("keeps an observation-only world off the speculative route", async () => {

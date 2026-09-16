@@ -327,7 +327,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
-	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope },
+	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope; readonly learn?: boolean },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
@@ -383,11 +383,13 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void): Promise<Value> {
+		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations || !supportsTool(world.speculation ?? world.observation!, action.tool)) continue;
+			let learning = false;
+			try { learning = learn && this.speculationEnabled(world.id); } catch { /* Optional observation cannot deny the Actor call. */ }
 			const next = execute;
-			execute = () => world.observeOperations!({ action, scope }, next, observe);
+			execute = () => world.observeOperations!({ action, scope, learn: learning }, next, observe);
 		}
 		return execute();
 	}

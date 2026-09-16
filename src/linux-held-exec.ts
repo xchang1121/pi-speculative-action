@@ -36,6 +36,8 @@ export interface HeldExecProcess {
 
 export interface HeldExecSnapshot {
 	readonly executable: string;
+	/** Actual output aliasing, usable for another isolated launch after context revalidation. */
+	readonly outputRoute?: readonly [1 | 2, 1 | 2];
 	readonly argv: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
@@ -47,7 +49,7 @@ export interface HeldExecSnapshot {
 }
 
 export type HeldExecDecision =
-	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number) => void }
+	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number | undefined) => void | Promise<void> }
 	| {
 			readonly kind: "replay";
 			readonly exitCode: number;
@@ -236,18 +238,20 @@ export class LinuxHeldExecBoundary {
 	}
 }
 
-async function observeCompletion(socket: net.Socket, observe: (durationMs: number) => void): Promise<void> {
+async function observeCompletion(socket: net.Socket, observe: (durationMs: number | undefined) => void | Promise<void>): Promise<void> {
 	const startedAt = performance.now();
-	await write(socket, Buffer.from("O\n"));
-	const event = await readLine(socket);
-	if (event === "D") {
+	let durationMs: number | undefined;
+	try {
+		await write(socket, Buffer.from("O\n"));
+		if (await readLine(socket) === "D") durationMs = Math.max(0, performance.now() - startedAt);
+	} finally {
 		try {
-			observe(Math.max(0, performance.now() - startedAt));
+			await observe(durationMs);
 		} catch {
-			// Timing feedback cannot affect the already-authorized process.
+			// Drain optional observation without replacing the already-authorized process outcome.
 		}
+		socket.end();
 	}
-	socket.end();
 }
 
 /** Resolve the native helper shared by transparent dispatch and x86-64 Actor handoff. */
@@ -337,6 +341,7 @@ export async function inspectHeldExecProcess(pid: number, executable: string): P
 	];
 	return {
 		executable,
+		outputRoute: descriptors[1]!.alias === descriptors[2]!.alias ? [1, 1] : [1, 2],
 		argv,
 		cwd,
 		environment,

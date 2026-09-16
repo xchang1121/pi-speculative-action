@@ -15,14 +15,16 @@ const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?
 
 describe("ProcessHandoffRegistry", () => {
 	it("owns bounded launch bindings without persisting secrets or granting result adoption", async () => {
-		for (const consumed of [false, true]) for (const revoke of ["clear", "count", "bytes", "dispose"] as const) {
+		for (const source of ["sealed", "consumed", "native"]) for (const revoke of ["clear", "count", "bytes", "dispose"] as const) {
+			const consumed = source === "consumed", native = source === "native";
 			const fixture = await producer(consumed, new ProcessHandoffRegistry<unknown>(8, 100));
 			const invocation = { argv: ["sensitive argument"], environment: { TOKEN: "sensitive value" } };
 			fixture.registry.bind(fixture.key, fixture.work, invocation);
 			expect(fixture.registry.bindings(SCOPE)).toEqual([]); // Unsealed execution is not a binding source.
-			await fixture.publish();
+			if (native) fixture.registry.complete(fixture.key, fixture.work);
+			else await fixture.publish();
 			const computation = fixture.work.computation;
-			expect(computation).toBeDefined();
+			expect(Boolean(computation)).toBe(!native);
 			if (consumed) {
 				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "hit" });
 				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
@@ -31,9 +33,26 @@ describe("ProcessHandoffRegistry", () => {
 				expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
 			}
 			// Consumption may precede binding publication; a launch capability grants no second result transfer.
-			fixture.registry.bind(fixture.key, fixture.work, invocation);
+			if (native) {
+				const observe = (value: unknown, duration = 12) => fixture.registry.observe(fixture.key,
+					fixture.certificate.prototype.executablePath, SCOPE, value, duration);
+				for (const duration of [-1, NaN, Infinity]) expect(observe(invocation, duration)).toBeUndefined();
+				expect(() => observe({ callback: () => {} })).toThrow();
+				expect(observe(new Map())).toBeUndefined();
+				expect(fixture.registry.bindings(SCOPE)).toEqual([]);
+				expect(fixture.registry.hasResults).toBe(false);
+				observe(invocation);
+			}
+			else fixture.registry.bind(fixture.key, fixture.work, invocation);
 			const [binding] = fixture.registry.bindings(OTHER_SCOPE);
 			expect(binding).toBeDefined();
+			expect(binding).not.toHaveProperty("certificate");
+			expect(binding!.executionMs).toBe(native ? 12 : fixture.certificate.result.observedProcessMs ?? 0);
+			if (native) {
+				expect(fixture.registry.hasResults).toBe(false);
+				expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
+				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+			}
 			expect(binding!.available).toBe(true);
 			const owned = fixture.registry.resolveBinding(binding!, OTHER_SCOPE);
 			expect(owned).toEqual(invocation);
