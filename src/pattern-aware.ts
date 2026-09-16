@@ -1546,31 +1546,29 @@ class PatternBindingAnalysis {
 				continue;
 			}
 			const targetIsPath = isPathField(String(targetPath.at(-1) ?? ""));
-			const direct = uniqueBindings(
-				samples.flatMap((sample, index) => this.candidateBindings(sample.context, targets[index], "direct", targetIsPath)),
-			);
-			let selected = direct.find((candidate) =>
-				samples.every((sample, index) => this.bindingMatches(candidate, sample.context, targets[index])),
-			);
-			if (!selected) {
-				const candidates = uniqueBindings([
-					...direct,
-					...samples.flatMap((sample, index) => typeof targets[index] === "string"
-						? this.candidateBindings(sample.context, targets[index], "all", targetIsPath) : []),
-				]);
-				const fallbackSources = direct.filter((binding) => binding.type === "event");
-				if (fallbackSources.length > 1) candidates.push({ type: "coalesce", sources: fallbackSources });
-				let selectedReplay = -1;
-				for (const candidate of candidates) {
-					const replay = samples.reduce(
-						(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
-						0,
-					);
-					if (replay <= selectedReplay) continue;
-					selected = candidate;
-					selectedReplay = replay;
-					if (replay === samples.length) break;
+			function* candidates(analysis: PatternBindingAnalysis): Generator<PatternAwareBinding> {
+				const direct: PatternAwareBinding[] = [];
+				for (const mode of ["direct", "all"] as const) for (const [index, sample] of samples.entries()) {
+					if (mode === "all" && typeof targets[index] !== "string") continue;
+					for (const binding of analysis.candidateBindings(sample.context, targets[index], mode, targetIsPath)) {
+						if (mode === "direct") direct.push(binding);
+						yield binding;
+					}
 				}
+				const fallbackSources = [...uniqueBy(direct.filter((binding) => binding.type === "event"), bindingStructureKey)];
+				if (fallbackSources.length > 1) yield { type: "coalesce", sources: fallbackSources };
+			}
+			let selected: PatternAwareBinding | undefined, selectedReplay = -1;
+			// Preserve direct/composite/fallback order and first-best ties without replaying candidates twice.
+			for (const candidate of uniqueBy(candidates(this), bindingStructureKey)) {
+				const replay = samples.reduce(
+					(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
+					0,
+				);
+				if (replay <= selectedReplay) continue;
+				selected = candidate;
+				selectedReplay = replay;
+				if (replay === samples.length) break;
 			}
 			if (selected) selected = this.withObservedVariantCounts(selected, samples, targets);
 			if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
@@ -1660,7 +1658,7 @@ class PatternBindingAnalysis {
 		return this.memo(context, key, () => {
 			const bindings = this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath);
 			if (mode === "first") for (const binding of bindings) return [binding];
-			return uniqueBindings([...bindings]);
+			return [...uniqueBy(bindings, bindingStructureKey)];
 		});
 	}
 
@@ -1780,7 +1778,7 @@ class PatternBindingAnalysis {
 					? `${binding.prefix}${value}${binding.suffix}` : transform(binding.operation, value)] : [],
 			);
 		} else return [];
-		return uniqueBy(values, stableStringify);
+		return [...uniqueBy(values, stableStringify)];
 	}
 
 	bindingMatches(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>, target: unknown) {
@@ -1971,14 +1969,14 @@ function isPathField(key: string) {
 	);
 }
 
-function uniqueBy<Value>(values: readonly Value[], keyFor: (value: Value) => string): Value[] {
+function* uniqueBy<Value>(values: Iterable<Value>, keyFor: (value: Value) => string): Generator<Value> {
 	const seen = new Set<string>();
-	return values.filter((item) => {
+	for (const item of values) {
 		const key = keyFor(item);
-		if (seen.has(key)) return false;
+		if (seen.has(key)) continue;
 		seen.add(key);
-		return true;
-	});
+		yield item;
+	}
 }
 
 const bindingStructureKeys = new WeakMap<object, string>();
@@ -1990,10 +1988,6 @@ function bindingStructureKey(binding: PatternAwareBinding): string {
 		bindingStructureKeys.set(binding, key);
 	}
 	return key;
-}
-
-function uniqueBindings(bindings: ReadonlyArray<PatternAwareBinding>) {
-	return uniqueBy(bindings, bindingStructureKey);
 }
 
 function bindingMapStructure(bindings: Readonly<Record<string, PatternAwareBinding>>) {
@@ -2036,7 +2030,7 @@ function bindingStructure(value: unknown): unknown {
 
 function bindingDependencies(bindings: Readonly<Record<string, PatternAwareBinding>>): PatternAwareDependency[] {
 	return Object.entries(bindings).flatMap(([encoded, binding]) => {
-		const sources = uniqueBy(bindingSources(binding), stableStringify);
+		const sources = [...uniqueBy(bindingSources(binding), stableStringify)];
 		return sources.length ? [{ targetPath: decodePath(encoded), sources }] : [];
 	});
 }
