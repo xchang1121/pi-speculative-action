@@ -1,3 +1,4 @@
+import { routedProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
@@ -178,7 +179,7 @@ interface ReadyBackend {
 	readonly fingerprint: string;
 	readonly platformFingerprint: Sha256Digest;
 	readonly observerFingerprint: Sha256Digest;
-	readonly executionContext: DispatcherExecutionContext;
+	readonly executionContext: ProcessExecutionContext;
 	readonly dispatcher: string;
 }
 
@@ -209,16 +210,7 @@ interface DispatcherRequest {
 	readonly args: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
-	readonly context: DispatcherExecutionContext;
-}
-
-interface DispatcherExecutionContext {
-	readonly key: string;
-	/** Parent contract, excluding state that the host-side leaf broker deliberately supplies. */
-	readonly launchKey: string;
-	readonly umask: number;
-	readonly descriptorTypes: readonly ["device" | "other", "pipe" | "socket", "pipe" | "socket"];
-	readonly outputEndpoints: readonly [string, string];
+	readonly context: ProcessExecutionContext;
 }
 
 type OutputRoute = readonly [1 | 2, 1 | 2];
@@ -645,7 +637,7 @@ export class LinuxProcessReuseBackend {
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
-		let executionContext: DispatcherExecutionContext | undefined;
+		let executionContext: ProcessExecutionContext | undefined;
 		try {
 			const logicalRoot = path.join(mountProbe, "logical");
 			const physicalRoot = path.join(mountProbe, "physical");
@@ -1403,7 +1395,7 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedExecutionContext(ready.executionContext, outputRoute),
+			context: routedProcessContext(ready.executionContext, outputRoute),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
 }
@@ -2017,7 +2009,7 @@ async function probeExecutionContext(input: {
 	readonly strace: string;
 	readonly logicalRoot: string;
 	readonly physicalRoot: string;
-}): Promise<DispatcherExecutionContext> {
+}): Promise<ProcessExecutionContext> {
 	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
 	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
@@ -2044,7 +2036,7 @@ async function probeExecutionContext(input: {
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
 	const parsed: unknown = JSON.parse(stdout);
-	if (!validDispatcherContext(parsed)) throw new Error("process execution context probe returned invalid data");
+	if (!validProcessContext(parsed)) throw new Error("process execution context probe returned invalid data");
 	return parsed;
 }
 
@@ -2211,7 +2203,7 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 			typeof request.cwd !== "string" ||
 			!request.environment ||
 			typeof request.environment !== "object" ||
-			!validDispatcherContext(request.context)
+			!validProcessContext(request.context)
 		) {
 			return undefined;
 		}
@@ -2239,7 +2231,7 @@ function materializeDispatcherRequest(
 async function eligibleRequest(
 	session: ActiveSession,
 	request: DispatcherRequest,
-	expectedContext: DispatcherExecutionContext,
+	expectedContext: ProcessExecutionContext,
 ): Promise<RequestEligibility> {
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
@@ -2251,70 +2243,10 @@ async function eligibleRequest(
 	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
 	if (!route[0] || !route[1]) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
 	const outputRoute: OutputRoute = [route[0], route[1]];
-	const context = routedExecutionContext(expectedContext, outputRoute);
+	const context = routedProcessContext(expectedContext, outputRoute);
 	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
 	if (request.context.umask !== context.umask) return { reason: "umask_mismatch" };
 	return { route: outputRoute };
-}
-
-function routedExecutionContext(context: DispatcherExecutionContext, route: OutputRoute): DispatcherExecutionContext {
-	const semantic = JSON.parse(context.key) as {
-		credentials: Record<string, unknown>;
-		signals: { blocked: string; ignored: string };
-		descriptors: Record<string, unknown>[];
-		[key: string]: unknown;
-	};
-	if (!semantic.credentials || !validSignalState(semantic.signals) ||
-		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) {
-		throw new Error("invalid probed execution context");
-	}
-	const descriptors = [
-		semantic.descriptors[0]!,
-		{ ...semantic.descriptors[route[0]]!, fd: 1, alias: 1 },
-		{ ...semantic.descriptors[route[1]]!, fd: 2, alias: route[0] === route[1] ? 1 : 2 },
-	];
-	// libuv resets the signal mask and dispositions for every spawned target.
-	const signals = {
-		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
-		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
-	};
-	const routed = { ...semantic, executionDomain: "ptrace", signals, descriptors };
-	return {
-		...context,
-		key: JSON.stringify(routed),
-		launchKey: JSON.stringify({
-			...routed,
-			credentials: { ...semantic.credentials, groups: "broker-preserved" },
-			signals: "broker-normalized",
-		}),
-		descriptorTypes: [
-			context.descriptorTypes[0],
-			context.descriptorTypes[route[0]],
-			context.descriptorTypes[route[1]],
-		],
-	};
-}
-
-function validSignalState(value: unknown): value is { blocked: string; ignored: string } {
-	if (!value || typeof value !== "object") return false;
-	const signals = value as { blocked?: unknown; ignored?: unknown };
-	return typeof signals.blocked === "string" && /^[0-9a-f]+$/i.test(signals.blocked) &&
-		typeof signals.ignored === "string" && /^[0-9a-f]+$/i.test(signals.ignored);
-}
-
-function validDispatcherContext(value: unknown): value is DispatcherExecutionContext {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const context = value as Partial<DispatcherExecutionContext>;
-	return (
-		typeof context.key === "string" && context.key.length > 0 && context.key.length <= 64 * 1024 &&
-		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
-		Number.isSafeInteger(context.umask) && context.umask! >= 0 && context.umask! <= 0o777 &&
-		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
-		context.descriptorTypes[0] === "device" && ["pipe", "socket"].includes(context.descriptorTypes[1] ?? "") &&
-		["pipe", "socket"].includes(context.descriptorTypes[2] ?? "") &&
-		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
-		context.outputEndpoints.every((endpoint) => typeof endpoint === "string" && endpoint.length <= 4096)
-	);
 }
 
 function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {

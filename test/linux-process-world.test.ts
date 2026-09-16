@@ -13,7 +13,7 @@ import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-co
 import { describe, expect, test, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
+import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
@@ -258,6 +258,22 @@ int main(int argc, char **argv) {
 				await stopped;
 			}
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
+			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", undefined], ["1>/dev/null", undefined]] as const) {
+				let inspected = 0;
+				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
+				const inspecting = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
+					inspected++;
+					inspection = inspectHeldExecProcess(pid, await filesystem.readlink(`/proc/${pid}/exe`));
+					await inspection.catch(() => undefined);
+					return { kind: "continue" };
+				} });
+				expect(await inspecting.execute({ command: `exec /bin/true ${redirection}`, cwd: root,
+					environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				expect(inspected).toBe(1);
+				// Assert outside the advisory callback, whose failures intentionally preserve native execution.
+				if (route) expect((await inspection!).outputRoute).toEqual(route);
+				else await expect(inspection).rejects.toThrow(/descriptors/);
+			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
 				let callbacks = 0, observed = 0, closed = 0, output = "", heldPid = 0;
@@ -579,13 +595,14 @@ int main(void) {
 			});
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; printf '%32768s:end' ''",
+				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
+					"/usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			const text = branch.output.result.content[0];
-			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\n" + " ".repeat(32768) + ":end");
+			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nfile-fallback\npipe-fallback\n" + " ".repeat(32768) + ":end");
 			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
 			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length, nextComplete: nextCapture.complete },
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });

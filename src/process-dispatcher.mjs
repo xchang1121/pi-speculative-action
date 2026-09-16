@@ -2,10 +2,10 @@
 
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { captureProcessContext } from "./process-context.mjs";
 
 const nativeRequested = process.argv[2] === "--native-dispatch";
 const native = nativeInvocation();
@@ -31,7 +31,7 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 	await run(args[2], [], args[2]);
 	if (process.exitCode !== 42) throw new Error("sandbox script read position is not preserved");
 	process.exitCode = 0;
-	fs.writeSync(1, JSON.stringify(executionContext()));
+	fs.writeSync(1, JSON.stringify(await captureProcessContext("self", ["0", "1", "2"])));
 } else if (!validConfiguration(configuration) || !invoked) {
 	await fallback();
 } else {
@@ -45,7 +45,7 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 			args,
 			cwd: process.cwd(),
 			environment,
-			context: executionContext(),
+			context: await captureProcessContext("self", ["0", "1", "2"]),
 		});
 		if (!response || response.version !== 2 || response.kind === "bypass") {
 			await fallback(response?.executable);
@@ -127,68 +127,6 @@ function validConfiguration(value) {
 	);
 }
 
-function executionContext() {
-	const status = Object.fromEntries(
-		fs.readFileSync("/proc/self/status", "utf8")
-			.split("\n")
-			.map((line) => line.split(/:\s*/, 2))
-			.filter(([name]) => ["Cpus_allowed_list", "Mems_allowed_list", "SigBlk", "SigIgn"].includes(name)),
-	);
-	const aliases = new Map();
-	const descriptors = [0, 1, 2].map((fd) => descriptor(fd, aliases));
-	const umask = process.umask();
-	const semantic = {
-		executionDomain: "ptrace",
-		rlimits: fs.readFileSync("/proc/self/limits", "utf8").split("\n").slice(1)
-			.map((line) => line.trim().split(/\s{2,}/).slice(0, 2)),
-		credentials: {
-			uid: process.getuid(), euid: process.geteuid(), gid: process.getgid(), egid: process.getegid(),
-			groups: process.getgroups().sort((left, right) => left - right),
-		},
-		systemMetadata: statIdentity("/bin/sh"),
-		signals: { blocked: status.SigBlk, ignored: status.SigIgn },
-		scheduling: {
-			nice: os.getPriority(), cpus: status.Cpus_allowed_list, memoryNodes: status.Mems_allowed_list,
-		},
-		descriptors: descriptors.map(({ endpoint, ...value }) => ({
-			...value, flags: value.flags & ~0o2000000, ...(value.type === "device" ? { endpoint } : {}),
-		})),
-	};
-	return {
-		key: JSON.stringify(semantic),
-		launchKey: JSON.stringify({
-			...semantic,
-			credentials: { ...semantic.credentials, groups: "broker-preserved" },
-			signals: "broker-normalized",
-		}),
-		umask,
-		descriptorTypes: descriptors.map(({ type }) => type),
-		outputEndpoints: [descriptors[1]?.endpoint ?? "", descriptors[2]?.endpoint ?? ""],
-	};
-}
-
-function statIdentity(target) {
-	const value = fs.statSync(target, { bigint: true });
-	return Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map((name) => [name, String(value[name])]));
-}
-
-function descriptor(fd, aliases) {
-	const stat = fs.fstatSync(fd, { bigint: true });
-	const endpoint = readDescriptorTarget(fd);
-	const identity = `${stat.dev}:${stat.ino}`;
-	if (!aliases.has(identity)) aliases.set(identity, aliases.size);
-	const flags = /^flags:\s*([0-7]+)/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))?.[1];
-	if (!flags) throw new Error(`descriptor ${fd} flags unavailable`);
-	return {
-		fd,
-		type: stat.isFile() ? "regular" : stat.isFIFO() ? "pipe" : stat.isSocket() ? "socket" :
-			stat.isCharacterDevice() ? (endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other",
-		flags: Number.parseInt(flags, 8),
-		alias: aliases.get(identity),
-		...(endpoint ? { endpoint } : {}),
-	};
-}
-
 async function exchange(request) {
 	const socket = net.createConnection(socketPath).setEncoding("utf8");
 	socket.setTimeout(24 * 60 * 60 * 1000, () => socket.destroy(new Error("broker timeout")));
@@ -200,13 +138,5 @@ async function exchange(request) {
 		return JSON.parse(body.trim());
 	} finally {
 		socket.destroy();
-	}
-}
-
-function readDescriptorTarget(fd) {
-	try {
-		return fs.readlinkSync(`/proc/self/fd/${fd}`);
-	} catch {
-		return undefined;
 	}
 }
