@@ -216,38 +216,51 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
-	it("separates internal execution, matching and continuation even when an adapter collides keys", async () => {
+	it.each(["same", "next"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
 		const complete = vi.fn(), materialized = vi.fn(), continuation = vi.fn(), settled = vi.fn();
 		let adopted: Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"];
+		let acceptScope: Parameters<TestAdapter["executeCandidate"]>[0]["acceptOperationScope"];
 		const source = planSource({ propose: () => ({ ...plan("internal"), actions: [
-			{ ...readAction("child", { path: "README.md" }), type: "operation", operation: binding },
-			readAction("whole", { path: "README.md" }),
+			{ ...readAction("child", { path: "README.md" }, { latestHorizon: 1 }), type: "operation", operation: binding },
+			readAction("whole", { path: "README.md" }, { latestHorizon: 1 }),
 		] }), continue: continuation, onSettled: settled });
 		const { runtime, events } = harness({ source, onCandidateMaterialized: materialized,
-			executeCandidate: async ({ candidate, onOperationAdopted }) => {
+			executeCandidate: async ({ candidate, onOperationAdopted, acceptOperationScope }) => {
 				complete(candidate.type);
-				if (candidate.type === "operation") adopted = onOperationAdopted;
+				if (candidate.type === "operation") { adopted = onOperationAdopted; acceptScope = acceptOperationScope; }
 				return world(candidate.type === "operation" ? "child only" : "whole tool", { validate: async () => validResource() });
 			},
 		});
 		try {
 			await runtime.startTurn(start("turn"));
 			await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded").length).toBe(2);
+			expect(acceptScope!(start("turn"))).toBe(true);
+			expect(acceptScope!(start("next"))).toBe(false);
+			const turn = mode === "next" ? "next" : "turn";
+			if (mode === "next") {
+				await runFallback(runtime, call("turn", { path: "unrelated" }));
+				await runtime.finishTurn({ ...call("turn"), terminal: false });
+				expect(acceptScope!(start("turn"))).toBe(false);
+				await runtime.startTurn(start(turn));
+				expect(acceptScope!(start(turn))).toBe(true);
+			}
 			expect(complete.mock.calls.map(([kind]) => kind).sort()).toEqual(["operation", "tool_call"]);
 			expect(materialized).toHaveBeenCalledOnce();
 			const receipt = { scope: { sessionID: "other", turnID: "turn" }, id: "launch:exec", sequence: 1, operationIdentity: "child" };
+			expect(acceptScope!(receipt.scope)).toBe(false);
 			adopted!(receipt);
 			expect(settled).not.toHaveBeenCalled();
-			const prepared = await runtime.prepareActorCall(call("turn"));
+			const prepared = await runtime.prepareActorCall(call(turn));
 			expect(prepared?.output).toBe("whole tool");
-			adopted!({ ...receipt, scope: start("turn") });
-			await runtime.finishTurn(call("turn"));
+			adopted!({ ...receipt, scope: start(turn) });
+			await runtime.finishTurn(call(turn));
+			expect(acceptScope!(start(turn))).toBe(false);
 			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
 				prediction: { kind: "operation" }, actorAction: { kind: "operation" }, match: { matched: true, adoption: { status: "adopted" } },
 			} }]);
 			expect(continuation.mock.calls.every(([input]) => input.actionID === "whole")).toBe(true);
-			expect(events.filter(event => event.type === "actor_action")).toHaveLength(1);
+			expect(events.filter(event => event.type === "actor_action")).toHaveLength(mode === "next" ? 2 : 1);
 		} finally { await runtime.dispose(); }
 	});
 	it.each(["call", "preview"] as const)("backs off shared failed work and immediately serves an Actor %s", async (mode) => {

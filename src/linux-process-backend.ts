@@ -498,6 +498,7 @@ export class LinuxProcessReuseBackend {
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+		readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
 	}): Promise<LinuxProcessSession> {
 		return this.withProducer(() => this.createSession(input));
 	}
@@ -558,7 +559,7 @@ export class LinuxProcessReuseBackend {
 			socketPath,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			pending: new Set<Promise<unknown>>(),
-			ownership: new ProcessHandoffOwnership(input.onOperationAdopted),
+			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
 			nestedEvidence: [],
 			executionBindings: new Map(),
 			computations: [],
@@ -920,8 +921,7 @@ export class LinuxProcessReuseBackend {
 			...("timing" in participant ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
-					// This observer cannot seal repeatable native instance inputs after the wait either.
-					if (!sameScope(scope, running.scope)) return "miss";
+					if (!running.ownership.acceptsScope(running.scope, scope)) return "miss";
 					admission = this.processScheduler.assessCandidateJoin({
 						identity: participant.timing, state: "running", expectedSpeculativeDurationMs: 1,
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),

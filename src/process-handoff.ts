@@ -8,9 +8,17 @@ import { TimelineInterval } from "./task-timing.ts";
 export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
+	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope) => boolean>;
 
-	constructor(observer?: (adoption: ExecutionOperationAdoption) => void) {
+	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope) => boolean) {
 		if (observer) this.observer = new WeakRef(observer);
+		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
+	}
+
+	/** A live plan consumer may own this one-shot computation beyond its production turn. */
+	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined): boolean {
+		if (!producer || !consumer || producer.sessionID !== consumer.sessionID) return false;
+		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer) === true;
 	}
 
 	/** Observational only; a retained certificate must not keep an expired runtime alive. */
@@ -173,7 +181,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				const state = record.state;
 				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
 				const oneShot = state.candidate.dependencyCertificate.taints.length > 0;
-				return oneShot && (!sameScope(record.scope, scope) || record.ownership.wholeClaimed)
+				return oneShot && (!record.ownership.acceptsScope(record.scope, scope) || record.ownership.wholeClaimed)
 					? [] : [{ record, state, candidate: state.candidate, oneShot }];
 			});
 			if (completed.length) {
@@ -181,7 +189,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.includes(selected.record) &&
-					(!selected.oneShot || selected.record.ownership.claimChild())) {
+					(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope) && selected.record.ownership.claimChild()))) {
 					// Retain bounded launch parameters without granting another transfer of this result.
 					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
 					return { kind: "hit", plan, joined, producer: selected.record };
@@ -196,8 +204,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				continue; // A candidate may have completed while history was being read.
 			}
 			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
-			// Waiting grants no transfer authority; only repeatable sealed evidence may cross turns.
-			const running = records.find((record) => record.state.status === "running" && sameScope(record.scope, scope)) ??
+			// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
+			const running = records.find((record) => record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope)) ??
 				records.find((record) => record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
 			if (!running || (await request.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
 			joined = true;

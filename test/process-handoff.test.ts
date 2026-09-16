@@ -14,6 +14,28 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it.each(["completed", "running"])("transfers %s work across a live consumer's turn and rechecks revocation", async phase => {
+		let active = false;
+		const acceptScope = (scope: typeof SCOPE) => active && scope.turnID === OTHER_SCOPE.turnID;
+		const fixture = await producer(true, undefined, 0, SCOPE, new ProcessHandoffOwnership(undefined, acceptScope));
+		if (phase === "completed") await fixture.publish();
+		await expect(acquireActor(fixture, undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+		active = true;
+		await expect(acquireActor(fixture, undefined, undefined, { ...OTHER_SCOPE, sessionID: "foreign" })).resolves.toMatchObject({ kind: "miss" });
+		const validation = gated();
+		const actor = acquireActor(fixture, async live => {
+			if (!live) return;
+			await validation.wait(); return livePlan(live);
+		}, async () => { await fixture.publish(); return "completed"; }, OTHER_SCOPE);
+		await validation.entered;
+		active = false; validation.release();
+		await expect(actor).resolves.toMatchObject({ kind: "miss" });
+		active = true;
+		await expect(acquireActor(fixture, undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
+		await expect(acquireActor(fixture, undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+		await expect(fixture.ownership.commit(async () => "whole")).rejects.toMatchObject({ disposition: "recoverable" });
+		fixture.registry.dispose();
+	});
 	it("owns bounded launch bindings without persisting secrets or granting result adoption", async () => {
 		for (const source of ["sealed", "consumed", "native"]) for (const revoke of ["clear", "count", "bytes", "dispose"] as const) {
 			const consumed = source === "consumed", native = source === "native";
@@ -300,8 +322,8 @@ describe("ProcessHandoffRegistry", () => {
 	});
 });
 
-async function producer(oneShot = false, registry = new ProcessHandoffRegistry<unknown>(8), exitCode = 0, scope = SCOPE) {
-	const ownership = new ProcessHandoffOwnership(), certificate = processCertificate(oneShot, exitCode);
+async function producer(oneShot = false, registry = new ProcessHandoffRegistry<unknown>(8), exitCode = 0, scope = SCOPE, ownership = new ProcessHandoffOwnership()) {
+	const certificate = processCertificate(oneShot, exitCode);
 	const key = certificate.weakKey;
 	const acquired = await registry.acquire({
 		key,

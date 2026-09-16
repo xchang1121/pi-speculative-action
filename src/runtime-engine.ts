@@ -14,7 +14,7 @@ import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
-import { type ExecutionOperationAdoption, type ExecutionOperationBinding, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
+import { type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionScope, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
@@ -443,6 +443,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+	acceptOperationScope?: (scope: ExecutionScope) => boolean;
 	validationMs: number;
 	validationBytes: number;
 	validationFiles: number;
@@ -1295,6 +1296,13 @@ export function makeSpeculativeActionRuntime<
 		let branch: WorldBranch<Output> | undefined;
 		try {
 			const parent = candidateWorld(candidate);
+			candidate.acceptOperationScope = scope => {
+				const turn = session.turns.get(scope.turnID);
+				if (session.lifecycle.sealed || masterDisabled() || scope.sessionID !== session.id ||
+					turn?.lifecycle !== "active" || candidate.work.controller.signal.aborted || !candidateStore.has(session.id, candidate)) return false;
+				return session.plan.matchable(turn.decisionSequence).some(node =>
+					"candidateID" in node.execution && node.execution.candidateID === candidate.id);
+			};
 			if (candidate.owner.draft.type === "operation") candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
 				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn ||
@@ -1320,6 +1328,7 @@ export function makeSpeculativeActionRuntime<
 				index: candidate.owner.index,
 				signal: candidate.work.controller.signal,
 				onOperationAdopted: candidate.onOperationAdopted,
+				acceptOperationScope: candidate.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
 			});
 			const output = branch.output;

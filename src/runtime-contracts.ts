@@ -2,7 +2,7 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
-import type { ExecutionOperationAdoption, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
+import type { ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
 import type { TimelineInterval } from "./task-timing.ts";
@@ -261,6 +261,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly executeCandidate: (input: Omit<RuntimeTurnContext<StartInput, StateData>, "settings"> & BoundCandidateCall & {
 		readonly parentWorld?: WorldBranch<Output>;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+		readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
 	}) => MaybePromise<WorldBranch<Output>>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {
