@@ -37,11 +37,11 @@ describe("strace provenance decoder", () => {
 				"newfstatat(AT_FDCWD, " + quoted + ", " + STAT + ", 0) = 0",
 				"fstat(3<" + descriptor + ">, " + STAT + ") = 0",
 			] });
-			expect(observation, name).toMatchObject({ complete: true, taints: [], incompleteReasons: [] });
+			expect(observation, name).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
 			expect(observation.paths, name).toContainEqual({ path: target, role: "metadata", followSymlinks: true, digest: STAT_DIGEST });
 		}
 		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
-		expect(failed).toMatchObject({ complete: true, taints: [], incompleteReasons: [] });
+		expect(failed).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
 		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
 		for (const line of ['openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3', 'openat(8, "unresolved", O_RDONLY) = 3'])
 			await expect(observe({ 100: [EXEC, line] })).rejects.toThrow();
@@ -80,7 +80,7 @@ describe("strace provenance decoder", () => {
 				incompleteReasons: complete ? [] : [spawn.includes("UNKNOWN") ? "clone_flags_unparsed:700" : "shared_cwd_mutation"] });
 			if (!complete) { expect(observation.taints).toContain("trace_incomplete"); continue; }
 			const childCwd = mutation.endsWith("= 0") ? "/work/final/child" : "/work/final";
-			expect(observation.taints).toEqual(["network"]);
+			expect(observation.taints).toEqual(["clock", "network", "random"]);
 			expect(observation.paths).toEqual(expect.arrayContaining([
 				...[...calls.values(), ["/work/final", "/work/final/input", "/work/input.txt"]].flat().map((path) => ({ path, role: "input" })),
 				{ path: childCwd + "/relative.dat", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
@@ -119,7 +119,7 @@ describe("strace provenance decoder", () => {
 					...(bypass ? ['execve("/private/original/tool", ["tool"], 0x0) = 0',
 						'openat(AT_FDCWD, "/work/input", O_RDONLY) = 4'] : ["socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3"])],
 			}, { interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]] });
-			expect(observation).toMatchObject({ complete: true, taints: [] });
+			expect(observation).toMatchObject({ complete: true, taints: ["clock", "random"] });
 			expect(observation.paths).not.toContainEqual({ path: "/usr/bin/tool", role: "executable" });
 			expect(observation.paths).not.toContainEqual({ path: "/private/launcher", role: "input" });
 			if (bypass) expect(observation.paths).toEqual(expect.arrayContaining([
@@ -169,7 +169,8 @@ describe("strace provenance decoder", () => {
 			['rename("/outside/source", "/outside/moved") = -1 EXDEV (Invalid cross-device link)', []],
 		] as const) {
 			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: ["/work"] });
-			expect(observation, line).toMatchObject({ complete: !semanticGap, taints, incompleteReasons: semanticGap ? [`filesystem_semantics:${semanticGap}:100`] : [] });
+			expect(observation, line).toMatchObject({ complete: !semanticGap, taints: [...new Set(["clock", "random", ...taints])].sort(),
+				incompleteReasons: semanticGap ? [`filesystem_semantics:${semanticGap}:100`] : [] });
 			if (line.includes('"/work/input"')) expect(observation.paths).toContainEqual({ path: "/work/input", role: "input" });
 			if (line.startsWith("setxattr")) expect(observation.paths).toContainEqual({ path: "/work/output", role: "input" });
 		}

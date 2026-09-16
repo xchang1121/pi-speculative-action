@@ -16,10 +16,9 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { sha256Digest } from "../src/provenance-certificate.ts";
-import { validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
@@ -47,6 +46,7 @@ describe("Linux process ExecutionWorld", () => {
 	test.for(["completed", "running", "native", "native-merged"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
+		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const release = deferred();
@@ -62,7 +62,7 @@ describe("Linux process ExecutionWorld", () => {
 int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
-	for (volatile unsigned long iteration = 0; iteration < ${native ? 50000000 : 0}ul; ++iteration) {}
+	for (volatile unsigned long iteration = 0; iteration < ${mode === "running" ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
 	return ${mode === "native-merged" ? 'write(2, "stderr\\n", 7) != 7' : "0"};
@@ -95,12 +95,14 @@ int main(int argc, char **argv) {
 				finally { await branch.dispose(); }
 				[binding] = fixture.backend.executionBindings(later);
 				expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
-				const [certificate] = await fixture.backend.store.findByWeakKey(binding!.key, path.join(fixture.workspace, "worker"));
+				const certificate = publishing.mock.calls.find(([certificate]) => certificate.weakKey === binding!.key)?.[0];
 				expect(certificate!.producer.execution.authority).toBe("speculative");
+				expect(certificate!.dependencyCertificate.taints).toEqual(["clock", "random"]);
+				expect(await fixture.backend.store.findByWeakKey(binding!.key, path.join(fixture.workspace, "worker"))).toEqual([]);
 				expect(JSON.stringify(binding)).not.toContain("private argument");
 				expect(JSON.stringify(binding)).not.toContain("private value");
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
-				await expect(validateDynamicDependencyCertificate(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
+				await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
 
 				await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
@@ -119,7 +121,7 @@ int main(int argc, char **argv) {
 				const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
 					environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
 				expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
-				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 1, crossTurnHits: 1 });
+				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 0, crossTurnHits: 0 });
 			} else {
 				expect(fixture.backend.executionBindings(later)).toEqual([]);
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
@@ -157,13 +159,14 @@ int main(int argc, char **argv) {
 			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
 			await host.finishTurn("seed");
 			expect(seedFallback).toHaveBeenCalledOnce(); // The whole Bash metadata proof remains rejected; the child can still be adopted.
-			expect(fixture.backend.actorMetrics().hits).toBe(native ? 0 : 2);
+			expect(fixture.backend.actorMetrics().hits).toBe(native ? 0 : 1);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
 			let sealing = false, joining: boolean | undefined;
+			let joinEvidence: unknown;
 			if (mode === "running") {
 				const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 				const publish = handoffs.publish.bind(handoffs);
@@ -174,7 +177,10 @@ int main(int argc, char **argv) {
 				const assess = scheduler.assessCandidateJoin.bind(scheduler);
 				const assessment = vi.spyOn(scheduler, "assessCandidateJoin").mockImplementation(request => {
 					const decision = assess(request);
-					if (request.state === "running") joining = decision.allowed;
+					if (request.state === "running") {
+						joining = decision.allowed; joinEvidence = { request, decision };
+						if (joining) queueMicrotask(() => release.resolve());
+					}
 					return decision;
 				});
 				restoreJoin = () => { publication.mockRestore(); assessment.mockRestore(); };
@@ -185,18 +191,24 @@ int main(int argc, char **argv) {
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
+			if (mode === "running") {
+				let output = "";
+				await route.executor.execute({ command: changedParent, cwd: fixture.workspace, environment: fixture.environment,
+					scope: { ...scope, turnID: "foreign" }, onData: bytes => { output += bytes.toString(); } });
+				expect(output).toBe("automatic-parent\nnewest\n");
+				expect(joining, "another turn cannot wait for this one-shot producer").toBeUndefined();
+			}
 			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
 			if (mode === "running") {
 				await expect.poll(() => joining).toBeDefined();
-				expect(joining).toBe(true);
-				await nextTurn(); release.resolve();
+				expect(joining, JSON.stringify(joinEvidence)).toBe(true);
 			}
 			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\nnewest\n${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
-			expect(fixture.backend.actorMetrics().joinedHits).toBe(Number(mode === "running"));
+			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence, metrics: fixture.backend.actorMetrics() })).toBe(Number(mode === "running"));
 			await host.finishTurn("prepared");
 			const execution = events.filter(event => event.type === "actor_action")
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
@@ -217,7 +229,7 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { release.resolve(); restoreJoin?.(); await host?.dispose(); await fixture.dispose(); }
+		} finally { release.resolve(); restoreJoin?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
@@ -716,7 +728,7 @@ int main(void) {
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
 		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt"
-			: failure === "host_parent" ? "tainted:mutable_input" : `injected ${failure} capture failure`);
+			: failure === "host_parent" ? "mutable_input" : `injected ${failure} capture failure`);
 		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
 		let processContext = {};
 		let restoreTransactions: (() => void) | undefined;
@@ -764,13 +776,14 @@ int main(void) {
 			if (JSON.stringify(args[1]).includes("/trace-")) executions++;
 			return spawn(...args);
 		});
-		const put = fixture.backend.store.put.bind(fixture.backend.store);
+		const planner = fixture.backend.planner;
+		const publish = planner.publishCompleted.bind(planner);
 		let publicationFailed = false;
-		const publishing = vi.spyOn(fixture.backend.store, "put").mockImplementation(async (certificate) => {
+		const publishing = vi.spyOn(planner, "publishCompleted").mockImplementation(async (...args) => {
 			if (failure === "publication" && !publicationFailed) {
 				publicationFailed = true; failed.resolve(); await gate.promise; throw error;
 			}
-			return put(certificate);
+			return publish(...args);
 		});
 		let running: ReturnType<typeof forkReusableBash> | undefined;
 		try {
@@ -802,9 +815,9 @@ int main(void) {
 			}
 			const validation = await branch.validate?.();
 			if (failure === "publication") {
-				await expect(validateDynamicDependencyCertificate(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
+				await expect(validateTransferredProcessEvidence(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
 				expect(lastError).toContain(`nested_publish:${error.message}`);
-				expect(detail).toMatchObject({ certificateID: publishing.mock.calls[0]![0].id, complete: true, taints: [] });
+				expect(detail).toMatchObject({ certificateID: publishing.mock.calls[0]![0].id, complete: true, taints: ["clock", "random"] });
 				// The parent's independent directory identity proof must still reject this private root.
 				expect(validation).toMatchObject({ status: "stale", cause: { code: "process_dependency_changed", detail: fixture.workspace } });
 				expect((await fixture.backend.store.stats()).certificates).toBe(0);
@@ -941,8 +954,10 @@ int main(void) {
 		}
 	});
 
-	test.for(["rename", "posix-lock", "ofd-lock", "flock"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["rename", "posix-lock", "ofd-lock", "flock", "rdtsc", "auxv-random"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
+		const instanceInput = mode === "rdtsc" || mode === "auxv-random";
+		if (instanceInput && process.arch !== "x64") return skip("x86-64 ELF input probe");
 		if (mode === "rename") {
 			const overlay = await linuxOverlayfsCapability();
 			if (!overlay.available) return skip(overlay.detail);
@@ -955,7 +970,23 @@ int main(void) {
 			await mkdir(path.join(workspace, "source"));
 			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
 			if (mode !== "rename") {
-				await writeFile(path.join(workspace, "probe.c"), `#define _GNU_SOURCE
+				await writeFile(path.join(workspace, "probe.c"), instanceInput ? `#include <elf.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv, char **envp) {
+	(void)argc; (void)argv; (void)envp; unsigned long long value;
+	${mode === "rdtsc" ? 'unsigned lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi)); value = ((unsigned long long)hi << 32) | lo;' : `
+	while (*envp) envp++;
+	Elf64_auxv_t *aux = (Elf64_auxv_t *)(envp + 1); const unsigned char *bytes = 0;
+	for (; aux->a_type != AT_NULL; aux++) if (aux->a_type == AT_RANDOM) bytes = (const unsigned char *)(uintptr_t)aux->a_un.a_val;
+	if (!bytes) return 2;
+	value = 14695981039346656037ull;
+	for (unsigned i = 0; i < 16; i++) value = (value ^ bytes[i]) * 1099511628211ull;`}
+	char output[80]; int size = snprintf(output, sizeof(output), "%llu\\n", value);
+	return write(1, output, (size_t)size) != size;
+}
+` : `#define _GNU_SOURCE
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -974,30 +1005,35 @@ int main(int argc, char **argv) {
 `);
 				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe" });
 				await commitBenchmarkFixture(workspace, "Resource control observation");
-				locker = childProcess.spawn(path.join(workspace, "probe"), ["hold"], { cwd: workspace, env: fixture.environment, stdio: ["pipe", "pipe", "pipe"] });
-				lockerClosed = once(locker, "close");
-				expect((await Promise.race([once(locker.stdout, "data"), lockerClosed.then(() => { throw new Error("lock holder exited"); })]))[0].toString()).toBe("R");
-				expect(execFileSync(path.join(workspace, "probe"), [], { cwd: workspace, env: fixture.environment, encoding: "utf8" })).toBe("L");
+				if (!instanceInput) {
+					locker = childProcess.spawn(path.join(workspace, "probe"), ["hold"], { cwd: workspace, env: fixture.environment, stdio: ["pipe", "pipe", "pipe"] });
+					lockerClosed = once(locker, "close");
+					expect((await Promise.race([once(locker.stdout, "data"), lockerClosed.then(() => { throw new Error("lock holder exited"); })]))[0].toString()).toBe("R");
+					expect(execFileSync(path.join(workspace, "probe"), [], { cwd: workspace, env: fixture.environment, encoding: "utf8" })).toBe("L");
+				}
 			}
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { includeWorkspaceFingerprint: true });
 			branch = await forkReusableBash(fixture, { command: mode === "rename" ? "mv source moved" : "probe", label: "driver-semantics-test",
 				actionNamespace: "driver-semantics-test", executionFingerprint });
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			if (mode !== "rename") {
-				expect(branch.output.result.content).toEqual([{ type: "text", text: "U" }]);
+				expect(branch.output.result.content).toEqual([{ type: "text", text: instanceInput ? expect.stringMatching(/^\d+\n$/) : "U" }]);
 				const route = await backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 					sourceRoot: workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
 						executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
 				}, true);
 				if (!("executor" in route)) throw new Error(route.detail);
 				let output = "";
-				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment, onData: data => { output += data.toString(); } });
-				expect(output, JSON.stringify(backend.actorMetrics())).toBe("L");
+				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment,
+					scope: { sessionID: "benchmark", turnID: "later" }, onData: data => { output += data.toString(); } });
+				expect(output, JSON.stringify(backend.actorMetrics())).toEqual(instanceInput ? expect.stringMatching(/^\d+\n$/) : "L");
 				expect(backend.actorMetrics().hits).toBe(0);
 			}
-			const validation = await branch.validate?.();
-			expect(validation?.status).toBe("indeterminate");
-			expect(JSON.stringify(validation)).toContain(mode === "rename" ? "filesystem_semantics" : "ipc");
+			if (!instanceInput) {
+				const validation = await branch.validate?.();
+				expect(validation?.status).toBe("indeterminate");
+				expect(JSON.stringify(validation)).toContain(mode === "rename" ? "filesystem_semantics" : "ipc");
+			}
 			expect(branch.executionMetrics.reuse?.requests).toBeGreaterThan(0);
 			expect(branch.executionMetrics.reuse?.executionMs).toBeGreaterThan(0);
 			expect(backend.metrics().tainted).toBeGreaterThan(0);

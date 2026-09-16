@@ -255,7 +255,10 @@ export async function observeStrace(
 
 	const paths = new Map<string, DependencyRole>();
 	const metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
-	const taints = new Set<ProvenanceTaint>();
+	// Native instructions and ELF startup state expose clock/random inputs without a syscall.
+	// A complete transcript therefore permits only the existing one-shot transfer, never proof
+	// that this process can be repeated. Do not infer unused inputs from their absence here.
+	const taints = new Set<ProvenanceTaint>(["clock", "random"]);
 	const interposedExecutables = new Map(
 		(options.interposedExecutables ?? []).map(([intercepted, original]) => [
 			path.posix.resolve(intercepted), path.posix.resolve(original),
@@ -310,8 +313,6 @@ export async function observeStrace(
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) taints.add("ipc");
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command)) taints.add("unsupported_syscall");
 			}
-			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
-			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
 				taints.add("confinement_observation");
 			}
@@ -473,8 +474,6 @@ function nonSocketQuery(line: TraceLine): boolean {
 		Boolean(absoluteDescriptorPath(line.args[0]) || /^\d+<pipe:\[\d+\]>$/.test(line.args[0] ?? ""));
 }
 
-const CLOCK_SYSCALLS = new Set(["clock_gettime", "gettimeofday", "time", "sysinfo", "times", "getrusage"]);
-const RANDOM_SYSCALLS = new Set(["getrandom"]);
 
 function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
 	if (!syscallSucceeded(line)) return false;

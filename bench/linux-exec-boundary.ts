@@ -54,7 +54,7 @@ try {
 	if (jobControl.code !== 0 || jobControl.stdout.toString() !== "resumed") throw new Error("ptrace changed job-control stops");
 	const detached = await run([tracer, "/bin/bash", "-c", "sleep 1 >/dev/null 2>&1 &"]);
 	if (detached.code !== 0 || detached.durationMs < 900) throw new Error("ptrace released an owned child after parent exit");
-	const childConversion = process.arch === "x64" ? await conversionAblation(tracer) : undefined;
+	const childConversion = process.arch === "x64" ? await conversionAblation() : undefined;
 	await writeBenchmarkReport({
 		schemaVersion: 2,
 		measuredAt: new Date().toISOString(),
@@ -77,14 +77,8 @@ function assertSame(expected: Outcome, actual: Outcome): void {
 		throw new Error("pass-through tracer changed the command result");
 }
 
-async function conversionAblation(heldExecBinary: string) {
+async function conversionAblation() {
 	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
-	const replayBackend = new LinuxProcessReuseBackend({
-		storeRoot: fixture.storeRoot,
-		heldExecBinary,
-		sandlockBinary: "/pi-dependency-disabled/sandlock",
-		straceBinary: "/pi-dependency-disabled/strace",
-	});
 	try {
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		await writeFile(path.join(fixture.workspace, "worker.c"), String.raw`
@@ -173,10 +167,11 @@ int main(int argc, char **argv) {
 		await withProducer("held-producer", ": speculative-parent; worker result.txt", async (production) => {
 			const branch = await production;
 			assert(!branch.output.isError, `speculative child failed: ${textOutput(branch.output.result)} ${JSON.stringify(fixture.backend.metrics())}`);
-			assert(fixture.backend.metrics().published > 0, `speculative child did not publish a reusable certificate: ${JSON.stringify(fixture.backend.metrics())}`);
+			assert(fixture.backend.metrics().tainted > 0 && fixture.backend.metrics().published === 0,
+				`native instance inputs escaped one-shot ownership: ${JSON.stringify(fixture.backend.metrics())}`);
 		});
-		const actor = await heldActor(fixture, replayBackend);
-		const { output: hit, totalMs: hitMs, metrics: hitMetrics } = await measureActor(replayBackend, actor, "held-hit", actorCommand);
+		const actor = await heldActor(fixture, fixture.backend);
+		const { output: hit, totalMs: hitMs, metrics: hitMetrics } = await measureActor(fixture.backend, actor, "held-hit", actorCommand);
 		assert(textOutput(hit) === expectedOutput, "held child changed Actor output");
 		assert((await readFile(path.join(fixture.workspace, "result.txt"))).equals(expectedResult), "held child changed workspace result");
 		assert(
@@ -184,7 +179,7 @@ int main(int argc, char **argv) {
 				hitMetrics.reusedProcessMs > 0,
 			`uncalibrated held child did not separate reused work from Actor timing: ${JSON.stringify(hitMetrics)}`,
 		);
-		const joiningActor = await heldActor(fixture, fixture.backend);
+		const joiningActor = actor;
 
 		const cwdProducerBefore = fixture.backend.metrics();
 		const cwdHits = await withProducer("held-cwd-producer", "/bin/pwd", async (production) => {
@@ -206,11 +201,11 @@ int main(int argc, char **argv) {
 			const securityBranch = await production;
 			assert(textOutput(securityBranch.output.result).includes("nnp:1"), "producer confinement probe was not active");
 			const produced = metricDelta(securityBefore, fixture.backend.metrics());
-			assert(produced.tainted === 1 && produced.published === 1,
+			assert(produced.tainted === 1 && produced.published === 0,
 				`confinement evidence was not retained: ${JSON.stringify(produced)}; validation=${JSON.stringify(await securityBranch.validate?.())}`);
 		});
 		const { output: securityActor, metrics: securityMetrics } = await measureActor(
-			replayBackend, actor, "held-security-actor", ": actor-security; worker unused probe");
+			fixture.backend, actor, "held-security-actor", ": actor-security; worker unused probe");
 		assert(textOutput(securityActor).includes("nnp:0"), "Actor did not retain its native security context");
 		assert(
 			securityMetrics.hits === 0 && securityMetrics.misses >= 1 && securityMetrics.lastError?.includes("certificate_tainted"),
@@ -222,7 +217,7 @@ int main(int argc, char **argv) {
 			const expectedInode = (await lstat(path.join(fixture.workspace, "input.txt"), { bigint: true })).ino
 				.toString(16).padStart(16, "0");
 			const { output: inodeActor, metrics: inodeMetrics } = await measureActor(
-				replayBackend, actor, "held-inode-actor", ": actor-inode; worker unused inode");
+				fixture.backend, actor, "held-inode-actor", ": actor-inode; worker unused inode");
 			assert(
 				textOutput(inodeActor).trim() === expectedInode,
 				`Actor observed speculative inode metadata: expected ${expectedInode}, got ${JSON.stringify(textOutput(inodeActor).trim())}; ${JSON.stringify(inodeMetrics)}`,
@@ -323,7 +318,7 @@ int main(int argc, char **argv) {
 				hits: hitMetrics.hits,
 				reusedProcessMs: hitMetrics.reusedProcessMs,
 				actorTimingAvailable: hitMetrics.actorTimedHits > 0,
-				producerDependenciesDisabledAtReplay: ["sandlock", "strace"],
+				source: "same-scope handoff",
 			},
 			joining: {
 				// A fixed arrival lead is a workload parameter, not a promise that joining beats fallback.
@@ -348,7 +343,6 @@ int main(int argc, char **argv) {
 			metadataMismatch,
 		};
 	} finally {
-		await replayBackend.dispose();
 		await fixture.dispose();
 	}
 }
