@@ -57,6 +57,8 @@ export interface CandidateJoinRequest {
 	readonly state: "queued" | "running" | "succeeded";
 	readonly expectedSpeculativeDurationMs: number;
 	readonly elapsedMs?: number;
+	/** Forecast lead before the Actor arrives; it is not execution already performed. */
+	readonly leadTimeMs?: number;
 }
 
 type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
@@ -306,7 +308,7 @@ export class SpeculationScheduler<Job extends object> {
 			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, 1);
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0;
 		const expectedRemainingMs =
-			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs);
+			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs - finite(request.leadTimeMs));
 		const expectedAdoptionMs = adoption?.value ?? 0;
 		const expectedNetBenefitMs =
 			expectedActorMs === undefined
@@ -354,12 +356,14 @@ export class SpeculationScheduler<Job extends object> {
 		);
 		const estimatedDeadlineMs = expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
-		if (waitBudgetMs <= 0) {
-			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
+		// A cancelled run supplies no completion sample. Passing that floor does not mean this run is nearly done.
+		const uncalibratedOverrun = speculative?.samples === 0 && request.state === "running" && elapsedMs >= expectedSpeculativeMs;
+		if (waitBudgetMs <= 0 || uncalibratedOverrun && !speculative.window.allowProbe()) {
+			return { allowed: false, reason: uncalibratedOverrun ? "warmup_probe" : "fallback_faster", waitBudgetMs: 0, ...base };
 		}
 		return {
 			allowed: true,
-			reason: speculative ? "profitable" : "warmup_probe",
+			reason: speculative?.samples ? "profitable" : "warmup_probe",
 			waitBudgetMs,
 			...base,
 		};
@@ -380,9 +384,9 @@ export class SpeculationScheduler<Job extends object> {
 			this.speculativeServiceTimes.get(key)?.estimate(0.9, "upper") === undefined) return true;
 		return this.assessCandidateJoin({
 			identity: forecast,
-			state: "running",
+			state: "queued",
 			expectedSpeculativeDurationMs: expectedDurationMs,
-			elapsedMs: runway,
+			leadTimeMs: runway,
 		}).allowed;
 	}
 
