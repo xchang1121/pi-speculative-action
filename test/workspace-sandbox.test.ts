@@ -18,7 +18,8 @@ import {
 } from "../src/effect-model.ts";
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { advanceFilesystemClock } from "../src/filesystem-evidence.ts";
+import { advanceFilesystemClock, captureStableFile } from "../src/filesystem-evidence.ts";
+import { hydrateWorkspaceFileEntry } from "../src/process-observation.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
@@ -198,6 +199,11 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot();
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
 		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
+		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
+		try {
+			expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
+			expect(validations, "driver selection must not revalidate a quiet prepared tree").not.toHaveBeenCalled();
+		} finally { validations.mockRestore(); }
 		await Promise.all(
 			Array.from({ length: 100 }, (_value, index) =>
 				writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
@@ -361,7 +367,14 @@ describe("workspace-branch ExecutionWorld", () => {
 				await mkdir(path.join(workspace.sandboxRoot, "replaced"));
 				await writeFile(path.join(workspace.sandboxRoot, "replaced", "created.txt"), "opaque\n", "utf8");
 				const delta = await capture.finish();
-				expect(delta.complete).toBe(true);
+				if (!delta.complete) throw new Error(delta.reason);
+				for (const snapshot of [delta.before, delta.after]) {
+					for (const [resource, entry] of snapshot.entries) {
+						if (entry.kind !== "file") continue;
+						const bytes = await captureStableFile(entry.contentPath ?? path.join(snapshot.root, resource));
+						expect(hydrateWorkspaceFileEntry(entry, bytes), resource).toMatchObject({ kind: "file" });
+					}
+				}
 				expect((await readdir(workspace.sandboxRoot)).some((entry) => entry.startsWith(".pi-speculative-"))).toBe(
 					false,
 				);
@@ -814,6 +827,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				// A stat-only change must not rebuild identical bytes, even when notifications are delayed.
 				const modified = iteration === 2 ? new Date("2021-01-01T00:00:00Z") : timestamp;
 				await utimes(path.join(root, "value[1].txt"), modified, modified);
+				await sandbox.fingerprint({ driver: "auto" }, root);
 				await sandbox.prepare(root, { driver: "git", signal });
 				const count = captures.mock.calls.length;
 				const roots = await Promise.all(["first\n", "second\n"].map((content) =>

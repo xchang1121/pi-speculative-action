@@ -388,7 +388,8 @@ async function resolveWorkspaceDriver(
 	const repository = acquiredRepository ?? ownedRepository;
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
-		const commit = await acquireSandboxBaseline(repository);
+		// Driver choice is preparation; actual workspace allocation still validates the exact baseline.
+		const commit = await acquireSandboxBaseline(repository, true);
 		const cached = repository.autoDriverDecision;
 		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) {
 			return cached.resolved;
@@ -1375,7 +1376,11 @@ function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<Work
 	baseline.structure ??= captureWorkspaceStructure(baseline.sandboxRoot, {
 		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
 		exclude: SNAPSHOT_EXCLUDES,
-	});
+	}).then(snapshot => Object.freeze({ ...snapshot,
+		// The lower stat identity belongs to this owned resource, not the merged mount's device.
+		entries: new Map([...snapshot.entries].map(([resource, entry]) => [resource,
+			entry.kind === "file" ? { ...entry, contentPath: path.join(snapshot.root, resource) } : entry])),
+	}));
 	return baseline.structure;
 }
 

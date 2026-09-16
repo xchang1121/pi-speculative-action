@@ -8,6 +8,8 @@ interface WorkspaceEntryChange {
 export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 	| {
 			readonly kind: "file";
+			/** Owned byte source when an immutable lower entry is carried into a layered view. */
+			readonly contentPath?: string;
 			readonly digest: Sha256Digest;
 			readonly metadataDigest: Sha256Digest;
 			readonly mode: number;
