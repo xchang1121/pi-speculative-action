@@ -107,7 +107,7 @@ import {
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-descriptor-controls";
+const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
@@ -920,6 +920,8 @@ export class LinuxProcessReuseBackend {
 			...("timing" in participant ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
+					// This observer cannot seal repeatable native instance inputs after the wait either.
+					if (!sameScope(scope, running.scope)) return "miss";
 					admission = this.processScheduler.assessCandidateJoin({
 						identity: participant.timing, state: "running", expectedSpeculativeDurationMs: 1,
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
@@ -1434,6 +1436,8 @@ function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest):
 		tool: "process",
 		executionFingerprint: digestObject({
 			executable: prototype.executableDigest,
+			// Different arguments can select a cheap probe or expensive work in the same image.
+			argv: prototype.argvDigest,
 			context: prototype.processContextDigest,
 			platform: prototype.platformFingerprint,
 		}),
