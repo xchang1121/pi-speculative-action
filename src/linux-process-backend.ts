@@ -462,7 +462,7 @@ export class LinuxProcessReuseBackend {
 					);
 					const weakKey = processWeakKey(prototype);
 					timing = processTimingIdentity(prototype, weakKey);
-					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded", expectedSpeculativeDurationMs: 1 });
+					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded" });
 					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
 					if (!plan) return this.actorReplayMiss(host, request, timing);
@@ -912,7 +912,7 @@ export class LinuxProcessReuseBackend {
 		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
 		let waitedMs = 0;
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
-		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded", expectedSpeculativeDurationMs: 1 }) : undefined;
+		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded" }) : undefined;
 		if (admission && !admission.allowed) {
 			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
 		}
@@ -925,7 +925,7 @@ export class LinuxProcessReuseBackend {
 				waitForRunning: async (running: ProcessHandoff) => {
 					if (!running.ownership.acceptsScope(running.scope, scope)) return "miss";
 					admission = this.processScheduler.assessCandidateJoin({
-						identity: participant.timing, state: "running", expectedSpeculativeDurationMs: 1,
+						identity: participant.timing, state: "running",
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 					});
 					if (!admission.allowed) return "miss";
