@@ -267,6 +267,7 @@ export function createSpeculativeActionExtension(
 ): ExtensionFactory {
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
+		const sessions = new RuntimeLifecycleLane();
 		const wrapperSources = new Map<string, string>();
 		const actorStream = new ActorStreamPreviewTracker();
 		const providerRequest = new AsyncLocalStorage<"drafter">();
@@ -275,11 +276,11 @@ export function createSpeculativeActionExtension(
 			providerRequest.getStore() === "drafter" ? event.payload : controller?.decorateActorPayload(event.payload),
 		);
 
-		pi.on("session_start", async (_event, ctx) => {
+		pi.on("session_start", (_event, ctx) => sessions.run(async () => {
 			await controller?.dispose();
 			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRequest);
 			controller.attachUI(ctx.ui);
-		});
+		}));
 		pi.on("context", async (event, ctx) => {
 			actorStream.clear();
 			await controller?.startTurn(event.messages, ctx);
@@ -300,13 +301,13 @@ export function createSpeculativeActionExtension(
 		pi.on("agent_end", async () => {
 			await controller?.finishTurn(true);
 		});
-		pi.on("session_shutdown", async (_event, ctx) => {
+		pi.on("session_shutdown", (_event, ctx) => sessions.run(async () => {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			const current = controller;
 			controller = undefined;
 			current?.detachUI();
 			await current?.dispose().catch(() => undefined);
-		});
+		}));
 
 		const command = {
 			description: "Configure speculative action pre-execution",

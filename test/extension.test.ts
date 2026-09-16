@@ -194,22 +194,23 @@ describe("zero-modification Pi extension", () => {
 		}
 	});
 
-	it.each(["retiring", "ready", "rejected", "thrown"] as const)("joins every admitted refresh preparation through shutdown (%s)", async (state) => {
+	it.each(["starting", "retiring", "ready", "rejected", "thrown"] as const)("owns session installation and every admitted refresh through shutdown (%s)", async (state) => {
 		const fixture = await createFixture({ settings: { enabled: true, searchExecution: "captured" } });
 		const profiles: ReturnType<typeof searchProfile>[] = [];
+		const searchGate = gated(), actorGate = gated();
 		const prepare = vi.spyOn(piTools, "createClosedSearchProfile").mockImplementation(async () => {
+			if (state === "starting") await searchGate.wait();
 			const profile = searchProfile(); profiles.push(profile); return profile;
 		});
-		const searchGate = gated(), actorGate = gated();
 		const actor = vi.spyOn(LinuxProcessReuseBackend.prototype, "prepareActorReplay").mockImplementation(async () => {
 			await actorGate.wait(); return { state: "unavailable", detail: "test route" };
 		});
 		const closeHost = vi.spyOn(fixture.host, "dispose");
 		let refresh: Promise<unknown> | undefined, shutdown: Promise<void> | undefined;
 		try {
-			await fixture.emit("session_start");
+			if (state !== "starting") await fixture.emit("session_start");
 			if (state === "retiring") profiles[0]!.pool.dispose.mockImplementationOnce(searchGate.wait);
-			else prepare.mockImplementationOnce(async () => {
+			else if (state !== "starting") prepare.mockImplementationOnce(async () => {
 				await searchGate.wait(); const profile = searchProfile(); profiles.push(profile); return profile;
 			});
 			vi.mocked(fixture.host.executionWorldDiagnostics).mockImplementationOnce(() => {
@@ -217,7 +218,8 @@ describe("zero-modification Pi extension", () => {
 				return state === "rejected" ? Promise.reject(new Error("diagnostics rejected")) : Promise.resolve(portableDiagnostics());
 			});
 			let refreshed = false, closed = false;
-			refresh = Promise.resolve(fixture.commands.get("speculative-action")!.handler("status", fixture.context as ExtensionCommandContext))
+			refresh = Promise.resolve(state === "starting" ? fixture.emit("session_start")
+				: fixture.commands.get("speculative-action")!.handler("status", fixture.context as ExtensionCommandContext))
 				.then(() => { refreshed = true; });
 			await searchGate.entered;
 			await nextTurn();
@@ -228,13 +230,14 @@ describe("zero-modification Pi extension", () => {
 			const whileClosing = { closed, host: closeHost.mock.calls.length };
 			searchGate.release();
 			await nextTurn();
-			if (state !== "retiring") expect({ refreshed, closed }).toEqual({ refreshed: false, closed: false });
+			if (state !== "starting" && state !== "retiring") expect({ refreshed, closed }).toEqual({ refreshed: false, closed: false });
 			actorGate.release();
 			await Promise.all([refresh, shutdown]);
-			expect(whileSearchPending).toEqual({ refreshed: false, actor: state === "retiring" ? 0 : 1, diagnostics: state === "retiring" ? 1 : 2 });
+			const prepared = state === "starting" || state === "retiring" ? 1 : 2;
+			expect(whileSearchPending).toEqual({ refreshed: false, actor: prepared - 1, diagnostics: prepared });
 			expect(whileClosing).toEqual({ closed: false, host: state === "retiring" ? 1 : 0 });
-			expect(prepare).toHaveBeenCalledTimes(state === "retiring" ? 1 : 2);
-			expect(profiles.map((profile) => profile.pool.dispose.mock.calls.length)).toEqual(state === "retiring" ? [1] : [1, 1]);
+			expect(prepare).toHaveBeenCalledTimes(prepared);
+			expect(profiles.map((profile) => profile.pool.dispose.mock.calls.length)).toEqual(Array(prepared).fill(1));
 		} finally {
 			searchGate.release(); actorGate.release();
 			await Promise.allSettled([refresh, shutdown]);
