@@ -103,7 +103,7 @@ export type SourceRequestSettlement =
 	| { readonly status: "error"; readonly cause: ResolutionCause & { readonly stage: "source" } }
 	| { readonly status: "aborted"; readonly cause: ResolutionCause & { readonly stage: "source" } };
 
-export type SourceRequestKind = "proposal" | "continuation";
+export type SourceRequestKind = "proposal" | "continuation" | "observation";
 
 export interface SourceRequestIdentity {
 	readonly source: string;

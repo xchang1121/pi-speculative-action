@@ -926,6 +926,7 @@ describe("speculative action host", () => {
 	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
 		const { cwd, patternSettings, patternStore, grepTool, readTool: learnedReadTool, materialized } = await patternRebaseFixture();
 		const carried = origin === "carried" || origin === "revised";
+		const retained = carried || origin === "preparing";
 		const readTool = carried ? createReadTool(cwd) : learnedReadTool;
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
 		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>(), feedbackGate = deferred<void>();
@@ -1003,11 +1004,14 @@ describe("speculative action host", () => {
 				allowRead = true;
 				await host.startTurn({ ...startInput(readTool, "next"),
 					context: { systemPrompt: "system", messages: [], tools }, tools });
-				expect(await nextRequest.promise).toBe(carried ? "empty" : "produced");
-				if (!carried) await waitFor(() => materialized.some((candidate) => candidate.turnID === "next" && candidate.tool === "read"));
+				expect(await nextRequest.promise).toBe(retained ? "empty" : "produced");
+				if (!retained) await waitFor(() => materialized.some((candidate) => candidate.turnID === "next" && candidate.tool === "read"));
 			}
-			if (carried) {
-				const args = { path: "notes.txt", offset: 2, limit: 1 };
+			if (retained) {
+				routeGate.resolve();
+				await waitFor(() => events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" && event.state.status === "succeeded"));
+				expect(materialized.filter(candidate => candidate.source === "pattern_aware" && candidate.tool === "read")).toHaveLength(1);
+				const args = { path: "notes.txt", ...(carried ? { offset: 2, limit: 1 } : {}) };
 				const native = vi.fn(() => readTool.execute("native", args));
 				expect(await host.execute({ turnID: "next", id: "narrow-read", tool: "read", args, tools }, undefined, native))
 					.toEqual(await readTool.execute("control", args));
@@ -1015,7 +1019,7 @@ describe("speculative action host", () => {
 				expect(native).not.toHaveBeenCalled();
 				expect(events.filter(event => event.type === "prediction")).toContainEqual(expect.objectContaining({ settlement:
 					expect.objectContaining({ observation: "observed", actorAction: expect.objectContaining({ turnID: "next" }), match:
-						expect.objectContaining({ matched: true, relation: expect.objectContaining({ kind: "projected", projector: "read.range" }),
+						expect.objectContaining({ matched: true, relation: expect.objectContaining(carried ? { kind: "projected", projector: "read.range" } : { kind: "exact" }),
 							adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
 			}
 		} finally { feedbackGate.resolve(); routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }

@@ -201,7 +201,8 @@ int main(int argc, char **argv) {
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
 			const timeline = new TaskTimeline(0), laterTask = new TaskTimeline(execution.startedAt);
 			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
-			expect(timeline.measure(execution.completedAt).authoritativeToolCount).toBe(2);
+			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
+				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(2);
 			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
 			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },

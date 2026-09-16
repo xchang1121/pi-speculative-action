@@ -437,8 +437,9 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["requests", "single", "batch", "revisions", "observed", "observed-terminal", "observed-disabled", "observed-disposed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
+	it.each(["requests", "single", "batch", "revisions", "observed", "observed-retained", "observed-aborted", "observed-terminal", "observed-disabled", "observed-disposed"] as const)("admits independent actions and proposals without head-of-line blocking: %s", async (mode) => {
 		const slow = gated(), executed: string[] = [];
+		const caller = new AbortController(), abandoned = deferred<void>(), retainedReady = candidateSucceeded(1, "slow.ts");
 		const independentStarted = barrier(mode === "single" || mode === "revisions" || mode === "observed" ? 1 : 2);
 		const replacementReady = candidateSucceeded(1, "replacement.ts");
 		const keyed: string[] = [];
@@ -456,11 +457,12 @@ describe("structural speculative runtime", () => {
 			{ proposalID: "proposal:0", source: "source", revision: 2, remove: ["slow"],
 			upsert: [readAction("same-plan", { path: "replacement.ts" })] }, proposals[1]!];
 		const revised = mode === "revisions" || mode === "observed";
-		const observation = mode.startsWith("observed"), retiring = observation && !revised;
+		const observation = mode.startsWith("observed"), crossing = observation && !revised;
+		const retained = mode === "observed-retained", aborted = mode === "observed-aborted";
 		const source = planSource({
 			proposalCount: () => mode === "requests" ? 2 : 1,
 			propose: ({ proposalIndex }) => observation ? undefined : mode === "revisions" ? revisions : mode === "batch" ? proposals : proposals[proposalIndex],
-			observe: ({ concrete }) => observation && concrete.path === "seed.ts" ? retiring ? proposals : observed : undefined,
+			observe: ({ concrete }) => observation && concrete.path === "seed.ts" ? crossing ? proposals : observed : undefined,
 		});
 		const { runtime, events } = harness({
 			source,
@@ -485,11 +487,15 @@ describe("structural speculative runtime", () => {
 				return "speculative";
 			},
 			onCandidateMaterialized: (candidate) => { if (String(candidate.input.path).includes("replacement.ts")) replacements.push(candidate); },
-			onEvent: replacementReady.observe,
+			onEvent: event => {
+				replacementReady.observe(event); retainedReady.observe(event);
+				if (event.type === "prediction" && event.settlement.prediction.actionID === "slow" &&
+					event.settlement.observation === "unobserved") abandoned.resolve();
+			},
 		});
 		let turnID = "parallel-admission";
 		try {
-			await runtime.startTurn(start(turnID));
+			await runtime.startTurn(start(turnID), caller.signal);
 			if (observation) {
 				const seed = call(turnID, { path: "seed.ts" });
 				await runFallback(runtime, seed, 1, "Actor");
@@ -501,11 +507,17 @@ describe("structural speculative runtime", () => {
 				expect(keyed).not.toContain("drifted-replacement.ts");
 			} else expect(keyed).not.toContain("replacement.ts");
 			expect(executed.sort()).toEqual([...(mode === "single" ? [] : ["other-plan.ts"]), revised ? "replacement.ts" : "same-plan.ts"]);
-			if (retiring) {
+			if (crossing) {
 				let closed = false;
 				const closing = runtime.finishTurn(call(turnID)).then(() => { closed = true; });
 				await nextTurn(); expect(closed).toBe(true); await closing;
 				turnID = "next-decision"; await runtime.startTurn(start(turnID));
+			}
+			if (retained || aborted) {
+				if (aborted) caller.abort();
+				slow.release(); await (retained ? retainedReady.promise : abandoned.promise);
+				expect(keyed.filter(path => path === "slow.ts")).toHaveLength(1);
+				expect(executed.includes("slow.ts")).toBe(retained);
 			}
 			if (mode === "observed") {
 				slow.release(); await runtime.finishTurn({ ...call(turnID), terminal: false });
@@ -515,8 +527,8 @@ describe("structural speculative runtime", () => {
 				source: "source", proposalID: "proposal:0", actionID: mode === "revisions" ? "next" : "same-plan",
 				input: { path: "replacement.ts" },
 			}]);
-			expect((await runtime.prepareActorCall(call(turnID, { path: revised ? "replacement.ts" : "same-plan.ts" })))?.output).toBe("speculative");
-			if (retiring) {
+			expect((await runtime.prepareActorCall(call(turnID, { path: retained ? "slow.ts" : revised ? "replacement.ts" : "same-plan.ts" })))?.output).toBe("speculative");
+			if (crossing && !retained && !aborted) {
 				let closed = false;
 				const closing = (mode === "observed-disposed" ? runtime.dispose() : mode === "observed-disabled"
 					? runtime.settingsChanged({ ...settings, enabled: false })
