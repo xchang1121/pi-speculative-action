@@ -811,7 +811,9 @@ describe("workspace-branch ExecutionWorld", () => {
 			for (const [iteration, text] of ["before\r\n", "after!\r\n", "after!\r\n"].entries()) {
 				const baseline = Buffer.from(text, encoding);
 				await writeFile(path.join(root, "value[1].txt"), baseline);
-				await utimes(path.join(root, "value[1].txt"), timestamp, timestamp);
+				// A stat-only change must not rebuild identical bytes, even when notifications are delayed.
+				const modified = iteration === 2 ? new Date("2021-01-01T00:00:00Z") : timestamp;
+				await utimes(path.join(root, "value[1].txt"), modified, modified);
 				await sandbox.prepare(root, { driver: "git", signal });
 				const count = captures.mock.calls.length;
 				const roots = await Promise.all(["first\n", "second\n"].map((content) =>
