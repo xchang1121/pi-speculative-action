@@ -105,7 +105,11 @@ static char *take_env(const char *name) {
 	return copy;
 }
 
-static int has_extra_descriptors(int ignored) {
+static int has_unmodeled_descriptors(void) {
+	/* Node fills closed standard streams; bypass before it changes the inherited table. */
+	for (int fd = 0; fd < 3; fd++) {
+		if (fcntl(fd, F_GETFD) < 0) return errno == EBADF ? 1 : -1;
+	}
 	DIR *directory = opendir("/proc/self/fd");
 	if (!directory) return -1;
 	int scan_fd = dirfd(directory), found = 0, saved = 0;
@@ -116,7 +120,7 @@ static int has_extra_descriptors(int ignored) {
 		if (!entry) { saved = errno; break; }
 		char *end;
 		long fd = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || fd <= 2 || fd == scan_fd || fd == ignored) continue;
+		if (!*entry->d_name || *end || fd <= 2 || fd == scan_fd) continue;
 		errno = 0;
 		if (fcntl((int)fd, F_GETFD) >= 0) { found = 1; break; }
 		if (errno != EBADF) { saved = errno; break; }
@@ -173,7 +177,7 @@ static int image_dispatch(int argc, char **argv) {
 	fclose(file); file = NULL;
 	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[3], name) >= (int)sizeof(invoked) ||
 		snprintf(native, sizeof(native), "%s/%s", fields[4], name) >= (int)sizeof(native)) goto done;
-	int extra = has_extra_descriptors(-1);
+	int extra = has_unmodeled_descriptors();
 	if (extra < 0) goto done;
 	if (extra) {
 		execv(native, argv);
@@ -491,11 +495,11 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("7");
+		puts("8");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
-		int extra = has_extra_descriptors(-1);
+		int extra = has_unmodeled_descriptors();
 		return extra < 0 ? 70 : extra ? 65 : 0;
 	}
 	if (getenv("PI_SPEC_HELD_EXEC_SHELL")) {
