@@ -304,6 +304,31 @@ describe("ProcessHandoffRegistry", () => {
 		fixture.registry.dispose();
 	});
 
+	it("revokes running input lookups and lets a rejected candidate yield without cancelling its owner", async () => {
+		for (const revoke of ["release", "publish", "failure", "dispose"]) {
+			const fixture = await producer(), changed = vi.fn(async () => true);
+			const release = fixture.registry.observeInputs(fixture.key, fixture.work, changed);
+			const borrowed = fixture.work.inputsChanged!;
+			await expect(borrowed()).resolves.toBe(true);
+			if (revoke === "release") release();
+			else if (revoke === "publish") await fixture.publish();
+			else if (revoke === "failure") fixture.registry.complete(fixture.key, fixture.work);
+			else fixture.registry.dispose();
+			await expect(borrowed()).resolves.toBe(false);
+			expect(changed).toHaveBeenCalledTimes(1);
+			fixture.registry.dispose();
+		}
+		const stale = await producer(), valid = await producer(false, stale.registry, 1);
+		stale.registry.observeInputs(stale.key, stale.work, async () => true);
+		await expect(acquireActor(stale, undefined, async running => {
+			if (await running.inputsChanged?.()) return "rejected";
+			await valid.publish(); return "completed";
+		})).resolves.toMatchObject({ kind: "hit", producer: valid.work, joined: true });
+		await expect(stale.work.inputsChanged!()).resolves.toBe(true);
+		await expect(stale.ownership.commit(async () => "still owned")).resolves.toBe("still owned");
+		stale.registry.dispose();
+	});
+
 	it.each(["deadline", "producer failure", "disposal"].flatMap(phase => [SCOPE, OTHER_SCOPE].map(scope => ({ phase, scope }))))(
 		"returns a miss after $phase while waiting in $scope.turnID", async ({ phase, scope }) => {
 		const fixture = await producer();
@@ -339,7 +364,7 @@ async function producer(oneShot = false, registry = new ProcessHandoffRegistry<u
 }
 
 function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = livePlan,
-	waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss"> = running => running.completion.then(() => "completed"), scope = SCOPE) {
+	waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss" | "rejected"> = running => running.completion.then(() => "completed"), scope = SCOPE) {
 	return fixture.registry.acquire({ key: fixture.key, scope, role: "actor", lookup, waitForRunning });
 }
 

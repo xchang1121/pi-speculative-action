@@ -29,6 +29,8 @@ export type WorkspaceTransactionDelta =
  * overlaps, but it must never alter or re-execute the operation itself.
  */
 export interface WorkspaceTransactionCapture {
+	/** Borrow a bounded copy of an active interval's original regular-file bytes. */
+	readonly readBefore?: (relativePath: string, maxBytes: number) => Promise<Uint8Array | undefined>;
 	readonly finish: () => Promise<WorkspaceTransactionDelta>;
 	readonly abort: () => Promise<void>;
 }

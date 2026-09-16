@@ -49,6 +49,8 @@ export interface ProcessHandoff {
 	readonly completion: Promise<void>;
 	readonly scope: ExecutionScope | undefined;
 	readonly startedAt: number;
+	/** A running owner's bounded negative lookup; false never authorizes adoption. */
+	readonly inputsChanged?: () => Promise<boolean>;
 }
 
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
@@ -60,7 +62,7 @@ export interface ProcessExecutionBinding {
 }
 
 type HandoffState =
-	| { readonly status: "running" }
+	| { readonly status: "running"; inputsChanged?: () => Promise<boolean> }
 	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
@@ -89,7 +91,7 @@ type AcquireOptions<Plan> = {
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
 	| {
 			readonly role: "actor";
-			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss">;
+			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss" | "rejected">;
 	  }
 );
 
@@ -170,10 +172,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return false;
 	}
 
+	/** The running state owns lookup access; completion or release revokes even a borrowed callback. */
+	observeInputs(key: Sha256Digest, handoff: ProcessHandoff, changed: () => Promise<boolean>): () => void {
+		const record = this.byKey.get(key)?.find(candidate => candidate === handoff), state = record?.state;
+		if (!record || state?.status !== "running") return () => {};
+		const check = () => record.state === state && state.inputsChanged === check ? changed() : Promise.resolve(false);
+		state.inputsChanged = check;
+		return () => { if (state.inputsChanged === check) state.inputsChanged = undefined; };
+	}
+
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
 		let joined = false, historyChecked = false;
-		const considered = new Map<HandoffRecord, Sha256Digest>();
+		const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
 		while (true) {
 			if (this.disposed) return { kind: "miss", joined };
 			const records = this.byKey.get(request.key) ?? [];
@@ -198,16 +209,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			}
 			if (!historyChecked) {
 				// A failed live attempt also rules out its immutable disk copy for this acquisition.
-				const plan = await request.lookup(undefined, new Set(considered.values()));
+				const plan = await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
 				if (plan && !this.disposed) return { kind: "hit", plan, joined };
 				historyChecked = true;
 				continue; // A candidate may have completed while history was being read.
 			}
 			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
 			// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
-			const running = records.find((record) => record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope)) ??
-				records.find((record) => record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
-			if (!running || (await request.waitForRunning(running)) !== "completed") return { kind: "miss", joined };
+			const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope)) ??
+				records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
+			if (!running) return { kind: "miss", joined };
+			const decision = await request.waitForRunning(running);
+			if (decision === "rejected") { considered.set(running, undefined); continue; }
+			if (decision !== "completed") return { kind: "miss", joined };
 			joined = true;
 			historyChecked = false;
 		}
@@ -261,6 +275,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			ownership,
 			startedAt: performance.now(),
 			state: { status: "running" },
+			get inputsChanged() { return record.state.status === "running" ? record.state.inputsChanged : undefined; },
 			settle,
 		};
 		const records = this.byKey.get(key) ?? [];

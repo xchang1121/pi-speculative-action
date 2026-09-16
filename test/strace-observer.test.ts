@@ -108,6 +108,18 @@ describe("strace provenance decoder", () => {
 			expect(observation).toMatchObject({ complete: false, incompleteReasons: reasons });
 			expect(observation.taints).toContain("trace_incomplete");
 		}
+		const prefix = [EXEC, 'open("known", O_RDONLY) = 3', ""].join("\n");
+		for (const terminated of [true, false]) {
+			const processes = { 100: [prefix, 'open("later", O_RDONLY) = 4'] };
+			const preview = await observe(processes, { previewBytes: Buffer.byteLength(prefix) }, terminated);
+			expect(preview.complete).toBe(false);
+			expect(preview.incompleteReasons).toContain("preview_only");
+			expect(preview.paths).toContainEqual({ path: "/work/known", role: "input" });
+			expect(preview.paths.some(({ path }) => path === "/work/later")).toBe(false);
+			expect((await observe(processes, { previewBytes: 4096 }, terminated)).complete).toBe(false);
+		}
+		await expect(observe({ 100: [EXEC] }, { previewBytes: 0 })).resolves.toMatchObject({ complete: false, paths: [] });
+		await expect(observe({ 100: [EXEC] }, { previewBytes: -1 })).rejects.toThrow("budget");
 	});
 
 	test("cuts dispatcher subtrees but resumes provenance at a descriptor-preserving native exec", async () => {

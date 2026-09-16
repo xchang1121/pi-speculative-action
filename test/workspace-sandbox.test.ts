@@ -965,15 +965,22 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(stat(clock)).rejects.toThrow();
 			await writeFile(path.join(root, "changed.txt"), "next baseline\n", "utf8");
 			await sandbox.prepare(root, { driver: "git" });
+			expect(workspace.sourceChanges?.().paths).toContain(path.join(root, "changed.txt"));
 			const initial = await workspace.transactions.begin();
 			Reflect.set(workspace, "commit", "0".repeat(40));
 			expect((await stat(clock)).isFile()).toBe(true);
 			await initial.abort();
+			await expect(initial.readBefore!("changed.txt", 64)).rejects.toThrow("unavailable");
 			const capture = await workspace.transactions.begin();
 			await writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after!\n", "utf8");
 			await writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8");
 			await rm(path.join(workspace.sandboxRoot, "deleted.txt"));
+			expect(Buffer.from((await capture.readBefore!("changed.txt", 64))!)).toEqual(Buffer.from("before\n"));
+			await expect(capture.readBefore!("changed.txt", 1)).rejects.toThrow();
+			await expect(capture.readBefore!("../changed.txt", 64)).resolves.toBeUndefined();
+			await expect(capture.readBefore!("created.txt", 64)).resolves.toBeUndefined();
 			const delta = await capture.finish();
+			await expect(capture.readBefore!("changed.txt", 64)).rejects.toThrow("unavailable");
 
 			if (!delta.complete) throw new Error(`workspace transaction was incomplete: ${delta.reason}`);
 			const beforeEntry = delta.before.entries.get("changed.txt");
@@ -1039,12 +1046,16 @@ describe("workspace-branch ExecutionWorld", () => {
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const first = await workspace.transactions.begin();
 			const second = await workspace.transactions.begin();
+			await expect(first.readBefore!("value.txt", 64)).rejects.toThrow("unavailable");
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "overlap\n", "utf8");
 			for (const delta of await Promise.all([first.finish(), second.finish()])) {
 				expect(delta).toMatchObject({ complete: false, changes: [], reason: "overlapping_workspace_transaction" });
 			}
 
 			const recovered = await workspace.transactions.begin();
+			const borrowed = await recovered.readBefore!("value.txt", 64);
+			expect(Buffer.from(borrowed!)).toEqual(Buffer.from("overlap\n"));
+			borrowed!.fill(0); // A borrower cannot alter the retained predecessor frontier.
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "recovered\n", "utf8");
 			const recoveredDelta = await recovered.finish();
 			if (!recoveredDelta.complete) {

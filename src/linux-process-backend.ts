@@ -68,7 +68,7 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { captureStableFile, hashExecutableFile, mapFilesystem, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, walkFilesystemPath } from "./filesystem-evidence.ts";
 import {
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
@@ -930,6 +930,12 @@ export class LinuxProcessReuseBackend {
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 					});
 					if (!admission.allowed) return "miss";
+					const check = running.inputsChanged;
+					if (check) {
+						const started = performance.now();
+						try { if (await check()) return "rejected"; }
+						finally { this.addActor("validationMs", Math.max(0, performance.now() - started)); }
+					}
 					const waitStarted = performance.now();
 					const finished = await waitForCandidate(running.completion, signal, admission.waitBudgetMs);
 					const interval = new TimelineInterval(waitStarted, performance.now());
@@ -1175,6 +1181,7 @@ export class LinuxProcessReuseBackend {
 		let traceRoot: string | undefined;
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
+		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
 			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
@@ -1185,6 +1192,29 @@ export class LinuxProcessReuseBackend {
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd);
+			const changedInput = async () => {
+				const changes = session.workspace.sourceChanges?.();
+				if (!changes?.paths.length || !transaction.readBefore) return false;
+				for (const changed of changes.paths) {
+					const relative = relativeFilesystemPath(session.sourceRoot, changed);
+					if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
+					const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
+					if (!before) continue;
+					// One regular input bounds lookup cost. Its transaction prestate includes valid predecessor effects.
+					await assertNoSymlinkPath(session.sourceRoot, changed);
+					const current = await captureStableFile(changed, MAX_REQUEST_BYTES);
+					this.addActor("validationFilesRead", 1);
+					this.addActor("validationBytesRead", current.bytesRead);
+					if (sha256Digest(before) === `sha256:${current.hash}`) return false;
+					const observation = await observeStrace(tracePrefix, logicalExecutable, logicalCwd, { previewBytes: 1024 * 1024 });
+					if (!observation.paths.some(observed => observed.role === "input" && observed.path === changed)) return false;
+					this.setActorError(`actor_running_input_changed:${changed}`);
+					return true;
+				}
+				return false;
+			};
+			releaseInputs = this.handoffs.observeInputs(weakKey, work, () => inputCheck ??=
+				changedInput().catch(() => false).finally(() => { inputCheck = undefined; }));
 			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,
 				...sandboxPolicyArguments(
@@ -1209,6 +1239,7 @@ export class LinuxProcessReuseBackend {
 				signal: session.signal,
 			});
 			const observedProcessMs = Math.max(0, performance.now() - processStarted);
+			releaseInputs();
 			try {
 				transactionFinishing = true;
 				const captures = [
@@ -1311,6 +1342,8 @@ export class LinuxProcessReuseBackend {
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
+			releaseInputs?.();
+			await inputCheck;
 			const durationMs = Math.max(0, performance.now() - started);
 			this.add(session, "executionMs", durationMs);
 			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);

@@ -32,7 +32,7 @@ import {
 	type WorkspaceStructureEntry,
 	type WorkspaceStructureSnapshot,
 } from "./process-observation.ts";
-import { ResourceVersionManager, type ResourceVersionToken } from "./resource-version.ts";
+import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
@@ -115,6 +115,8 @@ export interface SandboxWorkspaceContext {
 	readonly structure: WorkspaceStructureDriver;
 	/** Content-addressed mutation intervals, independent of any process or tool implementation. */
 	readonly transactions: WorkspaceTransactionDriver;
+	/** Source notifications since this fork's baseline; lookup hints, never freshness authority. */
+	readonly sourceChanges?: () => ResourceChangeSet;
 }
 
 export interface SandboxWorkspaceBranchOptions extends WorkspaceSandboxOptions {
@@ -389,7 +391,7 @@ async function resolveWorkspaceDriver(
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
 		// Driver choice is preparation; actual workspace allocation still validates the exact baseline.
-		const commit = await acquireSandboxBaseline(repository, true);
+		const { commit } = await acquireSandboxBaseline(repository, true);
 		const cached = repository.autoDriverDecision;
 		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) {
 			return cached.resolved;
@@ -682,7 +684,7 @@ async function prepareSandboxWorkspaceFor(
 			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
 		);
 		throwIfAborted(options.signal);
-		const commit = await acquireSandboxBaseline(repository, true);
+		const { commit } = await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -834,7 +836,7 @@ async function createPrivateSandboxWorkspace(
 		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 	})();
 	try {
-		const commit = await acquireSandboxBaseline(pool);
+		const baseline = await acquireSandboxBaseline(pool), { commit } = baseline;
 		let sandboxRoot: string;
 		let processRoot: string;
 		let gitDirectory: string;
@@ -900,6 +902,7 @@ async function createPrivateSandboxWorkspace(
 			observationExcludes,
 			structure,
 			transactions,
+			sourceChanges: () => pool.versions.changesSince(baseline.version),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
 			pool,
 			commit,
@@ -966,7 +969,17 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 			}
 			const capture: Capture = { contaminated, before };
 			active.add(capture);
-			return { finish: () => finish(capture), abort: () => abort(capture) };
+			return {
+				readBefore: (resource, maxBytes) => withWorkspaceLock(lock, async () => {
+					if (!active.has(capture) || capture.contaminated || !capture.before) throw new Error("workspace transaction input is unavailable");
+					if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("workspace transaction input budget is invalid");
+					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
+					const state = await readFrontierState(git, commit, frontier, resource, maxBytes);
+					if (state && state.content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
+					return state && Uint8Array.from(state.content);
+				}),
+				finish: () => finish(capture), abort: () => abort(capture),
+			};
 		});
 
 	async function finish(capture: Capture): Promise<WorkspaceTransactionDelta> {
@@ -1118,14 +1131,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		let retainedBytes = stateMapBytes(frontier);
 		for (const relativePath of paths) {
 			// The lock and overlap rejection keep this frontier unchanged throughout the interval.
-			const previous = frontier.has(relativePath)
-				? frontier.get(relativePath)
-				: await readGitTreeRegularState(
-						git,
-						commit,
-						relativePath,
-						WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes,
-					);
+			const previous = await readFrontierState(git, commit, frontier, relativePath, WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes);
 			beforeBytes += previous?.content.byteLength ?? 0;
 			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) {
 				throw new Error("workspace transaction before-state exceeds capture limit");
@@ -1225,21 +1231,21 @@ async function createSandboxRepository(
 async function acquireSandboxBaseline(
 	repository: PooledGitRepository,
 	warmup = false,
-): Promise<string> {
+): Promise<NonNullable<PooledGitRepository["baseline"]>> {
 	// The pool owns this shared baseline; callers cancel before private workspace allocation.
 	return withWorkspaceLock(repository, async () => {
 		const baseline = repository.baseline;
 		if (baseline) {
 			// Quiet notifications may reuse preparation work; every actual fork still checks exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
-			if (changes && !changes.uncertain && !changes.paths.length) return baseline.commit;
+			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
 			// Warm-up can reject an old baseline before hashing; actual forks keep the checks parallel.
 			const indexed = sandboxIndexChanges(repository);
 			const current = warmup
 				? indexed.then((paths) => paths.length ? { expired: true } : repository.versions.validate(baseline.version))
 				: repository.versions.validate(baseline.version);
 			const [version, paths] = await Promise.all([current, indexed]);
-			if (!version.expired && !paths.length) return baseline.commit;
+			if (!version.expired && !paths.length) return baseline;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
@@ -1256,7 +1262,7 @@ async function acquireSandboxBaseline(
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				repository.baseline = { commit, tree, version };
 				baseline?.version.release();
-				return commit;
+				return repository.baseline;
 			} finally {
 				if (repository.baseline?.version !== version) version.release();
 			}
@@ -1603,7 +1609,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promis
 		}
 		await assertNoSymlinkPath(workspace.sourceRoot, target);
 		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
-		const before = await readBaselineState(workspace, resource);
+		const before = await readFrontierState(workspace.pool.git, workspace.commit, workspace.baselineFrontier, resource, 64 * 1024 * 1024);
 		const after = await readRegularState(sandboxTarget);
 		if (!sameSandboxState(before, after)) {
 			changes.push({
@@ -1792,12 +1798,14 @@ async function collectOverlayChangeResources(
 	return Object.freeze([...resources]);
 }
 
-async function readBaselineState(
-	workspace: PrivateSandboxWorkspace,
+async function readFrontierState(
+	git: ReturnType<typeof bindGit>,
+	commit: string,
+	frontier: ReadonlyMap<string, RegularFileState | undefined>,
 	resource: string,
+	maxBytes: number,
 ): Promise<RegularFileState | undefined> {
-	if (workspace.baselineFrontier.has(resource)) return workspace.baselineFrontier.get(resource);
-	return readGitTreeRegularState(workspace.pool.git, workspace.commit, resource, 64 * 1024 * 1024);
+	return frontier.has(resource) ? frontier.get(resource) : readGitTreeRegularState(git, commit, resource, maxBytes);
 }
 
 async function readGitTreeRegularState(
