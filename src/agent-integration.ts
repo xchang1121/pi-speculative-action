@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import { type ActionKey, type ActionSemanticsRegistry, ownActionKeyProjector, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "./action-semantics.ts";
+import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, ownActionKeyProjector, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import {
 	clampCandidateLimit,
@@ -20,6 +20,7 @@ import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type {
 	ExecutionWorldDiagnosticSnapshot,
+	ExecutionOperationBinding,
 	SpeculativeExecutionRoute,
 } from "./execution-world.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
@@ -213,6 +214,7 @@ export function createSpeculativeActionHost(
 					{
 						operation: {
 							tool,
+							backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,
 							input: undefined,
 							...(signal ? { signal } : {}),
 							...(action ? { action } : {}),
@@ -313,7 +315,16 @@ export function createSpeculativeActionHost(
 			if (!tool || validated === undefined) return undefined;
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
-			return (await resolveBinding(toolName, validated, schemaHash)).action;
+			const { action, invocation } = await resolveBinding(toolName, validated, schemaHash);
+			const operation = context.type === "start" ? context.operation : undefined;
+			if (!operation) return action;
+			const definition = action && actionSemantics.definition(action);
+			if (!action || !invocation || !definition || operation.permissionHash !== action.hash) return undefined;
+			const epoch = `${definition.epoch}:operation:${operation.backend}`;
+			return buildActionKey({ ...action, input: { operation: operation.identity }, semanticsEpoch: epoch,
+				semantics: { ...definition, epoch, projectors: [] },
+				executionContext: Object.freeze({ ...invocation, operation: Object.freeze({ binding: operation, permission: action }) }),
+			});
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
 		captureAuthoritativeResult: async ({ startInput, data, tool: toolName, concrete, action, callID, signal }) => {
@@ -333,11 +344,13 @@ export function createSpeculativeActionHost(
 			return captured && { route: captured.route, ...captured.capture };
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
-		preflightCandidate: ({ data, tool: toolName, concrete, action, route, signal }) =>
-			checkPermission(data.tools.get(toolName), { toolName, args: concrete, action, route, signal }),
+		preflightCandidate: ({ data, tool: toolName, concrete, action, route, signal }) => {
+			const permission = (action.executionContext as ToolInvocation | undefined)?.operation?.permission ?? action;
+			return checkPermission(data.tools.get(toolName), { toolName, args: permission === action ? concrete : permission.input, action: permission, route, signal });
+		},
 		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
 			checkPermission(stateData.tools.get(toolName), { toolName, args: concrete, action, route, signal: signal ?? new AbortController().signal }, true),
-		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld }) => {
+		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, onOperationAdopted }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = structuredClone(concrete);
@@ -346,6 +359,7 @@ export function createSpeculativeActionHost(
 				route,
 				{
 					cwd: options.cwd, tool, toolName, args, action, callID, signal,
+					onOperationAdopted,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
 				},
@@ -414,7 +428,12 @@ export function createSpeculativeActionHost(
 					}
 				: undefined;
 			let prepared: PreparedActorCall<ToolSettlement> | undefined;
-			return executionGateway.executeAuthoritative(operation, () => bind().then(executor), {
+			let operations: ExecutionOperationBinding[] | undefined;
+			return executionGateway.executeAuthoritative(operation, async () => {
+				const bound = await bind();
+				return bound.action && input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
+					() => executor(bound), bindings => { if (bindings.length) (operations ??= []).push(...bindings); }) : executor(bound);
+			}, {
 				...(actorCall
 					? {
 							reuse: async () => {
@@ -422,10 +441,11 @@ export function createSpeculativeActionHost(
 								return prepared?.output?.result;
 							},
 							settled: async (settlement) => {
-								await prepared?.settle(settlement.toolExecution,
-									settlement.status === "succeeded"
-											? { result: settlement.output, isError: false }
-											: toolErrorSettlement(settlement.error));
+								if (!prepared) return;
+								const output = settlement.status === "succeeded"
+									? { result: settlement.output, isError: false } : toolErrorSettlement(settlement.error);
+								await (operations ? prepared.settle(settlement.toolExecution, output, operations)
+									: prepared.settle(settlement.toolExecution, output));
 							},
 						}
 					: {}),

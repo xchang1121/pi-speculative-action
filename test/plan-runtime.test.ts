@@ -7,6 +7,22 @@ import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("PlanRuntime", () => {
+	it("keeps internal preparation within its Actor batch and pins capability identity", () => {
+		const plan = new PlanRuntime(), operation = Object.freeze({ backend: "process", identity: "exec", permissionHash: "parent",
+			executionMs: 2, expectedDurationMs: 3 });
+		const prepare: PlanAction = { ...action("prepare"), type: "operation", operation };
+		const after = action("after", { dependsOn: [{ actionID: "prepare", condition: "execution_settled" }] });
+		expect(plan.apply(proposal([prepare, after]), 0)).toMatchObject({ accepted: true });
+		expect(plan.get("plan", "prepare")?.action.operation).toBe(operation);
+		expect(plan.get("plan", "after")).toMatchObject({ expectedDecisionSeq: 1, readiness: "waiting" });
+		const execution = new CandidateExecution<string>("exclusive");
+		plan.attachExecution("plan", "prepare", "process", execution);
+		execution.start(0); execution.fail(cause("execution", "binding_expired"), 2, 2);
+		expect(plan.get("plan", "after")).toMatchObject({ expectedDecisionSeq: 1, readiness: "ready" });
+		const original = plan.get("plan", "prepare")!.identity;
+		expect(plan.apply({ ...proposal([{ ...prepare, operation: Object.freeze({ ...operation }) }, after]), revision: 2 }, 0)).toMatchObject({ accepted: true });
+		expect(plan.get("plan", "prepare")?.identity).not.toEqual(original);
+	});
 	it.each(["replace", "remove"] as const)("pins cross-source ancestors through %s and propagates their timing", (mode) => {
 		const plan = new PlanRuntime();
 		plan.apply(proposal([action("parent", { latestHorizon: 5 })]), 0);

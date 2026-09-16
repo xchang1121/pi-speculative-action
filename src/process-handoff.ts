@@ -1,4 +1,4 @@
-import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
+import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
@@ -6,6 +6,14 @@ import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
+	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
+
+	constructor(observer?: (adoption: ExecutionOperationAdoption) => void) {
+		if (observer) this.observer = new WeakRef(observer);
+	}
+
+	/** Observational only; a retained certificate must not keep an expired runtime alive. */
+	adopted(adoption: ExecutionOperationAdoption): void { this.observer?.deref()?.(adoption); }
 
 	get wholeClaimed(): boolean { return this.state === "whole"; }
 
@@ -26,6 +34,8 @@ export class ProcessHandoffOwnership {
 }
 
 export interface ProcessHandoff {
+	readonly ownership: ProcessHandoffOwnership;
+	readonly binding?: ProcessExecutionBinding;
 	readonly completion: Promise<void>;
 	readonly scope: ExecutionScope | undefined;
 	readonly startedAt: number;
@@ -36,17 +46,17 @@ export interface ProcessExecutionBinding {
 	readonly key: Sha256Digest;
 	readonly certificate: ProcessProvenanceCertificate;
 	readonly scope: ExecutionScope;
+	readonly available: boolean;
 }
 
 type HandoffState =
 	| { readonly status: "running" }
-	| { readonly status: "completed"; readonly candidate?: ProcessProvenanceCertificate };
+	| { readonly status: "completed" | "consumed"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
 	state: HandoffState;
 	binding?: ProcessExecutionBinding;
 	readonly executablePath: string;
-	readonly ownership: ProcessHandoffOwnership;
 	readonly settle: () => void;
 }
 
@@ -93,19 +103,22 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
-	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): void {
+	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): ProcessExecutionBinding | undefined {
 		const record = this.byKey.get(key)?.find(candidate => candidate === handoff);
-		if (!record?.scope || record.binding || record.state.status !== "completed" || record.state.candidate?.weakKey !== key ||
+		if (!record?.scope || record.binding || record.state.status === "running" || record.state.candidate?.weakKey !== key ||
 			!record.state.candidate.dependencyCertificate.complete || this.maxBindingBytes <= 0) return;
 		const value = immutableSnapshot(invocation);
 		if (!isImmutableSnapshot(value)) return;
 		const bytes = Buffer.byteLength(JSON.stringify(value));
 		if (bytes > this.maxBindingBytes) return;
-		const binding = Object.freeze({ key, certificate: record.state.candidate, scope: record.scope });
+		const owner = new WeakRef(this.invocations);
+		const binding = Object.freeze({ key, certificate: record.state.candidate, scope: record.scope,
+			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
 		this.invocations.set(binding, { value, bytes });
 		record.binding = binding;
 		this.bindingBytes += bytes;
 		this.trim();
+		return this.invocations.has(binding) ? binding : undefined;
 	}
 
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
@@ -119,11 +132,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
-	get hasResults(): boolean { return this.byKey.size > 0; }
+	get hasResults(): boolean {
+		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "consumed")) return true;
+		return false;
+	}
 
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {
-		for (const records of this.byKey.values()) if (records.some(record => record.executablePath === executablePath)) return true;
+		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "consumed" && record.executablePath === executablePath)) return true;
 		return false;
 	}
 
@@ -147,7 +163,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.includes(selected.record) &&
 					(!selected.oneShot || selected.record.ownership.claimChild())) {
-					if (selected.oneShot) this.remove(request.key, selected.record);
+					// Retain bounded launch parameters without granting another transfer of this result.
+					if (selected.oneShot) selected.record.state = { ...selected.state, status: "consumed" };
 					return { kind: "hit", plan, joined, producer: selected.record };
 				}
 				continue;
@@ -232,11 +249,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private trim(limit = this.maxCompleted): void {
-		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status === "completed").length - limit;
+		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status !== "running").length - limit;
 		if (excess <= 0 && this.bindingBytes <= this.maxBindingBytes) return;
 		for (const [key, records] of this.byKey) {
 			for (const record of records) {
-				if (record.state.status === "completed" && excess-- > 0) this.remove(key, record);
+				if (record.state.status !== "running" && excess-- > 0) this.remove(key, record);
 				else if (this.bindingBytes > this.maxBindingBytes) this.revokeBinding(record);
 			}
 		}

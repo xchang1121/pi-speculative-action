@@ -2,7 +2,7 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
-import type { SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
+import type { ExecutionOperationAdoption, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
 import type { TimelineInterval } from "./task-timing.ts";
@@ -195,6 +195,7 @@ export interface SpeculativePlanSource<
 		readonly tool: string;
 		readonly concrete: Record<string, unknown>;
 		readonly output?: Output;
+		readonly operations?: readonly ExecutionOperationBinding[];
 		readonly durationMs: number;
 		readonly order: number;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
@@ -235,7 +236,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		tool: string,
 		input: unknown,
 		context:
-			| { readonly type: "start"; readonly startInput: StartInput; readonly data: StateData }
+			| { readonly type: "start"; readonly startInput: StartInput; readonly data: StateData; readonly operation?: ExecutionOperationBinding }
 			| { readonly type: "consume"; readonly consumeInput: ConsumeInput },
 	) => MaybePromise<ActionKey | undefined>;
 	/** Resolve the highest-priority safe execution capability for this attempt. */
@@ -257,6 +258,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => MaybePromise<CandidatePreflight>;
 	readonly executeCandidate: (input: Omit<RuntimeTurnContext<StartInput, StateData>, "settings"> & BoundCandidateCall & {
 		readonly parentWorld?: WorldBranch<Output>;
+		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	}) => MaybePromise<WorldBranch<Output>>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {
@@ -305,7 +307,7 @@ export interface SpeculativeRuntimeInspection {
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
 export interface PreparedActorCall<Output> {
 	readonly output?: Output;
-	readonly settle: (toolExecution: TimelineInterval, output?: Output) => Promise<void>;
+	readonly settle: (toolExecution: TimelineInterval, output?: Output, operations?: readonly ExecutionOperationBinding[]) => Promise<void>;
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {

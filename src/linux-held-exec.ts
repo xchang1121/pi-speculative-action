@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { AsyncResource } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
@@ -23,6 +24,9 @@ const PRIVATE_ENV = {
 const PRIVATE_ENV_NAMES: readonly string[] = Object.values(PRIVATE_ENV);
 
 export interface HeldExecProcess {
+	/** Host-owned launch identity and ordered exec event; never a reusable bare PID. */
+	readonly id: string;
+	readonly sequence: number;
 	readonly pid: number;
 	readonly tracerPid: number;
 	readonly sourceRoot: string;
@@ -50,6 +54,7 @@ export type HeldExecDecision =
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
+			readonly adopted?: () => void;
 	  };
 
 export interface LinuxHeldExecOptions {
@@ -58,6 +63,7 @@ export interface LinuxHeldExecOptions {
 }
 
 interface ActiveExecution {
+	sequence: number;
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
@@ -132,9 +138,10 @@ export class LinuxHeldExecBoundary {
 				const controller = new AbortController();
 				let finished!: () => void;
 				const active: ActiveExecution = {
+					sequence: 0,
 					sourceRoot: options.sourceRoot,
 					scope: snapshotExecutionScope(request.scope),
-					decide: options.decide,
+					decide: AsyncResource.bind(options.decide),
 					pending: new Set<Promise<void>>(), controller,
 					completion: new Promise<void>((resolve) => { finished = resolve; }),
 					signal: AbortSignal.any([controller.signal, ...(request.signal ? [request.signal] : [])]),
@@ -186,6 +193,8 @@ export class LinuxHeldExecBoundary {
 			}
 			throwIfAborted(active.signal);
 			const decision = await active.decide({
+				id: `${request.execution}:${++active.sequence}`,
+				sequence: active.sequence,
 				pid: request.pid,
 				tracerPid: request.tracer,
 				sourceRoot: active.sourceRoot,
@@ -212,6 +221,7 @@ export class LinuxHeldExecBoundary {
 			await decision.commit();
 			await write(socket, Buffer.from("R\n"));
 			if ((await readLine(socket)) !== "D") throw new Error("held-exec adoption completion is unknown");
+			try { decision.adopted?.(); } catch { /* Feedback cannot poison a completed handoff. */ }
 			socket.end();
 		} catch (error) {
 			if (active && (prepared || isPoisonedEffectCommit(error))) {

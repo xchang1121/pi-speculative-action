@@ -128,7 +128,7 @@ function validResource() {
 
 function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	"settings" | "stateData" | "actionKey" | "resolveExecution" | "captureAuthoritativeResult" |
-	"preflightCandidate" | "authorizeCandidate" | "onCandidateMaterialized" | "onTurnFinished" | "rejectCandidateOutput"
+	"preflightCandidate" | "authorizeCandidate" | "onCandidateMaterialized" | "onTurnFinished" | "rejectCandidateOutput" | "executeCandidate"
 >> & {
 	readonly source: Source<SessionID>;
 	readonly peers?: readonly Source<SessionID>[];
@@ -159,7 +159,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		actual: (call) => call,
 		preflightCandidate: input.preflightCandidate ?? (() => ({ ok: true })),
 		authorizeCandidate: input.authorizeCandidate,
-		executeCandidate: async ({ tool, concrete, action, route, signal, parentWorld }) => {
+		executeCandidate: input.executeCandidate ?? (async ({ tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
 			const version =
 				route.isolation === "resource_snapshot" ? await (input.capture?.() ?? { version: 1 }) : undefined;
@@ -182,7 +182,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 						}
 					: {}),
 			});
-		},
+		}),
 		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection ? [input.projection] : [])],
 		onCandidateMaterialized: input.onCandidateMaterialized,
 		onTurnFinished: input.onTurnFinished,
@@ -216,6 +216,40 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it("separates internal execution, matching and continuation even when an adapter collides keys", async () => {
+		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
+		const complete = vi.fn(), materialized = vi.fn(), continuation = vi.fn(), settled = vi.fn();
+		let adopted: Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"];
+		const source = planSource({ propose: () => ({ ...plan("internal"), actions: [
+			{ ...readAction("child", { path: "README.md" }), type: "operation", operation: binding },
+			readAction("whole", { path: "README.md" }),
+		] }), continue: continuation, onSettled: settled });
+		const { runtime, events } = harness({ source, onCandidateMaterialized: materialized,
+			executeCandidate: async ({ candidate, onOperationAdopted }) => {
+				complete(candidate.type);
+				if (candidate.type === "operation") adopted = onOperationAdopted;
+				return world(candidate.type === "operation" ? "child only" : "whole tool", { validate: async () => validResource() });
+			},
+		});
+		try {
+			await runtime.startTurn(start("turn"));
+			await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded").length).toBe(2);
+			expect(complete.mock.calls.map(([kind]) => kind).sort()).toEqual(["operation", "tool_call"]);
+			expect(materialized).toHaveBeenCalledOnce();
+			const receipt = { scope: { sessionID: "other", turnID: "turn" }, id: "launch:exec", sequence: 1, operationIdentity: "child" };
+			adopted!(receipt);
+			expect(settled).not.toHaveBeenCalled();
+			const prepared = await runtime.prepareActorCall(call("turn"));
+			expect(prepared?.output).toBe("whole tool");
+			adopted!({ ...receipt, scope: start("turn") });
+			await runtime.finishTurn(call("turn"));
+			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
+				prediction: { kind: "operation" }, actorAction: { kind: "operation" }, match: { matched: true, adoption: { status: "adopted" } },
+			} }]);
+			expect(continuation.mock.calls.every(([input]) => input.actionID === "whole")).toBe(true);
+			expect(events.filter(event => event.type === "actor_action")).toHaveLength(1);
+		} finally { await runtime.dispose(); }
+	});
 	it.each(["call", "preview"] as const)("backs off shared failed work and immediately serves an Actor %s", async (mode) => {
 		const materialized = [barrier(), barrier(), barrier()], failed = [barrier(), barrier()], recovered = barrier();
 		const seen = [0, 0, 0], feedback: PredictionSettlement[] = [];

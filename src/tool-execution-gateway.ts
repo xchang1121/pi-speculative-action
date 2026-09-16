@@ -15,6 +15,8 @@ import {
 	ExecutionWorldRouter,
 	type ExecutionWorld,
 	type ExecutionWorldPreparation,
+	type ExecutionOperationBinding,
+	type ExecutionScope,
 	type SpeculativeExecutionRoute,
 } from "./execution-world.ts";
 
@@ -27,6 +29,8 @@ import {
  */
 export interface ToolOperation {
 	readonly tool: string;
+	/** A backend-issued internal unit cannot fall through to another world's whole-tool executor. */
+	readonly backend?: string;
 	/** Absent for capability warm-up before a concrete call exists. */
 	readonly callID?: string;
 	readonly input: unknown;
@@ -83,11 +87,16 @@ export class ToolExecutionGateway<Context, Output> {
 		preparation: ExecutionWorldPreparation,
 	): Promise<SpeculativeExecutionRoute | undefined> {
 		const { operation, effect, requirements } = requirement;
-		return this.router.resolve({ tool: operation.tool, action: operation.action, effect, requirements }, preparation);
+		return this.router.resolve({ tool: operation.tool, action: operation.action, backend: operation.backend, effect, requirements }, preparation);
 	}
 
 	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return this.router.diagnostics(input);
+	}
+
+	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
+		observe: (bindings: readonly ExecutionOperationBinding[]) => void): Promise<Value> {
+		return this.router.observeOperations(action, scope, execute, observe);
 	}
 
 	captureAuthoritativeResult(

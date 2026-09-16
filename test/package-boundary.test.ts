@@ -171,7 +171,7 @@ async function importWithBlockedDependencies(entries: readonly string[], blocked
 		}
 	`;
 	try {
-		const result = await execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+		const result = await execFileAsync(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "--eval", script], {
 			cwd: packageRoot, windowsHide: true,
 			...(emptyTools ? { env: { ...process.env, PATH: "", PI_CODING_AGENT_DIR: emptyTools } } : {}),
 		});

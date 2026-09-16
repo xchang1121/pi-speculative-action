@@ -745,6 +745,54 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); await lease.release(); }
 	});
 
+	it("retires failed internal bindings without training misses or discarding a newer observation", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+		const request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const concrete = { path: "rare.txt" }, action = PI_ACTION_SEMANTICS.buildKey("read", concrete, cwd, "schema")!;
+		const binding = (identity: string, executionMs: number, permissionHash = action.hash, available = () => true) =>
+			Object.freeze({ backend: "test", identity, executionMs, expectedDurationMs: executionMs + 10, permissionHash,
+				get available() { return available(); } });
+		const slow = binding("slow", 8), fast = binding("fast", 3);
+		const observe = (operations: readonly ReturnType<typeof binding>[]) => controller.source.observe!({ ...request, action, operations,
+			consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: concrete, tools: [tool] },
+			tool: "read", concrete, output: { result: textResult("ready"), isError: false }, durationMs: 20, order: 0 });
+		const proposed = async () => {
+			const plan = await controller.source.propose(request);
+			if (!plan) return undefined;
+			if (!("actions" in plan)) throw new Error("Expected a Pattern proposal");
+			const internal = plan.actions.find(action => action.type === "operation");
+			return internal && { ...internal, proposalID: plan.id, actionID: internal.id, feedback: internal.feedback };
+		};
+		try {
+			for (const turnID of ["common-1", "common-2"]) store.observe({ sessionID: "session", turnID, tool: "read",
+				input: { path: "notes.txt" }, outcome: "success", durationMs: 20, schemaHash: "schema" });
+			await observe([fast, slow, binding("wrong permission", 100, "foreign")]);
+			controller.turnFinished(request.startInput, request.settings, false);
+			const internal = (await proposed())!;
+			expect(internal.operation).toBe(slow);
+			const snapshot = store.snapshot(), prediction = { id: "internal", source: "pattern_aware", proposalID: internal.proposalID, actionID: internal.id };
+			await controller.source.onIssued!(internal);
+			const settle = (stage: "matching" | "execution") => controller.source.onSettled!({ ...internal,
+				settlement: { prediction, observation: "unobserved", cause: { stage, code: stage === "matching" ? "operation_not_observed" : "candidate_failed" } } });
+			await settle("matching");
+			expect((await proposed())!.operation).toBe(slow);
+			await settle("execution");
+			expect((await proposed())!.operation).toBe(fast);
+			let available = true;
+			const refreshed = binding("slow", 9, action.hash, () => available);
+			await observe([refreshed]); await settle("execution");
+			expect((await proposed())!.operation).toBe(refreshed);
+			available = false;
+			expect((await proposed())!.operation).toBe(fast);
+			expect(store.snapshot()).toEqual(snapshot);
+			await controller.finishSession();
+			expect(await proposed()).toBeUndefined();
+		} finally { await controller.dispose(); }
+	});
+
 	it.each([false, true])("owns late Pattern feedback across configuration replacement and return=%s", async (returning) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const older = patternAwareSettings({ enabled: true, maxContextLength: 2 }), newer = patternAwareSettings({ ...older, maxContextLength: 3 });

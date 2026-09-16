@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { ActionKey } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import {
@@ -7,6 +8,8 @@ import {
 	type LinuxProcessSession,
 } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
+import type { ProcessExecutionBinding } from "./process-handoff.ts";
+import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import {
 	WorkspaceSandboxService,
@@ -32,6 +35,26 @@ export function createLinuxProcessExecutionWorld(
 	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
 	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary };
 	const roots = new Set<string>();
+	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
+	const operationCosts = new WeakMap<ProcessExecutionBinding, number>();
+	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
+		const expectedDurationMs = operationCosts.get(binding);
+		if (expectedDurationMs === undefined) return undefined;
+		const reference = new WeakRef(binding);
+		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash,
+			executionMs: binding.certificate.result.observedProcessMs ?? 0, expectedDurationMs,
+			get available() { return reference.deref()?.available ?? false; } });
+		operations.set(descriptor, { binding: reference, permissionKey: permission.key });
+		return descriptor;
+	};
+	const operationFor = (action: ActionKey) => {
+		const operation = (action.executionContext as ToolInvocation | undefined)?.operation;
+		if (!operation) return undefined;
+		const issued = operations.get(operation.binding), binding = issued?.binding.deref();
+		if (!binding?.available || operation.permission.key !== issued?.permissionKey)
+			throw new Error("internal process binding is unavailable");
+		return binding;
+	};
 	const qualifiedDrivers = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>();
 	let backendChecked = false;
 	const qualify = async (sourceRoot: string) => {
@@ -45,6 +68,9 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
+		observeOperations: ({ action, scope }, execute, observe) => backend.observeBindings(scope, execute, bindings => {
+			observe(bindings.flatMap(binding => { const operation = describeOperation(binding, action); return operation ? [operation] : []; }));
+		}),
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			tools: options.tools,
@@ -52,6 +78,7 @@ export function createLinuxProcessExecutionWorld(
 				backendChecked = true;
 				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
 				if (request.action && !invocation) throw new Error("execution action has no process invocation");
+				if (request.action) operationFor(request.action);
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
 					invocation?.cwd
@@ -96,8 +123,10 @@ export function createLinuxProcessExecutionWorld(
 				});
 			},
 			execute: (context) => backend.withProducer(async () => {
+			const startedAt = performance.now();
 			const invocation = processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
+			const operation = operationFor(context.action);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const selected = await qualify(sourceRoot);
@@ -128,10 +157,16 @@ export function createLinuxProcessExecutionWorld(
 						invocation,
 						...(context.executionScope ? { scope: context.executionScope } : {}),
 						signal: context.signal,
+						onOperationAdopted: operation ? context.onOperationAdopted : undefined,
 					});
 					const executor = session.executor;
 					let launches = 0;
 					try {
+						if (operation) {
+							const result = await session.executeBinding(operation);
+							// Scheduler-only output. The held native exec consumes the original ordered byte journal.
+							return { result: { content: [], details: { exit: result.exit } }, isError: false };
+						}
 						const result = await options.coordinator.runWith(
 							{
 								execute: (request) => {
@@ -153,7 +188,18 @@ export function createLinuxProcessExecutionWorld(
 			});
 			if (session) {
 				const ownership = session.ownership, commit = branch.commit.bind(branch);
-				Object.assign(branch, { commit: () => ownership.commit(commit) });
+				const overheadMs = Math.max(0, performance.now() - startedAt - session.metrics().executionMs);
+				Object.assign(branch, {
+					operations: Object.freeze(session.executionBindings().map(binding => {
+						const executionMs = binding.certificate.result.observedProcessMs ?? 0;
+						operationCosts.set(binding, overheadMs + executionMs);
+						return describeOperation(binding, context.action)!;
+					})),
+					commit: () => {
+						if (operation) throw new Error("internal process output cannot commit an enclosing tool");
+						return ownership.commit(commit);
+					},
+				});
 			}
 			return branch;
 			}),

@@ -571,9 +571,10 @@ export class PlanRuntime {
 				const parent = this.parent(node.identity.proposalID, dependency);
 				if (!parent || !parent.validDependencies) node.validDependencies = false;
 				if (!parent) continue;
-				node.earliestDecisionSeq = Math.max(node.earliestDecisionSeq, parent.earliestDecisionSeq + 1);
-				node.expectedDecisionSeq = Math.max(node.expectedDecisionSeq, parent.expectedDecisionSeq + 1);
-				node.latestDecisionSeq = Math.max(node.latestDecisionSeq, parent.latestDecisionSeq + 1);
+				const batchAdvance = parent.action.type === "operation" ? 0 : 1;
+				node.earliestDecisionSeq = Math.max(node.earliestDecisionSeq, parent.earliestDecisionSeq + batchAdvance);
+				node.expectedDecisionSeq = Math.max(node.expectedDecisionSeq, parent.expectedDecisionSeq + batchAdvance);
+				node.latestDecisionSeq = Math.max(node.latestDecisionSeq, parent.latestDecisionSeq + batchAdvance);
 			}
 		}
 		for (let index = graph.ordered.length - 1; index >= 0; index--) {
@@ -595,6 +596,7 @@ function newNode(
 	anchorDecisionSeq: number,
 ): MutableNode {
 	const identity: PlanActionIdentity = Object.freeze({
+		...(action.type === "operation" ? { kind: "operation" as const } : {}),
 		id: planNodeID(source, proposalID, action.id, revision),
 		source,
 		proposalID,
@@ -645,7 +647,7 @@ function freezeAdoption(adoption: PredictionAdoption): PredictionAdoption {
 }
 
 function sameActorAction(left: ActorActionIdentity, right: ActorActionIdentity): boolean {
-	return left.id === right.id && left.sequence === right.sequence && left.turnID === right.turnID;
+	return left.kind === right.kind && left.id === right.id && left.sequence === right.sequence && left.turnID === right.turnID;
 }
 
 function canonicalCondition(
@@ -688,7 +690,9 @@ function validateActions(
 	const result = actions.map((source) => ({ ...source }));
 	const ids = new Set<string>();
 	for (const source of result) {
-		if (!validToken(source.id) || !validToken(source.tool) || source.type !== "tool_call") {
+		if (!validToken(source.id) || !validToken(source.tool) ||
+			(source.type !== "tool_call" && source.type !== "operation") ||
+			(source.type === "operation" ? !source.operation || !Object.isFrozen(source.operation) : source.operation !== undefined)) {
 			return { ok: false, reason: "invalid_action" };
 		}
 		if (ids.has(source.id)) return { ok: false, reason: "duplicate_action" };
@@ -737,7 +741,7 @@ function dependencyOrder(actions: ReadonlyMap<string, PlanAction>, external: (de
 }
 
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
-	if (left.tool !== right.tool || !isDeepStrictEqual(left.input, right.input)) return false;
+	if (left.type !== right.type || left.operation !== right.operation || left.tool !== right.tool || !isDeepStrictEqual(left.input, right.input)) return false;
 	// Owned dependency records have canonical fields; opaque IDs must not use locale ordering.
 	const counts = new Map<string, number>();
 	for (const [dependencies, delta] of [[left.dependsOn, 1], [right.dependsOn, -1]] as const) {

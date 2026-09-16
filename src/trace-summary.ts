@@ -33,6 +33,8 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		adoptionYield: 0,
 		predictionUnobserved: {} as Readonly<Record<string, number>>,
 		predictionRejectedAfterMatch: {} as Readonly<Record<string, number>>,
+		operationPredictionsSettled: 0,
+		operationPredictionsAdopted: 0,
 		candidateStarted: 0,
 		candidateSucceeded: 0,
 		candidateFailed: 0,
@@ -87,6 +89,11 @@ export function reduceSpeculativeTrace<SessionID>(
 		cache: cloneCache(event.cache),
 	};
 	switch (event.type) {
+		case "operation_prediction":
+			next.operationPredictionsSettled++;
+			if (event.settlement.observation === "observed" && event.settlement.match.matched &&
+				event.settlement.match.adoption.status === "adopted") next.operationPredictionsAdopted++;
+			break;
 		case "task":
 			next.tasks++;
 			next.endToEndMs += metric(event.timing.endToEndMs);
