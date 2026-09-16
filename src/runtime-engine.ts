@@ -398,7 +398,7 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	draft: SpeculativeDraftCandidate;
 	readonly admissionSignal: AbortSignal;
 	readonly admissionController: AbortController;
-	readonly sourceSlot?: SourceRequestSlot;
+	readonly sourceSlot: SourceRequestSlot;
 	readonly continuationSlots: Set<SourceRequestSlot>;
 	readonly continuationTriggers: Set<"execution_succeeded" | "actor_adopted">;
 	continuationTail: Promise<void>;
@@ -406,19 +406,18 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	executionRoute?: SpeculativeExecutionRoute;
 }
 
-/** One producer request and its admitted actions share a cancellation lifetime and decision budget. */
+/** Producer requests and ordered observations share ownership with their admitted actions. */
 interface SourceRequestSlot {
 	readonly request: SourceRequestIdentity;
 	readonly expiresAtTarget: boolean;
 	readonly generation: SourceGeneration;
 	readonly owners: Set<string>;
-	pending: boolean;
+	pending: number;
 }
 
 interface PlanAdmissionScope<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
 	readonly session: SessionState<SessionID, Output, StartInput, StateData>;
-	readonly signal: AbortSignal;
-	readonly slot?: SourceRequestSlot;
+	readonly slot: SourceRequestSlot;
 }
 
 interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
@@ -495,6 +494,7 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	readonly definitions: readonly DrafterToolDefinition[];
 	readonly candidateNames: readonly string[];
 	readonly generation: SourceGeneration;
+	readonly signal?: AbortSignal;
 	readonly decisionSequence: number;
 	readonly actorActions: Set<ActorAction<CandidateRecord<Output, StartInput, StateData>, Output>>;
 	actorObservation?: ActorActionIdentity | null;
@@ -707,6 +707,7 @@ export function makeSpeculativeActionRuntime<
 				definitions,
 				candidateNames: names,
 				generation,
+				signal,
 				decisionSequence: session.decisionSequence + 1,
 				actorActions: new Set(),
 				actorToolHints: new Set(),
@@ -747,16 +748,21 @@ export function makeSpeculativeActionRuntime<
 		expiresAtTarget = true,
 		parent?: AbortSignal,
 	): SourceRequestSlot | undefined => {
-		const used = [...session.sourceSlots].filter(
-			(slot) => slot.request.source === source && slot.request.targetDecisionSequence === targetDecisionSequence,
-		).length;
-		if (used >= limit) return undefined;
+		const slots = [...session.sourceSlots].filter((slot) => slot.request.source === source &&
+			slot.request.targetDecisionSequence === targetDecisionSequence &&
+			(slot.request.kind === "observation") === (requestKind === "observation"));
+		const observed = requestKind === "observation" && slots.find((slot) => slot.request.turnID === turnID);
+		if (observed) {
+			observed.pending++;
+			return observed;
+		}
+		if (slots.length >= limit) return undefined;
 		const slot: SourceRequestSlot = {
 			request: { source, turnID, index: session.sourceRequestSequence++, kind: requestKind, targetDecisionSequence },
 			expiresAtTarget,
 			generation: new SourceGeneration(parent),
 			owners: new Set(),
-			pending: true,
+			pending: 1,
 		};
 		session.sourceSlots.add(slot);
 		return slot;
@@ -774,7 +780,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const releaseSourceRequest = (session: Session, slot: SourceRequestSlot): void => {
-		slot.pending = false;
+		slot.pending--;
 		releaseUnusedSourceSlot(session, slot);
 	};
 
@@ -846,12 +852,11 @@ export function makeSpeculativeActionRuntime<
 
 	/** Initial and continuation requests retain the same identity, production and admission owners. */
 	const requestSource = (
-		input: Omit<PlanAdmissionScope<SessionID, Output, StartInput, StateData>, "signal"> & { readonly slot: SourceRequestSlot },
+		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
 		produce: (signal: AbortSignal) => ReturnType<NonNullable<Source["continue"]>>,
 	): Promise<void> => {
-		const { session, slot } = input;
-		const scope = { ...input, signal: slot.generation.signal };
+		const { session, slot } = scope;
 		session.pendingSourceRequests++;
 		return runSourceRequest({
 			request: slot.request,
@@ -864,7 +869,7 @@ export function makeSpeculativeActionRuntime<
 			try {
 				queueSourceRequestEvent(session, slot.request.turnID, scope.settings, request);
 				if (request.settlement.status === "produced" && request.value !== undefined &&
-					session.sourceSlots.has(slot) && !scope.signal.aborted) {
+					session.sourceSlots.has(slot) && slot.generation.active) {
 					await admitUpdates(scope, source, request.value, request);
 				}
 			} finally {
@@ -880,7 +885,7 @@ export function makeSpeculativeActionRuntime<
 		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
-		if (session.lifecycle.sealed || scope.signal.aborted) return;
+		if (session.lifecycle.sealed || !scope.slot.generation.active) return;
 		await Promise.allSettled(asUpdates(updates).map(async (update) => {
 			const captured = PlanRuntime.capture(update, source.multiStepEnabled?.(scope.settings) !== false);
 			if (!("update" in captured)) return;
@@ -902,7 +907,7 @@ export function makeSpeculativeActionRuntime<
 		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
-		if (session.lifecycle.sealed || scope.signal.aborted) return;
+		if (session.lifecycle.sealed || !scope.slot.generation.active) return;
 		if (update.source !== source.id) return;
 		const draftTokens = finiteMetric(update.draftTokens);
 		const applied = session.plan.apply(update, session.decisionSequence);
@@ -917,7 +922,7 @@ export function makeSpeculativeActionRuntime<
 			const issued = !context;
 			if (issued) {
 				const admissionController = new AbortController();
-				scope.slot?.owners.add(node.identity.id);
+				scope.slot.owners.add(node.identity.id);
 				session.actionContexts.set(node.identity.id, {
 					identity: node.identity,
 					opportunity: session.plan.opportunity(node.proposalID, node.action.id)!,
@@ -928,9 +933,9 @@ export function makeSpeculativeActionRuntime<
 					draftTokens,
 					totalDraftTokens: session.tokenTotal,
 					draft: planActionDraft(node),
-					admissionSignal: AbortSignal.any([scope.signal, admissionController.signal]),
+					admissionSignal: AbortSignal.any([scope.slot.generation.signal, admissionController.signal]),
 					admissionController,
-					...(scope.slot ? { sourceSlot: scope.slot } : {}),
+					sourceSlot: scope.slot,
 					continuationTriggers: new Set(),
 					continuationSlots: new Set(),
 					continuationTail: Promise.resolve(),
@@ -1013,7 +1018,7 @@ export function makeSpeculativeActionRuntime<
 		if (!session.plan.bindActionKey(node.identity, predictedAction)) return;
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
-		if (slot && session.sourceSlots.has(slot) && slot.request.kind === "proposal" &&
+		if (session.sourceSlots.has(slot) && slot.request.kind === "proposal" &&
 			sourcesByID.get(node.source)?.concurrentProposalPolicy?.(context.settings) === "first_produced")
 			cancelCompetingProposals(session, slot);
 		const onCandidateMaterialized = adapter.onCandidateMaterialized;
@@ -1065,10 +1070,8 @@ export function makeSpeculativeActionRuntime<
 		if (!context) return;
 		session.actionContexts.delete(id);
 		context.admissionController.abort(cause("control", "prediction_retired"));
-		if (context.sourceSlot) {
-			context.sourceSlot.owners.delete(id);
-			releaseUnusedSourceSlot(session, context.sourceSlot);
-		}
+		context.sourceSlot.owners.delete(id);
+		releaseUnusedSourceSlot(session, context.sourceSlot);
 		if (!keepContinuation)
 			for (const slot of context.continuationSlots)
 				releaseSourceSlot(session, slot, cause("control", "parent_prediction_not_adopted"));
@@ -2073,13 +2076,14 @@ export function makeSpeculativeActionRuntime<
 								: executionDuration(settledCandidate),
 						order: settlement.actorAction.sequence,
 					});
-					if (state.lifecycle === "active") {
-						// Preserve observation order; only session retirement drains optional binding and route preparation.
-						void trackSourceTask(state.session, admitUpdates(
-							{ ...turnContext(state), session: state.session, signal: state.generation.signal },
-							source, updates,
-						));
-					}
+					const target = state.decisionSequence + 1;
+					if (state.lifecycle !== "active" || !state.generation.active ||
+						target <= state.session.decisionSequence || !asUpdates(updates).length) return;
+					// Real observations remain ordered; their next-decision preparation survives normal turn closure.
+					const slot = claimSourceSlot(state.session, source.id, state.turnID, target, 1, "observation", true, state.signal);
+					if (slot) void trackSourceTask(state.session, admitUpdates(
+						{ ...turnContext(state), session: state.session, slot }, source, updates,
+					).finally(() => releaseSourceRequest(state.session, slot)));
 				});
 			} catch { /* Unowned data can settle normally but cannot train a source. */ }
 		}
