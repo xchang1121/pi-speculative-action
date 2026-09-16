@@ -244,16 +244,13 @@ describe("Linux process ExecutionWorld", () => {
 
 			const executable = path.join(fixture.workspace, "lookup-worker"), key = sha256Digest("different execution identity");
 			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
-			const scan = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess").mockResolvedValue({
-				executable, cwd: fixture.workspace, argv: [executable], environment: {},
-				context: { key: "lookup", umask: 0o22, descriptorTypes: ["device", "pipe", "pipe"] },
-			});
-			const image = vi.spyOn(await import("../src/filesystem-evidence.ts"), "hashExecutableFile").mockRejectedValue(new Error("image proof required"));
+			const scan = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess").mockRejectedValue(new Error("process context required"));
+			const image = vi.spyOn(filesystem, "realpath").mockResolvedValue(executable);
 			const inspect = () => decide({ pid: process.pid, tracerPid: process.pid, sourceRoot: fixture.workspace });
 			let work: ProcessHandoff | undefined;
 			const history = vi.spyOn(fixture.backend.store, "mayHaveCertificates");
 			try {
-				await expect(inspect()).resolves.toEqual({ kind: "continue" }); expect(image).not.toHaveBeenCalled();
+				await expect(inspect()).resolves.toEqual({ kind: "continue" }); expect(scan).not.toHaveBeenCalled();
 				history.mockImplementationOnce(async () => {
 					const result = await handoffs.acquire({ key, executablePath: executable, role: "producer",
 						ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
@@ -262,8 +259,8 @@ describe("Linux process ExecutionWorld", () => {
 				});
 				await expect(inspect()).resolves.toEqual({ kind: "continue" });
 				expect(history).toHaveBeenLastCalledWith(executable);
-				expect(image).toHaveBeenCalledExactlyOnceWith(`/proc/${process.pid}/exe`);
-				expect(fixture.backend.actorMetrics().hits).toBe(0);
+				expect(scan).toHaveBeenCalledExactlyOnceWith(process.pid, executable);
+				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 0, lastError: "actor_child:process context required" });
 			} finally {
 				if (work) handoffs.complete(key, work);
 				history.mockRestore(); image.mockRestore(); scan.mockRestore();
