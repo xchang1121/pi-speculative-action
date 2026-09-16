@@ -188,6 +188,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
 		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
 		operations: branch.operations && Object.freeze([...branch.operations]),
+		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
 		validate: ((shared && branch.validateAndCommit) || branch.validate)?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
 		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
 	});

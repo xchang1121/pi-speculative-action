@@ -43,4 +43,35 @@ describe("single-run serialized counterfactual timing", () => {
 		expect(nextTask.measure(300)).toMatchObject({ authoritativeToolCount: 0, toolExecutionMs: 0, hiddenLatencyMs: 0 });
 		expect(new TimelineInterval(Number.NaN, -1)).toEqual({ startedAt: 0, completedAt: 0 });
 	});
+
+	it("accounts for accepted child computations without counting enclosing work or joining waits twice", () => {
+		const child = new TimelineInterval(20, 150);
+		const shared = [{ startedAt: 105, completedAt: 150 }];
+		const inputs = [{ computation: child, shared }];
+		const native = new TimelineInterval(100, 170, inputs);
+		shared[0]!.completedAt = 170;
+		inputs.length = 0;
+		expect(JSON.stringify(native)).toBe('{"startedAt":100,"completedAt":170}');
+		const timeline = new TaskTimeline(0);
+		timeline.recordActor(0, 100);
+		timeline.recordTool(native);
+		timeline.recordTool(child);
+		expect(timeline.measure(170)).toMatchObject({ toolExecutionMs: 155, serializedMs: 255, hiddenLatencyMs: 85,
+			authoritativeToolCount: 2 });
+		const serialChild = new TimelineInterval(100, 150), serial = new TaskTimeline(0);
+		serial.recordActor(0, 100);
+		serial.recordTool(new TimelineInterval(100, 160, [{ computation: serialChild, shared: [serialChild] }]));
+		expect(serial.measure(160)).toMatchObject({ toolExecutionMs: 60, serializedMs: 160, hiddenLatencyMs: 0 });
+
+		for (const childFirst of [false, true]) {
+			const left = new TimelineInterval(20, 60), right = new TimelineInterval(40, 80);
+			const parent = new TimelineInterval(10, 90, [left, right].map(computation => ({ computation, shared: [computation] })));
+			const wholeAndPartial = new TaskTimeline(0);
+			wholeAndPartial.recordActor(0, 100);
+			for (const interval of childFirst ? [left, right, parent] : [parent, left, right]) wholeAndPartial.recordTool(interval);
+			// Two distinct overlapping children retain their identities; the parent contributes only its remaining 20 ms.
+			expect(wholeAndPartial.measure(100)).toMatchObject({ toolExecutionMs: 100, serializedMs: 200,
+				hiddenLatencyMs: 100, authoritativeToolCount: 3 });
+		}
+	});
 });

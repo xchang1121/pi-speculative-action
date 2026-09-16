@@ -27,6 +27,7 @@ import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
+import { TaskTimeline } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import {
@@ -42,10 +43,12 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
-	test("reexecutes an owned child binding across turns without replaying its parent or stale input", async ({ skip }) => {
+	test.for(["completed", "running"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
+		const release = deferred();
+		let restoreJoin: (() => void) | undefined;
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
@@ -139,16 +142,47 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.actorMetrics().hits).toBe(2);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
+			let sealing = false, joining: boolean | undefined;
+			if (mode === "running") {
+				const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
+				const publish = handoffs.publish.bind(handoffs);
+				const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
+					sealing = true; await release.promise; return publish(...args);
+				});
+				const scheduler = Reflect.get(fixture.backend, "processScheduler") as SpeculationScheduler<object>;
+				const assess = scheduler.assessCandidateJoin.bind(scheduler);
+				const assessment = vi.spyOn(scheduler, "assessCandidateJoin").mockImplementation(request => {
+					const decision = assess(request);
+					if (request.state === "running") joining = decision.allowed;
+					return decision;
+				});
+				restoreJoin = () => { publication.mockRestore(); assessment.mockRestore(); };
+			}
 			await start("prepared");
-			await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
+			if (mode === "running") await expect.poll(() => sealing, { timeout: 5000 }).toBe(true);
+			else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
 			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
-			expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([{ type: "text", text: "automatic-parent\nnewest\n" }]);
+			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
+			void nativeExecution.catch(() => undefined);
+			if (mode === "running") {
+				await expect.poll(() => joining).toBeDefined();
+				expect(joining).toBe(true);
+				await nextTurn(); release.resolve();
+			}
+			expect((await nativeExecution).content).toEqual([{ type: "text", text: "automatic-parent\nnewest\n" }]);
 			expect(actor).toHaveBeenCalledOnce();
+			expect(fixture.backend.actorMetrics().joinedHits).toBe(Number(mode === "running"));
 			await host.finishTurn("prepared");
+			const execution = events.filter(event => event.type === "actor_action")
+				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
+			const timeline = new TaskTimeline(0), laterTask = new TaskTimeline(execution.startedAt);
+			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
+			expect(timeline.measure(execution.completedAt).authoritativeToolCount).toBe(2);
+			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
 			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 			} }]);
@@ -161,8 +195,8 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { await host?.dispose(); await fixture.dispose(); }
-	}, 20_000);
+		} finally { release.resolve(); restoreJoin?.(); await host?.dispose(); await fixture.dispose(); }
+	});
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
@@ -816,6 +850,7 @@ int main(void) {
 			ownership,
 			executeBinding: async () => { throw new Error("unexpected process binding"); },
 			executionBindings: () => [],
+			computationDependencies: () => [],
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),

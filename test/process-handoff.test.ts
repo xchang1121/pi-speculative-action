@@ -21,9 +21,12 @@ describe("ProcessHandoffRegistry", () => {
 			fixture.registry.bind(fixture.key, fixture.work, invocation);
 			expect(fixture.registry.bindings(SCOPE)).toEqual([]); // Unsealed execution is not a binding source.
 			await fixture.publish();
+			const computation = fixture.work.computation;
+			expect(computation).toBeDefined();
 			if (consumed) {
 				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "hit" });
 				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+				expect(fixture.work.computation).toBe(computation);
 				expect(fixture.registry.hasResults).toBe(false);
 				expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
 			}

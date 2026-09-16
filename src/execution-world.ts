@@ -8,6 +8,7 @@ import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlem
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { errorMessage as errorDetail } from "./error-utils.ts";
 import { immutableSnapshot } from "./stable-json.ts";
+import type { TimelineDependency } from "./task-timing.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
@@ -152,6 +153,7 @@ export interface WorldBranch<Output> {
 	readonly backend: string;
 	/** Observed internal work. Only successful Actor adoption makes these authoritative learning inputs. */
 	readonly operations?: readonly ExecutionOperationBinding[];
+	readonly computationDependencies?: readonly TimelineDependency[];
 	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
@@ -326,7 +328,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
 	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope },
-		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[]) => void) => Promise<Value>;
+		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
@@ -381,7 +383,7 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[]) => void): Promise<Value> {
+		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations || !supportsTool(world.speculation ?? world.observation!, action.tool)) continue;
 			const next = execute;
