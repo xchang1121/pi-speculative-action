@@ -66,6 +66,8 @@ npm run setup:linux
 
 持久进程缓存按可执行文件路径组织索引；旧目录布局的缓存需清空后重新预热。路径检索只用于排除未命中，复用仍验证完整执行身份、当前依赖和效果闭包。
 
+Linux 后端可在同一会话内保留已封存子进程的执行绑定，在新隔离工作区中重新执行该子进程。原始参数和环境仅驻留内存，受条目数及最多 4 MiB 的绑定预算约束，清理缓存或关闭后撤销；绑定本身不授予结果采纳权。该接口尚未接入 PatternAware 的自动子进程预测。
+
 ### Actor probe
 
 `selfSpeculation` 默认关闭，只对权威 Actor 流生效。`sidecar` 需要实现 `/self-speculation/fork`、`candidates`、`clear` 的服务；`provider` 需要真正支持相应 SPORK 协议和概率证据的推理端，普通兼容 API 不因此获得自投机能力。

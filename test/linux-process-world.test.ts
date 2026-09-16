@@ -37,6 +37,72 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test("reexecutes an owned child binding across turns without replaying its parent or stale input", async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") return skip(status.detail);
+			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
+		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
+	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
+	return size <= 0 || write(1, text, (size_t)size) != size;
+}
+`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
+			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'";
+			const branch = await forkReusableBash(fixture, { command, label: "recorded", actionNamespace: "binding", executionFingerprint, executionScope: scope });
+			try { expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } }); }
+			finally { await branch.dispose(); }
+			const [binding] = fixture.backend.executionBindings(later);
+			expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
+			expect(binding!.certificate.producer.execution.authority).toBe("speculative");
+			expect(JSON.stringify(binding)).not.toContain("private argument");
+			expect(JSON.stringify(binding)).not.toContain("private value");
+			await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
+			await expect(validateDynamicDependencyCertificate(binding!.certificate.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
+			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+				try {
+					const result = await session.executeBinding(binding!);
+					expect(result.exit).toEqual({ kind: "code", code: 0 });
+					expect(result.output.map(({ fd, data }) => [fd, data.toString()])).toEqual([[1, "after\n"]]);
+					await session.seal([]);
+					const validation = await session.validate();
+					expect(validation, JSON.stringify({ validation, metrics: session.metrics() })).toMatchObject({ status: "valid" });
+					await expect(session.executeBinding(binding!)).rejects.toThrow("already consumed");
+				} finally { await session.close(); }
+			});
+			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
+				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
+					executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
+			}, true);
+			if (!("executor" in route)) throw new Error(route.detail);
+			let output = "";
+			const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
+				environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
+			expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
+			expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 1, crossTurnHits: 1 });
+			await fixture.backend.storage.maintain("clear");
+			expect(fixture.backend.executionBindings(later)).toEqual([]);
+			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
+				finally { await session.close(); }
+			});
+		} finally { await fixture.dispose(); }
+	});
+
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
@@ -680,6 +746,7 @@ int main(void) {
 		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
 			ownership,
+			executeBinding: async () => { throw new Error("unexpected process binding"); },
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),

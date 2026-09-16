@@ -92,7 +92,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
@@ -152,6 +152,11 @@ type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: 
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	/** Execute one retained exec unit in this fresh sandbox; its output is not the enclosing tool's result. */
+	readonly executeBinding: (binding: ProcessExecutionBinding) => Promise<{
+		readonly output: readonly BufferedOutput[];
+		readonly exit: ExitOutcome;
+	}>;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly metrics: () => LinuxProcessReuseMetrics;
 	/** Join the outer workspace transaction delta to the process observation before validation. */
@@ -212,6 +217,12 @@ interface DispatcherExecutionContext {
 
 type OutputRoute = readonly [1 | 2, 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
+type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment">;
+type BoundProcessInvocation = ProcessArguments & {
+	readonly sourceRoot: string;
+	readonly executable: string;
+	readonly outputRoute: OutputRoute;
+};
 
 interface BufferedOutput {
 	readonly fd: 1 | 2;
@@ -282,7 +293,7 @@ export class LinuxProcessReuseBackend {
 	private platformFingerprint?: Promise<Sha256Digest>;
 	private heldExec?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
-	private readonly handoffs: ProcessHandoffRegistry;
+	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation>;
 	private readonly processScheduler = new SpeculationScheduler<object>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
@@ -294,11 +305,11 @@ export class LinuxProcessReuseBackend {
 		this.options = options;
 		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
-		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates);
+		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_REQUEST_BYTES, this.store.limits.maxBytes));
 		this.storage = {
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
-				this.handoffs.configure(this.store.limits.maxCertificates);
+				this.handoffs.configure(this.store.limits.maxCertificates, Math.min(MAX_REQUEST_BYTES, this.store.limits.maxBytes));
 			},
 			maintain: async (operation) => {
 				this.handoffs.clearCompleted();
@@ -341,6 +352,11 @@ export class LinuxProcessReuseBackend {
 	/** Actor-path counters, excluding child reuse performed inside speculative worlds. */
 	actorMetrics(): LinuxProcessReuseMetrics {
 		return Object.freeze({ ...this.actorCounters });
+	}
+
+	/** Real sandbox executions, still speculative until an Actor consumes them. Never persisted as launch parameters. */
+	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
+		return this.handoffs.bindings(scope);
 	}
 
 	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
@@ -512,7 +528,7 @@ export class LinuxProcessReuseBackend {
 			sourceRoot,
 			workspace: input.workspace,
 			invocation: input.invocation,
-			scope: input.scope,
+			scope: snapshotExecutionScope(input.scope),
 			projection,
 			interposition,
 			originalPath,
@@ -529,14 +545,19 @@ export class LinuxProcessReuseBackend {
 		};
 		await listenUnixSocket(server, socketPath);
 		this.producers++;
+		let executionKind: "tool" | "operation" | undefined;
+		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
+			if (session.closing || executionKind === "operation" || executionKind && executionKind !== kind)
+				return Promise.reject(new Error("process session execution boundary is already consumed"));
+			executionKind = kind;
+			const pending = Promise.resolve().then(operation).finally(() => { session.pending.delete(pending); });
+			session.pending.add(pending);
+			return pending;
+		};
 		return {
 			ownership: session.ownership,
-			executor: { execute: (request) => {
-				const pending = Promise.resolve().then(() => this.executeTopLevel(session, request))
-					.finally(() => { session.pending.delete(pending); });
-				session.pending.add(pending);
-				return pending;
-			} },
+			executor: { execute: (request) => execute("tool", () => this.executeTopLevel(session, request)) },
+			executeBinding: (binding) => execute("operation", () => this.executeBinding(session, binding)),
 			metrics: () => Object.freeze({ ...session.metrics }),
 			seal: (changes) => {
 				session.sealPromise ??= this.withProducer(() => this.seal(session, changes));
@@ -803,8 +824,30 @@ export class LinuxProcessReuseBackend {
 			session.incompleteReasons.add(`broker_bypass:${request.name}:${eligibility.reason}`);
 			return { version: 2, kind: "bypass", executable };
 		}
-		const outputRoute = eligibility.route;
-		const prototype = await this.prototype(session, request, executable, outputRoute);
+		return this.executeRequest(session, request, executable, eligibility.route, requestID);
+	}
+
+	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
+		const invocation = this.handoffs.resolveBinding(binding, session.scope);
+		if (!invocation || invocation.sourceRoot !== session.sourceRoot || !compatibleProducer(session.nestedProducer, binding.certificate.producer))
+			throw new Error("process execution binding is unavailable in this scope");
+		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
+		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
+		const request = { ...invocation, cwd };
+		const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
+		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
+		const before = await session.workspace.structure.capture();
+		this.add(session, "requests");
+		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype);
+		const after = await session.workspace.structure.capture();
+		session.topLevelCapture = { before, after,
+			observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } };
+		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })), exit: result.exit! };
+	}
+
+	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
+		requestID: number, prototype?: ExecPrototype): Promise<DispatcherResponse> {
+		prototype ??= await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
 			weakKey,
@@ -1034,7 +1077,7 @@ export class LinuxProcessReuseBackend {
 
 	private async executeAndPublish(
 		session: ActiveSession,
-		request: DispatcherRequest,
+		request: ProcessArguments,
 		executable: string,
 		prototype: ExecPrototype,
 		weakKey: Sha256Digest,
@@ -1072,7 +1115,7 @@ export class LinuxProcessReuseBackend {
 				fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
 				"--exec",
 				outputRoute.join(""),
-				request.name,
+				request.argv0,
 				logicalExecutable,
 				...request.args,
 			]);
@@ -1159,6 +1202,10 @@ export class LinuxProcessReuseBackend {
 					work,
 					certificate,
 					() => {
+						this.handoffs.bind(weakKey, work, {
+							argv0: request.argv0, args: request.args, environment: request.environment,
+							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute,
+						});
 						stage = "history_publication";
 						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
 							// Optional history storage cannot invalidate already sealed execution evidence.
@@ -1259,7 +1306,7 @@ export class LinuxProcessReuseBackend {
 
 	private async prototype(
 		session: ActiveSession,
-		request: DispatcherRequest,
+		request: ProcessArguments,
 		executable: string,
 		outputRoute: OutputRoute,
 	): Promise<ExecPrototype> {
