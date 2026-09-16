@@ -645,7 +645,7 @@ export class LinuxProcessReuseBackend {
 			const logicalRoot = path.join(mountProbe, "logical");
 			const physicalRoot = path.join(mountProbe, "physical");
 			await Promise.all([mkdir(logicalRoot), mkdir(physicalRoot)]);
-			executionContext = await probeExecutionContext({ sandlock, strace, logicalRoot, physicalRoot });
+			executionContext = await probeExecutionContext({ sandlock, strace, dispatcher, logicalRoot, physicalRoot });
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
@@ -1193,8 +1193,7 @@ export class LinuxProcessReuseBackend {
 					[],
 				),
 				"--",
-				process.execPath,
-				fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+				ready.dispatcher,
 				"--exec",
 				outputRoute.join(""),
 				request.argv0,
@@ -2013,6 +2012,7 @@ function execMountArgument(mount: ExecMount): string {
 async function probeExecutionContext(input: {
 	readonly sandlock: string;
 	readonly strace: string;
+	readonly dispatcher: string;
 	readonly logicalRoot: string;
 	readonly physicalRoot: string;
 }): Promise<ProcessExecutionContext> {
@@ -2023,8 +2023,7 @@ async function probeExecutionContext(input: {
 			{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false },
 		], []),
 		"--",
-		process.execPath,
-		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+		input.dispatcher,
 		"--exec",
 		"12",
 		"pi-context-probe",

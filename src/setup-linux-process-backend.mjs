@@ -136,7 +136,7 @@ async function installHeldExec() {
 	try {
 		const [installedStamp, installed] = await Promise.all([readFile(stamp, "utf8"), readFile(target)]);
 		if (installedStamp.trim() !== `${sourceDigest}:${sha256(installed)}`) throw new Error("installation changed");
-		await run(target, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
+		await qualifyHeldExec(target);
 		console.log(`Held-exec Actor boundary ready: ${target}`);
 		return;
 	} catch {
@@ -147,13 +147,18 @@ async function installHeldExec() {
 	try {
 		await run(compiler, ["-static", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
 		await chmod(temporary, 0o755);
-		await run(temporary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
+		await qualifyHeldExec(temporary);
 		await rename(temporary, target);
 		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target))}\n`, { mode: 0o600 });
 	} finally {
 		await rm(temporary, { force: true }).catch(() => undefined);
 	}
 	console.log(`Held-exec Actor boundary ready: ${target}`);
+}
+
+async function qualifyHeldExec(binary) {
+	await run(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
+	await run(binary, ["--exec", "21", "pi-exec-probe", binary, "--probe-clean-fds"]);
 }
 
 async function installFuseOverlayfs() {

@@ -495,8 +495,26 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("8");
+		puts("9");
 		return 0;
+	}
+	if (argc >= 2 && !strcmp(argv[1], "--exec")) {
+		if (argc < 5 || strlen(argv[2]) != 2 || strspn(argv[2], "12") != 2) return 64;
+		/* Save stdout's source before changing either endpoint, including swapped routes. */
+		int output = fcntl(argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
+		if (output < 0) return 70;
+		int routed = dup2(argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
+		close(output);
+		if (!routed) return 70;
+		/* Preserve the former libuv outlet's empty mask and default dispositions. */
+		sigset_t empty;
+		sigemptyset(&empty);
+		if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return 70;
+		for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
+		char *executable = argv[4];
+		argv[4] = argv[3];
+		execv(executable, argv + 4);
+		return errno == ENOENT ? 127 : 126;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
 		int extra = has_unmodeled_descriptors();

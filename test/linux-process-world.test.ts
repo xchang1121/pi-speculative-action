@@ -241,6 +241,22 @@ int main(int argc, char **argv) {
 		execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
+			const text = `bound-name\nliteral ' $ value\nprivate value\n${root}\nstdin\n`;
+			for (const [route, stdout, stderr] of [["12", text, "stderr"], ["11", text + "stderr", ""],
+				["21", "stderr", text], ["22", "", text + "stderr"]]) {
+				const result = childProcess.spawnSync(binary, ["--exec", route!, "bound-name", "/bin/sh", "-c",
+					'IFS= read -r value; printf "%s\\n" "$0" "$1" "$BOUND_EXEC" "$PWD" "$value"; printf stderr >&2; exit 23',
+					"bound-name", "literal ' $ value"], { encoding: "utf8", cwd: root,
+					env: { ...process.env, BOUND_EXEC: "private value" }, input: "stdin\n" });
+				expect([result.status, result.stdout, result.stderr]).toEqual([23, stdout, stderr]);
+				expect(childProcess.spawnSync(binary, ["--exec", route!, "clean", binary, "--probe-clean-fds"]).status).toBe(0);
+			}
+			for (const args of [["--exec"], ["--exec", "13", "invalid", "/bin/true"]])
+				expect(childProcess.spawnSync(binary, args).status).toBe(64);
+			expect(childProcess.spawnSync(binary, ["--exec", "12", "missing", path.join(root, "missing")]).status).toBe(127);
+			for (const signal of ["TERM", "PIPE", "XFSZ"])
+				expect(childProcess.spawnSync("/bin/bash", ["-c", `trap '' ${signal}; exec "$@"`, "outer", binary,
+					"--exec", "12", "signals", "/bin/sh", "-c", `kill -${signal} $$; exit 99`]).signal).toBe(`SIG${signal}`);
 			const permissions = new Error("socket permission failure"), retained = await filesystem.readdir(root);
 			vi.mocked(filesystem.chmod).mockResolvedValueOnce().mockRejectedValueOnce(permissions);
 			await expect(LinuxHeldExecBoundary.open({ storeRoot: root, binary })).rejects.toBe(permissions);
