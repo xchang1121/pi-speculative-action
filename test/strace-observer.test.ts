@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { filesystemObservationDigest } from "../src/provenance-certificate.ts";
-import { observeStrace, type StraceObservationOptions } from "../src/strace-observer.ts";
+import { observeStrace, straceCommand, type StraceObservationOptions } from "../src/strace-observer.ts";
 
 const EXEC = 'execve("/usr/bin/example", ["example"], 0x0) = 0';
 const STAT = "{st_dev=makedev(0, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=0, st_gid=0, st_rdev=0, st_size=4, st_blksize=4096, st_blocks=8, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}";
@@ -129,7 +129,19 @@ describe("strace provenance decoder", () => {
 	});
 
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
+		const filter = straceCommand("strace", "/trace", ["program"]).find(value => value.startsWith("trace="))!;
+		for (const syscall of ["fcntl", "fcntl64", "flock"]) expect(filter.split(/[,=]/)).toContain(syscall);
 		for (const [line, taints, semanticGap] of [
+			['fcntl(3</work/input>, F_GETLK, {l_type=F_UNLCK, l_whence=SEEK_SET, l_start=0, l_len=0}) = 0', ["ipc"]],
+			['fcntl64(3</work/input>, F_OFD_GETLK, {l_type=F_WRLCK, l_pid=-1}) = 0', ["ipc"]],
+			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
+			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', ["ipc"]],
+			['fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
+			['fcntl(3</work/input>, F_GETLEASE) = 2 (F_UNLCK)', ["unsupported_syscall"]],
+			['fcntl(1<pipe:[7]>, 0xffff /* F_??? */, 0) = -1 EINVAL (Invalid argument)', ["unsupported_syscall"]],
+			['fcntl(1<pipe:[7]>, F_GETFD) = 0', []],
+			['fcntl(3</work/input>, F_SETFD, FD_CLOEXEC) = 0', []],
+			['fcntl(1<pipe:[7]>, F_DUPFD_CLOEXEC, 10) = 10<pipe:[7]>', []],
 			['prctl(PR_SET_NAME, "worker socket(AF_UNIX) = -1 EPERM") = 0', []],
 			['prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0', []],
 			['setrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0', ["unsupported_syscall"]],

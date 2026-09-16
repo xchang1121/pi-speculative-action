@@ -1,5 +1,6 @@
 import { gated, deferred, nextTurn } from "./async.ts";
 import { execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
@@ -940,23 +941,63 @@ int main(void) {
 		}
 	});
 
-	test("rejects adoption when the COW driver forces a handled cross-device rename", async ({ skip }) => {
+	test.for(["rename", "posix-lock", "ofd-lock", "flock"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
-		const overlay = await linuxOverlayfsCapability();
-		if (!overlay.available) return skip(overlay.detail);
-		const fixture = await createLinuxProcessBenchmark("pi-process-driver-semantics-", "overlayfs");
+		if (mode === "rename") {
+			const overlay = await linuxOverlayfsCapability();
+			if (!overlay.available) return skip(overlay.detail);
+		}
+		const fixture = await createLinuxProcessBenchmark("pi-process-driver-semantics-", mode === "rename" ? "overlayfs" : undefined);
 		const { workspace, backend } = fixture;
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
+		let locker: childProcess.ChildProcessWithoutNullStreams | undefined, lockerClosed: Promise<unknown> | undefined;
 		try {
 			await mkdir(path.join(workspace, "source"));
 			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { workspaceDriver: "overlayfs", includeWorkspaceFingerprint: true });
-			branch = await forkReusableBash(fixture, { command: "mv source moved", label: "driver-semantics-test",
+			if (mode !== "rename") {
+				await writeFile(path.join(workspace, "probe.c"), `#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+	(void)argv; int fd = open("source/value.txt", O_RDWR); if (fd < 0) return 2;
+	struct flock lock = {.l_type=F_WRLCK, .l_whence=SEEK_SET}; char value;
+	if (argc > 1) {
+		if (${mode === "flock" ? "flock(fd, LOCK_EX)" : "fcntl(fd, F_SETLK, &lock)"} < 0) return 3;
+		if (write(1, "R", 1) != 1) return 4;
+		return read(0, &value, 1) < 0;
+	}
+	${mode === "flock" ? "(void)lock; value = flock(fd, LOCK_EX|LOCK_NB) == 0 ? 'U' : 'L';" :
+		`if (fcntl(fd, ${mode === "ofd-lock" ? "F_OFD_GETLK" : "F_GETLK"}, &lock) < 0) return 5; value = lock.l_type == F_UNLCK ? 'U' : 'L';`}
+	return write(1, &value, 1) != 1;
+}
+`);
+				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe" });
+				await commitBenchmarkFixture(workspace, "Resource control observation");
+				locker = childProcess.spawn(path.join(workspace, "probe"), ["hold"], { cwd: workspace, env: fixture.environment, stdio: ["pipe", "pipe", "pipe"] });
+				lockerClosed = once(locker, "close");
+				expect((await Promise.race([once(locker.stdout, "data"), lockerClosed.then(() => { throw new Error("lock holder exited"); })]))[0].toString()).toBe("R");
+				expect(execFileSync(path.join(workspace, "probe"), [], { cwd: workspace, env: fixture.environment, encoding: "utf8" })).toBe("L");
+			}
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { includeWorkspaceFingerprint: true });
+			branch = await forkReusableBash(fixture, { command: mode === "rename" ? "mv source moved" : "probe", label: "driver-semantics-test",
 				actionNamespace: "driver-semantics-test", executionFingerprint });
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
+			if (mode !== "rename") {
+				expect(branch.output.result.content).toEqual([{ type: "text", text: "U" }]);
+				const route = await backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
+					sourceRoot: workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
+						executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
+				}, true);
+				if (!("executor" in route)) throw new Error(route.detail);
+				let output = "";
+				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment, onData: data => { output += data.toString(); } });
+				expect(output, JSON.stringify(backend.actorMetrics())).toBe("L");
+				expect(backend.actorMetrics().hits).toBe(0);
+			}
 			const validation = await branch.validate?.();
 			expect(validation?.status).toBe("indeterminate");
-			expect(JSON.stringify(validation)).toContain("filesystem_semantics");
+			expect(JSON.stringify(validation)).toContain(mode === "rename" ? "filesystem_semantics" : "ipc");
 			expect(branch.executionMetrics.reuse?.requests).toBeGreaterThan(0);
 			expect(branch.executionMetrics.reuse?.executionMs).toBeGreaterThan(0);
 			expect(backend.metrics().tainted).toBeGreaterThan(0);
@@ -965,6 +1006,7 @@ int main(void) {
 			expect((await stat(path.join(workspace, "source"))).isDirectory()).toBe(true);
 			await expect(stat(path.join(workspace, "moved"))).rejects.toThrow();
 		} finally {
+			locker?.stdin.end(); await lockerClosed;
 			await branch?.dispose();
 			await fixture.dispose();
 		}

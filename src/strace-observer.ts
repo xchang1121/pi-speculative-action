@@ -16,7 +16,7 @@ const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
 	"io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
 ]);
-const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,fstat,fstatfs,getdents,getdents64,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,fstat,fstatfs,getdents,getdents64,fcntl,fcntl64,flock,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -302,6 +302,14 @@ export async function observeStrace(
 			}
 			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line)) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
+			// Descriptor-local flags and duplication stay within the traced process tree. OFD controls
+			// can observe or mutate locks, leases, shared flags and owners that file snapshots do not seal.
+			if (syscall === "flock") taints.add("ipc");
+			if (syscall === "fcntl" || syscall === "fcntl64") {
+				const command = line.args[1] ?? "";
+				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) taints.add("ipc");
+				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command)) taints.add("unsupported_syscall");
+			}
 			if (CLOCK_SYSCALLS.has(syscall)) taints.add("clock");
 			if (RANDOM_SYSCALLS.has(syscall)) taints.add("random");
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
