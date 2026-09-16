@@ -1065,11 +1065,14 @@ describe("PatternAware", () => {
 		expect(probabilities.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(1);
 	});
 
-	test("does not let single-sample mappers bypass constant provenance evidence", () => {
+	test("requires constant provenance from independently supporting samples", () => {
 		const store = patternStore();
-		for (const sessionID of ["one", "two", "three"]) {
+		for (const [sessionID, filePath] of [
+			["noise-one", "unrelated-a.ts"], ["noise-two", "unrelated-b.ts"],
+			["one", "README.md"], ["two", "README.md"], ["three", "README.md"],
+		]) {
 			store.observe(input(sessionID, "inspect", {}, { output: { kind: "path" } }));
-			store.observe(input(sessionID, "read", { filePath: "README.md" }));
+			store.observe(input(sessionID, "read", { filePath }));
 			store.finishSession(sessionID);
 		}
 

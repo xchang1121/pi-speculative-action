@@ -1084,25 +1084,19 @@ export class PatternAwareStore {
 			return;
 		}
 		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
+		const constantSupport = bindingEvidenceThreshold(this.settings);
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
 		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
-			if (!bindings) return;
+			if (!bindings || (!firstRecurrenceProbe &&
+				!hasSufficientBindingProvenance(bindings, pool.samples, constantSupport))) return;
 			candidates.set(stableStringify(bindingMapStructure(bindings)), bindings);
 		};
-		const hasBindingEvidence = (bindings: Readonly<Record<string, PatternAwareBinding>>) =>
-			hasSufficientBindingProvenance(bindings, pool.samples, bindingEvidenceThreshold(this.settings));
-		for (const patternID of pool.patternIDs ?? []) {
-			const bindings = this.patterns.get(patternID)?.bindings;
-			if (bindings && hasBindingEvidence(bindings)) remember(bindings);
-		}
-		const currentBindings = this.bindingAnalysis.inferBindings(context, target.input);
-		if (firstRecurrenceProbe || hasBindingEvidence(currentBindings)) {
-			remember(currentBindings);
-		}
+		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
+		remember(this.bindingAnalysis.inferBindings(context, target.input));
 		remember(
 			this.bindingAnalysis.inferBindingsFromSamples(
 				pool.samples,
-				bindingEvidenceThreshold(this.settings),
+				constantSupport,
 				this.actionSemantics !== undefined,
 			),
 		);
@@ -1110,7 +1104,8 @@ export class PatternAwareStore {
 		const retained = new Set<string>();
 		for (const candidate of candidates.values()) {
 			const { bindings, support } = this.minimizeProjectedBindings(candidate, pool);
-			if (support.length < minimumSupport) continue;
+			if (support.length < minimumSupport || (!firstRecurrenceProbe &&
+				!hasSufficientBindingProvenance(bindings, support, constantSupport))) continue;
 			const id = hash(
 				stableStringify({
 					context: signatures,
@@ -1842,14 +1837,10 @@ function hasSufficientBindingProvenance(
 	minimum: number,
 ) {
 	return Object.entries(bindings).every(([encodedPath, binding]) => {
+		if (binding.type !== "constant") return true;
 		const targetPath = decodePath(encodedPath);
-		return (
-			!targetPath ||
-			binding.type !== "constant" ||
-			!requiresProvenance(targetPath, binding.value) ||
-			stablePayloadConstant(samples, minimum)
-		);
-	});
+		return !targetPath || !requiresProvenance(targetPath, binding.value);
+	}) || stablePayloadConstant(samples, minimum);
 }
 
 const MISSING = Symbol("missing");
