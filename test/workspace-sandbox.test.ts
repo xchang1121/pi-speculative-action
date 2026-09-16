@@ -885,11 +885,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			pending.push(sandbox.prepare(root, { driver: "git" }));
 			await gate.entered;
 			const repository = await Reflect.get(sandbox, "state").repositories.values().next().value;
-			const previous = repository.baseline.commit;
+			const previous = repository.baseline;
+			validations.mockClear();
 			await writeFile(path.join(root, "value.txt"), "after\n");
 			pending.push(sandbox.prepare(root, { driver: "git" }));
-			await vi.waitFor(() => expect(repository.baseline.commit).not.toBe(previous));
+			await vi.waitFor(() => expect(repository.baseline.commit).not.toBe(previous.commit));
 			await repository.lock; await nextTurn();
+			expect(validations.mock.calls.map(([token]) => token)).toEqual([repository.baseline.version]);
 			const count = validations.mock.calls.length;
 			pending.push(sandbox.prepare(root, { driver: "git" }));
 			await vi.waitFor(() => expect(validations.mock.calls.length).toBeGreaterThan(count));
