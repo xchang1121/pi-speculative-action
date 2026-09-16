@@ -1,5 +1,8 @@
 /** Host-neutral speculative runtime surface. Pi adapters live in the root and extension entries. */
-export * from "./action-key-projection.ts";
+export {
+	type ActionProjectionCoverage, type ActionProjectionRule, type ReadRangeCoverage,
+	READ_RANGE_ACTION_KEY_PROJECTOR, READ_RANGE_COVERAGE_DETAILS_KEY, readRangesShareInFlight,
+} from "./action-key-projection.ts";
 export {
 	type ActionEffect,
 	type ActionKey,

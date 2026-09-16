@@ -1480,7 +1480,7 @@ describe("structural speculative runtime", () => {
 			await runtime.startTurn(start("turn-1"));
 			await (phase === "running" ? started.promise : ready.promise);
 			const mutation: Call = { ...call("turn-1"), id: "mutation", tool: phase === "observation" ? "read" : "write",
-				input: { path: "future.ts", ...(phase === "observation" ? { offset: 100, limit: 1 } : { content: "new" }) } };
+				input: { path: "future.ts", ...(phase === "observation" ? { offset: 2001, limit: 1 } : { content: "new" }) } };
 			const mutationCall = await runtime.prepareActorCall(mutation);
 			expect(mutationCall?.output).toBeUndefined();
 			if (phase === "sealed stale" || phase === "running") version++;

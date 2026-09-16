@@ -1,10 +1,6 @@
-import type { ActionProjectionCoverage, ActionProjectionRule } from "./action-key-projection.ts";
-import type {
-	ActionKey,
-	ActionKeyMatch,
-	ActionSemanticsRegistry,
-} from "./action-semantics.ts";
-import { actionKeyCovers, actionKeyMatch, ownActionKeyProjector, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { type ActionProjectionCoverage, type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
+import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorAction, type ActorCandidateSelection } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation } from "./candidate-execution.ts";
 import {
@@ -76,17 +72,6 @@ class CandidateFailure extends Error {
 		super(failure.detail ?? failure.code);
 		this.failure = failure;
 	}
-}
-
-function uniqueProjectionRules<Output>(
-	rules: readonly ActionProjectionRule<Output>[],
-	semantics: ActionSemanticsRegistry,
-): readonly ActionProjectionRule<Output>[] {
-	const unique = new Map<string, ActionProjectionRule<Output>>();
-	for (const rule of rules) {
-		if (semantics.supportsProjector(rule.id) && !unique.has(rule.id)) unique.set(rule.id, ownActionKeyProjector(rule));
-	}
-	return [...unique.values()];
 }
 
 function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): readonly PlanUpdate[] {
@@ -574,7 +559,7 @@ export function makeSpeculativeActionRuntime<
 		if (sourcesByID.has(source.id)) throw new Error(`duplicate speculative plan source ${source.id}`);
 		sourcesByID.set(source.id, source);
 	}
-	const projectionRules = uniqueProjectionRules(adapter.projectionRules ?? [], semantics);
+	const projectionRules = resolveActionProjectionRules(adapter.projectionRules ?? [], semantics);
 	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue);
 	const sessionStates = new Map<SessionID, Session>();
 	let masterEnabled: boolean | undefined;
