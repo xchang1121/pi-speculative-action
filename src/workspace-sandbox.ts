@@ -1233,11 +1233,13 @@ async function acquireSandboxBaseline(
 			// Quiet notifications may reuse preparation work; every actual fork still checks exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline.commit;
-			const [current, indexed] = await Promise.all([
-				repository.versions.validate(baseline.version),
-				sandboxIndexChanges(repository),
-			]);
-			if (!current.expired && indexed.length === 0) return baseline.commit;
+			// Warm-up can reject an old baseline before hashing; actual forks keep the checks parallel.
+			const indexed = sandboxIndexChanges(repository);
+			const current = warmup
+				? indexed.then((paths) => paths.length ? { expired: true } : repository.versions.validate(baseline.version))
+				: repository.versions.validate(baseline.version);
+			const [version, paths] = await Promise.all([current, indexed]);
+			if (!version.expired && !paths.length) return baseline.commit;
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
