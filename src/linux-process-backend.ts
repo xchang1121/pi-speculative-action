@@ -245,7 +245,7 @@ interface ActiveSession {
 	readonly invocation: ToolProcessInvocation;
 	readonly scope?: ExecutionScope;
 	readonly projection: ExecutionPathProjection;
-	readonly interposition: Awaited<ReturnType<typeof createProcessInterposition>>;
+	interposition: Awaited<ReturnType<typeof createProcessInterposition>>;
 	readonly originalPath: string;
 	readonly deniedPaths: readonly string[];
 	readonly producer: ProcessProducerProof;
@@ -516,26 +516,6 @@ export class LinuxProcessReuseBackend {
 		const originalPath = input.invocation.environment.PATH ?? input.invocation.environment.Path ?? "";
 		const token = randomToken();
 		const socketPath = path.join(input.workspace.processRoot, `broker-${token.slice(0, 12)}.sock`);
-		const interposition = await createProcessInterposition({
-			privateRoot: input.workspace.processRoot,
-			pathValue: originalPath,
-			projection,
-			sourceRoot,
-			workspaceRoot: input.workspace.sandboxRoot,
-			workspaceExcludes: input.workspace.observationExcludes,
-			signal: input.signal,
-			token,
-			socketPath,
-			dispatcherBinary: ready.dispatcher,
-			excludedExecutables: [
-				input.invocation.shell,
-				process.execPath,
-				ready.dispatcher,
-				ready.sandlock,
-				ready.strace,
-			],
-		});
-		throwIfAborted(input.signal);
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
@@ -551,7 +531,7 @@ export class LinuxProcessReuseBackend {
 			invocation: input.invocation,
 			scope: snapshotExecutionScope(input.scope),
 			projection,
-			interposition,
+			interposition: { mounts: [], execMounts: [], directories: [], executables: [], dependencies: [] },
 			originalPath,
 			deniedPaths,
 			producer,
@@ -566,14 +546,35 @@ export class LinuxProcessReuseBackend {
 			incompleteReasons: new Set<string>(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
-		await listenUnixSocket(server, socketPath);
 		this.producers++;
 		let executionKind: "tool" | "operation" | undefined;
+		let dispatch: Promise<void> | undefined;
 		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
 			if (session.closing || executionKind === "operation" || executionKind && executionKind !== kind)
 				return Promise.reject(new Error("process session execution boundary is already consumed"));
 			executionKind = kind;
-			const pending = Promise.resolve().then(operation).finally(() => { session.pending.delete(pending); });
+			const pending = Promise.resolve().then(async () => {
+				throwIfAborted(session.signal);
+				// A bound operation already names its executable; only enclosing tools need PATH interception.
+				if (kind === "tool") await (dispatch ??= createProcessInterposition({
+					privateRoot: input.workspace.processRoot,
+					pathValue: originalPath,
+					projection,
+					sourceRoot,
+					workspaceRoot: input.workspace.sandboxRoot,
+					workspaceExcludes: input.workspace.observationExcludes,
+					signal: session.signal,
+					token,
+					socketPath,
+					dispatcherBinary: ready.dispatcher,
+					excludedExecutables: [input.invocation.shell, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
+				}).then(interposition => {
+					throwIfAborted(session.signal);
+					session.interposition = interposition;
+					return listenUnixSocket(server, socketPath);
+				}));
+				return operation();
+			}).finally(() => { session.pending.delete(pending); });
 			session.pending.add(pending);
 			return pending;
 		};
@@ -591,6 +592,7 @@ export class LinuxProcessReuseBackend {
 			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 			close: () => session.closing ??= Promise.resolve().then(async () => {
 				controller.abort(new Error("Linux process session closed"));
+				await dispatch?.catch(() => undefined);
 				try { await closeServer(server); } finally {
 					await Promise.allSettled(session.pending);
 					await rm(socketPath, { force: true }).catch(() => undefined);

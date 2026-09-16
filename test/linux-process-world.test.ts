@@ -114,6 +114,8 @@ int main(int argc, char **argv) {
 						const validation = await session.validate();
 						expect(validation, JSON.stringify({ validation, metrics: session.metrics() })).toMatchObject({ status: "valid" });
 						await expect(session.executeBinding(binding!)).rejects.toThrow("already consumed");
+						expect(existsSync(path.join(workspace.processRoot, "process-interposition"))).toBe(false);
+						expect((await filesystem.readdir(workspace.processRoot)).filter(name => name.startsWith("broker-"))).toEqual([]);
 					} finally { await session.close(); }
 				});
 
@@ -833,22 +835,24 @@ int main(void) {
 		}
 	});
 
-	test.for([false, true])("replenishes shared PATH alias probes while preserving mappings and owned cancellation (cancel=%s)", { timeout: 15_000 }, async (cancel, { skip }) => {
+	test.for([false, true, "close"] as const)("replenishes shared PATH alias probes while preserving mappings and owned cancellation (cancel=%s)", { timeout: 15_000 }, async (cancel, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-interposition-cancel-");
 		const { realpath: resolvePath } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const controller = new AbortController(), entered = deferred(), gate = deferred();
 		let activeRoot: string | undefined, held = false, returned = false, probesAfterAbort = 0;
 		const probes = new Map<string, number>();
+		let closing: (() => Promise<void>) | undefined, closed: Promise<void> | undefined, cancelled = false;
 		const open = fixture.backend.open.bind(fixture.backend);
-		const opening = vi.spyOn(fixture.backend, "open").mockImplementation((input) => {
-			activeRoot = input.workspace.sandboxRoot; return open(input);
+		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+			activeRoot = input.workspace.sandboxRoot;
+			const session = await open(input); closing = session.close; return session;
 		});
 		const resolving = vi.spyOn(filesystem, "realpath").mockImplementation((...args) => {
 			const target = String(args[0]);
 			if (activeRoot && path.dirname(target) === path.join(activeRoot, "bin") && path.basename(target).startsWith("probe-")) {
 				probes.set(path.basename(target), (probes.get(path.basename(target)) ?? 0) + 1);
-				if (controller.signal.aborted) probesAfterAbort++;
+				if (cancelled) probesAfterAbort++;
 				if (!held) { held = true; entered.resolve(); return gate.promise.then(() => resolvePath(...args)); }
 			}
 			return resolvePath(...args);
@@ -873,7 +877,9 @@ int main(void) {
 			running = forkReusableBash({ ...fixture, tool, environment }, { ...args, label: "cancel-interposition",
 				actionNamespace: "cancel-interposition", executionFingerprint, signal: controller.signal });
 			void running.then(() => { returned = true; }, () => { returned = true; });
-			await Promise.race([entered.promise, running]); if (cancel) controller.abort(); await nextTurn();
+			await Promise.race([entered.promise, running]);
+			if (cancel) { cancelled = true; if (cancel === "close") closed = closing!(); else controller.abort(); }
+			await nextTurn();
 			if (!cancel) await expect.poll(() => probes.size, { timeout: 1000 }).toBe(33);
 			expect({ returned, owned: existsSync(activeRoot!) }).toEqual({ returned: false, owned: true });
 			gate.resolve();
@@ -892,7 +898,7 @@ int main(void) {
 			expect(afterAbort, `preparation ownership: ${JSON.stringify(afterAbort)}`).toEqual({ probesAfterAbort: 0, brokerStarted: !cancel });
 			await expect(stat(activeRoot!)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
-			gate.resolve(); await running?.then((branch) => branch.dispose(), () => undefined);
+			gate.resolve(); await running?.then((branch) => branch.dispose(), () => undefined); await closed;
 			opening.mockRestore(); resolving.mockRestore(); listening.mockRestore(); await fixture.dispose();
 		}
 	});
