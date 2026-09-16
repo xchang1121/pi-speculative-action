@@ -45,7 +45,7 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
-	it("stops cancelled preparation between stages without cancelling a concurrent owner", async () => {
+	it("retains shared baseline work when a preparation owner cancels", async () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
 			const root = await temporaryRoot(), controller = new AbortController();
@@ -74,7 +74,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				expect(cancelled).toMatchObject({ status: "rejected", reason: { message: "owner closed" } });
 				expect(live.status).toBe(owner === "cancelled" ? "rejected" : "fulfilled");
 				expect(workspaces).toBe(Number(owner === "active"));
-				expect(captures).toBe(Number(phase === "baseline") + Number(owner === "active"));
+				expect(captures).toBe(Number(phase === "baseline" || owner === "active"));
 				const branch = await sandbox.createExecutionWorld({ driver: "git" }).speculation.execute(
 					context(root, "write", writeTool, { path: "value.txt", content: "live owner\n" }));
 				await branch.commit(); await branch.dispose();
