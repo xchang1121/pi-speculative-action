@@ -631,6 +631,8 @@ describe("structural speculative runtime", () => {
 		const source = planSource({
 			enabled: () => enabled,
 			propose: () => plan("bounded-join"),
+			observesOperations: true,
+			observe: () => undefined,
 		});
 		const { runtime, events, ready: candidateReady } = harness({
 			source,
@@ -650,6 +652,7 @@ describe("structural speculative runtime", () => {
 		await gate.entered;
 		const prepared = await runtime.prepareActorCall(call("prediction"));
 		expect(prepared?.output).toBeUndefined();
+		expect(prepared?.observeOperations).toBe(true);
 
 		gate.release();
 		await candidateReady.promise;
@@ -667,7 +670,7 @@ describe("structural speculative runtime", () => {
 		});
 		enabled = false;
 		await runtime.startTurn(start("retained"));
-		expect((await runtime.prepareActorCall(call("retained")))?.output).toBe("learned");
+		expect(await runtime.prepareActorCall(call("retained"))).toMatchObject({ output: "learned", observeOperations: false });
 		await runtime.finishTurn({ ...call("retained"), terminal: true });
 		const event = events.find((event) => event.type === "actor_action" && event.turnID === "retained");
 		const retained = event?.type === "actor_action" ? event.settlement.provider : undefined;

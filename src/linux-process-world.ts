@@ -38,11 +38,10 @@ export function createLinuxProcessExecutionWorld(
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
 	const operationCosts = new WeakMap<ProcessExecutionBinding, number>();
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
-		const expectedDurationMs = operationCosts.get(binding);
-		if (expectedDurationMs === undefined) return undefined;
+		const expectedDurationMs = operationCosts.get(binding) ?? binding.executionMs;
 		const reference = new WeakRef(binding);
 		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash,
-			executionMs: binding.certificate.result.observedProcessMs ?? 0, expectedDurationMs,
+			executionMs: binding.executionMs, expectedDurationMs,
 			get available() { return reference.deref()?.available ?? false; } });
 		operations.set(descriptor, { binding: reference, permissionKey: permission.key });
 		return descriptor;
@@ -68,9 +67,9 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
-		observeOperations: ({ action, scope }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
-			observe(bindings.flatMap(binding => { const operation = describeOperation(binding, action); return operation ? [operation] : []; }), computations);
-		}),
+		observeOperations: ({ action, scope, learn }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
+			observe(bindings.map(binding => describeOperation(binding, action)), computations);
+		}, learn),
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			tools: options.tools,
@@ -192,9 +191,9 @@ export function createLinuxProcessExecutionWorld(
 				Object.assign(branch, {
 					computationDependencies: session.computationDependencies(),
 					operations: Object.freeze(session.executionBindings().map(binding => {
-						const executionMs = binding.certificate.result.observedProcessMs ?? 0;
+						const executionMs = binding.executionMs;
 						operationCosts.set(binding, overheadMs + executionMs);
-						return describeOperation(binding, context.action)!;
+						return describeOperation(binding, context.action);
 					})),
 					commit: () => {
 						if (operation) throw new Error("internal process output cannot commit an enclosing tool");

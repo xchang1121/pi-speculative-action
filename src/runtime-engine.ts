@@ -1832,7 +1832,8 @@ export function makeSpeculativeActionRuntime<
 		state.actorActions.add(actorAction);
 		state.actorObservation ??= actualKey ? identity : null;
 		let capturePreparationMs = 0;
-		const prepared: { output?: Output; settle: PreparedActorCall<Output>["settle"] } = {
+		const prepared: { output?: Output; observeOperations: boolean; settle: PreparedActorCall<Output>["settle"] } = {
+			observeOperations: state.settings.enabled && sources.some(source => source.observesOperations && source.observe && source.enabled(state.settings)),
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
 				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]))),
 		};

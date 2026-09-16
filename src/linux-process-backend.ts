@@ -228,6 +228,7 @@ type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
 	readonly executable: string;
 	readonly outputRoute: OutputRoute;
+	readonly producer?: ProcessProducerProof;
 };
 
 interface BufferedOutput {
@@ -294,13 +295,13 @@ type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay"
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
 	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean;
-		bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
+		learn: boolean; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
 
-	/** Only acknowledged held-exec adoptions enter the enclosing native call's ordered observations. */
+	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void): Promise<Value> {
+		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
+			learn, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
@@ -378,7 +379,7 @@ export class LinuxProcessReuseBackend {
 		return Object.freeze({ ...this.actorCounters });
 	}
 
-	/** Real sandbox executions, still speculative until an Actor consumes them. Never persisted as launch parameters. */
+	/** Scoped launches; sandbox bindings are still speculative until adopted. Raw parameters are never persisted. */
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
 		return this.handoffs.bindings(scope);
 	}
@@ -424,8 +425,10 @@ export class LinuxProcessReuseBackend {
 				try {
 					request = { ...request, scope: snapshotExecutionScope("scope" in request ? request.scope : options.held?.scope?.()) };
 				} catch { return host.execute(request); }
-				// Only actual production and retained evidence need replay. Recheck after IO; never cache emptiness.
-				if ((!this.hasLiveResults && !(await this.store.mayHaveCertificates()) && !this.hasLiveResults) || this.disposed) return host.execute(request);
+				const observation = this.observations.getStore();
+				const learning = observation?.learn && !observation.closed && sameScope(observation.scope, request.scope);
+				// Learning explicitly requests held execs; other calls retain the empty-history fast path.
+				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates()) && !this.hasLiveResults) || this.disposed) return host.execute(request);
 				return (await (prepared ??= prepare())).execute(request);
 			},
 		} };
@@ -858,7 +861,8 @@ export class LinuxProcessReuseBackend {
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
 		const invocation = this.handoffs.resolveBinding(binding, session.scope);
-		if (!invocation || invocation.sourceRoot !== session.sourceRoot || !compatibleProducer(session.nestedProducer, binding.certificate.producer))
+		if (!invocation || invocation.sourceRoot !== session.sourceRoot ||
+			invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
 			throw new Error("process execution binding is unavailable in this scope");
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
@@ -1018,6 +1022,7 @@ export class LinuxProcessReuseBackend {
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
+		const learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
 		const order = observation ? ++observation.sequence : 0;
 		const requestStarted = performance.now();
 		this.addActor("requests");
@@ -1027,8 +1032,9 @@ export class LinuxProcessReuseBackend {
 			const executable = await realpath(`/proc/${process.pid}/exe`);
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 			const executablePath = projection.toLogical(executable);
-			if (!this.handoffs.mayHaveExecutable(executablePath) && !(await this.store.mayHaveCertificates(executablePath)) &&
-				!this.handoffs.mayHaveExecutable(executablePath)) {
+			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
+				this.handoffs.mayHaveExecutable(executablePath);
+			if (!learning && !available) {
 				this.addActor("misses");
 				return { kind: "continue" };
 			}
@@ -1036,6 +1042,33 @@ export class LinuxProcessReuseBackend {
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
 				this.addActor("bypasses");
 				return { kind: "continue" };
+			}
+			const observe = (prototype: ExecPrototype, durationMs: number) => {
+				const weakKey = processWeakKey(prototype);
+				this.processScheduler.observeActorService(processTimingIdentity(prototype, weakKey), durationMs);
+				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute ||
+					observation!.bindings.size >= this.store.limits.maxCertificates) return;
+				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
+					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
+					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
+				}, durationMs);
+				if (binding) observation!.bindings.set(order, binding);
+			};
+			if (!available) {
+				// Pin the actual image before resuming it. Learning must not wait for a large digest after a short native call.
+				const platform = await this.resolvePlatformFingerprint(), controller = new AbortController();
+				let pinned!: () => void, digest: Sha256Digest | undefined;
+				const ready = new Promise<void>(resolve => { pinned = resolve; });
+				const capturing = hashExecutableFile(`/proc/${process.pid}/exe`, { pinned,
+					signal: process.signal ? AbortSignal.any([process.signal, controller.signal]) : controller.signal,
+				}).then(value => { digest = value; }, () => {}).finally(pinned);
+				await ready;
+				this.addActor("misses");
+				return { kind: "continue", observeCompletion: async durationMs => {
+					if (!digest || durationMs === undefined) controller.abort();
+					await capturing;
+					if (durationMs !== undefined && digest) observe(bufferedProcessPrototype(snapshot, projection, digest, platform), durationMs);
+				} };
 			}
 			const prototype = bufferedProcessPrototype(
 				snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`),
@@ -1057,7 +1090,7 @@ export class LinuxProcessReuseBackend {
 				this.addActor("misses");
 				return {
 					kind: "continue",
-					observeCompletion: (durationMs) => this.processScheduler.observeActorService(timing, durationMs),
+					observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); },
 				};
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
@@ -1257,7 +1290,7 @@ export class LinuxProcessReuseBackend {
 					() => {
 						const binding = this.handoffs.bind(weakKey, work, {
 							argv0: request.argv0, args: request.args, environment: request.environment,
-							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute,
+							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
