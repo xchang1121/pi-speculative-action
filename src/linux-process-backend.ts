@@ -107,7 +107,7 @@ import {
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-protected-inputs";
+const BACKEND_EPOCH = "pi-linux-process-descriptor-controls";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
