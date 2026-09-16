@@ -28,7 +28,7 @@ index 96309ec..1925e1c 100644
      match &args.gpu {
          // `all` maps to an empty device list, which the core expands to every
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..f06fe6e 100644
+index 6e4ab93..23e21ac 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -76,6 +76,8 @@ pub(crate) struct ChrootCtx<'a> {
@@ -236,6 +236,12 @@ index 6e4ab93..f06fe6e 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
+@@ -1727,4 +1766,4 @@ pub(crate) async fn handle_chroot_readlink(
+     let target = match std::fs::read_link(&host_path) {
+         Ok(t) => t,
+-        Err(_) => return NotifAction::Errno(libc::ENOENT),
++        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EIO)),
+     };
 @@ -2482,6 +2521,7 @@ mod mount_ro_tests {
              denied: &[],
              mounts,

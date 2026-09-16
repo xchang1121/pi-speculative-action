@@ -64,7 +64,7 @@ pi -e /absolute/path/to/pi-speculative-action
 npm run setup:linux
 ```
 
-安装器构建并验证固定版本的后端；Runtime 使用前仍会自检。升级后若提示 helper 协议不匹配，重新运行上述安装命令。可选 fuse-overlayfs 通过完整资格后用于大型工作区，不可用时保留 Git。WSL checkout 应放在 Linux 原生文件系统中。
+安装器构建并验证固定版本的后端；Runtime 使用前仍会自检。更新后端补丁或提示 helper 协议不匹配时，重新运行上述安装命令。可选 fuse-overlayfs 通过完整资格后用于大型工作区，不可用时保留 Git。WSL checkout 应放在 Linux 原生文件系统中。
 
 原生程序可以通过 CPU 指令或 ELF 启动状态取得时钟和随机输入，系统调用观察不能证明它们未被使用。当前 Linux 后端保留这些输入限制，已执行或仍在运行的计算只可转交一次；Plan 仍有有效消费者时可跨轮转交，消费者取消或过期后跨轮资格失效。没有 Plan 所有权的直接调用仍限于同轮，不发布为跨轮、跨会话重放的历史结果；旧观察契约的证书拒绝采纳。可执行绑定仍可跨轮保留，在新轮次重新预执行。
 
