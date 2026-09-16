@@ -864,17 +864,16 @@ export class LinuxProcessReuseBackend {
 		const request = { ...invocation, cwd };
 		const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
 		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
-		const before = await session.workspace.structure.capture();
 		this.add(session, "requests");
-		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype);
-		const after = await session.workspace.structure.capture();
-		session.topLevelCapture = { before, after,
-			observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } };
+		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
+			capture => { session.topLevelCapture = { ...capture,
+				observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } }; });
 		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })), exit: result.exit! };
 	}
 
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
-		requestID: number, prototype?: ExecPrototype): Promise<DispatcherResponse> {
+		requestID: number, prototype?: ExecPrototype,
+		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void): Promise<DispatcherResponse> {
 		prototype ??= await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
@@ -885,7 +884,9 @@ export class LinuxProcessReuseBackend {
 			{ ownership: session.ownership, executablePath: prototype.executablePath },
 		);
 		if (acquired.plan) {
+			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 			const result = await this.replay(session, acquired.plan, weakKey, acquired);
+			if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
 			if (acquired.producer?.computation) session.computations.push({ computation: acquired.producer.computation });
 			const binding = acquired.producer?.binding;
 			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
@@ -894,7 +895,7 @@ export class LinuxProcessReuseBackend {
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID);
+			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace);
 		} finally {
 			this.handoffs.complete(weakKey, acquired.work);
 			const computation = acquired.work.computation;
@@ -1166,6 +1167,7 @@ export class LinuxProcessReuseBackend {
 		outputRoute: OutputRoute,
 		work: ProcessHandoff,
 		requestID: number,
+		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -1231,6 +1233,8 @@ export class LinuxProcessReuseBackend {
 					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
 				}
 				const { before, after } = delta;
+				// A bound child is the entire execution interval; its transaction already sealed both endpoints.
+				captureWorkspace?.({ before, after });
 				stage = "workspace_effects";
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
 				stage = "dependencies";
@@ -1563,7 +1567,7 @@ function transactionDependencySource(
 		if (!cached.has(relative)) cached.set(relative, (async () => {
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
-			const content = deltas.get(relative)?.before ?? await captureStableFile(path.resolve(snapshot.root, relative), structure.size);
+			const content = deltas.get(relative)?.before ?? await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
 			const hydrated = hydrateWorkspaceFileEntry(structure, content);
 			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
 			return hydrated;
