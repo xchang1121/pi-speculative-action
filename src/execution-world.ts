@@ -26,6 +26,7 @@ export function snapshotExecutionScope(scope: ExecutionScope | undefined): Execu
 
 /** Tool effects are resolved independently from K(a) and prediction source. */
 export interface ExecutionWorldRequest {
+	readonly backend?: string;
 	readonly effect: ActionEffect;
 	readonly requirements: EffectRequirements;
 	/** Tool scope is still known during warm-up, before a concrete action key exists. */
@@ -118,6 +119,27 @@ export interface WorldCheckpoint {
 	readonly depth: number;
 }
 
+/** Opaque backend-issued capability for an internal unit; the enclosing action still owns permission. */
+export interface ExecutionOperationBinding {
+	readonly backend: string;
+	readonly identity: string;
+	/** Live preparation hint only; true never replaces backend permission or dependency checks. */
+	readonly available?: boolean;
+	/** Retrieval hint only. The issuing backend must check the current enclosing action's complete K(a). */
+	readonly permissionHash: string;
+	readonly executionMs: number;
+	/** Isolated service estimate, including observed preparation and capture. */
+	readonly expectedDurationMs: number;
+}
+
+/** Delivered only after the authoritative OS boundary confirms the internal result was consumed. */
+export interface ExecutionOperationAdoption {
+	readonly scope: ExecutionScope;
+	readonly id: string;
+	readonly sequence: number;
+	readonly operationIdentity: string;
+}
+
 /**
  * A sealed speculative execution artifact.
  *
@@ -128,6 +150,8 @@ export interface WorldCheckpoint {
 export interface WorldBranch<Output> {
 	readonly output: Output;
 	readonly backend: string;
+	/** Observed internal work. Only successful Actor adoption makes these authoritative learning inputs. */
+	readonly operations?: readonly ExecutionOperationBinding[];
 	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
@@ -300,6 +324,9 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	/** Pre-Actor execution and Actor-authorized observation deliberately have independent authority. */
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
+	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
+	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope },
+		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[]) => void) => Promise<Value>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }
@@ -351,6 +378,16 @@ export class ExecutionWorldRouter<Context, Output> {
 		if (!this.speculationEnabled(world.id)) throw new Error(`Execution world ${world.id} is disabled by routing policy`);
 		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
 		return this.lifecycle.admit(() => world.speculation!.execute(context));
+	}
+
+	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
+		observe: (bindings: readonly ExecutionOperationBinding[]) => void): Promise<Value> {
+		for (const world of this.worldsByID.values()) {
+			if (!world.observeOperations || !supportsTool(world.speculation ?? world.observation!, action.tool)) continue;
+			const next = execute;
+			execute = () => world.observeOperations!({ action, scope }, next, observe);
+		}
+		return execute();
 	}
 
 	/** Select a capture-capable world and snapshot its baseline before host execution. */
@@ -430,7 +467,8 @@ export class ExecutionWorldRouter<Context, Output> {
 	): Promise<Selected | undefined> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worldsByID.values()) {
-				if (world.scope !== scope || (kind === "speculation" && !this.speculationEnabled(world.id))) continue;
+				if (world.scope !== scope || request.backend !== undefined && request.backend !== world.id ||
+					(kind === "speculation" && !this.speculationEnabled(world.id))) continue;
 				const operation = world[kind];
 				if (!operation) continue;
 				try {

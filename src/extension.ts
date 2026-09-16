@@ -1339,6 +1339,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				formatDuration(event.request.durationMs),
 			);
 			break;
+		case "operation_prediction":
 		case "prediction": {
 			const settlement = event.settlement;
 			parts.push(settlement.prediction.source, settlement.prediction.actionID);

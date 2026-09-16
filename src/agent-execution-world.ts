@@ -4,6 +4,7 @@ import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
 	ExecutionWorld,
 	ExecutionScope,
+	ExecutionOperationAdoption,
 	WorldBranch,
 	WorldCheckpoint,
 	WorldResultCapture,
@@ -29,6 +30,7 @@ export interface SpeculativeToolExecutionContext {
 	readonly callID: string;
 	readonly signal: AbortSignal;
 	readonly executionScope?: ExecutionScope;
+	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;
 }

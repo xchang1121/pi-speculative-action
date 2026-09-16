@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { constants as fsConstants } from "node:fs";
@@ -79,6 +80,7 @@ import {
 	emptyWorldReuseMetrics,
 	snapshotExecutionScope,
 	type ExecutionScope,
+	type ExecutionOperationAdoption,
 	type ExecutionWorldStorageControl,
 	type WorldReuseMetrics,
 } from "./execution-world.ts";
@@ -152,6 +154,8 @@ type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: 
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
+	/** Captured exec units in dispatcher arrival order, still speculative until the enclosing branch is adopted. */
+	readonly executionBindings: () => readonly ProcessExecutionBinding[];
 	/** Execute one retained exec unit in this fresh sandbox; its output is not the enclosing tool's result. */
 	readonly executeBinding: (binding: ProcessExecutionBinding) => Promise<{
 		readonly output: readonly BufferedOutput[];
@@ -255,6 +259,7 @@ interface ActiveSession {
 	readonly signal: AbortSignal;
 	readonly pending: Set<Promise<unknown>>;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
+	readonly executionBindings: Map<number, ProcessExecutionBinding>;
 	readonly incompleteReasons: Set<string>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
@@ -285,6 +290,18 @@ type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay"
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
+	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; bindings: Map<number, ProcessExecutionBinding> }>();
+
+	/** Only acknowledged held-exec adoptions enter the enclosing native call's ordered observations. */
+	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>, observe: (bindings: readonly ProcessExecutionBinding[]) => void): Promise<Value> {
+		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false, bindings: new Map<number, ProcessExecutionBinding>() };
+		try { return await this.observations.run(observation, execute); }
+		finally {
+			observation.closed = true;
+			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)); }
+			catch { /* Learning cannot replace the native result or error. */ }
+		}
+	}
 	readonly store: ProvenanceCertificateStore;
 	readonly planner: ProcessReusePlanner;
 	readonly storage: ExecutionWorldStorageControl;
@@ -478,6 +495,7 @@ export class LinuxProcessReuseBackend {
 		readonly invocation: ToolProcessInvocation;
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
+		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	}): Promise<LinuxProcessSession> {
 		return this.withProducer(() => this.createSession(input));
 	}
@@ -538,8 +556,9 @@ export class LinuxProcessReuseBackend {
 			socketPath,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			pending: new Set<Promise<unknown>>(),
-			ownership: new ProcessHandoffOwnership(),
+			ownership: new ProcessHandoffOwnership(input.onOperationAdopted),
 			nestedEvidence: [],
+			executionBindings: new Map(),
 			incompleteReasons: new Set<string>(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
@@ -556,6 +575,7 @@ export class LinuxProcessReuseBackend {
 		};
 		return {
 			ownership: session.ownership,
+			executionBindings: () => Object.freeze([...session.executionBindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)),
 			executor: { execute: (request) => execute("tool", () => this.executeTopLevel(session, request)) },
 			executeBinding: (binding) => execute("operation", () => this.executeBinding(session, binding)),
 			metrics: () => Object.freeze({ ...session.metrics }),
@@ -856,7 +876,12 @@ export class LinuxProcessReuseBackend {
 			session.scope,
 			{ ownership: session.ownership, executablePath: prototype.executablePath },
 		);
-		if (acquired.plan) return this.replay(session, acquired.plan, weakKey, acquired);
+		if (acquired.plan) {
+			const result = await this.replay(session, acquired.plan, weakKey, acquired);
+			const binding = acquired.producer?.binding;
+			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
+			return result;
+		}
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
@@ -975,6 +1000,8 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
+		const observation = this.observations.getStore();
+		const order = observation ? ++observation.sequence : 0;
 		const requestStarted = performance.now();
 		this.addActor("requests");
 		try {
@@ -1026,23 +1053,28 @@ export class LinuxProcessReuseBackend {
 					try {
 						throwIfAborted(process.signal);
 						await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
-						this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
-						this.processScheduler.observeAdoption(
-							timing,
-							Math.max(0, performance.now() - requestStarted - acquired.waitedMs),
-						);
-						this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
-						if (acquired.actorMs !== undefined) {
-							this.addActor("actorTimedHits");
-							this.addActor("actorBaselineMs", acquired.actorMs);
-							this.addActor("actorTimedHitLatencyMs", Math.max(0, performance.now() - requestStarted));
-						}
 					} catch (error) {
 						this.setActorError(`actor_child_commit:${errorMessage(error)}`);
 						throw error;
 					} finally {
 						this.addActor("replayMs", Math.max(0, performance.now() - started));
 					}
+				},
+				adopted: () => {
+					const binding = acquired.producer?.binding;
+					if (observation && !observation.closed && sameScope(observation.scope, scope) && binding &&
+						this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
+						observation.bindings.set(order, binding);
+					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
+					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
+					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
+					if (acquired.actorMs !== undefined) {
+						this.addActor("actorTimedHits");
+						this.addActor("actorBaselineMs", acquired.actorMs);
+						this.addActor("actorTimedHitLatencyMs", Math.max(0, performance.now() - requestStarted));
+					}
+					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id,
+						sequence: process.sequence, operationIdentity: weakKey });
 				},
 			};
 		} catch (error) {
@@ -1202,10 +1234,11 @@ export class LinuxProcessReuseBackend {
 					work,
 					certificate,
 					() => {
-						this.handoffs.bind(weakKey, work, {
+						const binding = this.handoffs.bind(weakKey, work, {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute,
 						});
+						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
 						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
 							// Optional history storage cannot invalidate already sealed execution evidence.

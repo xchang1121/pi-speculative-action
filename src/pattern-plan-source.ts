@@ -2,6 +2,8 @@ import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionSemanticsRegistry } from "./action-semantics.ts";
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import type { ExecutionOperationBinding } from "./execution-world.ts";
 import {
 	agentBatchKey,
 	type AgentPlanSource,
@@ -9,6 +11,7 @@ import {
 } from "./agent-runtime-types.ts";
 import {
 	acquirePatternAwareStore,
+	PATTERN_AWARE_DEFAULTS,
 	asPatternAwareRuntimeContext,
 	type PatternAwareCandidate,
 	type PatternAwareEventInput,
@@ -29,7 +32,11 @@ import { candidateExecutionMs, candidateToolNames } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
-type PatternPlanFeedback = PatternAwareRuntimeContext & { readonly patternIDs: ReadonlyArray<string> };
+type ObservedOperation = { readonly key: string; readonly parentHash: string; readonly binding: ExecutionOperationBinding };
+type PatternPlanFeedback = PatternAwareRuntimeContext & {
+	readonly patternIDs: ReadonlyArray<string>;
+	readonly operation?: ObservedOperation;
+};
 type CarriedPrediction = { readonly signature: string; readonly pending: Set<PatternPlanFeedback>; abandoned: boolean };
 
 export interface PatternPlanSourceController {
@@ -64,6 +71,8 @@ export function createPatternPlanSource({
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
 	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
+	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
+	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
 	let analysisTail: Promise<void> = Promise.resolve();
 
 	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
@@ -124,6 +133,28 @@ export function createPatternPlanSource({
 		...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
 		learnTarget: false,
 	});
+	const planAction = (candidate: PatternAwareCandidate, store: PatternAwareStore, id: string,
+		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"]) => {
+		const action = patternPlanAction(candidate, store, id, dependsOn);
+		// Preserve established whole-action paths. Uncertain idle-capacity probes may prepare a known smaller unit.
+		if (!candidate.background || dependsOn?.length || !operationBindings.size) return action;
+		const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
+		let operation: ObservedOperation | undefined;
+		for (const item of operationBindings.values()) {
+			if (item.binding.available === false) operationBindings.delete(item.key);
+			else if (item.parentHash === parentHash && item.binding.executionMs > (operation?.binding.executionMs ?? 0)) operation = item;
+		}
+		if (!operation) return action;
+		const { binding } = operation;
+		return { ...action, id: `${id}:operation:${binding.identity}`, type: "operation" as const, operation: binding,
+			expectedDurationMs: binding.expectedDurationMs,
+			expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * binding.executionMs),
+			feedback: { ...action.feedback, operation },
+		};
+	};
+	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
+		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"], parentID?: string) =>
+		candidates.map(candidate => planAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), schemaHashes, dependsOn));
 
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
@@ -145,9 +176,7 @@ export function createPatternPlanSource({
 				id: `pattern:${startInput.turnID}`,
 				source: "pattern_aware",
 				revision: nextRevision(startInput.sessionID, startInput.turnID),
-				actions: candidates.map((candidate) =>
-					patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)),
-				),
+				actions: planActions(candidates, store, data.schemaHashes),
 			};
 		}),
 		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
@@ -164,8 +193,7 @@ export function createPatternPlanSource({
 			if (!candidates.length) return undefined;
 			const dependencies = batch.map(({ identity }) => ({ proposalID: identity.proposalID, actionID: identity.actionID,
 				identity: identity.id, condition: "execution_succeeded" as const }));
-			return { id, source: "pattern_aware", revision: 0, actions: candidates.map((candidate) =>
-				patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity), dependencies)) };
+			return { id, source: "pattern_aware", revision: 0, actions: planActions(candidates, store, data.schemaHashes, dependencies) };
 		}),
 		continue: ({
 			startInput,
@@ -183,7 +211,7 @@ export function createPatternPlanSource({
 		}) => admit(settings, async (patternSettings) => {
 			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
-			if (!context) return undefined;
+			if (!context || context.operation) return undefined;
 			const action = adoptedAction ?? candidate;
 			const next = context.store.continue(
 				context.continuation,
@@ -197,16 +225,18 @@ export function createPatternPlanSource({
 				proposalID,
 				source: "pattern_aware",
 				revision,
-				upsert: next.map((item) =>
-					patternPlanAction(item, context.store, patternPlanActionID(item.actionIdentity, actionID), [
-						{ actionID, condition: "execution_succeeded" },
-					]),
-				),
+				upsert: planActions(next, context.store, data.schemaHashes, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
-		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order }) => admit(settings, async (patternSettings) => {
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
+			const parentHash = operations?.length && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
+			if (parentHash) for (const binding of operations ?? []) {
+				if (binding.available === false || binding.permissionHash !== action?.hash) continue;
+				const key = `${parentHash}:${binding.backend}:${binding.identity}`;
+				operationBindings.set(key, { key, parentHash, binding });
+			}
 			const observation = projectPatternAwareObservation(
 				output?.result,
 				extractOutputPaths(tool, concrete, output?.result),
@@ -238,8 +268,7 @@ export function createPatternPlanSource({
 				data.schemaHashes,
 				patternSettings,
 			);
-			const actions = candidates.map((candidate) =>
-				patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity)));
+			const actions = planActions(candidates, store, data.schemaHashes);
 			// An observation can finish after its turn closes, or lose individual actions during admission.
 			const carried = { signature: patternPredictionSignature(candidates),
 				pending: new Set(actions.map((action) => action.feedback)), abandoned: false };
@@ -260,6 +289,7 @@ export function createPatternPlanSource({
 		onIssued: ({ feedback }) => {
 			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
+			if (context?.operation) return;
 			if (context) context.store.issued(context.continuation);
 			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
 		},
@@ -268,6 +298,12 @@ export function createPatternPlanSource({
 			const context = asPatternPlanFeedback(feedback);
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
+			if (context?.operation) {
+				// Execution failure retires this preparation hint; absence of an OS observation is not a negative example.
+				if (settlement.observation === "unobserved" && settlement.cause.stage === "execution" &&
+					operationBindings.get(context.operation.key) === context.operation) operationBindings.delete(context.operation.key);
+				return;
+			}
 			if (context) context.store.settled(context.continuation, settlement);
 			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
 		},
@@ -310,6 +346,7 @@ export function createPatternPlanSource({
 			await lifecycle.drain();
 			revisions.clear();
 			carriedPredictions.clear();
+			operationBindings.clear();
 			clearAuthoritativeSession(authoritativeBatches, sessionID);
 			try {
 				await flushStores(true);
@@ -324,6 +361,7 @@ export function createPatternPlanSource({
 			ownedStores.clear();
 			openedStore = undefined;
 			authoritativeBatches.clear();
+			operationBindings.clear();
 			revisions.clear();
 			carriedPredictions.clear();
 			await Promise.allSettled(leases.map(async lease => (await lease).release()));

@@ -26,6 +26,8 @@ describe("speculative trace reduction", () => {
 			adoptionYield: 1 / 2,
 			predictionUnobserved: { "source:timeout": 1 },
 			predictionRejectedAfterMatch: { "freshness:resource_changed": 1 },
+			operationPredictionsSettled: 2,
+			operationPredictionsAdopted: 1,
 			candidateStarted: 2,
 			candidateSucceeded: 1,
 			candidateFailed: 0,
@@ -105,6 +107,8 @@ function authoritativeEvents(): SpeculativeActionEvent<string>[] {
 			rejectedSettlement("freshness", "resource_changed"),
 			adoptedSettlement(),
 		].map((settlement) => ({ ...base, type: "prediction" as const, settlement })),
+		...[unobservedSettlement("matching", "operation_not_observed"), adoptedSettlement()]
+			.map(settlement => ({ ...base, type: "operation_prediction" as const, settlement })),
 		{ ...base, type: "candidate", candidate: candidate("one"), state: { status: "running", startedAt: 0 } },
 		{
 			...base,

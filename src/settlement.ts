@@ -43,6 +43,7 @@ export type ResourceValidation =
 	  };
 
 export interface PlanActionIdentity {
+	readonly kind?: "operation";
 	readonly id: string;
 	readonly source: string;
 	readonly proposalID: string;
@@ -52,6 +53,7 @@ export interface PlanActionIdentity {
 export type PredictionIdentity = PlanActionIdentity;
 
 export interface ActorActionIdentity {
+	readonly kind?: "operation";
 	readonly id: string;
 	/** Unique order of this concrete tool call. */
 	readonly sequence: number;

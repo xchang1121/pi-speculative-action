@@ -24,6 +24,7 @@ export interface SpeculativeCacheSnapshot {
 }
 
 export interface CandidateEventDescriptor {
+	readonly kind?: "operation";
 	readonly id: string;
 	readonly origin: "prediction" | "actor_preview" | "actor_result";
 	readonly tool: string;
@@ -85,6 +86,10 @@ export type SpeculativeActionEvent<SessionID> =
 	  })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "prediction";
+			readonly settlement: PredictionSettlement;
+	  })
+	| (EventEnvelope<SessionID> & {
+			readonly type: "operation_prediction";
 			readonly settlement: PredictionSettlement;
 	  })
 	| (EventEnvelope<SessionID> & {

@@ -1,5 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { ActionSemanticsDefinition } from "./action-semantics.ts";
+import type { ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts";
+import type { ExecutionOperationBinding } from "./execution-world.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -42,6 +43,8 @@ export interface ToolFilesystemOperations {
 /** Versioned identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
+	/** Internal execution uses the current enclosing action for permission and an opaque backend binding. */
+	readonly operation?: { readonly binding: ExecutionOperationBinding; readonly permission: ActionKey };
 	/** Explicit common Actor/speculation profile; never inferred from the tool's name. */
 	readonly semantics?: ActionSemanticsDefinition;
 	/** Input-invariant executor identity used by K(a); the exact invocation remains in `process`. */

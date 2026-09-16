@@ -67,6 +67,8 @@ describe("ExecutionWorldRouter", () => {
 
 		expect(route).toMatchObject({ backend: "resource", scope: "fallback" });
 		expect(unavailable.speculation.prepare).toHaveBeenCalledOnce();
+		for (const backend of ["unavailable", "missing"]) expect(await router.resolve({ backend,
+			effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }, preparation)).toBeUndefined();
 		expect(route && (await router.fork(route, { value: "captured" })).output).toBe("captured");
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route })).toBe(true);
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "changed" })).toBe(false);

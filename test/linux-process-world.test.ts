@@ -1,5 +1,6 @@
 import { gated, deferred, nextTurn } from "./async.ts";
 import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import * as filesystem from "node:fs/promises";
@@ -23,6 +24,10 @@ import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invo
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
+import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
+import type { SpeculativeActionEvent } from "../src/events.ts";
+import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import {
 	commitBenchmarkFixture,
@@ -40,6 +45,7 @@ describe("Linux process ExecutionWorld", () => {
 	test("reexecutes an owned child binding across turns without replaying its parent or stale input", async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
+		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
@@ -61,7 +67,16 @@ int main(int argc, char **argv) {
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
 			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'";
 			const branch = await forkReusableBash(fixture, { command, label: "recorded", actionNamespace: "binding", executionFingerprint, executionScope: scope });
-			try { expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } }); }
+			try {
+				expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } });
+				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+				const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
+				const binding = branch.operations![0]!;
+				for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
+					await expect(fixture.world.speculation.fingerprint!({ effect: "unbounded", requirements: PI_ACTION_SEMANTICS.definition("bash")!.requirements, tool: "bash",
+						action: { ...permission, executionContext: { ...invocation, operation } } })).rejects.toThrow("binding is unavailable");
+				}
+			}
 			finally { await branch.dispose(); }
 			const [binding] = fixture.backend.executionBindings(later);
 			expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
@@ -93,6 +108,52 @@ int main(int argc, char **argv) {
 				environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
 			expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
 			expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 1, crossTurnHits: 1 });
+			const patternSettings = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
+			const patternStore = new PatternAwareStore(patternSettings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
+			const events: SpeculativeActionEvent<string>[] = [], tools = [fixture.tool];
+			host = createSpeculativeActionHost(scope.sessionID, { cwd: fixture.workspace, patternStore,
+				complete: async () => { throw new Error("unexpected inference"); },
+				getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: patternSettings }),
+				preflight: ({ args, action }) => { expect(args).toHaveProperty("command"); expect(action.input.command).toBe((args as { command: string }).command); return true; }, executionWorlds: [fixture.world],
+				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
+				onEvent: event => { events.push(event); },
+			});
+			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
+				context: { systemPrompt: "unchanged", messages: [], tools } });
+			const call = (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools });
+			for (const turnID of ["common-1", "common-2"]) {
+				await start(turnID);
+				await host.execute(call(turnID, "printf common"), undefined, () => fixture.tool.execute(turnID, { command: "printf common" }));
+				await host.finishTurn(turnID);
+			}
+			await start("seed");
+			await host.previewActorCall(call("seed", command));
+			await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
+				event.candidate.origin === "actor_preview" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+			expect(patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common"]);
+			const seedFallback = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
+				scope: { ...scope, turnID: "seed" } }) }, () => fixture.tool.execute("seed", { command })));
+			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: "parent\nafter\n" }]);
+			await host.finishTurn("seed");
+			expect(seedFallback).toHaveBeenCalledOnce(); // The whole Bash metadata proof remains rejected; the child can still be adopted.
+			expect(fixture.backend.actorMetrics().hits).toBe(2);
+			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
+			const before = fixture.backend.metrics();
+			await start("prepared");
+			await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
+				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
+			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
+			const changedParent = command.replace("parent", "automatic-parent");
+			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
+				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
+			expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([{ type: "text", text: "automatic-parent\nnewest\n" }]);
+			expect(actor).toHaveBeenCalledOnce();
+			await host.finishTurn("prepared");
+			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
+				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
+			} }]);
+			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command, changedParent]);
+			expect(JSON.stringify(events.filter(event => event.type === "candidate" && event.candidate.kind === "operation"))).not.toContain("private value");
 			await fixture.backend.storage.maintain("clear");
 			expect(fixture.backend.executionBindings(later)).toEqual([]);
 			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
@@ -100,8 +161,8 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { await fixture.dispose(); }
-	});
+		} finally { await host?.dispose(); await fixture.dispose(); }
+	}, 20_000);
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
@@ -204,24 +265,29 @@ int main(void) {
 				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); },
 			})).toEqual({ exitCode: 0 });
 			expect(output).toBe("2097152\n"); expect(committed).toHaveBeenCalledOnce();
+			const actorContext = new AsyncLocalStorage<string>(), execIDs = new Set<string>();
 			for (const disposition of [undefined, "recoverable", "poisoned", "killed"] as const) {
 				const after = path.join(root, `after-${disposition}`);
 				const scope = { sessionID: "session", turnID: "original" };
 				const nativeDone = deferred();
+				const adopted = vi.fn(() => { throw new Error("advisory feedback failed"); });
 				let heldPid = 0;
 				const commit = vi.fn(async () => {
 					if (disposition === "killed") { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
 					else if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
 				});
 				const decide = vi.fn(async (process: HeldExecProcess) => {
-					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit };
+					expect(actorContext.getStore()).toBe("original");
+					expect(process.id).toMatch(/^[a-f0-9]{48}:1$/); expect(process.sequence).toBe(1);
+					execIDs.add(process.id);
+					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit, adopted };
 				});
 				const executor = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
 					sourceRoot: root, realShell: "/bin/bash",
 					decide,
 				});
-				const run = executor.execute({ command: `/bin/true; printf continued > '${after}'`, cwd: root,
-					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5, scope });
+				const run = actorContext.run("original", () => executor.execute({ command: `/bin/true; printf continued > '${after}'`, cwd: root,
+					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5, scope }));
 				scope.turnID = "later";
 				if (disposition) {
 					await expect(run).rejects.toMatchObject({ disposition: "poisoned" });
@@ -231,10 +297,12 @@ int main(void) {
 					expect(await readFile(after, "utf8")).toBe("continued");
 				}
 				expect(commit).toHaveBeenCalledOnce();
+				expect(adopted).toHaveBeenCalledTimes(disposition ? 0 : 1);
 				expect(decide).toHaveBeenCalledOnce();
 				expect(decide.mock.calls[0]![0].scope).toEqual({ sessionID: "session", turnID: "original" });
 				expect(Object.isFrozen(decide.mock.calls[0]![0].scope)).toBe(true);
 			}
+			expect(execIDs.size).toBe(4);
 			let closed = false;
 			const gate = gated();
 			const executor = boundary.executor({ execute: async () => {
@@ -339,7 +407,7 @@ int main(void) {
 			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 			const scan = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess").mockRejectedValue(new Error("process context required"));
 			const image = vi.spyOn(filesystem, "realpath").mockResolvedValue(executable);
-			const inspect = () => decide({ pid: process.pid, tracerPid: process.pid, sourceRoot: fixture.workspace });
+			const inspect = () => decide({ id: "lookup:1", sequence: 1, pid: process.pid, tracerPid: process.pid, sourceRoot: fixture.workspace });
 			let work: ProcessHandoff | undefined;
 			const history = vi.spyOn(fixture.backend.store, "mayHaveCertificates");
 			try {
@@ -747,6 +815,7 @@ int main(void) {
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
 			ownership,
 			executeBinding: async () => { throw new Error("unexpected process binding"); },
+			executionBindings: () => [],
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),

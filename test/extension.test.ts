@@ -12,7 +12,7 @@ import {
 	type SourceInfo,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -37,9 +37,11 @@ import { TimelineInterval } from "../src/task-timing.ts";
 const directories = temporaryDirectories("pi-spec-extension-");
 const hosts: SpeculativeActionHost[] = [];
 
+beforeEach(async () => { vi.stubEnv("PI_CODING_AGENT_DIR", await directories.create()); });
 afterEach(async () => {
 	await Promise.all(hosts.splice(0).map((host) => host.dispose()));
 	await directories.dispose();
+	vi.unstubAllEnvs();
 });
 
 describe("zero-modification Pi extension", () => {

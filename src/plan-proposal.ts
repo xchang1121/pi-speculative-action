@@ -1,3 +1,5 @@
+import type { ExecutionOperationBinding } from "./execution-world.ts";
+
 export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted";
 
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
@@ -12,7 +14,9 @@ export interface PlanActionDependency {
 export interface PlanAction {
 	/** Stable within one proposal across revisions. */
 	readonly id: string;
-	readonly type: "tool_call";
+	readonly type: "tool_call" | "operation";
+	/** Internal work retains its backend capability and uses tool/input only as the permission anchor. */
+	readonly operation?: ExecutionOperationBinding;
 	readonly tool: string;
 	readonly input: unknown;
 	readonly diagnostic?: string;
