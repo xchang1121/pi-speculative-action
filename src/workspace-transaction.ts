@@ -1,5 +1,24 @@
 import type { WorkspaceStructureSnapshot } from "./workspace-state.ts";
 
+/** Apply removals child first and creations parent first, preserving each caller's path order. */
+export function orderWorkspaceChanges<Value>(
+	values: readonly Value[],
+	order: (value: Value) => {
+		readonly change: { readonly kind?: "file" | "directory"; readonly after?: unknown };
+		readonly depth: number;
+		readonly key: string;
+	},
+): Value[] {
+	if (values.length < 2) return [...values];
+	return values.map(value => {
+		const { change, depth, key } = order(value);
+		const removed = change.after === undefined;
+		return { value, key, depth: removed ? -depth : depth,
+			phase: change.kind === "directory" ? (removed ? 1 : 2) : (removed ? 0 : 3) };
+	}).sort((left, right) => left.phase - right.phase || left.depth - right.depth || left.key.localeCompare(right.key))
+		.map(({ value }) => value);
+}
+
 /** Exact regular-file transition captured around one workspace operation. */
 export interface WorkspaceRegularDelta {
 	readonly relativePath: string;

@@ -17,7 +17,7 @@ import type {
 	WorkspaceStructureSnapshot,
 	WorkspaceTreeEntry,
 } from "./workspace-state.ts";
-import type { WorkspaceRegularDelta } from "./workspace-transaction.ts";
+import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
 export type {
 	WorkspaceStructureEntry,
@@ -244,25 +244,14 @@ export function diffWorkspaceStructures(
 		}
 		return { effects: [], complete: false, reason: `untracked_inode_transition:${relativePath}` };
 	}
-	return { effects: Object.freeze(orderWorkspaceTransactionEffects(effects)), complete: true };
-}
-
-function orderWorkspaceTransactionEffects(
-	effects: readonly WorkspaceTransactionEffect[],
-): WorkspaceTransactionEffect[] {
-	const phase = (effect: WorkspaceTransactionEffect): number =>
-		effect.change.kind === "directory" ? (effect.change.after === undefined ? 1 : 2) : (effect.change.after === undefined ? 0 : 3);
-	const depth = (effect: WorkspaceTransactionEffect): number =>
-		effect.relativePath.split(path.sep).filter(Boolean).length;
-	return [...effects].sort((left, right) => {
-		const phaseDifference = phase(left) - phase(right);
-		if (phaseDifference !== 0) return phaseDifference;
-		const depthDifference = depth(left) - depth(right);
-		if (left.change.after === undefined) {
-			if (depthDifference !== 0) return -depthDifference;
-		} else if (depthDifference !== 0) return depthDifference;
-		return left.relativePath.localeCompare(right.relativePath);
-	});
+	return {
+		effects: Object.freeze(orderWorkspaceChanges(effects, effect => ({
+			change: effect.change,
+			depth: effect.relativePath.split(path.sep).filter(Boolean).length,
+			key: effect.relativePath,
+		}))),
+		complete: true,
+	};
 }
 
 export function hydrateWorkspaceFileEntry(
