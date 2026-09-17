@@ -104,7 +104,6 @@ const ROOT_SETTING_INPUTS = {
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
-type RootInputField = keyof typeof ROOT_SETTING_INPUTS;
 
 const SELF_SPECULATION_INPUTS = {
 	endpoint: settingInput("Control service URL", String, (input) => {
@@ -131,7 +130,6 @@ const SELF_SPECULATION_INPUTS = {
 	forkForcedPrefix: nonEmptyTextInput("Forced tool-call prefix override ('auto' to derive)"),
 	apiKeyEnv: optionalTextInput("Authentication token environment variable name (not the token)"),
 } satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
-type SelfSpeculationInputField = keyof typeof SELF_SPECULATION_INPUTS;
 
 const PATTERN_SETTING_INPUTS = {
 	maxContextLength: positiveIntegerInput("Previous actions used as context"),
@@ -150,7 +148,6 @@ const PATTERN_SETTING_INPUTS = {
 		error: "Minimum argument-replay confidence must be between 0 and 1.",
 	}),
 } satisfies Partial<SettingInputDescriptors<PatternAwareSettings, keyof PatternAwareSettings>>;
-type PatternInputField = keyof typeof PATTERN_SETTING_INPUTS;
 
 const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
 	"Drafter sampling temperature range",
@@ -910,17 +907,17 @@ function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActi
 function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActionController, advanced = false): Promise<void> {
 	return runActionMenuLoop(ctx, advanced ? "Model Drafter advanced" : "Model Drafter", () => {
 		const settings = controller.settings();
-		const edit = (field: RootInputField) => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings);
+		const { input, toggle } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
 		return new Map<string, MenuAction>(!advanced ? [
-			[`Enabled: ${settings.drafterEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterEnabled: !settings.drafterEnabled })],
+			toggle("drafterEnabled", "Enabled"),
 			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
-			[`Candidate requests per decision: ${settings.candidateLimit}`, () => edit("candidateLimit")],
+			input("candidateLimit", "Candidate requests per decision"),
 			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
 		] : [
-			[`Pause drafts on estimated negative utility: ${settings.drafterGateEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, drafterGateEnabled: !settings.drafterGateEnabled })],
-			[`Follow-up tool steps: ${settings.drafterMaxDepth}`, () => edit("drafterMaxDepth")],
-			[`Maximum output tokens: ${settings.drafterMaxTokens ?? "Provider default"}`, () => edit("drafterMaxTokens")],
-			[`Temperature-0 candidates: ${settings.drafterDeterministicCandidates}`, () => edit("drafterDeterministicCandidates")],
+			toggle("drafterGateEnabled", "Pause drafts on estimated negative utility"),
+			input("drafterMaxDepth", "Follow-up tool steps"),
+			input("drafterMaxTokens", "Maximum output tokens", value => value ?? "Provider default"),
+			input("drafterDeterministicCandidates", "Temperature-0 candidates"),
 			[`Sampling temperature: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
 		]);
 	});
@@ -944,16 +941,16 @@ function openActorForkSettings(
 	return runActionMenuLoop(ctx, titles[menu], () => {
 		const settings = controller.settings();
 		const self = settings.selfSpeculation;
-		const edit = (field: SelfSpeculationInputField) => editSetting(ctx, self, field, SELF_SPECULATION_INPUTS,
-			(selfSpeculation) => controller.setSettings({ ...settings, selfSpeculation }));
+		const save = (selfSpeculation: SelfSpeculationSettings) => controller.setSettings({ ...settings, selfSpeculation });
+		const { input, toggle } = settingActions(ctx, self, SELF_SPECULATION_INPUTS, save);
 		const actions = new Map<string, MenuAction>();
 		if (menu === "basic") {
 			const active = self.enabled && self.forkEnabled;
-			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: active ? self.enabled : true, forkEnabled: !active }));
+			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => save({ ...self, enabled: active ? self.enabled : true, forkEnabled: !active }));
 			actions.set("Advanced settings › integration, decoding, verification, benefit control", () => openActorForkSettings(ctx, controller, "advanced"));
 			if (self.forkTransport === "sidecar") {
-				actions.set(`Use forked calls for tool pre-execution: ${self.forkActionEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkActionEnabled: !self.forkActionEnabled }));
-				if (self.forkActionEnabled) actions.set(`Minimum tool-name confidence: ${formatPercent(self.forkActionMinConfidence)}`, () => edit("forkActionMinConfidence"));
+				actions.set(...toggle("forkActionEnabled", "Use forked calls for tool pre-execution"));
+				if (self.forkActionEnabled) actions.set(...input("forkActionMinConfidence", undefined, formatPercent));
 			}
 		} else if (menu === "advanced") {
 			actions.set(`Integration and authentication › ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, () => openActorForkSettings(ctx, controller, "integration"));
@@ -964,33 +961,33 @@ function openActorForkSettings(
 			actions.set(`Integration: ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, async () => {
 				const selected = await ctx.ui.select("Actor probe integration", ["Provider-integrated", "Sidecar service", BACK]);
 				if (selected === "Provider-integrated" || selected === "Sidecar service")
-					await updateSelfSpeculation(controller, settings, { forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
+					await save({ ...self, forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
 			});
 			if (self.forkTransport === "sidecar") {
-				actions.set(`Control service URL: ${self.endpoint}`, () => edit("endpoint"));
-				actions.set(`Request timeout: ${formatDuration(self.timeoutMs)}`, () => edit("timeoutMs"));
-				actions.set(`Authentication token variable: ${self.apiKeyEnv ?? "None"}`, () => edit("apiKeyEnv"));
+				actions.set(...input("endpoint"));
+				actions.set(...input("timeoutMs", "Request timeout", formatDuration));
+				actions.set(...input("apiKeyEnv", "Authentication token variable", value => value ?? "None"));
 			}
 		} else if (menu === "fork") {
-			actions.set(`Maximum output tokens: ${self.forkMaxTokens}`, () => edit("forkMaxTokens"));
-			actions.set(`Sampling temperature: ${formatNumber(self.forkTemperature)}`, () => edit("forkTemperature"));
-			actions.set(`Tool-call decoder: ${self.forkDecoder}`, () => edit("forkDecoder"));
-			actions.set(`Forced tool-call prefix: ${syntaxSettingLabel(self.forkForcedPrefix)}`, () => edit("forkForcedPrefix"));
+			actions.set(...input("forkMaxTokens", "Maximum output tokens"));
+			actions.set(...input("forkTemperature", "Sampling temperature", formatNumber));
+			actions.set(...input("forkDecoder", "Tool-call decoder"));
+			actions.set(...input("forkForcedPrefix", "Forced tool-call prefix", syntaxSettingLabel));
 		} else if (menu === "target") {
-			actions.set(`Verify predicted calls during Actor decoding: ${self.enabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { enabled: !self.enabled }));
-			actions.set(`Candidates sent per decision: ${self.maxCandidates}`, () => edit("maxCandidates"));
-			actions.set(`Draft-token limit per candidate: ${self.maxDraftTokens}`, () => edit("maxDraftTokens"));
-			actions.set(`Actor Profile: ${self.actorProfile}`, () => edit("actorProfile"));
-			actions.set(`Tool-call format override: ${self.draftFormat}`, () => edit("draftFormat"));
-			actions.set(`Tool-call boundary: ${syntaxSettingLabel(self.draftBoundary)}`, () => edit("draftBoundary"));
+			actions.set(...toggle("enabled", "Verify predicted calls during Actor decoding"));
+			actions.set(...input("maxCandidates", "Candidates sent per decision"));
+			actions.set(...input("maxDraftTokens"));
+			actions.set(...input("actorProfile", "Actor Profile"));
+			actions.set(...input("draftFormat", "Tool-call format override"));
+			actions.set(...input("draftBoundary", "Tool-call boundary", syntaxSettingLabel));
 		} else {
-			actions.set(`Pause forks that stop saving time: ${self.forkGateEnabled ? "On" : "Off"}`, () => updateSelfSpeculation(controller, settings, { forkGateEnabled: !self.forkGateEnabled }));
+			actions.set(...toggle("forkGateEnabled", "Pause forks that stop saving time"));
 			if (self.forkGateEnabled) {
-				actions.set(`Warm-up samples: ${self.forkGateMinSamples}`, () => edit("forkGateMinSamples"));
-				actions.set(`Rolling samples: ${self.forkGateWindowSize}`, () => edit("forkGateWindowSize"));
-				actions.set(`Minimum expected time saved: ${formatDuration(self.forkGateMinNetBenefitMs)}`, () => edit("forkGateMinNetBenefitMs"));
-				actions.set(`Recovery probe interval: ${self.forkGateProbeInterval}`, () => edit("forkGateProbeInterval"));
-				actions.set(`Consecutive-failure limit: ${self.forkGateFailureThreshold}`, () => edit("forkGateFailureThreshold"));
+				actions.set(...input("forkGateMinSamples", "Warm-up samples"));
+				actions.set(...input("forkGateWindowSize", "Rolling samples"));
+				actions.set(...input("forkGateMinNetBenefitMs", "Minimum expected time saved", formatDuration));
+				actions.set(...input("forkGateProbeInterval"));
+				actions.set(...input("forkGateFailureThreshold"));
 			}
 		}
 		return actions;
@@ -1006,11 +1003,11 @@ function openPatternAwareSettings(
 	return runActionMenuLoop(ctx, title, () => {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
-		const edit = (field: PatternInputField) => editSetting(ctx, pattern, field, PATTERN_SETTING_INPUTS,
+		const { input, toggle } = settingActions(ctx, pattern, PATTERN_SETTING_INPUTS,
 			(patternAware) => controller.setSettings({ ...settings, patternAware }));
 		if (menu === "basic") return new Map<string, MenuAction>([
-			[`Enabled: ${pattern.enabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, enabled: !pattern.enabled } })],
-			[`Predict follow-up tool steps: ${pattern.multiStepEnabled ? "On" : "Off"}`, () => controller.setSettings({ ...settings, patternAware: { ...pattern, multiStepEnabled: !pattern.multiStepEnabled } })],
+			toggle("enabled", "Enabled"),
+			toggle("multiStepEnabled", "Predict follow-up tool steps"),
 			[`Advanced settings › history, confidence, search limits`, () => openPatternAwareSettings(ctx, controller, "advanced")],
 		]);
 		if (menu === "advanced") {
@@ -1022,16 +1019,16 @@ function openPatternAwareSettings(
 			return actions;
 		}
 		return new Map<string, MenuAction>(menu === "learning" ? [
-			[`Previous actions used as context: ${pattern.maxContextLength}`, () => edit("maxContextLength")],
-			[`Maximum skipped Actor decisions: ${pattern.maxFutureGap}`, () => edit("maxFutureGap")],
-			[`Early-prediction coverage: ${formatPercent(pattern.futureGapCoverage)}`, () => edit("futureGapCoverage")],
-			[`History half-life: ${pattern.decayHalfLifeEvents} events`, () => edit("decayHalfLifeEvents")],
-			[`Uses before learning a pattern: ${pattern.minOccurrences}`, () => edit("minOccurrences")],
-			[`Stored pattern limit: ${pattern.maxPatterns}`, () => edit("maxPatterns")],
+			input("maxContextLength"),
+			input("maxFutureGap"),
+			input("futureGapCoverage", "Early-prediction coverage", formatPercent),
+			input("decayHalfLifeEvents", "History half-life", value => `${value} events`),
+			input("minOccurrences", "Uses before learning a pattern"),
+			input("maxPatterns"),
 		] : [
-			[`Alternatives retained per tool: ${pattern.beamWidth}`, () => edit("beamWidth")],
-			[`Maximum predicted tool steps: ${pattern.maxPredictionDepth}`, () => edit("maxPredictionDepth")],
-			[`Minimum argument-replay confidence: ${formatPercent(pattern.minBindingReplayProbability)}`, () => edit("minBindingReplayProbability")],
+			input("beamWidth"),
+			input("maxPredictionDepth"),
+			input("minBindingReplayProbability", "Minimum argument-replay confidence", formatPercent),
 		]);
 	});
 }
@@ -1039,16 +1036,15 @@ function openPatternAwareSettings(
 function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	return runActionMenuLoop(ctx, "Scheduling and storage", () => {
 		const settings = controller.settings();
-		const fields = new Map<string, RootInputField>([
-			[`Simultaneous speculative tools: ${settings.maxConcurrentActions}`, "maxConcurrentActions"],
-			[`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`, "predictionTimeoutMs"],
-			[`Live result entries: ${settings.resourceCacheMaxEntries}`, "resourceCacheMaxEntries"],
-			[`Live result memory: ${formatBytes(settings.resourceCacheMaxBytes)}`, "resourceCacheMaxBytes"],
-			[`Reusable command history entries: ${settings.executionStoreMaxEntries}`, "executionStoreMaxEntries"],
-			[`Reusable command history memory: ${formatBytes(settings.executionStoreMaxBytes)}`, "executionStoreMaxBytes"],
+		const { input } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
+		const actions = new Map<string, MenuAction>([
+			input("maxConcurrentActions"),
+			input("predictionTimeoutMs", "Prediction wait limit", formatDuration),
+			input("resourceCacheMaxEntries"),
+			input("resourceCacheMaxBytes", "Live result memory", formatBytes),
+			input("executionStoreMaxEntries"),
+			input("executionStoreMaxBytes", "Reusable command history memory", formatBytes),
 		]);
-		const actions = new Map<string, MenuAction>([...fields].map(([label, field]) =>
-			[label, () => editSetting(ctx, settings, field, ROOT_SETTING_INPUTS, controller.setSettings)]));
 		for (const [label, operation] of [["Reclaim", "gc"], ["Clear", "clear"]] as const) actions.set(`${label} reusable command history`, async () => {
 			if (operation === "clear" && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) return;
 			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
@@ -1176,17 +1172,6 @@ function editToolPolicy(
 	});
 }
 
-function updateSelfSpeculation(
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-	update: Partial<SelfSpeculationSettings>,
-): Promise<void> {
-	return controller.setSettings({
-		...settings,
-		selfSpeculation: { ...settings.selfSpeculation, ...update },
-	});
-}
-
 async function promptSetting<T>(
 	ctx: ExtensionContext,
 	current: T,
@@ -1200,19 +1185,26 @@ async function promptSetting<T>(
 	else await publish(parsed.value);
 }
 
-function editSetting<T extends object, Field extends keyof T>(
+function settingActions<T extends object, Field extends keyof T>(
 	ctx: ExtensionContext,
 	current: T,
-	field: Field,
 	descriptors: SettingInputDescriptors<T, Field>,
 	publish: (value: T) => Promise<void>,
-): Promise<void> {
-	return promptSetting(ctx, current[field], descriptors[field], async (value) => {
+) {
+	const update = (field: keyof T, value: unknown) => {
 		const next = { ...current };
 		if (value === undefined) Reflect.deleteProperty(next, field);
 		else Object.assign(next, { [field]: value });
-		await publish(next);
-	});
+		return publish(next);
+	};
+	return {
+		input<Key extends Field>(key: Key, label = descriptors[key].title, format: (value: T[Key]) => string | number = String): [string, MenuAction] {
+			return [`${label}: ${format(current[key])}`, () => promptSetting(ctx, current[key], descriptors[key], value => update(key, value))];
+		},
+		toggle(key: { [Key in keyof T]: T[Key] extends boolean ? Key : never }[keyof T], label: string): [string, MenuAction] {
+			return [`${label}: ${current[key] ? "On" : "Off"}`, () => update(key, !current[key])];
+		},
+	};
 }
 
 async function editDrafterTemperatureRange(
