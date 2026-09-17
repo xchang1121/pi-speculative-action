@@ -28,54 +28,39 @@ export interface SuiteBenchmarkRun {
 
 type MeasuredRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
 
-export interface SuiteStatisticsOptions {
-	readonly bootstrapSamples?: number;
-	readonly seed?: number;
-}
-
-export interface PairedLatencyObservation {
-	readonly cluster: string;
-	readonly baselineMs: number;
-	readonly treatmentMs: number;
-}
-
-export function summarizeSuite(
-	runs: readonly SuiteBenchmarkRun[],
-	options: SuiteStatisticsOptions = {},
-) {
-	const statistics = normalizeStatisticsOptions(options);
-	const accepted = runs.filter((run): run is MeasuredRun => !!run.summary?.patchCandidate && !run.error &&
-		!Object.keys(run.summary.benchmarkErrors ?? {}).length);
-	const acceptedSet = new Set<SuiteBenchmarkRun>(accepted);
+export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
+	const measured = runs.filter(hasTiming);
+	const invalidRuns = runs.flatMap((run) => {
+		const reasons = [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)];
+		if (run.summary && !hasTiming(run)) reasons.push("unavailable_timing");
+		return reasons.length ? [{ instance: run.instance, repeat: run.repeat, output: run.output,
+			...(run.error ? { error: run.error } : {}), reasons }] : [];
+	});
 	return {
 		runs: runs.length,
-		patchCandidates: accepted.length,
-		allRunsScreenedIn: runs.length > 0 && accepted.length === runs.length,
+		patchCandidates: runs.length - invalidRuns.length,
+		allRunsScreenedIn: runs.length > 0 && invalidRuns.length === 0,
 		statistics: {
 			primaryEstimator: "ratio_of_means",
 			baseline: "same_run_serialized_counterfactual",
-			cluster: "instance",
-			bootstrapSamples: statistics.bootstrapSamples,
-			seed: statistics.seed,
+			samplePolicy: "all_measured_runs",
 		},
+		unmeasuredRuns: runs.length - measured.length,
 		implementationCommits: [...new Set(runs.flatMap((run) => run.implementationCommit ? [run.implementationCommit] : []))],
-		invalidRuns: runs
-			.filter((run) => !acceptedSet.has(run))
-			.map((run) => ({
-				instance: run.instance,
-				repeat: run.repeat,
-				output: run.output,
-				...(run.error ? { error: run.error } : {}),
-				reasons: [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)],
-			})),
-		pooled: accepted.length ? pooled(accepted, statistics) : undefined,
+		invalidRuns,
+		pooled: measured.length ? pooled(measured) : undefined,
 		byInstance: Object.fromEntries(
 			[...new Set(runs.map((run) => run.instance))].map((instance) => {
-				const values = accepted.filter((run) => run.instance === instance);
-				return [instance, values.length ? pooled(values, statistics) : null];
+				const values = measured.filter((run) => run.instance === instance);
+				return [instance, values.length ? pooled(values) : null];
 			}),
 		),
 	};
+}
+
+function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
+	return !!run.summary && Number.isFinite(run.summary.actualEndToEndMs) && run.summary.actualEndToEndMs > 0 &&
+		Number.isFinite(run.summary.serializedCounterfactualMs) && run.summary.serializedCounterfactualMs >= 0;
 }
 
 export function nearestRank(values: readonly number[], percentile: number): number | undefined {
@@ -85,85 +70,20 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 	return ordered[Math.max(1, Math.ceil(percentile * ordered.length)) - 1];
 }
 
-/** The caller records whether each baseline is measured independently or reconstructed. */
-export function pairedLatencyStatistics(
-	observations: readonly PairedLatencyObservation[],
-	options: SuiteStatisticsOptions = {},
-) {
-	if (!observations.length) throw new Error("paired latency statistics require at least one observation");
-	const clusters = new Map<string, { count: number; baselineMs: number; treatmentMs: number; differenceMs: number }>();
-	for (const observation of observations) {
-		if (
-			!Number.isFinite(observation.baselineMs) ||
-			observation.baselineMs < 0 ||
-			!Number.isFinite(observation.treatmentMs) ||
-			observation.treatmentMs <= 0
-		) {
-			throw new Error("paired latency observations require non-negative baselines and positive treatments");
-		}
-		const total = clusters.get(observation.cluster) ?? { count: 0, baselineMs: 0, treatmentMs: 0, differenceMs: 0 };
-		total.count++;
-		total.baselineMs += observation.baselineMs;
-		total.treatmentMs += observation.treatmentMs;
-		total.differenceMs += observation.treatmentMs - observation.baselineMs;
-		clusters.set(observation.cluster, total);
-	}
-	const statistics = normalizeStatisticsOptions(options);
-	const clusterValues = [...clusters.values()];
-	const baselineMeanMs = mean(observations.map((observation) => observation.baselineMs));
-	const treatmentMeanMs = mean(observations.map((observation) => observation.treatmentMs));
-	const meanDifferenceMs = mean(observations.map((observation) => observation.treatmentMs - observation.baselineMs));
-	const ratios: number[] = [];
-	const differences: number[] = [];
-	const random = seededRandom(statistics.seed);
-	for (let sample = 0; sample < statistics.bootstrapSamples; sample++) {
-		let baselineMs = 0, treatmentMs = 0, differenceMs = 0, count = 0;
-		for (let index = 0; index < clusterValues.length; index++) {
-			const selected = clusterValues[Math.floor(random() * clusterValues.length)]!;
-			baselineMs += selected.baselineMs;
-			treatmentMs += selected.treatmentMs;
-			differenceMs += selected.differenceMs;
-			count += selected.count;
-		}
-		ratios.push((baselineMs / count) / (treatmentMs / count));
-		differences.push(differenceMs / count);
-	}
-	return {
-		pairs: observations.length,
-		clusters: clusters.size,
-		ratioOfMeans: baselineMeanMs / treatmentMeanMs,
-		...(ratios.length ? { ratioOfMeansCI95: [quantile(ratios, 0.025), quantile(ratios, 0.975)] as const } : {}),
-		baselineMeanMs,
-		treatmentMeanMs,
-		meanDifferenceMs,
-		...(differences.length
-			? { meanDifferenceCI95: [quantile(differences, 0.025), quantile(differences, 0.975)] as const }
-			: {}),
-	} as const;
-}
-
-function pooled(runs: readonly MeasuredRun[], options: Required<SuiteStatisticsOptions>) {
+function pooled(runs: readonly MeasuredRun[]) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
 	const serializedCounterfactualMs = sum(runs, "serializedCounterfactualMs");
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
-	const latency = pairedLatencyStatistics(
-		runs.map((run) => ({
-			cluster: run.instance,
-			baselineMs: run.summary.serializedCounterfactualMs,
-			treatmentMs: run.summary.actualEndToEndMs,
-		})),
-		options,
-	);
 	return {
 		runs: runs.length,
-		instanceClusters: latency.clusters,
+		instanceClusters: new Set(runs.map(run => run.instance)).size,
 		actualEndToEndMs,
 		serializedCounterfactualMs,
-		accelerationRatio: latency.ratioOfMeans,
-		accelerationRatioCI95: latency.ratioOfMeansCI95,
-		meanLatencyDifferenceMs: latency.meanDifferenceMs,
-		meanLatencyDifferenceCI95: latency.meanDifferenceCI95,
+		actualEndToEndMeanMs: actualEndToEndMs / runs.length,
+		serializedCounterfactualMeanMs: serializedCounterfactualMs / runs.length,
+		accelerationRatio: serializedCounterfactualMs / actualEndToEndMs,
+		meanLatencyDifferenceMs: (actualEndToEndMs - serializedCounterfactualMs) / runs.length,
 		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
 		serializedCounterfactualP95Ms: nearestRank(
 			runs.map((run) => run.summary.serializedCounterfactualMs),
@@ -176,41 +96,6 @@ function pooled(runs: readonly MeasuredRun[], options: Required<SuiteStatisticsO
 		hitRate: actorActions > 0 ? speculativeHits / actorActions : 0,
 		actorCost: sum(runs, "actorCost"),
 		drafterCost: sum(runs, "drafterCost"),
-	};
-}
-
-function normalizeStatisticsOptions(options: SuiteStatisticsOptions): Required<SuiteStatisticsOptions> {
-	const bootstrapSamples = options.bootstrapSamples ?? 10_000;
-	const seed = options.seed ?? 42;
-	if (!Number.isSafeInteger(bootstrapSamples) || bootstrapSamples < 0)
-		throw new Error("bootstrapSamples must be a non-negative integer");
-	if (!Number.isSafeInteger(seed)) throw new Error("seed must be an integer");
-	return { bootstrapSamples, seed };
-}
-
-function mean(values: readonly number[]): number {
-	return values.reduce((total, value) => total + value, 0) / values.length;
-}
-
-function quantile(values: readonly number[], fraction: number): number {
-	const ordered = [...values].sort((left, right) => left - right);
-	if (ordered.length === 1) return ordered[0]!;
-	const position = fraction * (ordered.length - 1);
-	const lower = Math.floor(position);
-	const upper = Math.ceil(position);
-	if (lower === upper) return ordered[lower]!;
-	const weight = position - lower;
-	return ordered[lower]! * (1 - weight) + ordered[upper]! * weight;
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) >>> 0;
-		let value = state;
-		value = Math.imul(value ^ (value >>> 15), value | 1);
-		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-		return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
 	};
 }
 
@@ -233,5 +118,5 @@ function screeningFailures(summary: SuiteBenchmarkSummary | undefined): string[]
 		!summary.changedFiles.length ? "no_changed_files" : undefined,
 		!summary.coveredGoldFiles.length ? "no_gold_file_overlap" : undefined,
 	].filter((reason): reason is string => reason !== undefined);
-	return reasons.length ? reasons : ["patch_candidate_false"];
+	return reasons.length || summary.patchCandidate ? reasons : ["patch_candidate_false"];
 }

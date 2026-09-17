@@ -3,7 +3,6 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
 	nearestRank,
-	pairedLatencyStatistics,
 	type SuiteBenchmarkRun,
 	summarizeSuite,
 } from "../bench/suite-report.ts";
@@ -54,7 +53,8 @@ describe("ablation suite report", () => {
 			expect(attempts).toBe(failure === "existing-output" ? 1 : 2);
 			const report = JSON.parse(files.get(path.resolve("offline-results", "suite-result.json")) ?? "null");
 			expect(report).toMatchObject({ runs: 2, patchCandidates: 1, allRunsScreenedIn: false,
-				pooled: { runs: 1, accelerationRatio: 1 }, byInstance: { failed: null },
+				pooled: { runs: complete ? 2 : 1, accelerationRatio: 1 }, byInstance: { failed: complete ? { runs: 1 } : null },
+				unmeasuredRuns: complete ? 0 : 1,
 				invalidRuns: [{ instance: "failed", repeat: 1, error: expect.stringContaining(message) }],
 			});
 			expect(report.runOutputs.map((value: { instance: string }) => value.instance)).toEqual(["first", "failed"]);
@@ -133,7 +133,7 @@ describe("ablation suite report", () => {
 		}
 	});
 
-	it("pools only completed patch candidates and exposes every screening failure", () => {
+	it("includes slow failed tasks in timing while exposing every screening failure", () => {
 		const report = summarizeSuite([
 			run("task-a", 1, {
 				actualEndToEndMs: 100,
@@ -148,6 +148,9 @@ describe("ablation suite report", () => {
 				speculativeHits: 3,
 			}),
 			run("task-b", 2, {
+				actualEndToEndMs: 1000,
+				serializedCounterfactualMs: 1000,
+				actorActions: 0,
 				patchCandidate: false,
 				timedOut: true,
 				patchClean: false,
@@ -163,23 +166,23 @@ describe("ablation suite report", () => {
 			statistics: {
 				primaryEstimator: "ratio_of_means",
 				baseline: "same_run_serialized_counterfactual",
-				cluster: "instance",
-				bootstrapSamples: 10_000,
-				seed: 42,
+				samplePolicy: "all_measured_runs",
 			},
 			implementationCommits: ["commit"],
 			pooled: {
-				runs: 2,
-				actualEndToEndMs: 400,
-				serializedCounterfactualMs: 450,
-				accelerationRatio: 1.125,
+				runs: 3,
+				actualEndToEndMs: 1400,
+				serializedCounterfactualMs: 1450,
+				actualEndToEndMeanMs: 1400 / 3,
+				serializedCounterfactualMeanMs: 1450 / 3,
+				accelerationRatio: 1450 / 1400,
 				actorActions: 40,
 				speculativeHits: 5,
 				hitRate: 0.125,
 			},
 			byInstance: {
 				"task-a": { runs: 1, accelerationRatio: 1.2, hitRate: 0.2 },
-				"task-b": { runs: 1, accelerationRatio: 1.1, hitRate: 0.1 },
+				"task-b": { runs: 2, accelerationRatio: 1330 / 1300, hitRate: 0.1 },
 			},
 		});
 		expect(report.invalidRuns).toEqual([
@@ -192,7 +195,7 @@ describe("ablation suite report", () => {
 		]);
 	});
 
-	it("uses nearest-rank p95 and a task-cluster bootstrap for paired repeats", () => {
+	it("retains repeats in nearest-rank p95 and total-time ratios", () => {
 		const report = summarizeSuite(
 			[
 				run("task-a", 1, { actualEndToEndMs: 5, serializedCounterfactualMs: 10 }),
@@ -200,35 +203,28 @@ describe("ablation suite report", () => {
 				run("task-b", 1, { actualEndToEndMs: 15, serializedCounterfactualMs: 30 }),
 				run("task-b", 2, { actualEndToEndMs: 20, serializedCounterfactualMs: 40 }),
 			],
-			{ bootstrapSamples: 200, seed: 7 },
 		);
 
 		expect(nearestRank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95)).toBe(10);
 		expect(report.pooled).toMatchObject({
 			instanceClusters: 2,
 			accelerationRatio: 2,
-			accelerationRatioCI95: [2, 2],
 			actualEndToEndP95Ms: 20,
 			serializedCounterfactualP95Ms: 40,
 		});
 	});
 
-	it("weights unequal cluster sizes in both point estimates and bootstrap samples", () => {
-		const statistics = pairedLatencyStatistics(
-			[
-				{ cluster: "short", baselineMs: 1, treatmentMs: 0.5 },
-				{ cluster: "long", baselineMs: 100, treatmentMs: 200 },
-				{ cluster: "long", baselineMs: 300, treatmentMs: 600 },
-			],
-			{ bootstrapSamples: 1, seed: 42 },
-		);
-
-		expect(statistics.ratioOfMeans).toBeCloseTo(401 / 800.5, 12);
-		expect(statistics.ratioOfMeans).toBeLessThan(1);
-		// Seed 42 draws the long cluster, then the short cluster, including both long repeats.
-		expect(statistics.ratioOfMeansCI95).toEqual([statistics.ratioOfMeans, statistics.ratioOfMeans]);
-		expect(statistics.meanDifferenceMs).toBeCloseTo(399.5 / 3, 12);
-		expect(statistics.meanDifferenceCI95).toEqual([statistics.meanDifferenceMs, statistics.meanDifferenceMs]);
+	it.each([0, -1, NaN, Infinity])("weights unequal repeats and exposes unavailable timing %s", (invalid) => {
+		const report = summarizeSuite([
+			run("short", 1, { serializedCounterfactualMs: 1, actualEndToEndMs: 0.5 }),
+			run("long", 1, { serializedCounterfactualMs: 100, actualEndToEndMs: 200 }),
+			run("long", 2, { serializedCounterfactualMs: 300, actualEndToEndMs: 600 }),
+			run("missing", 1, { actualEndToEndMs: invalid }),
+		]);
+		expect(report.pooled?.accelerationRatio).toBeCloseTo(401 / 800.5, 12);
+		expect(report.pooled?.meanLatencyDifferenceMs).toBeCloseTo(399.5 / 3, 12);
+		expect(report).toMatchObject({ runs: 4, unmeasuredRuns: 1, pooled: { runs: 3 }, byInstance: { missing: null },
+			invalidRuns: [{ instance: "missing", reasons: ["unavailable_timing"] }] });
 	});
 });
 
