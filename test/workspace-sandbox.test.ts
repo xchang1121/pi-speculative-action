@@ -20,6 +20,7 @@ import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock, captureStableFile } from "../src/filesystem-evidence.ts";
 import { hydrateWorkspaceFileEntry } from "../src/process-observation.ts";
+import { deferredWorkspaceTransactionDriver } from "../src/workspace-transaction.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
@@ -46,6 +47,29 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
+	it.each(["external", "factory"])("joins one driver cleanup after %s retirement during construction", async (retirement) => {
+		const gate = gated(), begin = vi.fn(), dispose = vi.fn(gate.wait);
+		const create = vi.fn(async () => {
+			if (retirement === "factory") void owner.dispose();
+			return { begin, dispose };
+		});
+		const owner = deferredWorkspaceTransactionDriver(create);
+		const waiting = Promise.allSettled([owner.begin(), owner.begin()]);
+		if (retirement === "external") void owner.dispose();
+		await gate.entered;
+		const closing = owner.dispose();
+		try {
+			expect(owner.dispose()).toBe(closing);
+			await nextTurn();
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(await Promise.race([closing.then(() => true), nextTurn().then(() => false)])).toBe(false);
+		} finally { gate.release(); await closing; }
+		expect(await waiting).toEqual([0, 1].map(() => ({ status: "rejected", reason: new Error("workspace transaction driver is disposed") })));
+		await expect(owner.begin()).rejects.toThrow("driver is disposed");
+		expect(create).toHaveBeenCalledTimes(1);
+		expect(begin).not.toHaveBeenCalled();
+	});
+
 	it("retains shared baseline work when a preparation owner cancels", async () => {
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
