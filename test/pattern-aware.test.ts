@@ -765,48 +765,29 @@ describe("PatternAware", () => {
 			{ id: "unreliable-binding", occurrences: 10, replayMatches: 7 }))).toBe(false);
 	});
 
-	test("learns indexed field fallbacks across historical samples", () => {
-		const store = patternStore();
-		trainOutputRead(store, "one", { primary: "src/a.ts" }, "src/a.ts");
-		trainOutputRead(store, "two", { fallback: "src/b.ts" }, "src/b.ts");
-
-		store.observe(input("probe", "grep", {}, { output: { fallback: "src/c.ts" } }));
+	test.each([
+		{ name: "indexed field fallbacks", tool: "grep", tuning: {},
+			training: [{ output: { primary: "src/a.ts" }, filePath: "src/a.ts" }, { output: { fallback: "src/b.ts" }, filePath: "src/b.ts" }],
+			probe: { fallback: "src/c.ts" }, expected: "src/c.ts" },
+		{ name: "a stable mapper after unrelated evidence", tool: "grep", tuning: { maxContextLength: 1, maxFutureGap: 0 },
+			training: [...Array.from({ length: 4 }, (_, index) => ({ output: { path: `src/source-${index}.ts` }, filePath: `src/unrelated-${index}.ts` })),
+				...Array.from({ length: 2 }, (_, index) => ({ output: { path: `src/stable-${index}.ts` }, filePath: `src/stable-${index}.ts` }))],
+			probe: { path: "src/result.ts" }, expected: "src/result.ts" },
+		{ name: "multiple structured fields", tool: "inspect", tuning: {},
+			training: [{ output: { root: "services/a", name: "alpha" }, filePath: "services/a/alpha" },
+				{ output: { root: "services/b", name: "beta" }, filePath: "services/b/beta" }],
+			probe: { root: "services/c", name: "gamma" }, expected: "services/c/gamma" },
+	])("learns $name without memorizing the training path", ({ tool, tuning, training, probe, expected }) => {
+		const store = patternStore(tuning);
+		for (const [index, { output, filePath }] of training.entries()) {
+			const sessionID = `training-${index}`;
+			store.observe(input(sessionID, tool, tool === "grep" ? { pattern: "TODO" } : {}, { output }));
+			store.observe(input(sessionID, "read", { filePath }));
+		}
+		store.observe(input("probe", tool, {}, { output: probe }));
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
-
 		expect(candidate?.type).toBe("tool_call");
-		expect(candidate?.input).toEqual({ filePath: "src/c.ts" });
-	});
-
-	test("learns a stable mapper branch after unrelated evidence", () => {
-		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
-		for (let index = 0; index < 4; index++) {
-			trainOutputRead(store, `noise-${index}`, { path: `src/source-${index}.ts` }, `src/unrelated-${index}.ts`);
-		}
-		for (let index = 0; index < 2; index++) {
-			const file = `src/stable-${index}.ts`;
-			trainOutputRead(store, `stable-${index}`, { path: file }, file);
-		}
-
-		store.observe(input("probe", "grep", {}, { output: { path: "src/result.ts" } }));
-		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({
-			filePath: "src/result.ts",
-		});
-	});
-
-	test("combines multiple structured fields instead of memorizing a concrete path", () => {
-		const store = patternStore();
-		trainJoinedRead(store, "one", "services/a", "alpha");
-		trainJoinedRead(store, "two", "services/b", "beta");
-
-		store.observe(
-			input("probe", "inspect", {}, {
-				output: { root: "services/c", name: "gamma" },
-			}),
-		);
-
-		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({
-			filePath: "services/c/gamma",
-		});
+		expect(candidate?.input).toEqual({ filePath: expected });
 	});
 
 	test("does not compose presentation text into a path binding", () => {
@@ -1532,21 +1513,6 @@ function trainGrepRead(store: PatternAwareStore, sessionID: string, filePath: st
 			...(schemaHash ? { schemaHash } : {}),
 		}),
 	);
-}
-
-function trainOutputRead(
-	store: PatternAwareStore,
-	sessionID: string,
-	output: Record<string, unknown>,
-	filePath: string,
-) {
-	store.observe(input(sessionID, "grep", { pattern: "TODO" }, { output }));
-	store.observe(input(sessionID, "read", { filePath }));
-}
-
-function trainJoinedRead(store: PatternAwareStore, sessionID: string, root: string, name: string) {
-	store.observe(input(sessionID, "inspect", {}, { output: { root, name } }));
-	store.observe(input(sessionID, "read", { filePath: `${root}/${name}` }));
 }
 
 function trainFrontier(store: PatternAwareStore, sessionID: string, sourcePath: string, testPath: string, turnBoundaries = false) {
