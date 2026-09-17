@@ -38,6 +38,10 @@ export interface ToolFilesystemOperations {
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;
+	/** Borrow a derived input representation from the same resource owner and byte budget. */
+	readonly prepare?: <Value, Result>(binding: object, key: string,
+		build: (view: ToolFilesystemOperations) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
+		consume: (value: Value) => Promise<Result>) => Promise<Result>;
 }
 
 /** Versioned identity of the concrete tool executor. */

@@ -1,7 +1,7 @@
 import { textResult } from "./result.ts";
 import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
-import { writeFile } from "node:fs/promises";
+import fs, { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel as model } from "./model.ts";
 import path from "node:path";
@@ -507,6 +507,8 @@ describe("speculative action host", () => {
 		await writeFile(path.join(cwd, "unused.txt"), "original");
 		const tools: AgentTool[] = [createReadTool(cwd), createLsTool(cwd), createFindTool(cwd), createGrepTool(cwd)];
 		const events: SpeculativeActionEvent<string>[] = [], ready = deferred<void>();
+		const directories = vi.spyOn(fs, "mkdtemp");
+		const preparations = () => directories.mock.calls.filter(([name]) => path.basename(String(name)) === "inputs-").length;
 		let predict = true, permitted = true, rootOverride: string | undefined, evaluations = 0;
 		const host = createSpeculativeActionHost("resources", {
 			cwd, draftModel: model("draft"),
@@ -528,8 +530,17 @@ describe("speculative action host", () => {
 		try {
 			await host.startTurn({ ...startInput(tools[3]!, "seed"), tools }); await ready.promise;
 			predict = false; await host.finishTurn("seed");
-			await writeFile(path.join(cwd, "unused.txt"), "changed but unused");
 			await host.startTurn({ ...startInput(tools[0]!, "consumer"), tools });
+			expect(preparations()).toBe(1);
+			for (const args of [{ pattern: "two", path: "." }, { pattern: "THREE", path: ".", ignoreCase: true, context: 1, limit: 1 },
+				{ pattern: "one", path: ".", glob: "*.txt" }]) {
+				const expected = await tools[3]!.execute("reference", args), actor = vi.fn(() => tools[3]!.execute("native", args));
+				const call = { turnID: "consumer", id: args.pattern, tool: "grep", args, tools };
+				expect(await host.execute(call, undefined, actor)).toEqual(expected);
+				expect(await host.execute({ ...call, id: args.pattern + ":again" }, undefined, actor)).toEqual(expected);
+				expect(actor).not.toHaveBeenCalled(); expect(preparations()).toBe(args.glob ? 2 : 1);
+			}
+			await writeFile(path.join(cwd, "unused.txt"), "changed but unused");
 			for (const [name, args] of [["read", { path: "notes.txt", offset: 2, limit: 1 }], ["ls", { path: "." }],
 				["find", { pattern: "*.txt", path: "." }], ["grep", { pattern: "two", path: "notes.txt" }]] as const) {
 				const tool = tools.find(tool => tool.name === name)!, expected = await tool.execute("reference", args as never);
@@ -552,10 +563,10 @@ describe("speculative action host", () => {
 			expect((await host.execute({ ...call, id: "changed" }, undefined, actor)).content).toEqual([{ type: "text", text: "current" }]);
 			expect(actor).toHaveBeenCalledTimes(3);
 			await host.finishTurn("consumer", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 14, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
 			expect(events.filter(event => event.type === "actor_action" && event.settlement.provider.kind === "speculative")
 				.every(event => event.type === "actor_action" && event.settlement.matchedPredictions.length === 0)).toBe(true);
-		} finally { await host.dispose(); await profile.pool.dispose(); }
+		} finally { await host.dispose(); await profile.pool.dispose(); directories.mockRestore(); }
 	});
 
 	it.each([false, true])("only promotes proven host observations, independently of prediction (ThinkThread=%s)", async (thinkthread) => {

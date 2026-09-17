@@ -10,7 +10,8 @@ import {
 } from "./action-semantics.ts";
 import { captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
-import type { ToolFilesystemStat } from "./tool-settlement.ts";
+import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -65,6 +66,10 @@ export class ResourceReadView {
 	private pending?: Promise<void>;
 	private disposal?: Promise<void>;
 	private dependencies?: Set<string>;
+	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, {
+		readonly value: unknown; readonly dispose: () => void | Promise<void>;
+		readonly dependencies?: ReadonlySet<string>; readonly boundary: ResourceReadView["boundary"];
+	}>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
@@ -127,6 +132,50 @@ export class ResourceReadView {
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
 	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void, root?: string): Promise<T> {
 		this.assertComplete(true);
+		return this.borrow(operation, observed, root);
+	}
+	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
+	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume) => {
+		this.assertComplete();
+		let owner: ResourceReadView = this;
+		while (owner.owner) owner = owner.owner;
+		const prepared = owner.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
+		return prepared.lifetime.admit(async () => {
+			this.assertComplete();
+			const cached = prepared.bindings.get(binding)?.get(key);
+			const inherit = (dependencies: ReadonlySet<string> | undefined) => {
+				if (!dependencies) this.dependencies = undefined;
+				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
+			};
+			if (owner.sealed && cached && cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot) {
+				inherit(cached.dependencies);
+				const result = await consume(cached.value as Parameters<typeof consume>[0]);
+				this.assertComplete(); return result;
+			}
+			let dependencies: ReadonlySet<string> | undefined;
+			let resource: Awaited<ReturnType<typeof build>> | undefined;
+			let retained = false;
+			try {
+				await this.borrow(async view => { resource = await build(view); }, (observed) => { dependencies = observed; inherit(observed); });
+				this.assertComplete();
+				if (!resource) throw new Error("resource_preparation_missing");
+				const bytes = resource.bytes + key.length * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+				if (!owner.sealed && !cached && owner.bytes + bytes <= owner.maxBytes) {
+					let entries = prepared.bindings.get(binding);
+					if (!entries) prepared.bindings.set(binding, entries = new Map());
+					if (!entries.has(key)) {
+						entries.set(key, { value: resource.value, dispose: resource.dispose, dependencies, boundary: this.boundary });
+						owner.capturedBytes += bytes; retained = true;
+					}
+				}
+				const result = await consume(resource.value);
+				this.assertComplete(); return result;
+			} finally { if (!retained) await resource?.dispose(); }
+		});
+	};
+	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void, root?: string): Promise<T> {
+		this.assertComplete();
 		const view = new ResourceReadView(0);
 		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set();
 		try {
@@ -157,11 +206,17 @@ export class ResourceReadView {
 	dispose(): void | Promise<void> {
 		if (!this.owner) this.entries.clear();
 		this.failure = new Error("resource_snapshot_disposed");
-		return this.disposal ??= this.pending?.then(() => {}, () => {});
+		return this.disposal ??= this.prepared ? this.prepared.lifetime.close(async () => {
+			await this.prepared!.lifetime.drain();
+			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].map(resource =>
+				this.prepared!.lifetime.release(resource)))]);
+			this.prepared!.bindings.clear();
+		}) : this.pending?.then(() => {}, () => {});
 	}
 	private async get(target: string, scope: ResourceDependency["scope"]) {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target)) this.unproven(target);
+		if (this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
 				const entry = this.entry(target, scope !== "entry");

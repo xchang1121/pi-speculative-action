@@ -230,6 +230,64 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
+	test.each([false, true])("owns prepared inputs with their original evidence and sealed byte budget (exhausted=%s)", async (exhausted) => {
+		const root = await workspace({ "value.txt": "A", unused: "B", "inside/other": "C" }), file = path.join(root, "value.txt");
+		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;
+		const binding = {}, dispose = vi.fn(), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+			const value = (await inputs.readFile(file)).toString();
+			expect(await inputs.exists!(path.join(root, "missing"))).toBe(false);
+			return { value, bytes: exhausted ? 65536 : 1, dispose };
+		});
+		try {
+			await view.readFile(path.join(root, "unused")); await view.stat(path.join(root, "inside"), "type");
+			expect(await view.prepare(binding, "selection", build, async value => value)).toBe("A");
+			view.seal(); const bytes = view.bytes;
+			let dependencies: ReadonlySet<string> | undefined;
+			const query = () => view.evaluate(v => v.prepare(binding, "selection", build, async value => value), observed => { dependencies = observed; });
+			expect(await query()).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
+			expect(dispose).toHaveBeenCalledTimes(exhausted ? 2 : 0); expect(view.bytes).toBe(bytes);
+			expect(dependencies?.size).toBeGreaterThan(0);
+			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
+			await fs.writeFile(path.join(root, "unused"), "irrelevant");
+			expect((await manager.validate(scoped)).expired).toBe(false);
+			await fs.writeFile(path.join(root, "missing"), "now present");
+			expect((await manager.validate(scoped)).expired).toBe(true);
+			await fs.unlink(path.join(root, "missing")); await fs.writeFile(file, "changed");
+			expect((await manager.validate(scoped)).expired).toBe(true);
+			await expect(view.evaluate(v => v.prepare(binding, "selection", build, async value => value), undefined, path.join(root, "inside")))
+				.rejects.toThrow("resource_access_unproven");
+			expect(await query()).toBe("A"); // Query failure cannot revoke a sibling's sealed input.
+			await view.evaluate(v => v.prepare({}, "selection", build, async value => value)); // A different binding must rebuild and release.
+			expect(build).toHaveBeenCalledTimes(exhausted ? 5 : 3);
+			expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 1); expect(view.bytes).toBe(bytes);
+		} finally { await token.release(); manager.close(); }
+		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
+	});
+
+	test.each(["build", "consume"])("drains prepared input %s before releasing its owner", async (phase) => {
+		const root = await workspace({ value: "A" }), manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture(undefined, 8192), view = token.view!, binding = {}, gate = gated(), dispose = vi.fn();
+		const build = async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+			const value = (await inputs.readFile(path.join(root, "value"))).toString();
+			if (phase === "build") await gate.wait();
+			return { value, bytes: 1, dispose };
+		};
+		let pending: Promise<unknown> | undefined, release: void | Promise<void>;
+		try {
+			if (phase === "consume") {
+				await view.prepare(binding, "input", build, async value => value); view.seal();
+				await expect(view.evaluate(v => v.prepare(binding, "input", build, async () => { throw new Error("consumer cancelled"); }))).rejects.toThrow("consumer cancelled");
+				expect(dispose).not.toHaveBeenCalled();
+			}
+			pending = view.prepare(binding, "input", build, async value => { if (phase === "consume") await gate.wait(); return value; });
+			const settled = Promise.allSettled([pending]); await gate.entered;
+			let released = false; release = token.release(); void Promise.resolve(release).then(() => { released = true; });
+			await nextTurn(); expect(released).toBe(false); expect(dispose).not.toHaveBeenCalled();
+			gate.release(); expect(await settled).toMatchObject([{ status: "rejected", reason: new Error("resource_snapshot_disposed") }]);
+			await release; expect(dispose).toHaveBeenCalledOnce();
+		} finally { gate.release(); await pending?.catch(() => {}); await token.release(); manager.close(); }
+	});
+
 	test("confines borrowed names, aliases and negative observations to the current root", async () => {
 		const root = await workspace({ "inside/data.txt": "A", "outside/data.txt": "B" });
 		const inside = path.join(root, "inside"), outside = path.join(root, "outside"), link = path.join(inside, "link");
