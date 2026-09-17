@@ -1684,7 +1684,7 @@ function formatActorProcessReuse(reuse: WorldReuseMetrics): string {
 		reuse.unattributedHits ? `${reuse.unattributedHits} stored` : "",
 		reuse.joinedHits ? `${reuse.joinedHits} joined` : "",
 	].filter(Boolean);
-	return [formatProcessWorkReuse(reuse), actorTiming(reuse), ...origins].filter(Boolean).join("; ");
+	return [formatProcessWorkReuse(reuse), ...origins].filter(Boolean).join("; ");
 }
 
 function formatActorProcessFooter(reuse: WorldReuseMetrics): string {
@@ -1694,18 +1694,5 @@ function formatActorProcessFooter(reuse: WorldReuseMetrics): string {
 	return [
 		`${formatRatio(hits, requests)} reused`,
 		workMs > 0 ? `${formatDuration(workMs)} work` : "",
-		actorTiming(reuse),
 	].filter(Boolean).join(" · ");
-}
-
-function actorTiming(reuse: WorldReuseMetrics): string {
-	const hits = reuse.hits + reuse.wholeCommandHits;
-	const timed = reuse.actorTimedHits + reuse.wholeCommandActorTimedHits;
-	if (hits <= 0) return "";
-	if (timed <= 0) return "Actor timing unavailable";
-	const baseline = reuse.actorBaselineMs + reuse.wholeCommandActorBaselineMs;
-	const latency = reuse.actorTimedHitLatencyMs + reuse.wholeCommandActorTimedHitLatencyMs;
-	const delta = baseline - latency;
-	const change = delta === 0 ? "unchanged" : `~${formatDuration(Math.abs(delta))} ${delta > 0 ? "shorter" : "longer"}`;
-	return `Actor path ${change} (${timed}/${hits} calibrated estimate)`;
 }

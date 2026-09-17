@@ -247,12 +247,6 @@ function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: Wo
 	return true;
 }
 
-function stateMapBytes(states: ReadonlyMap<string, RegularFileState | undefined>): number {
-	let total = 0;
-	for (const state of states.values()) total += state?.content.byteLength ?? 0;
-	return total;
-}
-
 // The execution world mirrors everything the actor can read below cwd. Git metadata is
 // replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
@@ -956,6 +950,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
 	let lastStructure = await workspace.structure.capture();
 	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
+	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() };
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
 	let clock: { readonly handle: FileHandle; readonly identity: Stats } | undefined;
@@ -1127,53 +1122,42 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 			poisonReason = transitions.reason;
 			return;
 		}
-		let retainedBytes = stateMapBytes(frontier);
-		for (const relativePath of transitions.paths) {
-			const entry = current.entries.get(relativePath);
-			retainedBytes -= frontier.get(relativePath)?.content.byteLength ?? 0;
-			const state =
-				entry?.kind === "file"
-					? await readRegularState(
-							path.resolve(sandboxRoot, relativePath),
-							WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
-						)
-					: undefined;
-			retainedBytes += state?.content.byteLength ?? 0;
-			frontier.set(relativePath, state);
-		}
+		await captureTransitions(transitions.paths, current, false);
 	}
 
 	async function captureTransitions(
 		paths: readonly string[],
 		after: WorkspaceStructureSnapshot,
+		captureBefore = true,
 	): Promise<readonly WorkspaceRegularDelta[]> {
 		const changes: WorkspaceRegularDelta[] = [];
 		let beforeBytes = 0;
 		let afterBytes = 0;
-		let retainedBytes = stateMapBytes(frontier);
 		for (const relativePath of paths) {
 			// The lock and overlap rejection keep this frontier unchanged throughout the interval.
-			const previous = await readFrontierState(git, commit, frontier, relativePath, WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes);
+			const previous = captureBefore
+				? await readFrontierState(git, commit, frontier, relativePath, WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes)
+				: undefined;
 			beforeBytes += previous?.content.byteLength ?? 0;
 			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) {
 				throw new Error("workspace transaction before-state exceeds capture limit");
 			}
 			const entry = after.entries.get(relativePath);
-			retainedBytes -= frontier.get(relativePath)?.content.byteLength ?? 0;
+			const unchangedBytes = retainedBytes - (frontier.get(relativePath)?.content.byteLength ?? 0);
 			const current =
 				entry?.kind === "file"
 					? await readRegularState(
 							path.resolve(sandboxRoot, relativePath),
 							Math.min(
 								WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes,
-								WORKSPACE_TRANSACTION_MAX_BYTES - retainedBytes,
+								WORKSPACE_TRANSACTION_MAX_BYTES - unchangedBytes,
 							),
 						)
 					: undefined;
-			afterBytes += current?.content.byteLength ?? 0;
-			retainedBytes += current?.content.byteLength ?? 0;
+			if (captureBefore) afterBytes += current?.content.byteLength ?? 0;
+			retainedBytes = unchangedBytes + (current?.content.byteLength ?? 0);
 			frontier.set(relativePath, current);
-			if (!sameSandboxState(previous, current)) {
+			if (captureBefore && !sameSandboxState(previous, current)) {
 				changes.push({
 					relativePath,
 					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),

@@ -476,11 +476,6 @@ export class LinuxProcessReuseBackend {
 					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					this.addActor("wholeCommandHits");
 					this.processScheduler.observeAdoption(timing, hitLatencyMs);
-					if (admission.expectedActorMs !== undefined) {
-						this.addActor("wholeCommandActorTimedHits");
-						this.addActor("wholeCommandActorBaselineMs", admission.expectedActorMs);
-						this.addActor("wholeCommandActorTimedHitLatencyMs", hitLatencyMs);
-					}
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
 					this.setActorError(`actor_replay:${errorMessage(error)}`);
@@ -910,12 +905,12 @@ export class LinuxProcessReuseBackend {
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
 	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff;
-		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number; readonly actorMs?: number }> {
+		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number }> {
 		let waitedMs = 0;
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded" }) : undefined;
 		if (admission && !admission.allowed) {
-			return { joined: false, waitedMs, ...(admission.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }) };
+			return { joined: false, waitedMs };
 		}
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
@@ -953,7 +948,6 @@ export class LinuxProcessReuseBackend {
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
 			waitedMs,
-			...(admission?.expectedActorMs === undefined ? {} : { actorMs: admission.expectedActorMs }),
 		};
 	}
 
@@ -1125,11 +1119,6 @@ export class LinuxProcessReuseBackend {
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
 					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
-					if (acquired.actorMs !== undefined) {
-						this.addActor("actorTimedHits");
-						this.addActor("actorBaselineMs", acquired.actorMs);
-						this.addActor("actorTimedHitLatencyMs", Math.max(0, performance.now() - requestStarted));
-					}
 					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id,
 						sequence: process.sequence, operationIdentity: weakKey });
 				},
