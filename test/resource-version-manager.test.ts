@@ -226,11 +226,14 @@ describe("speculative action resource versions", () => {
 		const args = { path: "value.txt", offset: 1, limit: 1 }, native = createReadTool(root);
 		const stock = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
 		const configuration = path.join(await workspace({ rule: "A" }), "rule");
-		const invocation = { ...stock, ...(capturedOnly ? { filesystemRoot: path.parse(root).root,
+		let afterRead: (() => Promise<void>) | undefined;
+		const invocation = { ...stock, ...(capturedOnly ? { filesystemRoot: path.parse(root).root } : {}),
 			filesystem: async (...request: Parameters<NonNullable<typeof stock.filesystem>>) => {
-				await request[0].readFile(configuration); return stock.filesystem!(...request);
+				if (capturedOnly) await request[0].readFile(configuration);
+				const output = await stock.filesystem!(...request);
+				await afterRead?.(); return output;
 			},
-		} : {}) };
+		};
 		const binding = { fingerprint: "original", context: invocation, ...(capturedOnly ? {
 			semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, resourceScope: "captured_inputs" as const },
 		} : {}) };
@@ -242,7 +245,8 @@ describe("speculative action resource versions", () => {
 			const unbound = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { ...binding, context: { ...invocation, filesystemRoot: undefined } })!;
 			await expect(world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: unbound, callID: "denied", signal })).rejects.toThrow("escapes workspace");
 		}
-		const branch = await world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
+		const execute = () => world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
+		const branch = await execute();
 		try {
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
 				{ path: "@value.txt", offset: 4, limit: 1 }, { path: file, offset: 5 }]) {
@@ -256,6 +260,18 @@ describe("speculative action resource versions", () => {
 			await fs.writeFile(configuration, "B");
 			expect((await branch.validate!()).status).toBe(capturedOnly ? "stale" : "valid");
 		} finally { await branch.dispose(); }
+		for (const target of capturedOnly ? [file, configuration] : [file]) {
+			const before = await fs.readFile(target), expected = await native.execute("control", args);
+			afterRead = () => fs.writeFile(target, "changed before sealing");
+			const retained = await execute(); afterRead = undefined;
+			try {
+				expect(retained.output.result).toEqual(expected);
+				expect((await retained.validate!()).status).toBe("stale");
+				await fs.writeFile(target, before);
+				expect((await retained.validate!()).status).toBe("valid");
+				expect((await retained.commit()).result).toEqual(expected);
+			} finally { await fs.writeFile(target, before); await retained.dispose(); }
+		}
 	});
 
 	test.runIf(process.platform !== "win32")("capture and branch share one resource lifetime", async () => {
