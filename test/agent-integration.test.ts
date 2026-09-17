@@ -501,6 +501,71 @@ describe("speculative action host", () => {
 		expect(worldDisposed).toHaveBeenCalledOnce();
 	});
 
+	it.for([false, true])("composes sealed names and bytes without dropping source proofs (oversized=%s)", async (oversized, { skip }) => {
+		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
+		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
+		await writeFile(path.join(cwd, ".ignore"), "# shared selection rules\n");
+		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd), createFindTool(cwd)];
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 });
+		const execute = world.speculation!.execute;
+		const sources = new Map<string, Awaited<ReturnType<typeof execute>>>();
+		vi.spyOn(world.speculation!, "execute").mockImplementation(async context => {
+			const branch = await execute(context); sources.set(context.toolName, branch);
+			return !oversized ? branch : { ...branch, reconstruct: async request => {
+				const query = await branch.reconstruct!(request);
+				return query && { ...query, capturedBytes: 2 ** 30 };
+			} };
+		});
+		const ready = deferred(), events: SpeculativeActionEvent<string>[] = [];
+		let predict = true, completed = 0, evaluations = 0;
+		const host = createSpeculativeActionHost("composed", {
+			cwd, draftModel: model("draft"),
+			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
+				candidateLimit: 1, maxConcurrentActions: 2, tools: tools.map(tool => tool.name) }),
+			complete: async () => assistant([
+				{ type: "toolCall", id: "names", name: "grep", arguments: { pattern: "seed", path: ".", glob: "*.absent" } },
+				{ type: "toolCall", id: "bytes", name: "read", arguments: { path: "notes.txt", limit: 1 } },
+			], "toolUse"),
+			resolveInvocation: (tool, input) => {
+				const bound = profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} });
+				return bound && { ...bound, filesystem: bound.filesystem && ((...args) => { evaluations++; return bound.filesystem!(...args); }) };
+			},
+			preflight: () => true, executionWorlds: [world],
+			onEvent: event => { events.push(event); if (event.type === "candidate") {
+				if (event.state.status === "succeeded" && ++completed === 2) ready.resolve();
+				if (event.state.status === "failed" || event.state.status === "cancelled") ready.reject(new Error(JSON.stringify(event.state)));
+			} },
+		});
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "seed"), tools }); await ready.promise;
+			predict = false; await host.finishTurn("seed");
+			await host.startTurn({ ...startInput(tools[0]!, "query"), tools });
+			const original = await fs.readFile(path.join(cwd, "notes.txt"));
+			const args = { pattern: "two", path: "." }, expected = await tools[0]!.execute("reference", args);
+			const actor = vi.fn(() => tools[0]!.execute("native", args));
+			const call = { turnID: "query", id: "query", tool: "grep", args, tools };
+			await host.previewActorCall(call);
+			for (const id of ["query", "retained"]) expect(await host.execute({ ...call, id }, undefined, actor)).toEqual(expected);
+			expect(actor.mock.calls.length, JSON.stringify(events.filter(event => event.type === "actor_action").map(event => event.settlement))).toBe(0);
+			expect(evaluations).toBe(oversized ? 5 : 3);
+			await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\nchanged unused line\n");
+			expect(await host.execute({ ...call, id: "stale-source" }, undefined, actor)).toEqual(expected);
+			expect(actor).toHaveBeenCalledOnce();
+			await writeFile(path.join(cwd, "notes.txt"), original);
+			expect(await host.execute({ ...call, id: "restored-source" }, undefined, actor)).toEqual(expected);
+			expect(actor).toHaveBeenCalledOnce();
+			await sources.get("read")!.dispose();
+			expect(await host.execute({ ...call, id: "retired-source" }, undefined, actor)).toEqual(expected);
+			expect(actor).toHaveBeenCalledTimes(2);
+			const find = { pattern: "notes.txt", path: "." }, findActor = vi.fn(() => tools[2]!.execute("native-find", find));
+			expect(await host.execute({ ...call, id: "surviving-source", tool: "find", args: find }, undefined, findActor))
+				.toEqual(await tools[2]!.execute("reference-find", find));
+			expect(findActor).not.toHaveBeenCalled();
+			await host.finishTurn("query", true);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 4, exactReuseHits: 0, predictionsMatched: 0 });
+		} finally { await host.dispose(); await profile.pool.dispose(); }
+	});
+
 	it("uses a completed search's inputs for current tools across turns without adopting its output or prediction", async ({ skip }) => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }

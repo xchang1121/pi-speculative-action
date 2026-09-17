@@ -188,7 +188,8 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			reconstructionScope: shared && branch.reconstruct && !validateAndCommit ? branch.reconstructionScope : undefined,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
-		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
+		checkpoint: branch.checkpoint, inputSource: shared ? branch.inputSource : undefined,
+		output: shared ? cloneSharedData(branch.output) : branch.output,
 		operations: branch.operations && Object.freeze([...branch.operations]),
 		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
 		validate: validateAndCommit ?? branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
@@ -244,7 +245,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 				if (!result) return undefined;
 				// An atomic validation/commit callback retains its complete proof and effect ownership.
 				const proof = !validateAndCommit && result.validate?.bind(result);
-				return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes,
+				return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes, requiresQueryValidation: result.requiresQueryValidation,
 					compatibility: proof ? immutableSnapshot(result.compatibility) : undefined,
 					...(proof ? { validate: () => validate(proof) } : {}) });
 			});

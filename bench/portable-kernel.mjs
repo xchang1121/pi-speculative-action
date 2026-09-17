@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 import { createClosedSearchProfile, readClosedSearchInput } from "../dist/pi-tool-invocation.js";
+import { bounded, searchJourney } from "./search-journey.mjs";
 
 // No extra engines or installation: qualify captured find, the process outlet, and both production TUI routes.
 const worker = await prepareWorker(true);
@@ -53,8 +54,6 @@ async function prepareWorker(qualification = false) {
 /** Full original Pi tool in independent Actor/producer workers; Runtime owns admission and adoption. */
 async function qualifyPiSearch(name) {
 	const { createFindToolDefinition, createWriteTool } = await import("@earendil-works/pi-coding-agent");
-	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
-	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { PI_ACTION_SEMANTICS } = await import("../dist/action-semantics.js");
 	const { createResourceSnapshotExecutionWorld } = await import("../dist/agent-execution-world.js");
 	const { captureResourceVersion } = await import("../dist/resource-version.js");
@@ -85,49 +84,19 @@ async function qualifyPiSearch(name) {
 	const tool = createFindToolDefinition(root), write = createWriteTool(root), tools = [tool, write];
 	const semantics = PI_ACTION_SEMANTICS;
 	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
-	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const signal = new AbortController().signal, journeys = [];
 	const args = { pattern: "*.txt", path: "search", limit: 1000 };
 	function journey(checkpoint, capacity = 1) {
-		const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
-		let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
 		const invocation = { ...bound,
 			filesystem: async (view, request) => {
 				if (checkpoint) return execute("producer", view, request, checkpoint);
 				counts.producer++; return bound.filesystem(view, request);
-			} };
-		const host = createSpeculativeActionHost("portable-" + journeys.length, {
-			cwd: root, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
-				drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: capacity, tools: prediction ? [name] : [],
-				patternAware: { enabled: false }, selfSpeculation: { enabled: false } }),
-			draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
-			resolveInvocation: (tool) => tool === name ? invocation : undefined,
-			preflight: () => { if (actorWaiting) authorized.resolve(); return true; },
-			executionWorlds: [resources],
-			onEvent: (event) => {
-				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate.resolve(event.state);
-			},
-			onActorActionSettled: ({ settlement }) => feedback?.resolve(settlement),
+			}, authoritative: (request) => { counts.actor++; return bound.authoritative(request); } };
+		const probe = searchJourney({ cwd: root, name, tools, args, invocation, world: resources,
+			settings: { maxConcurrentActions: capacity },
 		});
-		journeys.push(host);
-		return { host, candidate: candidate.promise, authorized: authorized.promise, actorCalls: () => actorCalls,
-			start: async (id, predict = true) => {
-				if (turnID) await host.finishTurn(turnID);
-				turnID = id; prediction = predict;
-				await host.startTurn({ turnID, actorModel: model, actorOptions: undefined, tools,
-					context: { systemPrompt: "qualification", messages: [], tools } });
-			},
-			actor: async (id, query = args) => {
-				actorWaiting = true; feedback = Promise.withResolvers();
-				const output = await host.execute({ turnID, id, tool: name, args: query, tools: [tool] }, signal, async (operation) => {
-					assert.deepEqual(operation.invocation?.identity, bound.identity, "Actor execution must retain the selected executor independently of K(a)");
-					actorCalls++; counts.actor++;
-					return (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: id })).result;
-				});
-				actorWaiting = false;
-				return { output, settlement: await bounded(feedback.promise, "Actor settlement") };
-			},
-		};
+		journeys.push(probe.host);
+		return probe;
 	}
 	try {
 		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: "kernel", commands: [] })), /closed search operation denied/);
@@ -363,10 +332,4 @@ async function qualifySearchExtension() {
 			assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });
 		}
 	}
-}
-
-function bounded(promise, label) {
-	let timer;
-	return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + " deadline")), 15_000); })])
-		.finally(() => clearTimeout(timer));
 }

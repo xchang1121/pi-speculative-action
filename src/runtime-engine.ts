@@ -239,12 +239,13 @@ async function projectOutput<Output>(
 			keyMatch: match,
 		})) : undefined;
 		const rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
+		if (rebuilt?.requiresQueryValidation && !rebuilt.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (rebuilt) projected = rebuilt.output;
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
 		return { ok: true, output: projected, execution, inputs: !!rebuilt, compatibility: rebuilt?.compatibility,
-			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
+			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes, requiresQueryValidation: rebuilt?.requiresQueryValidation };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
@@ -366,8 +367,7 @@ function retainResultView<Output>(
 		const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
 		let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
 		const views = candidate.resultViews ??= new Map();
-		// Prefer retained query data to an extra proof; the original complete proof remains sufficient.
-		if (candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
+		if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
 		while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
 			const [key, previous] = views.entries().next().value!;
 			views.delete(key); candidate.estimatedBytes -= previous.bytes;
@@ -523,7 +523,7 @@ interface ClaimedPrediction {
 }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -614,6 +614,23 @@ export function makeSpeculativeActionRuntime<
 
 	const acquireCandidate = (session: Session, candidate: Candidate, owner: string) =>
 		candidateStore.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
+
+	const borrowCandidateInputs = (session: Session, source: Candidate, owner: string) => {
+		const leases = new Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>>();
+		let closed = false;
+		return {
+			lookup: function* (path: string): Iterable<object> {
+				if (closed || session.lifecycle.sealed || masterDisabled()) return;
+				for (const candidate of candidateStore.lookupInputs(session.id, [path])) {
+					if (candidate === source || candidate.owner.draft.type !== "tool_call" || candidateWorld(candidate) || candidate.route.reuse !== "shared_result" ||
+						candidate.work.execution.status !== "succeeded" || !candidate.work.execution.output.inputSource) continue;
+					const lease = leases.get(candidate) ?? acquireCandidate(session, candidate, owner);
+					if (lease) { leases.set(candidate, lease); yield candidate.work.execution.output.inputSource; }
+				}
+			},
+			dispose: () => { closed = true; for (const lease of leases.values()) lease.release(); leases.clear(); },
+		};
+	};
 
 	const createCandidate = (
 		session: Session,
@@ -1473,15 +1490,18 @@ export function makeSpeculativeActionRuntime<
 			if (!active() || state.actorPreviews.get(actualCall.id!) !== record) return;
 			const lease = acquireCandidate(state.session, candidate, `preview:${callKey(state.turnID, actualCall.id!)}`);
 			if (!lease) return;
+			const inputs = execution.output.inputSource
+				? borrowCandidateInputs(state.session, candidate, `inputs:preview:${callKey(state.turnID, actualCall.id!)}`) : undefined;
 			try {
 				if (await authorize(state, input, action, actualCall, candidate, signal) || !active()) return;
 				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
 				const projected = await projectOutput(candidate, action, match,
 					projectionRules, { action, args: action.input, callID: actualCall.id!,
-						signal: signal ?? state.generation.signal });
+						signal: signal ?? state.generation.signal, inputs: inputs?.lookup });
 				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate &&
 					retainResultView(candidate, action, projected, state.settings)) trimResults(state.session, state.settings);
 			} finally {
+				inputs?.dispose();
 				lease.release();
 			}
 			return;
@@ -1665,6 +1685,7 @@ export function makeSpeculativeActionRuntime<
 				continue;
 			}
 			const attemptStartedAt = performance.now();
+			let inputs: ReturnType<typeof borrowCandidateInputs> | undefined;
 			let waitMs = 0;
 			try {
 				if (candidate.work.execution.status === "queued") {
@@ -1731,13 +1752,15 @@ export function makeSpeculativeActionRuntime<
 					(await preview.actionKey)?.key === actualKey.key) await waitForCandidate(preview.task, signal);
 				if (stopCandidate(candidate)) break;
 				// Evaluate sealed data first, then prove freshness once immediately before commit.
+				if (choice.match.kind !== "exact" && branch.inputSource && !candidate.resultViews?.has(actualKey.key))
+					inputs = borrowCandidateInputs(state.session, candidate, `inputs:${actorAction.identity.id}`);
 				const projection = await projectOutput(
 					candidate,
 					actualKey,
 					choice.match,
 					projectionRules,
 					{ action: actualKey, args: actualCall.input, callID: actualCall.id ?? actualKey.hash,
-						signal: signal ?? state.generation.signal },
+						signal: signal ?? state.generation.signal, inputs: inputs?.lookup },
 				);
 				if (stopCandidate(candidate)) break;
 				if (!projection.ok) {
@@ -1756,7 +1779,12 @@ export function makeSpeculativeActionRuntime<
 				if (stopCandidate(candidate)) break;
 				if (validation.status !== "valid") {
 					actorAction.rejectCandidate(candidate.id, choice.match, validation.cause);
-					if (validation.status === "stale") invalidateCandidates(state.session, [candidate], validation.cause);
+					if (validation.status === "stale") {
+						const retained = candidate.resultViews?.get(actualKey.key);
+						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes; }
+						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
+						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause);
+					}
 					continue;
 				}
 				let output = projection.output;
@@ -1801,6 +1829,7 @@ export function makeSpeculativeActionRuntime<
 				});
 				break;
 			} finally {
+				inputs?.dispose();
 				reservation.release();
 				state.session.scheduler.observeAdoption(adoptionIdentity, Math.max(0, performance.now() - attemptStartedAt - waitMs));
 			}
