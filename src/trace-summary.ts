@@ -76,13 +76,6 @@ export function reduceSpeculativeTrace<SessionID>(
 ): SpeculativeTraceSummary {
 	const next = {
 		...current,
-		sourceOutcomes: { ...current.sourceOutcomes },
-		predictionUnobserved: { ...current.predictionUnobserved },
-		predictionRejectedAfterMatch: { ...current.predictionRejectedAfterMatch },
-		candidateTerminalCauses: { ...current.candidateTerminalCauses },
-		actorCandidateRejections: { ...current.actorCandidateRejections },
-		partialResultReuseByProjector: { ...current.partialResultReuseByProjector },
-		processReuse: { ...current.processReuse },
 		cache: cloneCache(event.cache),
 	};
 	switch (event.type) {
@@ -103,20 +96,20 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "source_request":
 			next.sourceRequests++;
-			increment(next.sourceOutcomes, event.request.settlement.status);
+			next.sourceOutcomes = increment(current.sourceOutcomes, event.request.settlement.status);
 			break;
 		case "prediction": {
 			next.predictionsSettled++;
 			const settlement = event.settlement;
 			if (settlement.observation === "unobserved") {
-				increment(next.predictionUnobserved, causeKey(settlement.cause));
+				next.predictionUnobserved = increment(current.predictionUnobserved, causeKey(settlement.cause));
 				break;
 			}
 			next.predictionsObserved++;
 			if (!settlement.match.matched) break;
 			next.predictionsMatched++;
 			if (settlement.match.adoption.status === "adopted") next.predictionsAdopted++;
-			else increment(next.predictionRejectedAfterMatch, causeKey(settlement.match.adoption.cause));
+			else next.predictionRejectedAfterMatch = increment(current.predictionRejectedAfterMatch, causeKey(settlement.match.adoption.cause));
 			break;
 		}
 		case "candidate":
@@ -134,21 +127,26 @@ export function reduceSpeculativeTrace<SessionID>(
 				else {
 					if (event.state.status === "failed") next.candidateFailed++;
 					else next.candidateCancelled++;
-					increment(next.candidateTerminalCauses, causeKey(event.state.cause));
+					next.candidateTerminalCauses = increment(current.candidateTerminalCauses, causeKey(event.state.cause));
 				}
 			}
 			break;
 		case "actor_action":
 			next.actorActions++;
-			for (const rejection of event.settlement.rejections) {
-				increment(next.actorCandidateRejections, causeKey(rejection.cause));
+			if (event.settlement.rejections.length) {
+				const counts = { ...current.actorCandidateRejections };
+				for (const rejection of event.settlement.rejections) {
+					const key = causeKey(rejection.cause);
+					counts[key] = (counts[key] ?? 0) + 1;
+				}
+				next.actorCandidateRejections = counts;
 			}
 			if (event.settlement.provider.kind === "speculative") {
 				next.speculativeHits++;
 				const match = event.settlement.provider.match;
 				if (match.kind === "projected") {
 					next.partialResultReuseHits++;
-					increment(next.partialResultReuseByProjector, match.projector);
+					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, match.projector);
 				} else if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
 				next.executionAheadMs += metric(event.settlement.provider.timing.executionAheadMs);
@@ -197,6 +195,6 @@ function ratio(numerator: number, denominator: number): number {
 	return denominator > 0 ? numerator / denominator : 0;
 }
 
-function increment(target: Record<string, number>, key: string): void {
-	target[key] = (target[key] ?? 0) + 1;
+function increment(target: Readonly<Record<string, number>>, key: string): Record<string, number> {
+	return { ...target, [key]: (target[key] ?? 0) + 1 };
 }
