@@ -306,6 +306,10 @@ const preparedWorkspaceBaselines = new WeakMap<QualifiedWorkspaceSandboxDriver, 
 	readonly baseline: NonNullable<PooledGitRepository["baseline"]>;
 }>();
 
+/** Bound filesystem operations validate all captured inputs and effects in the commit transaction. */
+const capturedWorkspaceInputs = Symbol("captured workspace inputs");
+type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorkspaceInputs;
+
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
 	private disposal?: Promise<void>;
@@ -634,6 +638,7 @@ async function commitSandboxExecution(
 async function forkSandboxWorkspaceFor(
 	state: WorkspaceSandboxState,
 	options: SandboxWorkspaceBranchOptions,
+	preparation: SandboxPreparation | undefined = options.validate ? options.preparation : undefined,
 ): Promise<WorldBranch<ToolSettlement>> {
 	const sourceRoot = path.resolve(options.cwd);
 	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
@@ -665,7 +670,7 @@ async function forkSandboxWorkspaceFor(
 			};
 		},
 		parent,
-		options.validate ? options.preparation : undefined,
+		preparation,
 	);
 	return workspaceBranch(
 		snapshot,
@@ -743,7 +748,8 @@ async function executeMutation(
 				const relative = relativeFilesystemPath(sourceRoot, logical);
 				if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
 				const target = path.resolve(workspace.sandboxRoot, relative);
-				await assertNoSymlinkPath(workspace.sandboxRoot, target);
+				await Promise.all([assertNoSymlinkPath(sourceRoot, path.resolve(sourceRoot, relative)),
+					assertNoSymlinkPath(workspace.sandboxRoot, target)]);
 				return target;
 			};
 			const targetRecord = (target: string) => ({ root: sourceRoot, target, resource: slash(path.relative(sourceRoot, target)) });
@@ -811,7 +817,7 @@ async function executeMutation(
 			}
 			return { output, changes: [...changes.values()] };
 		},
-	});
+	}, capturedWorkspaceInputs);
 }
 
 async function createPrivateSandboxWorkspace(
@@ -820,7 +826,7 @@ async function createPrivateSandboxWorkspace(
 	gitBinary: string,
 	driver: Exclude<WorkspaceSandboxDriver, "auto">,
 	overlayOptions: LinuxOverlayfsOptions,
-	preparation?: QualifiedWorkspaceSandboxDriver,
+	preparation?: SandboxPreparation,
 ): Promise<PrivateSandboxWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -849,9 +855,9 @@ async function createPrivateSandboxWorkspace(
 		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 	})();
 	try {
-		const prepared = preparation && preparedWorkspaceBaselines.get(preparation);
-		const baseline = prepared?.repository === pool && preparation?.driver === driver
-			? prepared.baseline : await acquireSandboxBaseline(pool);
+		const prepared = typeof preparation === "object" ? preparedWorkspaceBaselines.get(preparation) : undefined;
+		const baseline = prepared?.repository === pool && typeof preparation === "object" && preparation.driver === driver
+			? prepared.baseline : await acquireSandboxBaseline(pool, preparation === capturedWorkspaceInputs);
 		const { commit } = baseline;
 		let sandboxRoot: string;
 		let processRoot: string;
@@ -1565,7 +1571,7 @@ async function withPrivateSandboxWorkspace<T>(
 	overlayOptions: LinuxOverlayfsOptions,
 	run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 	checkpoint?: WorkspaceCheckpoint,
-	preparation?: QualifiedWorkspaceSandboxDriver,
+	preparation?: SandboxPreparation,
 ): Promise<T> {
 	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions, preparation);
 	try {
