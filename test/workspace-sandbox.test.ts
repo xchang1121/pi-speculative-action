@@ -846,6 +846,37 @@ describe("workspace-branch ExecutionWorld", () => {
 		} finally { captures.mockRestore(); events.mockRestore(); vi.unstubAllEnvs(); }
 	});
 
+	it("borrows preparations only within their live pool and keeps current input/effect validation", async () => {
+		for (const mode of ["borrowed", "unvalidated", "copied", "foreign", "other-root", "retired"]) {
+			const root = await temporaryRoot(), target = path.join(root, "value.txt"), other = new WorkspaceSandboxService();
+			await writeFile(target, "before\n");
+			try {
+				let preparation = await sandbox.prepare(root, { driver: "git" });
+				if (mode === "copied") preparation = { ...preparation };
+				if (mode === "foreign") preparation = await other.prepare(root, { driver: "git" });
+				if (mode === "other-root") preparation = await sandbox.prepare(await temporaryRoot(), { driver: "git" });
+				if (mode === "retired") await sandbox.closePools([root]);
+				await writeFile(target, "current\n");
+				const branch = await sandbox.fork({ cwd: root, driver: "git", preparation,
+					action: requiredAction("write", { path: "value.txt", content: "after\n" }, root),
+					...(mode === "unvalidated" ? {} : { validate: async () => ({ status: "indeterminate" as const,
+						cause: { stage: "freshness" as const, code: "inputs_not_proven" },
+						metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" as const } }) }),
+					execute: async ({ sandboxRoot }) => {
+						const file = path.join(sandboxRoot, "value.txt");
+						expect(await readFile(file, "utf8")).toBe(mode === "borrowed" ? "before\n" : "current\n");
+						await writeFile(file, "after\n"); return settlement("done");
+					},
+				});
+				if (mode !== "unvalidated") expect((await branch.validate!()).status).toBe("indeterminate");
+				if (mode === "borrowed") await expect(branch.commit()).rejects.toThrow("resource changed before commit");
+				else await branch.commit();
+				await branch.dispose();
+				expect(await readFile(target, "utf8")).toBe(mode === "borrowed" ? "current\n" : "after\n");
+			} finally { await other.dispose(); }
+		}
+	});
+
 	it("repairs staged bytes that changed between source capture and validation", async () => {
 		const root = await temporaryRoot(), target = path.join(root, "value.txt"), content = "before\n";
 		await writeFile(target, content);
@@ -866,7 +897,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
 		const root = await temporaryRoot(), gate = gated();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<void>[] = [];
+		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate"), pending: Promise<unknown>[] = [];
 		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockReturnValue({ uncertain: true, paths: [] });
 		let heldRoot: string | undefined, removals = 0;
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
