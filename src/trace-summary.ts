@@ -63,10 +63,6 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		executionAheadMs: 0,
 		attemptLeadMs: 0,
 		hitLatencyMs: 0,
-		executionBlockedActorActions: 0, // Matched predictions deliberately not executed.
-		executionBlockedAttemptLeadMs: 0, // Earliest matching intent to Actor interception.
-		executionBlockedPotentialHiddenLatencyMs: 0, // Counterfactual safe overlap, not measured speedup.
-		executionBlockedPotentialHitLatencyMs: 0, // Actor work remaining after that overlap.
 		totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
@@ -164,13 +160,6 @@ export function reduceSpeculativeTrace<SessionID>(
 					next.actorPreviews++;
 				} else {
 					next.actorFallbacks++;
-					const timing = event.settlement.provider.executionBlockedTiming;
-					if (timing) {
-						next.executionBlockedActorActions++;
-						next.executionBlockedAttemptLeadMs += metric(timing.attemptLeadMs);
-						next.executionBlockedPotentialHiddenLatencyMs += metric(timing.executionAheadMs);
-						next.executionBlockedPotentialHitLatencyMs += metric(timing.hitLatencyMs);
-					}
 				}
 			}
 			break;
