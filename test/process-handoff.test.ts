@@ -19,11 +19,11 @@ describe("ProcessHandoffRegistry", () => {
 		const acceptScope = (scope: typeof SCOPE) => active && scope.turnID === OTHER_SCOPE.turnID;
 		const fixture = await producer(true, undefined, 0, SCOPE, new ProcessHandoffOwnership(undefined, acceptScope));
 		if (phase === "completed") await fixture.publish();
-		await expect(acquireActor(fixture, undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+		await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
 		active = true;
-		await expect(acquireActor(fixture, undefined, undefined, { ...OTHER_SCOPE, sessionID: "foreign" })).resolves.toMatchObject({ kind: "miss" });
+		await expect(fixture.actor(undefined, undefined, { ...OTHER_SCOPE, sessionID: "foreign" })).resolves.toMatchObject({ kind: "miss" });
 		const validation = gated();
-		const actor = acquireActor(fixture, async live => {
+		const actor = fixture.actor(async live => {
 			if (!live) return;
 			await validation.wait(); return livePlan(live);
 		}, async () => { await fixture.publish(); return "completed"; }, OTHER_SCOPE);
@@ -31,8 +31,8 @@ describe("ProcessHandoffRegistry", () => {
 		active = false; validation.release();
 		await expect(actor).resolves.toMatchObject({ kind: "miss" });
 		active = true;
-		await expect(acquireActor(fixture, undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
-		await expect(acquireActor(fixture, undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+		await expect(fixture.actor(undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
+		await expect(fixture.actor(undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
 		await expect(fixture.ownership.commit(async () => "whole")).rejects.toMatchObject({ disposition: "recoverable" });
 		fixture.registry.dispose();
 	});
@@ -48,8 +48,8 @@ describe("ProcessHandoffRegistry", () => {
 			const computation = fixture.work.computation;
 			expect(Boolean(computation)).toBe(!native);
 			if (consumed) {
-				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "hit" });
-				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+				await expect(fixture.actor()).resolves.toMatchObject({ kind: "hit" });
+				await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
 				expect(fixture.work.computation).toBe(computation);
 				expect(fixture.registry.hasResults).toBe(false);
 				expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
@@ -73,7 +73,7 @@ describe("ProcessHandoffRegistry", () => {
 			if (native) {
 				expect(fixture.registry.hasResults).toBe(false);
 				expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
-				await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+				await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
 			}
 			expect(binding!.available).toBe(true);
 			const owned = fixture.registry.resolveBinding(binding!, OTHER_SCOPE);
@@ -96,6 +96,10 @@ describe("ProcessHandoffRegistry", () => {
 			expect(binding!.available).toBe(false);
 			expect(fixture.registry.bindings(SCOPE)).toEqual([]);
 			expect(JSON.stringify(owned)).toContain("sensitive value"); // An admitted consumer owns its immutable copy.
+			if (revoke !== "dispose") {
+				fixture.registry.configure(1, 100);
+				expect(fixture.registry.observe(digest("refilled"), "/usr/bin/other", SCOPE, invocation, 1)?.available).toBe(true);
+			}
 			fixture.registry.dispose();
 		}
 	});
@@ -111,7 +115,7 @@ describe("ProcessHandoffRegistry", () => {
 			await lookupGate.wait();
 			return undefined;
 		});
-		const actor = acquireActor(fixture, lookup);
+		const actor = fixture.actor(lookup);
 
 		await lookupGate.entered;
 		await fixture.publish(async () => true);
@@ -119,7 +123,7 @@ describe("ProcessHandoffRegistry", () => {
 
 		await expect(actor).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate }, joined: false });
 		expect(lookup).toHaveBeenCalledTimes(3);
-		await expect(acquireActor(previous, live => livePlan(live?.filter(candidate => candidate === previous.certificate))))
+		await expect(previous.actor(live => livePlan(live?.filter(candidate => candidate === previous.certificate))))
 			.resolves.toMatchObject({ kind: "hit", plan: { certificate: previous.certificate } });
 	});
 
@@ -139,7 +143,7 @@ describe("ProcessHandoffRegistry", () => {
 			expect(fixture.registry.hasResults).toBe(true);
 
 			const lookup = vi.fn(livePlan);
-			const actor = await acquireActor(fixture, lookup, undefined, scope);
+			const actor = await fixture.actor(lookup, undefined, scope);
 			expect(actor).toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate }, producer: fixture.work });
 			expect(fixture.registry.hasResults).toBe(true);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
@@ -151,11 +155,11 @@ describe("ProcessHandoffRegistry", () => {
 				persistence.resolve(stored!);
 				await expect(publishing).resolves.toBe(stored);
 			}
-			await expect(acquireActor(fixture, lookup, undefined, scope)).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
+			await expect(fixture.actor(lookup, undefined, scope)).resolves.toMatchObject({ kind: "hit", plan: { certificate: fixture.certificate } });
 			fixture.registry.clearCompleted();
 			expect(fixture.registry.hasResults).toBe(false);
 			expect(fixture.registry.mayHaveExecutable(fixture.certificate.prototype.executablePath)).toBe(false);
-			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+			await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
 		}
 	});
 
@@ -167,7 +171,7 @@ describe("ProcessHandoffRegistry", () => {
 		expect(second.certificate.id).toBe(first.certificate.id);
 		expect(second.work).not.toBe(first.work);
 		await first.publish();
-		const actor = acquireActor(first, async live => { await gate.wait(); return livePlan(live); });
+		const actor = first.actor(async live => { await gate.wait(); return livePlan(live); });
 		await gate.entered;
 		scope.turnID = "later";
 		await second.publish(); gate.release();
@@ -177,7 +181,7 @@ describe("ProcessHandoffRegistry", () => {
 		expect(result.producer).toBe(first.work);
 		expect(Object.isFrozen(result.producer!.scope)).toBe(true);
 		first.registry.clearCompleted();
-		await expect(acquireActor(first, async () => ({ certificate: first.certificate })))
+		await expect(first.actor(async () => ({ certificate: first.certificate })))
 			.resolves.toEqual({ kind: "hit", plan: { certificate: first.certificate }, joined: false });
 		first.registry.dispose();
 	});
@@ -194,7 +198,7 @@ describe("ProcessHandoffRegistry", () => {
 			await gate.wait();
 			return completed ? livePlan(live) : { certificate: fixture.certificate };
 		});
-		const actor = acquireActor(fixture, lookup);
+		const actor = fixture.actor(lookup);
 		await gate.entered;
 		if (operation === "clear") fixture.registry.clearCompleted();
 		else if (operation === "trim") fixture.registry.configure(0);
@@ -203,7 +207,7 @@ describe("ProcessHandoffRegistry", () => {
 		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
 		if (completed) await expect(fixture.ownership.commit(async () => "whole")).resolves.toBe("whole");
 		else {
-			await expect(acquireActor(fixture, lookup)).resolves.toEqual({ kind: "miss", joined: false });
+			await expect(fixture.actor(lookup)).resolves.toEqual({ kind: "miss", joined: false });
 			await expect(fixture.work.completion).resolves.toBeUndefined();
 		}
 		expect(lookup).toHaveBeenCalledTimes(operation === "dispose" ? 1 : 2);
@@ -215,7 +219,7 @@ describe("ProcessHandoffRegistry", () => {
 			await fixture.publish();
 			const validating = deferred<void>(), release = deferred<void>();
 			let validations = 0;
-			const children = Array.from({ length: 2 }, () => acquireActor(fixture, async (live) => {
+			const children = Array.from({ length: 2 }, () => fixture.actor(async (live) => {
 				if (!live) return undefined;
 				if (++validations === 2) validating.resolve();
 				await release.promise; return livePlan(live);
@@ -240,9 +244,9 @@ describe("ProcessHandoffRegistry", () => {
 			const whole = fixture.ownership.commit(async () => {
 				await release.promise; throw disposition ? effectCommitFailure(failure, disposition) : failure;
 			});
-			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: "miss" });
+			await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
 			release.resolve(); await expect(whole).rejects.toThrow("commit failed");
-			await expect(acquireActor(fixture)).resolves.toMatchObject({ kind: disposition === "recoverable" ? "hit" : "miss" });
+			await expect(fixture.actor()).resolves.toMatchObject({ kind: disposition === "recoverable" ? "hit" : "miss" });
 		}
 		for (const winner of ["whole", "child"]) {
 			const first = await producer(true);
@@ -252,33 +256,34 @@ describe("ProcessHandoffRegistry", () => {
 			const lookup = vi.fn(async (live?: readonly ProcessProvenanceCertificate[]) => {
 				await gate.wait(); return livePlan(live);
 			});
-			const pending = acquireActor(first, lookup);
+			const pending = first.actor(lookup);
 			await gate.entered;
 			if (winner === "whole") await second.ownership.commit(async () => undefined);
-			else await expect(acquireActor(second)).resolves.toMatchObject({ kind: "hit", plan: { certificate: second.certificate } });
+			else await expect(second.actor()).resolves.toMatchObject({ kind: "hit", plan: { certificate: second.certificate } });
 			gate.release();
 			await expect(pending).resolves.toMatchObject({ kind: "hit", plan: { certificate: first.certificate } });
 			expect(lookup.mock.calls).toEqual([[[second.certificate, first.certificate]], [[first.certificate]]]);
-			await expect(acquireActor(first)).resolves.toMatchObject({ kind: "miss" });
+			await expect(first.actor()).resolves.toMatchObject({ kind: "miss" });
 		}
 	});
 
-	it.each([false, true].flatMap(oneShot => [SCOPE, OTHER_SCOPE].map(scope => ({ oneShot, scope }))))(
-		"waits in $scope.turnID and preserves one-shot ownership ($oneShot)", async ({ oneShot, scope }) => {
+	it.each(["completed", "deadline", "producer failure", "disposal"].flatMap(phase =>
+		(phase === "completed" ? [false, true] : [false]).flatMap(oneShot => [SCOPE, OTHER_SCOPE].map(scope => ({ phase, oneShot, scope })))))(
+		"settles $phase in $scope.turnID and preserves one-shot ownership ($oneShot)", async ({ phase, oneShot, scope }) => {
 		const fixture = await producer(oneShot);
-		const parallelProducer = await fixture.registry.acquire({
+		const parallelProducer = phase === "completed" ? await fixture.registry.acquire({
 			key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: async () => undefined,
 			executablePath: fixture.certificate.prototype.executablePath,
-		});
-		if (parallelProducer.kind !== "work") throw new Error("independent producers must not wait for each other");
+		}) : undefined;
+		if (parallelProducer && parallelProducer.kind !== "work") throw new Error("independent producers must not wait for each other");
 		const waitGate = gated();
 		const waitForRunning = vi.fn(async (running: ProcessHandoff) => {
-			if (running === parallelProducer.work) {
+			if (running === parallelProducer?.work) {
 				fixture.registry.complete(fixture.key, running); // Failed same-scope work must yield to the repeatable candidate.
 				return "completed" as const;
 			}
 			await waitGate.wait();
-			return "completed" as const;
+			return phase === "deadline" ? "miss" as const : "completed" as const;
 		});
 
 		for (const foreign of [undefined, { sessionID: "other", turnID: "turn" }]) await expect(fixture.registry.acquire({
@@ -288,15 +293,17 @@ describe("ProcessHandoffRegistry", () => {
 
 		const lookup = vi.fn(livePlan);
 		const requestScope = { ...scope };
-		const actor = acquireActor(fixture, lookup, waitForRunning, requestScope);
+		const actor = fixture.actor(lookup, waitForRunning, requestScope);
 		await waitGate.entered;
-		expect(waitForRunning.mock.calls[0]![0]).toBe(scope === SCOPE ? fixture.work : parallelProducer.work);
+		expect(waitForRunning.mock.calls[0]![0]).toBe(scope === OTHER_SCOPE && parallelProducer ? parallelProducer.work : fixture.work);
 		requestScope.turnID = scope === SCOPE ? OTHER_SCOPE.turnID : SCOPE.turnID;
-		await fixture.publish();
+		if (phase === "completed") await fixture.publish();
+		else if (phase === "producer failure") fixture.registry.complete(fixture.key, fixture.work);
+		else if (phase === "disposal") fixture.registry.dispose();
 		waitGate.release();
-		const transferable = !oneShot || scope === SCOPE;
-		await expect(actor).resolves.toMatchObject({ kind: transferable ? "hit" : "miss", joined: true });
-		expect(lookup.mock.calls).toEqual([[undefined, new Set()], ...(scope === OTHER_SCOPE ? [[undefined, new Set()]] : []),
+		const transferable = phase === "completed" && (!oneShot || scope === SCOPE);
+		await expect(actor).resolves.toMatchObject({ kind: transferable ? "hit" : "miss", joined: phase !== "deadline" });
+		if (phase === "completed") expect(lookup.mock.calls).toEqual([[undefined, new Set()], ...(scope === OTHER_SCOPE ? [[undefined, new Set()]] : []),
 			transferable ? [[fixture.certificate]] : [undefined, new Set()]]);
 		const whole = fixture.ownership.commit(async () => "whole");
 		if (oneShot && transferable) await expect(whole).rejects.toMatchObject({ disposition: "recoverable" });
@@ -320,30 +327,13 @@ describe("ProcessHandoffRegistry", () => {
 		}
 		const stale = await producer(), valid = await producer(false, stale.registry, 1);
 		stale.registry.observeInputs(stale.key, stale.work, async () => true);
-		await expect(acquireActor(stale, undefined, async running => {
+		await expect(stale.actor(undefined, async running => {
 			if (await running.inputsChanged?.()) return "rejected";
 			await valid.publish(); return "completed";
 		})).resolves.toMatchObject({ kind: "hit", producer: valid.work, joined: true });
 		await expect(stale.work.inputsChanged!()).resolves.toBe(true);
 		await expect(stale.ownership.commit(async () => "still owned")).resolves.toBe("still owned");
 		stale.registry.dispose();
-	});
-
-	it.each(["deadline", "producer failure", "disposal"].flatMap(phase => [SCOPE, OTHER_SCOPE].map(scope => ({ phase, scope }))))(
-		"returns a miss after $phase while waiting in $scope.turnID", async ({ phase, scope }) => {
-		const fixture = await producer();
-		const deadline = gated();
-		const actor = acquireActor(fixture, undefined, async () => {
-			await deadline.wait();
-			return phase === "deadline" ? "miss" : "completed";
-		}, scope);
-		await deadline.entered;
-
-		if (phase === "producer failure") fixture.registry.complete(fixture.key, fixture.work);
-		else if (phase === "disposal") fixture.registry.dispose();
-		deadline.release();
-		await expect(actor).resolves.toEqual({ kind: "miss", joined: phase !== "deadline" });
-		fixture.registry.dispose();
 	});
 });
 
@@ -360,12 +350,10 @@ async function producer(oneShot = false, registry = new ProcessHandoffRegistry<u
 	});
 	if (acquired.kind !== "work") throw new Error("expected process work");
 	return { certificate, key, registry, ownership, work: acquired.work,
-		publish: (persist = async () => false) => registry.publish(key, acquired.work, certificate, persist) };
-}
-
-function acquireActor(fixture: Awaited<ReturnType<typeof producer>>, lookup = livePlan,
-	waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss" | "rejected"> = running => running.completion.then(() => "completed"), scope = SCOPE) {
-	return fixture.registry.acquire({ key: fixture.key, scope, role: "actor", lookup, waitForRunning });
+		publish: (persist = async () => false) => registry.publish(key, acquired.work, certificate, persist),
+		actor: (lookup = livePlan, waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss" | "rejected"> =
+			running => running.completion.then(() => "completed"), scope = SCOPE) => registry.acquire({ key, scope, role: "actor", lookup, waitForRunning }),
+	};
 }
 
 function processCertificate(oneShot: boolean, code: number) {
