@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
 			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
 			await host.finishTurn("seed");
 			expect(seedFallback).toHaveBeenCalledOnce(); // The whole Bash metadata proof remains rejected; the child can still be adopted.
-			expect(fixture.backend.actorMetrics().hits).toBe(native ? 0 : 1);
+			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(native ? 0 : 1);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);

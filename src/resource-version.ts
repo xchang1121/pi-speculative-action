@@ -231,8 +231,17 @@ export class ResourceVersionManager {
 
 	/** Undefined dependencies grant only bounded on-demand captures; observation of host tools stays eager. */
 	async capture(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
-		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
+		return this.captureToken(dependencies, retainBytes);
+	}
+
+	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
+	observeChanges(): Promise<ResourceVersionToken> {
+		return this.captureToken([]);
+	}
+
+	private async captureToken(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
+		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
 		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>();
 		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;

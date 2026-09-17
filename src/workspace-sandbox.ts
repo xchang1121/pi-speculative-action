@@ -1255,16 +1255,20 @@ async function acquireSandboxBaseline(
 			// Quiet notifications reuse preparation; fresh allocations check exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
-			// Warm-up can reject an old baseline before hashing; actual forks keep the checks parallel.
-			const indexed = sandboxIndexChanges(repository);
-			const current = warmup
-				? indexed.then((paths) => paths.length ? { expired: true } : repository.versions.validate(baseline.version))
-				: repository.versions.validate(baseline.version);
-			const [version, paths] = await Promise.all([current, indexed]);
-			if (!version.expired && !paths.length) return baseline;
+			if (warmup) {
+				if (!(await sandboxIndexChanges(repository)).length) return baseline;
+			} else if (baseline.version.observations.size) {
+				const [version, paths] = await Promise.all([
+					repository.versions.validate(baseline.version), sandboxIndexChanges(repository),
+				]);
+				if (!version.expired && !paths.length) return baseline;
+			}
 		}
 		for (let attempt = 0; attempt < 3; attempt++) {
-			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
+			// Preparation owns immutable bytes, not source freshness. Actual allocations capture exact
+			// evidence; borrowed process preparations validate their observed inputs and effects at adoption.
+			const version = warmup ? await repository.versions.observeChanges()
+				: await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			try {
 				// Events and Git stat data can both miss changes. A changed baseline owns a fresh index.
 				await repository.index(["read-tree", "--empty"]);
@@ -1274,7 +1278,9 @@ async function acquireSandboxBaseline(
 					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
 					{ environment: SANDBOX_AUTHOR_ENVIRONMENT },
 				)).toString("utf8").trim();
-				if ((await repository.versions.validate(version)).expired) continue;
+				if (!warmup && (await repository.versions.validate(version)).expired) continue;
+				// An ABA during staging can restore captured source bytes after Git copied different bytes.
+				if (!warmup && (await sandboxIndexChanges(repository)).length) continue;
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				repository.baseline = { commit, tree, version };
 				baseline?.version.release();
