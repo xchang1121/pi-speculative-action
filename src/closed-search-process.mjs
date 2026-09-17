@@ -10,12 +10,14 @@ export class ClosedSearchProcessPool {
 	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		signal?.throwIfAborted();
-		const worker = this.#idle.get(role) ?? launchClosedSearchWorker(), controller = new AbortController();
+		// Actors may borrow idle producer capacity; producers leave reserved Actor capacity available.
+		const idleRole = role === "actor" && !this.#idle.has(role) && this.#idle.has("producer") ? "producer" : role;
+		const worker = this.#idle.get(idleRole) ?? launchClosedSearchWorker(), controller = new AbortController();
 		const executionSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-		this.#idle.delete(role);
+		this.#idle.delete(idleRole);
 		if (!this.#workers.has(worker)) void worker.closure.then(() => {
 			if (!this.#workers.get(worker)?.execution) this.#workers.delete(worker);
-			if (this.#idle.get(role) === worker) this.#idle.delete(role);
+			if (this.#idle.get(idleRole) === worker) this.#idle.delete(idleRole);
 		});
 		const execution = Promise.resolve().then(() => { executionSignal.throwIfAborted(); return operation(worker, executionSignal); });
 		const lease = { role, execution, controller };
@@ -23,10 +25,10 @@ export class ClosedSearchProcessPool {
 		try { const output = await execution; executionSignal.throwIfAborted(); return output; }
 		finally {
 			lease.execution = undefined;
-			if (this.#retirement || executionSignal.aborted || worker.closed() || this.#idle.has(role)) {
+			if (this.#retirement || executionSignal.aborted || worker.closed() || this.#idle.has(idleRole)) {
 				await worker.dispose(); this.#workers.delete(worker);
 			}
-			else this.#idle.set(role, worker);
+			else this.#idle.set(idleRole, worker);
 		}
 	}
 	dispose() {
