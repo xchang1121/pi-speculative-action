@@ -159,10 +159,8 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 
 interface WorkspaceSandboxState {
 	readonly repositories: Map<string, Promise<PooledGitRepository>>;
-	readonly pendingCommits: Set<Promise<unknown>>;
+	readonly lifetime: RuntimeLifecycleLane;
 	readonly overlayfsCapabilities: LinuxOverlayfsCapabilityRegistry;
-	cleanupTail: Promise<void>;
-	disposed: boolean;
 }
 
 interface PooledGitRepository {
@@ -307,13 +305,10 @@ type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorks
 
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
-	private disposal?: Promise<void>;
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
-		pendingCommits: new Set(),
+		lifetime: new RuntimeLifecycleLane(),
 		overlayfsCapabilities: new LinuxOverlayfsCapabilityRegistry(),
-		cleanupTail: Promise.resolve(),
-		disposed: false,
 	};
 
 	async fingerprint(options: WorkspaceSandboxOptions = {}, sourceRoot?: string): Promise<string> {
@@ -363,11 +358,11 @@ export class WorkspaceSandboxService {
 	}
 
 	dispose(): Promise<void> {
-		if (this.disposal) return this.disposal;
-		this.state.disposed = true;
-		return this.disposal = Promise.allSettled([...this.state.pendingCommits])
-			.then(() => closeWorkspaceSandboxPoolsFor(this.state))
-			.finally(() => this.state.overlayfsCapabilities.dispose());
+		return this.state.lifetime.close(async () => {
+			await this.state.lifetime.drain();
+			try { await closeWorkspaceSandboxPoolsNow(this.state); }
+			finally { this.state.overlayfsCapabilities.dispose(); }
+		});
 	}
 }
 
@@ -403,7 +398,7 @@ async function resolveWorkspaceDriver(
 		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) {
 			return cached.resolved;
 		}
-		const treeEntries = await countGitBaselineEntries(repository, commit);
+		const treeEntries = parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", commit])).length;
 		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES
 			? overlay
 			: { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
@@ -625,9 +620,7 @@ async function commitSandboxExecution(
 			};
 		},
 	);
-	const tracked = commit.finally(() => state.pendingCommits.delete(tracked));
-	state.pendingCommits.add(tracked);
-	return tracked;
+	return state.lifetime.track(commit);
 }
 
 async function forkSandboxWorkspaceFor(
@@ -955,7 +948,6 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() };
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
 	let clock: { readonly handle: FileHandle; readonly identity: Stats } | undefined;
-	let disposed = false;
 
 	if (!poisonReason) {
 		try {
@@ -973,7 +965,6 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 
 	const begin = (): Promise<WorkspaceTransactionCapture> =>
 		withWorkspaceLock(lock, async () => {
-			if (disposed) throw new Error("workspace transaction driver is disposed");
 			const contaminated = active.size > 0;
 			let before: WorkspaceStructureSnapshot | undefined;
 			if (contaminated) {
@@ -1107,8 +1098,6 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 
 	const dispose = (): Promise<void> =>
 		withWorkspaceLock(lock, async () => {
-			if (disposed) return;
-			disposed = true;
 			for (const capture of active) capture.contaminated = true;
 			active.clear();
 			const closingClock = clock;
@@ -1284,11 +1273,6 @@ async function acquireSandboxBaseline(
 	});
 }
 
-async function countGitBaselineEntries(repository: PooledGitRepository, commit: string): Promise<number> {
-	const tree = await repository.git(["ls-tree", "-r", "-z", "--name-only", commit]);
-	return parseNullList(tree).length;
-}
-
 async function ensurePreparedSandbox(repository: PooledGitRepository, commit: string, signal?: AbortSignal): Promise<void> {
 	const existing = repository.prepared;
 	if (existing?.commit === commit) {
@@ -1372,7 +1356,8 @@ async function acquireOverlayBaseline(
 		}
 		let pending = repository.overlayBaselines.get(commit);
 		if (!pending) {
-			pending = createOverlayBaseline(repository, commit);
+			pending = attachSandboxWorkspace(repository, commit, path.join(repository.parent, `overlay-baseline-${commit}`))
+				.then(workspace => ({ ...workspace, active: 0 }));
 			repository.overlayBaselines.set(commit, pending);
 			void pending.catch(() => {
 				if (repository.overlayBaselines.get(commit) === pending) repository.overlayBaselines.delete(commit);
@@ -1382,15 +1367,6 @@ async function acquireOverlayBaseline(
 		baseline.active++;
 		return baseline;
 	});
-}
-
-async function createOverlayBaseline(
-	repository: PooledGitRepository,
-	commit: string,
-): Promise<SharedOverlayBaseline> {
-	const privateRoot = path.join(repository.parent, `overlay-baseline-${commit}`);
-	const prepared = await attachSandboxWorkspace(repository, commit, privateRoot);
-	return { ...prepared, active: 0 };
 }
 
 function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<WorkspaceStructureSnapshot> {
@@ -1420,18 +1396,10 @@ async function sandboxIndexChanges(repository: PooledGitRepository): Promise<str
 		.map((file) => path.resolve(repository.sourceRoot, file));
 }
 
-async function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise<T>): Promise<T> {
-	const previous = owner.lock;
-	let release: () => void = () => {};
-	owner.lock = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	await previous;
-	try {
-		return await run();
-	} finally {
-		release();
-	}
+function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise<T>): Promise<T> {
+	const pending = owner.lock.then(run);
+	owner.lock = pending.then(() => undefined, () => undefined);
+	return pending;
 }
 
 function releaseSandboxRepository(repository: PooledGitRepository): void {
@@ -1442,11 +1410,12 @@ function releaseSandboxRepository(repository: PooledGitRepository): void {
 	}
 	if (repository.quarantined || repository.disposal || repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
-		if (repository.active > 0) return;
+		// A sealed service owns the final pool sweep; keep its registration until that sweep.
+		if (repository.active > 0 || repository.owner.lifetime.sealed) return;
 		const { owner } = repository, key = `${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
 		if (owner.repositories.get(key) === repository.registration) owner.repositories.delete(key);
 		// Detach this generation now, but keep its asynchronous retirement inside the service lifecycle.
-		void queueWorkspaceCleanup(owner, () => closeSandboxRepository(repository)).catch(() => undefined);
+		void owner.lifetime.run(() => closeSandboxRepository(repository)).catch(() => undefined);
 	}, SANDBOX_REPOSITORY_IDLE_MS);
 	repository.idleTimer.unref?.();
 }
@@ -1473,13 +1442,7 @@ function closeWorkspaceSandboxPoolsFor(
 	state: WorkspaceSandboxState,
 	roots?: readonly string[],
 ): Promise<void> {
-	return queueWorkspaceCleanup(state, () => closeWorkspaceSandboxPoolsNow(state, roots));
-}
-
-function queueWorkspaceCleanup(state: WorkspaceSandboxState, close: () => Promise<void>): Promise<void> {
-	const pending = state.cleanupTail.then(close, close);
-	state.cleanupTail = pending.catch(() => undefined);
-	return pending;
+	return state.lifetime.run(() => closeWorkspaceSandboxPoolsNow(state, roots));
 }
 
 async function closeWorkspaceSandboxPoolsNow(
@@ -1503,7 +1466,7 @@ async function closeWorkspaceSandboxPoolsNow(
 
 function closeSandboxRepository(repository: PooledGitRepository): Promise<void> {
 	return repository.disposal ??= (async () => {
-		await waitForSandboxRepositoryIdle(repository);
+		if (repository.active > 0) await new Promise<void>(resolve => repository.idleWaiters.add(resolve));
 		if (repository.quarantined) return;
 		if (repository.idleTimer) clearTimeout(repository.idleTimer);
 		const prepared = await takePreparedSandbox(repository);
@@ -1513,14 +1476,6 @@ function closeSandboxRepository(repository: PooledGitRepository): Promise<void> 
 		repository.versions.close();
 		await rm(repository.parent, { recursive: true, force: true });
 	})();
-}
-
-async function waitForSandboxRepositoryIdle(repository: PooledGitRepository): Promise<void> {
-	if (repository.active === 0) return;
-	await new Promise<void>((resolve) => {
-		repository.idleWaiters.add(resolve);
-		if (repository.active === 0 && repository.idleWaiters.delete(resolve)) resolve();
-	});
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -1545,7 +1500,7 @@ function isSnapshotExcluded(relative: string): boolean {
 }
 
 function assertWorkspaceSandboxOpen(state: WorkspaceSandboxState): void {
-	if (state.disposed) throw new Error("Workspace sandbox service is disposed");
+	if (state.lifetime.sealed) throw new Error("Workspace sandbox service is disposed");
 }
 
 async function withPrivateSandboxWorkspace<T>(

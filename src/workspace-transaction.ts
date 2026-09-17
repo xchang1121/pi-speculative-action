@@ -74,24 +74,16 @@ export function deferredWorkspaceTransactionDriver(
 	create: () => Promise<WorkspaceTransactionDriver>,
 ): WorkspaceTransactionDriver {
 	let driver: Promise<WorkspaceTransactionDriver> | undefined;
-	let disposed = false;
 	let disposal: Promise<void> | undefined;
 	return {
 		begin: async () => {
-			if (disposed) throw new Error("workspace transaction driver is disposed");
-			const resolved = await (driver ??= create());
-			if (disposed) {
-				await resolved.dispose();
-				throw new Error("workspace transaction driver is disposed");
+			if (!disposal) {
+				const resolved = await (driver ??= Promise.resolve().then(create));
+				if (!disposal) return resolved.begin();
+				await disposal;
 			}
-			return resolved.begin();
+			throw new Error("workspace transaction driver is disposed");
 		},
-		dispose: () => {
-			disposed = true;
-			disposal ??= (async () => {
-				if (driver) await (await driver).dispose();
-			})();
-			return disposal;
-		},
+		dispose: () => disposal ??= driver ? driver.then(resolved => resolved.dispose()) : Promise.resolve(),
 	};
 }
