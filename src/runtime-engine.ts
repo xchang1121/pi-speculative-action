@@ -223,7 +223,7 @@ async function projectOutput<Output>(
 ): Promise<ProjectionResult<Output>> {
 	if (match.kind === "exact") return { ok: true, output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution, validate: retained.validate };
+	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution, inputs: retained.inputs, validate: retained.validate };
 	const reconstruct = candidateBranch(candidate)?.reconstruct;
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
@@ -239,11 +239,11 @@ async function projectOutput<Output>(
 			keyMatch: match,
 		})) : undefined;
 		const rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
-		if (rebuilt) projected = cloneSharedData(rebuilt.output);
+		if (rebuilt) projected = rebuilt.output;
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
-		return { ok: true, output: projected, execution, validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
+		return { ok: true, output: projected, execution, inputs: !!rebuilt, validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
@@ -368,7 +368,7 @@ function retainResultView<Output>(
 			views.delete(key); candidate.estimatedBytes -= previous.bytes;
 		}
 		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-			views.set(action.key, { output: owned, bytes, execution: projection.execution, validate }); candidate.estimatedBytes += bytes;
+			views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, validate }); candidate.estimatedBytes += bytes;
 			return true;
 		}
 	} catch { /* Optional retention cannot alter an already committed result. */ }
@@ -444,7 +444,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	expectedDurationMs: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly validate?: WorldBranch<Output>["validate"] }>;
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly validate?: WorldBranch<Output>["validate"] }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	acceptOperationScope?: (scope: ExecutionScope) => boolean;
@@ -518,7 +518,7 @@ interface ClaimedPrediction {
 }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -1772,17 +1772,19 @@ export function makeSpeculativeActionRuntime<
 					candidateStore.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 					if (retained) trimResults(state.session, state.settings);
 				}
+				// Re-evaluating inputs adopts this query's computation, not the source tool's unused output work.
+				const toolExecution = projection.inputs ? projection.execution! : execution.toolExecution;
 				actorAction.select({
 					candidate,
 					match: choice.match,
 					output,
 					timing: {
-						executionAheadMs: Math.min(execution.executionMs, Math.max(0, actorArrivedAt - execution.toolExecution.startedAt)),
+						executionAheadMs: Math.max(0, Math.min(toolExecution.completedAt, actorArrivedAt) - toolExecution.startedAt),
 						attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
 						hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
 						...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
 					},
-					toolExecution: execution.toolExecution,
+					toolExecution,
 					...(projection.execution ? { projection: projection.execution } : {}),
 				});
 				break;
