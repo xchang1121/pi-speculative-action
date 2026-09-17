@@ -91,59 +91,35 @@ describe("ActorAction", () => {
 	});
 });
 
-describe("PostSettlementQueue", () => {
-	it("preserves order, contains failures, and drains recursively enqueued work", async () => {
-		const order: number[] = [];
-		const failures = vi.fn(() => {
-			throw new Error("diagnostic failed");
-		});
-		const queue = new PostSettlementQueue(failures);
-		queue.enqueue(async () => {
-			order.push(1);
-			queue.enqueue(() => {
-				order.push(3);
-			});
-			throw new Error("observer failed");
-		});
-		queue.enqueue(() => {
-			order.push(2);
-		});
-
-		await queue.flush();
-		expect(order).toEqual([1, 2, 3]);
-		expect(failures).toHaveBeenCalledOnce();
-		await queue.close();
-		expect(queue.enqueue(() => {})).toBe(false);
-	});
-});
-
-describe("BoundedEventQueue", () => {
-	it("bounds stalled observers and drains reentrant delivery through failures and concurrent flushes", async () => {
+describe("ordered delivery", () => {
+	it.each(["settlement", "observer"])("drains %s delivery through failures, reentrancy and concurrent flushes", async kind => {
 		const { promise: blocked, resolve: release } = deferred();
 		const delivered: number[] = [];
-		const failures = vi.fn(() => { queue.enqueue(6); throw new Error("diagnostic failed"); });
-		const queue = new BoundedEventQueue<number>(4, async (event) => {
+		const failures = vi.fn(() => { enqueue(6); throw new Error("diagnostic failed"); });
+		const deliver = async (event: number) => {
 			delivered.push(event);
 			if (event === 1) await blocked;
 			if (event === 2) throw new Error("observer failed");
-			if (event === 3) queue.enqueue(7);
-		}, failures);
+			if (event === 3) enqueue(7);
+		};
+		const queue = kind === "settlement" ? new PostSettlementQueue(failures) : new BoundedEventQueue(4, deliver, failures);
+		const enqueue = (event: number) => queue instanceof PostSettlementQueue
+			? queue.enqueue(() => deliver(event)) : queue.enqueue(event);
 
-		expect(queue.enqueue(1)).toBe(true);
-		expect(queue.enqueue(2)).toBe(true);
-		expect(queue.enqueue(3)).toBe(true);
-		expect(queue.enqueue(4)).toBe(true);
-		expect(queue.enqueue(5)).toBe(false);
-		expect(queue.snapshot()).toMatchObject({ capacity: 4, pending: 4, dropped: 1 });
+		for (const event of [1, 2, 3, 4]) expect(enqueue(event)).toBe(true);
+		expect(delivered).toEqual(kind === "settlement" ? [] : [1]);
+		expect(enqueue(5)).toBe(kind === "settlement");
+		if (queue instanceof BoundedEventQueue) expect(queue.snapshot()).toMatchObject({ capacity: 4, pending: 4, dropped: 1 });
 
 		const flushing = [queue.flush(), queue.flush()];
 		release(); await Promise.all(flushing);
-		expect(delivered).toEqual([1, 2, 3, 4, 6, 7]);
+		const expected = [1, 2, 3, 4, ...(kind === "settlement" ? [5] : []), 6, 7];
+		expect(delivered).toEqual(expected);
 		expect(failures).toHaveBeenCalledOnce();
-		expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: 1, oldestPendingMs: 0 });
-		expect(queue.enqueue(8)).toBe(true); await queue.flush();
-		expect(delivered).toEqual([1, 2, 3, 4, 6, 7, 8]);
+		if (queue instanceof BoundedEventQueue) expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: 1, oldestPendingMs: 0 });
+		expect(enqueue(8)).toBe(true); await queue.flush();
+		expect(delivered).toEqual([...expected, 8]);
 		await queue.close();
-		expect(queue.enqueue(9)).toBe(false);
+		expect(enqueue(9)).toBe(false);
 	});
 });
