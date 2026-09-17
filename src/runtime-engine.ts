@@ -1875,7 +1875,7 @@ export function makeSpeculativeActionRuntime<
 			if (!actualKey) {
 				const failure = cause("matching", "action_not_keyable");
 				abandonActorPreview(state, preview, failure);
-				actorAction.deferToFallback([], undefined, failure);
+				actorAction.deferToFallback([], failure);
 				preemptForActor(state.session, state.settings);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				return Object.freeze(prepared);
@@ -1944,7 +1944,6 @@ export function makeSpeculativeActionRuntime<
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
 			const adoption = actorAction.deferToFallback(
 				matchingPredictions.map(({ opportunity }) => opportunity.identity),
-				executionBlockedAttemptLead(state.session, matchingPredictions, actorArrivedAt),
 			);
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 			const effect = semantics.effect(actualKey);
@@ -1960,21 +1959,6 @@ export function makeSpeculativeActionRuntime<
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
 			actorAction.deferToFallback();
 		}
-	};
-
-	const executionBlockedAttemptLead = (
-		session: Session,
-		matches: readonly ClaimedPrediction[],
-		actorArrivedAt: number,
-	): number | undefined => {
-		let earliestAttempt: number | undefined;
-		for (const { node } of matches) {
-			if (node.execution.status !== "execution_blocked") continue;
-			const startedAt = session.actionContexts.get(node.identity.id)?.attemptStartedAt;
-			if (startedAt === undefined || !Number.isFinite(startedAt)) continue;
-			earliestAttempt = earliestAttempt === undefined ? startedAt : Math.min(earliestAttempt, startedAt);
-		}
-		return earliestAttempt === undefined ? undefined : Math.max(0, actorArrivedAt - earliestAttempt);
 	};
 
 	const promoteAuthoritativeResult = async (

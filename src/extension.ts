@@ -256,7 +256,6 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`No-safe-route potential: ${metrics.executionBlockedActorActions} Actor actions; ${formatDuration(metrics.executionBlockedPotentialHiddenLatencyMs)} could be hidden; ${formatDuration(metrics.executionBlockedPotentialHitLatencyMs)} would remain; ${formatDuration(metrics.executionBlockedAttemptLeadMs)} attempt lead`,
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
@@ -1352,17 +1351,6 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				parts.push(
 					`${formatDuration(event.settlement.provider.durationMs)} Actor ${event.settlement.provider.origin} execution`,
 				);
-				const timing =
-					event.settlement.provider.origin === "fallback"
-						? event.settlement.provider.executionBlockedTiming
-						: undefined;
-				if (timing) {
-					parts.push(
-						`${formatDuration(timing.executionAheadMs)} potentially hidden`,
-						`${formatDuration(timing.hitLatencyMs)} would remain`,
-						`${formatDuration(timing.attemptLeadMs)} prediction lead`,
-					);
-				}
 			}
 			parts.push(compactEventText(event.actualAction));
 			break;

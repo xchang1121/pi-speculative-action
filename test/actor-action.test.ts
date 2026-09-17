@@ -72,19 +72,16 @@ describe("ActorAction", () => {
 		}
 	});
 
-	it("settles isolation-blocked benefit without moving a completed computation into later Actor work", () => {
-		for (const [attemptLeadMs, executionAheadMs, hitLatencyMs] of [[80, 80, 40], [200, 120, 0]]) {
-			const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
-			const action = new ActorAction({ identity, tool: "bash", actionKey,
-				fallback: cause("execution", "isolation_unavailable") });
-			expect(action.deferToFallback([], attemptLeadMs)?.status).toBe("rejected");
-			expect(action.settleActor(execution, false)).toMatchObject({ provider: { kind: "actor", durationMs: 120,
-				executionBlockedTiming: { attemptLeadMs, executionAheadMs, hitLatencyMs } } });
-			expect(action.settlement?.provider.toolExecution).toBe(execution);
-			timeline.recordActor(0, 100); timeline.recordActor(220, 500);
-			timeline.recordTool(action.settlement!.provider.toolExecution);
-			expect(timeline.measure(500)).toMatchObject({ serializedMs: 500, toolExecutionMs: 120, hiddenLatencyMs: 0 });
-		}
+	it("reports an isolation-blocked fallback without inventing completed computation", () => {
+		const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
+		const action = new ActorAction({ identity, tool: "bash", actionKey,
+			fallback: cause("execution", "isolation_unavailable") });
+		expect(action.deferToFallback()?.status).toBe("rejected");
+		expect(action.settleActor(execution, false)).toMatchObject({ provider: { kind: "actor", durationMs: 120 } });
+		expect(action.settlement?.provider.toolExecution).toBe(execution);
+		timeline.recordActor(0, 100); timeline.recordActor(220, 500);
+		timeline.recordTool(action.settlement!.provider.toolExecution);
+		expect(timeline.measure(500)).toMatchObject({ serializedMs: 500, toolExecutionMs: 120, hiddenLatencyMs: 0 });
 	});
 });
 

@@ -65,6 +65,8 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 返回与内部 `hitLatencyMs` 分开；running 接管还需区分接入、剩余执行与完成后交付。
 
+未执行的预测只报告阻塞和匹配事实，不推算潜在节省。模型套件保留真实工具调用计数及原始 Drafter 记录，不重复采集 `toolIntentMs`、`rawActorToolServiceMs`，也不再输出可从预测记录还原的 `drafterStopReasons`、`drafterToolCalls`、`drafterNoToolStopReasons`。
+
 正确性先于计时：核对完整输入输出、后续模型 payload、thinking、工具批次、预算、usage、逐步文件效果、最终回复、单次执行及零残留。Pattern 按各自实际批次顺序进入真实 Store，不随意重排以掩盖差异。保留较慢、失败和未命中样本，不将组件或构造时序推广为自然任务收益。
 
 模型报告的 `patchCandidate` 仅筛选已结束、补丁干净且文件有交集的运行；正确性仍需数据集的 `FAIL_TO_PASS`/`PASS_TO_PASS`。prompt 或回收抛错时，单次报告保留计时、usage 和各阶段的 `benchmarkErrors`，写出后以失败状态退出。套件保留本次 runner 失败前写出的报告和原始退出错误，停止后续任务；已有单次输出不会被覆盖，无法读取的 summary 不补造计时。套件按任务聚类汇总重复样本，失败不包装成性能收益。

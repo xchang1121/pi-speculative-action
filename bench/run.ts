@@ -45,11 +45,6 @@ interface DatasetRow {
 
 type PreparedTask = Readonly<Awaited<ReturnType<typeof prepareTask>>>;
 
-interface ToolCounters {
-	readonly executions: Record<string, number>;
-	readonly serviceMs: Record<string, number>;
-}
-
 type BenchmarkOptions = Readonly<typeof options>;
 
 interface CommandResult {
@@ -177,7 +172,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
 	const taskStartedAt = performance.now();
 	const events: SpeculativeActionEvent<string>[] = [];
-	const counters: ToolCounters = { executions: {}, serviceMs: {} };
+	const rawActorToolExecutions: Record<string, number> = {};
 	const shellEnvironment = benchmarkShellEnvironment();
 	const tools = [
 		createReadTool(task.workspace),
@@ -194,9 +189,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const workspaceSandbox = new WorkspaceSandboxService(), sandbox = workspaceSandbox.createExecutionWorld();
 	const resolveInvocation = (tool: string, args: unknown) =>
 		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
-	const drafterStopReasons: Record<string, number> = {};
-	const drafterToolCalls: Record<string, number> = {};
-	const drafterNoToolStopReasons: Record<string, number> = {};
 	const drafterPredictionTrace: Array<{
 		readonly requestSessionID?: string;
 		readonly stopReason: string;
@@ -225,7 +217,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		getDraftOptions: ({ signal }) => ({ signal }),
 		complete: async (draftModel, context, streamOptions) => {
 			const message = await streamSimple(draftModel, context, streamOptions).result();
-			increment(drafterStopReasons, message.stopReason);
 			const calls = message.content.filter((item) => item.type === "toolCall");
 			drafterPredictionTrace.push({
 				...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
@@ -233,8 +224,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				usage: message.usage,
 				calls: calls.map((call) => ({ tool: call.name, input: call.arguments })),
 			});
-			for (const call of calls) increment(drafterToolCalls, call.name);
-			if (!calls.length) increment(drafterNoToolStopReasons, message.stopReason);
 			return message;
 		},
 		preflight: () => true,
@@ -254,7 +243,6 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
 	const actorStream = new ActorStreamPreviewTracker();
-	const toolIntentMs: number[] = [];
 	const actorActionsByTool: Record<string, number> = {};
 	const actorTools = tools.map(
 		(base): AgentTool => ({
@@ -262,24 +250,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			execute: async (callID, args, signal, onUpdate) => {
 				const turnID = currentTurnID;
 				if (!turnID) throw new Error("Actor tool executed outside an active turn");
-				const intentStartedAt = performance.now();
 				increment(actorActionsByTool, base.name);
-				try {
-					return await host.execute(
-						{ turnID, id: callID, tool: base.name, args, tools }, signal,
-						async (operation) => {
-							const startedAt = performance.now();
-							increment(counters.executions, base.name);
-							try {
-								return await base.execute(callID, operation.input as never, operation.signal, onUpdate as never);
-							} finally {
-								counters.serviceMs[base.name] = (counters.serviceMs[base.name] ?? 0) + performance.now() - startedAt;
-							}
-						},
-					);
-				} finally {
-					toolIntentMs.push(performance.now() - intentStartedAt);
-				}
+				return host.execute(
+					{ turnID, id: callID, tool: base.name, args, tools }, signal,
+					(operation) => {
+						increment(rawActorToolExecutions, base.name);
+						return base.execute(callID, operation.input as never, operation.signal, onUpdate as never);
+					},
+				);
 			},
 		}),
 	);
@@ -365,6 +343,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 	}
 	const taskCompletedAt = performance.now();
+	const actorActions = Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);
 	const summary = summarizeSpeculativeTrace(events);
 	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
@@ -419,10 +398,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			nonToolMs,
 			authoritativeToolMs: summary.toolExecutionMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
-			actorActions: toolIntentMs.length,
+			actorActions,
 			actorActionsByTool,
-			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : toolIntentMs.length,
-			hitRate: toolIntentMs.length ? summary.speculativeHits / toolIntentMs.length : 0,
+			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,
+			hitRate: actorActions ? summary.speculativeHits / actorActions : 0,
 			actorCost: actorUsage.cost,
 			drafterCost: drafterUsage.cost,
 			actorTokens: actorUsage.tokens,
@@ -435,17 +414,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterOutputTokens: drafterUsage.outputTokens,
 			drafterCacheReadTokens: drafterUsage.cacheReadTokens,
 			drafterCacheWriteTokens: drafterUsage.cacheWriteTokens,
-			drafterStopReasons,
-			drafterToolCalls,
-			drafterNoToolStopReasons,
 			turns: turnSequence,
 			turnLimitReached,
 			timedOut,
 			agentError: agent.state.errorMessage,
 			benchmarkErrors,
-			toolIntentMs,
-			rawActorToolExecutions: counters.executions,
-			rawActorToolServiceMs: counters.serviceMs,
+			rawActorToolExecutions,
 			changedFiles,
 			goldFiles,
 			testPatchFiles,
