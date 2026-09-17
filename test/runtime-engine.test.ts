@@ -1126,7 +1126,7 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each((["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
-		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup"] as const)
+		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup", "input-scope"] as const)
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
@@ -1135,12 +1135,14 @@ describe("structural speculative runtime", () => {
 		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
-		const succeeds = ["valid", "running-covered", "output-valid", "output-preferred", "input-lookup"].includes(scenario);
+		const succeeds = ["valid", "running-covered", "output-valid", "output-preferred", "input-lookup", "input-scope"].includes(scenario);
+		const inputLookup = scenario.startsWith("input-"), scoped = scenario === "input-scope";
 		let changed = false;
-		const validate = vi.fn(async (): Promise<ResourceValidation> => changed
+		const proof = async (): Promise<ResourceValidation> => changed
 			? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }
-			: validResource());
-		const actor = call("turn", { path: "README.md", offset: ["running-outside", "input-lookup"].includes(scenario) ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
+			: validResource();
+		const validate = vi.fn(proof), queryValidate = vi.fn(proof);
+		const actor = call("turn", { path: "README.md", offset: scenario === "running-outside" || inputLookup ? 200 : 10, limit: scenario === "running-unproven" ? 200 : 10 });
 		const evidence = { complete: scenario !== "output-uncovered", view: { text: "narrow" } };
 		const projection = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
 			canShareInFlight: scenario === "running-throws" ? () => { throw new Error("proof unavailable"); } : READ_RANGE_ACTION_KEY_PROJECTOR.canShareInFlight,
@@ -1156,7 +1158,7 @@ describe("structural speculative runtime", () => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
 			await gate.wait();
 			if (scenario === "rejected") throw new Error("evaluation failed");
-			return scenario === "uncovered" ? undefined : "narrow";
+			return scenario === "uncovered" ? undefined : { output: "narrow", ...(scoped ? { validate: queryValidate } : {}) };
 		});
 		const { runtime, events, ready: candidateReady } = harness({
 			source: planSource({
@@ -1166,7 +1168,7 @@ describe("structural speculative runtime", () => {
 			execute: async () => { started.arrive(); if (running) await completion.promise;
 				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
-				...world("wide", { validate }),
+				...world("wide", { validate: scoped ? async () => { throw new Error("unrelated input is stale"); } : validate }),
 				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
@@ -1181,7 +1183,7 @@ describe("structural speculative runtime", () => {
 			if (!running && !outputOnly && scenario !== "legacy-miss") await gate.entered;
 			else await preparation;
 			expect(validate).not.toHaveBeenCalled(); expect(commit).not.toHaveBeenCalled();
-			if (["valid", "input-lookup"].includes(scenario)) { gate.release(); await preparation; }
+			if (scenario === "valid" || inputLookup) { gate.release(); await preparation; }
 		}
 		const consumed = runtime.prepareActorCall(actor, controller.signal).then(prepared => prepared?.output);
 		try {
@@ -1194,16 +1196,16 @@ describe("structural speculative runtime", () => {
 				gate.release();
 			}
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
-			expect(commit).toHaveBeenCalledTimes(succeeds ? 1 : 0);
-			expect(validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
+			expect(commit).toHaveBeenCalledTimes(succeeds && !scoped ? 1 : 0);
+			expect(scoped ? queryValidate : validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
 			if (["rejected", "changed", "uncovered", "output-rejected"].includes(scenario)) expect(adoption).toHaveBeenCalledOnce();
-			if (scenario === "input-lookup") {
+			if (inputLookup) {
 				expect((await runtime.prepareActorCall({ ...actor, id: "same-query" }))?.output).toBe("narrow");
 				expect(reconstruct).toHaveBeenCalledOnce();
 				changed = true;
 				expect((await runtime.prepareActorCall({ ...actor, id: "stale-query" }))?.output).toBeUndefined();
 				expect(reconstruct).toHaveBeenCalledOnce();
-				expect(validate).toHaveBeenCalledTimes(3);
+				expect(scoped ? queryValidate : validate).toHaveBeenCalledTimes(3);
 			}
 			if (scenario === "output-preferred") expect(reconstruct).not.toHaveBeenCalled();
 			if (scenario === "output-valid") {
@@ -1216,8 +1218,8 @@ describe("structural speculative runtime", () => {
 				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
 				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
 					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
-						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, scenario === "input-lookup" ? "resource.inputs" : "read.range",
-						...(preview || ["input-lookup", "output-valid"].includes(scenario) ? ["retained"] : [])]) });
+						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, inputLookup ? "resource.inputs" : "read.range",
+						...(preview || inputLookup || scenario === "output-valid" ? ["retained"] : [])]) });
 			}
 		} finally {
 			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
@@ -1225,7 +1227,7 @@ describe("structural speculative runtime", () => {
 			admission.mockRestore(); adoption.mockRestore();
 		}
 		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? 2 : 0);
-		if (scenario === "input-lookup") {
+		if (inputLookup) {
 			expect(events.filter((event) => event.type === "actor_action").at(-1)?.settlement.matchedPredictions).toEqual([]);
 			expect(events.filter((event) => event.type === "prediction").at(-1)?.settlement)
 				.toMatchObject({ observation: "observed", match: { matched: false } });
@@ -1268,12 +1270,13 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
-	it.each([[2, 4096, 2], [1, 4096, 3], [2, 128, 3]])("bounds sealed query results by %i entries and %i bytes", async (entries, bytes, evaluations) => {
+	it.each([[2, 4096, 0, 2], [1, 4096, 0, 3], [2, 128, 0, 3], [2, 4096, 4096, 2]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes", async (entries, bytes, proofBytes, evaluations) => {
 		const disposed = vi.fn();
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
-		const learned = entries === 2 && bytes === 4096;
-		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return String((args as { offset: number }).offset); });
+		const learned = entries === 2 && bytes === 4096 && !proofBytes, unretained = bytes === 128;
+		const queryValidate = vi.fn(async () => { now += 3; return validResource(); });
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return { output: String((args as { offset: number }).offset), capturedBytes: proofBytes, ...(proofBytes ? { validate: queryValidate } : {}) }; });
 		const { runtime, events, executions: executionCount, ready } = harness({
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "first"
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
@@ -1301,18 +1304,19 @@ describe("structural speculative runtime", () => {
 				}
 			}
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(executionCount()).toBe(1);
+			expect(queryValidate).not.toHaveBeenCalled(); // Oversized proof falls back to the full proof without repeating the query.
 			await runtime.finishTurn({ ...call("second"), terminal: true });
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
 				toolExecutionMs: 10 + evaluations * 20, authoritativeToolCount: 1 + evaluations,
-				hiddenLatencyMs: learned || bytes === 128 ? 10 : 50,
+				hiddenLatencyMs: learned || unretained ? 10 : proofBytes ? 30 : 50,
 			});
 			now += 10;
 			await runtime.startTurn(start("next-task"));
 			expect((await runtime.prepareActorCall(call("next-task", { path: "input", offset: 2, limit: 1 })))?.output).toBe("2");
 			await runtime.finishTurn({ ...call("next-task"), terminal: true });
-			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (bytes === 128 ? 1 : 0));
+			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
-				toolExecutionMs: bytes === 128 ? 20 : 0, authoritativeToolCount: bytes === 128 ? 1 : 0, hiddenLatencyMs: 0,
+				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0,
 			});
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
@@ -1334,7 +1338,7 @@ describe("structural speculative runtime", () => {
 				reconstruct: async ({ args }) => {
 					const offset = (args as { offset: number }).offset;
 					if (offset === 10) { await gate.wait(); }
-					return String(offset);
+					return { output: String(offset) };
 				},
 			})),
 		});

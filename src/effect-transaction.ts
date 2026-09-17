@@ -182,6 +182,7 @@ export class EffectTransactionCoordinator<Output> {
 
 function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>): EffectTransaction<Output> {
 	const shared = attempt.descriptor.route.reuse === "shared_result";
+	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
 		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, capturedBytes: branch.capturedBytes,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
@@ -189,12 +190,12 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
 		operations: branch.operations && Object.freeze([...branch.operations]),
 		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
-		validate: ((shared && branch.validateAndCommit) || branch.validate)?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
+		validate: validateAndCommit ?? branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
 		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
 	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
-	const reconstructions = new Set<Promise<Output | undefined>>();
+	const reconstructions = new Set<ReturnType<NonNullable<WorldBranch<Output>["reconstruct"]>>>();
 	const abort = (): Promise<void> => {
 		if (cleanupPromise) return cleanupPromise;
 		if (!["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
@@ -208,6 +209,26 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		})();
 		return cleanupPromise;
 	};
+	const validate = async (queryProof?: WorldBranch<Output>["validate"]): Promise<ResourceValidation> => {
+		// A reserved commit owns its proof window; a later validation must not reset that state.
+		if (!cleanupPromise && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
+		if (cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
+			return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
+		}
+		// Each request owns a fresh proof after its predecessors, never their earlier observation.
+		const pending = Promise.resolve(validationPromise).then(async () => {
+			if (!queryProof && ["sealed", "validated"].includes(attempt.stateValue)) attempt.stateValue = "validating";
+			const result = await validateWorldBranch(queryProof ? { validate: queryProof } : sealed, attempt.descriptor.route.reuse);
+			// A query borrows the same lifetime and validation lane, but cannot authorize the source output.
+			if (!queryProof) {
+				validation = result;
+				if (attempt.stateValue === "validating") attempt.stateValue = result.status === "valid" ? "validated" : "sealed";
+			}
+			return result;
+		});
+		validationPromise = pending;
+		try { return await pending; } finally { if (validationPromise === pending) validationPromise = undefined; }
+	};
 	return Object.freeze<EffectTransaction<Output>>({
 		...sealed, transactionID: attempt.id,
 		get state() { return attempt.stateValue; },
@@ -218,28 +239,17 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
 			// Borrowing sealed inputs grants no commit authority; freshness is checked after evaluation.
 			if (cleanupPromise || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;
-			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then(cloneSharedData);
+			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then((result) => {
+				if (!result) return undefined;
+				// An atomic validation/commit callback retains its complete proof and effect ownership.
+				const proof = !validateAndCommit && result.validate?.bind(result);
+				return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes,
+					...(proof ? { validate: () => validate(proof) } : {}) });
+			});
 			reconstructions.add(task);
 			try { return await task; } finally { reconstructions.delete(task); }
 		} : undefined,
-		validate: async () => {
-			// A reserved commit owns its proof window; a later validation must not reset that state.
-			if (!cleanupPromise && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
-			if (cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
-				return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
-			}
-			// Each request owns a fresh proof after its predecessors, never their earlier observation.
-			const pending = Promise.resolve(validationPromise).then(async () => {
-				if (["sealed", "validated"].includes(attempt.stateValue)) attempt.stateValue = "validating";
-				validation = await validateWorldBranch(sealed, attempt.descriptor.route.reuse);
-				if (attempt.stateValue === "validating") {
-					attempt.stateValue = validation.status === "valid" ? "validated" : "sealed";
-				}
-				return validation;
-			});
-			validationPromise = pending;
-			try { return await pending; } finally { if (validationPromise === pending) validationPromise = undefined; }
-		},
+		validate: () => validate(),
 		commit: async () => {
 			// An admitted effect keeps its original settlement, including during/after retirement.
 			if (commitPromise) return shared ? cloneSharedData(await commitPromise) : commitPromise;

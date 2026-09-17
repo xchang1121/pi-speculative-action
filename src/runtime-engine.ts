@@ -223,7 +223,7 @@ async function projectOutput<Output>(
 ): Promise<ProjectionResult<Output>> {
 	if (match.kind === "exact") return { ok: true, output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution };
+	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution, validate: retained.validate };
 	const reconstruct = candidateBranch(candidate)?.reconstruct;
 	const rule = rules.find((item) => item.id === match.projector);
 	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
@@ -231,18 +231,19 @@ async function projectOutput<Output>(
 	if (!reconstruct && (!coverage || !rule.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		let projected = coverage && rule.projectOutput ? cloneSharedData(await rule.projectOutput({
+		let projected: Output | undefined = coverage && rule.projectOutput ? cloneSharedData(await rule.projectOutput({
 			speculative: candidate.key,
 			actor,
 			output,
 			coverage: cloneSharedData(coverage.value),
 			keyMatch: match,
 		})) : undefined;
-		if (projected === undefined) projected = await reconstruct?.(request);
+		const rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
+		if (rebuilt) projected = cloneSharedData(rebuilt.output);
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
-		return { ok: true, output: projected, execution };
+		return { ok: true, output: projected, execution, validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
@@ -357,14 +358,17 @@ function retainResultView<Output>(
 ): boolean {
 	if (!projection.execution || candidate.resultViews?.has(action.key)) return false;
 	try {
-		const owned = cloneSharedData(projection.output), bytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
+		const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
+		let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
 		const views = candidate.resultViews ??= new Map();
+		// Prefer retained query data to an extra proof; the original complete proof remains sufficient.
+		if (candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
 		while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
 			const [key, previous] = views.entries().next().value!;
 			views.delete(key); candidate.estimatedBytes -= previous.bytes;
 		}
 		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-			views.set(action.key, { output: owned, bytes, execution: projection.execution }); candidate.estimatedBytes += bytes;
+			views.set(action.key, { output: owned, bytes, execution: projection.execution, validate }); candidate.estimatedBytes += bytes;
 			return true;
 		}
 	} catch { /* Optional retention cannot alter an already committed result. */ }
@@ -440,7 +444,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	expectedDurationMs: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval }>;
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly validate?: WorldBranch<Output>["validate"] }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	acceptOperationScope?: (scope: ExecutionScope) => boolean;
@@ -514,7 +518,7 @@ interface ClaimedPrediction {
 }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -1736,7 +1740,7 @@ export function makeSpeculativeActionRuntime<
 					actorAction.rejectCandidate(candidate.id, choice.match, projection.cause);
 					continue;
 				}
-				const validation = await validateCandidate(candidate);
+				const validation = await validateCandidate(candidate, projection.validate);
 				if (stopCandidate(candidate)) break;
 				if (validation.status !== "valid") {
 					actorAction.rejectCandidate(candidate.id, choice.match, validation.cause);
@@ -1745,8 +1749,10 @@ export function makeSpeculativeActionRuntime<
 				}
 				let output = projection.output;
 				try {
-					const committed = await branch.commit();
-					if (choice.match.kind === "exact") output = committed;
+					if (!projection.validate) {
+						const committed = await branch.commit();
+						if (choice.match.kind === "exact") output = committed;
+					}
 				} catch (error) {
 					const commitFailure = effectCommitFailure(error, "poisoned");
 					if (isPoisonedEffectCommit(commitFailure)) throw commitFailure;
@@ -2355,8 +2361,8 @@ export function makeSpeculativeActionRuntime<
 		];
 	};
 
-	const validateCandidate = async (candidate: Candidate): Promise<ResourceValidation> => {
-		const validation = await validateWorldBranch(candidateBranch(candidate), candidate.route.reuse);
+	const validateCandidate = async (candidate: Candidate, validate?: WorldBranch<Output>["validate"]): Promise<ResourceValidation> => {
+		const validation = await validateWorldBranch(validate ? { validate } : candidateBranch(candidate), candidate.route.reuse);
 		recordValidation(candidate, validation);
 		return validation;
 	};

@@ -53,7 +53,7 @@ type CapturedResource = (
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
 	| { readonly type: "alias"; readonly target?: string; readonly link: string }
 	| { readonly type: "special" }
-	| { readonly type: "missing" }) & { readonly realPath?: string };
+	| { readonly type: "missing" }) & { readonly realPath?: string; readonly dependency?: string; readonly metadataDependency?: string };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
@@ -64,6 +64,7 @@ export class ResourceReadView {
 	private sealed = false;
 	private pending?: Promise<void>;
 	private disposal?: Promise<void>;
+	private dependencies?: Set<string>;
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
 	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>) {
@@ -89,13 +90,17 @@ export class ResourceReadView {
 	}
 	capture(target: string, entry: CapturedResource): void {
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
+		const sameMetadata = previous?.type === entry.type && previous?.realPath === entry.realPath && entry.type !== "alias";
+		const metadataDependency = /^(entry|type|stat):/.test(entry.dependency ?? "") ? entry.dependency
+			: sameMetadata ? previous?.metadataDependency : undefined;
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined);
-		if (!this.reserve(redundant ? 0 : Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + 64 + (entry.type === "directory"
+		if (!this.reserve(redundant ? metadataDependency && metadataDependency !== previous?.metadataDependency ? Buffer.byteLength(metadataDependency) + 16 : 0
+			: Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(entry.dependency ?? "") + 64 + (entry.type === "directory"
 			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0)) || redundant) return;
-		this.entries.set(key, entry);
+			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0))) return;
+		if (!redundant || sameMetadata) this.entries.set(key, { ...(redundant ? previous! : entry), metadataDependency });
 	}
 	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
 	stat = async (target: string, fields?: "type" | "entry"): Promise<ToolFilesystemStat> => {
@@ -117,13 +122,14 @@ export class ResourceReadView {
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
-	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>): Promise<T> {
+	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void): Promise<T> {
 		this.assertComplete(true);
 		const view = new ResourceReadView(0);
-		view.entries = this.entries; view.owner = this; view.sealed = true;
+		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set();
 		try {
 			const output = await operation(view);
 			view.assertComplete();
+			observed?.(view.dependencies);
 			return output;
 		} finally { view.dispose(); }
 	}
@@ -157,23 +163,32 @@ export class ResourceReadView {
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		return this.entry(target, scope !== "entry") ?? this.unproven(target);
+		return this.entry(target, scope !== "entry", scope) ?? this.unproven(target);
 	}
-	private entry(target: string, follow = true): CapturedResource | undefined {
+	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): CapturedResource | undefined {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
 		const visited = new Set<string>();
 		while (!visited.has(current) && visited.size <= this.entries.size) {
 			visited.add(current);
-			const exact = this.entries.get(current);
+			const exact = this.observe(this.entries.get(current), scope);
 			if (exact?.type === "alias" && follow) { if (!exact.target) break; current = exact.target; continue; }
 			if (exact) return exact;
 			let parent = path.dirname(current);
 			while (parent !== path.dirname(parent) && this.entries.get(parent)?.type !== "alias") parent = path.dirname(parent);
 			const alias = this.entries.get(parent);
 			if (alias?.type !== "alias" || !alias.target) break;
+			this.observe(alias);
 			current = filesystemPathKey(path.resolve(alias.target, path.relative(parent, current)));
 		}
+	}
+	private observe(entry: CapturedResource | undefined, scope?: ResourceDependency["scope"]): CapturedResource | undefined {
+		if (entry && this.dependencies) {
+			const dependency = entry.type !== "alias" && (scope === "type" || scope === "entry" || (scope === "stat" && entry.type !== "file"))
+				? entry.metadataDependency ?? entry.dependency : entry.dependency;
+			if (dependency) this.dependencies.add(dependency); else this.dependencies = undefined;
+		}
+		return entry;
 	}
 	private unproven(target: string): never {
 		throw (this.failure ??= new Error(`resource_access_unproven:${target}`));
@@ -540,13 +555,14 @@ async function fingerprintDependencies(
 	}
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
-		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope);
+		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, dependencyKey(dependency));
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 	});
 
 	async function fingerprintPath(
 		target: string,
 		scope: ResourceDependency["scope"],
+		dependency: string,
 		ancestors: ReadonlySet<string> = new Set(),
 		descend = true,
 	): Promise<FingerprintResult> {
@@ -555,7 +571,7 @@ async function fingerprintDependencies(
 			captured = await captureEntry(target, scope);
 		} catch (error) {
 			if (!missingResource(error)) throw error;
-			view?.capture(target, { type: "missing" });
+			view?.capture(target, { type: "missing", dependency });
 			return {
 				value: { exists: false, error: errorCode(error) },
 				stamp: digest([filesystemPathKey(target), await nearestExisting(target)]),
@@ -579,8 +595,8 @@ async function fingerprintDependencies(
 					if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
 				}
 			});
-			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, new Set(ancestors).add(identity), descend);
-			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget });
+			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, dependency, new Set(ancestors).add(identity), descend);
+			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency });
 			return {
 				value: {
 					type: "symlink",
@@ -595,7 +611,7 @@ async function fingerprintDependencies(
 			};
 		}
 		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget,
+			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency,
 				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 			return stableEntry(target, info, identity, scope);
 		}
@@ -607,7 +623,7 @@ async function fingerprintDependencies(
 				const retain = view?.reserve(Number(info.size)) ?? false;
 				const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
 				assertInside(realRoot, content.realPath);
-				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath });
+				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath, dependency });
 				return {
 					value: {
 						type: "file",
@@ -631,7 +647,7 @@ async function fingerprintDependencies(
 		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 		const descendants = new Set(ancestors).add(identity);
 		const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
-			const child = await fingerprintPath(path.join(target, entry.name), scope, descendants, scope !== "entries");
+			const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries");
 			return { name: entry.name, ...child };
 		});
 		const [afterEntries, after] = await Promise.all([
@@ -645,7 +661,7 @@ async function fingerprintDependencies(
 		) {
 			throw new Error(`resource_directory_changed:${target}`);
 		}
-		view?.capture(target, { type: "directory", entries: selected.map((entry) => entry.name), realPath: realTarget });
+		view?.capture(target, { type: "directory", entries: selected.map((entry) => entry.name), realPath: realTarget, dependency });
 		return {
 			value: {
 				type: "directory",
