@@ -159,32 +159,8 @@ describe("PatternAware", () => {
 		).toEqual({ ...target, command: "run Gamma now", joined: "Gamma:Beta" });
 	});
 
-	test("rebases predictions over an authoritative provider batch without learning it early", () => {
-		const store = patternStore();
-		trainGrepRead(store, "one", "src/a.ts");
-		trainGrepRead(store, "two", "src/b.ts");
-		const before = store.recent("probe");
-
-		const candidates = store.predictAfterBatch("probe", [
-			input("probe", "grep", { pattern: "TODO" }, {
-				turnID: "probe:scan",
-				outputPaths: ["src/c.ts"],
-			}),
-		]);
-
-		expect(candidates).toContainEqual(
-			expect.objectContaining({
-				source: "pattern_aware",
-				tool: "read",
-				input: { filePath: "src/c.ts" },
-			}),
-		);
-		expect(store.recent("probe")).toEqual(before);
-		expect(store.predictAfterBatch("missing-payload", [input("missing-payload", "grep", { pattern: "TODO" })])
-			.find((item) => item.tool === "read")).toBeUndefined();
-	});
-
 	test.each([
+		["single", ["TODO", "TODO", "TODO"], undefined, false],
 		["tools", ["TODO", "TODO", "TODO"], "src/**/*.ts", false],
 		["arguments", ["aaa", "zzz", "xyz"], "mmm", false],
 		["unicode", ["caf\u00e9", "caf\u00e9", "caf\u00e9"], "cafe\u0301", true],
@@ -196,7 +172,9 @@ describe("PatternAware", () => {
 		] as const) {
 			const batch = scanBatch(sessionID, filePath, [queries[reverse ? 1 : 0], sibling], sameTool);
 			store.observeBatch(reverse ? [...batch].reverse() : batch);
-			expect(store.recent(sessionID).map((event) => event.input.pattern)).toEqual([sibling, queries[reverse ? 1 : 0]]);
+			expect(store.recent(sessionID).map((event) => event.input.pattern)).toEqual(
+				sibling === undefined ? [queries[reverse ? 1 : 0]] : [sibling, queries[reverse ? 1 : 0]],
+			);
 			store.observeBatch([input(sessionID, "read", { filePath }, { turnID: `${sessionID}:read`, })]);
 			store.finishSession(sessionID);
 		}
@@ -204,6 +182,9 @@ describe("PatternAware", () => {
 		const batch = scanBatch("probe", "src/c.ts", [queries[2], sibling], sameTool).reverse();
 		const previews = store.predictAfterBatch("probe", batch).filter((item) => item.tool === "read"), preview = previews[0];
 		expect(previews.map((item) => item.input)).toEqual([{ filePath: "src/c.ts" }]);
+		expect(preview?.source).toBe("pattern_aware");
+		expect(store.predictAfterBatch("missing-payload", batch.map(event => ({ ...event, sessionID: "missing-payload", outputPaths: undefined })))
+			.find(item => item.tool === "read")).toBeUndefined();
 		const before = store.snapshot(), seed = { visitedPatternIDs: ["foreign-batch"], pathProbability: 0.5 };
 		const peer = store.predictAfterBatch("probe", batch, {}, settings(), seed).find((item) => item.tool === "read");
 		expect(peer).toMatchObject({ input: preview?.input, depth: 2, conditionalProbability: preview?.conditionalProbability });
@@ -232,45 +213,27 @@ describe("PatternAware", () => {
 		).toBe(false);
 	});
 
-	test.each([
-		["co-occurring", () => ["find", "grep"] as const, 1],
-		["alternative", (index: number) => [index % 2 === 0 ? "find" : "grep"] as const, 0.5],
-	] as const)("calibrates %s batch members as marginal events", (_name, targets, expected) => {
+	test.each(["co-occurring", "alternative", "same-tool"] as const)("calibrates %s batch members as marginal events", (mode) => {
 		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
-		for (let index = 0; index < 8; index++) {
-			observeBatchTransition(
-				store,
-				`sample-${index}`,
-				targets(index).map((tool) => ({ tool, input: { pattern: tool === "find" ? "*.ts" : "TODO" } })),
-			);
+		const repeated = mode === "same-tool";
+		const targets = repeated
+			? ["one.ts", "two.ts"].map(filePath => ({ tool: "read", input: { filePath } }))
+			: ["find", "grep"].map(tool => ({ tool, input: { pattern: tool === "find" ? "*.ts" : "TODO" } }));
+		// Sixteen batches also exercise eviction from the per-pattern sample window.
+		for (let index = 0; index < (repeated ? 16 : 8); index++) {
+			observeBatchTransition(store, `sample-${index}`, mode === "alternative" ? [targets[index % 2]!] : targets);
 		}
-		const probabilities = (() => {
-			const sessionID = "probe";
-			store.observeBatch([
-				input(sessionID, "inspect", { scope: "src" }, { turnID: `${sessionID}:context`, }),
-			]);
-			return new Map(
-				store.predict(sessionID).map((candidate) => [candidate.tool, candidate.conditionalProbability]),
-			);
-		})();
-		for (const tool of ["find", "grep"]) {
-			if (expected === 1) expect(probabilities.get(tool)).toBeGreaterThan(0.9);
-			else expect(probabilities.get(tool)).toBeCloseTo(expected);
+		store.observeBatch([input("probe", "inspect", repeated ? {} : { scope: "src" }, { turnID: "probe:context" })]);
+		const predictions = store.predict("probe");
+		if (repeated) expect(predictions.filter(candidate => candidate.tool === "read")).toHaveLength(2);
+		for (const tool of repeated ? ["read"] : ["find", "grep"]) {
+			const matches = predictions.filter(candidate => candidate.tool === tool);
+			expect(matches.length).toBeGreaterThan(0);
+			for (const candidate of matches) {
+				if (mode === "alternative") expect(candidate.conditionalProbability).toBeCloseTo(0.5);
+				else expect(candidate.conditionalProbability).toBeGreaterThan(0.9);
+			}
 		}
-	});
-
-	test("counts repeated same-tool batch members once while sample windows slide", () => {
-		const store = patternStore({ maxContextLength: 1, maxFutureGap: 0 });
-		for (let index = 0; index < 16; index++)
-			observeBatchTransition(
-				store,
-				`same-tool-${index}`,
-				["one.ts", "two.ts"].map((filePath) => ({ tool: "read", input: { filePath } })),
-			);
-		store.observeBatch([input("probe", "inspect", {}, { turnID: "probe:context", })]);
-		const reads = store.predict("probe").filter((candidate) => candidate.tool === "read");
-		expect(reads).toHaveLength(2);
-		expect(reads.every((candidate) => candidate.conditionalProbability > 0.9)).toBe(true);
 	});
 
 	test("learns mappers per gap and merges equivalent actions only at prediction", () => {
@@ -1552,12 +1515,12 @@ function observeBatchTransition(
 	store.finishSession(sessionID);
 }
 
-function scanBatch(sessionID: string, filePath: string, patterns: readonly [string, string], sameTool: boolean) {
+function scanBatch(sessionID: string, filePath: string, patterns: readonly [string, string | undefined], sameTool: boolean) {
 	const turnID = `${sessionID}:scan`;
 	return [
 		input(sessionID, "grep", { pattern: patterns[0] }, { turnID, outputPaths: [filePath] }),
-		input(sessionID, sameTool ? "grep" : "find", { pattern: patterns[1] },
-			{ turnID, ...(sameTool ? { outputPaths: [filePath.replace("src/", "ignored/").replace(".ts", ".txt")] } : { output: { count: 1 } }) }),
+		...(patterns[1] === undefined ? [] : [input(sessionID, sameTool ? "grep" : "find", { pattern: patterns[1] },
+			{ turnID, ...(sameTool ? { outputPaths: [filePath.replace("src/", "ignored/").replace(".ts", ".txt")] } : { output: { count: 1 } }) })]),
 	];
 }
 
