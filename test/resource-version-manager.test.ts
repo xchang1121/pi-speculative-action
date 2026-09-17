@@ -101,6 +101,28 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
+	test("keeps preparation notifications without reading or authorizing resource content", async () => {
+		for (const watch of [true, false]) for (const snapshotExcludes of [[], [".git"]]) {
+			const root = await workspace({ "value.txt": "before" }), idle = vi.fn();
+			const manager = new ResourceVersionManager(root, { watch, snapshotExcludes, onIdle: idle });
+			const reads = vi.spyOn(fs, "open");
+			const token = await manager.observeChanges();
+			try {
+				expect([token.observations.size, token.view]).toEqual([0, undefined]);
+				await expect(manager.capture([])).rejects.toThrow("resource_dependencies_unproven");
+				for (const content of ["before", "after!"]) {
+					await fs.writeFile(path.join(root, "value.txt"), content);
+					if (watch) await vi.waitFor(() => expect(manager.changesSince(token).paths).toContain(path.join(root, "value.txt")));
+					else expect(manager.changesSince(token).uncertain).toBe(true);
+					expect(await manager.validate(token)).toMatchObject({ expired: true, bytesRead: 0, filesRead: 0 });
+					expect((await manager.seal(token)).expired).toBe(true);
+				}
+				expect(reads).not.toHaveBeenCalled();
+				await token.release(); await token.release(); expect(idle).toHaveBeenCalledTimes(1);
+			} finally { reads.mockRestore(); await token.release(); manager.close(); }
+		}
+	});
+
 	test.each([true, false])("rechecks shared missing ancestors on every adoption (watch=%s)", async (watch) => {
 		const root = await workspace({ "value.txt": "A" }), parent = path.join(root, "missing");
 		const manager = new ResourceVersionManager(root, { watch });
