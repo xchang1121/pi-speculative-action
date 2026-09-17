@@ -3,12 +3,11 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { serialize } from "node:v8";
 import { launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
 import { createClosedSearchProfile, readClosedSearchInput } from "../dist/pi-tool-invocation.js";
 
 // No extra engines or installation: qualify captured find, the process outlet, and both production TUI routes.
-const started = performance.now(), worker = await prepareWorker(true);
+const worker = await prepareWorker(true);
 try {
 	const pi = { find: await qualifyPiSearch("find") }, extension = await qualifySearchExtension();
 	const cancellation = [];
@@ -16,7 +15,7 @@ try {
 		const interrupted = await prepareWorker(!mode.startsWith("input")), controller = new AbortController();
 		const inputClosed = Promise.withResolvers(), inputWait = mode.startsWith("input"); let inputChild, inputCompleted = false;
 		try {
-			const arrived = performance.now(); let entered = false;
+			let entered = false;
 			const reason = inputWait ? 0 : new Error("cancelled running guest");
 			const abort = () => { entered = true; if (mode.endsWith("abort")) controller.abort(reason); };
 			await assert.rejects(interrupted.request(inputWait ? { kind: "find", root: process.cwd(), home: os.homedir(), args: { pattern: "needle" } } : { kind: "spin" }, {
@@ -37,11 +36,11 @@ try {
 			assert.ok(interrupted.closed(), "Actor fallback must not race a still-running worker");
 			assert.ok(entered, "cancellation must exercise an entered guest, not just process startup");
 			assert.ok(!inputWait || inputCompleted, "input ownership must retire before Actor fallback, not just the guest process");
-			cancellation.push({ mode, retirementMs: performance.now() - arrived });
+			cancellation.push(mode);
 		} finally { if (inputChild) { inputChild.kill("SIGKILL"); await inputClosed.promise; } await interrupted.dispose(); }
 	}
 	console.log(JSON.stringify({ platform: process.platform, node: process.version, profile: worker.profile,
-		workerPreparationMs: worker.preparationMs, processTotalMs: performance.now() - started, cancellation, pi, extension,
+		cancellation, pi, extension,
 		admission: "Captured find plus available qualified grep through the production TUI route; no extra dependency/download. Not native-default equivalence, macOS or ThinkThread Runtime qualification." }, null, 2));
 } finally { await worker.dispose(); }
 
@@ -62,7 +61,6 @@ async function qualifyPiSearch(name) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-portable-profile-")), searchRoot = path.join(root, "search");
 	const { pool, profile, invocations } = await createClosedSearchProfile(root), bound = invocations.get(name);
 	const counts = { producer: 0, actor: 0 }, reads = new Set();
-	let inputRequests = 0, inputBytes = 0;
 	const execute = (role, source, request, checkpoint) => pool.run(role, async (worker, signal) => {
 		counts[role]++;
 		let checkpointReached = false;
@@ -75,9 +73,7 @@ async function qualifyPiSearch(name) {
 			} };
 			const output = await worker.request({ kind: name, root, home: bound.identity.home, args: request.args },
 				{ signal, onInput: async (operation, target) => {
-					inputRequests++;
 					const value = await readClosedSearchInput(observed, root, operation, target, profile.limits.inputBytes);
-					inputBytes += serialize(value).byteLength;
 					if (checkpoint && !checkpointReached && operation === "readFile" && target === "/workspace/.gitignore") {
 						checkpointReached = true; await checkpoint();
 					}
@@ -123,14 +119,13 @@ async function qualifyPiSearch(name) {
 			},
 			actor: async (id, query = args) => {
 				actorWaiting = true; feedback = Promise.withResolvers();
-				const arrived = performance.now();
 				const output = await host.execute({ turnID, id, tool: name, args: query, tools: [tool] }, signal, async (operation) => {
 					assert.deepEqual(operation.invocation?.identity, bound.identity, "Actor execution must retain the selected executor independently of K(a)");
 					actorCalls++; counts.actor++;
 					return (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: id })).result;
 				});
 				actorWaiting = false;
-				return { output, totalMs: performance.now() - arrived, settlement: await bounded(feedback.promise, "Actor settlement") };
+				return { output, settlement: await bounded(feedback.promise, "Actor settlement") };
 			},
 		};
 	}
@@ -183,19 +178,12 @@ async function qualifyPiSearch(name) {
 			}
 			finally { await fs.rm(fifo); }
 		}
-		inputRequests = 0; inputBytes = 0; reads.clear();
-		const sample = async (execute) => {
-			const times = []; let output;
-			for (let index = 0; index < 3; index++) { const started = performance.now(); output = await execute(); times.push(performance.now() - started); }
-			return { output, samplesMs: times, medianMs: [...times].sort((a, b) => a - b)[1] };
-		};
-		const baseline = await sample(async () => execute("actor", fs, { args, signal }));
-		const inputTransport = { meanRequests: inputRequests / 3, meanPayloadBytes: inputBytes / 3, ignoredBytes: 16 * 1024 * 1024 };
+		reads.clear();
+		const expected = (await execute("actor", fs, { args, signal })).result;
 		assert.ok(!reads.has("/workspace/search/ignored.bin") && !reads.has("/workspace/search/ignored.txt"), "the broker transferred ignored content");
 		await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, home: bound.identity.home, args }, {
 			onInput: () => { throw new Error("resource_access_unproven"); },
 		})), /resource_access_unproven/, "a guest must not turn missing authority into an empty successful search");
-		const native = await sample(() => tool.execute("native", args, signal)), expected = baseline.output.result;
 		if (process.platform === "win32") for (const cwd of [root.replace(/^[a-z]:/iu, (drive) => drive.toLowerCase()), root.replaceAll("\\", "/")]) {
 			const { pool: aliasPool, invocations } = await createClosedSearchProfile(cwd);
 			try { assert.deepEqual((await invocations.get(name).authoritative({ args, signal, callID: "root-alias" })).result, expected); }
@@ -287,10 +275,9 @@ async function qualifyPiSearch(name) {
 			drain.resolve(); assert.deepEqual((await actor).result, stale.output); await Promise.all([retiring, rejected]);
 			await assert.rejects(pool.run("actor", (worker) => worker.request({ kind: name, root, args })), /search pool retired/);
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
-		return { nativeActorMs: native.medianMs, nativeActorSamplesMs: native.samplesMs,
-			profileWarmActorMs: baseline.medianMs, profileWarmActorSamplesMs: baseline.samplesMs, behaviors, rejectedEscapingLinks: true,
-			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable", inputTransport, speculativeMs: completed.executionMs,
-			readyAdoptionMs: adopted.totalMs, unpromotedObservation: { totalMs: observed.totalMs, ...observed.settlement }, retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
+		return { behaviors, rejectedEscapingLinks: true,
+			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable",
+			retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
 			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorAndInputs: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
@@ -351,16 +338,15 @@ async function qualifySearchExtension() {
 		assert.match(notices.join("\n"), /settings applied/);
 		for (const name of ["find", "grep"]) {
 			const args = { pattern: name === "find" ? "notes.txt" : "needle", path: "." }; selected = [name, args];
-			await invoke(name, args); // Exclude worker startup from the warm Actor baseline.
-			const baselineAt = performance.now(), expected = await invoke(name, args), warmActorMs = performance.now() - baselineAt;
+			const expected = await invoke(name, args);
 			candidate = Promise.withResolvers(); settlement = Promise.withResolvers();
 			await emit("context", { messages: [] });
 			const completed = await bounded(candidate.promise, "extension candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
-			const arrived = performance.now(); assert.deepEqual(await invoke(name, args), expected); const hitMs = performance.now() - arrived;
+			assert.deepEqual(await invoke(name, args), expected);
 			const feedback = await bounded(settlement.promise, "extension settlement");
 			if (feedback.provider.kind !== "speculative") assert.ok(feedback.provider.kind === "actor" &&
 				feedback.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(feedback));
-			results[name] = { warmActorMs, arrivalMs: hitMs, provider: feedback.provider, rejections: feedback.rejections };
+			results[name] = { provider: feedback.provider.kind, rejections: feedback.rejections };
 			await emit("agent_end");
 		}
 		await command("status"); await invoke(...selected);
