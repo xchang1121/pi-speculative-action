@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { expect, it } from "vitest";
-import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR } from "../src/action-semantics.ts";
+import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 
 const shell = (() => { try { return getShellConfig(); } catch { return undefined; } })();
 const nativeBash = shell && /(^|[\\/])bash(?:\.exe)?$/i.test(shell.shell) && shell.commandTransport !== "stdin";
@@ -24,8 +24,6 @@ it.skipIf(!nativeBash).each([
 	})!);
 	const projectors = PI_ACTION_SEMANTICS.projectors();
 	expect(actionKeyMatch(producer!, producer!, projectors)?.kind).toBe("exact");
-	// Sealed-input lookup is only a hint to re-execute, never permission to project these outputs.
-	const relation = actionKeyMatch(producer!, actor!, projectors);
-	if (relation) expect(relation).toMatchObject({ kind: "projected", projector: RESOURCE_INPUT_ACTION_KEY_PROJECTOR.id });
+	expect(actionKeyMatch(producer!, actor!, projectors)).toBeUndefined();
 	expect(actionKeyCovers(producer!, actor!, projectors)).toBe(false);
 });

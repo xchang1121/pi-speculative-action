@@ -1,4 +1,6 @@
 import { nonNegativeCount as finiteLimit, nonNegativeFinite as finiteValue } from "./number-utils.ts";
+import { filesystemPathKey } from "./path-utils.ts";
+import path from "node:path";
 import {
 	type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
 	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector,
@@ -17,7 +19,8 @@ export interface CandidateLookup<Entry> {
 
 interface IndexedEntry<Entry> {
 	readonly entry: Entry;
-	readonly memberships: ReadonlyArray<readonly [Map<string, Set<IndexedEntry<Entry>>>, string]>;
+	readonly memberships: Array<readonly [Map<string, Set<IndexedEntry<Entry>>>, string]>;
+	inputs?: boolean;
 	recency: number;
 	result?: ResultCacheEvidence;
 }
@@ -84,7 +87,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 
 	lookup(scope: Scope, action: ActionKey, requireCoverage?: (entry: Entry) => boolean): readonly CandidateLookup<Entry>[] {
 		return this.scopes.has(scope)
-			? this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage).map(({ entry, match }) => ({ entry, match }))
+			? this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage, true).map(({ entry, match }) => ({ entry, match }))
 			: [];
 	}
 
@@ -127,12 +130,21 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	/** Retention adds evidence to the existing owner; it neither reinserts nor changes identity. */
-	settle(scope: Scope, entry: Entry, shared = true): void {
+	settle(scope: Scope, entry: Entry, shared = true, inputs: readonly string[] = []): void {
 		this.insert(scope, entry);
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
 		this.scopes.get(scope)!.pending.delete(indexed);
 		if (shared) indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
+		if (shared && !indexed.inputs && inputs.length) {
+			const partitions = this.scopes.get(scope)!.partitions;
+			for (const key of new Set(inputs.map(inputPartition))) {
+				const members = partitions.get(key) ?? new Set();
+				members.add(indexed); partitions.set(key, members);
+				indexed.memberships.push([partitions, key]);
+			}
+			indexed.inputs = true;
+		}
 	}
 
 	cached(scope: Scope): Entry[] {
@@ -175,15 +187,29 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return record?.entry === entry ? record : undefined;
 	}
 
-	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean) {
+	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean, includeInputs = false) {
 		const state = this.scopes.get(scope);
 		if (!state) return [];
 		const candidates = new Set(state.exact.get(action.key));
+		const inputs = new Map<IndexedEntry<Entry>, number>();
+		if (includeInputs) for (const resource of action.resources) {
+			if (action.resourceRoot === undefined && !path.isAbsolute(resource)) continue;
+			let current = path.resolve(action.resourceRoot ?? "", resource), depth = 0;
+			for (;;) {
+				for (const indexed of state.partitions.get(inputPartition(current)) ?? []) {
+					inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth)); candidates.add(indexed);
+				}
+				const parent = path.dirname(current); if (parent === current) break;
+				current = parent; depth++;
+			}
+		}
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
 		const ranked: (CandidateLookup<Entry> & { readonly indexed: IndexedEntry<Entry> })[] = [];
 		for (const indexed of candidates) {
 			if (this.record(scope, indexed.entry) !== indexed) continue;
-			const match = actionKeyMatch(indexed.entry.key, action, this.projectors, requireCoverage?.(indexed.entry) ?? false);
+			const coverage = requireCoverage?.(indexed.entry) ?? false;
+			const match = actionKeyMatch(indexed.entry.key, action, this.projectors, coverage) ??
+				(!coverage && inputs.has(indexed) ? { kind: "inputs" as const, distance: Number.MAX_SAFE_INTEGER - 1024 + Math.min(inputs.get(indexed)!, 1024) } : undefined);
 			if (match) ranked.push({ entry: indexed.entry, match, indexed });
 		}
 		// Provider callbacks may retire or replace a registration, even with the same object and ID.
@@ -234,6 +260,8 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return retired;
 	}
 }
+
+const inputPartition = (resource: string) => "inputs:" + filesystemPathKey(resource);
 
 export type ResultCacheSegment = "cold" | "hot";
 

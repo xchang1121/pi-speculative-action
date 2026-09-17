@@ -14,7 +14,7 @@ import type { ToolFilesystemStat } from "./tool-settlement.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
-	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "names" | "binding";
+	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "names" | "binding" | "resolution";
 };
 
 export type ResourceValidationMetrics = {
@@ -65,15 +65,18 @@ export class ResourceReadView {
 	private pending?: Promise<void>;
 	private disposal?: Promise<void>;
 	private dependencies?: Set<string>;
+	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
-	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>) {
+	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>, boundary?: ResourceReadView["boundary"]) {
 		if (!Number.isFinite(maxBytes) || maxBytes < 0) throw new Error("resource_snapshot_budget_invalid");
 		this.maxBytes = maxBytes;
 		this.load = load;
+		this.boundary = boundary;
 	}
 	get bytes(): number { return this.capturedBytes; }
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
+	get resources(): readonly string[] { this.assertComplete(true); return [...this.entries.keys()]; }
 
 	reserve(bytes: number): boolean {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
@@ -122,11 +125,21 @@ export class ResourceReadView {
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
-	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void): Promise<T> {
+	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void, root?: string): Promise<T> {
 		this.assertComplete(true);
 		const view = new ResourceReadView(0);
 		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set();
 		try {
+			if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
+				view.boundary = this.boundary;
+				if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
+			} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
+				view.boundary = { root, physicalRoot: root };
+			} else {
+				const entry = await view.stat(root, "type");
+				if (!entry.isDirectory() || !entry.realPath) view.unproven(root);
+				view.boundary = { root, physicalRoot: entry.realPath! };
+			}
 			const output = await operation(view);
 			view.assertComplete();
 			observed?.(view.dependencies);
@@ -148,6 +161,7 @@ export class ResourceReadView {
 	}
 	private async get(target: string, scope: ResourceDependency["scope"]) {
 		this.assertComplete();
+		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target)) this.unproven(target);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
 				const entry = this.entry(target, scope !== "entry");
@@ -183,6 +197,8 @@ export class ResourceReadView {
 		}
 	}
 	private observe(entry: CapturedResource | undefined, scope?: ResourceDependency["scope"]): CapturedResource | undefined {
+		if (this.owner && this.boundary && entry?.realPath && (entry.type !== "alias" || scope === "entry") &&
+			!containsFilesystemPath(this.boundary.physicalRoot, entry.realPath)) this.unproven(entry.realPath);
 		if (entry && this.dependencies) {
 			const dependency = entry.type !== "alias" && (scope === "type" || scope === "entry" || (scope === "stat" && entry.type !== "file"))
 				? entry.metadataDependency ?? entry.dependency : entry.dependency;
@@ -280,7 +296,11 @@ export class ResourceVersionManager {
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
 					dependencies && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined)) observations.set(dependencyKey(observation), observation);
 			};
-			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
+			const boundary = { path: this.root, scope: "resolution" as const }, boundaryKey = dependencyKey(boundary);
+			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]),
+				{ root: this.root, physicalRoot, dependency: boundaryKey });
+			if (view) observations.set(boundaryKey, { ...boundary, stamp: filesystemPathKey(physicalRoot),
+				fingerprint: digest({ path: filesystemPathKey(this.root), scope: "resolution", value: filesystemPathKey(physicalRoot) }) });
 			if (dependencies) await capture(dependencies);
 			if (dependencies) await watcherTurn();
 			const retained = view?.retained ? view : undefined;
@@ -555,7 +575,9 @@ async function fingerprintDependencies(
 	}
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
-		const { value, ...metrics } = await fingerprintPath(dependency.path, dependency.scope, dependencyKey(dependency));
+		const { value, ...metrics } = dependency.scope === "resolution"
+			? await fingerprintIO(async () => { const resolved = filesystemPathKey(await fs.realpath(dependency.path)); return { value: resolved, stamp: resolved, bytesRead: 0, filesRead: 0 }; })
+			: await fingerprintPath(dependency.path, dependency.scope, dependencyKey(dependency));
 		return { ...dependency, fingerprint: digest({ path: filesystemPathKey(dependency.path), scope: dependency.scope, value }), ...metrics };
 	});
 
@@ -571,10 +593,11 @@ async function fingerprintDependencies(
 			captured = await captureEntry(target, scope);
 		} catch (error) {
 			if (!missingResource(error)) throw error;
-			view?.capture(target, { type: "missing", dependency });
+			const nearest = await nearestExisting(target);
+			view?.capture(target, { type: "missing", realPath: nearest.realPath, dependency });
 			return {
-				value: { exists: false, error: errorCode(error) },
-				stamp: digest([filesystemPathKey(target), await nearestExisting(target)]),
+				value: { exists: false, error: errorCode(error), resolved: nearest.realPath },
+				stamp: digest([filesystemPathKey(target), nearest.fingerprint]),
 				bytesRead: 0,
 				filesRead: 0,
 			};
@@ -721,11 +744,12 @@ function specialFileType(value: Stats | BigIntStats | import("node:fs").Dirent) 
 	return value.isBlockDevice() ? "block_device" : "other";
 }
 
-function missingResourceResolver(realRoot: string): (target: string) => Promise<string> {
+function missingResourceResolver(realRoot: string) {
 	// Negative queries commonly share ancestors. Join only concurrent reads in this proof batch;
 	// settled observations are never cached for another query or Actor validation.
-	const pending = new Map<string, Promise<string>>();
-	const resolve = (target: string): Promise<string> => {
+	type Resolution = { readonly realPath: string; readonly fingerprint: string };
+	const pending = new Map<string, Promise<Resolution>>();
+	const resolve = (target: string): Promise<Resolution> => {
 		const current = path.resolve(target), existing = pending.get(current);
 		if (existing) return existing;
 		const task = (async () => {
@@ -735,13 +759,14 @@ function missingResourceResolver(realRoot: string): (target: string) => Promise<
 					fingerprintIO(() => fs.lstat(current, { bigint: true })),
 				]);
 				assertInside(realRoot, real);
-				return digest([filesystemPathKey(real), statStamp(stat)]);
+				return { realPath: filesystemPathKey(real), fingerprint: digest([filesystemPathKey(real), statStamp(stat)]) };
 			} catch (error) {
 				if (!missingResource(error)) throw error;
 			}
 			const parent = path.dirname(current);
 			if (parent === current) throw new Error(`resource_path_unresolved:${target}`);
-			return resolve(parent);
+			const ancestor = await resolve(parent);
+			return { realPath: filesystemPathKey(path.join(ancestor.realPath, path.basename(current))), fingerprint: ancestor.fingerprint };
 		})().finally(() => pending.delete(current));
 		pending.set(current, task);
 		return task;

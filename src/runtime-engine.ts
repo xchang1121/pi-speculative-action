@@ -216,25 +216,25 @@ function captureCoverage<Output>(
 async function projectOutput<Output>(
 	candidate: CandidateRecord<Output>,
 	actor: ActionKey,
-	output: Output,
 	match: ActionKeyMatch,
 	rules: readonly ActionProjectionRule<Output>[],
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
-	if (match.kind === "exact") return { ok: true, output };
+	const branch = candidateBranch(candidate)!;
+	if (match.kind === "exact") return { ok: true, output: branch.output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained) return { ok: true, output: cloneSharedData(retained.output), execution: retained.execution, inputs: retained.inputs, validate: retained.validate };
-	const reconstruct = candidateBranch(candidate)?.reconstruct;
-	const rule = rules.find((item) => item.id === match.projector);
-	if (!rule) return { ok: false, cause: cause("projection", "rule_missing") };
-	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule.id);
-	if (!reconstruct && (!coverage || !rule.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
+	if (retained) return { ok: true, ...retained, output: cloneSharedData(retained.output) };
+	const reconstruct = branch.reconstruct;
+	const rule = match.kind === "projected" ? rules.find((item) => item.id === match.projector) : undefined;
+	if (match.kind === "projected" && !rule) return { ok: false, cause: cause("projection", "rule_missing") };
+	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule?.id);
+	if (!reconstruct && (!coverage || !rule?.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
 	try {
-		let projected: Output | undefined = coverage && rule.projectOutput ? cloneSharedData(await rule.projectOutput({
+		let projected: Output | undefined = match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
 			speculative: candidate.key,
 			actor,
-			output,
+			output: branch.output,
 			coverage: cloneSharedData(coverage.value),
 			keyMatch: match,
 		})) : undefined;
@@ -243,7 +243,8 @@ async function projectOutput<Output>(
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
-		return { ok: true, output: projected, execution, inputs: !!rebuilt, validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
+		return { ok: true, output: projected, execution, inputs: !!rebuilt, compatibility: rebuilt?.compatibility,
+			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
 	}
@@ -351,6 +352,10 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 	return Object.entries(value).reduce((sum, [key, item]) => sum + key.length * 2 + estimateValueBytes(item, seen), 0);
 }
 
+function retainedBranchBytes(branch: WorldBranch<unknown>): number {
+	return branch.capturedBytes + (branch.reconstruct ? branch.inputResources?.reduce((bytes, name) => bytes + name.length * 2 + 64, 0) ?? 0 : 0);
+}
+
 /** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
 function retainResultView<Output>(
 	candidate: CandidateRecord<Output>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
@@ -368,7 +373,7 @@ function retainResultView<Output>(
 			views.delete(key); candidate.estimatedBytes -= previous.bytes;
 		}
 		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-			views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, validate }); candidate.estimatedBytes += bytes;
+			views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate }); candidate.estimatedBytes += bytes;
 			return true;
 		}
 	} catch { /* Optional retention cannot alter an already committed result. */ }
@@ -444,7 +449,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	expectedDurationMs: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly validate?: WorldBranch<Output>["validate"] }>;
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"] }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	acceptOperationScope?: (scope: ExecutionScope) => boolean;
@@ -518,7 +523,7 @@ interface ClaimedPrediction {
 }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -1345,7 +1350,7 @@ export function makeSpeculativeActionRuntime<
 			});
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
-			candidate.estimatedBytes = estimateValueBytes(output) + branch.capturedBytes;
+			candidate.estimatedBytes = estimateValueBytes(output) + retainedBranchBytes(branch);
 			const completedAt = performance.now();
 			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, branch.computationDependencies), completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
@@ -1355,7 +1360,7 @@ export function makeSpeculativeActionRuntime<
 				actionTimingIdentity(candidate.key),
 				completedAt - startedAt,
 			);
-			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared");
+			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
 			queueCandidateContinuations(
 				session,
 				session.plan.consumers(candidate.id),
@@ -1462,13 +1467,16 @@ export function makeSpeculativeActionRuntime<
 			const execution = candidate.work.execution;
 			if (!record || match.kind === "exact" || candidate.route.reuse !== "shared_result" || execution.status !== "succeeded" ||
 				candidate.resultViews?.has(action.key) || candidate.estimatedBytes + action.key.length * 2 + 64 >= cacheByteLimit(state.settings)) return;
+			if (execution.output.reconstructionScope !== "current_action" &&
+				!state.session.scheduler.assessCompatibility(execution.output.compatibility, action.executionFingerprint).compatible) return;
 			await new Promise<void>(setImmediate);
 			if (!active() || state.actorPreviews.get(actualCall.id!) !== record) return;
 			const lease = acquireCandidate(state.session, candidate, `preview:${callKey(state.turnID, actualCall.id!)}`);
 			if (!lease) return;
 			try {
+				if (await authorize(state, input, action, actualCall, candidate, signal) || !active()) return;
 				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
-				const projected = await projectOutput(candidate, action, execution.output.output, match,
+				const projected = await projectOutput(candidate, action, match,
 					projectionRules, { action, args: action.input, callID: actualCall.id!,
 						signal: signal ?? state.generation.signal });
 				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate &&
@@ -1614,7 +1622,7 @@ export function makeSpeculativeActionRuntime<
 				...actorIdentity,
 				actionKeyHash: JSON.stringify([candidate.key.hash, actualKey.hash]),
 				operation: JSON.stringify([route.backend, route.fingerprint, route.scope, route.isolation, route.reuse,
-					choice.match.kind === "exact" ? "exact" : choice.match.projector,
+					choice.match.kind === "projected" ? choice.match.projector : choice.match.kind,
 					...(candidate.resultViews?.has(actualKey.key) ? ["retained"] : [])]),
 			};
 			// Equivalent ready choices share this Actor decision, including its recovery probe.
@@ -1710,17 +1718,14 @@ export function makeSpeculativeActionRuntime<
 					continue;
 				}
 				const branch = execution.output;
-				const compatibility = state.session.scheduler.assessCompatibility(
-					branch.compatibility,
-					actualKey.executionFingerprint,
-				);
-				if (!compatibility.compatible) {
-					const failure = cause("compatibility", compatibility.code, compatibility.detail);
+				const sourceCompatibility = branch.reconstructionScope === "current_action" && choice.match.kind !== "exact" ? undefined
+					: state.session.scheduler.assessCompatibility(branch.compatibility, actualKey.executionFingerprint);
+				if (sourceCompatibility && !sourceCompatibility.compatible) {
+					const failure = cause("compatibility", sourceCompatibility.code, sourceCompatibility.detail);
 					actorAction.rejectCandidate(candidate.id, choice.match, failure);
-					discardCandidate(state.session, candidate, failure);
+					if (choice.match.kind !== "inputs") discardCandidate(state.session, candidate, failure);
 					continue;
 				}
-
 				// Join only this exact Actor intent; changed arguments or executors cannot inherit its preparation.
 				if (preview?.state.status === "candidate" && preview.state.candidateID === candidate.id &&
 					(await preview.actionKey)?.key === actualKey.key) await waitForCandidate(preview.task, signal);
@@ -1729,7 +1734,6 @@ export function makeSpeculativeActionRuntime<
 				const projection = await projectOutput(
 					candidate,
 					actualKey,
-					branch.output,
 					choice.match,
 					projectionRules,
 					{ action: actualKey, args: actualCall.input, callID: actualCall.id ?? actualKey.hash,
@@ -1738,6 +1742,14 @@ export function makeSpeculativeActionRuntime<
 				if (stopCandidate(candidate)) break;
 				if (!projection.ok) {
 					actorAction.rejectCandidate(candidate.id, choice.match, projection.cause);
+					continue;
+				}
+				const compatibility = sourceCompatibility ?? state.session.scheduler.assessCompatibility(
+					projection.compatibility ?? branch.compatibility, actualKey.executionFingerprint);
+				if (!compatibility.compatible) {
+					const failure = cause("compatibility", compatibility.code, compatibility.detail);
+					actorAction.rejectCandidate(candidate.id, choice.match, failure);
+					if (choice.match.kind !== "inputs") discardCandidate(state.session, candidate, failure);
 					continue;
 				}
 				const validation = await validateCandidate(candidate, projection.validate);
@@ -1776,7 +1788,7 @@ export function makeSpeculativeActionRuntime<
 				const toolExecution = projection.inputs ? projection.execution! : execution.toolExecution;
 				actorAction.select({
 					candidate,
-					match: choice.match,
+					match: projection.inputs ? { kind: "inputs", distance: choice.match.distance } : choice.match,
 					output,
 					timing: {
 						executionAheadMs: Math.max(0, Math.min(toolExecution.completedAt, actorArrivedAt) - toolExecution.startedAt),
@@ -1990,14 +2002,14 @@ export function makeSpeculativeActionRuntime<
 				route: capture.route,
 				attemptStartedAt: toolExecution.startedAt,
 				expectedDurationMs: durationMs,
-				estimatedBytes: estimateValueBytes(output) + branch.capturedBytes,
+					estimatedBytes: estimateValueBytes(output) + retainedBranchBytes(branch),
 				projectionCoverage: captureCoverage(action, output, projectionRules),
 			});
 			candidate.work.start(toolExecution.startedAt);
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
-			candidateStore.settle(state.sessionID, candidate);
+			candidateStore.settle(state.sessionID, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
 			retained = true;
 			trimResults(state.session, state.settings);
 		} catch {

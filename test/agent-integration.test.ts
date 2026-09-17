@@ -7,7 +7,7 @@ import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
@@ -19,10 +19,11 @@ import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
+import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -500,6 +501,63 @@ describe("speculative action host", () => {
 		expect(worldDisposed).toHaveBeenCalledOnce();
 	});
 
+	it("uses a completed search's inputs for current tools across turns without adopting its output or prediction", async ({ skip }) => {
+		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
+		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
+		await writeFile(path.join(cwd, "unused.txt"), "original");
+		const tools: AgentTool[] = [createReadTool(cwd), createLsTool(cwd), createFindTool(cwd), createGrepTool(cwd)];
+		const events: SpeculativeActionEvent<string>[] = [], ready = deferred<void>();
+		let predict = true, permitted = true, rootOverride: string | undefined, evaluations = 0;
+		const host = createSpeculativeActionHost("resources", {
+			cwd, draftModel: model("draft"),
+			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
+				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 16, resourceCacheMaxBytes: 1024 * 1024 }),
+			complete: async () => assistant([{ type: "toolCall", id: "search", name: "grep", arguments: { pattern: ".", path: "." } }], "toolUse"),
+			resolveInvocation: (tool, input) => {
+				const invocation = profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} });
+				return invocation && { ...invocation, ...(rootOverride ? { filesystemRoot: rootOverride } : {}),
+					filesystem: invocation.filesystem && ((...args) => { evaluations++; return invocation.filesystem!(...args); }) };
+			},
+			preflight: context => { expect(context.action.tool).toBe(context.toolName); return permitted; },
+			executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 })],
+			onEvent: event => { events.push(event); if (event.type === "candidate") {
+				if (event.state.status === "succeeded") ready.resolve();
+				else if (event.state.status === "failed" || event.state.status === "cancelled") ready.reject(new Error(JSON.stringify(event.state.cause)));
+			} },
+		});
+		try {
+			await host.startTurn({ ...startInput(tools[3]!, "seed"), tools }); await ready.promise;
+			predict = false; await host.finishTurn("seed");
+			await writeFile(path.join(cwd, "unused.txt"), "changed but unused");
+			await host.startTurn({ ...startInput(tools[0]!, "consumer"), tools });
+			for (const [name, args] of [["read", { path: "notes.txt", offset: 2, limit: 1 }], ["ls", { path: "." }],
+				["find", { pattern: "*.txt", path: "." }], ["grep", { pattern: "two", path: "notes.txt" }]] as const) {
+				const tool = tools.find(tool => tool.name === name)!, expected = await tool.execute("reference", args as never);
+				const actor = vi.fn(() => tool.execute("native", args as never));
+				const call = { turnID: "consumer", id: name, tool: name, args, tools };
+				await host.previewActorCall(call);
+				expect(await host.execute(call, undefined, actor), name).toEqual(expected);
+				expect(await host.execute({ ...call, id: name + ":again" }, undefined, actor)).toEqual(expected);
+				expect(actor).not.toHaveBeenCalled();
+			}
+			const args = { path: "notes.txt", offset: 2, limit: 1 }, reader = tools[0]!, actor = vi.fn(() => reader.execute("native", args));
+			const call = { turnID: "consumer", id: "denied", tool: "read", args, tools };
+			rootOverride = path.join(cwd, "unproven");
+			await host.execute({ ...call, id: "root-rebound" }, undefined, actor); expect(actor).toHaveBeenCalledOnce();
+			rootOverride = undefined; permitted = false;
+			const beforeDeniedPreview = evaluations; await host.previewActorCall({ ...call, id: "denied-preview", args: { path: "notes.txt", offset: 3 } });
+			expect(evaluations).toBe(beforeDeniedPreview);
+			await host.execute(call, undefined, actor); expect(actor).toHaveBeenCalledTimes(2);
+			permitted = true; await writeFile(path.join(cwd, "notes.txt"), "changed\ncurrent");
+			expect((await host.execute({ ...call, id: "changed" }, undefined, actor)).content).toEqual([{ type: "text", text: "current" }]);
+			expect(actor).toHaveBeenCalledTimes(3);
+			await host.finishTurn("consumer", true);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
+			expect(events.filter(event => event.type === "actor_action" && event.settlement.provider.kind === "speculative")
+				.every(event => event.type === "actor_action" && event.settlement.matchedPredictions.length === 0)).toBe(true);
+		} finally { await host.dispose(); await profile.pool.dispose(); }
+	});
+
 	it.each([false, true])("only promotes proven host observations, independently of prediction (ThinkThread=%s)", async (thinkthread) => {
 		const cwd = await temporaryWorkspace(process.env.THINKTHREAD_FS ?? path.join(process.cwd(), "bench")), file = path.join(cwd, "notes.txt");
 		let tools: string[] = [];
@@ -696,7 +754,7 @@ describe("speculative action host", () => {
 			expect(output.content).toEqual([{ type: "text", text: "tail arguments: -n 2" }]);
 			expect(actor).toHaveBeenCalledOnce();
 			await waitFor(() => events.some((event) => event.type === "actor_action"));
-			expect(preflight).toHaveBeenCalledTimes(mode === "missing" ? 0 : mode === "preflight" || mode === "suffix" && phase === "running" ? 1 : 2);
+			expect(preflight).toHaveBeenCalledTimes(mode === "missing" ? 0 : mode === "preflight" || mode === "suffix" ? 1 : 2);
 			if (mode === "recheck") expect(events.find((event) => event.type === "actor_action")).toMatchObject({ settlement: {
 				rejections: [{ cause: { stage: "authorization", code: "permission_or_policy_changed", ...(phase === "completed" ? { detail: "restricted" } : {}) } }],
 			} });

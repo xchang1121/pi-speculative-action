@@ -31,6 +31,8 @@ export interface ActionKey {
 	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly resources: readonly string[];
+	/** Root for resolving logical resource names during retrieval; not equivalence evidence. */
+	readonly resourceRoot?: string;
 	/** Version of the canonicalization and execution contract, independent of the input schema. */
 	readonly semanticsEpoch: string;
 	/** Stable hash of the validated input schema used by both producer and consumer. */
@@ -71,7 +73,13 @@ export interface ProjectedActionKeyMatch {
 	readonly projector: string;
 }
 
-export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch;
+/** Resource retrieval is not action equivalence or a correct prediction. */
+export interface ResourceInputMatch {
+	readonly kind: "inputs";
+	readonly distance: number;
+}
+
+export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch | ResourceInputMatch;
 
 export type ActionKeyMismatchReason =
 	| "different_tool"
@@ -166,6 +174,7 @@ export class ActionSemanticsRegistry {
 			return buildActionKey({
 				tool,
 				resources: canonical.resources,
+				resourceRoot: cwd,
 				input: canonical.input,
 				schemaHash,
 				semanticsEpoch: definition.epoch,
@@ -184,20 +193,6 @@ export const READ_DEFAULT_LIMIT = 2000;
 export const GREP_DEFAULT_LIMIT = 100;
 export const FIND_DEFAULT_LIMIT = 1000;
 export const LS_DEFAULT_LIMIT = 500;
-
-/** Lookup hint only: different queries require re-evaluation over the branch's sealed inputs.
- * No running join is inferred before a branch proves that it owns those inputs. */
-export const RESOURCE_INPUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
-	id: "resource.inputs",
-	partition: (action) => action.resources.length ? JSON.stringify([
-		action.tool, action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
-	]) : undefined,
-	project: (speculative, actor) => {
-		const partition = RESOURCE_INPUT_ACTION_KEY_PROJECTOR.partition(speculative);
-		return partition !== undefined && partition === RESOURCE_INPUT_ACTION_KEY_PROJECTOR.partition(actor)
-			? { action: actor, distance: Number.MAX_SAFE_INTEGER } : undefined;
-	},
-});
 
 /** π_read narrows a cached read action to the actor's requested interval. */
 export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
@@ -290,6 +285,7 @@ export const KEYABLE_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames());
 export function buildActionKey(input: {
 	readonly tool: string;
 	readonly resources: readonly string[];
+	readonly resourceRoot?: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly schemaHash?: string;
 	readonly semanticsEpoch?: string;
@@ -317,6 +313,7 @@ export function buildActionKey(input: {
 		tool: input.tool,
 		input: canonicalInput,
 		resources: Object.freeze([...input.resources]),
+		...(input.resourceRoot !== undefined ? { resourceRoot: path.resolve(input.resourceRoot) } : {}),
 		semanticsEpoch,
 		schemaHash,
 		executionFingerprint,
@@ -592,7 +589,7 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 	if (!epoch) throw new Error(`action semantics epoch must not be empty for ${tool}`);
 	const definition = Object.freeze({ ...source, tool, epoch,
 		requirements: normalizeEffectRequirements(source.requirements),
-		projectors: Object.freeze([...new Set([...(source.projectors ?? []), ...(source.resourceScope ? [RESOURCE_INPUT_ACTION_KEY_PROJECTOR] : [])])].map(ownActionKeyProjector)),
+		projectors: Object.freeze([...new Set(source.projectors ?? [])].map(ownActionKeyProjector)),
 	});
 	assertDefinitionCoherence(definition);
 	normalizedDefinitions.add(definition);

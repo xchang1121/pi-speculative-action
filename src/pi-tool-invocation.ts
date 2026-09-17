@@ -66,6 +66,7 @@ export function resolvePiToolInvocation(
 		const executor = "pi.filesystem.local.v2";
 		return {
 			executor,
+			filesystemRoot: cwd,
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
 			filesystem: async (view, request) => {
 				const denied = (): never => { throw new Error("Filesystem operation is not authorized by this execution world"); };
@@ -203,7 +204,7 @@ export async function createClosedSearchProfile(cwd: string) {
 		}, request.signal);
 		invocations.set(tool, Object.freeze({
 			executor: profile.id, identity: Object.freeze({ profile, cwd, home, ...(engine ? { engine: engine.identity } : {}) }),
-			...(engine ? { filesystemRoot: path.parse(cwd).root } : {}),
+			filesystemRoot: engine ? path.parse(cwd).root : cwd,
 			semantics: semantics.get(tool),
 			authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
 		} satisfies ToolInvocation));

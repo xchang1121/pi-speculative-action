@@ -267,7 +267,9 @@ export function createSpeculativeActionHost(
 		});
 		const action = schemaHash === undefined || ![input, invocation?.identity, invocation?.process].every(isImmutableSnapshot)
 			? undefined : actionSemantics.buildKey(tool, input, options.cwd, schemaHash, invocation
-			? { fingerprint: stableValueHash(invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
+			? { fingerprint: stableValueHash(invocation.filesystem
+				? [invocation.identity ?? invocation, { filesystemRoot: invocation.filesystemRoot ?? options.cwd }]
+				: invocation.identity ?? invocation), context: invocation, semantics: invocation.semantics } : undefined);
 		return { ...(invocation ? { invocation } : {}), ...(action ? { action } : {}) };
 	};
 	const checkPermission = async (tool: AgentTool | undefined, context: Omit<SpeculativeAgentPreflightContext, "tool">, recheck = false): Promise<CandidatePreflight> => {

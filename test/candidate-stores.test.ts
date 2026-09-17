@@ -10,6 +10,35 @@ interface Entry {
 }
 
 describe("CandidateStore", () => {
+	it("indexes owned inputs across tools only after sealing and retires their lookup with the owner", () => {
+		let inspected = 0;
+		const store = new CandidateStore<string, Entry>([READ_RANGE_ACTION_KEY_PROJECTOR]);
+		const scopedKey = (tool: string, input: unknown, root = "/workspace") => buildPiActionKey(tool, input, root)!;
+		const source: Entry = { id: "search", estimatedBytes: 1, key: scopedKey("grep", { pattern: "x", path: "." }) };
+		const query = scopedKey("read", { path: "child/value.txt" });
+		for (let i = 0; i < 100; i++) {
+			const action = scopedKey("read", { path: String(i) }, "/other"), other: Entry = { id: `other:${i}`, estimatedBytes: 1, key: action };
+			Object.defineProperty(other, "key", { get: () => { inspected++; return action; } });
+			store.settle("one", other, true, [`/other/${i}`]);
+		}
+		store.insert("one", source); expect(store.lookup("one", query)).toEqual([]);
+		store.settle("one", source, true, ["/workspace/child"]);
+		inspected = 0;
+		expect(store.lookup("one", query)).toMatchObject([{ entry: source, match: { kind: "inputs" } }]);
+		expect(inspected).toBe(0); // Query paths address the existing index, not every retained resource owner.
+		expect(store.lookup("one", query, () => true)).toEqual([]);
+		expect(store.lookup("one", scopedKey("read", { path: "sibling/value.txt" }))).toEqual([]);
+		expect(store.lookup("one", scopedKey("read", { path: "child/value.txt" }, "/elsewhere"))).toEqual([]);
+		expect(store.lookup("one", { ...query, resourceRoot: undefined })).toEqual([]);
+		expect(store.lookup("two", query)).toEqual([]);
+		const requested = { ...entry("request", "unused"), key: query };
+		expect(store.getOrCreate("one", query, () => requested, () => true).inserted).toBe(true);
+		store.delete("one", requested);
+		expect(store.lookup("one", source.key)[0]?.match.kind).toBe("exact");
+		store.delete("one", source);
+		expect(store.lookup("one", query)).toEqual([]);
+	});
+
 	it.each(["id", "partition", "project"] as const)("owns %s while keeping projection reuse and retirement coherent", (field) => {
 		let partitionAvailable = true;
 		let partitionCalls = 0;
