@@ -505,9 +505,12 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		await writeFile(path.join(cwd, "unused.txt"), "original");
+		await writeFile(path.join(cwd, ".ignore"), "# captured preparation rules\n");
+		await writeFile(path.join(cwd, ".rgignore"), "# original transport rules\n");
+		await fs.mkdir(path.join(cwd, "nested")); await writeFile(path.join(cwd, "nested/extra.txt"), "unmatched");
 		const tools: AgentTool[] = [createReadTool(cwd), createLsTool(cwd), createFindTool(cwd), createGrepTool(cwd)];
 		const events: SpeculativeActionEvent<string>[] = [], ready = deferred<void>();
-		const directories = vi.spyOn(fs, "mkdtemp");
+		const directories = vi.spyOn(fs, "mkdtemp"), mkdirs = vi.spyOn(fs, "mkdir"), copies = vi.spyOn(fs, "writeFile");
 		const preparations = () => directories.mock.calls.filter(([name]) => path.basename(String(name)) === "inputs-").length;
 		let predict = true, permitted = true, rootOverride: string | undefined, evaluations = 0;
 		const host = createSpeculativeActionHost("resources", {
@@ -529,16 +532,20 @@ describe("speculative action host", () => {
 		});
 		try {
 			await host.startTurn({ ...startInput(tools[3]!, "seed"), tools }); await ready.promise;
+			const privatePath = (name: unknown) => String(name).includes(`${path.sep}inputs-`);
+			const created = mkdirs.mock.calls.filter(([name]) => privatePath(name)).map(([name]) => String(name));
+			expect(created.length).toBeGreaterThan(0); expect(new Set(created).size).toBe(created.length);
+			expect(copies.mock.calls.filter(([name, bytes]) => privatePath(name) && Buffer.isBuffer(bytes) && bytes.toString() === "# captured preparation rules\n")).toHaveLength(1);
 			predict = false; await host.finishTurn("seed");
 			await host.startTurn({ ...startInput(tools[0]!, "consumer"), tools });
 			expect(preparations()).toBe(1);
 			for (const args of [{ pattern: "two", path: "." }, { pattern: "THREE", path: ".", ignoreCase: true, context: 1, limit: 1 },
-				{ pattern: "one", path: ".", glob: "*.txt" }]) {
+				{ pattern: "one", path: ".", glob: "*.txt" }, { pattern: "^!", path: ".", glob: "*" }]) {
 				const expected = await tools[3]!.execute("reference", args), actor = vi.fn(() => tools[3]!.execute("native", args));
 				const call = { turnID: "consumer", id: args.pattern, tool: "grep", args, tools };
 				expect(await host.execute(call, undefined, actor)).toEqual(expected);
 				expect(await host.execute({ ...call, id: args.pattern + ":again" }, undefined, actor)).toEqual(expected);
-				expect(actor).not.toHaveBeenCalled(); expect(preparations()).toBe(args.glob ? 2 : 1);
+				expect(actor).not.toHaveBeenCalled(); expect(preparations()).toBe(args.glob === "*" ? 3 : args.glob ? 2 : 1);
 			}
 			await writeFile(path.join(cwd, "unused.txt"), "changed but unused");
 			for (const [name, args] of [["read", { path: "notes.txt", offset: 2, limit: 1 }], ["ls", { path: "." }],
@@ -563,10 +570,10 @@ describe("speculative action host", () => {
 			expect((await host.execute({ ...call, id: "changed" }, undefined, actor)).content).toEqual([{ type: "text", text: "current" }]);
 			expect(actor).toHaveBeenCalledTimes(3);
 			await host.finishTurn("consumer", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 14, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 16, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
 			expect(events.filter(event => event.type === "actor_action" && event.settlement.provider.kind === "speculative")
 				.every(event => event.type === "actor_action" && event.settlement.matchedPredictions.length === 0)).toBe(true);
-		} finally { await host.dispose(); await profile.pool.dispose(); directories.mockRestore(); }
+		} finally { await host.dispose(); await profile.pool.dispose(); directories.mockRestore(); mkdirs.mockRestore(); copies.mockRestore(); }
 	});
 
 	it.each([false, true])("only promotes proven host observations, independently of prediction (ThinkThread=%s)", async (thinkthread) => {
