@@ -186,6 +186,27 @@ describe("speculative action resource versions", () => {
 		manager.close();
 	});
 
+	test("shares pending entry reads across scopes and rechecks the next adoption", async () => {
+		const root = await workspace({ value: "A" }), file = path.join(root, "value"), gate = gated();
+		const manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture((["entry", "type", "stat"] as const).map(scope => ({ path: file, scope })));
+		const nativeStat = fs.lstat;
+		const stat = vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+			if (String(target) === file) await gate.wait();
+			return nativeStat(target, options);
+		}) as typeof fs.lstat);
+		const pending = manager.validate(token);
+		try {
+			await gate.entered;
+			expect(stat.mock.calls.filter(([target]) => String(target) === file)).toHaveLength(1);
+			gate.release();
+			expect((await pending).expired).toBe(false);
+			expect(stat.mock.calls.filter(([target]) => String(target) === file)).toHaveLength(4); // Shared admission plus each scope's final identity check.
+			await fs.appendFile(file, "changed");
+			expect((await manager.validate(token)).expired).toBe(true);
+		} finally { gate.release(); await pending; stat.mockRestore(); await token.release(); manager.close(); }
+	});
+
 	test("coalesces pending input reads and drains failed parallel captures before releasing ownership", async () => {
 		for (const phase of ["pending", "dependencies", "tree"]) {
 			const root = await workspace({ value: "A", broken: "B" }), idle = vi.fn();

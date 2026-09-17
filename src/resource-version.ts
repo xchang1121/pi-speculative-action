@@ -606,31 +606,29 @@ async function fingerprintDependencies(
 	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
 ) {
 	const files = new Map<string, Promise<FingerprintResult>>(), nearestExisting = missingResourceResolver(realRoot);
-	let captureEntry = (target: string, _scope: ResourceDependency["scope"]) => fingerprintIO(() => captureFilesystemEntry(target));
-	if (bindings) {
-		// One eager capture owns the namespace evidence shared by every dependency and recursive child.
-		const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
-		const capture = (target: string) => {
-			const key = filesystemPathKey(target), previous = entries.get(key);
-			if (previous) return previous;
-			const pending = fingerprintIO(() => captureFilesystemEntry(target)).then((entry) => {
-				// File and missing fingerprints own their leaf identity; binding evidence owns the namespace.
-				if (entry.info.isDirectory() || entry.link !== undefined) {
-					const dependency = { path: target, scope: "binding" as const };
-					bindings.observations.set(dependencyKey(dependency), { ...dependency, fingerprint: "binding", stamp: digest([statStamp(entry.info), entry.link]) });
-				}
-				return entry;
-			});
-			entries.set(key, pending); return pending;
-		};
-		await capture(bindings.root);
-		captureEntry = async (target, scope) => {
+	const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
+	const capture = (target: string) => {
+		const key = filesystemPathKey(target), previous = entries.get(key);
+		if (previous) return previous;
+		const pending = fingerprintIO(() => captureFilesystemEntry(target)).then((entry) => {
+			// Eager captures own namespace evidence; ordinary validation joins only pending reads.
+			if (bindings && (entry.info.isDirectory() || entry.link !== undefined)) {
+				const dependency = { path: target, scope: "binding" as const };
+				bindings.observations.set(dependencyKey(dependency), { ...dependency, fingerprint: "binding", stamp: digest([statStamp(entry.info), entry.link]) });
+			}
+			return entry;
+		}).finally(() => { if (!bindings) entries.delete(key); });
+		entries.set(key, pending); return pending;
+	};
+	if (bindings) await capture(bindings.root);
+	const captureEntry = async (target: string, scope: ResourceDependency["scope"]) => {
+		if (bindings) {
 			for await (const entry of walkFilesystemPath(target, { capture, followFinal: scope !== "entry" })) {
 				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
 			}
-			return capture(target);
-		};
-	}
+		}
+		return capture(target);
+	};
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
 		const { value, ...metrics } = dependency.scope === "resolution"
