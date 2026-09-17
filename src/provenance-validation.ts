@@ -46,6 +46,15 @@ export type ProvenanceValidation =
 	| (Extract<DynamicDependencyValidation, { status: "valid" }> & { readonly strongKey: Sha256Digest })
 	| Exclude<DynamicDependencyValidation, { status: "valid" }>;
 
+const OBSERVATION_FIELDS = {
+	file: ["contentDigest", "metadataDigest"],
+	directory: ["entriesDigest", "metadataDigest"],
+	absence: ["parentEntriesDigest"],
+	symlink: ["targetDigest", "target"],
+	metadata: ["digest"],
+	fd: ["contentDigest", "eof"],
+} satisfies { [Kind in DynamicDependency["kind"]]: readonly (keyof Extract<DynamicDependency, { kind: Kind }>)[] };
+
 export async function validateProcessCertificate(
 	certificate: ProcessProvenanceCertificate,
 	context: ProvenanceValidationContext = {},
@@ -66,126 +75,83 @@ export async function validateDynamicDependencyCertificate(
 	const startedAt = performance.now();
 	let filesRead = 0;
 	let bytesRead = 0;
+	const metrics = () => ({ filesRead, bytesRead, durationMs: Math.max(0, performance.now() - startedAt) });
+	const indeterminate = (reason: string): DynamicDependencyValidation => ({ status: "indeterminate", reason, ...metrics() });
 	if (!certificate.complete) {
-		return indeterminate("trace_incomplete", startedAt, filesRead, bytesRead);
+		return indeterminate("trace_incomplete");
 	}
 	const acceptedTaints = new Set(context.acceptedTaints ?? []);
 	const blockingTaints = certificate.taints.filter((taint) => !acceptedTaints.has(taint));
 	if (blockingTaints.length) {
-		return indeterminate(
-			`tainted:${blockingTaints.join(",")}`,
-			startedAt,
-			filesRead,
-			bytesRead,
-		);
+		return indeterminate(`tainted:${blockingTaints.join(",")}`);
 	}
 
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];
 	for (const expected of structuredClone(certificate.dependencies)) {
 		try {
+			let observed: DynamicDependency | undefined;
 			if (expected.kind === "fd") {
 				const descriptor = context.fileDescriptors?.get(expected.fd);
-				if (!descriptor) return indeterminate(`fd_unavailable:${expected.fd}`, startedAt, filesRead, bytesRead);
-				const observed: DynamicDependency = { kind: "fd", fd: expected.fd, ...descriptor };
-				current.push(observed);
-				if (descriptor.contentDigest !== expected.contentDigest || descriptor.eof !== expected.eof) {
-					changed.push(`fd:${expected.fd}`);
-				}
-				continue;
-			}
-
-			const physicalPath = context.resolvePath
-				? context.resolvePath(expected.path)
-				: path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
-			if (!physicalPath) return indeterminate(`path_unmapped:${expected.path}`, startedAt, filesRead, bytesRead);
-			switch (expected.kind) {
-				case "file": {
-					const observed = await captureFileDependency(physicalPath, expected.path, expected.role, {
-						includeMetadata: expected.metadataDigest !== undefined,
-						maxFileBytes: context.maxFileBytes,
-					});
-					filesRead++;
-					bytesRead += observed.bytesRead;
-					current.push(observed.dependency);
-					if (
-						observed.dependency.contentDigest !== expected.contentDigest ||
-						observed.dependency.metadataDigest !== expected.metadataDigest
-					) {
-						changed.push(expected.path);
-					}
-					break;
-				}
-				case "directory": {
-					const dependency = await captureDirectoryDependency(
-						physicalPath,
-						expected.path,
-						expected.metadataDigest !== undefined,
-						expected.excludedEntries,
-					);
-					current.push(dependency);
-					if (
-						dependency.entriesDigest !== expected.entriesDigest ||
-						dependency.metadataDigest !== expected.metadataDigest
-					) {
-						changed.push(expected.path);
-					}
-					break;
-				}
-				case "absence": {
-					const dependency = await captureAbsenceDependency(
-						physicalPath,
-						expected.path,
-						expected.parentEntriesDigest !== undefined,
-						expected.parentExcludedEntries,
-					);
-					if (!dependency) {
-						changed.push(expected.path);
+				if (!descriptor) return indeterminate(`fd_unavailable:${expected.fd}`);
+				observed = { kind: "fd", fd: expected.fd, ...descriptor };
+			} else {
+				const physicalPath = context.resolvePath
+					? context.resolvePath(expected.path)
+					: path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
+				if (!physicalPath) return indeterminate(`path_unmapped:${expected.path}`);
+				switch (expected.kind) {
+					case "file": {
+						const captured = await captureFileDependency(physicalPath, expected.path, expected.role, {
+							includeMetadata: expected.metadataDigest !== undefined,
+							maxFileBytes: context.maxFileBytes,
+						});
+						filesRead++;
+						bytesRead += captured.bytesRead;
+						observed = captured.dependency;
 						break;
 					}
-					current.push(dependency);
-					if (dependency.parentEntriesDigest !== expected.parentEntriesDigest) changed.push(expected.path);
-					break;
+					case "directory":
+						observed = await captureDirectoryDependency(
+							physicalPath,
+							expected.path,
+							expected.metadataDigest !== undefined,
+							expected.excludedEntries,
+						);
+						break;
+					case "absence":
+						observed = await captureAbsenceDependency(
+							physicalPath,
+							expected.path,
+							expected.parentEntriesDigest !== undefined,
+							expected.parentExcludedEntries,
+						);
+						break;
+					case "symlink":
+						observed = await captureSymlinkDependency(physicalPath, expected.path);
+						break;
+					case "metadata":
+						observed = await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks);
+						break;
 				}
-				case "symlink": {
-					const dependency = await captureSymlinkDependency(physicalPath, expected.path);
-					current.push(dependency);
-					if (dependency.targetDigest !== expected.targetDigest || dependency.target !== expected.target) {
-						changed.push(expected.path);
-					}
-					break;
-				}
-				case "metadata": {
-					const dependency = await captureMetadataDependency(
-						physicalPath,
-						expected.path,
-						expected.followSymlinks,
-					);
-					current.push(dependency);
-					if (dependency.digest !== expected.digest) changed.push(expected.path);
-					break;
-				}
+			}
+			if (observed) current.push(observed);
+			if (!observed || OBSERVATION_FIELDS[expected.kind].some(field => Reflect.get(observed, field) !== Reflect.get(expected, field))) {
+				changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
 			}
 		} catch (error) {
 			if (missing(error)) {
 				changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
 				continue;
 			}
-			return indeterminate(
-				`validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`,
-				startedAt,
-				filesRead,
-				bytesRead,
-			);
+			return indeterminate(`validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`);
 		}
 	}
 
 	return {
 		...(changed.length ? { status: "stale", changed: Object.freeze([...new Set(changed)]) } : { status: "valid" }),
 		dependencies: Object.freeze(current),
-		filesRead,
-		bytesRead,
-		durationMs: elapsed(startedAt),
+		...metrics(),
 	};
 }
 
@@ -272,19 +238,6 @@ export async function captureSymlinkDependency(
 	const { link: target } = await captureFilesystemEntry(physicalPath);
 	if (target === undefined) throw new Error("not_symlink");
 	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(Buffer.from(target, "utf8")) };
-}
-
-function indeterminate(
-	reason: string,
-	startedAt: number,
-	filesRead: number,
-	bytesRead: number,
-): ProvenanceValidation {
-	return { status: "indeterminate", reason, filesRead, bytesRead, durationMs: elapsed(startedAt) };
-}
-
-function elapsed(startedAt: number): number {
-	return Math.max(0, performance.now() - startedAt);
 }
 
 function finiteLimit(value: number): number {
