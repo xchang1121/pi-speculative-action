@@ -66,6 +66,7 @@ type HandoffState =
 	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
+	readonly key: Sha256Digest;
 	state: HandoffState;
 	binding?: ProcessExecutionBinding;
 	computation?: TimelineInterval;
@@ -97,11 +98,12 @@ type AcquireOptions<Plan> = {
 
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
-	private readonly byKey = new Map<Sha256Digest, HandoffRecord[]>();
+	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
 	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number }>();
 	private maxCompleted: number;
 	private maxBindingBytes: number;
 	private bindingBytes = 0;
+	private completedCount = 0;
 	private disposed = false;
 
 	constructor(maxCompleted: number, maxBindingBytes = 0) {
@@ -117,7 +119,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
 	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): ProcessExecutionBinding | undefined {
-		const record = this.byKey.get(key)?.find(candidate => candidate === handoff);
+		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status === "running" || record.state.candidate?.weakKey !== key ||
 			!record.state.candidate.dependencyCertificate.complete) return;
 		return this.retainBinding(key, record, invocation, record.state.candidate.result.observedProcessMs ?? 0);
@@ -128,10 +130,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (this.disposed || !Number.isFinite(executionMs) || executionMs < 0) return;
 		const record = this.reserve(key, executablePath, new ProcessHandoffOwnership(), snapshotExecutionScope(scope));
 		record.state = { status: "retained" };
+		this.completedCount++;
 		record.settle();
 		let binding: ProcessExecutionBinding | undefined;
 		try { return binding = this.retainBinding(key, record, invocation, executionMs); }
-		finally { if (!binding) this.remove(key, record); }
+		finally { if (!binding) this.remove(record); }
 	}
 
 	private retainBinding(key: Sha256Digest, record: HandoffRecord, invocation: Invocation, executionMs: number): ProcessExecutionBinding | undefined {
@@ -151,8 +154,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
-		return Object.freeze([...this.byKey.values()].flatMap(records => records.flatMap(record =>
-			record.binding?.scope.sessionID === scope.sessionID ? [record.binding] : [])));
+		return Object.freeze([...this.records()].flatMap(record => record.binding?.scope.sessionID === scope.sessionID ? [record.binding] : []));
 	}
 
 	/** Copying a digest/descriptor cannot mint a capability. Revocation affects subsequent admissions. */
@@ -162,19 +164,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean {
-		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "retained")) return true;
+		for (const record of this.records()) if (record.state.status !== "retained") return true;
 		return false;
 	}
 
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {
-		for (const records of this.byKey.values()) if (records.some(record => record.state.status !== "retained" && record.executablePath === executablePath)) return true;
+		for (const record of this.records()) if (record.state.status !== "retained" && record.executablePath === executablePath) return true;
 		return false;
 	}
 
 	/** The running state owns lookup access; completion or release revokes even a borrowed callback. */
 	observeInputs(key: Sha256Digest, handoff: ProcessHandoff, changed: () => Promise<boolean>): () => void {
-		const record = this.byKey.get(key)?.find(candidate => candidate === handoff), state = record?.state;
+		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
 		if (!record || state?.status !== "running") return () => {};
 		const check = () => record.state === state && state.inputsChanged === check ? changed() : Promise.resolve(false);
 		state.inputsChanged = check;
@@ -187,7 +189,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
 		while (true) {
 			if (this.disposed) return { kind: "miss", joined };
-			const records = this.byKey.get(request.key) ?? [];
+			const records = [...this.byKey.get(request.key)?.values() ?? []];
 			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
 				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
@@ -199,7 +201,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				const plan = await request.lookup(completed.map(({ candidate }) => candidate));
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
-				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.includes(selected.record) &&
+				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record) &&
 					(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope) && selected.record.ownership.claimChild()))) {
 					// Retain bounded launch parameters without granting another transfer of this result.
 					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
@@ -239,12 +241,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate): boolean {
-		const record = this.byKey.get(key)?.find((record) => record === handoff);
+		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
+		this.completedCount++;
 		if (candidate) record.computation = new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
-		if (!candidate || !record.scope) this.remove(key, record);
+		if (!candidate || !record.scope) this.remove(record);
 		else this.trim();
 		return true;
 	}
@@ -255,13 +258,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	dispose(): void {
 		this.disposed = true;
-		for (const [key, records] of this.byKey) {
-			for (const record of records) {
-				this.revokeBinding(record);
-				this.complete(key, record);
-			}
+		for (const record of this.records()) {
+			this.revokeBinding(record);
+			this.complete(record.key, record);
 		}
 		this.byKey.clear();
+		this.completedCount = 0;
 	}
 
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): HandoffRecord {
@@ -269,6 +271,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const record: HandoffRecord = {
+			key,
 			completion,
 			executablePath,
 			scope,
@@ -278,27 +281,28 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			get inputsChanged() { return record.state.status === "running" ? record.state.inputsChanged : undefined; },
 			settle,
 		};
-		const records = this.byKey.get(key) ?? [];
-		records.push(record);
+		const records = this.byKey.get(key) ?? new Map();
+		records.set(record, record);
 		this.byKey.set(key, records);
 		return record;
 	}
 
-	private remove(key: Sha256Digest, record: HandoffRecord): void {
+	private *records(): IterableIterator<HandoffRecord> {
+		for (const records of this.byKey.values()) yield* records.values();
+	}
+
+	private remove(record: HandoffRecord): void {
 		this.revokeBinding(record);
-		const retained = this.byKey.get(key)?.filter((candidate) => candidate !== record) ?? [];
-		if (retained.length) this.byKey.set(key, retained);
-		else this.byKey.delete(key);
+		const records = this.byKey.get(record.key);
+		if (records?.delete(record) && record.state.status !== "running") this.completedCount--;
+		if (!records?.size) this.byKey.delete(record.key);
 	}
 
 	private trim(limit = this.maxCompleted): void {
-		let excess = [...this.byKey.values()].flat().filter((record) => record.state.status !== "running").length - limit;
-		if (excess <= 0 && this.bindingBytes <= this.maxBindingBytes) return;
-		for (const [key, records] of this.byKey) {
-			for (const record of records) {
-				if (record.state.status !== "running" && excess-- > 0) this.remove(key, record);
-				else if (this.bindingBytes > this.maxBindingBytes) this.revokeBinding(record);
-			}
+		if (this.completedCount <= limit && this.bindingBytes <= this.maxBindingBytes) return;
+		for (const record of this.records()) {
+			if (record.state.status !== "running" && this.completedCount > limit) this.remove(record);
+			else if (this.bindingBytes > this.maxBindingBytes) this.revokeBinding(record);
 		}
 	}
 
