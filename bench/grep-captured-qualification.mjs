@@ -25,26 +25,13 @@ const nativeEnvironment = Object.freeze({ HOME: pathRules.homeDir, LC_ALL: "C", 
 const rg = getToolPath("rg");
 if (!rg) { console.log(JSON.stringify({ qualification: "skipped", reason: "No existing Pi rg; nothing installed" })); process.exit(0); }
 process.env.PI_OFFLINE = "1";
-const semanticOnly = process.argv.includes("--semantics-only");
-const costOnly = process.argv.includes("--cost-only");
-assert.ok(!costOnly || !semanticOnly, "choose either semantic or cost qualification");
+assert.ok(!process.argv.includes("--cost-only"), "Use complete task replays for performance measurements");
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
 let pool, ownedRg, engine;
 let referenceProcesses = 0, referenceClosed = 0, referenceCancels = 0;
 const configuredAtStart = process.env.RIPGREP_CONFIG_PATH;
 const nativeFlags = ["--no-config", "--sort=path", "--no-ignore-global", "--no-ignore-parent"];
-const rows = semanticOnly ? [] : [
-  { label: "repository", contents: await fs.readFile(new URL("../src/runtime-engine.ts", import.meta.url)), files: costOnly ? 8 : 32, patterns: ["authoritativeMutationResources", "\\b(?:[A-Za-z_]\\w*\\.){4,}[A-Za-z_]\\w*\\b", "(?:\\p{L}+\\s+){15}\\p{L}+"] },
-  { label: "unicode", contents: Buffer.from("Αλφα βήτα Ελληνικά κώδικας γράμματα λέξεις μία δύο τρία τέσσερα\n".repeat(costOnly ? 7_000 : 50_000)), files: 1, patterns: ["needle", "^\\w{60}$", "(?P<word>Αλφα)", "."] },
-];
-const repeats = semanticOnly ? 1 : costOnly ? 3 : 5;
-const timing = (samplesMs) => ({ ms: [...samplesMs].sort((a, b) => a - b)[Math.floor(samplesMs.length / 2)], samplesMs });
-const median = async (run) => {
-  const times = []; let output;
-  for (let i = 0; i < repeats; i++) { const started = performance.now(); output = await run(); times.push(performance.now() - started); }
-  return { ...timing(times), output };
-};
 try {
   const binary = await captureStableFile(await resolveHostExecutable(rg, "rg"), 32 * 1024 * 1024, true);
   engine = Object.freeze({ profile: CLOSED_SEARCH_PROFILE, sha256: binary.hash, platform: process.platform, arch: process.arch, pathRules, environment: nativeEnvironment, selectionFlags: nativeFlags, executionFlags: [...nativeFlags, "--no-ignore"] });
@@ -53,45 +40,19 @@ try {
   pool = new ClosedSearchProcessPool();
   const { preparationMs: workerPreparationMs } = await pool.run("actor", (worker) => worker.ready);
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
-  if (semanticOnly) {
-    process.env.RIPGREP_CONFIG_PATH = configuration;
-    report.push(await qualifyNamespace());
-  }
-  for (const row of rows) {
-    const cwd = path.join(root, row.label); await fs.mkdir(cwd);
-    for (let i = 0; i < row.files; i++) await fs.writeFile(path.join(cwd, `${i}.txt`), row.contents);
-    if (selectedCases.size && !selectedCases.has(row.label)) continue;
-    const tool = createGrepTool(cwd);
-    for (const pattern of row.patterns) {
-      const args = { path: ".", pattern, limit: pattern === "." ? 1 : 100, ...(pattern.startsWith("(?P") ? { context: 1 } : {}) };
-      const native = await median(() => tool.execute("Actor", args));
-      process.env.RIPGREP_CONFIG_PATH = configuration;
-      let captured;
-      try {
-        const configured = await median(() => tool.execute("sorted host Actor", args));
-        captured = await qualifyCaptured(cwd, args, configured.output);
-        captured.sortedHostActorMs = configured.ms;
-        captured.sortedHostActorSamplesMs = configured.samplesMs;
-        captured.nativeOutputEqual = JSON.stringify(configured.output) === JSON.stringify(native.output);
-      } finally { if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart; }
-      report.push({ fixture: row.label, files: row.files, bytes: row.contents.length * row.files, pattern,
-        nativeActorMs: native.ms, nativeActorSamplesMs: native.samplesMs,
-        outputBytes: Buffer.byteLength(JSON.stringify(native.output)), noMatch: native.output.content[0]?.text === "No matches found", captured });
-      console.log(JSON.stringify(report.at(-1)));
-    }
-  }
-  if (!semanticOnly) for (const label of selectedCases) assert.ok(report.some((row) => row.fixture === label), `unknown cost fixture: ${label}`);
-  const cancellationCwd = path.join(root, semanticOnly ? "namespace/search" : "unicode");
-  const cancellation = [{ mode: "limit", ...await qualifyCancellation(cancellationCwd, "limit") }];
-  const cancellationRepeats = semanticOnly || costOnly ? 1 : 20;
-  for (let repeat = 0; repeat < cancellationRepeats; repeat++) {
-    const mode = repeat % 2 ? "budget" : "abort";
-    cancellation.push({ mode, repeat, ...await qualifyCancellation(cancellationCwd, mode) });
+  process.env.RIPGREP_CONFIG_PATH = configuration;
+  report.push(await qualifyNamespace());
+  const cancellationCwd = path.join(root, "namespace/search");
+  const cancellation = [];
+  for (const mode of ["limit", "abort", "budget"]) {
+    // The budget probe needs enough output to exhaust the existing IPC bound.
+    if (mode === "budget") await fs.writeFile(path.join(cancellationCwd, "budget.txt"), "needle\n".repeat(2_000_000));
+    cancellation.push({ mode, ...await qualifyCancellation(cancellationCwd, mode) });
   }
   assert.equal(referenceClosed, referenceProcesses);
   console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
-    referenceProcesses, referenceClosed, referenceCancels, cancellationRepeats,
-    qualification: "Production captured-search profile through Host admission, with explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Counters cover instrumented reference workers and cancellation probes only; ordinary native Pi baselines and production-profile processes are not counted. Cost mode primes the same Host with original Actor service before measured admission; fallback is a valid outcome, not a hit. Not native-default equivalence." }, null, 2));
+    referenceProcesses, referenceClosed, referenceCancels,
+    qualification: "Production captured-search profile through Host admission, with explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Counters cover instrumented reference workers and cancellation probes only. Component timings are not task speedups. Not native-default equivalence." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
   await pool?.dispose();
@@ -100,8 +61,8 @@ try {
 }
 
 async function qualifyCaptured(cwd, args, expected, changed, rejected = false, stableChange = false) {
-  const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set(), trials = [];
-  let started, executions = 0, actorCalls = 0, drafterEnabled = !costOnly, settled;
+  const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set();
+  let executions = 0, actorCalls = 0, settled;
   const preparation = performance.now(), profile = await createClosedSearchProfile(cwd), profilePreparationMs = performance.now() - preparation;
   const bound = profile.invocations.get("grep");
   if (!bound) { await profile.pool.dispose(); throw new Error("existing rg is not qualified by the production profile"); }
@@ -118,7 +79,7 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
   const host = createSpeculativeActionHost("probe", {
-    cwd, getSettings: () => ({ enabled: true, drafterEnabled, drafterGateEnabled: false, drafterMaxDepth: 0,
+    cwd, getSettings: () => ({ enabled: true, drafterEnabled: true, drafterGateEnabled: false, drafterMaxDepth: 0,
       tools: ["grep"], candidateLimit: 1, maxConcurrentActions: 1, resourceCacheMaxEntries: 32, resourceCacheMaxBytes: 16 * 1024 * 1024, patternAware: { enabled: false } }),
     complete: async () => fauxAssistantMessage(fauxToolCall("grep", args), { stopReason: "toolUse" }),
     resolveInvocation: () => invocation, preflight: () => true, executionWorlds: [world],
@@ -132,29 +93,15 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   let callID = 0;
   const actor = async () => {
     settled = Promise.withResolvers();
-    const before = actorCalls, started = performance.now();
+    const before = actorCalls;
     const result = await host.execute({ turnID: turn.turnID, id: `Actor-${++callID}`, tool: "grep", args, tools }, new AbortController().signal,
       async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
-    const ms = performance.now() - started, { provider, rejections } = await settled.promise;
+    const { provider } = await settled.promise;
     assert.equal(actorCalls - before, provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
-    trials.push({ ms, provider, rejections });
     return result;
   };
-  const sampleActor = async () => {
-    const first = trials.length;
-    for (let i = 0; i < repeats; i++) assert.deepEqual(await actor(), expected);
-    return timing(trials.slice(first).map(({ ms }) => ms));
-  };
   try {
-    let hostActor;
-    if (costOnly) {
-      turn.turnID = "baseline"; await host.startTurn(turn);
-      hostActor = await sampleActor();
-      assert.equal(executions, 0); assert.equal(actorCalls, 3);
-      await host.finishTurn(turn.turnID);
-      actorCalls = 0; trials.length = 0; drafterEnabled = true; turn.turnID = "probe";
-    }
-    started = performance.now();
+    const started = performance.now();
     await host.startTurn(turn);
     const completion = await ready.promise;
     assert.equal(completion.observation === "unobserved" ? completion.cause.code : completion.status,
@@ -168,15 +115,11 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
       return { profilePreparationMs, producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
     assert.ok(reads.size || enumerated.size, "captured input observation must reach prepared views");
-    const adopted = await sampleActor();
+    assert.deepEqual(await actor(), expected);
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
-    if (costOnly) for (const trial of trials) {
-      if (trial.provider.kind === "actor") assert.ok(trial.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(trial));
-    } else assert.equal(actorCalls, 0);
+    assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { profilePreparationMs, producerMs, ...(costOnly
-      ? { hostActorMs: hostActor.ms, hostActorSamplesMs: hostActor.samplesMs, probeMs: adopted.ms, probeSamplesMs: adopted.samplesMs, trials }
-      : { hitMs: adopted.ms, hitSamplesMs: adopted.samplesMs }),
+    return { profilePreparationMs, producerMs,
       producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
   } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
 }

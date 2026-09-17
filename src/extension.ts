@@ -826,85 +826,34 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 		const dirty = !isDeepStrictEqual(draft, applied);
 		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools());
 		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
-		const choice = await ctx.ui.select("Speculative action", [
-			`Enabled: ${draft.enabled ? "On" : "Off"}`,
-			`Save settings to: ${scope}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`,
-			`Prediction sources › ${sourceSummary(draft)}`,
-			`Tools & execution › ${toolPolicy.enabled}/${toolPolicy.available} enabled for prediction`,
-			"Advanced settings › tuning, decoding, scheduling, storage",
-			`Apply changes${dirty ? " (pending)" : ""}`,
-			...(dirty ? ["Discard changes"] : []),
-			"Status",
-			"Recent events",
-			"Restore defaults",
-			CLOSE,
-		]);
-		if (!choice || choice === CLOSE) {
-			if (
-				!dirty ||
-				(await ctx.ui.confirm("Discard changes?", "Close without applying the pending speculative-action changes?"))
-			)
-				return;
-			continue;
-		}
-		if (choice.startsWith("Enabled:")) {
-			await editor.setSettings({ ...draft, enabled: !draft.enabled });
-			continue;
-		}
-		if (choice.startsWith("Save settings to:")) {
-			const selected = await ctx.ui.select("Save settings to", ["All projects", "This project", BACK]);
-			if (
-				(selected === "All projects" || selected === "This project") &&
-				(!dirty || (await ctx.ui.confirm("Discard changes?", "Switch configuration scope without applying?")))
-			) {
-				controller.setSettingsScope(selected === "All projects" ? "global" : "project");
+		const actions = new Map<string, MenuAction>([
+			[`Enabled: ${draft.enabled ? "On" : "Off"}`, () => editor.setSettings({ ...draft, enabled: !draft.enabled })],
+			[`Save settings to: ${scope}${isDeepStrictEqual(applied, controller.settings()) ? "" : " (this project overrides shared settings)"}`, async () => {
+				const selected = await ctx.ui.select("Save settings to", ["All projects", "This project", BACK]);
+				if ((selected === "All projects" || selected === "This project") &&
+					(!dirty || await ctx.ui.confirm("Discard changes?", "Switch configuration scope without applying?"))) {
+					controller.setSettingsScope(selected === "All projects" ? "global" : "project");
+					reload();
+				}
+			}],
+			[`Prediction sources › ${sourceSummary(draft)}`, () => openPredictionSources(ctx, editor)],
+			[`Tools & execution › ${toolPolicy.enabled}/${toolPolicy.available} enabled for prediction`, () => openToolsAndExecution(ctx, editor, controller)],
+			["Advanced settings › tuning, decoding, scheduling, storage", () => openAdvancedSettings(ctx, editor)],
+			[`Apply changes${dirty ? " (pending)" : ""}`, async () => {
+				if (!dirty) return ctx.ui.notify("No pending speculative-action changes.", "info");
+				await controller.setSettings(draft);
 				reload();
-			}
-			continue;
-		}
-		if (choice.startsWith("Prediction sources")) {
-			await openPredictionSources(ctx, editor);
-			continue;
-		}
-		if (choice.startsWith("Tools & execution")) {
-			await openToolsAndExecution(ctx, editor, controller);
-			continue;
-		}
-		if (choice.startsWith("Advanced settings")) {
-			await openAdvancedSettings(ctx, editor);
-			continue;
-		}
-		if (choice.startsWith("Apply changes")) {
-			if (!dirty) {
-				ctx.ui.notify("No pending speculative-action changes.", "info");
-				continue;
-			}
-			await controller.setSettings(draft);
-			reload();
-			ctx.ui.notify("Speculative-action settings applied.", "info");
-			continue;
-		}
-		if (choice === "Discard changes") {
-			draft = structuredClone(applied);
-			continue;
-		}
-		if (choice === "Status") {
+				ctx.ui.notify("Speculative-action settings applied.", "info");
+			}],
+		]);
+		if (dirty) actions.set("Discard changes", () => { draft = structuredClone(applied); });
+		actions.set("Status", async () => {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(controller.statusText(), "info");
-			continue;
-		}
-		if (choice === "Recent events") {
-			showRecentEvents(ctx, controller);
-			continue;
-		}
-		if (choice === "Restore defaults") {
-			if (
-				!(await ctx.ui.confirm(
-					"Restore defaults?",
-					"Restore tuning values while keeping the main switch and prediction-source choices?",
-				))
-			)
-				continue;
+		});
+		actions.set("Recent events", () => showRecentEvents(ctx, controller));
+		actions.set("Restore defaults", async () => {
+			if (!await ctx.ui.confirm("Restore defaults?", "Restore tuning values while keeping the main switch and prediction-source choices?")) return;
 			const defaults = normalizeSpeculativeActionSettings(undefined);
 			await editor.setSettings({
 				...defaults,
@@ -922,7 +871,17 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 					forkActionEnabled: draft.selfSpeculation.forkActionEnabled,
 				},
 			});
+		});
+		const choice = await ctx.ui.select("Speculative action", [...actions.keys(), CLOSE]);
+		if (!choice || choice === CLOSE) {
+			if (
+				!dirty ||
+				(await ctx.ui.confirm("Discard changes?", "Close without applying the pending speculative-action changes?"))
+			)
+				return;
+			continue;
 		}
+		await actions.get(choice)?.();
 	}
 }
 

@@ -1,30 +1,53 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { vi } from "vitest";
+import { deferred } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
 	LinuxProcessReuseBackend,
-	type LinuxProcessBackendStatus,
 	type LinuxProcessReuseMetrics,
 } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
+import type { ProcessHandoffRegistry } from "../src/process-handoff.ts";
+import type { SpeculationScheduler } from "../src/scheduler.ts";
 
-export type NumericMetrics = Readonly<Record<string, number>>;
-export const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
-type ReadyLinuxProcessBackendStatus = LinuxProcessBackendStatus & {
-	readonly state: "ready";
-	readonly sandlockBinary: string;
-	readonly straceBinary: string;
-};
+const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
+
+/** Retain a real producer at publication until an Actor is admitted to its running work. */
+export function holdProcessPublication(backend: LinuxProcessReuseBackend) {
+	const release = deferred();
+	let reached = false;
+	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
+	const publish = handoffs.publish.bind(handoffs);
+	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
+		reached = true; await release.promise; return publish(...args);
+	});
+	const scheduler = Reflect.get(backend, "processScheduler") as SpeculationScheduler<object>;
+	const assess = scheduler.assessCandidateJoin.bind(scheduler);
+	let evidence: { request: Parameters<typeof assess>[0]; decision: ReturnType<typeof assess> } | undefined;
+	const assessment = vi.spyOn(scheduler, "assessCandidateJoin").mockImplementation(request => {
+		const decision = assess(request);
+		if (request.state === "running") {
+			evidence = { request, decision };
+			if (decision.allowed) queueMicrotask(() => release.resolve());
+		}
+		return decision;
+	});
+	return {
+		reached: () => reached,
+		evidence: () => evidence,
+		close: () => { release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
+	};
+}
 
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
@@ -107,53 +130,16 @@ export async function prepareLinuxProcessReuse(
 	const status = await fixture.backend.check(true);
 	if (status.state !== "ready") throw new Error(status.detail);
 	if (!status.sandlockBinary || !status.straceBinary) throw new Error("Linux process backend omitted ready binaries");
-	const readyStatus: ReadyLinuxProcessBackendStatus = {
-		...status,
-		state: "ready",
-		sandlockBinary: status.sandlockBinary,
-		straceBinary: status.straceBinary,
-	};
-	const started = performance.now();
 	const workspaceFingerprint = options.includeWorkspaceFingerprint
 		? await fixture.workspaceSandbox.fingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)
 		: undefined;
 	await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 	const backendFingerprint = await fixture.backend.fingerprint();
 	return {
-		status: readyStatus,
 		executionFingerprint: workspaceFingerprint
 			? `${backendFingerprint}:${workspaceFingerprint}`
 			: backendFingerprint,
-		...(workspaceFingerprint ? { workspaceFingerprint } : {}),
-		routePreparationMs: performance.now() - started,
 	};
-}
-
-export async function executeReusableBash(
-	fixture: Pick<LinuxProcessBenchmark, "backend" | "world" | "tool" | "workspace" | "environment" | "shellPath">,
-	input: ReusableBashInput,
-) {
-	const metricsBefore = fixture.backend.metrics();
-	const started = performance.now();
-	const branch = await forkReusableBash(fixture, input);
-	const forkMs = performance.now() - started;
-	const result = await (async () => {
-		if (branch.output.isError) throw new Error(textOutput(branch.output.result));
-		const validationStarted = performance.now();
-		const validation = await branch.validate?.();
-		const validationMs = performance.now() - validationStarted;
-		if (validation?.status !== "valid") throw new Error(`branch validation failed: ${JSON.stringify(validation)}`);
-		const commitStarted = performance.now();
-		const committed = await branch.commit();
-		const commitMs = performance.now() - commitStarted;
-		return {
-			measurement: { forkMs, validationMs, commitMs },
-			output: committed,
-			resources: Object.freeze([...branch.resources]),
-		};
-	})().finally(() => branch.dispose());
-	return { ...result, measurement: { ...result.measurement, totalMs: performance.now() - started,
-		metricDelta: metricDelta(metricsBefore, fixture.backend.metrics()) } };
 }
 
 export interface ReusableBashInput {
@@ -188,45 +174,6 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 		signal: input.signal ?? new AbortController().signal,
 		executionScope: input.executionScope ?? BENCHMARK_SCOPE,
 	});
-}
-
-export async function executeDirectBash(
-	fixture: LinuxProcessBenchmark,
-	input: { readonly label: string; readonly command: string },
-) {
-	const started = performance.now();
-	const output = await fixture.tool.execute(
-		`bench-${input.label}`,
-		{ command: input.command },
-		new AbortController().signal,
-	);
-	return { totalMs: performance.now() - started, output };
-}
-
-export async function linuxBenchmarkHost(
-	status?: ReadyLinuxProcessBackendStatus,
-) {
-	return {
-		platform: process.platform,
-		arch: process.arch,
-		node: process.version,
-		kernel: (await commandOutput("uname", ["-srm"])).trim(),
-		...(status
-			? {
-				sandlock: (await commandOutput(status.sandlockBinary, ["--version"])).trim(),
-				strace: (await commandOutput(status.straceBinary, ["-V"])).split(/\r?\n/)[0]?.trim(),
-			}
-			: {}),
-	};
-}
-
-export async function writeBenchmarkReport(value: unknown, outputPath?: string): Promise<void> {
-	const rendered = `${JSON.stringify(value, null, 2)}\n`;
-	if (outputPath) {
-		await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-		await writeFile(path.resolve(outputPath), rendered, "utf8");
-	}
-	process.stdout.write(rendered);
 }
 
 export async function compileBenchmarkHelper(
@@ -277,28 +224,8 @@ export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProces
 	} as LinuxProcessReuseMetrics;
 }
 
-export function numericMetrics(metrics: LinuxProcessReuseMetrics): NumericMetrics {
+function numericMetrics(metrics: LinuxProcessReuseMetrics): Readonly<Record<string, number>> {
 	return Object.fromEntries(
 		Object.entries(metrics).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
 	);
-}
-
-export function argument(name: string): string | undefined {
-	const index = process.argv.indexOf(name);
-	if (index < 0) return undefined;
-	const value = process.argv[index + 1];
-	if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-	return value;
-}
-
-export function assert(condition: unknown, message: string): asserts condition {
-	if (!condition) throw new Error(message);
-}
-
-export async function waitUntil(condition: () => boolean, timeoutMs = 10_000, intervalMs = 10): Promise<void> {
-	const deadline = performance.now() + timeoutMs;
-	while (!condition()) {
-		if (performance.now() >= deadline) throw new Error("timed out waiting for speculative process state");
-		await delay(intervalMs);
-	}
 }

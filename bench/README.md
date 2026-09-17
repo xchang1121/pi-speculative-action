@@ -11,19 +11,16 @@ npm run bench:check
 npm test -- --maxWorkers=1 --no-file-parallelism
 ```
 
-Windows 与 WSL 顺序运行。性能压力、模型请求和后端资格按需执行，不随文档修改重复运行。测试使用的 `stock-tool-qualification.ts` 和 `linux-process-harness.ts` 是共享夹具。
+Windows 与 WSL 顺序运行。性能压力、模型请求和后端资格按需执行，不随文档修改重复运行。原版工具资格共用 `stock-tool-qualification.ts`；Linux 进程场景共用 `test/linux-process-fixture.ts`。
 
 ## 受控搜索资格
 
 ```sh
 node bench/portable-kernel.mjs
-node --import tsx bench/grep-captured-qualification.mjs --semantics-only
-node --import tsx bench/grep-captured-qualification.mjs --cost-only
+node --import tsx bench/grep-captured-qualification.mjs
 ```
 
-第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 语义资格覆盖配置、目录、链接、输出及原生输入进程的回收；成本模式独立测量配置一致的原生调用、Host 和采纳。
-
-重复计时除中位数外保留按执行顺序排列的 `*SamplesMs`。grep 的 Host 汇总与 `trials.ms` 使用同一组完整 `Host.execute` 返回计时；`cancellation` 按执行顺序记录每次结果，不覆盖相同模式的早期试验。
+第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 资格覆盖配置、目录、链接、输出、取消、输入预算及原生输入进程的回收。组件耗时仅供诊断；性能使用完整任务报告，不再维护独立的 grep 成本模式。
 
 需要已有、合格的 Pi rg，不安装或下载。可用 `--case=<名称>` 选择 grep 场景。资格针对显式 captured profile，不能外推 Native Pi 默认语义、macOS、ARM64 或 ThinkThread。
 
@@ -32,11 +29,11 @@ node --import tsx bench/grep-captured-qualification.mjs --cost-only
 在 Linux 原生文件系统中的 checkout 运行，先使用当前后端自检：
 
 ```sh
-npm run bench:exec-boundary -- --output /tmp/exec-boundary.json
+npm run bench:exec-boundary -- --reporter=json --outputFile=/tmp/exec-boundary.json
 npm run bench:overlay-probe
 ```
 
-`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的单次回退。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，缺少能力时保留跳过原因；它不代替完整进程资格。
+`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口直接运行进程测试，输出 Vitest 报告，检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的回退。场景与日常测试共用，不再维护另一套运行器或组件计时报告。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，缺少能力时保留跳过原因；它不代替完整进程资格。
 
 失败时保留原错误和最小复现信息；时钟证明拒绝不能通过延长等待或跳过检查消除。
 
