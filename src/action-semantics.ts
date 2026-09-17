@@ -222,60 +222,50 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyP
 // A static workspace tree is not their dependency closure or their isolation authority.
 const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities);
 
-export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry([
+export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
 	{
 		tool: "read",
-		epoch: "pi.read",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "content",
-		canonicalize: canonicalRead,
 		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
 	},
 	{
 		tool: "grep",
-		epoch: "pi.grep",
 		effect: "unbounded",
 		requirements: HOST_PROCESS_EFFECTS,
-		canonicalize: canonicalGrep,
 	},
 	{
 		tool: "find",
-		epoch: "pi.find",
 		effect: "unbounded",
 		requirements: HOST_PROCESS_EFFECTS,
-		canonicalize: canonicalFind,
 	},
 	{
 		tool: "ls",
-		epoch: "pi.ls",
 		effect: "observation",
 		requirements: RESOURCE_OBSERVATION_EFFECTS,
 		resourceScope: "entries",
-		canonicalize: canonicalLs,
 	},
 	{
 		tool: "bash",
-		epoch: "pi.bash",
 		effect: "unbounded",
 		requirements: UNRESTRICTED_PROCESS_EFFECTS,
-		canonicalize: canonicalBash,
 	},
 	{
 		tool: "write",
-		epoch: "pi.write",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-		canonicalize: canonicalWrite,
 	},
 	{
 		tool: "edit",
-		epoch: "pi.edit",
 		effect: "workspace_mutation",
 		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-		canonicalize: canonicalEdit,
 	},
-]);
+] satisfies Omit<ActionSemanticsDefinition, "epoch" | "canonicalize">[]).map((definition): ActionSemanticsDefinition => ({
+	...definition,
+	epoch: `pi.${definition.tool}`,
+	canonicalize: (input, cwd) => canonicalPiAction(definition.tool, input, cwd),
+})));
 
 export const OBSERVATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("observation"));
 export const WORKSPACE_MUTATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("workspace_mutation"));
@@ -459,107 +449,51 @@ function finiteOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function canonicalRead(input: unknown, cwd: string): CanonicalAction | undefined {
+function canonicalPiAction(tool: string, input: unknown, cwd: string): CanonicalAction | undefined {
 	const record = asRecord(input);
-	if (!record || typeof record.path !== "string") return undefined;
-	if (!validOptionalInteger(record.offset, 1) || !validOptionalInteger(record.limit, 0)) {
-		return undefined;
+	if (!record) return undefined;
+	if (tool === "bash") {
+		if (typeof record.command !== "string") return undefined;
+		const resource = slash(path.resolve(cwd));
+		return { resources: [resource], input: { command: record.command, cwd: resource,
+			...(finiteOrUndefined(record.timeout) !== undefined ? { timeout: record.timeout } : {}) } };
 	}
-	const resource = normalizeWorkspacePath(record.path, cwd, true);
-	if (resource === undefined) return undefined;
-	return {
-		resources: [resource],
-		input: {
-			path: resource,
-			offset: normalizeReadOffset(record.offset),
-			...(record.limit !== undefined ? { limit: normalizeReadLimit(record.limit) } : {}),
-		},
-	};
-}
-
-function canonicalGrep(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || typeof record.pattern !== "string") return undefined;
-	if (!validOptionalInteger(record.context, 0) || !validOptionalInteger(record.limit, 1)) return undefined;
-	const root = normalizeRelativeRoot(record.path, cwd);
-	if (root === undefined) return undefined;
-	return {
-		resources: [root],
-		input: {
-			pattern: record.pattern,
-			path: root,
-			...(typeof record.glob === "string" ? { glob: record.glob } : {}),
-			ignoreCase: record.ignoreCase === true,
-			literal: record.literal === true,
-			context: nonNegativeInteger(record.context, 0),
-			limit: positiveInteger(record.limit, GREP_DEFAULT_LIMIT),
-		},
-	};
-}
-
-function canonicalFind(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || typeof record.pattern !== "string") return undefined;
-	if (!validOptionalInteger(record.limit, 1)) return undefined;
-	const root = normalizeRelativeRoot(record.path, cwd);
-	if (root === undefined) return undefined;
-	return {
-		resources: [root],
-		input: {
-			pattern: record.pattern,
-			path: root,
-			limit: positiveInteger(record.limit, FIND_DEFAULT_LIMIT),
-		},
-	};
-}
-
-function canonicalLs(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || !validOptionalInteger(record.limit, 1)) return undefined;
-	const root = normalizeRelativeRoot(record.path, cwd);
-	if (root === undefined) return undefined;
-	return {
-		resources: [root],
-		input: { path: root, limit: positiveInteger(record.limit, LS_DEFAULT_LIMIT) },
-	};
-}
-
-function canonicalBash(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || typeof record.command !== "string") return undefined;
-	const normalizedCwd = slash(path.resolve(cwd));
-	return {
-		resources: [normalizedCwd],
-		input: {
-			command: record.command,
-			cwd: normalizedCwd,
-			...(finiteOrUndefined(record.timeout) !== undefined ? { timeout: record.timeout } : {}),
-		},
-	};
-}
-
-function canonicalWrite(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || typeof record.path !== "string" || typeof record.content !== "string") return undefined;
-	const resource = normalizeWorkspacePath(record.path, cwd);
-	if (resource === undefined || resource === ".") return undefined;
-	return { resources: [resource], input: { path: resource, content: record.content } };
-}
-
-function canonicalEdit(input: unknown, cwd: string): CanonicalAction | undefined {
-	const record = asRecord(input);
-	if (!record || typeof record.path !== "string" || !Array.isArray(record.edits) || record.edits.length === 0) {
-		return undefined;
-	}
-	const edits: Array<{ readonly oldText: string; readonly newText: string }> = [];
-	for (const value of record.edits) {
-		const edit = asRecord(value);
-		if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string") return undefined;
-		edits.push({ oldText: edit.oldText, newText: edit.newText });
-	}
-	const resource = normalizeWorkspacePath(record.path, cwd);
-	if (resource === undefined || resource === ".") return undefined;
-	return { resources: [resource], input: { path: resource, edits } };
+	const query = tool === "grep" || tool === "find" || tool === "ls";
+	if (!query && typeof record.path !== "string") return undefined;
+	let fields: Record<string, unknown>;
+	if (query) {
+		if (!validOptionalInteger(record.limit, 1) || (tool !== "ls" && typeof record.pattern !== "string")) return undefined;
+		fields = { ...(tool !== "ls" ? { pattern: record.pattern } : {}), path: record.path };
+		if (tool === "grep") {
+			if (!validOptionalInteger(record.context, 0)) return undefined;
+			Object.assign(fields, {
+				...(typeof record.glob === "string" ? { glob: record.glob } : {}),
+				ignoreCase: record.ignoreCase === true, literal: record.literal === true,
+				context: nonNegativeInteger(record.context, 0),
+			});
+		}
+		fields.limit = positiveInteger(record.limit, tool === "grep" ? GREP_DEFAULT_LIMIT : tool === "find" ? FIND_DEFAULT_LIMIT : LS_DEFAULT_LIMIT);
+	} else if (tool === "read") {
+		if (!validOptionalInteger(record.offset, 1) || !validOptionalInteger(record.limit, 0)) return undefined;
+		fields = { path: record.path, offset: normalizeReadOffset(record.offset),
+			...(record.limit !== undefined ? { limit: normalizeReadLimit(record.limit) } : {}) };
+	} else if (tool === "write") {
+		if (typeof record.content !== "string") return undefined;
+		fields = { path: record.path, content: record.content };
+	} else if (tool === "edit") {
+		if (!Array.isArray(record.edits) || !record.edits.length) return undefined;
+		const edits: Array<{ readonly oldText: string; readonly newText: string }> = [];
+		for (const value of record.edits) {
+			const edit = asRecord(value);
+			if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string") return undefined;
+			edits.push({ oldText: edit.oldText, newText: edit.newText });
+		}
+		fields = { path: record.path, edits };
+	} else return undefined;
+	const resource = query ? normalizeRelativeRoot(record.path, cwd) : normalizeWorkspacePath(record.path as string, cwd, tool === "read");
+	if (resource === undefined || ((tool === "write" || tool === "edit") && resource === ".")) return undefined;
+	fields.path = resource;
+	return { resources: [resource], input: fields };
 }
 
 function readProjectionPartition(action: ActionKey): string | undefined {
