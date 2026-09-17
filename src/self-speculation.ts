@@ -652,9 +652,7 @@ export class SelfSpeculationCoordinator {
 					actor_profile: settings.actorProfile,
 					...(settings.draftFormat === "auto" ? {} : { format: settings.draftFormat }),
 					...(settings.draftBoundary === "auto" ? {} : { boundary: settings.draftBoundary }),
-					candidates: candidates.map((candidate) =>
-						candidatePayload(candidate, this.candidateCalibration(state, candidate)),
-					),
+					candidates: candidates.map(({ candidate, calibration }) => candidatePayload(candidate, calibration)),
 				},
 				settings,
 			);
@@ -841,35 +839,29 @@ function providerPayload(
 		[settings.requestIDField]: requestID,
 	};
 	if (settings.forkTransport === "sidecar") return identified;
+	const { max_tokens, temperature, decoder, forced_prefix, ...fork } = forkPayload(settings);
 	return {
 		...identified,
 		self_speculation: {
 			version: 2,
 			fork: settings.forkEnabled,
 			fork_transport: settings.forkTransport,
-			actor_profile: settings.actorProfile,
-			...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
-			max_draft_tokens: settings.maxDraftTokens,
-			...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
-			fork_max_tokens: settings.forkMaxTokens,
-			fork_temperature: settings.forkTemperature,
-			fork_decoder: settings.forkDecoder,
-			...(settings.forkForcedPrefix === "auto"
-				? {}
-				: { fork_forced_prefix: settings.forkForcedPrefix }),
-			require_logprobs: requiresForkLogprobs(settings),
+			...fork,
+			fork_max_tokens: max_tokens,
+			fork_temperature: temperature,
+			fork_decoder: decoder,
+			...(forced_prefix === undefined ? {} : { fork_forced_prefix: forced_prefix }),
 			d2: {
 				confidence_metric: "minimum_tool_name_probability",
 				confidence_threshold: settings.forkActionMinConfidence,
 				max_attempts: probeSchedule.maxAttempts,
 				retry_token_step: probeSchedule.retryStreamUpdates,
 			},
-			fork_gate: forkGatePayload(settings),
 		},
 	};
 }
 
-function forkPayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
+function forkPayload(settings: SelfSpeculationSettings) {
 	return {
 		actor_profile: settings.actorProfile,
 		...(settings.draftFormat === "auto" ? {} : { draft_format: settings.draftFormat }),
@@ -937,7 +929,7 @@ function candidatePayload(candidate: CandidateRecord, calibration: CandidateCali
 function rankedCandidates(
 	candidates: Iterable<CandidateRecord>,
 	calibration: (candidate: CandidateRecord) => CandidateCalibration,
-): CandidateRecord[] {
+) {
 	return [...candidates]
 		.map((candidate) => ({ candidate, calibration: calibration(candidate) }))
 		.sort(
@@ -951,8 +943,7 @@ function rankedCandidates(
 				right.candidate.expectedDurationMs - left.candidate.expectedDurationMs ||
 				left.candidate.depth - right.candidate.depth ||
 				left.candidate.sequence - right.candidate.sequence,
-		)
-		.map(({ candidate }) => candidate);
+		);
 }
 
 function contextPayload(context: Context) {
