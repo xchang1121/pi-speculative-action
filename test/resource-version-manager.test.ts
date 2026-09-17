@@ -34,7 +34,7 @@ afterEach(async () => {
 
 describe("speculative action resource versions", () => {
 	test.each([true, false])("seals eager observations and on-demand inputs (watch=%s)", async (watch) => {
-		for (const onDemand of [false, true]) for (const change of ["unchanged", "ancestor", "sibling", "write", "restore", "replace", "entries"] as const) {
+		for (const onDemand of [false, true]) for (const change of ["unchanged", "ancestor", "sibling", "write", "restore", "replace", "kind", "entries"] as const) {
 			const parent = await workspace({ "workspace/value.txt": "A" }), root = path.join(parent, "workspace");
 			const file = path.join(root, "value.txt");
 			const manager = new ResourceVersionManager(root, { watch });
@@ -53,7 +53,7 @@ describe("speculative action resource versions", () => {
 				if (onDemand) {
 					expect((await manager.validate(token)).expired).toBe(true); // Open capture is never an adoptable certificate.
 					const value = change === "entries" ? root : file, view = token.view!;
-					const inputs = [() => view.stat(value), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
+					const inputs = [() => view.stat(value, "entry"), () => change === "entries" ? view.readdir(value) : view.readFile(value)];
 					for (const capture of watch ? inputs : inputs.reverse()) await capture();
 					const evidence = [view.bytes, [...token.observations]];
 					view.capture(value, { type: change === "entries" ? "directory" : "file" });
@@ -71,7 +71,8 @@ describe("speculative action resource versions", () => {
 					} finally { opened.mockRestore(); stat.mockRestore(); resolved.mockRestore(); }
 					expect(change === "entries" ? await view.readdir(root) : (await view.readFile(file)).toString()).toEqual(change === "entries" ? ["value.txt"] : "A");
 				}
-				if (change === "write" || change === "restore") await fs.writeFile(file, "B");
+				if (change === "write" || change === "restore") await fs.writeFile(file, change === "write" ? "longer B" : "B");
+				if (change === "kind") { await fs.rm(file); await fs.mkdir(file); }
 				if (change === "unchanged") await directories.create(); // Shared ancestor noise must not change this fixture's expected outcome.
 				if (change === "ancestor") await fs.mkdir(path.join(parent, "unrelated"));
 				if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
@@ -89,7 +90,16 @@ describe("speculative action resource versions", () => {
 					}
 				}
 				token.view!.seal();
-				expect((await manager.validate(token)).expired, change).toBe(change === "write");
+				expect((await manager.validate(token)).expired, change).toBe(change === "write" || change === "kind");
+				if (onDemand) {
+					let dependencies: ReadonlySet<string> | undefined;
+					await token.view!.evaluate((view) => view.stat(change === "entries" ? root : file, "entry"), (observed) => { dependencies = observed; });
+					expect(dependencies?.size).toBe(1);
+					const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
+					const checked = await manager.validate(scoped);
+					expect(checked.expired, change).toBe(change === "kind" || (change === "write" && !watch));
+					if (watch) expect(checked).toMatchObject({ filesRead: 0, bytesRead: 0 });
+				}
 				const sealed = await manager.seal(token);
 				expect(sealed.expired, JSON.stringify({ watch, onDemand, change, sealed })).toBe(onDemand || process.platform === "win32" || change !== "unchanged");
 				if (change === "ancestor" && !onDemand && process.platform !== "win32")
@@ -251,12 +261,23 @@ describe("speculative action resource versions", () => {
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
 				{ path: "@value.txt", offset: 4, limit: 1 }, { path: file, offset: 5 }]) {
 				const action = PI_ACTION_SEMANTICS.buildKey("read", query, root, "", binding)!;
-				expect((await branch.reconstruct!({ action, args: query, callID: "actor", signal }))?.result)
+				expect((await branch.reconstruct!({ action, args: query, callID: "actor", signal }))?.output.result)
 					.toEqual(await native.execute("native", query));
+			}
+			if (capturedOnly) {
+				const query = { path: configuration }, action = PI_ACTION_SEMANTICS.buildKey("read", query, path.dirname(configuration), "", binding)!;
+				const narrow = await branch.reconstruct!({ action, args: query, callID: "configuration", signal });
+				expect(narrow?.output.result).toEqual(await native.execute("native", query));
+				await fs.writeFile(file, "unrelated input changed");
+				expect((await branch.validate!()).status).toBe("stale");
+				expect(await narrow?.validate?.()).toMatchObject({ status: "valid", metrics: { filesRead: 1 } });
+				await fs.writeFile(configuration, "changed query input");
+				expect((await narrow?.validate?.())?.status).toBe("stale");
+				await fs.writeFile(file, text); await fs.writeFile(configuration, "A");
 			}
 			await expect(branch.reconstruct!({ action: key, args: { path: "unproven" }, callID: "bad", signal })).rejects.toThrow("unproven");
 			expect((await branch.validate!()).status).toBe("valid");
-			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.result).toEqual(await native.execute("native", args));
+			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.output.result).toEqual(await native.execute("native", args));
 			await fs.writeFile(configuration, "B");
 			expect((await branch.validate!()).status).toBe(capturedOnly ? "stale" : "valid");
 		} finally { await branch.dispose(); }
@@ -453,6 +474,10 @@ describe("speculative action resource versions", () => {
 				} finally { await lazy.release(); }
 			}
 			const leaf = directory ? path.join(alias, "value.txt") : alias;
+			let dependencies: ReadonlySet<string> | undefined;
+			await token.view!.evaluate((view) => view.readFile(leaf), (observed) => { dependencies = observed; });
+			expect(dependencies?.size).toBe(1); // Child reads retain the proof of the complete alias chain.
+			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
 			for (const requested of [leaf, ...(relative ? [query] : [])]) for (const replaced of [link, ...(relative ? [path.dirname(target)] : [])]) {
 				const observed = await manager.capture([{ path: requested, scope: requested === query ? "tree_content" : "content" }]);
 				const parked = path.join(path.dirname(replaced), "parked");
@@ -461,6 +486,7 @@ describe("speculative action resource versions", () => {
 					if (replaced === link) await fs.symlink(directory ? outside : path.join(outside, "value.txt"), link, type);
 					else { await fs.mkdir(replaced); await fs.writeFile(path.join(replaced, ".git"), "external"); }
 					expect(await fs.readFile(leaf, "utf8")).toBe("external"); // Actor sees B while the original leaf and links remain intact.
+					expect((await manager.validate(scoped)).expired).toBe(true);
 				} finally { await fs.rm(replaced, { force: true, recursive: replaced !== link }); await fs.rename(parked, replaced); }
 				try {
 					expect(await fs.readFile(leaf, "utf8")).toBe("before");

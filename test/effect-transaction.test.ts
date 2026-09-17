@@ -96,7 +96,7 @@ describe("EffectTransactionCoordinator", () => {
 	});
 
 	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
-		for (const phase of ["reconstruction", "validation", "committing", "committed"] as const) for (const fails of [false, true]) {
+		for (const phase of ["reconstruction", "validation", "query-validation", "committing", "committed"] as const) for (const fails of [false, true]) {
 			const gate = gated();
 			const failure = new Error("borrow failed"), dispose = vi.fn();
 			const borrow = async () => {
@@ -107,13 +107,17 @@ describe("EffectTransactionCoordinator", () => {
 			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
 				validate: async () => { if (phase === "validation") await borrow(); return { status: "valid", metrics: metrics() }; },
 				validateAndCommit: closing === "callback" && phase === "validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined,
-				reconstruct: async () => { await borrow(); return "rebuilt"; },
+				reconstruct: async () => {
+					if (phase !== "query-validation") await borrow();
+					return { output: "rebuilt", validate: phase === "query-validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined };
+				},
 				commit: async () => { if (phase === "committing") await borrow(); return "committed"; }, dispose,
 			}));
 			const request = { action: buildPiActionKey("read", { path: "notes" }, "/workspace")!, args: {}, callID: "actor", signal: new AbortController().signal };
 			if (phase === "committing" || phase === "committed") await transaction.validate();
 			if (phase === "committed") await transaction.commit();
-			const invoke = () => phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
+			const query = phase === "query-validation" ? await transaction.reconstruct!(request) : undefined;
+			const invoke = () => query ? query.validate!() : phase === "validation" ? transaction.validate() : phase === "committing" ? transaction.commit() : transaction.reconstruct!(request);
 			const operations = Promise.allSettled(Array.from({ length: closing === "external" && phase !== "committing" ? 2 : 1 }, invoke));
 			await gate.entered;
 			const aborts = Promise.all([transaction.abort(), transaction.abort()]);
@@ -122,11 +126,12 @@ describe("EffectTransactionCoordinator", () => {
 				await nextTurn();
 				expect(dispose).not.toHaveBeenCalled();
 			} finally { gate.release(); await operations; await aborts; }
-			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" ? "rejected" : "fulfilled");
+			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" && phase !== "query-validation" ? "rejected" : "fulfilled");
 			expect(await late).toMatchObject([{ status: "fulfilled", value: { status: "indeterminate" } }, { status: "fulfilled", value: undefined }]);
 			expect(dispose).toHaveBeenCalledOnce();
 			expect(transaction.state).toBe(phase === "committed" || (phase === "committing" && !fails) ? "committed" : phase === "committing" ? "poisoned" : "aborted");
 			expect(await transaction.validate()).toMatchObject({ status: "indeterminate" });
+			if (query) expect(await query.validate!()).toMatchObject({ status: "indeterminate" });
 			expect(await transaction.reconstruct!(request)).toBeUndefined();
 			if (phase === "committed" || (phase === "committing" && !fails)) await expect(transaction.commit()).resolves.toBe("sealed");
 			else await expect(transaction.commit()).rejects.toMatchObject({ disposition: phase === "committing" ? "poisoned" : "recoverable" });
@@ -197,8 +202,9 @@ describe("EffectTransactionCoordinator", () => {
 				compatibility: { status: "incompatible" as const, backend: "test", code: "sealed_incompatible" } };
 			const commit = vi.fn(async function (this: WorldBranch<typeof output>) { expect(this).toBe(source); return output; });
 			const dispose = vi.fn(function (this: WorldBranch<typeof output>) { expect(this).toBe(source); });
+			const query = { output: expected, validate: async function () { expect(this).toBe(query); return { status: "valid" as const, metrics: metrics() }; } };
 			const source: WorldBranch<typeof output> = { ...metadata, checkpoint, output, commit, dispose,
-				reconstruct: async function () { expect(this).toBe(source); return expected; },
+				reconstruct: async function () { expect(this).toBe(source); return query; },
 				validateAndCommit: captured ? async function (this: WorldBranch<typeof output>) { await commit.call(this); return { status: "valid", metrics: metrics() }; } : undefined,
 				validate: async function () { expect(this).toBe(source); return { status: "valid", metrics: metrics() }; } };
 			const pending = captured ? coordinator.capture(attempt, { seal: () => source, dispose: () => {} }).seal(output)
@@ -228,8 +234,14 @@ describe("EffectTransactionCoordinator", () => {
 			expect(Object.getPrototypeOf(borrowed.details)).toBe(Object.prototype);
 			borrowed.content.push("reader edit"); borrowed.details[metadataKey].push("reader edit");
 			expect(transaction.output).toEqual(expected);
-			expect(await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,
-				args: {}, callID: "actor", signal: new AbortController().signal })).toEqual(expected);
+			const rebuilt = await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,
+				args: {}, callID: "actor", signal: new AbortController().signal });
+			expect(rebuilt?.output).toEqual(expected); expect(!!rebuilt?.validate).toBe(!captured);
+			Object.assign(query, { validate: replaced });
+			if (!captured) {
+				expect((await rebuilt?.validate?.())?.status).toBe("valid");
+				expect(attempt.state).toBe("sealed");
+			}
 			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 			await transaction.validate!();
 			expect(attempt.state).toBe("validated"); expect(commit).toHaveBeenCalledTimes(Number(captured));

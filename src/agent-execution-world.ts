@@ -126,24 +126,34 @@ function resourceSnapshotBranch(
 	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number,
 ): WorldBranch<ToolSettlement> {
 	let owned: ResourceVersionToken | undefined = version;
+	const validate = async (token: ResourceVersionToken | undefined) => {
+		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
+		return expired
+			? { status: "stale" as const, cause: cause("freshness", reason ?? "resource_changed"), metrics }
+			: { status: "valid" as const, metrics };
+	};
 	return {
 		backend: "resource_version", output, resources: Object.freeze([]),
 		capturedBytes: version.view?.bytes ?? 0,
 		executionMetrics: Object.freeze({ setupMs }),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
-		validate: async () => {
-			const { expired, reason, ...metrics } = await validateResourceVersion(owned);
-			return expired
-				? { status: "stale", cause: cause("freshness", reason ?? "resource_changed"), metrics }
-				: { status: "valid", metrics };
-		},
+		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			request.signal.throwIfAborted();
 			const execute = (request.action.executionContext as ToolInvocation | undefined)?.filesystem;
 			if (!owned?.view || !execute || request.action.executionFingerprint !== executionFingerprint) return undefined;
-			const result = await owned.view.evaluate((view) => execute(view, request));
+			let scoped: ResourceVersionToken | undefined, capturedBytes = 0;
+			const result = await owned.view.evaluate((view) => execute(view, request), (dependencies) => {
+				if (!dependencies?.size) return;
+				const observations = new Map<string, ResourceVersionToken["observations"] extends ReadonlyMap<string, infer Entry> ? Entry : never>();
+				for (const key of dependencies) {
+					const entry = version.observations.get(key); if (!entry) return;
+					observations.set(key, entry); capturedBytes += key.length * 2 + 64;
+				}
+				scoped = { ...version, observations };
+			});
 			request.signal.throwIfAborted();
-			return result;
+			return { output: result, ...(scoped ? { validate: () => validate(scoped), capturedBytes } : {}) };
 		} } : {}),
 		commit: async () => {
 			if (!owned) throw new Error("resource snapshot is disposed");

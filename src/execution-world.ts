@@ -166,13 +166,19 @@ export interface WorldBranch<Output> {
 	/** Shared observations only: prove freshness and complete the effect-free backend commit together.
 	 * Every call must validate afresh; the coordinator still owns Actor adoption and may call commit again. */
 	readonly validateAndCommit?: () => Promise<ResourceValidation>;
-	/** Re-evaluate a compatible query using only this branch's sealed inputs, without host effects. */
+	/** Re-evaluate sealed inputs; an optional query proof excludes inputs that evaluation never used. */
 	readonly reconstruct?: (request: {
 		readonly action: ActionKey;
 		readonly args: unknown;
 		readonly callID: string;
 		readonly signal: AbortSignal;
-	}) => Promise<Output | undefined>;
+	}) => Promise<{
+		readonly output: Output;
+		/** Authorizes only this effect-free result, without committing the source output. */
+		readonly validate?: () => Promise<ResourceValidation>;
+		/** Additional retained proof storage, excluding the already-owned inputs. */
+		readonly capturedBytes?: number;
+	} | undefined>;
 	/** Shared adoption returns the sealed output; only exclusive effects may return an updated settlement.
 	 * Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */
 	readonly commit: () => Promise<Output>;
@@ -181,7 +187,7 @@ export interface WorldBranch<Output> {
 }
 
 /** Only an actual backend proof can authorize a sealed result; path/event hints cannot replace it. */
-export async function validateWorldBranch<Output>(branch: WorldBranch<Output> | undefined, reuse: WorldReuseStrategy): Promise<ResourceValidation> {
+export async function validateWorldBranch<Output>(branch: Pick<WorldBranch<Output>, "validate"> | undefined, reuse: WorldReuseStrategy): Promise<ResourceValidation> {
 	try {
 		const validation: ResourceValidation = branch?.validate ? await branch.validate() : branch && reuse === "exclusive_branch"
 			? { status: "valid", metrics: zeroValidationMetrics() }
