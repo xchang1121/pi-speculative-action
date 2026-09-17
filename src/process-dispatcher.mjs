@@ -7,36 +7,29 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { captureProcessContext } from "./process-context.mjs";
 
-const nativeRequested = process.argv[2] === "--native-dispatch";
-const native = nativeInvocation();
-const configuration = globalThis.__PI_SPEC_PROCESS_DISPATCHER__ ?? native?.configuration;
-const socketPath = configuration?.socketPath;
-const token = configuration?.token;
-const invokedPath = native?.invokedPath ?? process.argv[1] ?? "";
-const invoked = path.basename(invokedPath);
-const argv0 = native?.argv0 ?? invoked;
-const args = native?.args ?? process.argv.slice(2);
 const environment = { ...process.env };
 // Node ignores SIGXFSZ at startup; an exec outlet must preserve the shell's default disposition.
 const resetXfsz = () => {};
 process.on("SIGXFSZ", resetXfsz);
 process.off("SIGXFSZ", resetXfsz);
 
-if (nativeRequested && (!native || !validConfiguration(configuration))) {
-	process.stderr.write("invalid native dispatch configuration\n");
-	process.exitCode = 125;
-} else if (!configuration && args.length === 3 && args[0] === "--probe-context" && process.cwd() === args[1]) {
-	await run(args[2], [], args[2]);
+if (process.argv.length === 5 && process.argv[2] === "--probe-context" && process.cwd() === process.argv[3]) {
+	await run(process.argv[4], [], process.argv[4]);
 	if (process.exitCode !== 42) throw new Error("sandbox script read position is not preserved");
 	process.exitCode = 0;
 	fs.writeSync(1, JSON.stringify(await captureProcessContext("self", ["0", "1", "2"])));
-} else if (!validConfiguration(configuration) || !invoked) {
-	await fallback();
 } else {
+	let invoked = "process dispatcher";
 	try {
+		if (process.argv[2] !== "--native-dispatch" || process.argv.length < 6) throw new Error("invalid native dispatch invocation");
+		const configuration = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+		if (!validConfiguration(configuration)) throw new Error("invalid native dispatch configuration");
+		const invokedPath = process.argv[4], argv0 = process.argv[5], args = process.argv.slice(6);
+		invoked = path.basename(invokedPath);
+		if (!invoked) throw new Error("missing native dispatch target");
 		const response = await exchange({
 			version: 2,
-			token,
+			token: configuration.token,
 			name: invoked,
 			invokedPath,
 			argv0,
@@ -44,9 +37,15 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 			cwd: process.cwd(),
 			environment,
 			context: await captureProcessContext("self", ["0", "1", "2"]),
-		});
+		}, configuration.socketPath);
 		if (!response || response.version !== 2 || response.kind === "bypass") {
-			await fallback(response?.executable);
+			let executable = response?.executable ?? invokedPath;
+			if (path.isAbsolute(executable)) {
+				const directory = configuration.directories.find(({ target, view }) =>
+					[target, view].some(candidate => path.resolve(path.dirname(executable)) === path.resolve(candidate)));
+				if (directory) executable = path.join(directory.shadow, path.basename(executable));
+			}
+			await run(executable, args, argv0);
 		} else {
 			for (const event of response.output ?? []) {
 				if ((event.fd !== 1 && event.fd !== 2) || typeof event.data !== "string") throw new Error("bad output event");
@@ -64,17 +63,6 @@ if (nativeRequested && (!native || !validConfiguration(configuration))) {
 	}
 }
 
-async function fallback(explicitExecutable) {
-	const unresolved = explicitExecutable ?? invokedPath;
-	const executable = escapeExecutable(unresolved);
-	if (!executable) {
-		process.stderr.write(`${invoked}: command not found\n`);
-		process.exitCode = 127;
-		return;
-	}
-	await run(executable, args, argv0);
-}
-
 async function run(executable, commandArgs, argv0) {
 	const child = spawn(executable, commandArgs, { argv0, cwd: process.cwd(), env: environment, stdio: "inherit" });
 	const outcome = await new Promise((resolve, reject) => {
@@ -83,30 +71,6 @@ async function run(executable, commandArgs, argv0) {
 	});
 	if (outcome.signal) process.kill(process.pid, outcome.signal);
 	else process.exitCode = outcome.code ?? 125;
-}
-
-function escapeExecutable(executable) {
-	if (!executable || !path.isAbsolute(executable)) return executable;
-	for (const directory of configuration?.directories ?? []) {
-		if ([directory.target, directory.view].some((candidate) => path.resolve(path.dirname(executable)) === path.resolve(candidate))) {
-			return path.join(directory.shadow, path.basename(executable));
-		}
-	}
-	return executable;
-}
-
-function nativeInvocation() {
-	if (process.argv[2] !== "--native-dispatch" || process.argv.length < 6) return undefined;
-	try {
-		return {
-			configuration: JSON.parse(fs.readFileSync(process.argv[3], "utf8")),
-			invokedPath: process.argv[4],
-			argv0: process.argv[5],
-			args: process.argv.slice(6),
-		};
-	} catch {
-		return undefined;
-	}
 }
 
 function validConfiguration(value) {
@@ -124,7 +88,7 @@ function validConfiguration(value) {
 	);
 }
 
-async function exchange(request) {
+async function exchange(request, socketPath) {
 	const socket = net.createConnection(socketPath).setEncoding("utf8");
 	socket.setTimeout(24 * 60 * 60 * 1000, () => socket.destroy(new Error("broker timeout")));
 	try {

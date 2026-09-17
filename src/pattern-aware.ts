@@ -1465,13 +1465,26 @@ export function projectPatternAwareObservation(
 	outputPaths: ReadonlyArray<string> = [],
 	resourceRoot?: string,
 ): PatternAwareObservation {
-	const structured = normalizeStructuredPaths(structuredOutput(output), "", resourceRoot);
-	const paths = uniqueStrings(
-		[...outputPaths, ...structuredPaths(structured)].map((item) => normalizeResourcePath(item, resourceRoot)),
-	).sort();
+	const paths = outputPaths.map(item => normalizeResourcePath(item, resourceRoot));
+	const project = (value: unknown, key = "", normalize = true): unknown => {
+		if (typeof value === "string") {
+			if (!isPathField(key)) return value;
+			const result = normalize ? normalizeResourcePath(value, resourceRoot) : value;
+			paths.push(normalizeResourcePath(result, resourceRoot));
+			return result;
+		}
+		if (Array.isArray(value)) return value.map(item => project(item, key, normalize));
+		const record = asRecord(value);
+		if (!record) return value;
+		// Binary payloads remain opaque; only their enumerable metadata contributes paths.
+		const copy = normalize && !ArrayBuffer.isView(value);
+		const entries = Object.entries(record).map(([name, item]) => [name, project(item, name, copy)]);
+		return copy ? Object.fromEntries(entries) : value;
+	};
+	const structured = project(structuredOutput(output)), uniquePaths = uniqueStrings(paths).sort();
 	return {
 		...(structured !== undefined ? { output: structured } : {}),
-		...(paths.length ? { outputPaths: paths } : {}),
+		...(uniquePaths.length ? { outputPaths: uniquePaths } : {}),
 	};
 }
 
@@ -1914,25 +1927,6 @@ function structuredOutput(value: unknown): unknown {
 		return values.length ? { values } : undefined;
 	}
 	return value;
-}
-
-function structuredPaths(value: unknown, key = ""): string[] {
-	if (typeof value === "string") return isPathField(key) ? [value] : [];
-	if (Array.isArray(value)) return value.flatMap((item) => structuredPaths(item, key));
-	const record = asRecord(value);
-	if (!record) return [];
-	return Object.entries(record).flatMap(([name, item]) => structuredPaths(item, name));
-}
-
-function normalizeStructuredPaths(value: unknown, key: string, resourceRoot?: string): unknown {
-	if (typeof value === "string") return isPathField(key) ? normalizeResourcePath(value, resourceRoot) : value;
-	if (Array.isArray(value)) return value.map((item) => normalizeStructuredPaths(item, key, resourceRoot));
-	if (ArrayBuffer.isView(value)) return value;
-	const record = asRecord(value);
-	if (!record) return value;
-	return Object.fromEntries(
-		Object.entries(record).map(([name, item]) => [name, normalizeStructuredPaths(item, name, resourceRoot)]),
-	);
 }
 
 function normalizeResourcePath(value: string, resourceRoot?: string) {
