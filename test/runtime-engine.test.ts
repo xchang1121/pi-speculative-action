@@ -1226,7 +1226,7 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn({ ...actor, terminal: true });
 			admission.mockRestore(); adoption.mockRestore();
 		}
-		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? 2 : 0);
+		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? outputOnly ? 2 : 1 : 0);
 		if (inputLookup) {
 			expect(events.filter((event) => event.type === "actor_action").at(-1)?.settlement.matchedPredictions).toEqual([]);
 			expect(events.filter((event) => event.type === "prediction").at(-1)?.settlement)
@@ -1270,7 +1270,7 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
-	it.each([[2, 4096, 0, 2], [1, 4096, 0, 3], [2, 128, 0, 3], [2, 4096, 4096, 2]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes", async (entries, bytes, proofBytes, evaluations) => {
+	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
 		const disposed = vi.fn();
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
@@ -1281,7 +1281,7 @@ describe("structural speculative runtime", () => {
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "first"
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
-			execute: () => { now += 10; return { ...world("1", { onDispose: disposed,
+			execute: () => { now += sourceMs; return { ...world("1", { onDispose: disposed,
 				validate: async () => { now += 3; return validResource(); } }), reconstruct }; },
 		});
 		try {
@@ -1307,8 +1307,8 @@ describe("structural speculative runtime", () => {
 			expect(queryValidate).not.toHaveBeenCalled(); // Oversized proof falls back to the full proof without repeating the query.
 			await runtime.finishTurn({ ...call("second"), terminal: true });
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
-				toolExecutionMs: 10 + evaluations * 20, authoritativeToolCount: 1 + evaluations,
-				hiddenLatencyMs: learned || unretained ? 10 : proofBytes ? 30 : 50,
+				toolExecutionMs: evaluations * 20, authoritativeToolCount: evaluations,
+				hiddenLatencyMs: learned || unretained ? 0 : proofBytes ? 20 : 40,
 			});
 			now += 10;
 			await runtime.startTurn(start("next-task"));
