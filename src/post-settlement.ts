@@ -9,37 +9,23 @@ export interface BoundedEventQueueSnapshot {
 
 /** Ordered, failure-isolated work that must never extend the Actor settlement barrier. */
 export class PostSettlementQueue {
-	private tail: Promise<void> = Promise.resolve();
-	private closed = false;
-	private readonly onFailure: PostSettlementFailureHandler;
+	private readonly queue: BoundedEventQueue<() => void | Promise<void>>;
 
 	constructor(onFailure: PostSettlementFailureHandler = () => {}) {
-		this.onFailure = onFailure;
+		// Learning is lossless; defer invocation so enqueue never enters a producer callback.
+		this.queue = new BoundedEventQueue(Number.MAX_SAFE_INTEGER, task => Promise.resolve().then(task), onFailure);
 	}
 
 	enqueue(task: () => void | Promise<void>): boolean {
-		if (this.closed) return false;
-		this.tail = this.tail.then(task).catch((error) => {
-			try {
-				this.onFailure(error);
-			} catch {
-				// Diagnostics cannot poison the ordered effects chain.
-			}
-		});
-		return true;
+		return this.queue.enqueue(task);
 	}
 
-	async flush(): Promise<void> {
-		while (true) {
-			const observed = this.tail;
-			await observed;
-			if (observed === this.tail) return;
-		}
+	flush(): Promise<void> {
+		return this.queue.flush();
 	}
 
-	async close(): Promise<void> {
-		this.closed = true;
-		await this.flush();
+	close(): Promise<void> {
+		return this.queue.close();
 	}
 }
 
@@ -51,17 +37,16 @@ interface PendingEvent<Event> {
 /**
  * Failure-isolated, bounded delivery for optional observers.
  *
- * Runtime state transitions and source learning must not enter this queue. If an observer stalls,
- * delivery drops new events after the fixed capacity instead of retaining an unbounded Promise
- * chain for the rest of a long-running session.
+ * Optional observers use a fixed capacity so stalled delivery cannot retain an unbounded backlog.
+ * PostSettlementQueue shares the drain machinery with a lossless capacity for source learning.
  */
 export class BoundedEventQueue<Event> {
 	private readonly capacityValue: number;
 	private readonly deliver: (event: Event) => void | Promise<void>;
 	private readonly onFailure: PostSettlementFailureHandler;
-	private readonly pending: PendingEvent<Event>[] = [];
+	private readonly pending = new Set<PendingEvent<Event>>();
 	private readonly idleWaiters = new Set<() => void>();
-	private active?: PendingEvent<Event>;
+	private active = false;
 	private closed = false;
 	private droppedValue = 0;
 
@@ -78,28 +63,27 @@ export class BoundedEventQueue<Event> {
 
 	enqueue(event: Event): boolean {
 		if (this.closed) return false;
-		const active = this.active ? 1 : 0;
-		if (active + this.pending.length >= this.capacityValue) {
+		if (this.pending.size >= this.capacityValue) {
 			this.droppedValue++;
 			return false;
 		}
-		this.pending.push({ value: event, enqueuedAt: performance.now() });
+		this.pending.add({ value: event, enqueuedAt: performance.now() });
 		if (!this.active) void this.drain();
 		return true;
 	}
 
 	snapshot(now = performance.now()): BoundedEventQueueSnapshot {
-		const oldest = this.active?.enqueuedAt ?? this.pending[0]?.enqueuedAt;
+		const oldest = this.pending.values().next().value?.enqueuedAt;
 		return Object.freeze({
 			capacity: this.capacityValue,
-			pending: this.pending.length + (this.active ? 1 : 0),
+			pending: this.pending.size,
 			dropped: this.droppedValue,
 			oldestPendingMs: oldest === undefined ? 0 : Math.max(0, now - oldest),
 		});
 	}
 
 	async flush(): Promise<void> {
-		if (!this.active && this.pending.length === 0) return;
+		if (!this.pending.size) return;
 		await new Promise<void>((resolve) => { this.idleWaiters.add(resolve); });
 	}
 
@@ -110,11 +94,10 @@ export class BoundedEventQueue<Event> {
 	}
 
 	private async drain(): Promise<void> {
+		this.active = true;
 		try {
-			while (true) {
-				const next = this.pending.shift();
-				if (!next) return;
-				this.active = next;
+			// A Set retains insertion order while admitting reentrant work without shifting a backlog.
+			for (const next of this.pending) {
 				try {
 					await this.deliver(next.value);
 				} catch (error) {
@@ -124,10 +107,11 @@ export class BoundedEventQueue<Event> {
 						// Diagnostics cannot poison later observer delivery.
 					}
 				}
+				this.pending.delete(next);
 			}
 		} finally {
 			// The empty-queue check and release are synchronous; enqueued callbacks drain in the loop.
-			this.active = undefined;
+			this.active = false;
 			for (const resolve of this.idleWaiters) resolve();
 			this.idleWaiters.clear();
 		}
