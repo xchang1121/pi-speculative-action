@@ -89,22 +89,13 @@ export class ProcessReusePlanner {
 
 	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
 		const startedAt = performance.now();
-		let candidateCertificates = 0;
-		let eligibleCertificates = 0;
-		let pathsetsValidated = 0;
-		let filesRead = 0;
-		let bytesRead = 0;
-		let artifactsLoaded = 0;
-		let artifactBytesRead = 0;
+		const metrics = {
+			candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0,
+			filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0,
+		};
 		const lookup = (): ProcessReuseLookupMetrics =>
 			Object.freeze({
-				candidateCertificates,
-				eligibleCertificates,
-				pathsetsValidated,
-				filesRead,
-				bytesRead,
-				artifactsLoaded,
-				artifactBytesRead,
+				...metrics,
 				durationMs: Math.max(0, performance.now() - startedAt),
 			});
 		const weakKey = request.weakKey;
@@ -115,7 +106,7 @@ export class ProcessReusePlanner {
 			...(live.length ? request.live!.acceptedTaints : []),
 		])];
 		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
-		candidateCertificates = certificates.length;
+		metrics.candidateCertificates = certificates.length;
 		if (!certificates.length) {
 			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
 		}
@@ -135,7 +126,7 @@ export class ProcessReusePlanner {
 				reasons.add("observation_contract_incompatible");
 				continue;
 			}
-			eligibleCertificates++;
+			metrics.eligibleCertificates++;
 			const pathset = dependencyPathsetKey(certificate.dependencyCertificate);
 			const grouped = pathsets.get(pathset);
 			if (grouped) grouped.push(certificate);
@@ -144,13 +135,13 @@ export class ProcessReusePlanner {
 
 		for (const grouped of pathsets.values()) {
 			const representative = grouped[0]!;
-			pathsetsValidated++;
+			metrics.pathsetsValidated++;
 			const observation = await validateDynamicDependencyCertificate(
 				representative.dependencyCertificate,
 				{ ...request.validation, acceptedTaints },
 			);
-			filesRead += observation.filesRead;
-			bytesRead += observation.bytesRead;
+			metrics.filesRead += observation.filesRead;
+			metrics.bytesRead += observation.bytesRead;
 			if (observation.status === "indeterminate") {
 				reasons.add("validation_indeterminate");
 				continue;
@@ -183,8 +174,8 @@ export class ProcessReusePlanner {
 					reasons.add("artifact_missing");
 					continue;
 				}
-				artifactsLoaded += artifacts.artifacts;
-				artifactBytesRead += artifacts.bytes;
+				metrics.artifactsLoaded += artifacts.artifacts;
+				metrics.artifactBytesRead += artifacts.bytes;
 				return {
 					kind: "completed_replay",
 					source: live.length ? "live" : "l2",

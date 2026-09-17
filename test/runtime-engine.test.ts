@@ -191,6 +191,8 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: input.onEvent === false ? undefined : async (event) => {
 			events.push(event);
+			for (const value of Object.values(liveSummary)) if (value && typeof value === "object") Object.freeze(value);
+			Object.freeze(liveSummary);
 			liveSummary = reduceSpeculativeTrace(liveSummary, event);
 			ready.observe(event);
 			if (input.onEvent) await input.onEvent(event);
