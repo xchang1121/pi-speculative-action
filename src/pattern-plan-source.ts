@@ -124,37 +124,42 @@ export function createPatternPlanSource({
 		const failure = results.find(result => result.status === "rejected");
 		if (failure) throw failure.reason;
 	};
+	const eventData = (tool: string, input: Readonly<Record<string, unknown>>, output: ToolSettlement | undefined, durationMs: number) => ({
+		tool, input: structuredClone(input), outcome: output?.isError ? "failure" as const : "success" as const,
+		...projectPatternAwareObservation(output?.result, extractOutputPaths(tool, input, output?.result), cwd),
+		durationMs,
+		...(typeof input.operation === "string" ? { operation: input.operation } : {}),
+	});
 	const predictedEvent = (startInput: AgentStartInput, action: Pick<SpeculativeCandidate, "key" | "input">,
 		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
-		sessionID: startInput.sessionID, turnID: startInput.turnID, tool: action.key.tool,
-		input: structuredClone(action.input), outcome: output.isError ? "failure" : "success",
-		...projectPatternAwareObservation(output.result, extractOutputPaths(action.key.tool, action.input, output.result), cwd),
-		durationMs, schemaHash: action.key.schemaHash,
-		...(typeof action.input.operation === "string" ? { operation: action.input.operation } : {}),
-		learnTarget: false,
+		sessionID: startInput.sessionID, turnID: startInput.turnID,
+		...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false,
 	});
-	const planAction = (candidate: PatternAwareCandidate, store: PatternAwareStore, id: string,
-		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"]) => {
-		const action = patternPlanAction(candidate, store, id, dependsOn);
-		// Preserve established whole-action paths. Uncertain idle-capacity probes may prepare a known smaller unit.
-		if (!candidate.background || dependsOn?.length || !operationBindings.size) return action;
-		const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
-		let operation: ObservedOperation | undefined;
-		for (const item of operationBindings.values()) {
-			if (item.binding.available === false) operationBindings.delete(item.key);
-			else if (item.parentHash === parentHash && item.binding.executionMs > (operation?.binding.executionMs ?? 0)) operation = item;
-		}
-		if (!operation) return action;
-		const { binding } = operation;
-		return { ...action, id: `${id}:operation:${binding.identity}`, type: "operation" as const, operation: binding,
-			expectedDurationMs: binding.expectedDurationMs,
-			expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * binding.executionMs),
-			feedback: { ...action.feedback, operation },
-		};
-	};
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
-		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"], parentID?: string) =>
-		candidates.map(candidate => planAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), schemaHashes, dependsOn));
+		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"], parentID?: string) => {
+		let operations: Map<string, ObservedOperation> | undefined;
+		return candidates.map(candidate => {
+			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
+			// Only root background probes may use smaller units; scan their live bindings once per batch.
+			if (!candidate.background || dependsOn?.length || !operationBindings.size) return action;
+			const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
+			if (!operations) {
+				operations = new Map();
+				for (const item of operationBindings.values()) {
+					if (item.binding.available === false) operationBindings.delete(item.key);
+					else if (item.binding.executionMs > (operations.get(item.parentHash)?.binding.executionMs ?? 0)) operations.set(item.parentHash, item);
+				}
+			}
+			const operation = parentHash === undefined ? undefined : operations.get(parentHash);
+			if (!operation) return action;
+			const { binding } = operation;
+			return { ...action, id: `${action.id}:operation:${binding.identity}`, type: "operation" as const, operation: binding,
+				expectedDurationMs: binding.expectedDurationMs,
+				expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * binding.executionMs),
+				feedback: { ...action.feedback, operation },
+			};
+		});
+	};
 
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
@@ -238,22 +243,12 @@ export function createPatternPlanSource({
 				const key = `${parentHash}:${binding.backend}:${binding.identity}`;
 				operationBindings.set(key, { key, parentHash, binding });
 			}
-			const observation = projectPatternAwareObservation(
-				output?.result,
-				extractOutputPaths(tool, concrete, output?.result),
-				cwd,
-			);
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
 			const event: PatternAwareEventInput = {
 				sessionID: consumeInput.sessionID,
 				turnID: consumeInput.turnID,
-				tool,
-				input: structuredClone(concrete),
-				outcome: output?.isError ? "failure" : "success",
-				...observation,
-				durationMs,
-				...(typeof concrete.operation === "string" ? { operation: concrete.operation } : {}),
+				...eventData(tool, concrete, output, durationMs),
 				...(schemaHash === undefined ? {} : { schemaHash }),
 				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
 			};
