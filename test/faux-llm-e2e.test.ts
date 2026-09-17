@@ -37,7 +37,10 @@ describe("faux LLM speculative action end to end", () => {
 			},
 		});
 		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
-		expect(result.summary).toMatchObject({ tasks: 1, actorActions: 5, speculativeHits: 5, actorFallbacks: 0 });
+		expect(result.summary).toMatchObject({ tasks: 1, actorActions: 5, speculativeHits: 5, exactReuseHits: 5, actorFallbacks: 0,
+			sourceRequests: 6, sourceOutcomes: { produced: 5 },
+			predictionsSettled: 5, predictionsObserved: 5, predictionsMatched: 5, predictionsAdopted: 5, predictionPrecision: 1, adoptionYield: 1,
+			candidateStarted: 5, candidateSucceeded: 5, cache: { resultEntries: 5, cacheCold: 0, cacheHot: 5 } });
 		expect(result.executions).toEqual({ read: 5 });
 		expect(result.actorFallbacks).toEqual([]);
 		expect(result.outputs).toEqual(calls.map(() => textResult("one\ntwo\nthree\n")));
@@ -78,7 +81,8 @@ describe("faux LLM speculative action end to end", () => {
 				},
 			});
 			expect(order).toEqual(["producer started", "Actor arrived", "producer released"]);
-			expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1 + drafterMaxDepth, actorFallbacks: 1 - drafterMaxDepth });
+			expect(result.summary).toMatchObject({ actorActions: 2, speculativeHits: 1 + drafterMaxDepth, actorFallbacks: 1 - drafterMaxDepth,
+				hitRate: (1 + drafterMaxDepth) / 2 });
 			expect(result.executions).toEqual({ read: 2 });
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
@@ -111,9 +115,7 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.executions.read).toBe(mode === "candidate error" ? 2 : 1);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n")]);
 			if (mode === "draft error") expect(result.summary.sourceOutcomes.error).toBeGreaterThanOrEqual(1);
-			if (mode === "candidate error") expect(result.events).toEqual(expect.arrayContaining([
-				expect.objectContaining({ type: "candidate", state: expect.objectContaining({ status: "failed" }) }),
-			]));
+			if (mode === "candidate error") expect(result.summary.candidateFailed).toBe(1);
 		}
 	});
 

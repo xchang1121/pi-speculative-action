@@ -4,6 +4,7 @@ import { ActorAction } from "../src/actor-action.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
+import { emptySpeculativeTraceSummary, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
 const identity = { id: "call-1", sequence: 7, turnID: "turn-1" } as const;
 const exact = { kind: "exact", distance: 0 } as const;
@@ -39,6 +40,11 @@ describe("ActorAction", () => {
 				.toEqual(provider === "preview" ? { status: "rejected", candidateID: "fresh", cause: cause("control", "actor_preview_provider") }
 					: { status: "adopted", candidateID: "fresh" });
 			const settled = action.settlement;
+			expect(summarizeSpeculativeTrace([{ type: "actor_action", settlement: settled!, actualAction: "read README.md",
+				sessionID: "session", turnID: identity.turnID, timestamp: 0, cache: emptySpeculativeTraceSummary().cache,
+			}])).toMatchObject(provider === "speculative"
+				? { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3, actorExecutionMs: 0 }
+				: { executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, actorExecutionMs: 40, actorPreviews: 1 });
 			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [{ id: "prediction", source: "pattern" }],
 				rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }], provider: { candidateID: "fresh",
 					...(provider === "preview" ? { kind: "actor", origin: "preview", durationMs: 40 } : { kind: "speculative", match: exact }) } });
