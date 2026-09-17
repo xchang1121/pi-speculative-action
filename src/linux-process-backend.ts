@@ -37,6 +37,7 @@ import {
 	type OrderedEffectEvent,
 	type ProcessProducerProof,
 	type ProcessProvenanceCertificate,
+	type ProcessResultRecord,
 	processWeakKey,
 	type ProvenanceTaint,
 	sealProcessCertificate,
@@ -782,25 +783,12 @@ export class LinuxProcessReuseBackend {
 		const execution = session.topLevelExecution;
 		const evidence = session.topLevelEvidence;
 		if (!execution || !evidence) return;
-		const journal: OrderedEffectEvent[] = [];
-		let sequence = 0;
-		for (const change of changes) {
-			const logicalPath = slash(path.resolve(session.sourceRoot, change.resource));
-			journal.push(await workspaceTransition(this.store, sequence++, logicalPath, change));
-		}
-		for (const event of execution.outcome.output) {
-			journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data: await this.store.artifacts.put(event.data) });
-		}
 		const certificate = sealProcessCertificate({
 			prototype: execution.prototype,
 			producer: session.producer,
 			dependencyCertificate: evidence,
-			result: {
-				replayProfile: "buffered_noninteractive",
-				observedProcessMs: execution.observedProcessMs,
-				journal,
-				exit: exitOutcome(execution.outcome),
-			},
+			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs,
+				changes.map(change => ({ logicalPath: slash(path.resolve(session.sourceRoot, change.resource)), change }))),
 		});
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
 			this.add(session, "wholeCommandPublished");
@@ -1278,22 +1266,13 @@ export class LinuxProcessReuseBackend {
 					taints: [...taints],
 				};
 				stage = "artifacts";
-				const journal: OrderedEffectEvent[] = [];
-				let sequence = 0;
-				for (const effect of effects.effects) {
-					journal.push(await workspaceTransition(this.store, sequence++, effect.logicalPath, effect.change));
-				}
-				for (const event of outcome.output) {
-					const data = await this.store.artifacts.put(event.data);
-					journal.push({ sequence: sequence++, kind: "output", fd: event.fd, data });
-				}
+				const result = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
 				stage = "certificate";
-				const exit = exitOutcome(outcome);
 				const certificate = sealProcessCertificate({
 					prototype,
 					producer: session.nestedProducer,
 					dependencyCertificate,
-					result: { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit },
+					result,
 				});
 				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
@@ -1765,34 +1744,30 @@ async function replayFilesystemEffects(
 	});
 }
 
-async function workspaceTransition(
+/** Whole commands and held children publish the same ordered, content-addressed result format. */
+async function captureProcessResult(
 	store: ProvenanceCertificateStore,
-	sequence: number,
-	logicalPath: string,
-	change:
+	outcome: SpawnOutcome,
+	observedProcessMs: number,
+	effects: readonly { readonly logicalPath: string; readonly change:
 		| Pick<SandboxFileChange, "kind" | "before" | "after" | "beforeMode" | "afterMode">
-		| Pick<SandboxDirectoryChange, "kind" | "before" | "after">,
-): Promise<Extract<OrderedEffectEvent, { kind: "workspace" }>> {
-	let before: WorkspaceEffectState;
-	let after: WorkspaceEffectState;
-	if (change.kind === "directory") {
-		before = change.before ? { kind: "directory", ...change.before } : { kind: "absent" };
-		after = change.after ? { kind: "directory", ...change.after } : { kind: "absent" };
-	} else {
-		before = await regularEffectState(store, change.before, change.beforeMode);
-		after = await regularEffectState(store, change.after, change.afterMode);
+		| Pick<SandboxDirectoryChange, "kind" | "before" | "after"> }[],
+): Promise<ProcessResultRecord> {
+	const journal: OrderedEffectEvent[] = [];
+	for (const { logicalPath, change } of effects) {
+		const state = async (side: "before" | "after"): Promise<WorkspaceEffectState> => {
+			if (change.kind === "directory") return change[side] ? { kind: "directory", ...change[side] } : { kind: "absent" };
+			const content = change[side], mode = change[side === "before" ? "beforeMode" : "afterMode"];
+			if (content === undefined) return { kind: "absent" };
+			if (mode === undefined) throw new Error("transaction file mode is unavailable");
+			return { kind: "file", data: await store.artifacts.put(content), mode };
+		};
+		journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after") });
 	}
-	return { sequence, kind: "workspace", path: logicalPath, before, after };
-}
-
-async function regularEffectState(
-	store: ProvenanceCertificateStore,
-	content: Uint8Array | undefined,
-	mode: number | undefined,
-): Promise<WorkspaceEffectState> {
-	if (content === undefined) return { kind: "absent" };
-	if (mode === undefined) throw new Error("transaction file mode is unavailable");
-	return { kind: "file", data: await store.artifacts.put(content), mode };
+	for (const event of outcome.output) {
+		journal.push({ sequence: journal.length, kind: "output", fd: event.fd, data: await store.artifacts.put(event.data) });
+	}
+	return { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit: exitOutcome(outcome) };
 }
 
 function directoryState(state: Extract<WorkspaceEffectState, { kind: "directory" }>): SandboxDirectoryChange["before"] {
