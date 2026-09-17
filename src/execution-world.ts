@@ -59,20 +59,18 @@ export function sameSpeculativeExecutionRoute(
 }
 
 const WORLD_REUSE_COUNTERS = [
-	"requests", "hits", "actorTimedHits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
+	"requests", "hits", "joinedHits", "sameTurnHits", "crossTurnHits", "unattributedHits",
 	"misses", "bypasses", "published", "tainted", "validationMs", "validationCandidates",
 	"validationPathsets", "validationFilesRead", "validationBytesRead", "validationArtifactsLoaded",
-	"validationArtifactBytesRead", "replayMs", "executionMs", "reusedProcessMs", "actorBaselineMs",
-	"actorTimedHitLatencyMs",
+	"validationArtifactBytesRead", "replayMs", "executionMs", "reusedProcessMs",
 	"wholeCommandRequests", "wholeCommandHits", "wholeCommandMisses", "wholeCommandPublished",
-	"wholeCommandReplayMs", "wholeCommandReusedProcessMs", "wholeCommandActorTimedHits",
-	"wholeCommandActorBaselineMs", "wholeCommandActorTimedHitLatencyMs",
+	"wholeCommandReplayMs", "wholeCommandReusedProcessMs",
 ] as const;
 
 type WorldReuseCounter = typeof WORLD_REUSE_COUNTERS[number];
 /**
  * Backend-neutral process-reuse accounting. Reused-process time is producer-observed work;
- * Actor baseline/latency fields exist only for hits calibrated by prior authoritative runs.
+ * complete-task latency and speedup come from TaskTimeline.
  */
 export type WorldReuseMetrics = Readonly<Record<WorldReuseCounter, number>> & { readonly lastError?: string };
 const EMPTY_WORLD_REUSE_METRICS = Object.fromEntries(WORLD_REUSE_COUNTERS.map((key) => [key, 0])) as unknown as WorldReuseMetrics;

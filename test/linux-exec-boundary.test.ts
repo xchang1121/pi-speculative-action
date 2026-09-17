@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
 					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${scenario.name === "stale" ? "after" : "before"}\n`);
 				if (["disposed", "completed", "running", "cwd"].includes(scenario.name)) {
 					expect(result.metrics, `${scenario.name}: ${JSON.stringify(result.metrics)}`).toMatchObject({ hits: 1, joinedHits: Number(scenario.name === "running"), sameTurnHits: 1,
-						actorTimedHits: 0, actorBaselineMs: 0, reusedProcessMs: expect.any(Number) });
+						reusedProcessMs: expect.any(Number) });
 					expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);
 				} else if (scenario.name === "descriptor") {
 					expect(result.metrics.wholeCommandHits).toBe(0);
