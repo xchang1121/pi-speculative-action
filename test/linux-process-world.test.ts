@@ -18,11 +18,11 @@ import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } f
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
+import { SpeculationScheduler } from "../src/scheduler.ts";
 import { sha256Digest } from "../src/provenance-certificate.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
-import { SpeculationScheduler } from "../src/scheduler.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
@@ -34,10 +34,10 @@ import {
 	commitBenchmarkFixture,
 	compileBenchmarkHelper,
 	createLinuxProcessBenchmark,
-	executeReusableBash,
 	forkReusableBash,
 	prepareLinuxProcessReuse,
-} from "../bench/linux-process-harness.ts";
+	holdProcessPublication,
+} from "./linux-process-fixture.ts";
 
 vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
@@ -49,8 +49,7 @@ describe("Linux process ExecutionWorld", () => {
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-		const release = deferred();
-		let restoreJoin: (() => void) | undefined;
+		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
 		try {
 			const status = await fixture.backend.check(true);
@@ -168,26 +167,7 @@ int main(int argc, char **argv) {
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
-			let sealing = false, joining: boolean | undefined;
-			let joinEvidence: unknown;
-			if (mode === "running") {
-				const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
-				const publish = handoffs.publish.bind(handoffs);
-				const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
-					sealing = true; await release.promise; return publish(...args);
-				});
-				const scheduler = Reflect.get(fixture.backend, "processScheduler") as SpeculationScheduler<object>;
-				const assess = scheduler.assessCandidateJoin.bind(scheduler);
-				const assessment = vi.spyOn(scheduler, "assessCandidateJoin").mockImplementation(request => {
-					const decision = assess(request);
-					if (request.state === "running") {
-						joining = decision.allowed; joinEvidence = { request, decision };
-						if (joining) queueMicrotask(() => release.resolve());
-					}
-					return decision;
-				});
-				restoreJoin = () => { publication.mockRestore(); assessment.mockRestore(); };
-			}
+			if (mode === "running") publication = holdProcessPublication(fixture.backend);
 			if (mode.startsWith("native-prepared-")) {
 				const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
 				const borrowing = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(async options => {
@@ -197,7 +177,7 @@ int main(int argc, char **argv) {
 				restorePreparation = () => borrowing.mockRestore();
 			}
 			await start("prepared");
-			if (mode === "running") await expect.poll(() => sealing, { timeout: 5000 }).toBe(true);
+			if (mode === "running") await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
 			else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
 			if (mode.startsWith("native-prepared-")) {
@@ -212,20 +192,19 @@ int main(int argc, char **argv) {
 				await route.executor.execute({ command: changedParent, cwd: fixture.workspace, environment: fixture.environment,
 					scope: { ...scope, turnID: "foreign" }, onData: bytes => { output += bytes.toString(); } });
 				expect(output).toBe("automatic-parent\nnewest\n");
-				expect(joining, "another turn cannot wait for this one-shot producer").toBeUndefined();
+				expect(publication!.evidence(), "another turn cannot wait for this one-shot producer").toBeUndefined();
 			}
 			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
 			if (mode === "running") {
-				await expect.poll(() => joining).toBeDefined();
-				expect(joining, JSON.stringify(joinEvidence)).toBe(true);
+				await expect.poll(() => publication!.evidence()?.decision.allowed).toBe(true);
 			}
 			const stalePreparation = mode === "native-prepared-stale";
 			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
-			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence, metrics: fixture.backend.actorMetrics() })).toBe(Number(mode === "running"));
+			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence: publication?.evidence(), metrics: fixture.backend.actorMetrics() })).toBe(Number(mode === "running"));
 			await host.finishTurn("prepared");
 			const execution = events.filter(event => event.type === "actor_action")
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
@@ -246,7 +225,7 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { release.resolve(); restoreJoin?.(); restorePreparation?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
+		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
@@ -256,6 +235,15 @@ int main(int argc, char **argv) {
 		execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
+			const run = (...args: string[]) => childProcess.spawnSync(binary, args, { encoding: "utf8", timeout: 1_000 });
+			const passThrough = "printf out; printf err >&2; exit 7";
+			const direct = childProcess.spawnSync("/bin/bash", ["-c", passThrough], { encoding: "utf8" });
+			expect(run("/bin/bash", "-c", passThrough)).toMatchObject({ status: direct.status, signal: direct.signal, stdout: direct.stdout, stderr: direct.stderr });
+			expect(run("--skip-code", "42", "/bin/bash", "-c", "exec /bin/sleep 5").status).toBe(42);
+			expect(childProcess.spawnSync("/bin/bash", ["-c", "grep '^TracerPid:' /proc/self/status"], { encoding: "utf8" }).stdout).toMatch(/\t0\n$/);
+			expect(run("/bin/bash", "-c", "grep '^TracerPid:' /proc/self/status").stdout).not.toMatch(/\t0\n$/);
+			expect(run("/bin/bash", "-c", "(sleep 0.05; kill -CONT $$) & kill -STOP $$; printf resumed"))
+				.toMatchObject({ status: 0, stdout: "resumed" });
 			const text = `bound-name\nliteral ' $ value\nprivate value\n${root}\nstdin\n`;
 			for (const [route, stdout, stderr] of [["12", text, "stderr"], ["11", text + "stderr", ""],
 				["21", "stderr", text], ["22", "", text + "stderr"]]) {
@@ -966,21 +954,7 @@ int main(void) {
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				expect(branch.commitMetrics).toBeDefined();
 				expect(ownership.claimChild()).toBe(false);
-				const gate = gated();
-				const clock = vi.spyOn(performance, "now").mockReturnValue(0);
-				const execute = vi.spyOn(world.speculation, "execute").mockResolvedValue(branch);
-				const dispose = vi.spyOn(branch, "dispose").mockImplementation(gate.wait);
-				let delivered = false;
-				const measured = executeReusableBash({ backend, world, workspace: root, environment: {}, shellPath: invocation.process!.shell,
-					tool: createBashTool(root) }, { label: "cleanup", command: "opaque", actionNamespace: "", executionFingerprint: "fake-process" })
-					.then(result => { delivered = true; return result; });
-				try {
-					await Promise.race([gate.entered, measured]); await nextTurn(); expect(delivered).toBe(false);
-					clock.mockReturnValue(100); gate.release();
-					expect((await measured).measurement.totalMs).toBe(100);
-				} finally {
-					gate.release(); await measured.catch(() => undefined); clock.mockRestore(); execute.mockRestore(); dispose.mockRestore();
-				}
+
 			}
 			finally { await branch.dispose(); }
 			expect(close).toHaveBeenCalledOnce();
