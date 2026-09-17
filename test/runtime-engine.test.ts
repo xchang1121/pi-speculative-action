@@ -6,6 +6,7 @@ import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../s
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
 import {
+	emptyWorldReuseMetrics,
 	type SpeculativeExecutionRoute,
 	type WorldBranch,
 } from "../src/execution-world.ts";
@@ -22,6 +23,7 @@ import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
+import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
 interface Start<SessionID = string> {
 	readonly sessionID: SessionID;
@@ -145,6 +147,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	readonly onEvent?: false | TestAdapter<SessionID>["onEvent"];
 }) {
 	const events: SpeculativeActionEvent<SessionID>[] = [];
+	let liveSummary = emptySpeculativeTraceSummary();
 	const ready = candidateSucceeded<SessionID>();
 	let executions = 0;
 	const runtime = makeSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
@@ -188,11 +191,15 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: input.onEvent === false ? undefined : async (event) => {
 			events.push(event);
+			liveSummary = reduceSpeculativeTrace(liveSummary, event);
 			ready.observe(event);
 			if (input.onEvent) await input.onEvent(event);
 		},
 	});
-	return { runtime, events, executions: () => executions, ready };
+	return { runtime, events, executions: () => executions, ready, summary: () => {
+		expect(summarizeSpeculativeTrace(events)).toEqual(liveSummary);
+		return liveSummary;
+	} };
 }
 
 function simulatedExecution(durationMs: number): TimelineInterval {
@@ -216,7 +223,7 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
-	it.each(["same", "next"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
+	it.each(["same", "next", "unused"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
 		const complete = vi.fn(), materialized = vi.fn(), continuation = vi.fn(), settled = vi.fn();
 		let adopted: Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"];
@@ -225,11 +232,15 @@ describe("structural speculative runtime", () => {
 			{ ...readAction("child", { path: "README.md" }, { latestHorizon: 1 }), type: "operation", operation: binding },
 			readAction("whole", { path: "README.md" }, { latestHorizon: 1 }),
 		] }), continue: continuation, onSettled: settled });
-		const { runtime, events } = harness({ source, onCandidateMaterialized: materialized,
+		const { runtime, events, summary } = harness({ source, onCandidateMaterialized: materialized,
 			executeCandidate: async ({ candidate, onOperationAdopted, acceptOperationScope }) => {
 				complete(candidate.type);
 				if (candidate.type === "operation") { adopted = onOperationAdopted; acceptScope = acceptOperationScope; }
-				return world(candidate.type === "operation" ? "child only" : "whole tool", { validate: async () => validResource() });
+				return world(candidate.type === "operation" ? "child only" : "whole tool", { validate: async () => validResource(),
+					executionMetrics: candidate.type === "operation" ? { reuse: {
+						...emptyWorldReuseMetrics(), requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3,
+					} } : {},
+				});
 			},
 		});
 		try {
@@ -253,12 +264,17 @@ describe("structural speculative runtime", () => {
 			expect(settled).not.toHaveBeenCalled();
 			const prepared = await runtime.prepareActorCall(call(turn));
 			expect(prepared?.output).toBe("whole tool");
-			adopted!({ ...receipt, scope: start(turn) });
-			await runtime.finishTurn(call(turn));
+			if (mode !== "unused") adopted!({ ...receipt, scope: start(turn) });
+			await runtime.finishTurn({ ...call(turn), terminal: mode === "unused" });
 			expect(acceptScope!(start(turn))).toBe(false);
-			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
+			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: mode === "unused" ? {
+				observation: "unobserved", cause: { stage: "control", code: "session_terminal" },
+			} : {
 				prediction: { kind: "operation" }, actorAction: { kind: "operation" }, match: { matched: true, adoption: { status: "adopted" } },
 			} }]);
+			expect(summary()).toMatchObject({ operationPredictionsSettled: 1, operationPredictionsAdopted: mode === "unused" ? 0 : 1,
+				candidateStarted: 2, candidateSucceeded: 2, candidateFailed: 0,
+				processReuse: { requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3 } });
 			expect(continuation.mock.calls.every(([input]) => input.actionID === "whole")).toBe(true);
 			expect(events.filter(event => event.type === "actor_action")).toHaveLength(mode === "next" ? 2 : 1);
 		} finally { await runtime.dispose(); }
@@ -581,13 +597,14 @@ describe("structural speculative runtime", () => {
 				settlements.push(settlement);
 			},
 		});
-		const { runtime, events, ready: candidateReady } = harness({
+		const { runtime, events, summary, ready: candidateReady } = harness({
 			source,
 			expired: () => true,
 			actionKey,
 		});
 		await runtime.startTurn(start("turn"));
 		await candidateReady.promise;
+		expect(summary().cache).toMatchObject({ resultEntries: 1, cacheCold: 1, cacheHot: 0 });
 
 		const prepared = await runtime.prepareActorCall(call("turn"));
 		expect(prepared?.output).toBeUndefined();
@@ -613,6 +630,12 @@ describe("structural speculative runtime", () => {
 		expect(events.find((event) => event.type === "candidate")).toMatchObject({
 			candidate: { draftTokens: 3, totalDraftTokens: 3 },
 		});
+		expect(summary()).toMatchObject({ predictionsSettled: 1, predictionsObserved: 1, predictionsMatched: 1, predictionsAdopted: 0,
+			predictionPrecision: 1, adoptionYield: 0, predictionRejectedAfterMatch: { "freshness:resource_changed": 1 },
+			actorActions: 1, speculativeHits: 0, actorFallbacks: 1, actorExecutionMs: 4, totalDraftTokens: 3 });
+		const invalidTiming = events.map(event => event.type === "candidate" && event.state.status === "succeeded"
+			? { ...event, state: { ...event.state, executionMs: Number.NaN } } : event);
+		expect(summarizeSpeculativeTrace(invalidTiming).speculativeExecutionMs).toBe(0);
 	});
 
 	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
@@ -801,7 +824,7 @@ describe("structural speculative runtime", () => {
 				}
 				finally { await cleanup(); }
 			})();
-			const { runtime, executions: executionCount } = harness({
+			const { runtime, summary, executions: executionCount } = harness({
 				source: planSource({ enabled: () => !observing,
 					timeoutMs: () => mode === "terminal" ? 0 : undefined,
 					propose: ({ signal }) => phase === "prediction" ? produce(signal) : plan("late"),
@@ -846,6 +869,8 @@ describe("structural speculative runtime", () => {
 				expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]); await observed;
 				expect(cleanup).toHaveBeenCalledOnce(); expect(executionCount()).toBe(executions);
 				expect(runtime.inspect().sharedCandidates).toBe(mode === "terminal" && phase === "continuation" ? 1 : 0);
+				if (mode === "terminal") expect(summary()).toMatchObject({ sourceOutcomes: { timeout: 1 },
+					...(phase === "continuation" ? { predictionUnobserved: { "control:session_terminal": 1 } } : {}) });
 			} finally { finish.arrive(); releaseGate.release(); await production?.catch(() => {}); await runtime.dispose(); }
 		}
 	});
@@ -923,7 +948,7 @@ describe("structural speculative runtime", () => {
 		const validate = (captured: unknown): ResourceValidation => captured === version
 			? validResource()
 			: { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() };
-		const { runtime, events, executions: executionCount } = harness({
+		const { runtime, events, summary, executions: executionCount } = harness({
 			source: planSource({ continueOn: ["execution_succeeded"],
 				propose: ({ startInput }) => startInput.turnID === "second" ? plan("recall") : undefined,
 				continue: ({ output }) => { outputs.push(output); recalled.arrive(); return undefined; } }),
@@ -973,6 +998,9 @@ describe("structural speculative runtime", () => {
 				authoritativeToolCount: reusable && !fallback ? 1 : 2,
 				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
 			});
+			expect(summary()).toMatchObject({ tasks: 1, endToEndMs: now - 100, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
+				nonToolMs: reusable ? 52 : 58, serializedMs: now - 100 + (reusable ? 0 : 6), hiddenLatencyMs: reusable ? 0 : 6,
+				speculativeExecutionMs: reusable ? 0 : 6, actorExecutionMs: fallback ? 6 : 4 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -1079,7 +1107,7 @@ describe("structural speculative runtime", () => {
 				return result;
 			});
 			const speculative = mode === "producer" || mode === "preview";
-			const { runtime } = harness({
+			const { runtime, summary } = harness({
 				source: planSource({ propose: () => [
 					{ id: "busy", source: "source", revision: 0, actions: [
 						readAction("busy", { path: "busy.ts" }, { expectedLatencyBenefitMs: speculative ? 0 : 1 })] },
@@ -1109,6 +1137,7 @@ describe("structural speculative runtime", () => {
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
 					stopped.arrive(); await cleanupGate.entered; await nextTurn();
 					expect(service.mock.calls.filter(([, , outcome]) => outcome === "cancelled")).toEqual(cancelled);
+					expect(summary()).toMatchObject({ candidateCancelled: 1, candidateTerminalCauses: { "admission:scheduler_preempted": 1 } });
 					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
 					cleanupGate.release(); await targetGate.entered;
 				}
@@ -1228,6 +1257,10 @@ describe("structural speculative runtime", () => {
 			admission.mockRestore(); adoption.mockRestore();
 		}
 		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? outputOnly ? 2 : 1 : 0);
+		if (scenario === "output-valid") expect(summarizeSpeculativeTrace(events)).toMatchObject({
+			actorActions: 2, speculativeHits: 2, exactReuseHits: 0, partialResultReuseHits: 2,
+			partialResultReuseByProjector: { "read.range": 2 }, hitRate: 1,
+		});
 		if (inputLookup) {
 			expect(events.filter((event) => event.type === "actor_action").at(-1)?.settlement.matchedPredictions).toEqual([]);
 			expect(events.filter((event) => event.type === "prediction").at(-1)?.settlement)
@@ -1481,6 +1514,9 @@ describe("structural speculative runtime", () => {
 				? { stage: "compatibility", code: indeterminate ? "backend_indeterminate" : "backend_incompatible",
 					detail: indeterminate ? "attestation_missing" : "sealed_incompatible" } : { stage: "commit", code: "world_commit_failed" });
 			expect(settlement?.provider).toMatchObject({ kind: "actor", origin: "fallback" });
+			if (indeterminate) expect(summarizeSpeculativeTrace(events)).toMatchObject({
+				actorCandidateRejections: { "compatibility:backend_indeterminate": 1 }, actorActions: 1, actorFallbacks: 1,
+			});
 			expect(commit).toHaveBeenCalledTimes(incompatible ? 0 : 1);
 			expect(dispose).toHaveBeenCalledOnce();
 			if (indeterminate) expect(settlements).toEqual([expect.objectContaining({ match: {
@@ -2206,6 +2242,9 @@ describe("structural speculative runtime", () => {
 					.filter((event) => event.type === "prediction")
 					.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined)),
 			).toEqual([false, true]);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ predictionsSettled: 2, predictionsObserved: 2,
+				predictionsMatched: 1, predictionsAdopted: 1, predictionPrecision: 1 / 2, adoptionYield: 1,
+				actorActions: 2, speculativeHits: 1, actorFallbacks: 1, hitRate: 1 / 2 });
 		} finally {
 			await runtime.finishTurn({ ...call("target"), terminal: true });
 		}
