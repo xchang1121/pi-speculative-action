@@ -572,6 +572,8 @@ describe("speculative action resource versions", () => {
 			const leaf = directory ? path.join(alias, "value.txt") : alias;
 			let dependencies: ReadonlySet<string> | undefined;
 			await token.view!.evaluate((view) => view.readFile(leaf), (observed) => { dependencies = observed; });
+			expect(token.view!.resources.filter(input => input.descendants).map(input => path.basename(input.path)).sort())
+				.toEqual(["alias"]); // Only the requested alias owns a query entry; intermediate links remain binding evidence.
 			expect(dependencies?.size).toBe(2); // Child reads retain the complete alias chain and current root resolution.
 			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
 			for (const requested of [leaf, ...(relative ? [query] : [])]) for (const replaced of [link, ...(relative ? [path.dirname(target)] : [])]) {

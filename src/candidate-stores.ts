@@ -1,6 +1,7 @@
 import { nonNegativeCount as finiteLimit, nonNegativeFinite as finiteValue } from "./number-utils.ts";
 import { filesystemPathKey } from "./path-utils.ts";
 import path from "node:path";
+import type { WorldBranch } from "./execution-world.ts";
 import {
 	type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
 	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector,
@@ -85,9 +86,9 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return this.get(scope, entry.id) === entry;
 	}
 
-	lookup(scope: Scope, action: ActionKey, requireCoverage?: (entry: Entry) => boolean): readonly CandidateLookup<Entry>[] {
+	lookup(scope: Scope, action: ActionKey, requireCoverage?: (entry: Entry) => boolean, includeInputs = true): readonly CandidateLookup<Entry>[] {
 		return this.scopes.has(scope)
-			? this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage, true).map(({ entry, match }) => ({ entry, match }))
+			? this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage, includeInputs).map(({ entry, match }) => ({ entry, match }))
 			: [];
 	}
 
@@ -130,7 +131,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	/** Retention adds evidence to the existing owner; it neither reinserts nor changes identity. */
-	settle(scope: Scope, entry: Entry, shared = true, inputs: readonly string[] = []): void {
+	settle(scope: Scope, entry: Entry, shared = true, inputs: NonNullable<WorldBranch<unknown>["inputResources"]> = []): void {
 		this.insert(scope, entry);
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
@@ -138,7 +139,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (shared) indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
 		if (shared && !indexed.inputs && inputs.length) {
 			const partitions = this.scopes.get(scope)!.partitions;
-			for (const key of new Set(inputs.map(inputPartition))) {
+			for (const key of new Set(inputs.map(input => inputPartition(input.path, input.descendants)))) {
 				const members = partitions.get(key) ?? new Set();
 				members.add(indexed); partitions.set(key, members);
 				indexed.memberships.push([partitions, key]);
@@ -196,8 +197,11 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			if (action.resourceRoot === undefined && !path.isAbsolute(resource)) continue;
 			let current = path.resolve(action.resourceRoot ?? "", resource), depth = 0;
 			for (;;) {
-				for (const indexed of state.partitions.get(inputPartition(current)) ?? []) {
-					inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth)); candidates.add(indexed);
+				const keys = depth ? [inputPartition(current, true)] : [inputPartition(current), inputPartition(current, true)];
+				for (const key of keys) {
+					for (const indexed of state.partitions.get(key) ?? []) {
+						inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth)); candidates.add(indexed);
+					}
 				}
 				const parent = path.dirname(current); if (parent === current) break;
 				current = parent; depth++;
@@ -261,7 +265,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 }
 
-const inputPartition = (resource: string) => "inputs:" + filesystemPathKey(resource);
+const inputPartition = (resource: string, descendants = false) => `inputs:${descendants ? "tree" : "path"}:` + filesystemPathKey(resource);
 
 export type ResultCacheSegment = "cold" | "hot";
 
