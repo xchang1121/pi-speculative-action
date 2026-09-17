@@ -53,7 +53,6 @@
 		"build": "shx rm -rf dist && tsc -p tsconfig.build.json && shx cp src/process-dispatcher.mjs src/closed-search-kernel.mjs src/closed-search-process.mjs dist/",
 		"bench:ablation": "tsx ./bench/run.ts",
 		"bench:suite": "tsx ./bench/suite.ts",
-		"bench:tape": "tsx ./bench/tape.ts",
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
 		"bench:exec-boundary": "vitest --run test/linux-exec-boundary.test.ts test/linux-process-world.test.ts --maxWorkers=1 --no-file-parallelism",
 		"bench:overlay-probe": "vitest --run test/linux-overlayfs.test.ts test/workspace-sandbox.test.ts --maxWorkers=1 --no-file-parallelism -t OverlayFS",
