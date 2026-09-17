@@ -20,7 +20,7 @@ node bench/portable-kernel.mjs
 node --import tsx bench/grep-captured-qualification.mjs
 ```
 
-第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 资格覆盖配置、目录、链接、输出、取消、输入预算及原生输入进程的回收。组件耗时仅供诊断；性能使用完整任务报告，不再维护独立的 grep 成本模式。
+第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 资格覆盖配置、目录、链接、输出、取消、输入预算及原生输入进程的回收；同一工作区的场景共用已准备的执行器，切换工作区时先回收旧执行器，各 Host 独立捕获和验证输入。两项只报告语义与回收结果，性能使用完整任务报告，不再重复运行工具成本采样。
 
 需要已有、合格的 Pi rg，不安装或下载。可用 `--case=<名称>` 选择 grep 场景。资格针对显式 captured profile，不能外推 Native Pi 默认语义、macOS、ARM64 或 ThinkThread。
 

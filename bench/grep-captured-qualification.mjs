@@ -28,7 +28,7 @@ process.env.PI_OFFLINE = "1";
 assert.ok(!process.argv.includes("--cost-only"), "Use complete task replays for performance measurements");
 const selectedCases = new Set(process.argv.find((arg) => arg.startsWith("--case="))?.slice(7).split(",") ?? []);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-grep-evidence-")), report = [];
-let pool, ownedRg, engine;
+let pool, ownedRg, engine, profile, preparedProfiles = 0;
 let referenceProcesses = 0, referenceClosed = 0, referenceCancels = 0;
 const configuredAtStart = process.env.RIPGREP_CONFIG_PATH;
 const nativeFlags = ["--no-config", "--sort=path", "--no-ignore-global", "--no-ignore-parent"];
@@ -38,7 +38,6 @@ try {
   ownedRg = path.join(root, process.platform === "win32" ? "rg-owned.exe" : "rg-owned");
   await fs.writeFile(ownedRg, binary.content, { flag: "wx", mode: 0o500 });
   pool = new ClosedSearchProcessPool();
-  const { preparationMs: workerPreparationMs } = await pool.run("actor", (worker) => worker.ready);
   const configuration = path.join(root, "controlled-rg-config"); await fs.writeFile(configuration, nativeFlags.slice(1).filter((flag) => flag !== "--no-ignore-parent").join("\n") + "\n");
   process.env.RIPGREP_CONFIG_PATH = configuration;
   report.push(await qualifyNamespace());
@@ -50,22 +49,21 @@ try {
     cancellation.push({ mode, ...await qualifyCancellation(cancellationCwd, mode) });
   }
   assert.equal(referenceClosed, referenceProcesses);
-  console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, workerPreparationMs, report, cancellation,
+  console.log(JSON.stringify({ platform: process.platform, node: process.version, engine, preparedProfiles, report, cancellation,
     referenceProcesses, referenceClosed, referenceCancels,
-    qualification: "Production captured-search profile through Host admission, with explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Counters cover instrumented reference workers and cancellation probes only. Component timings are not task speedups. Not native-default equivalence." }, null, 2));
+    qualification: "Production captured-search profile through Host admission, with explicit fixed rg flags, pinned existing executable, captured inputs and stock Pi formatting. Counters cover instrumented reference workers and cancellation probes only. Not native-default equivalence or a performance measurement." }, null, 2));
 } finally {
   if (configuredAtStart === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = configuredAtStart;
-  await pool?.dispose();
+  await Promise.all([pool?.dispose(), profile?.pool.dispose()]);
   assert.equal(path.dirname(root), path.resolve(os.tmpdir())); assert.ok(path.basename(root).startsWith("pi-grep-evidence-"));
   await fs.rm(root, { recursive: true, force: true });
 }
 
-async function qualifyCaptured(cwd, args, expected, changed, rejected = false, stableChange = false) {
+async function qualifyCaptured(cwd, profile, args, expected, changed, rejected = false, stableChange = false) {
   const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set();
   let executions = 0, actorCalls = 0, settled;
-  const preparation = performance.now(), profile = await createClosedSearchProfile(cwd), profilePreparationMs = performance.now() - preparation;
   const bound = profile.invocations.get("grep");
-  if (!bound) { await profile.pool.dispose(); throw new Error("existing rg is not qualified by the production profile"); }
+  assert.ok(bound, "existing rg is not qualified by the production profile");
   const observeInputs = (view) => ({ ...view,
     readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
     readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
@@ -101,27 +99,25 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
     return result;
   };
   try {
-    const started = performance.now();
     await host.startTurn(turn);
     const completion = await ready.promise;
     assert.equal(completion.observation === "unobserved" ? completion.cause.code : completion.status,
       rejected === "unkeyable" ? "action_not_keyable" : rejected ? "failed" : "succeeded", JSON.stringify(completion));
-    const producerMs = performance.now() - started, materialized = reads.size;
+    const materialized = reads.size;
     if (stableChange) { assert.deepEqual(await changed(), expected); changed = undefined; }
     if (rejected) {
       if (expected instanceof Error) await assert.rejects(actor, { message: expected.message });
       else assert.deepEqual(await actor(), expected);
       assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
-      return { profilePreparationMs, producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
+      return { producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
     assert.ok(reads.size || enumerated.size, "captured input observation must reach prepared views");
     assert.deepEqual(await actor(), expected);
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
     assert.equal(actorCalls, 0);
     if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { profilePreparationMs, producerMs,
-      producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
-  } finally { try { await host.dispose(); } finally { await profile.pool.dispose(); } }
+    return { producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
+  } finally { await host.dispose(); }
 }
 
 async function qualifyNamespace() {
@@ -261,7 +257,11 @@ async function qualifyNamespace() {
       "ignored-subtree-change": ["search/blocked/arrived.txt", "needle arrived inside ignored tree\n"],
     }[label];
     const changed = mutation ? async () => { await fs.writeFile(path.resolve(workspace, mutation[0]), mutation[1]); return reference(); } : undefined;
-    const captured = await qualifyCaptured(workspace, args, expected, changed, rejected, label === "ignored-subtree-change");
+    if (profile?.cwd !== workspace) {
+      await profile?.pool.dispose();
+      profile = { cwd: workspace, ...await createClosedSearchProfile(workspace) }; preparedProfiles++;
+    }
+    const captured = await qualifyCaptured(workspace, profile, args, expected, changed, rejected, label === "ignored-subtree-change");
     assert.ok(!captured.reads.some((file) => file.endsWith("ignored.bin")), "ignored payload must not consume the input budget");
     if (!["explicit-ignored-directory", "glob-positive-directory", "link-glob-directory"].includes(label)) assert.ok(!captured.enumerated.includes("search/blocked"), "ignored directory must not consume the enumeration budget");
     if (label.endsWith("glob-negative-directory")) assert.ok(!captured.enumerated.includes("search/nested"), "negative glob directory must not consume the enumeration budget");
@@ -270,7 +270,7 @@ async function qualifyNamespace() {
     console.log(JSON.stringify({ semanticCase: checks.at(-1) }));
   }
   for (const label of selectedCases) assert.ok(checks.some((check) => check.label === label), `unknown/unavailable semantic case: ${label}`);
-  return { mode: "small-semantic-fixture", checks, qualification: "Full host key/route/transaction/adoption; content, ignore rules and negative names each invalidate before one Actor fallback. Timings are not performance claims." };
+  return { mode: "small-semantic-fixture", checks, qualification: "Full host key/route/transaction/adoption; content, ignore rules and negative names each invalidate before one Actor fallback." };
 }
 
 async function runInput(operation, invocation, signal, emit, { cwd, inputRoot, onSpawn } = {}) {
