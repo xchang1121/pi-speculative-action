@@ -38,6 +38,7 @@ import type { ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import {
 	deferredWorkspaceTransactionDriver,
+	orderWorkspaceChanges,
 	type WorkspaceRegularDelta,
 	type WorkspaceStructureDriver,
 	type WorkspaceTransactionCapture,
@@ -2114,21 +2115,11 @@ async function replaceFile(temporary: string, target: string, mode?: number): Pr
 }
 
 function orderSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
-	const phase = (change: SandboxWorkspaceChange): number => {
-		if (change.kind !== "directory") return change.after === undefined ? 0 : 3;
-		return change.after === undefined ? 1 : 2;
-	};
-	const depth = (change: SandboxWorkspaceChange): number =>
-		slash(change.resource).split("/").filter(Boolean).length;
-	return changes.filter((change) => !change.validationOnly).sort((left, right) => {
-		const phaseDifference = phase(left) - phase(right);
-		if (phaseDifference !== 0) return phaseDifference;
-		const depthDifference = depth(left) - depth(right);
-		if (phase(left) <= 1) {
-			if (depthDifference !== 0) return -depthDifference;
-		} else if (depthDifference !== 0) return depthDifference;
-		return filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target));
-	});
+	return orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
+		change,
+		depth: slash(change.resource).split("/").filter(Boolean).length,
+		key: filesystemPathKey(change.target),
+	}));
 }
 
 /** Root locks make namespace changes conflict with every file commit below the same workspace. */
