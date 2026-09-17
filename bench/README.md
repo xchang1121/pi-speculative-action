@@ -37,15 +37,9 @@ npm run bench:overlay-probe
 
 失败时保留原错误和最小复现信息；时钟证明拒绝不能通过延长等待或跳过检查消除。
 
-## 录制与模型套件
+## 模型套件
 
-已有录制由外部 `pi-llm-tape` 提供；本工具只分析文件，不发送模型请求：
-
-```sh
-npm run bench:tape -- --tape /private/path/tape.json --actor-model actor-id --drafter-model draft-id
-```
-
-入口分析 Chat Completions SSE，保留请求 payload、完整工具批次、usage 及失败记录，按请求累加服务耗时，按相同 messages 和工具定义比较动作参数。相同上下文只表示可比较，不证明候选归属或实际采纳。录制格式的时间是请求内相对时间，因此不从中推算到达顺序、领先时间、策略收益或主加速比；这些证据来自完整运行报告。
+`bench:tape` 离线 SSE 相似度分析入口已退役；不再维护独立的协议解析、上下文配对和潜在命中统计。实际命中、工具批次、usage、失败和耗时由下述完整运行报告保留，既有原始录制与阶段材料仍在仓库外保存。
 
 真实模型套件需要显式提供 `DEEPSEEK_API_KEY`，会产生网络和 API 成本：
 
