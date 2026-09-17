@@ -42,7 +42,7 @@ export function benchmarkTraceReport<SessionID>(
 		candidateStartsByDepth: countBy(candidates, (event) => String(event.candidate.depth)),
 		speculativeHitsByDepth: countBy(hits, ({ event }) => String(event.candidate?.depth ?? 0)),
 		speculativeHitsByTool: countBy(hits, ({ event }) => event.settlement.tool),
-		speculativeHitsByRelation: countBy(hits, ({ provider }) => provider.match.kind === "exact" ? "exact" : `projected:${provider.match.projector}`),
+		speculativeHitsByRelation: countBy(hits, ({ provider }) => provider.match.kind === "projected" ? `projected:${provider.match.projector}` : provider.match.kind),
 		speculativeHitProvidersBySource: countBy(hits, ({ event }) => event.candidate?.source ?? "cache"),
 		actorActionMatchesByPredictionSource: countBy(actorActionTrace.flatMap((event) => event.matchedPredictionSources), (source) => source),
 		actorFallbacksByTool: countBy(native.filter((event) => event.origin !== "preview"), (event) => event.tool,

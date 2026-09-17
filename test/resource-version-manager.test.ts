@@ -94,7 +94,7 @@ describe("speculative action resource versions", () => {
 				if (onDemand) {
 					let dependencies: ReadonlySet<string> | undefined;
 					await token.view!.evaluate((view) => view.stat(change === "entries" ? root : file, "entry"), (observed) => { dependencies = observed; });
-					expect(dependencies?.size).toBe(1);
+					expect(dependencies?.size).toBe(2);
 					const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
 					const checked = await manager.validate(scoped);
 					expect(checked.expired, change).toBe(change === "kind" || (change === "write" && !watch));
@@ -230,6 +230,41 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
+	test("confines borrowed names, aliases and negative observations to the current root", async () => {
+		const root = await workspace({ "inside/data.txt": "A", "outside/data.txt": "B" });
+		const inside = path.join(root, "inside"), outside = path.join(root, "outside"), link = path.join(inside, "link");
+		const directoryLink = process.platform === "win32" ? "junction" : "dir";
+		await fs.symlink(outside, link, directoryLink);
+		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 8192), view = token.view!;
+		try {
+			await view.stat(inside, "type");
+			for (const target of [path.join(inside, "data.txt"), path.join(outside, "data.txt"), path.join(link, "data.txt")]) await view.readFile(target);
+			for (const target of [path.join(inside, "missing"), path.join(link, "missing")]) expect(await view.exists(target)).toBe(false);
+			view.seal();
+			expect((await view.evaluate(v => v.readFile(path.join(inside, "data.txt")), undefined, inside)).toString()).toBe("A");
+			expect(await view.evaluate(v => v.exists(path.join(inside, "missing")), undefined, inside)).toBe(false);
+			for (const [target, missing] of [[path.join(outside, "data.txt"), false], [path.join(link, "data.txt"), false], [path.join(link, "missing"), true]] as const)
+				await expect(view.evaluate(async v => missing ? await v.exists(target) : await v.readFile(target), undefined, inside)).rejects.toThrow("resource_access_unproven");
+			expect((await view.evaluate(v => v.readFile(path.join(outside, "data.txt")))).toString()).toBe("B");
+			expect((await manager.validate(token)).expired).toBe(false);
+		} finally { await token.release(); manager.close(); }
+
+		// The same leaf can remain reachable after the root redirects elsewhere and a child points back.
+		const alias = path.join(root, "scope"), bounce = path.join(outside, "bounce");
+		await fs.symlink(inside, alias, directoryLink);
+		await fs.mkdir(path.join(inside, "bounce")); await fs.writeFile(path.join(inside, "bounce/data.txt"), "same");
+		await fs.symlink(path.join(inside, "bounce"), bounce, directoryLink);
+		const scopedManager = new ResourceVersionManager(alias, { watch: false });
+		const scoped = await scopedManager.capture([{ path: "bounce/data.txt", scope: "content" }], 8192);
+		try {
+			const leaf = path.join(alias, "bounce/data.txt"), before = await fs.realpath(leaf);
+			await fs.unlink(alias); await fs.symlink(outside, alias, directoryLink);
+			expect(await fs.realpath(leaf)).toBe(before);
+			expect((await scopedManager.validate({ ...scoped, observations: new Map([...scoped.observations].filter(([, entry]) => entry.scope !== "resolution")) })).expired).toBe(false);
+			expect((await scopedManager.validate(scoped)).expired).toBe(true);
+		} finally { await scoped.release(); scopedManager.close(); }
+	});
+
 	test.each([false, true])("re-evaluates sealed bytes without expanding Actor observation authority (captured-only=%s)", async (capturedOnly) => {
 		const text = "first\r\n\n[999 more lines in file. Use offset=3 to continue.]\n" + "x".repeat(60_000) + "\nlast";
 		const root = await workspace({ "value.txt": text }), file = path.join(root, "value.txt");
@@ -258,6 +293,9 @@ describe("speculative action resource versions", () => {
 		const execute = () => world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
 		const branch = await execute();
 		try {
+			const expanded = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { ...binding,
+				semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, requirements: { capabilities: ["filesystem.read", "validation.resource_snapshot", "network.mediate"] } } })!;
+			expect(await branch.reconstruct!({ action: expanded, args, callID: "unsupported-effects", signal })).toBeUndefined();
 			for (const query of [{ path: "@value.txt", offset: 2, limit: 0 }, { path: "value.txt", offset: 3 },
 				{ path: "@value.txt", offset: 4, limit: 1 }, { path: file, offset: 5 }]) {
 				const action = PI_ACTION_SEMANTICS.buildKey("read", query, root, "", binding)!;
@@ -476,7 +514,7 @@ describe("speculative action resource versions", () => {
 			const leaf = directory ? path.join(alias, "value.txt") : alias;
 			let dependencies: ReadonlySet<string> | undefined;
 			await token.view!.evaluate((view) => view.readFile(leaf), (observed) => { dependencies = observed; });
-			expect(dependencies?.size).toBe(1); // Child reads retain the proof of the complete alias chain.
+			expect(dependencies?.size).toBe(2); // Child reads retain the complete alias chain and current root resolution.
 			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
 			for (const requested of [leaf, ...(relative ? [query] : [])]) for (const replaced of [link, ...(relative ? [path.dirname(target)] : [])]) {
 				const observed = await manager.capture([{ path: requested, scope: requested === query ? "tree_content" : "content" }]);

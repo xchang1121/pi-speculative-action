@@ -242,7 +242,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
-		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
+		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
 			: []),
@@ -1384,7 +1384,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			if (event.settlement.provider.kind === "speculative") {
 				const match = event.settlement.provider.match;
 				parts.push(
-					match.kind === "projected" ? `partial-result reuse (${match.projector})` : "exact-action reuse",
+					match.kind === "projected" ? `partial-result reuse (${match.projector})` : match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse",
 					`${formatDuration(event.settlement.provider.timing.executionAheadMs)} ahead`,
 					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
 					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,

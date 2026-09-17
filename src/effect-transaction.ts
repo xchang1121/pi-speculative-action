@@ -184,7 +184,8 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	const shared = attempt.descriptor.route.reuse === "shared_result";
 	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
-		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, capturedBytes: branch.capturedBytes,
+		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
+			reconstructionScope: shared && branch.reconstruct && !validateAndCommit ? branch.reconstructionScope : undefined,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
 		checkpoint: branch.checkpoint, output: shared ? cloneSharedData(branch.output) : branch.output,
@@ -244,6 +245,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 				// An atomic validation/commit callback retains its complete proof and effect ownership.
 				const proof = !validateAndCommit && result.validate?.bind(result);
 				return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes,
+					compatibility: proof ? immutableSnapshot(result.compatibility) : undefined,
 					...(proof ? { validate: () => validate(proof) } : {}) });
 			});
 			reconstructions.add(task);

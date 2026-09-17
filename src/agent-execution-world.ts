@@ -9,7 +9,7 @@ import type {
 	WorldCheckpoint,
 	WorldResultCapture,
 } from "./execution-world.ts";
-import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
+import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureResourceVersion,
 	type ResourceReadView,
@@ -75,7 +75,7 @@ export function createResourceSnapshotExecutionWorld(
 						const validation = await owned.manager.seal(owned);
 						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					}
-					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs);
+					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs, actionSemantics);
 				} catch (error) {
 					await releaseResourceVersion(owned);
 					throw error;
@@ -123,7 +123,7 @@ export function createResourceSnapshotExecutionWorld(
 }
 
 function resourceSnapshotBranch(
-	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number,
+	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number, semantics: ActionSemanticsRegistry,
 ): WorldBranch<ToolSettlement> {
 	let owned: ResourceVersionToken | undefined = version;
 	const validate = async (token: ResourceVersionToken | undefined) => {
@@ -134,14 +134,19 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, resources: Object.freeze([]),
+		inputResources: version.view?.resources,
+		reconstructionScope: "current_action",
 		capturedBytes: version.view?.bytes ?? 0,
 		executionMetrics: Object.freeze({ setupMs }),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			request.signal.throwIfAborted();
-			const execute = (request.action.executionContext as ToolInvocation | undefined)?.filesystem;
-			if (!owned?.view || !execute || request.action.executionFingerprint !== executionFingerprint) return undefined;
+			const invocation = request.action.executionContext as ToolInvocation | undefined;
+			const execute = invocation?.filesystem, definition = request.action.semantics ?? semantics.definition(request.action);
+			const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
+			if (!owned?.view || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope) return undefined;
+			if (!effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
 			let scoped: ResourceVersionToken | undefined, capturedBytes = 0;
 			const result = await owned.view.evaluate((view) => execute(view, request), (dependencies) => {
 				if (!dependencies?.size) return;
@@ -151,9 +156,10 @@ function resourceSnapshotBranch(
 					observations.set(key, entry); capturedBytes += key.length * 2 + 64;
 				}
 				scoped = { ...version, observations };
-			});
+			}, root);
 			request.signal.throwIfAborted();
-			return { output: result, ...(scoped ? { validate: () => validate(scoped), capturedBytes } : {}) };
+			return { output: result, validate: () => validate(scoped ?? version), capturedBytes,
+				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
 		} } : {}),
 		commit: async () => {
 			if (!owned) throw new Error("resource snapshot is disposed");

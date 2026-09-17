@@ -14,7 +14,6 @@ import {
 	OBSERVATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
 	READ_RANGE_ACTION_KEY_PROJECTOR,
-	RESOURCE_INPUT_ACTION_KEY_PROJECTOR,
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
@@ -172,7 +171,7 @@ describe("ActionSemanticsRegistry", () => {
 			expect(PI_ACTION_SEMANTICS.definition(closed)?.effect).toBe("observation");
 			expect(resourceDependencies(native, "/workspace")).toEqual([]);
 			expect(resourceDependencies(closed, "/workspace")).toEqual(scope === "captured_inputs" ? [] : [{ path: path.resolve("/workspace"), scope }]);
-			expect(actionKeyMatch(native, closed, [RESOURCE_INPUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
+			expect(actionKeyMatch(native, closed, PI_ACTION_SEMANTICS.projectors())).toBeUndefined();
 			expect(buildActionKey(closed).semantics).toBe(closed.semantics);
 			expect(closed.semantics?.canonicalize).toBe(profile.canonicalize);
 			expect(() => buildActionKey({ ...closed, tool: "unrelated" })).toThrow("contract identity mismatch");
@@ -250,7 +249,7 @@ describe("ActionSemanticsRegistry", () => {
 			requirements: UNRESTRICTED_PROCESS_EFFECTS, resourceScope: undefined }])).not.toThrow();
 	});
 
-	it("owns immutable definitions and shares registered projectors without duplicate input relations", () => {
+	it("owns immutable definitions and shares registered result projectors", () => {
 		const projectors = [projector("kept")];
 		const source = { ...resourceDefinition("one", "one", canonicalEmpty), projectors };
 		const registry = new ActionSemanticsRegistry([source, { ...source, tool: "two" }]);
@@ -264,7 +263,7 @@ describe("ActionSemanticsRegistry", () => {
 		names.push("outside");
 
 		expect(registry.definition("one")?.epoch).toBe("one");
-		expect(registry.projectors()).toEqual([registered, RESOURCE_INPUT_ACTION_KEY_PROJECTOR]);
+		expect(registry.projectors()).toEqual([registered]);
 		expect(registered.id).toBe("kept");
 		expect(Object.isFrozen(registered)).toBe(true);
 		expect(Object.isFrozen(projectors[0])).toBe(false);
@@ -273,7 +272,7 @@ describe("ActionSemanticsRegistry", () => {
 		expect(registry.supportsProjector("kept")).toBe(true);
 		expect(registry.supportsProjector("late")).toBe(false);
 		expect(registry.toolNames()).toEqual(["one", "two"]);
-		expect(registry.definition("one")?.projectors).toHaveLength(2);
+		expect(registry.definition("one")?.projectors).toHaveLength(1);
 		expect(new ActionSemanticsRegistry([registry.definition("one")!]).definition("one")).toBe(registry.definition("one"));
 		expect(() =>
 			(registry.definition("one")?.projectors as ActionKeyProjector[]).push(projector("blocked")),

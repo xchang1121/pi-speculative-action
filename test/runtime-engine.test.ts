@@ -3,7 +3,7 @@ import { gated, deferred, barrier, nextTurn } from "./async.ts";
 import { testBranch as world } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { buildPiActionKey, PI_ACTION_SEMANTICS, RESOURCE_INPUT_ACTION_KEY_PROJECTOR, type ActionKey } from "../src/action-semantics.ts";
+import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
 import {
 	type SpeculativeExecutionRoute,
@@ -183,7 +183,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 					: {}),
 			});
 		}),
-		projectionRules: [RESOURCE_INPUT_ACTION_KEY_PROJECTOR, ...(input.projection ? [input.projection] : [])],
+		projectionRules: input.projection ? [input.projection] : [],
 		onCandidateMaterialized: input.onCandidateMaterialized,
 		onTurnFinished: input.onTurnFinished,
 		onEvent: input.onEvent === false ? undefined : async (event) => {
@@ -1169,6 +1169,7 @@ describe("structural speculative runtime", () => {
 				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
 				...world("wide", { validate: scoped ? async () => { throw new Error("unrelated input is stale"); } : validate }),
+				inputResources: ["/workspace/README.md"],
 				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
@@ -1218,7 +1219,7 @@ describe("structural speculative runtime", () => {
 				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
 				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
 					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
-						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, inputLookup ? "resource.inputs" : "read.range",
+						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, inputLookup ? "inputs" : "read.range",
 						...(preview || inputLookup || scenario === "output-valid" ? ["retained"] : [])]) });
 			}
 		} finally {
@@ -1282,7 +1283,7 @@ describe("structural speculative runtime", () => {
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
 			execute: () => { now += sourceMs; return { ...world("1", { onDispose: disposed,
-				validate: async () => { now += 3; return validResource(); } }), reconstruct }; },
+				validate: async () => { now += 3; return validResource(); } }), reconstruct, inputResources: ["/workspace/input"] }; },
 		});
 		try {
 			await runtime.startTurn(start("first")); await ready.promise;
@@ -1333,6 +1334,7 @@ describe("structural speculative runtime", () => {
 			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
 			authorizeCandidate: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
 			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
+				inputResources: ["/workspace/README.md"],
 				...world("1", { executionFingerprint: "bound", onDispose: disposed, onCommit: committed,
 					validate: async () => (validResource()) }),
 				reconstruct: async ({ args }) => {

@@ -156,6 +156,10 @@ export interface WorldBranch<Output> {
 	readonly computationDependencies?: readonly TimelineDependency[];
 	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
+	/** Sealed input names for indexed retrieval only; never action or adoption authority. */
+	readonly inputResources?: readonly string[];
+	/** May evaluate the current action instead of only the source executor. Still requires query evidence. */
+	readonly reconstructionScope?: "current_action";
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorldExecutionMetrics;
@@ -174,6 +178,8 @@ export interface WorldBranch<Output> {
 		readonly signal: AbortSignal;
 	}) => Promise<{
 		readonly output: Output;
+		/** Evidence for the current operation that evaluated these inputs. */
+		readonly compatibility?: WorldCompatibilityEvidence;
 		/** Authorizes only this effect-free result, without committing the source output. */
 		readonly validate?: () => Promise<ResourceValidation>;
 		/** Additional retained proof storage, excluding the already-owned inputs. */
