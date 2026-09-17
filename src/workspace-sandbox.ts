@@ -123,6 +123,8 @@ export interface SandboxWorkspaceBranchOptions extends WorkspaceSandboxOptions {
 	readonly cwd: string;
 	readonly action: SpeculativeToolExecutionContext["action"];
 	readonly parentCheckpoint?: WorldCheckpoint;
+	/** Borrow an immutable workspace when validate is supplied; preparation never proves current inputs. */
+	readonly preparation?: QualifiedWorkspaceSandboxDriver;
 	/** An operation boundary may supply its complete input/effect delta, avoiding a second tree scan. */
 	readonly execute: (workspace: SandboxWorkspaceContext) => Promise<ToolSettlement | SandboxExecutionDelta>;
 	/** Optional backend metrics collected during execute/capture and sealed into the branch. */
@@ -298,6 +300,12 @@ export interface QualifiedWorkspaceSandboxDriver {
 	readonly fingerprint: string;
 }
 
+// Preparation owns no additional handles. A retired/replaced pool cannot lend its old snapshot.
+const preparedWorkspaceBaselines = new WeakMap<QualifiedWorkspaceSandboxDriver, {
+	readonly repository: PooledGitRepository;
+	readonly baseline: NonNullable<PooledGitRepository["baseline"]>;
+}>();
+
 /** Owns workspace repositories and commit serialization for one extension/runtime lifecycle. */
 export class WorkspaceSandboxService {
 	private disposal?: Promise<void>;
@@ -327,9 +335,9 @@ export class WorkspaceSandboxService {
 		return createWorkspaceSandboxFor(this.state, options);
 	}
 
-	async prepare(cwd: string, options: PrepareSandboxWorkspaceOptions = {}): Promise<void> {
+	async prepare(cwd: string, options: PrepareSandboxWorkspaceOptions = {}): Promise<QualifiedWorkspaceSandboxDriver> {
 		assertWorkspaceSandboxOpen(this.state);
-		await prepareSandboxWorkspaceFor(this.state, cwd, options);
+		return await prepareSandboxWorkspaceFor(this.state, cwd, options);
 	}
 
 	async fork(options: SandboxWorkspaceBranchOptions): Promise<WorldBranch<ToolSettlement>> {
@@ -657,6 +665,7 @@ async function forkSandboxWorkspaceFor(
 			};
 		},
 		parent,
+		options.validate ? options.preparation : undefined,
 	);
 	return workspaceBranch(
 		snapshot,
@@ -672,7 +681,7 @@ async function prepareSandboxWorkspaceFor(
 	state: WorkspaceSandboxState,
 	cwd: string,
 	options: PrepareSandboxWorkspaceOptions,
-): Promise<void> {
+): Promise<QualifiedWorkspaceSandboxDriver> {
 	throwIfAborted(options.signal);
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -684,7 +693,7 @@ async function prepareSandboxWorkspaceFor(
 			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
 		);
 		throwIfAborted(options.signal);
-		const { commit } = await acquireSandboxBaseline(repository, true);
+		const baseline = await acquireSandboxBaseline(repository, true), { commit } = baseline;
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const baseline = await acquireOverlayBaseline(repository, commit);
@@ -696,6 +705,9 @@ async function prepareSandboxWorkspaceFor(
 			}
 		} else await ensurePreparedSandbox(repository, commit, options.signal);
 		throwIfAborted(options.signal);
+		const prepared = Object.freeze({ ...resolved });
+		preparedWorkspaceBaselines.set(prepared, { repository, baseline });
+		return prepared;
 	} finally {
 		releaseSandboxRepository(repository);
 	}
@@ -808,6 +820,7 @@ async function createPrivateSandboxWorkspace(
 	gitBinary: string,
 	driver: Exclude<WorkspaceSandboxDriver, "auto">,
 	overlayOptions: LinuxOverlayfsOptions,
+	preparation?: QualifiedWorkspaceSandboxDriver,
 ): Promise<PrivateSandboxWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -836,7 +849,10 @@ async function createPrivateSandboxWorkspace(
 		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 	})();
 	try {
-		const baseline = await acquireSandboxBaseline(pool), { commit } = baseline;
+		const prepared = preparation && preparedWorkspaceBaselines.get(preparation);
+		const baseline = prepared?.repository === pool && preparation?.driver === driver
+			? prepared.baseline : await acquireSandboxBaseline(pool);
+		const { commit } = baseline;
 		let sandboxRoot: string;
 		let processRoot: string;
 		let gitDirectory: string;
@@ -1236,7 +1252,7 @@ async function acquireSandboxBaseline(
 	return withWorkspaceLock(repository, async () => {
 		const baseline = repository.baseline;
 		if (baseline) {
-			// Quiet notifications may reuse preparation work; every actual fork still checks exact evidence below.
+			// Quiet notifications reuse preparation; fresh allocations check exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
 			// Warm-up can reject an old baseline before hashing; actual forks keep the checks parallel.
@@ -1398,7 +1414,7 @@ function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void {
 
 async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
 	const [tracked, untracked] = await Promise.all([
-		// Porcelain refreshes stat-only changes; exact resource validation still guards every actual fork.
+		// Porcelain refreshes stat-only changes; fresh allocations also validate exact resources.
 		repository.index(["diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", "--"]),
 		repository.index(["ls-files", "--others", "-z", "--"]),
 	]);
@@ -1543,8 +1559,9 @@ async function withPrivateSandboxWorkspace<T>(
 	overlayOptions: LinuxOverlayfsOptions,
 	run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 	checkpoint?: WorkspaceCheckpoint,
+	preparation?: QualifiedWorkspaceSandboxDriver,
 ): Promise<T> {
-	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions);
+	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions, preparation);
 	try {
 		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
 		return await run(workspace);

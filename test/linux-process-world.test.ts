@@ -43,7 +43,7 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
-	test.for(["completed", "running", "native", "native-merged"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
@@ -51,6 +51,7 @@ describe("Linux process ExecutionWorld", () => {
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const release = deferred();
 		let restoreJoin: (() => void) | undefined;
+		let restorePreparation: (() => void) | undefined;
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
@@ -187,10 +188,23 @@ int main(int argc, char **argv) {
 				});
 				restoreJoin = () => { publication.mockRestore(); assessment.mockRestore(); };
 			}
+			if (mode.startsWith("native-prepared-")) {
+				const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
+				const borrowing = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(async options => {
+					if (options.preparation) await writeFile(path.join(fixture.workspace, "input.txt"), "changed after preparation\n");
+					return fork(options);
+				});
+				restorePreparation = () => borrowing.mockRestore();
+			}
 			await start("prepared");
 			if (mode === "running") await expect.poll(() => sealing, { timeout: 5000 }).toBe(true);
 			else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
+			if (mode.startsWith("native-prepared-")) {
+				expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed after preparation\n");
+				restorePreparation?.(); restorePreparation = undefined;
+				if (mode === "native-prepared-restored") await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
+			}
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
 			if (mode === "running") {
@@ -208,7 +222,8 @@ int main(int argc, char **argv) {
 				await expect.poll(() => joining).toBeDefined();
 				expect(joining, JSON.stringify(joinEvidence)).toBe(true);
 			}
-			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\nnewest\n${suffix}` }]);
+			const stalePreparation = mode === "native-prepared-stale";
+			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
 			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence, metrics: fixture.backend.actorMetrics() })).toBe(Number(mode === "running"));
 			await host.finishTurn("prepared");
@@ -217,9 +232,9 @@ int main(int argc, char **argv) {
 			const timeline = new TaskTimeline(0), laterTask = new TaskTimeline(execution.startedAt);
 			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
 			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
-				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(2);
+				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(stalePreparation ? 1 : 2);
 			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
-			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: {
+			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([{ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 			} }]);
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command, changedParent]);
@@ -231,7 +246,7 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { release.resolve(); restoreJoin?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
+		} finally { release.resolve(); restoreJoin?.(); restorePreparation?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {

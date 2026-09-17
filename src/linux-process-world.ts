@@ -115,11 +115,12 @@ export function createLinuxProcessExecutionWorld(
 				if (status.state !== "ready") throw new Error(status.detail);
 				roots.add(path.resolve(cwd));
 				const selected = await qualify(cwd);
-				await workspaceSandbox.prepare(cwd, {
+				const prepared = await workspaceSandbox.prepare(cwd, {
 					...workspaceOptions,
 					driver: selected.driver,
 					...(signal ? { signal } : {}),
 				});
+				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
 			execute: (context) => backend.withProducer(async () => {
 			const startedAt = performance.now();
@@ -128,7 +129,7 @@ export function createLinuxProcessExecutionWorld(
 			const operation = operationFor(context.action);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
-			const selected = await qualify(sourceRoot);
+			const selected = operation && qualifiedDrivers.get(sourceRoot) || await qualify(sourceRoot);
 			let session: LinuxProcessSession | undefined;
 			const branch = await workspaceSandbox.fork({
 				cwd: sourceRoot,
@@ -136,6 +137,7 @@ export function createLinuxProcessExecutionWorld(
 				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
 				...workspaceOptions,
 				driver: selected.driver,
+				...(operation ? { preparation: selected } : {}),
 				executionMetrics: () => (session ? { reuse: session.metrics() } : {}),
 				validate: async () =>
 					session
