@@ -223,7 +223,7 @@ async function qualifyPiSearch(name) {
 			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
 			assert.deepEqual(reconstructed.output, actor.result);
 			assert.equal(reconstructed.settlement.provider.kind, query.path === "." ? "actor" : "speculative");
-			if (query.path !== ".") assert.equal(reconstructed.settlement.provider.match?.projector, "resource.inputs");
+			if (query.path !== ".") assert.equal(reconstructed.settlement.provider.match?.kind, "inputs");
 		}
 		assert.equal(ready.actorCalls(), 1, "a new query cannot extend a sealed candidate's input authority");
 		const reached = Promise.withResolvers(), resume = Promise.withResolvers();
@@ -252,9 +252,11 @@ async function qualifyPiSearch(name) {
 		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 3 : 2);
 		const changed = journey(() => fs.appendFile(path.join(root, ".gitignore"), "# changed during search\n"));
 		await changed.start("changing");
-		const failed = await bounded(changed.candidate, "changed search");
-		assert.equal(failed.status, "failed"); assert.match(JSON.stringify(failed.cause), /resource_fingerprint_changed/);
-		assert.deepEqual((await changed.actor("changed")).output, stale.output); assert.equal(changed.actorCalls(), 1);
+		assert.equal((await bounded(changed.candidate, "changed search")).status, "succeeded"); // Private captured inputs seal without rereading the host.
+		const changedActor = await changed.actor("changed");
+		assert.equal(changedActor.settlement.provider.kind, "actor");
+		assert.match(JSON.stringify(changedActor.settlement.rejections), /resource_fingerprint_changed/);
+		assert.deepEqual(changedActor.output, stale.output); assert.equal(changed.actorCalls(), 1);
 		const paused = Promise.withResolvers(), released = Promise.withResolvers();
 		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 2);
 		const disabled = { enabled: false, resourceCacheMaxEntries: 32, predictionTimeoutMs: 5000, tools: [name] };

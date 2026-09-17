@@ -94,6 +94,10 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 				const { pool, invocations } = await bound;
 				const gate = gated(2);
 				try {
+					const origin = phase === "preparation" ? "producer" : "actor";
+					const empty = { result: { content: [], details: undefined }, isError: false };
+					let reservedWorker: unknown;
+					await pool.run(origin, async worker => { reservedWorker = worker; return empty; });
 					if (phase === "preparation") {
 						const find = invocations.get("find")!;
 						expect(find.identity).toMatchObject({ home: cwd });
@@ -112,9 +116,12 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 						expect(homeBefore).toEqual(result); // Parent HOME changed back after binding; both key and worker retain it.
 						for (const code of [undefined, "EACCES", "EIO"]) {
 							const requested: string[] = [];
-							await expect(pool.run("actor", (worker, signal) => worker.request({ kind: "grep", root: cwd, args: { pattern: "captured" }, home: agentDir }, {
-								signal, onInput: async (operation) => { requested.push(operation); throw Object.assign(new Error("ungranted input"), { code }); },
-							}))).rejects.toThrow(code ? `Path not found: ${cwd}` : "ungranted input");
+							await expect(pool.run("actor", (worker, signal) => {
+								expect(worker).toBe(reservedWorker); // Finished producer capacity serves Actor calls with fresh inputs and bindings.
+								return worker.request({ kind: "grep", root: cwd, args: { pattern: "captured" }, home: agentDir }, {
+									signal, onInput: async (operation) => { requested.push(operation); throw Object.assign(new Error("ungranted input"), { code }); },
+								});
+							})).rejects.toThrow(code ? `Path not found: ${cwd}` : "ungranted input");
 							expect(requested).toEqual(["stat"]); // No process or ambient file access before the caller grants it.
 						}
 						expect(await homeResult()).toEqual(homeBefore); // A grep home binding cannot drift a later find invocation.
@@ -122,8 +129,13 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 					if (phase === "cleanup") await expect(runCapturedSearchProcess(process.execPath,
 						["-e", "setInterval(() => {}, 1000); process.stdout.write('owned');"], cwd,
 						process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}, AbortSignal.timeout(3000), () => { throw 0; })).rejects.toBe(0);
+					if (phase === "cleanup") await pool.run("producer", async worker => {
+						expect(worker).not.toBe(reservedWorker); // Prediction cannot consume the idle Actor reservation.
+						return empty;
+					});
 					let entered = 0, retired = false;
 					const executions = Promise.allSettled((["actor", "producer"] as const).map((role) => pool.run(role, async (worker, signal) => {
+						if (role === "actor") expect(worker).toBe(reservedWorker);
 						if (phase === "cleanup") await worker.dispose(); // A closed worker must not erase its still-active cleanup owner.
 						entered++;
 						await gate.wait(); signal.throwIfAborted();
