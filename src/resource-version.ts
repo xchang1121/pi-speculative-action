@@ -254,7 +254,7 @@ export class ResourceVersionManager {
 				if (!normalized.length) return;
 				if (dependencies && this.reliable) precise = this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
-					dependencies ? { root: this.root, observations } : undefined)) observations.set(dependencyKey(observation), observation);
+					dependencies && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined)) observations.set(dependencyKey(observation), observation);
 			};
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]));
 			if (dependencies) await capture(dependencies);

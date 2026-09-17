@@ -456,7 +456,7 @@ describe("speculative action resource versions", () => {
 		} finally { token.release(); manager.close(); baseline.release(); snapshot.close(); }
 	});
 
-	test("rejects known non-regular paths before opening a data descriptor", async () => {
+	test("rejects non-regular paths before data access and inconsistent virtual file sizes", async () => {
 		const root = await workspace(), manager = new ResourceVersionManager(root, { watch: false }), paths = [root];
 		if (process.platform === "linux") {
 			const fifo = path.join(root, "input.pipe"); await execFileAsync("mkfifo", [fifo]); paths.push(fifo);
@@ -472,6 +472,9 @@ describe("speculative action resource versions", () => {
 				await expect(manager.capture([{ path: target, scope: "content" }])).rejects.toThrow("unsupported_resource_type:");
 			}
 			expect(open.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(0);
+			if (process.platform === "linux") for (const capture of [captureStableFile, hashExecutableFile]) {
+				await expect(capture("/proc/version")).rejects.toThrow("file_changed_during_capture");
+			}
 		} finally { open.mockRestore(); manager.close(); }
 	});
 
