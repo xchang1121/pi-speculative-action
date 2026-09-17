@@ -448,6 +448,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	validationBytes: number;
 	validationFiles: number;
 	validationMode?: "watcher" | "exact";
+	admissionValidation?: Promise<ResourceValidation>;
 	projectionMs: number;
 }
 
@@ -653,7 +654,9 @@ export function makeSpeculativeActionRuntime<
 							actionKeyCovers(existing.key, input.key, projectionRules));
 				});
 			if (!inserted && candidate.work.execution.status === "succeeded") {
-				const validation = await validateCandidate(candidate);
+				// Joining producers share only the in-flight check; Actor adoption always validates afresh.
+				const validation = await (candidate.admissionValidation ??= validateCandidate(candidate)
+					.finally(() => { candidate.admissionValidation = undefined; }));
 				if (validation.status !== "valid" || !candidateStore.has(session.id, candidate)) {
 					(rejected ??= new Set()).add(candidate);
 					if (validation.status === "stale") invalidateCandidates(session, [candidate], validation.cause);

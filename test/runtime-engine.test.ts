@@ -703,10 +703,10 @@ describe("structural speculative runtime", () => {
 		if (retained?.kind === "speculative") expect(retained.timing.expectedActorMs).toBeGreaterThanOrEqual(100);
 	});
 
-	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "late-generation"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
+	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "concurrent-refresh"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
 		const ready = candidateSucceeded(), refreshed = candidateSucceeded(2);
-		const late = mode === "late-generation", validating = barrier(late ? 2 : 1), validationGate = barrier(), secondValidation = barrier();
-		const bindingGate = gated(), continued = barrier(2), outputs: string[] = [];
+		const late = mode === "concurrent-refresh", validating = barrier(), validationGate = barrier();
+		const bindingGate = gated(), continued = barrier(), outputs: string[] = [];
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const executed: string[] = [];
 		let configured = settings, validations = 0;
@@ -732,7 +732,7 @@ describe("structural speculative runtime", () => {
 				const branch = world(`generation:${generation}`, {
 					executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint,
 					validate: async () => {
-						if (generation === 1) { const gate = late && validations++ > 0 ? secondValidation : validationGate; validating.arrive(); await gate.promise; }
+						if (generation === 1) { validations++; validating.arrive(); await validationGate.promise; }
 						return generation === 1 && mode !== "replaced" && mode !== "evicted"
 							? { status: "indeterminate", cause: cause("freshness", "validation_failed"), metrics: zeroValidationMetrics() }
 							: validResource();
@@ -750,8 +750,9 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn({ ...unrelated, terminal: false });
 			await runtime.startTurn(start("turn-2")); await validating.promise;
 			if (late) {
-				validationGate.arrive(); await refreshed.promise; secondValidation.arrive(); await continued.promise;
-				expect(outputs).toEqual(["generation:2", "generation:2"]);
+				await nextTurn(); expect(validations).toBe(1);
+				validationGate.arrive(); await refreshed.promise; await continued.promise;
+				expect(outputs).toEqual(["generation:2"]); // Both consumers finish together; the source has one continuation slot.
 			} else if (mode === "replaced") {
 				const replacement = call("turn-2", { path: "replace.ts" });
 				await runFallback(runtime, replacement); await bindingGate.entered;
@@ -779,7 +780,7 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall(call(late || mode === "refresh" ? "turn-2" : "turn-3",
 					{ path: mode === "replaced" ? "replacement.ts" : "README.md" })))?.output).toBe("generation:2");
 			}
-		} finally { validationGate.arrive(); secondValidation.arrive(); bindingGate.release(); await closing; await runtime.dispose(); }
+		} finally { validationGate.arrive(); bindingGate.release(); await closing; await runtime.dispose(); }
 		expect(cleanup).toHaveBeenCalledTimes(executed.length);
 	});
 
@@ -1574,24 +1575,26 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each(["parallel-predictions", "different-routes", "late-prediction", "preview-first", "two-previews", "cancel-owner", "prediction-first", "future-prediction", "feedback-skip", "feedback-error"] as const)(
+	it.each(["parallel-predictions", "completed-predictions", "completed-changed", "different-routes", "late-prediction", "preview-first", "two-previews", "cancel-owner", "prediction-first", "future-prediction", "feedback-skip", "feedback-error"] as const)(
 		"coalesces candidate admission across producer entrances: %s", async (mode) => {
 		const dual = mode === "two-previews" || mode === "cancel-owner", distinct = mode === "different-routes";
-		const sourceCount = dual ? 0 : distinct ? 2 : mode === "parallel-predictions" ? 8 : 1;
-		const admitted = barrier(), admissionGate = barrier(), continued = barrier(sourceCount);
-		const proposalGate = gated(sourceCount), keyed = barrier(sourceCount), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
+		const completed = mode.startsWith("completed-"), validationGate = gated(), lateProposal = gated();
+		const sourceCount = dual ? 0 : distinct ? 2 : mode === "parallel-predictions" || completed ? 8 : 1;
+		const admitted = barrier(), admissionGate = barrier(), continued = barrier(sourceCount), firstContinued = barrier(sourceCount - 1);
+		const proposalGate = gated(sourceCount), keyed = barrier(sourceCount - Number(completed)), executing = barrier(distinct ? 2 : 1), executionGate = barrier();
 		const ready = candidateSucceeded(distinct ? 2 : 1), nextReady = candidateSucceeded(2), disposed = vi.fn();
 		const settlements: PredictionSettlement[] = [];
 		const filtered = mode.startsWith("feedback-");
-		let admissions = 0, proposals = 0, routes = 0;
+		let admissions = 0, proposals = 0, routes = 0, validations = 0, changed = false;
 		const { runtime, events, executions: executionCount } = harness({
 			source: planSource({ enabled: () => !dual, proposalCount: () => sourceCount,
 				continueOn: filtered ? () => { continued.arrive(); if (mode === "feedback-error") throw new Error("feedback failure"); return false; } : ["execution_succeeded"],
 				propose: async ({ startInput, proposalIndex }) => {
 					proposals++; await proposalGate.wait();
+					if (completed && proposalIndex === sourceCount - 1) await lateProposal.wait();
 					const proposal = plan(`${startInput.turnID}:${proposalIndex}`, { path: "README.md", ...(startInput.turnID === "range" ? { offset: 2 } : {}) });
 					return mode === "future-prediction" ? { ...proposal, actions: proposal.actions.map((action) => ({ ...action, horizon: 3, expectedDurationMs: 10 })) } : proposal;
-				}, continue: () => { continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } }),
+				}, continue: () => { firstContinued.arrive(); continued.arrive(); return undefined; }, onSettled: ({ settlement }) => { settlements.push(settlement); } }),
 			preflightCandidate: async ({ candidate: draft }) => {
 				if (draft.source === "actor_preview" && (mode === "late-prediction" || dual)) {
 					if (++admissions === (dual ? 2 : 1)) admitted.arrive(); await admissionGate.promise;
@@ -1603,7 +1606,10 @@ describe("structural speculative runtime", () => {
 				executing.arrive(); if (distinct) await executionGate.promise;
 				return world(concrete.offset === 2 ? "different query" : "shared observation", {
 					executionFingerprint: buildPiActionKey(tool, concrete, "/workspace")!.executionFingerprint,
-					validate: async () => (validResource()), onDispose: disposed });
+					validate: async () => {
+						if (++validations === 1 && completed) await validationGate.wait();
+						return changed ? { status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource();
+					}, onDispose: disposed });
 			},
 			onCandidateMaterialized: () => keyed.arrive(), onEvent: (event) => { ready.observe(event); nextReady.observe(event); },
 		});
@@ -1628,6 +1634,12 @@ describe("structural speculative runtime", () => {
 				await Promise.all(previews);
 			}
 			await ready.promise;
+			if (completed) {
+				proposalGate.release(); await validationGate.entered; await keyed.promise; await nextTurn();
+				expect(validations).toBe(1); validationGate.release(); await firstContinued.promise;
+				lateProposal.release(); await continued.promise; expect(validations).toBe(2);
+				changed = mode === "completed-changed";
+			}
 			if (mode === "preview-first") { proposalGate.release(); await continued.promise; }
 			expect(executionCount()).toBe(distinct ? 2 : 1);
 			if (distinct) { expect(runtime.inspect().sharedCandidates).toBe(2); expect(routes).toBe(2); }
@@ -1635,7 +1647,9 @@ describe("structural speculative runtime", () => {
 			if (mode === "cancel-owner") {
 				const changed = { ...actor, input: { path: "different.ts" } };
 				await runFallback(runtime, changed, 1, "different observation");
-			} else expect((await runtime.prepareActorCall(actor))?.output).toBe("shared observation");
+			} else if (changed) await runFallback(runtime, actor, 1, "changed observation");
+			else expect((await runtime.prepareActorCall(actor))?.output).toBe("shared observation");
+			if (completed) expect(validations).toBe(3);
 			if (dual || mode === "prediction-first") expect((await runtime.prepareActorCall(second))?.output).toBe("shared observation");
 			await runtime.finishTurn({ ...actor, terminal: mode !== "prediction-first" });
 			if (filtered) expect(events.filter((event) => event.type === "source_request" && event.request.request.kind === "continuation")).toEqual([]);
@@ -1645,7 +1659,7 @@ describe("structural speculative runtime", () => {
 				expect(providers[1]!.toolExecution).toBe(providers[0]!.toolExecution);
 				if (dual) expect(events.find((event) => event.type === "task")?.timing.authoritativeToolCount).toBe(1);
 			}
-			if (mode === "parallel-predictions") {
+			if (mode === "parallel-predictions" || completed) {
 				expect(settlements).toHaveLength(8);
 				expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(new Set([actor.id]));
 			}
@@ -1661,7 +1675,7 @@ describe("structural speculative runtime", () => {
 				expect(events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
 			}
 			expect(executionCount()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
-		} finally { proposalGate.release(); admissionGate.arrive(); executionGate.arrive(); await runtime.dispose(); }
+		} finally { proposalGate.release(); admissionGate.arrive(); executionGate.arrive(); validationGate.release(); lateProposal.release(); await runtime.dispose(); }
 		expect(disposed).toHaveBeenCalledTimes(executionCount());
 	});
 
