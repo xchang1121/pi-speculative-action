@@ -436,16 +436,28 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("validates consumed inputs and written outputs together without rewriting reads", async () => {
+	it.each(["preparation", "execution"])("validates inputs and outputs changed after %s without rewriting reads", async (phase) => {
 		const root = await temporaryRoot();
 		const input = path.join(root, "input.txt"), target = path.join(root, "output.txt");
 		const directory = path.join(root, "readable"); await mkdir(directory);
 		await writeFile(path.join(directory, "keep"), "");
 		const world = sandbox.createExecutionWorld();
+		const changesSince = ResourceVersionManager.prototype.changesSince;
+		let delayed = false;
+		const notifications = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockImplementation(function (this: ResourceVersionManager, token) {
+			return delayed ? { uncertain: false, paths: [] } : changesSince.call(this, token);
+		});
 		try {
 			for (const changed of [undefined, input, target, "permission", "directory-permission"]) {
 				await writeFile(input, "base\n"); await writeFile(target, "before\n");
 				const before = await stat(input, { bigint: true });
+				await sandbox.prepare(root, { driver: "git" });
+				const alter = async () => {
+					if (changed === "permission") await chmod(input, 0o444);
+					else if (changed === "directory-permission") await chmod(directory, 0);
+					else if (changed) await writeFile(changed, "actor\n");
+				};
+				if (phase === "preparation") { await alter(); delayed = true; }
 				const branch = await world.speculation.execute(boundContext(root, async (view) => {
 					await view.access(input, true);
 					await view.access(directory);
@@ -453,11 +465,10 @@ describe("workspace-branch ExecutionWorld", () => {
 					await view.writeFile!(target, bytes.toString());
 					return settlement((await view.readFile(target)).toString());
 				}));
+				delayed = false;
 				expect(branch.resources).toEqual(["output.txt"]);
-				expect(await readFile(target, "utf8")).toBe("before\n");
-				if (changed === "permission") await chmod(input, 0o444);
-				else if (changed === "directory-permission") await chmod(directory, 0);
-				else if (changed) await writeFile(changed, "actor\n");
+				expect(await readFile(target, "utf8")).toBe(phase === "preparation" && changed === target ? "actor\n" : "before\n");
+				if (phase === "execution") await alter();
 				const permissionChange = changed === "permission" || changed === "directory-permission";
 				const permissionDenied = permissionChange && !(await access(changed === "permission" ? input : directory,
 					changed === "permission" ? fsConstants.R_OK | fsConstants.W_OK : fsConstants.R_OK).then(() => true, () => false));
@@ -480,6 +491,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				await chmod(input, 0o666); await chmod(directory, 0o755);
 			}
 		} finally {
+			notifications.mockRestore();
 			await chmod(input, 0o666).catch(() => undefined);
 			await chmod(directory, 0o755).catch(() => undefined);
 		}
@@ -848,12 +860,14 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("borrows preparations only within their live pool and keeps current input/effect validation", async () => {
-		for (const mode of ["borrowed", "unvalidated", "copied", "foreign", "other-root", "retired"]) {
+		for (const mode of ["borrowed", "unvalidated", "copied", "marker", "foreign", "other-root", "retired"]) {
 			const root = await temporaryRoot(), target = path.join(root, "value.txt"), other = new WorkspaceSandboxService();
 			await writeFile(target, "before\n");
+			const notifications = mode === "marker" ? vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockReturnValue({ uncertain: false, paths: [] }) : undefined;
 			try {
 				let preparation = await sandbox.prepare(root, { driver: "git" });
 				if (mode === "copied") preparation = { ...preparation };
+				if (mode === "marker") preparation = "captured_inputs" as unknown as typeof preparation;
 				if (mode === "foreign") preparation = await other.prepare(root, { driver: "git" });
 				if (mode === "other-root") preparation = await sandbox.prepare(await temporaryRoot(), { driver: "git" });
 				if (mode === "retired") await sandbox.closePools([root]);
@@ -874,7 +888,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				else await branch.commit();
 				await branch.dispose();
 				expect(await readFile(target, "utf8")).toBe(mode === "borrowed" ? "current\n" : "after\n");
-			} finally { await other.dispose(); }
+			} finally { notifications?.mockRestore(); await other.dispose(); }
 		}
 	});
 
