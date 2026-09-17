@@ -331,16 +331,21 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		return path.join(privateVolume, relative);
 	};
 	const target = map(sourceTarget), logicalTarget = map(originalTarget), privateCwd = map(cwd), marker = "pi-directory-" + randomUUID();
-	const files = new Map<string, string | undefined>(), loaded = new Set<string>(), pending = new Map<string, string>(), linkedConfigurations = new Set<string>();
+	const files = new Map<string, string | undefined>(), loaded = new Map<string, boolean>(), pending = new Map<string, string>(), linkedConfigurations = new Set<string>();
+	const directories = new Set<string>();
+	const mkdir = async (target: string) => {
+		if (directories.has(target)) return;
+		await fs.mkdir(target, { recursive: true }); directories.add(target);
+	};
 	let entries = 0, inputBytes = 0;
 	const load = async (source: string, target: string) => {
 		signal.throwIfAborted();
 		const bytes = await view.readFile(source); assert.ok((inputBytes += bytes.length) <= 8 * 1024 * 1024, "search input byte budget");
-		await fs.writeFile(target, bytes); loaded.add(target);
+		await fs.writeFile(target, bytes); loaded.set(target, true);
 	};
 	const file = async (source: string, target: string, configuration: boolean) => {
 		if (!files.has(target)) {
-			await fs.mkdir(path.dirname(target), { recursive: true });
+			await mkdir(path.dirname(target));
 			await fs.writeFile(target, "", { flag: "wx" }); files.set(target, source);
 		}
 		if (configuration) {
@@ -356,16 +361,17 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 	const admitDirectory = async (parent: string, pattern: string) => {
 		const control = path.join(parent, ".rgignore");
 		if (!files.has(control)) files.set(control, undefined);
+		if (loaded.has(control)) loaded.set(control, false);
 		await fs.appendFile(control, `\n!/${pattern}/\n`);
 	};
 	const rules = async (source: string, target: string) => {
-		await fs.mkdir(target, { recursive: true });
+		await mkdir(target);
 		for (const name of [".gitignore", ".ignore", ".rgignore"]) {
 			if (await exists(path.join(source, name))) await file(path.join(source, name), path.join(target, name), true);
 		}
 		const jj = path.join(source, ".jj"), privateJj = path.join(target, ".jj");
 		if (await exists(jj)) {
-			if ((await stat(jj, "type")).isDirectory()) await fs.mkdir(privateJj, { recursive: true });
+			if ((await stat(jj, "type")).isDirectory()) await mkdir(privateJj);
 			else await file(jj, privateJj, false);
 			if ((await stat(jj, "entry")).type === "symlink") linkedConfigurations.add(privateJj);
 		}
@@ -373,7 +379,7 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		if (!await exists(git)) return;
 		const entry = await stat(git, "entry"), gitDirectory = (await stat(git, "type")).isDirectory();
 		if (gitDirectory) {
-			await fs.mkdir(privateGit, { recursive: true });
+			await mkdir(privateGit);
 			if (await exists(path.join(git, "info/exclude"))) await file(path.join(git, "info/exclude"), path.join(privateGit, "info/exclude"), true);
 			return;
 		}
@@ -384,13 +390,14 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		// This follows the pinned ignore engine's pointer resolution, not Git's broader config grammar.
 		const gitdir = path.resolve(cwd, pointer.slice(8)), common = path.join(gitdir, "commondir");
 		const control = path.join(destination, "git-" + randomUUID()); await fs.mkdir(control);
+		loaded.set(privateGit, false);
 		await fs.writeFile(privateGit, "gitdir: " + control + "\n");
 		if (!await exists(common)) return;
 		await file(common, map(common), true);
 		const commonLine = await line(map(common));
 		if (commonLine === undefined) return;
 		const commonDirectory = path.resolve(commonLine.startsWith(".") ? gitdir : cwd, commonLine);
-		await fs.mkdir(map(commonDirectory), { recursive: true });
+		await mkdir(map(commonDirectory));
 		await fs.writeFile(path.join(control, "commondir"), map(commonDirectory) + "\n");
 		const exclude = path.join(commonDirectory, "info/exclude");
 		if (await exists(exclude)) await file(exclude, map(exclude), true);
@@ -431,7 +438,7 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		if (source !== sourceTarget) { await rules(source, map(source)); await admitDirectory(map(source), "*"); }
 		if (source === volume) break;
 	}
-	await fs.mkdir(privateCwd, { recursive: true });
+	await mkdir(privateCwd);
 	const parents = new Set([target]), deny = path.join(destination, "glob-deny");
 	if (query.glob) await fs.writeFile(deny, "*\n", { flag: "wx" });
 	const selectedFiles = async (flags: readonly string[] = []) => {
@@ -453,7 +460,7 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 	if (directory) {
 		await expand(target);
 		if (logicalTarget !== target) {
-			await fs.mkdir(path.dirname(logicalTarget), { recursive: true });
+			await mkdir(path.dirname(logicalTarget));
 			await fs.symlink(target, logicalTarget, process.platform === "win32" ? "junction" : "dir");
 		}
 	}
@@ -474,7 +481,9 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 	}
 	const selected = directory ? await selectedFiles() : new Set([target]);
 	for (const [target, source] of files) {
-		if (source !== undefined && selected.has(target)) await load(source, target); // Restore raw configuration after private-only transport.
+		if (source !== undefined && selected.has(target)) {
+			if (!loaded.get(target)) await load(source, target); // Restore only configurations changed for private transport.
+		}
 		else { assert.ok(relativeFilesystemPath(privateVolume, target) !== undefined); await fs.unlink(target); }
 	}
 	return { cwd: privateCwd, path: pathToFileURL(logicalTarget).href,

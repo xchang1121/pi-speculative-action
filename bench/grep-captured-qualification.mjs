@@ -105,12 +105,15 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
   const preparation = performance.now(), profile = await createClosedSearchProfile(cwd), profilePreparationMs = performance.now() - preparation;
   const bound = profile.invocations.get("grep");
   if (!bound) { await profile.pool.dispose(); throw new Error("existing rg is not qualified by the production profile"); }
+  const observeInputs = (view) => ({ ...view,
+    readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
+    readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
+    ...(view.prepare ? { prepare: (binding, key, build, consume) =>
+      view.prepare(binding, key, (borrowed) => build(observeInputs(borrowed)), consume) } : {}),
+  });
   const invocation = { ...bound, filesystem: (view, request) => {
     executions++;
-    return bound.filesystem({ ...view,
-      readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
-      readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
-    }, request);
+    return bound.filesystem(observeInputs(view), request);
   }, authoritative: (request) => { actorCalls++; return bound.authoritative(request); } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
   const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
@@ -164,6 +167,7 @@ async function qualifyCaptured(cwd, args, expected, changed, rejected = false, s
       assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
       return { profilePreparationMs, producerMs, producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
+    assert.ok(reads.size || enumerated.size, "captured input observation must reach prepared views");
     const adopted = await sampleActor();
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
     if (costOnly) for (const trial of trials) {
