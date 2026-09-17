@@ -19,14 +19,18 @@ describe("CandidateStore", () => {
 		for (let i = 0; i < 100; i++) {
 			const action = scopedKey("read", { path: String(i) }, "/other"), other: Entry = { id: `other:${i}`, estimatedBytes: 1, key: action };
 			Object.defineProperty(other, "key", { get: () => { inspected++; return action; } });
-			store.settle("one", other, true, [`/other/${i}`]);
+			store.settle("one", other, true, [{ path: `/other/${i}` }, { path: "/workspace" }]);
 		}
 		store.insert("one", source); expect(store.lookup("one", query)).toEqual([]);
-		store.settle("one", source, true, ["/workspace/child"]);
+		store.settle("one", source, true, [{ path: "/workspace/child/value.txt" }, { path: "/workspace/child" },
+			{ path: "/workspace/alias", descendants: true }]);
 		inspected = 0;
 		expect(store.lookup("one", query)).toMatchObject([{ entry: source, match: { kind: "inputs" } }]);
 		expect(inspected).toBe(0); // Query paths address the existing index, not every retained resource owner.
 		expect(store.lookup("one", query, () => true)).toEqual([]);
+		expect(store.lookup("one", query, undefined, false)).toEqual([]);
+		expect(store.lookup("one", scopedKey("read", { path: "child/unknown.txt" }))).toEqual([]);
+		expect(store.lookup("one", scopedKey("read", { path: "alias/value.txt" }))).toMatchObject([{ entry: source, match: { kind: "inputs" } }]);
 		expect(store.lookup("one", scopedKey("read", { path: "sibling/value.txt" }))).toEqual([]);
 		expect(store.lookup("one", scopedKey("read", { path: "child/value.txt" }, "/elsewhere"))).toEqual([]);
 		expect(store.lookup("one", { ...query, resourceRoot: undefined })).toEqual([]);
@@ -35,6 +39,7 @@ describe("CandidateStore", () => {
 		expect(store.getOrCreate("one", query, () => requested, () => true).inserted).toBe(true);
 		store.delete("one", requested);
 		expect(store.lookup("one", source.key)[0]?.match.kind).toBe("exact");
+		expect(store.lookup("one", source.key, undefined, false)[0]?.match.kind).toBe("exact");
 		store.delete("one", source);
 		expect(store.lookup("one", query)).toEqual([]);
 	});

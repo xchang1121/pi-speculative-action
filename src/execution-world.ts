@@ -156,8 +156,8 @@ export interface WorldBranch<Output> {
 	readonly computationDependencies?: readonly TimelineDependency[];
 	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
-	/** Sealed input names for indexed retrieval only; never action or adoption authority. */
-	readonly inputResources?: readonly string[];
+	/** Indexed names only; descendant lookup requires an explicit backend hint, never adoption authority. */
+	readonly inputResources?: readonly { readonly path: string; readonly descendants?: boolean }[];
 	/** May evaluate the current action instead of only the source executor. Still requires query evidence. */
 	readonly reconstructionScope?: "current_action";
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */

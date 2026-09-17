@@ -81,7 +81,10 @@ export class ResourceReadView {
 	}
 	get bytes(): number { return this.capturedBytes; }
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
-	get resources(): readonly string[] { this.assertComplete(true); return [...this.entries.keys()]; }
+	get resources() {
+		this.assertComplete(true);
+		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
+	}
 
 	reserve(bytes: number): boolean {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");

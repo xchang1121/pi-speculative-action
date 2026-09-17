@@ -353,7 +353,7 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 }
 
 function retainedBranchBytes(branch: WorldBranch<unknown>): number {
-	return branch.capturedBytes + (branch.reconstruct ? branch.inputResources?.reduce((bytes, name) => bytes + name.length * 2 + 64, 0) ?? 0 : 0);
+	return branch.capturedBytes + (branch.reconstruct ? branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0 : 0);
 }
 
 /** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
@@ -2416,7 +2416,7 @@ export function makeSpeculativeActionRuntime<
 		preferred?: string,
 	) => {
 		const now = performance.now();
-		return candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded")
+		return candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded", semantics.effect(action) === "observation")
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				if (candidate.owner.draft.type !== "tool_call" || !activeExecution(candidate) || candidateWorld(candidate) !== undefined) return [];

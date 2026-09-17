@@ -1169,7 +1169,7 @@ describe("structural speculative runtime", () => {
 				if (scenario === "output-valid") await new Promise<void>((resolve) => setTimeout(resolve, 5));
 				return {
 				...world("wide", { validate: scoped ? async () => { throw new Error("unrelated input is stale"); } : validate }),
-				inputResources: ["/workspace/README.md"],
+				inputResources: [{ path: "/workspace/README.md" }],
 				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
@@ -1271,6 +1271,24 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
+	it.each(["workspace_mutation", "unbounded"] as const)("skips input retrieval for a bound %s action while retaining exact results", async effect => {
+		const authorize = vi.fn(() => ({ ok: true as const })), reconstruct = vi.fn(async () => ({ output: "query" }));
+		const { runtime, ready } = harness({ source: planSource({ propose: () => plan("inputs", { path: "input", offset: 1, limit: 1 }) }),
+			actionKey: (tool, args) => PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", (args as Record<string, unknown>).offset === 2 ? {
+				fingerprint: "bound", semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, epoch: `bound.${effect}`, effect },
+			} : undefined), authorizeCandidate: authorize,
+			execute: () => ({ ...world("source", { validate: async () => validResource() }), reconstruct,
+				inputResources: [{ path: "/workspace/input" }], reconstructionScope: "current_action" as const }),
+		});
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			expect((await runtime.prepareActorCall(call("turn", { path: "input", offset: 2, limit: 1 })))?.output).toBeUndefined();
+			expect(authorize).not.toHaveBeenCalled(); expect(reconstruct).not.toHaveBeenCalled();
+			expect((await runtime.prepareActorCall({ ...call("turn", { path: "input", offset: 1, limit: 1 }), id: "exact" }))?.output).toBe("source");
+			expect(authorize).toHaveBeenCalledOnce(); expect(reconstruct).not.toHaveBeenCalled();
+		} finally { await runtime.dispose(); }
+	});
+
 	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
 		const disposed = vi.fn();
 		let now = 100;
@@ -1283,7 +1301,7 @@ describe("structural speculative runtime", () => {
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
 			settings: () => ({ ...settings, resourceCacheMaxEntries: entries, resourceCacheMaxBytes: bytes }),
 			execute: () => { now += sourceMs; return { ...world("1", { onDispose: disposed,
-				validate: async () => { now += 3; return validResource(); } }), reconstruct, inputResources: ["/workspace/input"] }; },
+				validate: async () => { now += 3; return validResource(); } }), reconstruct, inputResources: [{ path: "/workspace/input" }] }; },
 		});
 		try {
 			await runtime.startTurn(start("first")); await ready.promise;
@@ -1334,7 +1352,7 @@ describe("structural speculative runtime", () => {
 			actionKey: (tool, input) => PI_ACTION_SEMANTICS.buildKey(tool, input, "/workspace", "", { fingerprint: executor }),
 			authorizeCandidate: () => allowed ? { ok: true } : { ok: false, reason: "denied" },
 			execute: () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
-				inputResources: ["/workspace/README.md"],
+				inputResources: [{ path: "/workspace/README.md" }],
 				...world("1", { executionFingerprint: "bound", onDispose: disposed, onCommit: committed,
 					validate: async () => (validResource()) }),
 				reconstruct: async ({ args }) => {
