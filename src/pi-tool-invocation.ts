@@ -173,17 +173,9 @@ export async function createClosedSearchProfile(cwd: string) {
 		if (tool === "grep" && !engine) continue;
 		const execute = (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => pool.run(view ? "producer" : "actor", async (worker, signal) => {
 			const capture = view || engine ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
-			let privateRoot: string | undefined, directory = cwd, args = request.args;
-			try {
-				if (engine && view) {
-					privateRoot = await fs.mkdtemp(path.join(engine.root, "inputs-"));
-					const query = request.args as GrepInput;
-					const prepared = await prepareCapturedGrep(view, cwd, privateRoot, { ...query,
-						path: resolvePath(query.path || ".", cwd, { homeDir: home, normalizeUnicodeSpaces: true, stripAtPrefix: true }) }, signal,
-						(directory, args, signal, emit) => engine.execute("selection", directory, args, signal, emit));
-					directory = prepared.cwd; args = prepared.args;
-				}
-				return await worker.request({ kind: tool, root: directory, home, args }, {
+			const run = (prepared?: { readonly root: string; readonly cwd: string; readonly path: string }) => {
+				const directory = prepared?.cwd ?? cwd, args = prepared ? { ...request.args as GrepInput, path: prepared.path } : request.args;
+				return worker.request({ kind: tool, root: directory, home, args }, {
 					signal, onInput: async (operation, target, signal, emit) => {
 						if (engine && operation === "process") {
 							const command = target as { file: string; args: string[]; options: unknown };
@@ -193,14 +185,28 @@ export async function createClosedSearchProfile(cwd: string) {
 						assert.equal(typeof target, "string");
 						if (!engine) return readClosedSearchInput((view ?? capture?.view)!, cwd, operation, target as string, profile.limits.inputBytes);
 						assert.ok(operation === "stat" || operation === "readFile", "grep input operation denied");
-						if (privateRoot) assert.ok(relativeFilesystemPath(privateRoot, target as string) !== undefined, "grep input escaped its owned tree");
+						if (prepared) assert.ok(relativeFilesystemPath(prepared.root, target as string) !== undefined, "grep input escaped its owned tree");
 						return operation === "stat" ? { directory: (await fs.stat(target as string)).isDirectory() } : fs.readFile(target as string, { signal });
 					},
 				});
-			} finally {
-				await capture?.release();
-				if (privateRoot) { assert.equal(path.dirname(privateRoot), engine!.root); await fs.rm(privateRoot, { recursive: true, force: true }); }
-			}
+			};
+			try {
+				if (!engine || !view) return await run();
+				const query = request.args as GrepInput;
+				const target = resolvePath(query.path || ".", cwd, { homeDir: home, normalizeUnicodeSpaces: true, stripAtPrefix: true });
+				const build = async (inputs: ToolFilesystemOperations) => {
+					const root = await fs.mkdtemp(path.join(engine.root, "inputs-"));
+					const dispose = async () => { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); };
+					try {
+						const prepared = await prepareCapturedGrep(inputs, cwd, root, { ...query, path: target }, signal,
+							(directory, args, signal, emit) => engine.execute("selection", directory, args, signal, emit));
+						return { value: { root, cwd: prepared.cwd, path: prepared.path }, bytes: prepared.bytes, dispose };
+					} catch (error) { await dispose(); throw error; }
+				};
+				if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run);
+				const prepared = await build(view);
+				try { return await run(prepared.value); } finally { await prepared.dispose(); }
+			} finally { await capture?.release(); }
 		}, request.signal);
 		invocations.set(tool, Object.freeze({
 			executor: profile.id, identity: Object.freeze({ profile, cwd, home, ...(engine ? { engine: engine.identity } : {}) }),
@@ -471,7 +477,8 @@ async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, 
 		if (source !== undefined && selected.has(target)) await load(source, target); // Restore raw configuration after private-only transport.
 		else { assert.ok(relativeFilesystemPath(privateVolume, target) !== undefined); await fs.unlink(target); }
 	}
-	return { cwd: privateCwd, args: { ...query, path: pathToFileURL(logicalTarget).href } };
+	return { cwd: privateCwd, path: pathToFileURL(logicalTarget).href,
+		bytes: inputBytes + [...files.keys(), ...parents, privateCwd, logicalTarget, destination].reduce((sum, name) => sum + name.length * 2 + 128, 0) };
 }
 import assert from "node:assert/strict";
 import path from "node:path";
