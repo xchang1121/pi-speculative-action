@@ -6,16 +6,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { createGrepTool } from "@earendil-works/pi-coding-agent";
-import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { createClosedSearchProfile, runCapturedSearchProcess } from "../src/pi-tool-invocation.ts";
-import { captureStableFile } from "../src/filesystem-evidence.ts";
-import { resolveHostExecutable } from "../src/executable-path.ts";
-import { relativeFilesystemPath } from "../src/path-utils.ts";
-import { CLOSED_SEARCH_PROFILE } from "../src/closed-search-kernel.mjs";
-import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../src/closed-search-process.mjs";
+import { createResourceSnapshotExecutionWorld } from "../dist/agent-execution-world.js";
+import { PI_ACTION_SEMANTICS } from "../dist/action-semantics.js";
+import { createClosedSearchProfile, runCapturedSearchProcess } from "../dist/pi-tool-invocation.js";
+import { captureStableFile } from "../dist/filesystem-evidence.js";
+import { resolveHostExecutable } from "../dist/executable-path.js";
+import { relativeFilesystemPath } from "../dist/path-utils.js";
+import { CLOSED_SEARCH_PROFILE } from "../dist/closed-search-kernel.mjs";
+import { ClosedSearchProcessPool, launchClosedSearchWorker } from "../dist/closed-search-process.mjs";
+import { searchJourney } from "./search-journey.mjs";
 
 // Qualification only: complete stock-Pi grep on private, token-owned inputs.
 // Stock Pi runs in a bounded process; the parent owns rg, its output and completion.
@@ -60,8 +59,8 @@ try {
 }
 
 async function qualifyCaptured(cwd, profile, args, expected, changed, rejected = false, stableChange = false) {
-  const ready = Promise.withResolvers(), reads = new Set(), enumerated = new Set();
-  let executions = 0, actorCalls = 0, settled;
+  const reads = new Set(), enumerated = new Set();
+  let executions = 0;
   const bound = profile.invocations.get("grep");
   assert.ok(bound, "existing rg is not qualified by the production profile");
   const observeInputs = (view) => ({ ...view,
@@ -73,34 +72,16 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
   const invocation = { ...bound, filesystem: (view, request) => {
     executions++;
     return bound.filesystem(observeInputs(view), request);
-  }, authoritative: (request) => { actorCalls++; return bound.authoritative(request); } };
+  } };
   const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
-  const tool = createGrepTool(cwd), tools = [tool], model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
-  const host = createSpeculativeActionHost("probe", {
-    cwd, getSettings: () => ({ enabled: true, drafterEnabled: true, drafterGateEnabled: false, drafterMaxDepth: 0,
-      tools: ["grep"], candidateLimit: 1, maxConcurrentActions: 1, resourceCacheMaxEntries: 32, resourceCacheMaxBytes: 16 * 1024 * 1024, patternAware: { enabled: false } }),
-    complete: async () => fauxAssistantMessage(fauxToolCall("grep", args), { stopReason: "toolUse" }),
-    resolveInvocation: () => invocation, preflight: () => true, executionWorlds: [world],
-    onActorActionSettled: ({ settlement }) => settled?.resolve(settlement),
-    onEvent: (event) => {
-      if (event.type === "candidate" && ["succeeded", "failed", "cancelled"].includes(event.state.status)) ready.resolve(event.state);
-      if (event.type === "prediction" && event.settlement.observation === "unobserved") ready.resolve(event.settlement);
-    },
+  const probe = searchJourney({ cwd, name: "grep", tools: [createGrepTool(cwd)], args, invocation, world,
+    settings: { resourceCacheMaxEntries: 32, resourceCacheMaxBytes: 16 * 1024 * 1024 },
   });
-  const turn = { turnID: "probe", actorModel: model, actorOptions: undefined, tools, context: { systemPrompt: "qualification", messages: [], tools } };
   let callID = 0;
-  const actor = async () => {
-    settled = Promise.withResolvers();
-    const before = actorCalls;
-    const result = await host.execute({ turnID: turn.turnID, id: `Actor-${++callID}`, tool: "grep", args, tools }, new AbortController().signal,
-      async (operation) => (await operation.invocation.authoritative({ args: operation.input, signal: operation.signal, callID: operation.callID })).result);
-    const { provider } = await settled.promise;
-    assert.equal(actorCalls - before, provider.kind === "actor" ? 1 : 0, "each fallback executes the original Actor exactly once");
-    return result;
-  };
+  const actor = async () => (await probe.actor(`Actor-${++callID}`)).output;
   try {
-    await host.startTurn(turn);
-    const completion = await ready.promise;
+    await probe.start("probe");
+    const completion = await probe.candidate;
     assert.equal(completion.observation === "unobserved" ? completion.cause.code : completion.status,
       rejected === "unkeyable" ? "action_not_keyable" : rejected ? "failed" : "succeeded", JSON.stringify(completion));
     const materialized = reads.size;
@@ -108,16 +89,16 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
     if (rejected) {
       if (expected instanceof Error) await assert.rejects(actor, { message: expected.message });
       else assert.deepEqual(await actor(), expected);
-      assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(actorCalls, 1);
-      return { producerCalls: executions, actorCalls, reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
+      assert.equal(executions, rejected === "unkeyable" ? 0 : 1); assert.equal(probe.actorCalls(), 1);
+      return { producerCalls: executions, actorCalls: probe.actorCalls(), reads: [...reads], enumerated: [...enumerated], rejected, actorError: expected instanceof Error };
     }
     assert.ok(reads.size || enumerated.size, "captured input observation must reach prepared views");
     assert.deepEqual(await actor(), expected);
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
-    assert.equal(actorCalls, 0);
-    if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(actorCalls, 1); }
-    return { producerCalls: executions, inputFilesRead: materialized, actorCalls, reads: [...reads], enumerated: [...enumerated] };
-  } finally { await host.dispose(); }
+    assert.equal(probe.actorCalls(), 0);
+    if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(probe.actorCalls(), 1); }
+    return { producerCalls: executions, inputFilesRead: materialized, actorCalls: probe.actorCalls(), reads: [...reads], enumerated: [...enumerated] };
+  } finally { await probe.host.dispose(); }
 }
 
 async function qualifyNamespace() {

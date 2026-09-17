@@ -13,6 +13,7 @@ import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-
 import {
 	captureResourceVersion,
 	type ResourceReadView,
+	type ResourceObservation,
 	type ResourceVersionToken,
 	releaseResourceVersion,
 	validateResourceVersion,
@@ -122,18 +123,22 @@ export function createResourceSnapshotExecutionWorld(
 	};
 }
 
+const resourceVersions = new WeakMap<object, ResourceVersionToken>();
+
 function resourceSnapshotBranch(
 	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number, semantics: ActionSemanticsRegistry,
 ): WorldBranch<ToolSettlement> {
+	const inputSource = Object.freeze({});
+	resourceVersions.set(inputSource, version);
 	let owned: ResourceVersionToken | undefined = version;
-	const validate = async (token: ResourceVersionToken | undefined) => {
+	const validate = async (token: ResourceVersionToken | readonly ResourceVersionToken[] | undefined) => {
 		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
 		return expired
 			? { status: "stale" as const, cause: cause("freshness", reason ?? "resource_changed"), metrics }
 			: { status: "valid" as const, metrics };
 	};
 	return {
-		backend: "resource_version", output, resources: Object.freeze([]),
+		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
 		inputResources: version.view?.resources,
 		reconstructionScope: "current_action",
 		capturedBytes: version.view?.bytes ?? 0,
@@ -147,18 +152,29 @@ function resourceSnapshotBranch(
 			const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
 			if (!owned?.view || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope) return undefined;
 			if (!effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
-			let scoped: ResourceVersionToken | undefined, capturedBytes = 0;
-			const result = await owned.view.evaluate((view) => execute(view, request), (dependencies) => {
-				if (!dependencies?.size) return;
-				const observations = new Map<string, ResourceVersionToken["observations"] extends ReadonlyMap<string, infer Entry> ? Entry : never>();
-				for (const key of dependencies) {
-					const entry = version.observations.get(key); if (!entry) return;
-					observations.set(key, entry); capturedBytes += key.length * 2 + 64;
+			const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>();
+			let capturedBytes = 0;
+			const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined) => {
+				let observations = proofs.get(token);
+				if (!observations) proofs.set(token, observations = new Map());
+				for (const key of dependencies ?? token.observations.keys()) {
+					const entry = token.observations.get(key);
+					if (!entry) throw new Error("resource_input_proof_missing");
+					if (!observations.has(key)) capturedBytes += key.length * 2 + 64;
+					observations.set(key, entry);
 				}
-				scoped = { ...version, observations };
-			}, root);
+			};
+			const result = await owned.view.evaluate((view) => execute(view, request), dependencies => observe(version, dependencies), root,
+				request.inputs && function* (target) {
+					for (const source of request.inputs!(target)) {
+						const token = resourceVersions.get(source);
+						if (token?.view) yield { view: token.view, observed: (dependencies) => observe(token, dependencies) };
+					}
+				});
 			request.signal.throwIfAborted();
-			return { output: result, validate: () => validate(scoped ?? version), capturedBytes,
+			const versions = [...proofs].map(([token, observations]) => ({ ...token, observations }));
+			return { output: result, validate: () => validate(versions), capturedBytes,
+				...(proofs.size > 1 ? { requiresQueryValidation: true as const } : {}),
 				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
 		} } : {}),
 		commit: async () => {
@@ -167,6 +183,7 @@ function resourceSnapshotBranch(
 		},
 		dispose: () => {
 			owned = undefined;
+			resourceVersions.delete(inputSource);
 			return version.release();
 		},
 	};

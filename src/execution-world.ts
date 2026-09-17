@@ -156,6 +156,8 @@ export interface WorldBranch<Output> {
 	readonly resources: readonly string[];
 	/** Indexed names only; descendant lookup requires an explicit backend hint, never adoption authority. */
 	readonly inputResources?: readonly { readonly path: string; readonly descendants?: boolean }[];
+	/** Opaque backend input owner; preserved through transactions, never result adoption authority. */
+	readonly inputSource?: object;
 	/** May evaluate the current action instead of only the source executor. Still requires query evidence. */
 	readonly reconstructionScope?: "current_action";
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */
@@ -174,6 +176,8 @@ export interface WorldBranch<Output> {
 		readonly args: unknown;
 		readonly callID: string;
 		readonly signal: AbortSignal;
+		/** Leased sealed owners from the session's input index; the backend must prove every borrowed dependency. */
+		readonly inputs?: (path: string) => Iterable<object>;
 	}) => Promise<{
 		readonly output: Output;
 		/** Evidence for the current operation that evaluated these inputs. */
@@ -182,6 +186,8 @@ export interface WorldBranch<Output> {
 		readonly validate?: () => Promise<ResourceValidation>;
 		/** Additional retained proof storage, excluding the already-owned inputs. */
 		readonly capturedBytes?: number;
+		/** A composed query cannot fall back to the source branch's narrower proof. */
+		readonly requiresQueryValidation?: true;
 	} | undefined>;
 	/** Shared adoption returns the sealed output; only exclusive effects may return an updated settlement.
 	 * Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */

@@ -92,6 +92,12 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			: [];
 	}
 
+	/** The same owned-name index serves dynamically discovered query dependencies. */
+	lookupInputs(scope: Scope, resources: readonly string[]): readonly Entry[] {
+		return [...this.inputRecords(scope, resources)].sort(([left, a], [right, b]) => a - b || right.recency - left.recency)
+			.map(([{ entry }]) => entry);
+	}
+
 	touch(scope: Scope, entry: Entry): boolean {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state) return false;
@@ -188,25 +194,31 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return record?.entry === entry ? record : undefined;
 	}
 
-	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean, includeInputs = false) {
+	private inputRecords(scope: Scope, resources: readonly string[]) {
 		const state = this.scopes.get(scope);
-		if (!state) return [];
-		const candidates = new Set(state.exact.get(action.key));
 		const inputs = new Map<IndexedEntry<Entry>, number>();
-		if (includeInputs) for (const resource of action.resources) {
-			if (action.resourceRoot === undefined && !path.isAbsolute(resource)) continue;
-			let current = path.resolve(action.resourceRoot ?? "", resource), depth = 0;
+		if (state) for (const resource of resources) {
+			let current = path.resolve(resource), depth = 0;
 			for (;;) {
 				const keys = depth ? [inputPartition(current, true)] : [inputPartition(current), inputPartition(current, true)];
 				for (const key of keys) {
 					for (const indexed of state.partitions.get(key) ?? []) {
-						inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth)); candidates.add(indexed);
+						inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth));
 					}
 				}
 				const parent = path.dirname(current); if (parent === current) break;
 				current = parent; depth++;
 			}
 		}
+		return inputs;
+	}
+
+	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean, includeInputs = false) {
+		const state = this.scopes.get(scope);
+		if (!state) return [];
+		const inputs = this.inputRecords(scope, includeInputs ? action.resources.flatMap(resource =>
+			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : []) : []);
+		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys()]);
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
 		const ranked: (CandidateLookup<Entry> & { readonly indexed: IndexedEntry<Entry> })[] = [];
 		for (const indexed of candidates) {

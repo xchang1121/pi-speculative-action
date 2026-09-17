@@ -18,6 +18,8 @@ export type ResourceDependency = {
 	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "names" | "binding" | "resolution";
 };
 
+export type ResourceObservation = ResourceDependency & { readonly fingerprint: string; readonly stamp?: string };
+
 export type ResourceValidationMetrics = {
 	readonly durationMs: number;
 	readonly bytesRead: number;
@@ -38,7 +40,7 @@ export type ResourceChangeSet = {
 export type ResourceVersionToken = {
 	readonly root: string;
 	readonly physicalRoot: string;
-	readonly observations: ReadonlyMap<string, ResourceDependency & { readonly fingerprint: string; readonly stamp?: string }>;
+	readonly observations: ReadonlyMap<string, ResourceObservation>;
 	readonly epoch: number;
 	readonly watching: boolean;
 	readonly preciseContent: ReadonlyArray<string>;
@@ -56,6 +58,11 @@ type CapturedResource = (
 	| { readonly type: "special" }
 	| { readonly type: "missing" }) & { readonly realPath?: string; readonly dependency?: string; readonly metadataDependency?: string };
 
+type ResourceInputLookup = (target: string) => Iterable<{
+	readonly view: ResourceReadView;
+	readonly observed: (dependencies: ReadonlySet<string> | undefined) => void;
+}>;
+
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
 	private entries = new Map<string, CapturedResource>();
@@ -66,6 +73,7 @@ export class ResourceReadView {
 	private pending?: Promise<void>;
 	private disposal?: Promise<void>;
 	private dependencies?: Set<string>;
+	private lookup?: ResourceInputLookup;
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, {
 		readonly value: unknown; readonly dispose: () => void | Promise<void>;
 		readonly dependencies?: ReadonlySet<string>; readonly boundary: ResourceReadView["boundary"];
@@ -133,9 +141,10 @@ export class ResourceReadView {
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
-	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void, root?: string): Promise<T> {
+	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
+		root?: string, lookup?: ResourceInputLookup): Promise<T> {
 		this.assertComplete(true);
-		return this.borrow(operation, observed, root);
+		return this.borrow(operation, observed, root, lookup);
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume) => {
@@ -177,10 +186,11 @@ export class ResourceReadView {
 			} finally { if (!retained) await resource?.dispose(); }
 		});
 	};
-	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void, root?: string): Promise<T> {
+	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
+		root?: string, lookup = this.lookup): Promise<T> {
 		this.assertComplete();
 		const view = new ResourceReadView(0);
-		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set();
+		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup;
 		try {
 			if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
 				view.boundary = this.boundary;
@@ -216,7 +226,7 @@ export class ResourceReadView {
 			this.prepared!.bindings.clear();
 		}) : this.pending?.then(() => {}, () => {});
 	}
-	private async get(target: string, scope: ResourceDependency["scope"]) {
+	private async get(target: string, scope: ResourceDependency["scope"]): Promise<CapturedResource> {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target)) this.unproven(target);
 		if (this.owner && !this.owner.sealed) await this.owner.get(target, scope);
@@ -224,10 +234,7 @@ export class ResourceReadView {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
 				const entry = this.entry(target, scope !== "entry");
 				// Existing input evidence also owns the metadata derivable from those bytes or names.
-				if (entry && (scope === "entry" || scope === "type" ||
-					(scope === "stat" && (entry.type !== "file" || entry.size !== undefined || entry.content !== undefined)) ||
-					(scope === "names" && entry.type === "directory" && entry.entries !== undefined) ||
-					(scope === "content" && entry.type === "file" && entry.content !== undefined))) return;
+				if (resourceCovers(entry, scope)) return;
 				return this.load!({ path: target, scope });
 			});
 			this.pending = pending;
@@ -235,7 +242,15 @@ export class ResourceReadView {
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		return this.entry(target, scope !== "entry", scope) ?? this.unproven(target);
+		const entry = this.entry(target, scope !== "entry", scope);
+		if (resourceCovers(entry, scope)) return entry!;
+		for (const source of this.lookup?.(target) ?? []) {
+			if (source.view.entries === this.entries || !source.view.retained) continue;
+			try {
+				return await source.view.evaluate(view => view.get(target, scope), source.observed, this.boundary?.root);
+			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
+		}
+		return this.unproven(target);
 	}
 	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): CapturedResource | undefined {
 		this.assertComplete();
@@ -267,6 +282,13 @@ export class ResourceReadView {
 	private unproven(target: string): never {
 		throw (this.failure ??= new Error(`resource_access_unproven:${target}`));
 	}
+}
+
+function resourceCovers(entry: CapturedResource | undefined, scope: ResourceDependency["scope"]): boolean {
+	return !!entry && (scope === "entry" || scope === "type" ||
+		(scope === "stat" && (entry.type !== "file" || entry.size !== undefined || entry.content !== undefined)) ||
+		(scope === "names" && entry.type === "directory" && entry.entries !== undefined) ||
+		(scope === "content" && entry.type === "file" && entry.content !== undefined));
 }
 
 type ResourceEvent = {
@@ -532,11 +554,34 @@ export async function captureResourceVersion(
 	return manager.capture(dependencies, retainBytes);
 }
 
-export function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
-	return isResourceVersionToken(token)
-		? token.manager.validate(token)
-		: Promise.resolve(validation(performance.now(), "resource_version_missing"));
+export async function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
+	if (!Array.isArray(token)) return isResourceVersionToken(token)
+		? token.manager.validate(token) : validation(performance.now(), "resource_version_missing");
+	if (token.length === 1) return validateResourceVersion(token[0]);
+	const started = performance.now(), checked: ResourceVersionValidation[] = [];
+	const groups = new Map<ResourceVersionManager, ResourceVersionToken & { observations: Map<string, ResourceObservation> }>();
+	try {
+		if (!token.length) throw new Error("resource_version_missing");
+		for (const source of token) {
+			if (!isResourceVersionToken(source)) throw new Error("resource_version_missing");
+			source.view?.assertComplete(true);
+			let group = groups.get(source.manager);
+			if (!group) groups.set(source.manager, group = { ...source, observations: new Map() });
+			if (group.root !== source.root || group.physicalRoot !== source.physicalRoot) throw new Error("resource_version_conflict");
+			for (const [key, entry] of source.observations) {
+				if (group.observations.has(key) && group.observations.get(key)!.fingerprint !== entry.fingerprint) throw new Error("resource_version_conflict");
+				group.observations.set(key, entry);
+			}
+		}
+		for (const group of groups.values()) {
+			const result = await group.manager.validate(group); checked.push(result);
+			if (result.expired) return validation(started, result.reason, "exact", checked);
+		}
+		for (const source of token as ResourceVersionToken[]) source.view?.assertComplete(true);
+		return validation(started, undefined, "exact", checked);
+	} catch (error) { return validation(started, error instanceof Error ? error.message : "resource_validation_failed", "exact", checked); }
 }
+
 
 export function releaseResourceVersion(token: unknown): void | Promise<void> {
 	if (!isResourceVersionToken(token)) return;
