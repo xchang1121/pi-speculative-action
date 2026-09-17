@@ -70,8 +70,11 @@ export function createResourceSnapshotExecutionWorld(
 				if (!owned) throw new Error("resource snapshot capture is already consumed");
 				try {
 					owned.view?.seal();
-					const validation = await (onDemand ? owned.manager.validate(owned) : owned.manager.seal(owned));
-					if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
+					// Bound execution already owns its inputs; adoption checks their current versions.
+					if (!onDemand) {
+						const validation = await owned.manager.seal(owned);
+						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
+					}
 					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs);
 				} catch (error) {
 					await releaseResourceVersion(owned);
