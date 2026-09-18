@@ -106,7 +106,7 @@ export async function validateDynamicDependencyCertificate(
 							includeMetadata: expected.metadataDigest !== undefined,
 							maxFileBytes: context.maxFileBytes,
 						});
-						filesRead++;
+						filesRead += captured.filesRead;
 						bytesRead += captured.bytesRead;
 						observed = captured.dependency;
 						break;
@@ -174,7 +174,7 @@ export async function captureFileDependency(
 	logicalPath: string,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
 	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number } = {},
-): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number }> {
+): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
 	const maxBytes = finiteLimit(options.maxFileBytes ?? Number.POSITIVE_INFINITY);
 	const content = await captureStableFile(physicalPath, maxBytes);
 	return {
@@ -185,7 +185,8 @@ export async function captureFileDependency(
 			contentDigest: `sha256:${content.hash}`,
 			...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(content.stat) } : {}),
 		},
-		bytesRead: content.bytesRead,
+		bytesRead: content.shared ? 0 : content.bytesRead,
+		filesRead: content.shared ? 0 : 1,
 	};
 }
 
