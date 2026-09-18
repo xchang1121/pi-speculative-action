@@ -11,7 +11,7 @@ import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transactio
 import type { ProcessExecutor } from "./process-execution.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 9;
+const HELPER_PROTOCOL_VERSION = 10;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -51,6 +51,11 @@ export type HeldExecDecision =
 			readonly kind: "replay";
 			readonly exitCode: number;
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
+			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
+			readonly descriptorOffsets?: readonly {
+				readonly fd: number; readonly device: string; readonly inode: string;
+				readonly flags: number; readonly before: number; readonly after: number;
+			}[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
 			readonly adopted?: () => void;
@@ -206,16 +211,27 @@ export class LinuxHeldExecBoundary {
 				return;
 			}
 			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0);
+			const positions = decision.descriptorOffsets?.map(position => ({ ...position })) ?? [];
+			const descriptors = new Set<number>();
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
-				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) return void socket.end("C\n");
+				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
+					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
+					return duplicate || ![position.fd, position.flags, position.before, position.after].every(value => Number.isSafeInteger(value) && value >= 0) ||
+						position.fd > 0x7fffffff || position.flags > 0x7fffffff || ![position.device, position.inode].every(value =>
+							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
+				})) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
-			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total}\n`));
+			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
+			for (const position of positions) await write(socket, Buffer.from(
+				`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after}\n`));
 			for (const event of decision.output) {
 				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
 				await write(socket, event.data);
 			}
-			if ((await readLine(socket)) !== "A") throw new Error("held-exec adoption was not acknowledged");
+			const acknowledgement = await readLine(socket);
+			if (acknowledgement === "N") { prepared = false; return void socket.end(); }
+			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
 			throwIfAborted(active.signal);
 			await decision.commit();
 			await write(socket, Buffer.from("R\n"));

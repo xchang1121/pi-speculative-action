@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
+#include <linux/kcmp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -26,6 +28,13 @@ static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 #define MAX_LINE 1024
 #define MAX_OUTPUT_EVENTS 65536
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
+#define MAX_POSITIONS 64
+
+struct file_position {
+	int descriptor, duplicate, flags, alias;
+	uintmax_t device, inode;
+	int64_t before, after;
+};
 
 struct output_event {
 	unsigned fd;
@@ -40,6 +49,8 @@ struct decision_job {
 	int channel[2], connection, outputs[3], result;
 	struct output_event *events;
 	unsigned count;
+	struct file_position *positions;
+	unsigned position_count;
 };
 
 struct traced_process {
@@ -203,7 +214,7 @@ done:
 	return result;
 }
 
-static int open_tracee_output(pid_t pid, unsigned fd) {
+static int duplicate_tracee_fd(pid_t pid, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 	int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
 	if (pidfd >= 0) {
@@ -217,6 +228,12 @@ static int open_tracee_output(pid_t pid, unsigned fd) {
 		} else errno = saved;
 	}
 	#endif
+	return -1;
+}
+
+static int open_tracee_output(pid_t pid, unsigned fd) {
+	int duplicate = duplicate_tracee_fd(pid, fd);
+	if (duplicate >= 0) return duplicate;
 	char path[64];
 	if (snprintf(path, sizeof(path), "/proc/%ld/fd/%u", (long)pid, fd) >= (int)sizeof(path)) {
 		errno = ENAMETOOLONG;
@@ -225,10 +242,20 @@ static int open_tracee_output(pid_t pid, unsigned fd) {
 	/* This fallback opens a new description; never change flags on a pidfd duplicate. */
 	int output = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
 	if (output < 0) return -1;
+	struct stat state;
 	int flags = fcntl(output, F_GETFL);
-	if (flags >= 0 && fcntl(output, F_SETFL, flags & ~O_NONBLOCK) >= 0) return output;
+	if (fstat(output, &state) == 0 && S_ISFIFO(state.st_mode) && flags >= 0 &&
+		fcntl(output, F_SETFL, flags & ~O_NONBLOCK) >= 0) return output;
 	close(output);
 	return -1;
+}
+
+static int position_matches(const struct file_position *position) {
+	struct stat state;
+	return fstat(position->duplicate, &state) == 0 && S_ISREG(state.st_mode) &&
+		(uintmax_t)state.st_dev == position->device && (uintmax_t)state.st_ino == position->inode &&
+		fcntl(position->duplicate, F_GETFL) == position->flags &&
+		lseek(position->duplicate, 0, SEEK_CUR) == position->before;
 }
 
 /* Only the tracer thread may mutate a held image. Each job owns its reply channel. */
@@ -257,8 +284,20 @@ static int actor_decision(struct decision_job *job) {
 	if (!strcmp(line, "C")) return -1;
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
-	if (sscanf(line, "P %u %u %zu", &code, &job->count, &total) != 3 || code > 255 ||
-		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES) return -1;
+	if (sscanf(line, "P %u %u %zu %u", &code, &job->count, &total, &job->position_count) != 4 || code > 255 ||
+		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || job->position_count > MAX_POSITIONS) return -1;
+	if (job->position_count) {
+		job->positions = calloc(job->position_count, sizeof(*job->positions));
+		if (!job->positions) return -1;
+		for (unsigned index = 0; index < job->position_count; index++) job->positions[index].duplicate = -1;
+	}
+	for (unsigned index = 0; index < job->position_count; index++) {
+		struct file_position *position = &job->positions[index];
+		if (read_line(connection, line, sizeof(line)) < 0 ||
+			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64, &position->descriptor,
+				&position->device, &position->inode, &position->flags, &position->before, &position->after) != 6 ||
+			position->descriptor < 0 || position->before < 0 || position->after < 0) goto decline;
+	}
 	job->events = calloc(job->count ? job->count : 1, sizeof(*job->events));
 	if (!job->events) return -1;
 	size_t received = 0;
@@ -281,14 +320,40 @@ static int actor_decision(struct decision_job *job) {
 		received += length;
 	}
 	if (received != total) return -1;
+	for (unsigned index = 0; index < job->position_count; index++) {
+		struct file_position *position = &job->positions[index];
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+		position->duplicate = duplicate_tracee_fd(job->pid, (unsigned)position->descriptor);
+		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		if (position->duplicate < 0 || !position_matches(position)) goto decline;
+		for (unsigned previous = 0; previous < index; previous++) {
+			const struct file_position *other = &job->positions[previous];
+			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, position->duplicate, other->duplicate);
+			if (same < 0) goto decline;
+			if (same == 0) {
+				if (position->before != other->before || position->after != other->after) goto decline;
+				position->alias = 1;
+			}
+		}
+	}
 	/* From the first text mutation onward, failure terminates the entire trace tree. */
 	if (request_exit(job, 125) < 0) return -2;
 	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) return -2;
+	for (unsigned index = 0; index < job->position_count; index++)
+		if (!position_matches(&job->positions[index])) return -2;
+	for (unsigned index = 0; index < job->position_count; index++) {
+		const struct file_position *position = &job->positions[index];
+		if (!position->alias && lseek(position->duplicate, position->after, SEEK_SET) != position->after) return -2;
+	}
 	for (unsigned index = 0; index < job->count; index++) {
 		struct output_event *event = &job->events[index];
 		if (transfer(job->outputs[event->fd], event->data, event->length, 1) < 0) return -2;
 	}
 	if (request_exit(job, code) < 0 || transfer(connection, "D\n", 2, 1) < 0) return -2;
+	return -1;
+decline:
+	/* No image or shared offset changed: explicitly acknowledge native fallback. */
+	(void)transfer(connection, "N\n", 2, 1);
 	return -1;
 }
 
@@ -305,6 +370,8 @@ static void *decide_process(void *argument) {
 static void free_job(struct decision_job *job) {
 	close(job->channel[0]); close(job->channel[1]); close(job->connection);
 	for (unsigned fd = 1; fd <= 2; fd++) close(job->outputs[fd]);
+	if (job->positions) for (unsigned index = 0; index < job->position_count; index++) close(job->positions[index].duplicate);
+	free(job->positions);
 	free_events(job->events, job->count);
 	free(job);
 }
@@ -495,7 +562,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("9");
+		puts("10");
 		return 0;
 	}
 	if (argc >= 2 && !strcmp(argv[1], "--exec")) {
