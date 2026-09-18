@@ -330,6 +330,36 @@ describe("speculative action resource versions", () => {
 		} finally { await retained?.release(); await token.release(); manager.close(); }
 	});
 
+	test("fills only missing inputs within one evaluation without expanding sealed read authority", async () => {
+		const root = await workspace({ known: "A", missing: "B" }), manager = new ResourceVersionManager(root, { watch: false });
+		const source = await manager.capture(undefined, 8192), extra = await manager.capture(undefined, 8192);
+		const known = path.join(root, "known"), missing = path.join(root, "missing");
+		await source.view!.readFile(known); source.view!.seal();
+		const opened = vi.spyOn(fs, "open"), dependencies = new Set<string>();
+		const fill = vi.fn(async () => ({ view: extra.view!, observed: (keys: ReadonlySet<string> | undefined) => {
+			for (const key of keys ?? []) dependencies.add(key);
+		} }));
+		try {
+			await expect(source.view!.evaluate(view => view.readFile(missing))).rejects.toThrow("resource_access_unproven");
+			expect(await source.view!.evaluate(async view => (await Promise.all([known, missing, missing].map(file => view.readFile(file)))).map(bytes => bytes.toString()),
+				undefined, root, undefined, fill)).toEqual(["A", "B", "B"]);
+			extra.view!.seal();
+			expect(opened.mock.calls.filter(([file]) => String(file) === known)).toHaveLength(0);
+			expect(opened.mock.calls.filter(([file]) => String(file) === missing)).toHaveLength(1);
+			expect([...dependencies].map(key => extra.observations.get(key)?.scope)).toContain("content");
+			const before = fill.mock.calls.length;
+			await expect(source.view!.evaluate(view => view.readFile(path.join(root, "..", "outside")), undefined, root, undefined, fill))
+				.rejects.toThrow("resource_access_unproven");
+			expect(fill).toHaveBeenCalledTimes(before);
+			await expect(source.view!.evaluate(async view => {
+				try { await view.readFile(missing); } catch { /* A tool cannot turn an unproven read into an adoptable result. */ }
+				return "masked";
+			}, undefined, root, undefined, async () => { throw new Error("capture denied"); })).rejects.toThrow("capture denied");
+			await fs.writeFile(missing, "changed");
+			expect((await manager.validate(extra)).expired).toBe(true);
+		} finally { opened.mockRestore(); await source.release(); await extra.release(); manager.close(); }
+	});
+
 	test("confines borrowed names, aliases and negative observations to the current root", async () => {
 		const root = await workspace({ "inside/data.txt": "A", "outside/data.txt": "B" });
 		const inside = path.join(root, "inside"), outside = path.join(root, "outside"), link = path.join(inside, "link");

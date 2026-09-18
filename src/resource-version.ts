@@ -58,10 +58,11 @@ type CapturedResource = (
 	| { readonly type: "special" }
 	| { readonly type: "missing" }) & { readonly realPath?: string; readonly dependency?: string; readonly metadataDependency?: string };
 
-type ResourceInputLookup = (target: string) => Iterable<{
+type ResourceInputSource = {
 	readonly view: ResourceReadView;
 	readonly observed: (dependencies: ReadonlySet<string> | undefined) => void;
-}>;
+};
+type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
@@ -74,6 +75,7 @@ export class ResourceReadView {
 	private disposal?: Promise<void>;
 	private dependencies?: Set<string>;
 	private lookup?: ResourceInputLookup;
+	private missing?: () => Promise<ResourceInputSource>;
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, {
 		readonly value: unknown; readonly dispose: () => void | Promise<void>;
 		readonly dependencies?: ReadonlySet<string>; readonly boundary: ResourceReadView["boundary"];
@@ -142,9 +144,9 @@ export class ResourceReadView {
 	};
 	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
 	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
-		root?: string, lookup?: ResourceInputLookup): Promise<T> {
+		root?: string, lookup?: ResourceInputLookup, missing?: () => Promise<ResourceInputSource>): Promise<T> {
 		this.assertComplete(true);
-		return this.borrow(operation, observed, root, lookup);
+		return this.borrow(operation, observed, root, lookup, missing);
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume) => {
@@ -187,10 +189,10 @@ export class ResourceReadView {
 		});
 	};
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
-		root?: string, lookup = this.lookup): Promise<T> {
+		root?: string, lookup = this.lookup, missing = this.missing): Promise<T> {
 		this.assertComplete();
 		const view = new ResourceReadView(0);
-		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup;
+		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
 		try {
 			if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
 				view.boundary = this.boundary;
@@ -249,6 +251,12 @@ export class ResourceReadView {
 			try {
 				return await source.view.evaluate(view => view.get(target, scope), source.observed, this.boundary?.root);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
+		}
+		if (this.missing) {
+			try {
+				const source = await this.missing();
+				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary?.root);
+			} catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 		}
 		return this.unproven(target);
 	}

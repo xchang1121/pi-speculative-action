@@ -121,16 +121,24 @@ export function createResourceSnapshotExecutionWorld(
 					const owner = resourceVersions.get(source);
 					if (!owner) continue;
 					const retained: ResourceVersionToken[] = [];
+					let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
 					try {
-						const query = await evaluateResourceInputs(owner, context, actionSemantics);
-						if (!query || query.capturedBytes > operations.maxBytes()) continue;
-						for (const version of query.versions) retained.push(version.manager.retain(version));
-						return resourceSnapshotBranch(query.output, retained, context.action.executionFingerprint, 0, actionSemantics, query.capturedBytes);
+						const query = await evaluateResourceInputs(owner, context, actionSemantics, () => missing ??= captureResourceVersion(undefined,
+							(context.action.executionContext as ToolInvocation).filesystemRoot ?? context.cwd, actionSemantics, operations.maxBytes())
+							.then(token => captured = token));
+						const bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
+						if (!query || bytes > operations.maxBytes()) continue;
+						captured?.view?.seal();
+						for (const version of query.versions) if (version.view !== captured?.view) retained.push(version.manager.retain(version));
+						const branch = resourceSnapshotBranch(query.output, captured ? [captured, ...retained] : retained,
+							context.action.executionFingerprint, 0, actionSemantics, bytes);
+						captured = undefined;
+						return branch;
 					} catch {
 						await Promise.allSettled(retained.map(releaseResourceVersion));
 						context.signal.throwIfAborted();
-						// Incomplete input coverage falls through to the same bound capture executor.
-					}
+						// Unprovable or over-budget inputs fall back to the same bound capture executor.
+					} finally { await captured?.release(); }
 				}
 				const owned = await capture(context, operations.maxBytes(), true);
 				try {
@@ -151,6 +159,7 @@ const resourceVersions = new WeakMap<object, ResourceInputOwner>();
 async function evaluateResourceInputs(
 	{ version, executionFingerprint }: ResourceInputOwner,
 	request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], semantics: ActionSemanticsRegistry,
+	captureMissing?: () => Promise<ResourceVersionToken>,
 ) {
 	request.signal.throwIfAborted();
 	const invocation = request.action.executionContext as ToolInvocation | undefined;
@@ -176,7 +185,11 @@ async function evaluateResourceInputs(
 				const token = resourceVersions.get(source)?.version;
 				if (token?.view) yield { view: token.view, observed: dependencies => observe(token, dependencies) };
 			}
-		});
+		}, captureMissing && (async () => {
+			const token = await captureMissing();
+			if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
+			return { view: token.view, observed: dependencies => observe(token, dependencies) };
+		}));
 	request.signal.throwIfAborted();
 	return { output, capturedBytes, versions: [...proofs].map(([token, observations]) => ({ ...token, observations })) };
 }
