@@ -576,9 +576,11 @@ describe("speculative action host", () => {
 		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd)];
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 });
 		const execute = world.speculation!.execute, sources: Awaited<ReturnType<typeof execute>>[] = [];
+		let successor: Awaited<ReturnType<typeof execute>> | undefined;
 		vi.spyOn(world.speculation!, "execute").mockImplementation(async context => {
 			const branch = await execute(context);
 			if (context.executionScope?.turnID === "seed") sources.push(branch);
+			if (context.executionScope?.turnID === "again") successor = branch;
 			return branch;
 		});
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), opened = vi.spyOn(fs, "open");
@@ -592,7 +594,7 @@ describe("speculative action host", () => {
 		const host = createSpeculativeActionHost("prediction-inputs", {
 			cwd, draftModel: model("draft"), preflight: () => permitted,
 			getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, maxConcurrentActions: 2,
-				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 3, resourceCacheMaxBytes: 1024 * 1024 }),
+				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 1024 * 1024 }),
 			complete: async () => assistant(stage === "seed" ? [
 				{ type: "toolCall", id: "names", name: "grep", arguments: { pattern: "seed", path: ".", glob: coverage === "prepared" ? args.glob : "*.absent" } },
 				{ type: "toolCall", id: "bytes", name: "read", arguments: { path: "notes.txt", limit: 1 } },
@@ -608,13 +610,13 @@ describe("speculative action host", () => {
 			await host.finishTurn("seed"); stage = "query";
 			const captured = captures.mock.calls.length, reads = opened.mock.calls.length, prepared = preparations();
 			await host.startTurn({ ...startInput(tools[0]!, "query"), tools }); await ready("query", 1);
-			expect(captures.mock.calls.length - captured).toBe(Number(partial));
+			expect(captures.mock.calls.length - captured).toBe(Number(coverage !== "prepared"));
 			expect(preparations() - prepared).toBe(coverage === "prepared" ? 0 : 1);
 			const sourceReads = opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "notes.txt"));
 			expect(sourceReads).toHaveLength(0);
 			expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "other.txt"))).toHaveLength(Number(partial));
 			for (const source of sources) await source.dispose();
-			const call = { turnID: "query", id: "first", tool: "grep", args, tools };
+			let call = { turnID: "query", id: "first", tool: "grep", args, tools };
 			const current = async () => (await profile.invocations.get("grep")!.authoritative!({ args, callID: "reference", signal: new AbortController().signal })).result;
 			const expected = await current(), actor = vi.fn(current);
 			expect(await host.execute(call, undefined, actor)).toEqual(expected);
@@ -624,10 +626,31 @@ describe("speculative action host", () => {
 			permitted = false;
 			expect(await host.execute({ ...call, id: "denied" }, undefined, actor)).toEqual(expected);
 			expect(actor).toHaveBeenCalledOnce(); permitted = true;
-			await writeFile(path.join(cwd, partial ? "other.txt" : "notes.txt"), "two changed\n");
-			expect(await host.execute({ ...call, id: "changed" }, undefined, actor)).toEqual(await current());
-			expect(actor).toHaveBeenCalledTimes(2);
-			await host.finishTurn("query", true);
+			if (coverage !== "prepared") {
+				const capturesBefore = captures.mock.calls.length, preparedBefore = preparations();
+				args.pattern = "one|another";
+				expect(await host.execute({ ...call, id: "reconstructed" }, undefined, actor)).toEqual(await current());
+				await host.finishTurn("query"); args.pattern = "three|another";
+				await host.startTurn({ ...startInput(tools[0]!, "again"), tools }); await ready("again", 1);
+				call = { ...call, turnID: "again" };
+				const validation = await successor!.validate!(); expect(validation.status, JSON.stringify(validation)).toBe("valid");
+				expect(await host.execute(call, undefined, actor)).toEqual(await current());
+				expect(actor).toHaveBeenCalledOnce();
+				expect(captures.mock.calls.length).toBe(capturesBefore); expect(preparations()).toBe(preparedBefore);
+			}
+			for (const name of partial ? ["notes.txt", "other.txt"] : ["notes.txt"]) {
+				const file = path.join(cwd, name), original = await fs.readFile(file), calls = actor.mock.calls.length;
+				await writeFile(file, "three changed\n");
+				if (successor) expect((await successor.validate!()).status).toBe("stale");
+				expect(await host.execute({ ...call, id: "changed-" + name }, undefined, actor)).toEqual(await current());
+				expect(actor).toHaveBeenCalledTimes(calls + 1);
+				await writeFile(file, original);
+				if (coverage !== "prepared") {
+					expect(await host.execute({ ...call, id: "restored-" + name }, undefined, actor)).toEqual(await current());
+					expect(actor).toHaveBeenCalledTimes(calls + 1);
+				}
+			}
+			await host.finishTurn(call.turnID, true);
 			expect(events.filter(event => event.type === "prediction" && event.turnID === "query" && event.settlement.observation === "observed" &&
 				event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toHaveLength(1);
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
