@@ -8,7 +8,7 @@ import { readFile, readlink, stat } from "node:fs/promises";
  * readonly key: string, readonly launchKey: string, readonly umask: number,
  * readonly descriptorTypes: readonly [DescriptorType, DescriptorType, DescriptorType],
  * readonly outputEndpoints: readonly [string, string]
- * readonly regularDescriptors?: readonly Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type">[]
+ * readonly regularDescriptors?: readonly (Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> & { readonly image?: number })[]
  * }} ProcessExecutionContext */
 
 /**
@@ -41,7 +41,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 		statPath("/bin/sh", { bigint: true }),
 		Promise.all([...new Set([0, ...inheritedDescriptors.map(Number)])].sort((a, b) => a - b).map(async fd => {
 			if (fd === 0 && !inheritedDescriptors.includes("0")) return {
-				fd, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0,
+				fd, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0, queue: undefined,
 			};
 			const [metadata, endpoint, info] = await Promise.all([
 				// Inside the sandbox inspect the inherited handle, without resolving its proc magic link.
@@ -55,7 +55,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			/** @type {DescriptorType} */
 			const type = metadata.isFile() ? "regular" : metadata.isDirectory() ? "directory" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
 				metadata.isCharacterDevice() ? (proof?.type === "null" && metadata.rdev === 259n ? "null" : endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
-			if (["regular", "null", "directory"].includes(type) && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
+			if ((["regular", "null", "directory"].includes(type) || type === "pipe" && proof) && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
 				proof.flags !== (Number.parseInt(flags, 8) & ~0o2000000) || String(proof.offset) !== /^pos:\s*(\d+)/m.exec(info)?.[1])) {
 				throw new Error(`held descriptor ${fd} lacks matching native OFD evidence`);
 			}
@@ -63,6 +63,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			return {
 				fd, endpoint, type,
 				identity: proof ? `ofd:${proof.alias}` : `${metadata.dev}:${metadata.ino}`,
+				...(type === "pipe" && proof ? { queue: `${metadata.dev}:${metadata.ino}` } : {}),
 				flags: Number.parseInt(flags, 8) & ~0o2000000,
 			};
 		})),
@@ -80,6 +81,8 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	groups.sort((left, right) => left - right);
 	/** @type {Map<string, number>} */
 	const aliases = new Map();
+	/** @type {Map<string, number>} */
+	const queues = new Map();
 	const semantic = {
 		executionDomain: "ptrace",
 		rlimits: limits.split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, 2)),
@@ -93,9 +96,11 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 		},
 		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
 			if (!aliases.has(identity)) aliases.set(identity, aliases.size);
+			if (descriptor.queue && !queues.has(descriptor.queue)) queues.set(descriptor.queue, descriptor.fd);
 			return {
 				fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags,
 				alias: aliases.get(identity),
+				...(descriptor.queue ? { queue: queues.get(descriptor.queue) } : {}),
 				...(descriptor.type === "device" ? { endpoint } : {}),
 			};
 		}),
@@ -122,7 +127,8 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 	];
 	if (regularDescriptors?.length) {
 		for (const descriptor of regularDescriptors) {
-			const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}` };
+			const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
+				...(descriptor.type === "pipe" ? { queue: descriptor.image } : {}) };
 			if (descriptor.fd === 0) descriptors[0] = entry;
 			else if (descriptor.fd > 2) descriptors.push(entry);
 			else throw new Error("inherited output descriptor cannot use buffered routing");
@@ -155,7 +161,7 @@ export function validProcessContext(value) {
 		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
 		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
 		(["device", "closed"].includes(context.descriptorTypes[0]) ||
-			(["regular", "null", "directory"].includes(context.descriptorTypes[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
+			(["regular", "null", "directory", "pipe"].includes(context.descriptorTypes[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
 		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
 		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);

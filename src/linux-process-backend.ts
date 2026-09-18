@@ -1106,7 +1106,7 @@ export class LinuxProcessReuseBackend {
 					const descriptor = process.descriptors!.find(({ fd }) => fd === position.fd)!;
 					return { ...position, device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags,
 						...(descriptor.type === "directory" ? { path: descriptorInputs.find(input => input.fd === position.fd)!.sourcePath! } : {}),
-						...(content ? { content: plan.artifacts.read(content) } : {}) };
+						...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.pipeHex!, "hex") } : content ? { content: plan.artifacts.read(content) } : {}) };
 				}) } : {}),
 				commit: async () => {
 					const started = performance.now();
@@ -1227,7 +1227,7 @@ export class LinuxProcessReuseBackend {
 					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
 					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
 						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
-					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)}\n${image}\n`;
+					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${Number(descriptor.type === "pipe")}\n${image}\n`;
 				}
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
 			}
@@ -1286,13 +1286,15 @@ export class LinuxProcessReuseBackend {
 			const observedProcessMs = Math.max(0, performance.now() - processStarted);
 			releaseInputs();
 			try {
+				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), request.descriptorInputs!) : undefined;
 				transactionFinishing = true;
 				const captures = [
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
-							.concat(request.descriptorInputs?.some(input => input.type === "null") ? ["/dev/null"] : []),
+							.concat(request.descriptorInputs?.some(input => input.type === "null") ? ["/dev/null"] : [])
+							.concat((descriptorOffsets ?? []).filter(position => request.descriptorInputs!.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
@@ -1342,10 +1344,9 @@ export class LinuxProcessReuseBackend {
 				};
 				stage = "artifacts";
 				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
-				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), request.descriptorInputs!) : undefined;
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
 					const input = request.descriptorInputs!.find(({ fd }) => fd === position.fd)!;
-					if (input.type === "null" || input.fd !== input.image) continue;
+					if (input.type === "null" || input.type === "pipe" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
 					const current = await lstat(image.physical, { bigint: true });
 					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile() || current.nlink !== 1n) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
