@@ -66,7 +66,7 @@ struct decision_job {
 	pthread_t thread;
 	pid_t pid;
 	const char *socket_path, *token, *execution_id;
-	int channel[2], connection, outputs[3], result;
+	int channel[2], connection, outputs[3], result, pidfd;
 	struct output_event *events;
 	unsigned count;
 	struct file_position *positions;
@@ -241,19 +241,11 @@ done:
 	return result;
 }
 
-static int duplicate_tracee_fd(pid_t pid, unsigned fd) {
+static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
-	int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
-	if (pidfd >= 0) {
-		int duplicate = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
-		int saved = errno;
-		close(pidfd);
-		if (duplicate >= 0) {
-			int flags = fcntl(duplicate, F_GETFD);
-			if (flags >= 0 && fcntl(duplicate, F_SETFD, flags | FD_CLOEXEC) >= 0) return duplicate;
-			close(duplicate);
-		} else errno = saved;
-	}
+	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
+	/* Both syscalls return CLOEXEC handles; one process pin serves the entire held decision. */
+	if (job->pidfd >= 0) return (int)syscall(SYS_pidfd_getfd, job->pidfd, fd, 0);
 	#endif
 	return -1;
 }
@@ -412,7 +404,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		char *end;
 		long descriptor = strtol(entry->d_name, &end, 10);
 		if (!*entry->d_name || *end || descriptor < 0 || descriptor > INT_MAX) continue;
-		int pin = duplicate_tracee_fd(job->pid, (unsigned)descriptor);
+		int pin = duplicate_tracee_fd(job, (unsigned)descriptor);
 		struct stat state;
 		if (pin < 0) goto done;
 		if (fstat(pin, &state) < 0) { close(pin); goto done; }
@@ -467,11 +459,11 @@ done:
 	return result;
 }
 
-static int open_tracee_output(pid_t pid, unsigned fd) {
-	int duplicate = duplicate_tracee_fd(pid, fd);
+static int open_tracee_output(struct decision_job *job, unsigned fd) {
+	int duplicate = duplicate_tracee_fd(job, fd);
 	if (duplicate >= 0) return duplicate;
 	char path[64];
-	if (snprintf(path, sizeof(path), "/proc/%ld/fd/%u", (long)pid, fd) >= (int)sizeof(path)) {
+	if (snprintf(path, sizeof(path), "/proc/%ld/fd/%u", (long)job->pid, fd) >= (int)sizeof(path)) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
@@ -567,7 +559,7 @@ static int actor_decision(struct decision_job *job) {
 		if (job->outputs[fd] < 0) {
 			/* Publish acquired descriptors before a cancellation point can retire the job. */
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-			job->outputs[fd] = open_tracee_output(job->pid, fd);
+			job->outputs[fd] = open_tracee_output(job, fd);
 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 			if (job->outputs[fd] < 0) return -1;
 		}
@@ -578,7 +570,7 @@ static int actor_decision(struct decision_job *job) {
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-		position->duplicate = duplicate_tracee_fd(job->pid, (unsigned)position->descriptor);
+		position->duplicate = duplicate_tracee_fd(job, (unsigned)position->descriptor);
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 		if (position->duplicate < 0 || !position_matches(position)) goto decline;
 		if (job->domain && (job->domain->escaped || job->domain->uncertain || !job->process->table ||
@@ -646,7 +638,7 @@ static void *decide_process(void *argument) {
 }
 
 static void free_job(struct decision_job *job) {
-	close(job->channel[0]); close(job->channel[1]); close(job->connection);
+	close(job->channel[0]); close(job->channel[1]); close(job->connection); close(job->pidfd);
 	for (unsigned fd = 1; fd <= 2; fd++) close(job->outputs[fd]);
 	if (job->positions) for (unsigned index = 0; index < job->position_count; index++) {
 		close(job->positions[index].duplicate); close(job->positions[index].writer); free(job->positions[index].content);
@@ -664,7 +656,7 @@ static int start_decision(struct traced_process *process, const char *socket_pat
 	if (!job) return -1;
 	*job = (struct decision_job){ .pid = process->pid, .socket_path = socket_path,
 		.token = token, .execution_id = execution_id, .channel = {-1, -1},
-		.connection = -1, .outputs = {-1, -1, -1}, .result = -1, .domain = domain, .process = process };
+		.connection = -1, .pidfd = -1, .outputs = {-1, -1, -1}, .result = -1, .domain = domain, .process = process };
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, job->channel) < 0 ||
 		pthread_create(&job->thread, NULL, decide_process, job) != 0) {
 		free_job(job);
