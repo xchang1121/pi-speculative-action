@@ -14,7 +14,7 @@ import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 15;
+const HELPER_PROTOCOL_VERSION = 16;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
