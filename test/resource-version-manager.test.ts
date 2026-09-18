@@ -354,11 +354,14 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledTimes(3);
 	});
 
-	test.each(["capturing", "transient", "transferred", "composed", "revoked", "cancelled"])("shares concurrent preparation with independent consumers and owned proof (%s)", async mode => {
-		const root = await workspace({ value: "A" }), file = path.join(root, "value"), manager = new ResourceVersionManager(root, { watch: false });
-		const token = await manager.capture(undefined, 8192), extra = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192);
+	test.each(["capturing", "transient", "transferred", "composed", "composed-unowned", "composed-reader", "composed-cancelled", "composed-budget", "missing", "revoked", "cancelled"])("shares concurrent preparation with independent consumers and owned proof (%s)", async mode => {
+		const root = await workspace({ value: "A" }), file = path.join(root, "value"), idle = vi.fn(), manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
+		const token = await manager.capture(undefined, 8192), extra = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, mode === "composed-budget" ? 1 : 8192);
 		const view = token.view!, binding = {}, gate = gated(), consuming = gated(), dispose = vi.fn(), observed = [vi.fn(), vi.fn()];
-		await (mode === "composed" ? extra.view! : view).readFile(file); extra.view!.seal();
+		const composed = mode.startsWith("composed"), independent = composed && mode !== "composed-unowned" || mode === "missing";
+		const builds = mode === "composed-unowned" || mode === "composed-reader" ? 2 : 1;
+		const cancelled = mode.endsWith("cancelled"), retained: ResourceVersionToken[] = [];
+		if (mode !== "missing") await (composed ? extra.view! : view).readFile(file); extra.view!.seal();
 		if (mode === "transient") await view.readdir(root);
 		const capturing = mode === "capturing" || mode === "revoked";
 		if (!capturing) view.seal();
@@ -368,32 +371,42 @@ describe("speculative action resource versions", () => {
 		const query = (index: number) => {
 			const operation = (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => inputs.prepare!(binding, "shared", build, async value => {
 				if (index === 1) await consuming.wait();
-				if (index === 0 && mode === "cancelled") throw new Error("consumer cancelled");
+				if (index === 0 && cancelled) throw new Error("consumer cancelled");
 				return value;
 			}, root);
+			const source = (token: ResourceVersionToken) => ({ view: token.view!, observed: (keys: ReadonlySet<string> | undefined) => {
+				observed[index]!(keys); return independent ? [{ ...token, view: undefined }] : undefined;
+			} });
 			return capturing ? operation(view) : view.evaluate(operation, observed[index], root,
-				mode === "composed" ? () => [{ view: extra.view!, observed: observed[index]! }] : undefined,
-				["transferred", "composed"].includes(mode) ? async () => ({ view: destination.view!, observed: () => {} }) : undefined);
+				composed ? () => [source(extra)] : undefined,
+				mode === "transferred" || composed || mode === "missing" ? async () => source(destination) : undefined,
+				independent && (mode !== "composed-reader" || index === 0) ? proofs => proofs.map(token => {
+					const proof = manager.retain(token); retained.push(proof); observed[index]!(new Set(proof.observations.keys())); return proof;
+				}) : undefined);
 		};
 		const first = query(0); await gate.entered;
 		const second = query(1), settled = Promise.allSettled([first, second]);
 		try {
-			await nextTurn(); expect(build).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1);
+			await nextTurn(); expect(build).toHaveBeenCalledTimes(builds);
 			if (mode === "revoked") { await fs.writeFile(file, "changed"); invalidateResourceInputs([token], [file]); }
 			gate.release(); await consuming.entered; await first.catch(() => {});
 			if (mode === "transient") expect(view.invalidate(new Set([`names:${root.replaceAll(path.sep, "/")}`])))
 				.toContain(root.replaceAll(path.sep, "/")); // A temporary preparation must not keep a revoked name indexed.
-			expect(build).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1); expect(dispose).not.toHaveBeenCalled();
+			expect(build).toHaveBeenCalledTimes(builds); expect(dispose).not.toHaveBeenCalled();
+			if (independent && mode !== "composed-reader") { await extra.release(); expect(retained).toHaveLength(2); }
 			consuming.release(); expect(await settled).toMatchObject([
-				mode === "cancelled" ? { status: "rejected", reason: new Error("consumer cancelled") } : { status: "fulfilled", value: "A" },
+				cancelled ? { status: "rejected", reason: new Error("consumer cancelled") } : { status: "fulfilled", value: "A" },
 				{ status: "fulfilled", value: "A" },
 			]);
-			if (!capturing) for (const observer of observed.slice(mode === "cancelled" ? 1 : 0)) expect(observer).toHaveBeenCalled();
+			if (!capturing) for (const observer of observed.slice(cancelled ? 1 : 0)) expect(observer).toHaveBeenCalled();
 			if (capturing) view.seal();
 			expect((await manager.validate(token)).expired).toBe(mode === "revoked");
-			if (mode === "composed") expect(observed.every(observer => observer.mock.calls.some(([keys]) => keys?.has(`content:${file.replaceAll(path.sep, "/")}`)))).toBe(true);
-		} finally { gate.release(); consuming.release(); await settled; await token.release(); await extra.release(); await destination.release(); manager.close(); }
-		expect(dispose).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1);
+			if (composed || mode === "missing") expect(observed.every(observer => observer.mock.calls.some(([keys]) => keys?.has(`content:${file.replaceAll(path.sep, "/")}`)))).toBe(true);
+			for (const proof of retained) expect((await manager.validate(proof)).expired).toBe(false);
+			if (retained.length) { await fs.writeFile(file, "changed"); for (const proof of retained) expect((await manager.validate(proof)).expired).toBe(true); }
+		} finally { gate.release(); consuming.release(); await settled; await token.release(); await extra.release(); await destination.release(); await Promise.all(retained.map(proof => proof.release())); manager.close(); }
+		expect(dispose).toHaveBeenCalledTimes(builds);
+		expect(idle).toHaveBeenCalledOnce();
 	});
 
 	test.each(["build", "consume"])("drains prepared input %s before releasing its owner", async (phase) => {

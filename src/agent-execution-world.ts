@@ -130,23 +130,23 @@ export function createResourceSnapshotExecutionWorld(
 					try {
 						const query = await evaluateResourceInputs(owner, context, actionSemantics, () => missing ??= captureResourceVersion(undefined,
 							(context.action.executionContext as ToolInvocation).filesystemRoot ?? context.cwd, actionSemantics, operations.maxBytes())
-							.then(token => captured = token));
+							.then(token => captured = token), retained);
 						let bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
 						if (!query || bytes > operations.maxBytes()) continue;
 						captured?.view?.seal();
+						const owned = captured ? [captured] : [];
 						for (const version of query.versions) if (!captured || version.view !== captured.view) {
-							const proof = version.manager.retain(version, operations.maxBytes() - bytes);
-							retained.push(proof); bytes += proof.view?.bytes ?? 0;
+							const proof = retained.includes(version) ? version : version.manager.retain(version, operations.maxBytes() - bytes);
+							if (proof !== version) retained.push(proof);
+							owned.push(proof); bytes += proof.view?.bytes ?? 0;
 						}
-						const branch = resourceSnapshotBranch(query.output, captured ? [captured, ...retained] : retained,
-							context.action, 0, actionSemantics);
-						captured = undefined;
+						const branch = resourceSnapshotBranch(query.output, owned, context.action, 0, actionSemantics);
+						captured = undefined; retained.length = 0;
 						return branch;
 					} catch {
-						await Promise.allSettled(retained.map(releaseResourceVersion));
 						context.signal.throwIfAborted();
 						// Unprovable or over-budget inputs fall back to the same bound capture executor.
-					} finally { await captured?.release(); }
+					} finally { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); }
 				}
 				const owned = await capture(context, operations.maxBytes(), true);
 				try {
@@ -168,6 +168,7 @@ async function evaluateResourceInputs(
 	{ versions, executionFingerprint }: ResourceInputOwner,
 	request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], semantics: ActionSemanticsRegistry,
 	captureMissing?: () => Promise<ResourceVersionToken>,
+	retained?: ResourceVersionToken[],
 ) {
 	request.signal.throwIfAborted();
 	const version = versions[0]!;
@@ -188,27 +189,30 @@ async function evaluateResourceInputs(
 			if (!observations.has(key)) capturedBytes += key.length * 2 + 64;
 			observations.set(key, entry);
 		}
+		return { ...token, observations, view: undefined };
 	};
 	const observeOwner = (tokens: readonly ResourceVersionToken[], dependencies: ReadonlySet<string> | undefined) => {
-		if (dependencies) observe(tokens[0]!, dependencies);
-		else for (const token of tokens) observe(token, undefined);
+		return dependencies ? [observe(tokens[0]!, dependencies)] : tokens.map(token => observe(token, undefined));
 	};
 	const output = await version.view.evaluate(view => execute(view, request), dependencies => observeOwner(versions, dependencies), root,
 		function* (target) {
 			for (const token of versions) if (token.view) yield { view: token.view,
-				observed: (dependencies: ReadonlySet<string> | undefined) => dependencies ? observe(token, dependencies) : observeOwner(versions, undefined) };
+				observed: (dependencies: ReadonlySet<string> | undefined) => dependencies ? [observe(token, dependencies)] : observeOwner(versions, undefined) };
 			for (const source of request.inputs?.(target) ?? []) {
 				const owner = resourceVersions.get(source);
 				if (owner) for (const token of owner.versions) if (token.view) yield { view: token.view,
-					observed: dependencies => dependencies ? observe(token, dependencies) : observeOwner(owner.versions, undefined) };
+					observed: dependencies => dependencies ? [observe(token, dependencies)] : observeOwner(owner.versions, undefined) };
 			}
 		}, captureMissing && (async () => {
 			const token = await captureMissing();
 			if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
-			return { view: token.view, observed: dependencies => observe(token, dependencies) };
-		}));
+			return { view: token.view, observed: dependencies => [observe(token, dependencies)] };
+		}), retained && (inputs => inputs.map(input => {
+			const proof = input.manager.retain(input); retained.push(proof); observe(proof, undefined); return proof;
+		})));
 	request.signal.throwIfAborted();
-	return { output, capturedBytes, versions: [...proofs].filter(([, observations]) => observations.size).map(([token, observations]) => ({ ...token, observations })) };
+	return { output, capturedBytes, versions: [...proofs].filter(([, observations]) => observations.size)
+		.map(([token, observations]) => observations.size === token.observations.size ? token : { ...token, observations }) };
 }
 
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
