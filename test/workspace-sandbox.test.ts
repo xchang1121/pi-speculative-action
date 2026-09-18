@@ -6,7 +6,7 @@ import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, r
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { createEditTool, createReadTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createLsTool, createReadTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { ActionSemanticsRegistry, buildPiActionKey } from "../src/action-semantics.ts";
@@ -38,7 +38,7 @@ const { create: temporaryRoot, dispose: disposeRoots } = temporaryDirectories("p
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
-	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
+	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), readdir: vi.fn(fs.readdir), rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
 });
 
 afterEach(async () => {
@@ -280,6 +280,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(inputs?.inputsOnly).toBe(true); expect(await branch.takeCommittedInputs!(8192)).toBeUndefined();
 			await branch.dispose();
 			try {
+				if (initial === undefined) {
+					const args = { path: path.dirname(target) }, invocation = resolvePiToolInvocation("ls", args, { cwd: root, environment: {} });
+					const query = await inputs!.reconstruct!({ action: { ...buildPiActionKey("ls", args, root)!, executionContext: invocation },
+						args, callID: "after-mkdir", signal: new AbortController().signal });
+					expect(query?.output).toEqual({ result: await createLsTool(root).execute("oracle", args), isError: false });
+					expect((await query!.validate!()).status).toBe("valid");
+				}
 				const args = { path: target }, invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} });
 				const query = await inputs!.reconstruct!({ action: { ...buildPiActionKey("read", args, root)!, executionContext: invocation },
 					args, callID: "after-write", signal: new AbortController().signal });
@@ -290,6 +297,37 @@ describe("workspace-branch ExecutionWorld", () => {
 			} finally { await inputs?.dispose(); await writeFile(target, expectedBytes); }
 		}
 		expect(forbidden.execute).not.toHaveBeenCalled();
+	});
+
+	it("transfers committed directory and deletion poststates without rescanning", async () => {
+		const root = await temporaryRoot(), directory = path.join(root, "area"), removed = path.join(directory, "removed.txt"), deleted = path.join(directory, "deleted");
+		await mkdir(deleted, { recursive: true }); await writeFile(removed, "old"); await writeFile(path.join(deleted, "old.txt"), "old");
+		const paths = ["area", "area/deleted", "area/created"], before = await Promise.all(paths.map(name => readSandboxDirectoryState(path.join(root, name))));
+		const action = buildPiActionKey("bash", { command: "update area" }, root)!;
+		const branch = await sandbox.fork({ cwd: root, action, execute: async workspace => {
+			const area = path.join(workspace.sandboxRoot, "area");
+			await rm(path.join(area, "removed.txt")); await rm(path.join(area, "deleted"), { recursive: true });
+			await mkdir(path.join(area, "created")); await writeFile(path.join(area, "created/value.txt"), "new");
+			await writeFile(path.join(area, "value.txt"), "new");
+			return settlement("updated");
+		}, afterCapture: async (workspace, capture) => [...capture.changes, ...await Promise.all(paths.map(async (resource, index) => ({
+			kind: "directory" as const, root, target: path.join(root, resource), resource, before: before[index],
+			after: await readSandboxDirectoryState(path.join(workspace.sandboxRoot, resource)),
+		}))) ] });
+		await branch.commit();
+		const scans = vi.mocked(readdir).mock.calls.length, inputs = await branch.takeCommittedInputs!(65536);
+		await branch.dispose();
+		try {
+			expect(vi.mocked(readdir).mock.calls.length).toBe(scans);
+			expect(inputs!.inputResources?.map(resource => resource.path)).toEqual(expect.arrayContaining([directory, removed, deleted].map(value => value.replaceAll(path.sep, "/"))));
+			const args = { path: directory }, invocation = resolvePiToolInvocation("ls", args, { cwd: root, environment: {} });
+			const query = await inputs!.reconstruct!({ action: { ...buildPiActionKey("ls", args, root)!, executionContext: invocation },
+				args, callID: "after-process", signal: new AbortController().signal });
+			expect(vi.mocked(readdir).mock.calls.length).toBe(scans);
+			expect(query?.output).toEqual({ result: await createLsTool(root).execute("oracle", args), isError: false });
+			expect((await inputs!.validate!()).status).toBe("valid");
+			await mkdir(deleted); expect((await inputs!.validate!()).status).toBe("stale");
+		} finally { await inputs?.dispose(); }
 	});
 
 	it.each(["capture", "refine", "execute", "checkpoint"])("owns %s deltas across branch commit and descendant materialization", async (boundary) => {

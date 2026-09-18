@@ -32,7 +32,7 @@ import {
 	type WorkspaceStructureEntry,
 	type WorkspaceStructureSnapshot,
 } from "./process-observation.ts";
-import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken } from "./resource-version.ts";
+import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
@@ -468,6 +468,7 @@ function workspaceBranch(
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
 	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
 	let commitMetrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	const inputs = new Map<string, ResourceInput>();
 	let disposed = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
 		backend, checkpoint, output: snapshot.output, validate,
@@ -476,28 +477,30 @@ function workspaceBranch(
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
 		get commitMetrics() { return commitMetrics; },
-		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot).then(({ output, metrics }) => {
+		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(({ output, metrics }) => {
 			commitMetrics = metrics;
+			if (disposed) inputs.clear();
 			return output;
 		}),
 		takeCommittedInputs: async (maxBytes) => {
 			if (disposed || !commitMetrics || transferred) return undefined;
 			return transferred = (async () => {
-				const inputs = new Map(changes.flatMap(change => !change.validationOnly && change.kind !== "directory" && change.after !== undefined
-					? [[change.target, change.after] as const] : []));
 				if (!inputs.size) return undefined;
-				const branch = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, inputs, maxBytes);
-				if (!disposed) return branch;
-				await branch.dispose(); return undefined;
+				try {
+					const branch = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, inputs, maxBytes);
+					if (!disposed) return branch;
+					await branch.dispose(); return undefined;
+				} finally { inputs.clear(); }
 			})();
 		},
-		dispose() { disposed = true; return transferred?.then(() => {}, () => {}); },
+		dispose() { disposed = true; inputs.clear(); return transferred?.then(() => {}, () => {}); },
 	};
 }
 
 async function commitSandboxExecution(
 	state: WorkspaceSandboxState,
 	execution: SandboxExecutionDelta,
+	inputs?: Map<string, ResourceInput>,
 ): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldCommitMetrics }> {
 	assertWorkspaceSandboxOpen(state);
 	const started = performance.now();
@@ -590,13 +593,25 @@ async function commitSandboxExecution(
 					}
 					resourcesCommitted++;
 				}
+				let directoryBytes = 0;
+				const createdEntries = new Map((inputs ? changes : []).filter(change => change.kind === "directory" && change.operation && change.after)
+					.map(change => [change.target, [] as string[]]));
+				if (inputs) for (const change of changes) if (!change.validationOnly && change.after)
+					createdEntries.get(path.dirname(change.target))?.push(path.basename(change.target));
 				for (const change of changes) {
 					if (change.validationOnly || change.kind !== "directory" || !change.after) continue;
-					if (!(await sameDirectoryAfter(change.target, change))) {
+					if (!(await sameDirectoryAfter(change.target, change, inputs && (names => {
+						names ??= createdEntries.get(change.target);
+						const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0;
+						const retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
+						if (retain) directoryBytes += bytes;
+						inputs.set(change.target, { names: retain ? names : undefined });
+					})))) {
 						throw new Error(`directory changed while committing: ${change.resource}`);
 					}
 				}
 			} catch (error) {
+				inputs?.clear();
 				if (applied.some((change) => change.kind !== "directory" && change.operation)) {
 					throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
 				}
@@ -619,6 +634,8 @@ async function commitSandboxExecution(
 				const failure = closed.find((result) => result.status === "rejected");
 				if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 			}
+			if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind !== "directory" || !change.after))
+				inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
 			return {
 				output: execution.output,
 				metrics: {
@@ -1856,10 +1873,11 @@ async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFIN
 }
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
-export async function readSandboxDirectoryState(target: string): Promise<SandboxDirectoryState | undefined> {
+export async function readSandboxDirectoryState(target: string, captureNames?: (names: readonly string[]) => void): Promise<SandboxDirectoryState | undefined> {
 	try {
 		const { info, entries } = await captureFilesystemEntry(target, "directory");
 		if (!entries) throw new Error(`sandbox resource is not a real directory: ${target}`);
+		captureNames?.(entries.map(entry => entry.name));
 		return { entriesDigest: directoryEntriesDigest(entries), mode: Number(info.mode & 0o777n), uid: Number(info.uid), gid: Number(info.gid) };
 	} catch (error) {
 		if (isMissing(error)) return undefined;
@@ -1887,9 +1905,12 @@ function sameSandboxBaseline(
 		? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
 }
 
-async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange): Promise<boolean> {
+async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange, captureNames?: (names: readonly string[] | undefined) => void): Promise<boolean> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
-	return change.operation ? (await lstat(target)).isDirectory() : sameSandboxState(await readSandboxDirectoryState(target), change.after);
+	if (!change.operation) return sameSandboxState(await readSandboxDirectoryState(target, captureNames), change.after);
+	const directory = (await lstat(target)).isDirectory();
+	if (directory) captureNames?.(undefined);
+	return directory;
 }
 
 function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {

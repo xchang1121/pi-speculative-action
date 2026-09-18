@@ -6,7 +6,7 @@ import {
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { asRecord, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
-import { captureResourceVersion } from "./resource-version.ts";
+import { captureResourceVersion, type ResourceInput } from "./resource-version.ts";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import process from "node:process";
@@ -126,9 +126,9 @@ export function resolvePiToolInvocation(
 	};
 }
 
-/** Retain the bytes the stock mutation actually writes; edit normalization and queuing stay in Pi. */
+/** Retain stock write poststates; edit normalization and queuing stay in Pi. */
 function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs"> {
-	let active: { inputs: Map<string, Buffer>; maxBytes: number; callID: string; started: boolean; complete: boolean; overflow: boolean } | undefined;
+	let active: { inputs: Map<string, ResourceInput>; maxBytes: number; callID: string; started: boolean; complete: boolean; overflow: boolean } | undefined;
 	return {
 		captureInputs: (action, maxBytes, callID) => {
 			if (active || !Number.isFinite(maxBytes) || maxBytes <= 0) throw new Error("resource_snapshot_budget_invalid");
@@ -138,6 +138,10 @@ function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, 
 				try {
 					if (active !== owned || !owned.complete || owned.overflow || !owned.inputs.size) throw new Error("actor_write_inputs_unavailable");
 					active = undefined;
+					// Only directories mkdir actually created are inferred; later adoption checks concurrent additions.
+					const names = new Map([...owned.inputs].filter(([, input]) => !(input instanceof Uint8Array)).map(([target]) => [target, [] as string[]]));
+					for (const target of owned.inputs.keys()) names.get(path.dirname(target))?.push(path.basename(target));
+					for (const [target, entries] of names) owned.inputs.set(target, { names: entries });
 					return await createCommittedResourceInputs(output, action, root, owned.inputs, maxBytes);
 				} finally { dispose(); }
 			} };
@@ -148,14 +152,22 @@ function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, 
 			const output = await execute({
 				readFile: target => fs.readFile(target),
 				access: (target, writable) => fs.access(target, fs.constants.R_OK | (writable ? fs.constants.W_OK : 0)),
-				mkdir: target => fs.mkdir(target, { recursive: true }).then(() => {}),
+				mkdir: async target => {
+					const created = await fs.mkdir(target, { recursive: true });
+					if (created && owned && active === owned && !owned.overflow) {
+						for (let directory = target; relativeFilesystemPath(path.toNamespacedPath(created), path.toNamespacedPath(directory)) !== undefined; directory = path.dirname(directory)) {
+							owned.inputs.set(directory, {});
+							if (path.dirname(directory) === directory) break;
+						}
+					}
+				},
 				writeFile: async (target, content) => {
 					const retain = owned && active === owned && !owned.overflow;
 					const bytes = retain && Buffer.byteLength(content) <= owned.maxBytes ? Buffer.from(content) : undefined;
 					await fs.writeFile(target, bytes ?? content, "utf-8");
 					if (retain && active === owned) {
 						if (bytes) owned.inputs.set(target, bytes);
-						if (!bytes || [...owned.inputs.values()].reduce((sum, input) => sum + input.length, 0) > owned.maxBytes) {
+						if (!bytes || [...owned.inputs.values()].reduce((sum, input) => sum + (input instanceof Uint8Array ? input.length : 0), 0) > owned.maxBytes) {
 							owned.overflow = true; owned.inputs.clear();
 						}
 					}

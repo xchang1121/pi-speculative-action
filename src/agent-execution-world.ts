@@ -15,6 +15,7 @@ import {
 	captureResourceVersion,
 	invalidateResourceInputs,
 	type ResourceReadView,
+	type ResourceInput,
 	type ResourceObservation,
 	type ResourceVersionToken,
 	releaseResourceVersion,
@@ -210,9 +211,9 @@ async function evaluateResourceInputs(
 	return { output, capturedBytes, versions: [...proofs].filter(([, observations]) => observations.size).map(([token, observations]) => ({ ...token, observations })) };
 }
 
-/** Committed bytes enter the same read view and exact dependency validation as captured inputs. */
+/** Committed poststates enter the same read view and exact validation as captured inputs. */
 export async function createCommittedResourceInputs(
-	output: ToolSettlement, action: ActionKey, root: string, inputs: ReadonlyMap<string, Uint8Array>, maxBytes: number,
+	output: ToolSettlement, action: ActionKey, root: string, inputs: ReadonlyMap<string, ResourceInput>, maxBytes: number,
 ): Promise<WorldBranch<ToolSettlement> & { readonly inputsOnly: true }> {
 	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
 	try {
