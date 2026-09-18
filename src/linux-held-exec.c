@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <linux/audit.h>
 #include <linux/kcmp.h>
+#include <sched.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -293,6 +294,15 @@ static void drop_descriptor_table(struct traced_process *process, struct descrip
 	process->table = NULL;
 }
 
+static int detach_descriptor_table(struct traced_process *process, struct descriptor_domain *domain) {
+	struct descriptor_table *old = process->table;
+	if (!old || (old->references == 1 && !old->active && process->call_epoch == old->epoch)) return 0;
+	struct descriptor_table *table = copy_descriptor_table(process);
+	if (!table) return -1;
+	drop_descriptor_table(process, domain); process->table = table;
+	return 0;
+}
+
 /* Called at syscall stops, on the tracer thread. No tracing cost in the ordinary mode. */
 static int observe_descriptor_syscall(struct traced_process *process, struct descriptor_domain *domain) {
 	if (domain->escaped) return 0;
@@ -308,18 +318,18 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	}
 	long number = process->syscall;
 	unsigned long first = process->arguments[0], second = process->arguments[1], third = process->arguments[2];
+	int detached = (number == SYS_unshare && first == CLONE_FILES) || (number == SYS_close_range && (third & CLOSE_RANGE_UNSHARE));
 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
 		/* These can publish handles outside the traced tree or bypass its syscall stops. */
 		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_io_uring_setup ||
 			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
-			number == SYS_process_vm_writev || number == SYS_unshare || number == SYS_setns;
+			number == SYS_process_vm_writev || (number == SYS_unshare && (first & ~(unsigned long)CLONE_FILES)) || number == SYS_setns;
 		if (number == SYS_clone) escapes |= (first & 0x00800000) != 0; /* CLONE_UNTRACED */
-		if (number == SYS_close_range) escapes |= (third & 2) != 0; /* CLOSE_RANGE_UNSHARE */
 		/* clone3 flags live in mutable shared memory: prove attachment from the kernel event instead. */
 		if (number == SYS_clone3 || number == SYS_ioctl) { process->uncertain = 1; domain->uncertain++; }
 		if (escapes) domain->escaped = 1;
 		process->call_epoch = table->epoch;
-		process->mutation = number == SYS_close || number == SYS_close_range || number == SYS_dup ||
+		process->mutation = number == SYS_close || (number == SYS_close_range && !detached) || number == SYS_dup ||
 			number == SYS_dup2 || number == SYS_dup3 || number == SYS_open || number == SYS_openat ||
 			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create ||
 			(number == SYS_fcntl && (second == F_SETFD || second == F_DUPFD || second == F_DUPFD_CLOEXEC));
@@ -334,12 +344,6 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0);
 		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
 			set_descriptor_origin(process, domain, (int)second, 0, 0);
-		if (number == SYS_close_range) for (unsigned index = 0; index < table->count;) {
-			struct descriptor_origin *entry = &table->entries[index];
-			if ((unsigned)entry->fd < first || (unsigned)entry->fd > second) { index++; continue; }
-			if (third & 4) { entry->cloexec = 1; index++; }
-			else set_descriptor_origin(process, domain, entry->fd, 0, 0);
-		}
 	}
 	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
 	if (process->uncertain) {
@@ -351,6 +355,17 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		if (!process->mutation_generation || process->mutation_generation != table->generation) return 0;
 	}
 	if (info.exit.is_error || domain->escaped) return 0;
+	/* A successful split changes only the caller's table; failure preserves sharing. */
+	if (detached) {
+		if (detach_descriptor_table(process, domain) < 0) return -1;
+		table = process->table;
+	}
+	if (number == SYS_close_range) for (unsigned index = 0; index < table->count;) {
+		struct descriptor_origin *entry = &table->entries[index];
+		if ((unsigned)entry->fd < (unsigned)first || (unsigned)entry->fd > (unsigned)second) { index++; continue; }
+		if (third & CLOSE_RANGE_CLOEXEC) { entry->cloexec = 1; index++; }
+		else set_descriptor_origin(process, domain, entry->fd, 0, 0);
+	}
 	struct descriptor_origin source = descriptor_origin(process, (int)first);
 	int fd = (int)info.exit.rval;
 	if (number == SYS_fcntl && second == F_SETFD) {
@@ -841,11 +856,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 				release_process(&processes, (pid_t)previous, &domain);
 			}
 			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
-			if (current->table && (current->table->references > 1 || current->table->active || current->call_epoch != current->table->epoch)) {
-				struct descriptor_table *table = copy_descriptor_table(current);
-				if (!table) goto fatal;
-				drop_descriptor_table(current, &domain); current->table = table;
-			}
+			if (detach_descriptor_table(current, &domain) < 0) goto fatal;
 			for (unsigned index = 0; current->table && index < current->table->count;)
 				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain, current->table->entries[index].fd, 0, 0);
 				else index++;
