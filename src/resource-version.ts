@@ -70,6 +70,7 @@ export class ResourceReadView {
 	private owner?: ResourceReadView;
 	private failure?: Error;
 	private capturedBytes = 0;
+	private inputEpoch = 0;
 	private sealed = false;
 	private pending?: Promise<void>;
 	private disposal?: Promise<void>;
@@ -79,6 +80,7 @@ export class ResourceReadView {
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, {
 		readonly value: unknown; readonly dispose: () => void | Promise<void>;
 		readonly dependencies?: ReadonlySet<string>; readonly boundary: ResourceReadView["boundary"];
+		revoked?: boolean;
 	}>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
@@ -94,6 +96,17 @@ export class ResourceReadView {
 	get resources() {
 		this.assertComplete(true);
 		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
+	}
+	/** Revoke data only; old outputs keep their immutable observations for exact validation. */
+	invalidate(dependencies: ReadonlySet<string>): void {
+		if (!dependencies.size) return;
+		this.inputEpoch++;
+		if (this.boundary?.dependency && dependencies.has(this.boundary.dependency)) this.boundary = undefined;
+		for (const [target, entry] of this.entries) if (!entry.dependency || dependencies.has(entry.dependency) ||
+			entry.metadataDependency && dependencies.has(entry.metadataDependency)) this.entries.delete(target);
+		for (const entries of this.prepared?.bindings.values() ?? []) for (const cached of entries.values()) {
+			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) cached.revoked = true;
+		}
 	}
 
 	reserve(bytes: number): boolean {
@@ -156,12 +169,13 @@ export class ResourceReadView {
 		const prepared = owner.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
 		return prepared.lifetime.admit(async () => {
 			this.assertComplete();
+			const inputEpoch = owner.inputEpoch;
 			const cached = prepared.bindings.get(binding)?.get(key);
 			const inherit = (dependencies: ReadonlySet<string> | undefined) => {
 				if (!dependencies) this.dependencies = undefined;
 				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
 			};
-			if (owner.sealed && cached && cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot) {
+			if (owner.sealed && cached && !cached.revoked && cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot) {
 				inherit(cached.dependencies);
 				const result = await consume(cached.value as Parameters<typeof consume>[0]);
 				this.assertComplete(); return result;
@@ -177,7 +191,7 @@ export class ResourceReadView {
 				const destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
-				if (!destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
+				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
 					let entries = retention.bindings.get(binding);
 					if (!entries) retention.bindings.set(binding, entries = new Map());
 					if (!entries.has(key)) {
@@ -617,6 +631,15 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 	} catch (error) { return validation(started, error instanceof Error ? error.message : "resource_validation_failed", "exact", checked); }
 }
 
+
+export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[], paths: readonly string[]): void {
+	const dependencies = new Set<string>(), precise = new Set<string>();
+	for (const token of tokens) for (const [key, dependency] of token.observations) {
+		if (paths.some(changed => dependency.scope === "resolution" ? containsFilesystemPath(changed, dependency.path)
+			: affects(dependency, { path: changed, type: "rename", epoch: 0 }, precise))) dependencies.add(key);
+	}
+	for (const token of tokens) token.view?.invalidate(dependencies);
+}
 
 export function releaseResourceVersion(token: unknown): void | Promise<void> {
 	if (!isResourceVersionToken(token)) return;
