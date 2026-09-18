@@ -1,12 +1,53 @@
 import { deferred } from "./async.ts";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { temporaryDirectories } from "./filesystem.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import { Worker } from "node:worker_threads";
 import process from "node:process";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { ToolFilesystemOperations } from "../src/tool-settlement.ts";
 
+const directories = temporaryDirectories("pi-actor-write-");
+afterEach(() => directories.dispose());
+
 describe("stock Pi invocation identity", () => {
+	it.each(["write", "edit", "over-budget", "failed", "aborted", "ignored", "foreign", "disposed"])("retains only completed Actor write bytes (%s)", async (mode) => {
+		const cwd = await directories.create(), file = path.join(cwd, "input.txt"), original = "\uFEFFbefore\r\nsecond\r\n";
+		await fs.writeFile(file, original);
+		const tool = mode === "edit" || mode === "failed" ? "edit" : "write";
+		const args = { path: "@input.txt", ...(tool === "write" ? { content: original.replace("before", "after") }
+			: { edits: [{ oldText: mode === "failed" ? "absent" : "before", newText: "after" }] }) };
+		const invocation = resolvePiToolInvocation(tool, args, { cwd, environment: {} })!;
+		const capture = invocation.captureInputs!(buildPiActionKey(tool, args, cwd)!, mode === "over-budget" ? 1 : 65536, mode);
+		const abort = new AbortController(), writes = vi.spyOn(fs, "writeFile"), reads = vi.spyOn(fs, "readFile"), opened = vi.spyOn(fs, "open");
+		let branch: Awaited<ReturnType<typeof capture.seal>> | undefined;
+		try {
+			if (mode === "aborted") abort.abort(new Error("cancelled"));
+			if (mode === "disposed") await capture.dispose();
+			let output: Awaited<ReturnType<NonNullable<typeof invocation.authoritative>>> = { result: { content: [], details: {} }, isError: false };
+			if (mode !== "ignored") {
+				const pending = invocation.authoritative!({ callID: mode === "foreign" ? "other" : mode, args, signal: abort.signal });
+				if (mode === "failed" || mode === "aborted") await expect(pending).rejects.toThrow();
+				else output = await pending;
+			}
+			expect(writes).toHaveBeenCalledTimes(["failed", "aborted", "ignored"].includes(mode) ? 0 : 1);
+			const readsBefore = reads.mock.calls.length, openedBefore = opened.mock.calls.length;
+			if (mode === "write" || mode === "edit") {
+				const sealing = capture.seal(output);
+				await expect(capture.seal(output)).rejects.toThrow("unavailable");
+				branch = await sealing;
+				expect(branch.inputsOnly).toBe(true);
+				expect(reads.mock.calls.length).toBe(readsBefore); expect(opened.mock.calls.length).toBe(openedBefore);
+				expect((await branch.validate!()).status).toBe("valid");
+				await expect(branch.commit()).rejects.toThrow("input_only");
+			} else await expect(capture.seal(output)).rejects.toThrow("unavailable");
+			expect(await fs.readFile(file, "utf8")).toBe(["failed", "aborted", "ignored"].includes(mode) ? original : original.replace("before", "after"));
+		} finally { await branch?.dispose(); await capture.dispose(); writes.mockRestore(); reads.mockRestore(); opened.mockRestore(); }
+	});
+
 	it.each(["read", "ls", "write", "edit"] as const)("borrows only the filesystem capabilities needed by %s", async (tool) => {
 		const allowed = { read: ["access", "readFile"], ls: ["exists", "stat", "readdir"],
 			write: ["writeFile", "mkdir"], edit: ["access", "readFile", "writeFile"] }[tool];
