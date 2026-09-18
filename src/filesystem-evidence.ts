@@ -107,33 +107,65 @@ async function captureFile(
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
 		observation?.pinned();
-		const hash = createHash("sha256");
-		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
-		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
-		let bytesRead = 0;
-		for (;;) {
-			observation?.signal.throwIfAborted();
-			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
-			const { bytesRead: size } = await handle.read(chunk);
-			if (size === 0) break;
-			bytesRead += size;
-			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-			hash.update(chunk.subarray(0, size));
-		}
-		const after = await handle.stat({ bigint: true });
 		observation?.signal.throwIfAborted();
-		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
-			throw new Error("file_changed_during_capture");
+		let captured: Omit<StableFileCapture, "realPath">;
+		if (verifyPath) captured = await readFileContents(handle, before, maxBytes, retainContent);
+		else {
+			const key = IDENTITY_FIELDS.map(field => String(before[field])).join(":"), borrower = { signal: observation?.signal };
+			let pending = executableCaptures.get(key);
+			const joined = !!pending;
+			if (!pending) {
+				const borrowers = new Set([borrower]), reader = handle;
+				pending = { borrowers, result: Promise.resolve().then(() => readFileContents(reader, before, maxBytes, false, () => {
+					for (const borrower of borrowers) if (!borrower.signal?.aborted) return;
+					borrowers.values().next().value?.signal?.throwIfAborted();
+				})).finally(() => { if (executableCaptures.get(key) === pending) executableCaptures.delete(key); }) };
+				executableCaptures.set(key, pending);
+			} else pending.borrowers.add(borrower);
+			try {
+				captured = await pending.result;
+				if (joined && !sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+			} finally { pending.borrowers.delete(borrower); }
 		}
+		observation?.signal.throwIfAborted();
+		const after = captured.stat;
 		if (verifyPath) {
 			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
 		}
-		return { hash: hash.digest("hex"), bytesRead, stat: after, realPath: beforePath, ...(content ? { content } : {}) };
-	} finally {
+		return { ...captured, realPath: beforePath };
+	} catch (error) { observation?.signal.throwIfAborted(); throw error; } finally {
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
+}
+
+/** Share only ongoing image reads; every borrower pins and fences its own descriptor. */
+const executableCaptures = new Map<string, {
+	readonly borrowers: Set<{ readonly signal: AbortSignal | undefined }>;
+	readonly result: Promise<Omit<StableFileCapture, "realPath">>;
+}>();
+
+async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void) {
+	const hash = createHash("sha256");
+	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
+	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
+	let bytesRead = 0;
+	for (;;) {
+		check?.();
+		const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
+		const { bytesRead: size } = await handle.read(chunk);
+		if (size === 0) break;
+		bytesRead += size;
+		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
+		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+		hash.update(chunk.subarray(0, size));
+	}
+	const after = await handle.stat({ bigint: true });
+	check?.();
+	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
+		throw new Error("file_changed_during_capture");
+	}
+	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}) };
 }
 
 /** Own a directory listing or link target together with its stable entry identity. */
