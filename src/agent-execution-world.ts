@@ -10,7 +10,7 @@ import type {
 	WorldCheckpoint,
 	WorldResultCapture,
 } from "./execution-world.ts";
-import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
+import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureResourceVersion,
 	invalidateResourceInputs,
@@ -97,11 +97,14 @@ export function createResourceSnapshotExecutionWorld(
 		id: "resource_version",
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		observation: { ...route, capabilities: canObserve ? route.capabilities : [],
-			diagnostics: () => canObserve ? route.diagnostics() : { state: "unavailable", detail: "Host path-binding observation is unproven on Windows; captured-input execution remains available" },
-			capture: (context) => capture(context,
-			operations?.tools.includes(context.toolName) && (context.action.executionContext as ToolInvocation | undefined)?.filesystem
-				? operations.maxBytes() : undefined) },
+		observation: { ...route, capabilities: [...(canObserve ? route.capabilities : []), ...(operations ? WORKSPACE_PATH_MUTATION_EFFECTS.capabilities : [])],
+			diagnostics: () => canObserve ? route.diagnostics() : { state: operations ? "ready" : "unavailable", detail: "Only explicit write-byte retention is available; host read windows remain unproven on Windows" },
+			capture: async (context) => {
+				const invocation = context.action.executionContext as ToolInvocation | undefined;
+				if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID);
+				if (actionSemantics.definition(context.action)?.effect !== "observation") throw new Error("Actor input capture requires an explicit binding");
+				return capture(context, operations?.tools.includes(context.toolName) && invocation?.filesystem ? operations.maxBytes() : undefined);
+			} },
 		...(operations?.tools.length ? { speculation: {
 			...route,
 			tools: operations.tools,

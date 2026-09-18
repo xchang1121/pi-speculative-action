@@ -122,13 +122,19 @@ export class EffectTransactionCoordinator<Output> {
 	): WorldResultCapture<Output> {
 		const owned = this.owned(attempt);
 		let consumed = false;
+		const inputsOnly = capture.inputsOnly;
 		return Object.freeze({
 			seal: async (output: Output) => {
 				if (consumed) throw new Error("effect transaction capture is already consumed");
 				consumed = true;
 				this.transition(owned, "begun", "sealing");
 				try {
-					return await this.seal(owned, await capture.seal(output));
+					const branch = await capture.seal(output);
+					if (inputsOnly && !branch.inputsOnly) {
+						await branch.dispose();
+						throw new Error("input_only_capture_required");
+					}
+					return await this.seal(owned, branch);
 				} catch (error) {
 					owned.stateValue = "failed";
 					await capture.dispose();

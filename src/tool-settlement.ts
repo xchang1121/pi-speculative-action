@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts";
-import type { ExecutionOperationBinding } from "./execution-world.ts";
+import type { ExecutionOperationBinding, WorldResultCapture } from "./execution-world.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -58,6 +58,8 @@ export interface ToolInvocation {
 	readonly filesystemRoot?: string;
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
+	/** Arm bounded final-byte retention in the selected Actor executor, without replaying a mutation. */
+	readonly captureInputs?: (action: ActionKey, maxBytes: number, callID: string) => WorldResultCapture<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
 	readonly filesystem?: (
 		view: ToolFilesystemOperations,

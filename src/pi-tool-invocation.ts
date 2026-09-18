@@ -17,6 +17,7 @@ import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { captureStableFile } from "./filesystem-evidence.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
+import { createCommittedResourceInputs } from "./agent-execution-world.ts";
 
 export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["find", "grep"];
 
@@ -64,7 +65,7 @@ export function resolvePiToolInvocation(
 		const modelSupportsImages = options.modelSupportsImages ?? true;
 		// Shared with the ThinkThread runner's binding check.
 		const executor = "pi.filesystem.local.v2";
-		return {
+		const invocation: ToolInvocation = {
 			executor,
 			filesystemRoot: cwd,
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
@@ -94,6 +95,7 @@ export function resolvePiToolInvocation(
 				return { result, isError: false };
 			},
 		};
+		return PI_OPERATION_TOOLS.workspace.includes(tool) ? { ...invocation, ...captureActorWrites(invocation.filesystem!, cwd) } : invocation;
 	}
 	if (!PI_OPERATION_TOOLS.process.includes(tool) || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const record = input as Record<string, unknown>;
@@ -120,6 +122,47 @@ export function resolvePiToolInvocation(
 			shellArgs: [...shell.args],
 			commandTransport,
 			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}),
+		},
+	};
+}
+
+/** Retain the bytes the stock mutation actually writes; edit normalization and queuing stay in Pi. */
+function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs"> {
+	let active: { inputs: Map<string, Buffer>; maxBytes: number; callID: string; started: boolean; complete: boolean; overflow: boolean } | undefined;
+	return {
+		captureInputs: (action, maxBytes, callID) => {
+			if (active || !Number.isFinite(maxBytes) || maxBytes <= 0) throw new Error("resource_snapshot_budget_invalid");
+			const owned = active = { inputs: new Map(), maxBytes, callID, started: false, complete: false, overflow: false };
+			const dispose = () => { if (active === owned) active = undefined; owned.inputs.clear(); };
+			return { inputsOnly: true, dispose, seal: async (output) => {
+				try {
+					if (active !== owned || !owned.complete || owned.overflow || !owned.inputs.size) throw new Error("actor_write_inputs_unavailable");
+					active = undefined;
+					return await createCommittedResourceInputs(output, action, root, owned.inputs, maxBytes);
+				} finally { dispose(); }
+			} };
+		},
+		authoritative: async (request) => {
+			const owned = active?.callID === request.callID && !active.started ? active : undefined;
+			if (owned) owned.started = true;
+			const output = await execute({
+				readFile: target => fs.readFile(target),
+				access: (target, writable) => fs.access(target, fs.constants.R_OK | (writable ? fs.constants.W_OK : 0)),
+				mkdir: target => fs.mkdir(target, { recursive: true }).then(() => {}),
+				writeFile: async (target, content) => {
+					const retain = owned && active === owned && !owned.overflow;
+					const bytes = retain && Buffer.byteLength(content) <= owned.maxBytes ? Buffer.from(content) : undefined;
+					await fs.writeFile(target, bytes ?? content, "utf-8");
+					if (retain && active === owned) {
+						if (bytes) owned.inputs.set(target, bytes);
+						if (!bytes || [...owned.inputs.values()].reduce((sum, input) => sum + input.length, 0) > owned.maxBytes) {
+							owned.overflow = true; owned.inputs.clear();
+						}
+					}
+				},
+			}, request);
+			if (owned && active === owned) owned.complete = !output.isError;
+			return output;
 		},
 	};
 }

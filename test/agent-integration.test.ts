@@ -7,7 +7,7 @@ import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
@@ -655,6 +655,45 @@ describe("speculative action host", () => {
 			expect(events.filter(event => event.type === "prediction" && event.turnID === "query" && event.settlement.observation === "observed" &&
 				event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toHaveLength(1);
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
+	});
+
+	it.each(["write", "edit"])("hands Actor %s inputs across turns without rereading or replaying the mutation", async (tool) => {
+		const cwd = await temporaryWorkspace(), tools = [createWriteTool(cwd), createEditTool(cwd), createReadTool(cwd)] as const;
+		const args = tool === "write" ? { path: "notes.txt", content: "after\nsecond\n" }
+			: { path: "notes.txt", edits: [{ oldText: "one", newText: "after" }] };
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("actor-write-inputs", {
+			cwd, draftModel: model("draft"), preflight: () => true,
+			getSettings: () => ({ ...settings(), tools: ["write", "edit", "read"], drafterEnabled: false, resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 65536 }),
+			complete: async () => { throw new Error("drafter disabled"); },
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 65536 })],
+			onEvent: event => { events.push(event); },
+		});
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "write"), tools });
+			const call = { turnID: "write", id: "write", tool, args, tools };
+			const execute = vi.fn(async (operation: Parameters<Parameters<typeof host.execute>[2]>[0]) =>
+				(await operation.invocation!.authoritative!({ args: operation.input, callID: operation.callID!, signal: operation.signal! })).result);
+			await host.execute(call, undefined, execute); expect(execute).toHaveBeenCalledOnce();
+			await host.finishTurn("write");
+			const captured = captures.mock.calls.length;
+			expect(captures.mock.calls.filter(call => call[2] !== undefined)).toHaveLength(1);
+			await host.startTurn({ ...startInput(tools[2]!, "read"), tools });
+			const query = { path: args.path, offset: 2 }, read = vi.fn(() => tools[2]!.execute("native", query));
+			const readCall = { turnID: "read", id: "read", tool: "read", args: query, tools };
+			expect(await host.execute(readCall, undefined, read)).toEqual(await tools[2]!.execute("oracle", query));
+			expect(read).not.toHaveBeenCalled(); expect(captures.mock.calls.length).toBe(captured);
+			await writeFile(path.join(cwd, args.path), "external\nchanged\n");
+			expect(await host.execute({ ...readCall, id: "changed" }, undefined, read)).toEqual(await tools[2]!.execute("oracle", query));
+			expect(read).toHaveBeenCalledOnce();
+			const repeated = host.execute({ ...call, turnID: "read", id: "repeat" }, undefined, execute);
+			if (tool === "edit") await expect(repeated).rejects.toThrow(); else await repeated;
+			expect(execute).toHaveBeenCalledTimes(2);
+			await host.finishTurn("read", true);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 1, predictionsMatched: 0 });
+		} finally { await host.dispose(); captures.mockRestore(); }
 	});
 
 	it("reuses committed write inputs across turns while repeating mutations and rejecting stale reads", async () => {

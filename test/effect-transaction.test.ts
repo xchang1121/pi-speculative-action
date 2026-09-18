@@ -210,6 +210,14 @@ describe("EffectTransactionCoordinator", () => {
 		expect(abandonedAttempt.state).toBe("aborted");
 	});
 
+	it("rejects an input-only capture that supplies a reusable action result", async () => {
+		const coordinator = new EffectTransactionCoordinator<string>(), dispose = vi.fn();
+		const attempt = coordinator.begin({ tool: "write", route: { ...route, reuse: "shared_result" } });
+		const capture = coordinator.capture(attempt, { inputsOnly: true, seal: () => branch({ dispose }), dispose: () => {} });
+		await expect(capture.seal("written")).rejects.toThrow("input_only_capture_required");
+		expect(dispose).toHaveBeenCalledOnce(); expect(attempt.state).toBe("failed");
+	});
+
 	it("owns sealed data and operation slots without changing opaque backend or Actor owners", async () => {
 		const getter = vi.fn(() => "not data"), opaque = Object.create({ method() {} });
 		const metadataKey = Symbol("evidence");

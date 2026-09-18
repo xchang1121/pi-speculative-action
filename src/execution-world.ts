@@ -216,6 +216,8 @@ export async function validateWorldBranch<Output>(branch: Pick<WorldBranch<Outpu
 
 /** Pre-execution evidence that can seal one externally executed authoritative result. */
 export interface WorldResultCapture<Output> {
+	/** The capture retains inputs only; it cannot authorize reuse of the captured action's output. */
+	readonly inputsOnly?: true;
 	/** Transfer the captured baseline into a normal branch. May be called at most once. */
 	readonly seal: (output: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;
 	/** Release an unsealed baseline. Idempotent; a sealed branch owns its own cleanup. */
@@ -428,7 +430,7 @@ export class ExecutionWorldRouter<Context, Output> {
 			preparation,
 			async (world, route) => {
 				const capture = await world.observation!.capture(context);
-				return Object.freeze({ route, capture });
+				return Object.freeze({ route: capture.inputsOnly ? Object.freeze({ ...route, reuse: "shared_result" as const }) : route, capture });
 			},
 		));
 	}

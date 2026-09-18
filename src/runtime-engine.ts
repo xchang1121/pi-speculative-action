@@ -1994,7 +1994,7 @@ export function makeSpeculativeActionRuntime<
 			const effect = semantics.effect(actualKey);
 			preemptForActor(state.session, state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
-			if (adapter.captureAuthoritativeResult && effect === "observation") {
+			if (adapter.captureAuthoritativeResult && (effect === "observation" || effect === "workspace_mutation")) {
 				const startedAt = performance.now();
 				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
 				capturePreparationMs = Math.max(0, performance.now() - startedAt);
