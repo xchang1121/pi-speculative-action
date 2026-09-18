@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <linux/audit.h>
 #include <linux/kcmp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -16,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ptrace.h>
+#include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/user.h>
@@ -25,15 +27,25 @@
 static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 	PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL;
 
-#define MAX_LINE 1024
+#define MAX_LINE 32768
 #define MAX_OUTPUT_EVENTS 65536
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
 #define MAX_POSITIONS 64
 
 struct file_position {
-	int descriptor, duplicate, flags, alias;
+	int descriptor, duplicate, writer, flags, alias;
 	uintmax_t device, inode;
 	int64_t before, after;
+	int64_t content_length;
+	unsigned char *content;
+};
+
+struct descriptor_origin { int fd, cloexec; unsigned long id; };
+
+/* Track provenance without keeping kernel handles alive beyond their native lifetime. */
+struct descriptor_domain {
+	int enabled, escaped;
+	unsigned long next;
 };
 
 struct output_event {
@@ -51,13 +63,19 @@ struct decision_job {
 	unsigned count;
 	struct file_position *positions;
 	unsigned position_count;
+	struct descriptor_domain *domain;
+	struct traced_process *process;
 };
 
 struct traced_process {
 	pid_t pid;
-	int fd, armed;
+	int fd, armed, stopped, pending, delivered, listening, historical, awaiting_parent;
 	struct decision_job *job;
 	struct traced_process *next;
+	unsigned descriptor_count;
+	struct descriptor_origin descriptors[256];
+	long syscall;
+	unsigned long arguments[3];
 };
 
 static int replace_with_exit(pid_t pid, unsigned code) {
@@ -231,6 +249,148 @@ static int duplicate_tracee_fd(pid_t pid, unsigned fd) {
 	return -1;
 }
 
+static struct descriptor_origin descriptor_origin(struct traced_process *process, int fd) {
+	for (unsigned index = 0; index < process->descriptor_count; index++)
+		if (process->descriptors[index].fd == fd) return process->descriptors[index];
+	return (struct descriptor_origin){.fd = fd};
+}
+
+static void set_descriptor_origin(struct traced_process *process, struct descriptor_domain *domain,
+	int fd, unsigned long id, int cloexec) {
+	for (unsigned index = 0; index < process->descriptor_count; index++) if (process->descriptors[index].fd == fd) {
+		process->descriptors[index] = process->descriptors[--process->descriptor_count]; break;
+	}
+	if (!id) return;
+	if (process->descriptor_count == sizeof(process->descriptors) / sizeof(process->descriptors[0])) { domain->escaped = 1; return; }
+	process->descriptors[process->descriptor_count++] = (struct descriptor_origin){fd, cloexec, id};
+}
+
+/* Called at syscall stops, on the tracer thread. No tracing cost in the ordinary mode. */
+static int observe_descriptor_syscall(struct traced_process *process, struct descriptor_domain *domain) {
+	if (domain->escaped) return 0;
+	pid_t pid = process->pid;
+	struct __ptrace_syscall_info info;
+	if (ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info) < 0) return -1;
+	if (info.arch != AUDIT_ARCH_X86_64) { domain->escaped = 1; return 0; }
+	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+		process->syscall = (long)info.entry.nr;
+		for (unsigned index = 0; index < 3; index++) process->arguments[index] = info.entry.args[index];
+	}
+	long number = process->syscall;
+	unsigned long first = process->arguments[0], second = process->arguments[1], third = process->arguments[2];
+	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+		/* These can publish handles outside the traced tree or bypass its syscall stops. */
+		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_io_uring_setup ||
+			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
+			number == SYS_process_vm_writev || number == SYS_unshare || number == SYS_setns;
+		/* Shared fd tables can race a syscall-exit observation; shared OFDs through fork are supported. */
+		if (number == SYS_clone) escapes |= (first & (0x00800000 | 0x400)) != 0 ||
+			((first & 0x100) && !(first & 0x4000)); /* Shared VM can race clone3 arguments; vfork suspends its parent. */
+		if (number == SYS_clone3) {
+			errno = 0;
+			long flags = ptrace(PTRACE_PEEKDATA, pid, first, 0);
+			escapes |= errno != 0 || (flags & (0x00800000 | 0x400)) != 0 ||
+				((flags & 0x100) && !(flags & 0x4000));
+		}
+		if (escapes) domain->escaped = 1;
+		/* Dropping uncertain provenance before a failing close/dup is safe; retaining a stale slot is not. */
+		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0);
+		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
+			set_descriptor_origin(process, domain, (int)second, 0, 0);
+		if (number == SYS_close_range) for (unsigned index = 0; index < process->descriptor_count;) {
+			struct descriptor_origin *entry = &process->descriptors[index];
+			if ((unsigned)entry->fd < first || (unsigned)entry->fd > second) { index++; continue; }
+			if (third & 4) { entry->cloexec = 1; index++; }
+			else set_descriptor_origin(process, domain, entry->fd, 0, 0);
+		}
+	}
+	if (info.op != PTRACE_SYSCALL_INFO_EXIT || info.exit.is_error || domain->escaped) return 0;
+	/* Unknown successful ioctl protocols may transfer a handle (for example Binder). */
+	if (number == SYS_ioctl) { domain->escaped = 1; return 0; }
+	struct descriptor_origin source = descriptor_origin(process, (int)first);
+	int fd = (int)info.exit.rval;
+	if (number == SYS_fcntl && second == F_SETFD) {
+		set_descriptor_origin(process, domain, source.fd, source.id, (third & FD_CLOEXEC) != 0);
+	} else if (number == SYS_dup || number == SYS_dup2 || number == SYS_dup3 ||
+		(number == SYS_fcntl && (second == F_DUPFD || second == F_DUPFD_CLOEXEC))) {
+		set_descriptor_origin(process, domain, fd, source.id,
+			(number == SYS_dup2 && first == second && source.cloexec) ||
+			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC));
+	} else if (number == SYS_open || number == SYS_openat || number == SYS_creat || number == SYS_memfd_create) {
+		unsigned long flags = number == SYS_open ? second : number == SYS_openat ? third : 0;
+		set_descriptor_origin(process, domain, fd, ++domain->next,
+			(flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1)));
+	} else if (number == SYS_openat2) {
+		/* Read the installed flag, rather than racing the tracee's open_how memory. */
+		char name[64], line[256]; unsigned flags = 0; int found = 0;
+		snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
+		FILE *file = fopen(name, "re");
+		while (file && fgets(line, sizeof(line), file)) if (sscanf(line, "flags: %o", &flags) == 1) { found = 1; break; }
+		if (file) fclose(file);
+		set_descriptor_origin(process, domain, fd, found ? ++domain->next : 0, (flags & O_CLOEXEC) != 0);
+	}
+	return 0;
+}
+
+/* The entire owned tree is stopped until this job retires. External OFDs remain unknown. */
+static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%ld/fd", (long)job->pid);
+	DIR *directory = opendir(path);
+	if (!directory) return -1;
+	int pins[MAX_POSITIONS], fds[MAX_POSITIONS], count = 0, result = -1;
+	struct dirent *entry;
+	size_t used = 0;
+	for (;;) {
+		errno = 0;
+		entry = readdir(directory);
+		if (!entry) { if (errno) goto done; break; }
+		char *end;
+		long descriptor = strtol(entry->d_name, &end, 10);
+		if (!*entry->d_name || *end || descriptor < 0 || descriptor > INT_MAX) continue;
+		int pin = duplicate_tracee_fd(job->pid, (unsigned)descriptor);
+		struct stat state;
+		if (pin < 0) goto done;
+		if (fstat(pin, &state) < 0) { close(pin); goto done; }
+		if (!S_ISREG(state.st_mode)) { close(pin); continue; }
+		if (count == MAX_POSITIONS) { close(pin); goto done; }
+		pins[count] = pin; fds[count++] = (int)descriptor;
+	}
+	/* Canonical alias representatives must not depend on procfs enumeration order. */
+	for (int index = 0; index < count; index++) for (int previous = index; previous > 0 && fds[previous] < fds[previous - 1]; previous--) {
+		int fd = fds[previous], pin = pins[previous];
+		fds[previous] = fds[previous - 1]; pins[previous] = pins[previous - 1];
+		fds[previous - 1] = fd; pins[previous - 1] = pin;
+	}
+	for (int index = 0; index < count; index++) {
+		int pin = pins[index], alias = fds[index], owned = 0, flags = fcntl(pin, F_GETFL);
+		struct stat state;
+		off_t offset = lseek(pin, 0, SEEK_CUR);
+		if (flags < 0 || offset < 0 || fstat(pin, &state) < 0) goto done;
+		for (int previous = 0; previous < index; previous++) {
+			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, pin, pins[previous]);
+			if (same < 0) goto done;
+			unsigned long origin = descriptor_origin(job->process, fds[index]).id;
+			unsigned long other = descriptor_origin(job->process, fds[previous]).id;
+			if (origin && other && ((same == 0) != (origin == other))) goto done;
+			if (!same) { alias = fds[previous]; break; }
+		}
+		owned = !job->domain->escaped && descriptor_origin(job->process, fds[index]).id != 0;
+		int length = snprintf(line + used, capacity - used,
+			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s}",
+			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags,
+			(intmax_t)offset, owned ? "true" : "false");
+		if (length < 0 || (size_t)length >= capacity - used) goto done;
+		used += (size_t)length;
+	}
+	line[used] = 0;
+	result = 0;
+done:
+	while (count) close(pins[--count]);
+	closedir(directory);
+	return result;
+}
+
 static int open_tracee_output(pid_t pid, unsigned fd) {
 	int duplicate = duplicate_tracee_fd(pid, fd);
 	if (duplicate >= 0) return duplicate;
@@ -259,7 +419,7 @@ static int position_matches(const struct file_position *position) {
 }
 
 /* Only the tracer thread may mutate a held image. Each job owns its reply channel. */
-static int request_exit(struct decision_job *job, unsigned code) {
+static int request_tracer(struct decision_job *job, unsigned code) {
 	char reply;
 	return transfer(job->channel[1], &code, sizeof(code), 1) < 0 ||
 		transfer(job->channel[1], &reply, 1, 0) < 0 || reply != 'Y' ? -1 : 0;
@@ -276,9 +436,18 @@ static int actor_decision(struct decision_job *job) {
 	struct sockaddr_un address = {.sun_family = AF_UNIX};
 	strcpy(address.sun_path, job->socket_path);
 	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) return -1;
+	char descriptors[MAX_LINE];
+	int captured = 0;
+	if (job->domain) {
+		/* Temporary snapshot pins must close before cancellation can retire their job. */
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+		captured = descriptor_context(job, descriptors, sizeof(descriptors)) == 0;
+		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	}
 	int request_length = snprintf(line, sizeof(line),
-		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld}\n",
-		job->token, job->execution_id, (long)job->pid, (long)getpid());
+		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s%s%s}\n",
+		job->token, job->execution_id, (long)job->pid, (long)getpid(),
+		captured ? ",\"descriptors\":[" : "", captured ? descriptors : "", captured ? "]" : "");
 	if (request_length < 0 || request_length >= (int)sizeof(line) ||
 		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) return -1;
 	if (!strcmp(line, "C")) return -1;
@@ -289,18 +458,26 @@ static int actor_decision(struct decision_job *job) {
 	if (job->position_count) {
 		job->positions = calloc(job->position_count, sizeof(*job->positions));
 		if (!job->positions) return -1;
-		for (unsigned index = 0; index < job->position_count; index++) job->positions[index].duplicate = -1;
+		for (unsigned index = 0; index < job->position_count; index++) {
+			job->positions[index].duplicate = -1; job->positions[index].writer = -1;
+		}
 	}
+	size_t received = 0;
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
 		if (read_line(connection, line, sizeof(line)) < 0 ||
-			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64, &position->descriptor,
-				&position->device, &position->inode, &position->flags, &position->before, &position->after) != 6 ||
-			position->descriptor < 0 || position->before < 0 || position->after < 0) goto decline;
+			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64, &position->descriptor,
+				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length) != 7 ||
+			position->descriptor < 0 || position->before < 0 || position->after < 0 || position->content_length < -1 ||
+			(position->content_length >= 0 && (uint64_t)position->content_length > total - received)) goto decline;
+		if (position->content_length > 0) {
+			position->content = malloc((size_t)position->content_length);
+			if (!position->content || transfer(connection, position->content, (size_t)position->content_length, 0) < 0) return -1;
+		}
+		if (position->content_length >= 0) received += (size_t)position->content_length;
 	}
 	job->events = calloc(job->count ? job->count : 1, sizeof(*job->events));
 	if (!job->events) return -1;
-	size_t received = 0;
 	for (unsigned index = 0; index < job->count; index++) {
 		size_t length;
 		unsigned fd;
@@ -326,8 +503,11 @@ static int actor_decision(struct decision_job *job) {
 		position->duplicate = duplicate_tracee_fd(job->pid, (unsigned)position->descriptor);
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 		if (position->duplicate < 0 || !position_matches(position)) goto decline;
+		if (job->domain && (job->domain->escaped || !descriptor_origin(job->process, position->descriptor).id)) goto decline;
 		for (unsigned previous = 0; previous < index; previous++) {
 			const struct file_position *other = &job->positions[previous];
+			if (position->content_length >= 0 && other->content_length >= 0 &&
+				position->device == other->device && position->inode == other->inode) goto decline;
 			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, position->duplicate, other->duplicate);
 			if (same < 0) goto decline;
 			if (same == 0) {
@@ -335,21 +515,37 @@ static int actor_decision(struct decision_job *job) {
 				position->alias = 1;
 			}
 		}
+		if (position->content_length >= 0) {
+			char path[64]; struct stat state;
+			snprintf(path, sizeof(path), "/proc/self/fd/%d", position->duplicate);
+			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+			position->writer = open(path, O_WRONLY | O_CLOEXEC);
+			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+			if (position->writer < 0 || fstat(position->writer, &state) < 0 ||
+				(uintmax_t)state.st_dev != position->device || (uintmax_t)state.st_ino != position->inode) goto decline;
+		}
 	}
 	/* From the first text mutation onward, failure terminates the entire trace tree. */
-	if (request_exit(job, 125) < 0) return -2;
+	if (request_tracer(job, 125) < 0) return -2;
 	if (transfer(connection, "A\n", 2, 1) < 0 || read_line(connection, line, sizeof(line)) < 0 || strcmp(line, "R")) return -2;
 	for (unsigned index = 0; index < job->position_count; index++)
 		if (!position_matches(&job->positions[index])) return -2;
 	for (unsigned index = 0; index < job->position_count; index++) {
 		const struct file_position *position = &job->positions[index];
+		if (position->writer >= 0 && (ftruncate(position->writer, 0) < 0 ||
+			transfer(position->writer, position->content, (size_t)position->content_length, 1) < 0)) return -2;
+	}
+	for (unsigned index = 0; index < job->position_count; index++) {
+		const struct file_position *position = &job->positions[index];
 		if (!position->alias && lseek(position->duplicate, position->after, SEEK_SET) != position->after) return -2;
 	}
+	/* Output may feed another tracee. Release the offset lease before a pipe write can block. */
+	if (job->domain && job->domain->enabled && request_tracer(job, 256) < 0) return -2;
 	for (unsigned index = 0; index < job->count; index++) {
 		struct output_event *event = &job->events[index];
 		if (transfer(job->outputs[event->fd], event->data, event->length, 1) < 0) return -2;
 	}
-	if (request_exit(job, code) < 0 || transfer(connection, "D\n", 2, 1) < 0) return -2;
+	if (request_tracer(job, code) < 0 || transfer(connection, "D\n", 2, 1) < 0) return -2;
 	return -1;
 decline:
 	/* No image or shared offset changed: explicitly acknowledge native fallback. */
@@ -370,19 +566,23 @@ static void *decide_process(void *argument) {
 static void free_job(struct decision_job *job) {
 	close(job->channel[0]); close(job->channel[1]); close(job->connection);
 	for (unsigned fd = 1; fd <= 2; fd++) close(job->outputs[fd]);
-	if (job->positions) for (unsigned index = 0; index < job->position_count; index++) close(job->positions[index].duplicate);
+	if (job->positions) for (unsigned index = 0; index < job->position_count; index++) {
+		close(job->positions[index].duplicate); close(job->positions[index].writer); free(job->positions[index].content);
+	}
 	free(job->positions);
 	free_events(job->events, job->count);
 	free(job);
 }
 
 static int start_decision(struct traced_process *process, const char *socket_path,
-	const char *token, const char *execution_id) {
+	const char *token, const char *execution_id, struct descriptor_domain *domain) {
+	struct user_regs_struct registers;
+	if (ptrace(PTRACE_GETREGS, process->pid, 0, &registers) < 0 || registers.cs != 0x33) return -1;
 	struct decision_job *job = calloc(1, sizeof(*job));
 	if (!job) return -1;
 	*job = (struct decision_job){ .pid = process->pid, .socket_path = socket_path,
 		.token = token, .execution_id = execution_id, .channel = {-1, -1},
-		.connection = -1, .outputs = {-1, -1, -1}, .result = -1 };
+		.connection = -1, .outputs = {-1, -1, -1}, .result = -1, .domain = domain, .process = process };
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, job->channel) < 0 ||
 		pthread_create(&job->thread, NULL, decide_process, job) != 0) {
 		free_job(job);
@@ -424,7 +624,11 @@ static void release_process(struct traced_process **processes, pid_t pid) {
 }
 
 static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
-	int skip, unsigned skip_code) {
+	int skip, unsigned skip_code, int descriptors) {
+	int inspect_descriptors = descriptors;
+	descriptors = descriptors == 1;
+	struct descriptor_domain domain = {.enabled = descriptors};
+	pid_t barrier = 0;
 	sigset_t blocked, original;
 	sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD);
 	if (pthread_sigmask(SIG_BLOCK, &blocked, &original) != 0) return 70;
@@ -444,7 +648,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		_exit(errno == ENOENT ? 127 : 126);
 	}
 	close(gate[0]);
-	if (ptrace(PTRACE_SEIZE, root, 0, options) < 0 || transfer(gate[1], "R", 1, 1) < 0) {
+	if (ptrace(PTRACE_SEIZE, root, 0, options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0)) < 0 || transfer(gate[1], "R", 1, 1) < 0) {
 		close(gate[1]);
 		kill(root, SIGKILL);
 		waitpid(root, NULL, 0);
@@ -467,18 +671,49 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			unsigned code;
 			ssize_t received = recv(job->channel[0], &code, sizeof(code), MSG_DONTWAIT);
 			if (received == sizeof(code)) {
-				item->armed = 1;
-				char reply = replace_with_exit(item->pid, code) < 0 ? 'N' : 'Y';
+				char reply;
+				if (code == 256 && descriptors && item->armed) {
+					item->pending = 0; if (barrier == item->pid) barrier = 0;
+					reply = 'Y';
+				} else {
+					item->armed = 1;
+					reply = code > 255 || replace_with_exit(item->pid, code) < 0 ? 'N' : 'Y';
+				}
 				if (send(job->channel[0], &reply, 1, MSG_NOSIGNAL) != 1) goto fatal;
 			} else if (received == 0) {
 				pthread_join(job->thread, NULL);
 				int result = job->result;
 				if (result >= 0) { item->fd = result; job->connection = -1; }
 				free_job(job); item->job = NULL; item->armed = 0;
-				if (result == -2 || (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH)) goto fatal;
+				if (result == -2) goto fatal;
+				if (descriptors) { item->pending = 0; if (barrier == item->pid) barrier = 0; }
+				else if (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
 				continue;
 			} else if (received > 0 || (errno != EAGAIN && errno != EINTR)) goto fatal;
 			count++;
+		}
+	manage_descriptors:
+		if (descriptors) {
+			if (!barrier) for (struct traced_process *item = processes; item; item = item->next)
+				if (item->pending && !item->historical) { barrier = item->pid; break; }
+			int ready = 1;
+			for (struct traced_process *item = processes; item; item = item->next) {
+				if (item->historical || item->stopped) continue;
+				ready = 0;
+				if (barrier && ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH && errno != EIO) goto fatal;
+			}
+			for (struct traced_process *item = processes; item; item = item->next) {
+				if (item->historical || !item->stopped) continue;
+				if (barrier) {
+					if (ready && item->pid == barrier && !item->job &&
+						start_decision(item, socket_path, token, execution_id, &domain) < 0) {
+						item->pending = 0; barrier = 0; goto manage_descriptors;
+					}
+				} else if (!item->job && !item->awaiting_parent) {
+					if (ptrace(item->listening ? PTRACE_LISTEN : domain.escaped ? PTRACE_CONT : PTRACE_SYSCALL, item->pid, 0, item->delivered) < 0 && errno != ESRCH) goto fatal;
+					item->stopped = 0; item->delivered = 0; item->listening = 0;
+				}
+			}
 		}
 		pid_t pid = waitpid(-1, &status, __WALL | WNOHANG);
 		if (pid < 0) {
@@ -487,6 +722,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			goto fatal;
 		}
 		if (pid == 0) {
+			count = 1;
+			for (struct traced_process *item = processes; item; item = item->next) if (item->job) count++;
 			if (count > capacity) {
 				struct pollfd *grown = realloc(polling, count * sizeof(*polling));
 				if (!grown) goto fatal;
@@ -500,6 +737,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			continue;
 		}
 		if (WIFEXITED(status) || WIFSIGNALED(status)) {
+			if (pid == barrier) barrier = 0;
 			if (pid == root) root_status = status;
 			for (struct traced_process *item = processes; item; item = item->next)
 				if (item->pid == pid && item->armed) goto fatal;
@@ -509,11 +747,32 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		if (!WIFSTOPPED(status)) continue;
 		unsigned event = (unsigned)status >> 16;
 		int delivered = WSTOPSIG(status);
+		struct traced_process *current = processes;
+		while (current && (current->pid != pid || current->historical)) current = current->next;
+		/* waitpid may deliver an automatically attached child's stop before its parent's fork event. */
+		if (!current) {
+			if (track_process(&processes, pid) < 0) goto fatal;
+			current = processes;
+			current->awaiting_parent = descriptors && event == PTRACE_EVENT_STOP;
+		}
+		current->stopped = 1;
+		if (descriptors && delivered == (SIGTRAP | 0x80)) {
+			if (observe_descriptor_syscall(current, &domain) < 0) goto fatal;
+			delivered = 0;
+		}
 		if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
 			unsigned long child;
-			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0 || track_process(&processes, (pid_t)child) < 0) goto fatal;
+			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0) goto fatal;
+			struct traced_process *known = processes;
+			while (known && known->pid != (pid_t)child) known = known->next;
+			if (!known && track_process(&processes, (pid_t)child) < 0) goto fatal;
+			if (!known) known = processes;
+			known->awaiting_parent = 0;
+			known->descriptor_count = current->descriptor_count;
+			memcpy(known->descriptors, current->descriptors, sizeof(current->descriptors));
 		}
 		if (event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
+			if (descriptors) { current->listening = 1; continue; }
 			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
 			continue;
 		}
@@ -522,6 +781,9 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &previous) < 0) goto fatal;
 			/* A non-leader exec replaces its TID without a separate death notification. */
 			if ((pid_t)previous != pid) release_process(&processes, (pid_t)previous);
+			for (unsigned index = 0; index < current->descriptor_count;)
+				if (current->descriptors[index].cloexec) set_descriptor_origin(current, &domain, current->descriptors[index].fd, 0, 0);
+				else index++;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
@@ -531,14 +793,21 @@ static int trace(char **command, const char *socket_path, const char *token, con
 					/* Earlier images still own completion of this process, including later execs. */
 					if (item->fd >= 0) {
 						if (track_process(&processes, pid) < 0) goto fatal;
+						item->historical = 1;
+						processes->descriptor_count = item->descriptor_count;
+						memcpy(processes->descriptors, item->descriptors, sizeof(item->descriptors));
+						item->descriptor_count = 0;
 						item = processes;
+						item->stopped = 1;
 					}
-					if (start_decision(item, socket_path, token, execution_id) == 0) goto held;
+					if (descriptors) { item->pending = 1; goto held; }
+					if (start_decision(item, socket_path, token, execution_id, inspect_descriptors ? &domain : NULL) == 0) goto held;
 					break;
 				}
 			}
 		}
 		if (event != 0) delivered = 0;
+		if (descriptors) { current->delivered = delivered; continue; }
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
 	held:;
 	}
@@ -558,15 +827,109 @@ fatal:
 	return 125;
 }
 
+/* Reproduce a complete regular-FD table at the existing sandboxed native outlet.
+ * The supervisor alone keeps the pins, and drains descendants before reporting offsets. */
+static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command) {
+	struct file_position positions[MAX_POSITIONS];
+	char *paths[MAX_POSITIONS] = {0}, line[MAX_LINE];
+	unsigned count = 0, close_input = 0, initialized = 0;
+	int result = 70, minimum = 3, output = -1, root_status = -1;
+	if (has_unmodeled_descriptors() != 0) return result;
+	FILE *input = fopen(manifest, "re");
+	if (!input) return result;
+	if (!fgets(line, sizeof(line), input) || sscanf(line, "FD1 %u %u", &count, &close_input) != 2 ||
+		count > MAX_POSITIONS || close_input > 1) goto done;
+	for (unsigned index = 0; index < count; index++) {
+		struct file_position *position = &positions[index];
+		*position = (struct file_position){.duplicate = -1}; initialized++;
+		unsigned length;
+		int alias;
+		if (!fgets(line, sizeof(line), input) || sscanf(line, "%d %d %d %" SCNd64 " %u",
+			&position->descriptor, &alias, &position->flags, &position->before, &length) != 5 ||
+			position->descriptor < 0 || position->descriptor == 1 || position->descriptor == 2 || position->descriptor == INT_MAX ||
+			(close_input && position->descriptor == 0) || (index && position->descriptor <= positions[index - 1].descriptor) ||
+			position->before < 0 || length >= PATH_MAX || alias > position->descriptor || alias < 0) goto done;
+		position->alias = (int)index;
+		if (alias != position->descriptor) {
+			unsigned previous = 0;
+			while (previous < index && positions[previous].descriptor != alias) previous++;
+			if (previous == index || positions[previous].alias != (int)previous || length ||
+				positions[previous].flags != position->flags || positions[previous].before != position->before) goto done;
+			position->alias = (int)previous;
+		} else if (!length) goto done;
+		paths[index] = calloc((size_t)length + 1, 1);
+		if (!paths[index] || fread(paths[index], 1, length, input) != length || fgetc(input) != '\n' ||
+			strlen(paths[index]) != length || (length && paths[index][0] != '/')) goto done;
+		if (position->descriptor >= minimum) minimum = position->descriptor + 1;
+	}
+	if (fgetc(input) != EOF || ferror(input)) goto done;
+	fclose(input); input = NULL;
+	for (unsigned index = 0; index < count; index++) {
+		struct file_position *position = &positions[index];
+		if (position->alias != (int)index) {
+			position->duplicate = fcntl(positions[position->alias].duplicate, F_DUPFD_CLOEXEC, minimum);
+		} else {
+			const int allowed = O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | 0x8000 /* kernel O_LARGEFILE */ | O_NOATIME | O_NOFOLLOW | O_DIRECT;
+			if ((position->flags & ~allowed) || (position->flags & O_ACCMODE) == O_ACCMODE) goto done;
+			int fd = open(paths[index], position->flags | O_CLOEXEC);
+			if (fd < 0) goto done;
+			position->duplicate = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
+			close(fd);
+		}
+		struct stat state;
+		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !S_ISREG(state.st_mode) ||
+			fcntl(position->duplicate, F_GETFL) != position->flags ||
+			lseek(position->duplicate, position->before, SEEK_SET) != position->before) goto done;
+	}
+	output = open(report, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (output < 0 || prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) goto done;
+	pid_t root = fork();
+	if (root < 0) goto done;
+	if (!root) {
+		close(output);
+		if (close_input && close(0) < 0 && errno != EBADF) _exit(70);
+		for (unsigned index = 0; index < count; index++)
+			if (dup2(positions[index].duplicate, positions[index].descriptor) < 0) _exit(70);
+		for (unsigned index = 0; index < count; index++) close(positions[index].duplicate);
+		execv(executable, command);
+		_exit(errno == ENOENT ? 127 : 126);
+	}
+	for (;;) {
+		int status;
+		pid_t child = waitpid(-1, &status, 0);
+		if (child == root) root_status = status;
+		if (child >= 0 || errno == EINTR) continue;
+		if (errno != ECHILD || root_status < 0) goto done;
+		break;
+	}
+	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0 || dprintf(output, "FD1 %u\n", count) < 0) goto done;
+	for (unsigned index = 0; index < count; index++) {
+		struct file_position *position = &positions[index];
+		off_t offset = lseek(position->duplicate, 0, SEEK_CUR);
+		int flags = fcntl(position->duplicate, F_GETFL);
+		struct stat state;
+		if (offset < 0 || flags < 0 || fstat(position->duplicate, &state) < 0 || dprintf(output, "%d %d %jd %ju %ju\n",
+			position->descriptor, flags, (intmax_t)offset, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino) < 0) goto done;
+	}
+	result = WIFEXITED(root_status) ? WEXITSTATUS(root_status) : 128 + WTERMSIG(root_status);
+done:
+	if (input) fclose(input);
+	if (output >= 0 && close(output) < 0) result = 70;
+	for (unsigned index = 0; index < initialized; index++) { free(paths[index]); close(positions[index].duplicate); }
+	if (root_status >= 0 && WIFSIGNALED(root_status)) { signal(WTERMSIG(root_status), SIG_DFL); raise(WTERMSIG(root_status)); }
+	return result;
+}
+
 int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("11");
+		puts("12");
 		return 0;
 	}
-	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input"))) {
-		if (argc < 5 || strlen(argv[2]) != 2 || strspn(argv[2], "12") != 2) return 64;
+	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
+		int descriptors = !strcmp(argv[1], "--exec-fds");
+		if (argc < (descriptors ? 7 : 5) || strlen(argv[2]) != 2 || strspn(argv[2], "12") != 2) return 64;
 		/* Save stdout's source before changing either endpoint, including swapped routes. */
 		int output = fcntl(argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
 		if (output < 0) return 70;
@@ -580,6 +943,11 @@ int main(int argc, char **argv) {
 		sigemptyset(&empty);
 		if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return 70;
 		for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
+		if (descriptors) {
+			char *executable = argv[6];
+			argv[6] = argv[5];
+			return execute_descriptors(argv[3], argv[4], executable, argv + 6);
+		}
 		char *executable = argv[4];
 		argv[4] = argv[3];
 		execv(executable, argv + 4);
@@ -594,6 +962,9 @@ int main(int argc, char **argv) {
 		char *socket_path = take_env("PI_SPEC_HELD_EXEC_SOCKET");
 		char *token = take_env("PI_SPEC_HELD_EXEC_TOKEN");
 		char *execution_id = take_env("PI_SPEC_HELD_EXEC_ID");
+		char *descriptors = take_env("PI_SPEC_HELD_EXEC_DESCRIPTORS");
+		int track_descriptors = descriptors && !strcmp(descriptors, "1") ? 1 : descriptors && !strcmp(descriptors, "2") ? 2 : 0;
+		free(descriptors);
 		if (!real_shell) return 70;
 		char **command = calloc((size_t)argc + 1, sizeof(*command));
 		if (!command) return 70;
@@ -603,7 +974,7 @@ int main(int argc, char **argv) {
 			execvp(real_shell, command);
 			return errno == ENOENT ? 127 : 126;
 		}
-		return trace(command, socket_path, token, execution_id, 0, 0);
+		return trace(command, socket_path, token, execution_id, 0, 0, track_descriptors);
 	}
 	if (argc < 2) return 64;
 	int command = 1, skip = 0;
@@ -612,5 +983,5 @@ int main(int argc, char **argv) {
 		skip = 1; skip_code = (unsigned)strtoul(argv[2], 0, 10); command = 3;
 		if (skip_code > 255) return 64;
 	}
-	return trace(argv + command, NULL, NULL, NULL, skip, skip_code);
+	return trace(argv + command, NULL, NULL, NULL, skip, skip_code, 0);
 }

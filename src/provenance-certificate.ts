@@ -49,6 +49,9 @@ export interface InheritedFileDescriptor {
 	readonly endpointDigest?: Sha256Digest;
 	readonly contentDigest?: Sha256Digest;
 	readonly offset?: number;
+	/** Canonical descriptor representing this inherited open-file description. */
+	readonly alias?: number;
+	readonly resourcePath?: string;
 	readonly eof?: boolean;
 }
 
@@ -175,6 +178,7 @@ export type OrderedEffectEvent =
 			readonly sequence: number;
 			readonly kind: "workspace";
 			readonly path: string;
+			readonly operation?: "write_contents";
 			readonly before: WorkspaceEffectState;
 			readonly after: WorkspaceEffectState;
 	  };
@@ -190,6 +194,8 @@ export interface ProcessResultRecord {
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
 	readonly exit: ExitOutcome;
+	readonly descriptorOffsets?: readonly { readonly fd: number; readonly before: number; readonly after: number;
+		readonly content?: ArtifactReference }[];
 }
 
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
@@ -285,7 +291,7 @@ export function sealProcessCertificate(input: {
 		dependencies: normalizeDependencies(evidence.dependencies),
 		taints: [...new Set(evidence.taints)].sort(),
 	});
-	const result = normalizeResult(input.result);
+	const result = normalizeResult(input.result, prototype);
 	// These records are already captured and validated; public key functions still normalize raw callers.
 	const weakKey = digestObject({ version: PROCESS_CERTIFICATE_VERSION, prototype });
 	const strongKey = digestObject({ weakKey, dependencies: dependencyCertificate.dependencies });
@@ -354,6 +360,7 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 			if (state.kind === "file") unique.set(state.data.digest, state.data);
 		}
 	}
+	for (const position of certificate.result.descriptorOffsets ?? []) if (position.content) unique.set(position.content.digest, position.content);
 	return [...unique.values()];
 }
 
@@ -466,6 +473,14 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 			return fd;
 		})
 		.sort((left, right) => left.fd - right.fd);
+	for (const descriptor of inheritedFDs) {
+		if (descriptor.resourcePath !== undefined && !validLogicalPath(descriptor.resourcePath)) throw new Error("invalid inherited descriptor path");
+		if (descriptor.alias === undefined) continue;
+		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
+		if (descriptor.type !== "regular" || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
+			!alias || alias.fd > descriptor.fd || alias.alias !== alias.fd || alias.type !== "regular" ||
+			alias.offset !== descriptor.offset || alias.contentDigest !== descriptor.contentDigest) throw new Error("invalid inherited OFD alias");
+	}
 	if (
 		!rawStdin ||
 		(stdin.type === "bytes" && !isSha256Digest(stdin.digest)) ||
@@ -609,7 +624,7 @@ function validExcludedEntries(entries: readonly string[] | undefined): boolean {
 	);
 }
 
-function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
+function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype): ProcessResultRecord {
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
 	if (
 		result.observedProcessMs !== undefined &&
@@ -620,7 +635,22 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 	const journal = [...result.journal]
 		.map((event) => ({ ...event }))
 		.sort((left, right) => left.sequence - right.sequence);
+	let descriptorOffsets: ProcessResultRecord["descriptorOffsets"];
+	if (result.descriptorOffsets !== undefined) {
+		const descriptors = prototype.inheritedFDs.filter(({ alias }) => alias !== undefined);
+		descriptorOffsets = [...result.descriptorOffsets].map(({ fd, before, after, content }) => ({ fd, before, after,
+			...(content ? { content: { ...content } } : {}) })).sort((a, b) => a.fd - b.fd);
+		if (descriptorOffsets.length !== descriptors.length || descriptorOffsets.some((position, index) => {
+			const descriptor = descriptors[index]!;
+			const alias = descriptorOffsets!.find(({ fd }) => fd === descriptor.alias);
+			return position.fd !== descriptor.fd || position.before !== descriptor.offset ||
+				!Number.isSafeInteger(position.after) || position.after < 0 || !alias || alias.after !== position.after;
+		})) throw new Error("invalid inherited OFD result offsets");
+	} else if (prototype.inheritedFDs.some(({ alias }) => alias !== undefined)) throw new Error("missing inherited OFD result offsets");
 	const artifactSizes = new Map<Sha256Digest, number>();
+	for (const position of descriptorOffsets ?? []) {
+		if (position.content) validateArtifact(position.content, artifactSizes);
+	}
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
 		if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) throw new Error("invalid effect sequence");
@@ -630,7 +660,9 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 			if (!validLogicalPath(event.path)) throw new Error("invalid effect path");
 			const before = normalizeWorkspaceEffectState(event.before, artifactSizes);
 			const after = normalizeWorkspaceEffectState(event.after, artifactSizes);
-			if (before.kind === after.kind && stableEqual(before, after)) {
+			if (event.operation !== undefined && (event.operation !== "write_contents" || before.kind !== "file" ||
+				after.kind !== "file" || before.mode !== after.mode)) throw new Error("invalid in-place file effect");
+			if (!event.operation && before.kind === after.kind && stableEqual(before, after)) {
 				throw new Error("workspace effect does not change state");
 			}
 			journal[index] = { ...event, before, after };
@@ -641,6 +673,7 @@ function normalizeResult(result: ProcessResultRecord): ProcessResultRecord {
 		...(result.observedProcessMs !== undefined ? { observedProcessMs: result.observedProcessMs } : {}),
 		journal,
 		exit: { ...result.exit },
+		...(descriptorOffsets ? { descriptorOffsets } : {}),
 	});
 }
 

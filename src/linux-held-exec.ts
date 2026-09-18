@@ -2,18 +2,21 @@ import { execFile } from "node:child_process";
 import { AsyncResource } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
 import { captureProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
+import { captureHeldFile } from "./filesystem-evidence.ts";
+import type { Sha256Digest } from "./provenance-certificate.ts";
+import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 11;
+const HELPER_PROTOCOL_VERSION = 12;
 const WIRE_PROTOCOL_VERSION = 1;
-const MAX_REQUEST_BYTES = 2048;
+const MAX_REQUEST_BYTES = 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 const PRIVATE_ENV = {
@@ -21,6 +24,7 @@ const PRIVATE_ENV = {
 	socket: "PI_SPEC_HELD_EXEC_SOCKET",
 	token: "PI_SPEC_HELD_EXEC_TOKEN",
 	execution: "PI_SPEC_HELD_EXEC_ID",
+	descriptors: "PI_SPEC_HELD_EXEC_DESCRIPTORS",
 } as const;
 const PRIVATE_ENV_NAMES: readonly string[] = Object.values(PRIVATE_ENV);
 
@@ -33,6 +37,28 @@ export interface HeldExecProcess {
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
+	/** Native KCMP_FILE groups. Owned entries are captured with the launch tree stopped.
+	 * `owned` proves creation in the traced tree with no observed export; it does not
+	 * authorize content reuse or cover an external debugger duplicating its handles. */
+	readonly descriptors?: readonly HeldFileDescriptor[];
+}
+
+export interface HeldFileDescriptor {
+	readonly fd: number;
+	readonly alias: number;
+	readonly device: string;
+	readonly inode: string;
+	readonly flags: number;
+	readonly offset: number;
+	readonly owned: boolean;
+}
+
+export interface FileDescriptorInput extends Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset"> {
+	readonly contentDigest: Sha256Digest;
+	/** One image per inode; distinct OFDs open it independently. */
+	readonly image: number;
+	readonly sourcePath?: string;
+	readonly content?: string;
 }
 
 export interface HeldExecSnapshot {
@@ -42,7 +68,8 @@ export interface HeldExecSnapshot {
 	readonly argv: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
-	readonly context: Pick<ProcessExecutionContext, "key" | "umask" | "descriptorTypes">;
+	readonly context: Pick<ProcessExecutionContext, "key" | "umask" | "descriptorTypes" | "regularDescriptors">;
+	readonly descriptorInputs?: readonly FileDescriptorInput[];
 }
 
 export type HeldExecDecision =
@@ -55,6 +82,8 @@ export type HeldExecDecision =
 			readonly descriptorOffsets?: readonly {
 				readonly fd: number; readonly device: string; readonly inode: string;
 				readonly flags: number; readonly before: number; readonly after: number;
+				/** Replace inode contents through a separate writer; never disturb OFD flags or position. */
+				readonly content?: Buffer;
 			}[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
@@ -84,6 +113,7 @@ interface WireRequest {
 	readonly execution: string;
 	readonly pid: number;
 	readonly tracer: number;
+	readonly descriptors?: readonly HeldFileDescriptor[];
 }
 
 /** A two-phase held-exec transport: arm the exit stub before committing reusable effects. */
@@ -128,7 +158,8 @@ export class LinuxHeldExecBoundary {
 
 	executor(
 		host: ProcessExecutor,
-		options: Pick<ActiveExecution, "sourceRoot" | "decide"> & { readonly realShell: string },
+		options: Pick<ActiveExecution, "sourceRoot" | "decide"> & { readonly realShell: string;
+			readonly descriptors?: boolean | ((request: Parameters<ProcessExecutor["execute"]>[0]) => boolean | "inspect") },
 		fallback: ProcessExecutor = host,
 	): ProcessExecutor {
 		return {
@@ -139,6 +170,7 @@ export class LinuxHeldExecBoundary {
 					return fallback.execute(request);
 				}
 				const execution = randomBytes(24).toString("hex");
+				const descriptors = typeof options.descriptors === "function" ? options.descriptors(request) : options.descriptors;
 				const controller = new AbortController();
 				let finished!: () => void;
 				const active: ActiveExecution = {
@@ -161,6 +193,7 @@ export class LinuxHeldExecBoundary {
 							[PRIVATE_ENV.socket]: this.socketPath,
 							[PRIVATE_ENV.token]: this.token,
 							[PRIVATE_ENV.execution]: execution,
+							...(descriptors ? { [PRIVATE_ENV.descriptors]: descriptors === "inspect" ? "2" : "1" } : {}),
 						},
 					});
 				} finally {
@@ -204,27 +237,31 @@ export class LinuxHeldExecBoundary {
 				sourceRoot: active.sourceRoot,
 				scope: active.scope,
 				...(active.signal ? { signal: active.signal } : {}),
+				...(request.descriptors ? { descriptors: request.descriptors } : {}),
 			});
 			if (decision.kind === "continue") {
 				if (!decision.observeCompletion) return void socket.end("C\n");
 				await observeCompletion(socket, decision.observeCompletion);
 				return;
 			}
-			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0);
 			const positions = decision.descriptorOffsets?.map(position => ({ ...position })) ?? [];
+			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0), 0);
 			const descriptors = new Set<number>();
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
 					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
-					return duplicate || ![position.fd, position.flags, position.before, position.after].every(value => Number.isSafeInteger(value) && value >= 0) ||
+					return duplicate || position.content !== undefined && !Buffer.isBuffer(position.content) ||
+						![position.fd, position.flags, position.before, position.after].every(value => Number.isSafeInteger(value) && value >= 0) ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
 				})) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
 			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
-			for (const position of positions) await write(socket, Buffer.from(
-				`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after}\n`));
+			for (const position of positions) {
+				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1}\n`));
+				if (position.content) await write(socket, position.content);
+			}
 			for (const event of decision.output) {
 				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
 				await write(socket, event.data);
@@ -279,7 +316,7 @@ export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
 }
 
 /** Inspect an image while PTRACE_EVENT_EXEC guarantees it has not run a user instruction. */
-export async function inspectHeldExecProcess(pid: number, executable: string): Promise<HeldExecSnapshot> {
+export async function inspectHeldExecProcess(pid: number, executable: string, descriptors?: readonly HeldFileDescriptor[]): Promise<HeldExecSnapshot> {
 	const root = `/proc/${pid}`;
 	const [cwd, command, environmentBytes, descriptorNames] = await Promise.all([
 		readlink(`${root}/cwd`),
@@ -287,7 +324,8 @@ export async function inspectHeldExecProcess(pid: number, executable: string): P
 		readFile(`${root}/environ`),
 		readdir(`${root}/fd`),
 	]);
-	const context = await captureProcessContext(pid, descriptorNames);
+	if (!validDescriptors(descriptors)) throw new Error("invalid native descriptor context");
+	const context = await captureProcessContext(pid, descriptorNames, descriptors);
 	if (!validProcessContext(context)) throw new Error("held process descriptors are not replayable");
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
@@ -304,6 +342,39 @@ export async function inspectHeldExecProcess(pid: number, executable: string): P
 	};
 }
 
+/** Capture one image per OFD. This is input evidence; only a native lease can authorize adoption. */
+export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = []): Promise<readonly FileDescriptorInput[]> {
+	const inputs = new Map<number, FileDescriptorInput>();
+	const images = new Map<string, FileDescriptorInput>();
+	let remaining = maxBytes;
+	for (const descriptor of descriptors) {
+		const { fd, alias: representative, flags, offset } = descriptor;
+		const identity = { fd, alias: representative, flags, offset };
+		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
+		const file = `${descriptor.device}:${descriptor.inode}`, image = images.get(file);
+		if (image) { inputs.set(descriptor.fd, { ...identity, image: image.image, contentDigest: image.contentDigest,
+			...(image.sourcePath ? { sourcePath: image.sourcePath } : {}) }); continue; }
+		const endpoint = await readlink(`/proc/${pid}/fd/${fd}`);
+		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
+			throw new Error("inherited descriptor refers to a denied resource");
+		const captured = await captureHeldFile(pid, descriptor.fd, remaining);
+		if (String(captured.stat.dev) !== descriptor.device || String(captured.stat.ino) !== descriptor.inode || !captured.content) {
+			throw new Error("held descriptor identity changed");
+		}
+		if (captured.stat.nlink > 1n) throw new Error("inherited descriptor namespace aliases are unproven");
+		const sourcePath = captured.stat.nlink ? endpoint : undefined;
+		if (sourcePath) {
+			const metadata = await stat(sourcePath, { bigint: true });
+			if (metadata.dev !== captured.stat.dev || metadata.ino !== captured.stat.ino) throw new Error("held descriptor pathname changed");
+		}
+		remaining -= captured.content.byteLength;
+		const capturedInput: FileDescriptorInput = { ...identity, image: fd, ...(sourcePath ? { sourcePath } : {}),
+			contentDigest: `sha256:${captured.hash}`, content: captured.content.toString("base64") };
+		inputs.set(descriptor.fd, capturedInput); images.set(file, capturedInput);
+	}
+	return [...inputs.values()];
+}
+
 function decodeNullFields(bytes: Buffer): string[] {
 	const fields = bytes.toString("utf8").split("\0");
 	if (fields.at(-1) === "") fields.pop();
@@ -318,10 +389,29 @@ function parseRequest(line: string): WireRequest | undefined {
 		const value = JSON.parse(line) as Partial<WireRequest>;
 		return value.version === WIRE_PROTOCOL_VERSION && /^[0-9a-f]{64}$/.test(value.token ?? "") &&
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
-			Number.isSafeInteger(value.tracer) && value.tracer! > 0 ? value as WireRequest : undefined;
+			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && validDescriptors(value.descriptors) ? value as WireRequest : undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
+	if (descriptors === undefined) return true;
+	if (!Array.isArray(descriptors) || descriptors.length > 64) return false;
+	let previous = -1;
+	const aliases = new Map<number, HeldFileDescriptor>();
+	for (const descriptor of descriptors) {
+		if (!descriptor || ![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
+			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
+			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>
+				typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn)) return false;
+		const alias = aliases.get(descriptor.alias);
+		if (descriptor.alias !== descriptor.fd && (!alias || alias.device !== descriptor.device || alias.inode !== descriptor.inode ||
+			alias.flags !== descriptor.flags || alias.offset !== descriptor.offset || alias.owned !== descriptor.owned)) return false;
+		if (descriptor.alias === descriptor.fd) aliases.set(descriptor.fd, descriptor);
+		previous = descriptor.fd;
+	}
+	return true;
 }
 
 async function heldBy(pid: number, tracer: number, binary: string): Promise<boolean> {
