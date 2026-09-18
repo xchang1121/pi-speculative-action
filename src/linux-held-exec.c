@@ -40,6 +40,7 @@ struct file_position {
 	int64_t before, after;
 	int64_t content_length;
 	unsigned char *content;
+	char *path;
 };
 
 struct descriptor_origin { int fd, cloexec; unsigned long id; };
@@ -408,7 +409,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		struct stat state;
 		if (pin < 0) goto done;
 		if (fstat(pin, &state) < 0) { close(pin); goto done; }
-		if (!S_ISREG(state.st_mode) && !(null_device(&state) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
+		if (!S_ISREG(state.st_mode) && !S_ISDIR(state.st_mode) && !(null_device(&state) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
 		if (count == MAX_POSITIONS) { close(pin); goto done; }
 		if (!descriptor && null_device(&state)) null_input = count;
 		nulls[count] = null_device(&state); pins[count] = pin; fds[count++] = (int)descriptor;
@@ -447,7 +448,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		int length = snprintf(line + used, capacity - used,
 			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s%s}",
 			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags,
-			(intmax_t)offset, owned ? "true" : "false", null_device(&state) ? ",\"type\":\"null\"" : "");
+			(intmax_t)offset, owned ? "true" : "false", null_device(&state) ? ",\"type\":\"null\"" : S_ISDIR(state.st_mode) ? ",\"type\":\"directory\"" : "");
 		if (length < 0 || (size_t)length >= capacity - used) goto done;
 		used += (size_t)length;
 	}
@@ -479,9 +480,17 @@ static int open_tracee_output(struct decision_job *job, unsigned fd) {
 }
 
 static int position_matches(const struct file_position *position) {
-	struct stat state;
-	return fstat(position->duplicate, &state) == 0 && (S_ISREG(state.st_mode) ||
-		(null_device(&state) && !position->before && !position->after && position->content_length == -1)) &&
+	struct stat state, named;
+	if (fstat(position->duplicate, &state) < 0) return 0;
+	if (S_ISDIR(state.st_mode)) {
+		char link[64], endpoint[PATH_MAX];
+		snprintf(link, sizeof(link), "/proc/self/fd/%d", position->duplicate);
+		ssize_t length = readlink(link, endpoint, sizeof(endpoint));
+		if (!position->path || length < 0 || strlen(position->path) != (size_t)length || memcmp(endpoint, position->path, (size_t)length) ||
+			lstat(position->path, &named) < 0 || named.st_dev != state.st_dev || named.st_ino != state.st_ino) return 0;
+	}
+	return (S_ISREG(state.st_mode) || ((null_device(&state) || S_ISDIR(state.st_mode)) &&
+		!position->before && !position->after && position->content_length == -1)) &&
 		(uintmax_t)state.st_dev == position->device && (uintmax_t)state.st_ino == position->inode &&
 		fcntl(position->duplicate, F_GETFL) == position->flags &&
 		lseek(position->duplicate, 0, SEEK_CUR) == position->before;
@@ -534,12 +543,19 @@ static int actor_decision(struct decision_job *job) {
 	size_t received = 0;
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
+		unsigned path_length;
 		if (read_line(connection, line, sizeof(line)) < 0 ||
-			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64 " %d", &position->descriptor,
-				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length, &position->after_flags) != 8 ||
+			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64 " %d %u", &position->descriptor,
+				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length, &position->after_flags, &path_length) != 9 ||
 			position->descriptor < 0 || position->before < 0 || position->after < 0 || position->content_length < -1 ||
-			position->after_flags < 0 || ((position->flags ^ position->after_flags) & ~(O_APPEND | O_NONBLOCK)) ||
-			(position->content_length >= 0 && (uint64_t)position->content_length > total - received)) goto decline;
+			path_length >= PATH_MAX || path_length > total - received || position->after_flags < 0 || ((position->flags ^ position->after_flags) & ~(O_APPEND | O_NONBLOCK)) ||
+			(position->content_length >= 0 && (uint64_t)position->content_length > total - received - path_length)) goto decline;
+		if (path_length) {
+			position->path = calloc((size_t)path_length + 1, 1);
+			if (!position->path || transfer(connection, position->path, path_length, 0) < 0) return -1;
+			if (*position->path != '/' || strlen(position->path) != path_length) goto decline;
+			received += path_length;
+		}
 		if (position->content_length > 0) {
 			position->content = malloc((size_t)position->content_length);
 			if (!position->content || transfer(connection, position->content, (size_t)position->content_length, 0) < 0) return -1;
@@ -641,7 +657,7 @@ static void free_job(struct decision_job *job) {
 	close(job->channel[0]); close(job->channel[1]); close(job->connection); close(job->pidfd);
 	for (unsigned fd = 1; fd <= 2; fd++) close(job->outputs[fd]);
 	if (job->positions) for (unsigned index = 0; index < job->position_count; index++) {
-		close(job->positions[index].duplicate); close(job->positions[index].writer); free(job->positions[index].content);
+		close(job->positions[index].duplicate); close(job->positions[index].writer); free(job->positions[index].content); free(job->positions[index].path);
 	}
 	free(job->positions);
 	free_events(job->events, job->count);
@@ -918,7 +934,7 @@ fatal:
  * The supervisor alone keeps the pins, and drains descendants before reporting offsets. */
 static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command) {
 	struct file_position positions[MAX_POSITIONS];
-	char *paths[MAX_POSITIONS] = {0}, line[MAX_LINE];
+	char line[MAX_LINE];
 	unsigned count = 0, close_input = 0, initialized = 0;
 	int result = 70, minimum = 3, output = -1, root_status = -1;
 	if (has_unmodeled_descriptors() != 0) return result;
@@ -944,9 +960,9 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 				positions[previous].flags != position->flags || positions[previous].before != position->before) goto done;
 			position->alias = (int)previous;
 		} else if (!length) goto done;
-		paths[index] = calloc((size_t)length + 1, 1);
-		if (!paths[index] || fread(paths[index], 1, length, input) != length || fgetc(input) != '\n' ||
-			strlen(paths[index]) != length || (length && paths[index][0] != '/')) goto done;
+		position->path = calloc((size_t)length + 1, 1);
+		if (!position->path || fread(position->path, 1, length, input) != length || fgetc(input) != '\n' ||
+			strlen(position->path) != length || (length && *position->path != '/')) goto done;
 		if (position->descriptor >= minimum) minimum = position->descriptor + 1;
 	}
 	if (fgetc(input) != EOF || ferror(input)) goto done;
@@ -956,16 +972,16 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (position->alias != (int)index) {
 			position->duplicate = fcntl(positions[position->alias].duplicate, F_DUPFD_CLOEXEC, minimum);
 		} else {
-			const int allowed = O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | 0x8000 /* kernel O_LARGEFILE */ | O_NOATIME | O_NOFOLLOW | O_DIRECT;
+			const int allowed = O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | 0x8000 /* kernel O_LARGEFILE */ | O_NOATIME | O_NOFOLLOW | O_DIRECT | O_DIRECTORY;
 			if ((position->flags & ~allowed) || (position->flags & O_ACCMODE) == O_ACCMODE) goto done;
-			int fd = open(paths[index], position->flags | O_CLOEXEC);
+			int fd = open(position->path, position->flags | O_CLOEXEC);
 			if (fd < 0) goto done;
 			position->duplicate = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
 			close(fd);
 		}
 		struct stat state;
 		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !(S_ISREG(state.st_mode) ||
-			(null_device(&state) && !position->before)) ||
+			((null_device(&state) || S_ISDIR(state.st_mode)) && !position->before)) ||
 			fcntl(position->duplicate, F_GETFL) != position->flags ||
 			lseek(position->duplicate, position->before, SEEK_SET) != position->before) goto done;
 	}
@@ -1003,7 +1019,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 done:
 	if (input) fclose(input);
 	if (output >= 0 && close(output) < 0) result = 70;
-	for (unsigned index = 0; index < initialized; index++) { free(paths[index]); close(positions[index].duplicate); }
+	for (unsigned index = 0; index < initialized; index++) { free(positions[index].path); close(positions[index].duplicate); }
 	if (root_status >= 0 && WIFSIGNALED(root_status)) { signal(WTERMSIG(root_status), SIG_DFL); raise(WTERMSIG(root_status)); }
 	return result;
 }
@@ -1012,7 +1028,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("14");
+		puts("15");
 		return 0;
 	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {

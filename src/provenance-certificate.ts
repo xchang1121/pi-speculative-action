@@ -44,7 +44,7 @@ export interface SemanticEnvironmentEntry {
 
 export interface InheritedFileDescriptor {
 	readonly fd: number;
-	readonly type: "closed" | "regular" | "null" | "pipe" | "socket" | "tty" | "device" | "other";
+	readonly type: "closed" | "regular" | "null" | "directory" | "pipe" | "socket" | "tty" | "device" | "other";
 	readonly flagsDigest: Sha256Digest;
 	readonly endpointDigest?: Sha256Digest;
 	readonly contentDigest?: Sha256Digest;
@@ -477,8 +477,9 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		if (descriptor.resourcePath !== undefined && !validLogicalPath(descriptor.resourcePath)) throw new Error("invalid inherited descriptor path");
 		if (descriptor.alias === undefined) continue;
 		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
-		if (!["regular", "null"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
-			descriptor.type === "null" && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
+		if (!["regular", "null", "directory"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
+			descriptor.type !== "regular" && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
+			descriptor.type === "directory" && (!descriptor.resourcePath || descriptor.resourcePath !== alias?.resourcePath) ||
 			!alias || alias.fd > descriptor.fd || alias.alias !== alias.fd || alias.type !== descriptor.type ||
 			alias.offset !== descriptor.offset || alias.contentDigest !== descriptor.contentDigest) throw new Error("invalid inherited OFD alias");
 	}
@@ -648,7 +649,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			return position.fd !== descriptor.fd || position.before !== descriptor.offset ||
 				!Number.isSafeInteger(position.after) || position.after < 0 || !alias || alias.after !== position.after || alias.afterFlags !== position.afterFlags ||
 				position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff) ||
-				descriptor.type === "null" && (position.after !== 0 || position.content !== undefined);
+				descriptor.type !== "regular" && (position.after !== 0 || position.content !== undefined);
 		})) throw new Error("invalid inherited OFD result offsets");
 	} else if (prototype.inheritedFDs.some(({ alias }) => alias !== undefined)) throw new Error("missing inherited OFD result offsets");
 	const artifactSizes = new Map<Sha256Digest, number>();

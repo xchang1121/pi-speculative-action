@@ -155,7 +155,7 @@ describe("strace provenance decoder", () => {
 			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
 			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', ["ipc"]],
 			['fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
-			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_NONBLOCK|O_APPEND|O_LARGEFILE) = 0', []],
+			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_NONBLOCK|O_APPEND|O_LARGEFILE|O_DIRECTORY) = 0', []],
 			['fcntl(3</work/input>, F_SETFL, O_RDONLY) = 0', []],
 			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_DIRECT) = 0', ["unsupported_syscall"]],
 			['fcntl(3</work/input>, F_SETFL, O_ASYNC) = 0', ["unsupported_syscall"]],
