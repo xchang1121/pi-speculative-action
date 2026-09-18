@@ -2434,7 +2434,7 @@ export function makeSpeculativeActionRuntime<
 		preferred?: string,
 	) => {
 		const now = performance.now();
-		return candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded", semantics.effect(action) === "observation")
+		const choices = candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded", semantics.effect(action) === "observation")
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				if (candidate.owner.draft.type !== "tool_call" || !activeExecution(candidate) || candidateWorld(candidate) !== undefined) return [];
@@ -2445,9 +2445,20 @@ export function makeSpeculativeActionRuntime<
 							? candidate.expectedDurationMs
 							: 0;
 				return [{ candidate, match, ready: execution.status === "succeeded", remainingMs }];
-			})
-			.sort(
+			});
+		if (choices.length < 2) return choices;
+		const inputConsumers = new Set(choices.flatMap(({ candidate, match }) => {
+			const reservation = candidate.work.reservation;
+			return match.kind === "inputs" && reservation.kind === "shared" ? reservation.owners : [];
+		}));
+		const priority = ({ candidate, match, ready }: typeof choices[number]) =>
+			ready && (match.kind !== "inputs" || candidate.resultViews?.has(action.key)) ? 0 :
+				match.kind === "exact" && candidate.work.execution.status === "running" &&
+				inputConsumers.has(`inputs:prediction:${candidate.id}`) ? 1 : 2;
+		// A ready input owner is not a ready query. Join its exact active consumer before rebuilding it.
+		return choices.sort(
 				(left, right) =>
+					priority(left) - priority(right) ||
 					Number(right.candidate.id === preferred) - Number(left.candidate.id === preferred) ||
 					Number(right.ready) - Number(left.ready) ||
 					left.remainingMs - right.remainingMs ||
