@@ -12,7 +12,7 @@ import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-wo
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActionSemanticsRegistry, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
@@ -22,7 +22,7 @@ import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
-import type { ToolSettlement } from "../src/tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -566,6 +566,41 @@ describe("speculative action host", () => {
 			await host.finishTurn("query", true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 4, exactReuseHits: 0, predictionsMatched: 0 });
 		} finally { await host.dispose(); await profile.pool.dispose(); }
+	});
+
+	it("shares one running grep preparation across predictions and retains independent result proofs", async ({ skip }) => {
+		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd), original = profile.invocations.get("grep");
+		if (!original) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
+		const tool = createGrepTool(cwd), world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 1024 * 1024 });
+		const joined = deferred<void>(), gate = gated(), nativeMkdtemp = fs.mkdtemp;
+		const invocation: ToolInvocation = { ...original, filesystem: (view, request) => original.filesystem!({ ...view, prepare: (...args) => {
+			const pending = view.prepare!(...args); if (request.callID === "second") joined.resolve(); return pending;
+		} }, request) };
+		const context = (args: { pattern: string; path: string; glob?: string }, callID: string) => ({
+			cwd, tool, toolName: "grep", args, callID, signal: new AbortController().signal,
+			action: { ...buildPiActionKey("grep", args, cwd)!, semantics: invocation.semantics, executionContext: invocation },
+		});
+		const seed = await world.speculation!.execute(context({ pattern: "seed", path: "." }, "seed"));
+		const directories = vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix, options) => {
+			const directory = await nativeMkdtemp(prefix, options);
+			if (path.basename(String(prefix)) === "inputs-") await gate.wait();
+			return directory;
+		});
+		let branches: Awaited<ReturnType<NonNullable<typeof world.speculation>["execute"]>>[] = [];
+		const args = [{ pattern: "two", path: ".", glob: "notes.txt" }, { pattern: "three", path: ".", glob: "notes.txt" }];
+		const first = world.speculation!.execute({ ...context(args[0]!, "first"), inputs: () => [seed.inputSource!] });
+		await gate.entered;
+		const second = world.speculation!.execute({ ...context(args[1]!, "second"), inputs: () => [seed.inputSource!] });
+		const settled = Promise.all([first, second]);
+		try {
+			await joined.promise; await nextTurn(); gate.release(); branches = await settled;
+			expect(directories.mock.calls.filter(([prefix]) => path.basename(String(prefix)) === "inputs-")).toHaveLength(1);
+			for (const [index, branch] of branches.entries()) expect(branch.output.result).toEqual(
+				(await original.authoritative!({ args: args[index]!, callID: "oracle", signal: new AbortController().signal })).result);
+			await seed.dispose(); await branches[0]!.dispose();
+			expect((await branches[1]!.validate!()).status).toBe("valid");
+			await writeFile(path.join(cwd, "notes.txt"), "changed"); expect((await branches[1]!.validate!()).status).toBe("stale");
+		} finally { gate.release(); await settled.catch(() => {}); await Promise.all(branches.map(branch => branch.dispose())); await seed.dispose(); directories.mockRestore(); await profile.pool.dispose(); }
 	});
 
 	it.for(["prepared", "composed", "partial"] as const)("borrows inputs during prediction and owns its proof after source retirement (%s)", async (coverage, { skip }) => {
