@@ -222,10 +222,10 @@ async function projectOutput<Output>(
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
 	const branch = candidateBranch(candidate)!;
-	if (branch.inputsOnly && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
+	if ((branch.inputsOnly || candidate.outputStale) && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	if (match.kind === "exact") return { ok: true, output: branch.output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained) return { ok: true, ...retained, output: cloneSharedData(retained.output) };
+	if (retained && (!candidate.outputStale || retained.validate)) return { ok: true, ...retained, output: cloneSharedData(retained.output) };
 	const reconstruct = branch.reconstruct;
 	const rule = match.kind === "projected" ? rules.find((item) => item.id === match.projector) : undefined;
 	if (match.kind === "projected" && !rule) return { ok: false, cause: cause("projection", "rule_missing") };
@@ -241,7 +241,7 @@ async function projectOutput<Output>(
 			keyMatch: match,
 		})) : undefined;
 		const rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
-		if (rebuilt?.requiresQueryValidation && !rebuilt.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
+		if ((rebuilt?.requiresQueryValidation || candidate.outputStale) && !rebuilt?.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (rebuilt) projected = rebuilt.output;
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
@@ -364,7 +364,7 @@ function retainResultView<Output>(
 	candidate: CandidateRecord<Output>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
 	settings: SpeculativeActionSettings,
 ): boolean {
-	if (!projection.execution || candidate.resultViews?.has(action.key)) return false;
+	if (!projection.execution || candidate.resultViews?.has(action.key) || candidate.outputStale && !projection.validate) return false;
 	try {
 		const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
 		let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
@@ -451,6 +451,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	expectedDurationMs: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
+	outputStale?: boolean;
 	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"] }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
@@ -677,7 +678,7 @@ export function makeSpeculativeActionRuntime<
 			const { entry: candidate, inserted } = candidateStore.getOrCreate(session.id, input.key, create, (existing, match) => {
 					const execution = existing.work.execution;
 					return existing.owner.draft.type === (input.kind ?? "tool_call") &&
-						!candidateBranch(existing)?.inputsOnly &&
+						!candidateBranch(existing)?.inputsOnly && !existing.outputStale &&
 						!rejected?.has(existing) && activeExecution(existing) && candidateWorld(existing) === input.worldParent &&
 						(sameSpeculativeExecutionRoute(existing.route, input.route) ||
 							(existing.route.reuse === "shared_result" && input.route.reuse === "shared_result" && execution.status === "succeeded" &&
@@ -689,9 +690,9 @@ export function makeSpeculativeActionRuntime<
 				// Joining producers share only the in-flight check; Actor adoption always validates afresh.
 				const validation = await (candidate.admissionValidation ??= validateCandidate(candidate)
 					.finally(() => { candidate.admissionValidation = undefined; }));
-				if (validation.status !== "valid" || !candidateStore.has(session.id, candidate)) {
+				if (validation.status !== "valid" || candidate.outputStale || !candidateStore.has(session.id, candidate)) {
 					(rejected ??= new Set()).add(candidate);
-					if (validation.status === "stale") invalidateCandidates(session, [candidate], validation.cause);
+					if (validation.status === "stale") invalidateCandidates(session, [candidate], validation.cause, true);
 					continue;
 				}
 			}
@@ -1794,7 +1795,7 @@ export function makeSpeculativeActionRuntime<
 						const retained = candidate.resultViews?.get(actualKey.key);
 						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes; }
 						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
-						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause);
+						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause, true);
 					}
 					continue;
 				}
@@ -2452,7 +2453,7 @@ export function makeSpeculativeActionRuntime<
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				if (candidate.owner.draft.type !== "tool_call" || !activeExecution(candidate) || candidateWorld(candidate) !== undefined) return [];
-				if (candidateBranch(candidate)?.inputsOnly) {
+				if (candidateBranch(candidate)?.inputsOnly || candidate.outputStale) {
 					if (semantics.effect(action) !== "observation") return [];
 					match = { kind: "inputs", distance: match.distance };
 				}
@@ -2558,11 +2559,19 @@ export function makeSpeculativeActionRuntime<
 		if (dispatch) dispatchReady(session);
 	};
 
-	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause): void => {
+	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause, retainInputs = false): void => {
 		let invalidated = false;
 		for (const candidate of new Set(candidates)) {
 			if (candidateStore.get(session.id, candidate.id) !== candidate) continue;
-			discardCandidate(session, candidate, failure, false);
+			const branch = candidateBranch(candidate);
+			if (retainInputs && candidate.work.reservation.kind === "shared" && !branch?.checkpoint &&
+				branch?.reconstructionScope === "current_action" && branch.inputSource && branch.reconstruct) {
+				candidate.outputStale = true;
+				// Independent query proofs survive; views backed only by the old output proof do not.
+				for (const [key, view] of candidate.resultViews ?? []) if (!view.validate) {
+					candidate.resultViews!.delete(key); candidate.estimatedBytes -= view.bytes;
+				}
+			} else discardCandidate(session, candidate, failure, false);
 			session.plan.rearmExecution(candidate.id);
 			invalidated = true;
 		}

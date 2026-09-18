@@ -657,6 +657,44 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
 	});
 
+	it("reuses an unaffected grep input across turns after its exact output expires", async ({ skip }) => {
+		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
+		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
+		await writeFile(path.join(cwd, "other.txt"), "two unchanged\n");
+		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd)], args = { pattern: "two", path: ".", glob: "*.txt" };
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep", "read"], maxBytes: () => 1024 * 1024 });
+		const ready = deferred(), events: SpeculativeActionEvent<string>[] = [];
+		let predict = true;
+		const host = createSpeculativeActionHost("stale-output-inputs", {
+			cwd, draftModel: model("draft"), preflight: () => true,
+			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0, tools: ["grep", "read"] }),
+			complete: async () => assistant([{ type: "toolCall", id: "seed", name: "grep", arguments: args }], "toolUse"),
+			resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
+			executionWorlds: [{ ...world, observation: undefined }], // No fallback capture can replace the original input owner.
+			onEvent: event => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+		});
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), directories = vi.spyOn(fs, "mkdtemp");
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "seed"), tools }); await ready.promise;
+			const current = async () => (await profile.invocations.get("grep")!.authoritative!({ args, callID: "reference", signal: new AbortController().signal })).result;
+			const actor = vi.fn(current), call = { turnID: "seed", id: "first", tool: "grep", args, tools };
+			expect(await host.execute(call, undefined, actor)).toEqual(await current()); expect(actor).not.toHaveBeenCalled();
+			predict = false; await host.finishTurn("seed");
+			await writeFile(path.join(cwd, "notes.txt"), "changed\n");
+			await host.startTurn({ ...startInput(tools[0]!, "changed"), tools });
+			expect(await host.execute({ ...call, turnID: "changed" }, undefined, actor)).toEqual(await current()); expect(actor).toHaveBeenCalledOnce();
+			await host.finishTurn("changed"); await host.startTurn({ ...startInput(tools[0]!, "sibling"), tools });
+			const input = { path: "other.txt" }, expected = await tools[1]!.execute("reference-read", input);
+			const fallback = vi.fn(() => tools[1]!.execute("fallback-read", input));
+			const captured = captures.mock.calls.length, prepared = directories.mock.calls.length;
+			for (const id of ["sibling", "retained"]) expect(await host.execute({ ...call, turnID: "sibling", tool: "read", args: input, id }, undefined, fallback)).toEqual(expected);
+			expect(fallback).not.toHaveBeenCalled();
+			expect(captures.mock.calls.length).toBe(captured); expect(directories.mock.calls.length).toBe(prepared);
+			await host.finishTurn("sibling", true);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ exactReuseHits: 1, inputReuseHits: 2 });
+		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); directories.mockRestore(); }
+	});
+
 	it.each(["write", "edit"])("hands Actor %s inputs across turns without rereading or replaying the mutation", async (tool) => {
 		const cwd = await temporaryWorkspace(), tools = [createWriteTool(cwd), createEditTool(cwd), createReadTool(cwd)] as const;
 		const args = tool === "write" ? { path: "notes.txt", content: "after\nsecond\n" }
@@ -821,9 +859,10 @@ describe("speculative action host", () => {
 		const tool = createReadTool(cwd);
 		const clientFactory = vi.fn(() => { throw new Error("Actor observation must not initialize the SDK"); });
 		const world = createThinkThreadExecutionWorld({ clientFactory, runnerFingerprint: "test" });
+		let unstable = false;
 		const base = createSpeculativeActionHost("session", {
 			cwd, getSettings: () => ({ enabled: true, drafterEnabled: false, tools, patternAware: { enabled: false } }),
-			complete: async () => { throw new Error("No model calls expected"); }, preflight: () => true,
+			complete: async () => { throw new Error("No model calls expected"); }, preflight: () => !unstable,
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
 			speculativeExecutionWorldEnabled: () => false, executionWorlds: [
 				...(thinkthread ? [world] : []),
@@ -831,7 +870,6 @@ describe("speculative action host", () => {
 			],
 		});
 		const host = thinkthread ? withThinkThreadProfileLifecycle(base, world) : base;
-		let unstable = false;
 		let args = { path: "@notes.txt", offset: 1 };
 		const actor = vi.fn(async () => {
 			if (unstable) await writeFile(file, "B\nsecond");
@@ -858,7 +896,8 @@ describe("speculative action host", () => {
 					const repeat = await host.execute({ ...call, id: `${turnID}:repeat` }, undefined, actor);
 					expect(repeat.content).toEqual([{ type: "text", text: expected }]);
 				}
-				expect(actor, turnID).toHaveBeenCalledTimes(calls + (process.platform === "win32" ? 1 : calls > 1 ? -1 : 0));
+				// Force the ABA host window above; once restored, independently proved old inputs remain reusable.
+				expect(actor, turnID).toHaveBeenCalledTimes(calls + (process.platform === "win32" ? 1 : turnID === "after-ABA" ? -2 : calls > 1 ? -1 : 0));
 				await host.finishTurn(turnID);
 			}
 			expect(clientFactory).not.toHaveBeenCalled();

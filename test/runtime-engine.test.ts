@@ -1308,6 +1308,49 @@ describe("structural speculative runtime", () => {
 		} finally { gate.release(); await pending; await runtime.dispose(); }
 	});
 
+	it.each(["actor", "prediction", "unscoped", "unproven"] as const)("retains independently provable inputs after the source output expires (%s)", async mode => {
+		let changed = false, executions = 0;
+		const source = {}, dispose = vi.fn(), commit = vi.fn();
+		const stale = () => ({ status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() });
+		const validate = vi.fn(async () => changed ? stale() : validResource());
+		const queryValidate = vi.fn(async () => validResource());
+		const reconstruct = vi.fn(async ({ args }: { args: unknown }) => ({
+			output: "sibling", ...(changed && mode !== "unproven" ? {
+				validate: (args as { path: string }).path === "other.txt" ? queryValidate : async () => stale(),
+			} : {}),
+		}));
+		const { runtime, ready, events } = harness({
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "seed" || mode === "prediction" ? plan(startInput.turnID) : undefined }),
+			executeCandidate: async ({ action }) => ++executions > 1
+				? world("fresh", { executionFingerprint: action.executionFingerprint, validate: async () => validResource() })
+				: { ...world("old", { validate, onDispose: dispose, onCommit: commit }),
+					inputSource: source, inputResources: [{ path: "/workspace/README.md" }, { path: "/workspace/other.txt" }],
+					...(mode !== "unscoped" ? { reconstructionScope: "current_action" as const } : {}), reconstruct },
+		});
+		try {
+			await runtime.startTurn(start("seed")); await ready.promise;
+			expect((await runtime.prepareActorCall(call("seed")))?.output).toBe("old");
+			expect((await runtime.prepareActorCall(call("seed", { path: "other.txt" })))?.output).toBe("sibling");
+			await runtime.finishTurn(call("seed")); changed = true;
+			await runtime.startTurn(start("next"));
+			if (mode === "prediction") await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded").length).toBe(2);
+			expect((await runtime.prepareActorCall(call("next")))?.output).toBe(mode === "prediction" ? "fresh" : undefined);
+			const checks = validate.mock.calls.length, commits = commit.mock.calls.length;
+			for (const id of ["sibling", "retained-sibling"]) {
+				expect((await runtime.prepareActorCall({ ...call("next", { path: "other.txt" }), id }))?.output)
+					.toBe(mode === "unscoped" || mode === "unproven" ? undefined : "sibling");
+			}
+			expect(validate).toHaveBeenCalledTimes(checks); expect(commit).toHaveBeenCalledTimes(commits);
+			if (mode === "actor" || mode === "prediction") {
+				expect(reconstruct).toHaveBeenCalledTimes(2); expect(queryValidate).toHaveBeenCalledTimes(2);
+				expect(dispose).not.toHaveBeenCalled();
+			}
+			if (mode !== "prediction") expect((await runtime.prepareActorCall({ ...call("next"), id: "still-stale" }))?.output).toBeUndefined();
+			expect(executions).toBe(mode === "prediction" ? 2 : 1);
+		} finally { await runtime.dispose(); }
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	it("keeps a useful result under pressure after its other inputs release their budget", async () => {
 		let bytes = 2048, budget = 4096;
 		const dispose = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
