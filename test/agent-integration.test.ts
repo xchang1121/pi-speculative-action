@@ -568,19 +568,31 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 
-	it("shares one running grep preparation across predictions and retains independent result proofs", async ({ skip }) => {
+	it.for(["local", "composed", "missing", "cancelled"] as const)("shares one running grep preparation across predictions and retains independent result proofs (%s)", async (mode, { skip }) => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd), original = profile.invocations.get("grep");
 		if (!original) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
-		const tool = createGrepTool(cwd), world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 1024 * 1024 });
-		const joined = deferred<void>(), gate = gated(), nativeMkdtemp = fs.mkdtemp;
-		const invocation: ToolInvocation = { ...original, filesystem: (view, request) => original.filesystem!({ ...view, prepare: (...args) => {
-			const pending = view.prepare!(...args); if (request.callID === "second") joined.resolve(); return pending;
+		const tool = createGrepTool(cwd), world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep", "read"], maxBytes: () => 1024 * 1024 });
+		const joined = deferred<void>(), gate = gated(), consuming = gated(), cancelled = new AbortController(), nativeMkdtemp = fs.mkdtemp;
+		const invocation: ToolInvocation = { ...original, filesystem: (view, request) => original.filesystem!({ ...view, prepare: (binding, key, build, consume, target) => {
+			const pending = view.prepare!(binding, key, build, async value => {
+				const result = await consume(value);
+				if (mode === "cancelled" && request.callID === "second") await consuming.wait();
+				if (mode === "cancelled" && request.callID === "first") {
+					await consuming.entered; cancelled.abort(new Error("first consumer cancelled")); throw cancelled.signal.reason;
+				}
+				return result;
+			}, target);
+			if (request.callID === "second") joined.resolve(); return pending;
 		} }, request) };
 		const context = (args: { pattern: string; path: string; glob?: string }, callID: string) => ({
-			cwd, tool, toolName: "grep", args, callID, signal: new AbortController().signal,
+			cwd, tool, toolName: "grep", args, callID, signal: callID === "first" ? cancelled.signal : new AbortController().signal,
 			action: { ...buildPiActionKey("grep", args, cwd)!, semantics: invocation.semantics, executionContext: invocation },
 		});
-		const seed = await world.speculation!.execute(context({ pattern: "seed", path: "." }, "seed"));
+		const seed = await world.speculation!.execute(context({ pattern: "seed", path: ".", ...(mode === "local" ? {} : { glob: "*.absent" }) }, "seed"));
+		const readArgs = { path: "notes.txt" }, read = resolvePiToolInvocation("read", readArgs, { cwd, environment: {} })!;
+		const payload = mode === "composed" || mode === "cancelled" ? await world.speculation!.execute({ cwd, tool: createReadTool(cwd), toolName: "read", args: readArgs,
+			callID: "payload", signal: new AbortController().signal, action: { ...buildPiActionKey("read", readArgs, cwd)!, executionContext: read } }) : undefined;
+		const inputs = () => [seed.inputSource!, ...(payload ? [payload.inputSource!] : [])];
 		const directories = vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix, options) => {
 			const directory = await nativeMkdtemp(prefix, options);
 			if (path.basename(String(prefix)) === "inputs-") await gate.wait();
@@ -588,19 +600,22 @@ describe("speculative action host", () => {
 		});
 		let branches: Awaited<ReturnType<NonNullable<typeof world.speculation>["execute"]>>[] = [];
 		const args = [{ pattern: "two", path: ".", glob: "notes.txt" }, { pattern: "three", path: ".", glob: "notes.txt" }];
-		const first = world.speculation!.execute({ ...context(args[0]!, "first"), inputs: () => [seed.inputSource!] });
+		const first = world.speculation!.execute({ ...context(args[0]!, "first"), inputs });
 		await gate.entered;
-		const second = world.speculation!.execute({ ...context(args[1]!, "second"), inputs: () => [seed.inputSource!] });
-		const settled = Promise.all([first, second]);
+		const second = world.speculation!.execute({ ...context(args[1]!, "second"), inputs });
+		const settled = Promise.allSettled([first, second]);
 		try {
-			await joined.promise; await nextTurn(); gate.release(); branches = await settled;
+			await joined.promise; await nextTurn(); gate.release();
+			if (mode === "cancelled") { await expect.poll(() => cancelled.signal.aborted).toBe(true); await nextTurn(); consuming.release(); }
+			const attempts = await settled; branches = attempts.flatMap(attempt => attempt.status === "fulfilled" ? [attempt.value] : []);
+			expect(attempts.map(attempt => attempt.status)).toEqual([mode === "cancelled" ? "rejected" : "fulfilled", "fulfilled"]);
 			expect(directories.mock.calls.filter(([prefix]) => path.basename(String(prefix)) === "inputs-")).toHaveLength(1);
-			for (const [index, branch] of branches.entries()) expect(branch.output.result).toEqual(
+			for (const [index, attempt] of attempts.entries()) if (attempt.status === "fulfilled") expect(attempt.value.output.result).toEqual(
 				(await original.authoritative!({ args: args[index]!, callID: "oracle", signal: new AbortController().signal })).result);
-			await seed.dispose(); await branches[0]!.dispose();
-			expect((await branches[1]!.validate!()).status).toBe("valid");
-			await writeFile(path.join(cwd, "notes.txt"), "changed"); expect((await branches[1]!.validate!()).status).toBe("stale");
-		} finally { gate.release(); await settled.catch(() => {}); await Promise.all(branches.map(branch => branch.dispose())); await seed.dispose(); directories.mockRestore(); await profile.pool.dispose(); }
+			await seed.dispose(); await payload?.dispose(); if (branches.length === 2) await branches[0]!.dispose();
+			expect((await branches.at(-1)!.validate!()).status).toBe("valid");
+			await writeFile(path.join(cwd, "notes.txt"), "changed"); expect((await branches.at(-1)!.validate!()).status).toBe("stale");
+		} finally { gate.release(); consuming.release(); await settled; await Promise.all(branches.map(branch => branch.dispose())); await seed.dispose(); await payload?.dispose(); directories.mockRestore(); await profile.pool.dispose(); }
 	});
 
 	it.for(["prepared", "composed", "partial"] as const)("borrows inputs during prediction and owns its proof after source retirement (%s)", async (coverage, { skip }) => {
