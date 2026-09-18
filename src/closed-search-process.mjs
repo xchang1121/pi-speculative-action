@@ -7,28 +7,38 @@ import { CLOSED_SEARCH_PROFILE } from "./closed-search-kernel.mjs";
 export class ClosedSearchProcessPool {
 	#workers = new Map(); #idle = new Map(); #retirement; #release;
 	constructor(release = () => {}) { this.#release = release; }
+	prepare() {
+		assert.ok(!this.#retirement, "search pool retired");
+		if (!this.#workers.size) this.#launch("producer");
+	}
+	#launch(role) {
+		const worker = launchClosedSearchWorker();
+		this.#workers.set(worker, { role, controller: new AbortController() });
+		this.#idle.set(role, worker);
+		void worker.closure.then(() => {
+			if (!this.#workers.get(worker)?.execution) this.#workers.delete(worker);
+			for (const [idleRole, idle] of this.#idle) if (idle === worker) this.#idle.delete(idleRole);
+		});
+		return worker;
+	}
 	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		signal?.throwIfAborted();
-		// Actors may borrow idle producer capacity; producers leave reserved Actor capacity available.
+		// Actor use reserves borrowed producer capacity; predictions leave that reservation available.
 		const idleRole = role === "actor" && !this.#idle.has(role) && this.#idle.has("producer") ? "producer" : role;
-		const worker = this.#idle.get(idleRole) ?? launchClosedSearchWorker(), controller = new AbortController();
+		const worker = this.#idle.get(idleRole) ?? this.#launch(idleRole), controller = new AbortController();
 		const executionSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 		this.#idle.delete(idleRole);
-		if (!this.#workers.has(worker)) void worker.closure.then(() => {
-			if (!this.#workers.get(worker)?.execution) this.#workers.delete(worker);
-			if (this.#idle.get(idleRole) === worker) this.#idle.delete(idleRole);
-		});
 		const execution = Promise.resolve().then(() => { executionSignal.throwIfAborted(); return operation(worker, executionSignal); });
 		const lease = { role, execution, controller };
 		this.#workers.set(worker, lease);
 		try { const output = await execution; executionSignal.throwIfAborted(); return output; }
 		finally {
 			lease.execution = undefined;
-			if (this.#retirement || executionSignal.aborted || worker.closed() || this.#idle.has(idleRole)) {
+			if (this.#retirement || executionSignal.aborted || worker.closed() || this.#idle.has(role)) {
 				await worker.dispose(); this.#workers.delete(worker);
 			}
-			else this.#idle.set(idleRole, worker);
+			else this.#idle.set(role, worker);
 		}
 	}
 	dispose() {
