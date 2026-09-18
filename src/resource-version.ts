@@ -98,6 +98,23 @@ export class ResourceReadView {
 		this.assertComplete(true);
 		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
 	}
+	/** Keep only proven directory metadata; payloads and preparations remain with their original owner. */
+	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
+		this.assertComplete(true);
+		if (maxBytes <= 0) return undefined;
+		let retained: ResourceReadView | undefined;
+		for (const observation of observations.values()) {
+			const target = filesystemPathKey(observation.path), entry = this.entries.get(target);
+			if (entry?.type !== "directory" || retained?.entries.has(target)) continue;
+			const dependency = entry.metadataDependency && observations.has(entry.metadataDependency) ? entry.metadataDependency : entry.dependency;
+			if (!dependency || !observations.has(dependency)) continue;
+			retained ??= new ResourceReadView(maxBytes, undefined,
+				this.boundary?.dependency && observations.has(this.boundary.dependency) ? this.boundary : undefined);
+			retained.capture(target, { type: "directory", realPath: entry.realPath, dependency });
+			if (!retained.retained) { void retained.dispose(); return undefined; }
+		}
+		retained?.seal(); return retained;
+	}
 	/** Revoke data only; old outputs keep their immutable observations for exact validation. */
 	invalidate(dependencies: ReadonlySet<string>): readonly string[] {
 		const removed: string[] = [];
@@ -229,12 +246,13 @@ export class ResourceReadView {
 		});
 	};
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
-		root?: string, lookup = this.lookup, missing = this.missing): Promise<T> {
+		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing): Promise<T> {
 		this.assertComplete();
 		const view = new ResourceReadView(0);
 		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
 		try {
-			if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
+			if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
+			else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
 				view.boundary = this.boundary;
 				if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
 			} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
@@ -289,13 +307,15 @@ export class ResourceReadView {
 		for (const source of this.lookup?.(target) ?? []) {
 			if (source.view.entries === this.entries || !source.view.retained) continue;
 			try {
-				return await source.view.evaluate(view => view.get(target, scope), source.observed, this.boundary?.root);
+				source.view.assertComplete(true);
+				// The caller already owns the boundary proof; the source contributes only its resource evidence.
+				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
 		}
 		if (this.missing) {
 			try {
 				const source = await this.missing();
-				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary?.root);
+				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary);
 			} catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 		}
 		return this.unproven(target);
@@ -403,15 +423,16 @@ export class ResourceVersionManager {
 	}
 
 	/** Own an evaluated query's evidence without keeping its input buffers or source branch alive. */
-	retain(token: ResourceVersionToken): ResourceVersionToken {
+	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.observations.size)
 			throw new Error("resource_version_owner_changed");
 		token.view?.assertComplete(true);
 		const observations = new Map(token.observations);
+		const view = metadataBytes === undefined ? undefined : token.view?.retainMetadata(observations, metadataBytes);
 		this.references++;
-		return { ...token, observations, view: undefined, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => {
-			observations.clear();
-			if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.();
+		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => {
+			const finish = () => { observations.clear(); if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.(); };
+			const pending = view?.dispose(); return pending ? pending.then(finish) : finish();
 		}) };
 	}
 

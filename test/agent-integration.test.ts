@@ -624,6 +624,12 @@ describe("speculative action host", () => {
 			await writeFile(path.join(cwd, "unused.log"), "unrelated content changed\n");
 			expect(await host.execute({ ...call, id: "unrelated" }, undefined, actor)).toEqual(expected);
 			expect(actor).not.toHaveBeenCalled();
+			if (partial) {
+				const input = { path: "other.txt" }, expectedRead = await tools[1]!.execute("reference-read", input);
+				const fallback = vi.fn(() => tools[1]!.execute("fallback-read", input)), capturedBefore = captures.mock.calls.length;
+				expect(await host.execute({ ...call, id: "cross-root-read", tool: "read", args: input }, undefined, fallback)).toEqual(expectedRead);
+				expect(fallback).not.toHaveBeenCalled(); expect(captures.mock.calls.length).toBe(capturedBefore);
+			}
 			permitted = false;
 			expect(await host.execute({ ...call, id: "denied" }, undefined, actor)).toEqual(expected);
 			expect(actor).toHaveBeenCalledOnce(); permitted = true;
