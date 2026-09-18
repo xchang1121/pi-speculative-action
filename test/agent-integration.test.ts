@@ -668,8 +668,7 @@ describe("speculative action host", () => {
 				drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 1024 * 1024 }),
 			complete: async () => assistant([{ type: "toolCall", id: "next", name: readNext ? "read" : "write", arguments: readNext ? { path: args.path } : args }], "toolUse"),
 			resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
-			// Isolate the committed owner from optional host-observation captures on Linux.
-			executionWorlds: [world, { ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 }), observation: undefined }],
+			executionWorlds: [world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 })],
 			onEvent: event => { events.push(event); },
 		});
 		try {

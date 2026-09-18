@@ -13,6 +13,7 @@ import type {
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import {
 	captureResourceVersion,
+	invalidateResourceInputs,
 	type ResourceReadView,
 	type ResourceObservation,
 	type ResourceVersionToken,
@@ -234,6 +235,7 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
+		invalidateInputs: paths => { if (owned) invalidateResourceInputs(owned, paths); },
 		inputResources,
 		reconstructionScope: "current_action",
 		capturedBytes,

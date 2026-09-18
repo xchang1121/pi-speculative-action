@@ -16,6 +16,7 @@ import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { THINKTHREAD_TOOL_RUNNER_VERSION } from "../src/thinkthread/tool-runner-protocol.ts";
 import {
 	captureResourceVersion,
+	invalidateResourceInputs,
 	closeResourceVersionManagers,
 	ResourceVersionManager,
 	type ResourceVersionToken,
@@ -301,6 +302,40 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
 	});
 
+	test("revokes changed inputs and preparations while retaining siblings and old result evidence", async () => {
+		const root = await workspace({ a: "A", b: "B" }), a = path.join(root, "a"), b = path.join(root, "b");
+		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;
+		const binding = {}, dispose = vi.fn(), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations, file: string) =>
+			({ value: (await inputs.readFile(file)).toString(), bytes: 1, dispose }));
+		const prepare = (file: string) => view.evaluate(v => v.prepare(binding, file, v => build(v, file), async value => value));
+		const gate = gated(); let active: Promise<unknown> | undefined;
+		const capturing = await manager.capture(undefined, 8192);
+		try {
+			for (const file of [a, b]) await view.prepare(binding, file, v => build(v, file), async value => value);
+			view.seal(); const bytes = view.bytes;
+			active = capturing.view!.prepare(binding, "in-flight", async inputs => {
+				const resource = await build(inputs, a); await gate.wait(); return resource;
+			}, async value => value);
+			await gate.entered;
+			await fs.writeFile(a, "changed");
+			const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat");
+			try {
+				invalidateResourceInputs([token, capturing], [a]);
+				expect(await prepare(b)).toBe("B"); expect(build).toHaveBeenCalledTimes(3);
+				expect(await view.evaluate(v => v.readFile(b))).toEqual(Buffer.from("B"));
+				expect(opened).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
+			} finally { opened.mockRestore(); stat.mockRestore(); }
+			await expect(prepare(a)).rejects.toThrow("resource_access_unproven");
+			expect(dispose).not.toHaveBeenCalled(); expect(view.bytes).toBe(bytes);
+			gate.release(); await active; expect(dispose).toHaveBeenCalledOnce();
+			capturing.view!.seal();
+			await expect(capturing.view!.evaluate(v => v.prepare(binding, "in-flight", v => build(v, a), async value => value))).rejects.toThrow("resource_access_unproven");
+			expect((await manager.validate(token)).expired).toBe(true);
+			await fs.writeFile(a, "A"); expect((await manager.validate(token)).expired).toBe(false);
+		} finally { gate.release(); await active?.catch(() => {}); await token.release(); await capturing.release(); manager.close(); }
+		expect(dispose).toHaveBeenCalledTimes(3);
+	});
+
 	test.each(["build", "consume"])("drains prepared input %s before releasing its owner", async (phase) => {
 		const root = await workspace({ value: "A" }), manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture(undefined, 8192), view = token.view!, binding = {}, gate = gated(), dispose = vi.fn();
@@ -330,6 +365,7 @@ describe("speculative action resource versions", () => {
 		const source = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192);
 		const binding = {}, dispose = vi.fn(), gate = gated();
 		await source.view!.readFile(path.join(root, "value")); source.view!.seal();
+		const proof = manager.retain(source);
 		const build = vi.fn(async (view: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
 			const value = (await view.readFile(path.join(root, "value"))).toString();
 			if (phase === "build") await gate.wait();
@@ -356,9 +392,11 @@ describe("speculative action resource versions", () => {
 					for (const [identity, key, boundary] of [[{}, "selection", root], [binding, "different", root], [binding, "selection", path.join(root, "inside")]] as const)
 						await expect(query(identity, key, boundary)).rejects.toThrow("resource_access_unproven");
 					expect(await query()).toBe("A");
+					invalidateResourceInputs([destination, proof], [path.join(root, "value")]);
+					await expect(query()).rejects.toThrow("resource_access_unproven");
 				} else await expect(query()).rejects.toThrow("resource_access_unproven");
 			}
-		} finally { gate.release(); await pending?.catch(() => {}); await source.release(); await destination.release(); manager.close(); }
+		} finally { gate.release(); await pending?.catch(() => {}); await source.release(); await destination.release(); await proof.release(); manager.close(); }
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 

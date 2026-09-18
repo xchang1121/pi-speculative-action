@@ -1,3 +1,4 @@
+import path from "node:path";
 import { type ActionProjectionCoverage, type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
@@ -2599,16 +2600,18 @@ export function makeSpeculativeActionRuntime<
 	const reconcileAuthoritativeEffects = (session: Session, action: ActionKey, adopted?: Candidate): void => {
 		const changed = authoritativeMutationResources(action, adopted);
 		if (!changed.length) return;
+		const paths = (adopted || semantics.effect(action) === "workspace_mutation" ? changed : []).flatMap(resource => action.resourceRoot !== undefined || path.isAbsolute(resource)
+			? [path.resolve(action.resourceRoot ?? "", resource)] : []);
 		const candidates = candidateStore.values(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
 			if (candidate === adopted || (adopted && descendsFrom(candidate, adopted))) continue;
+			try { if (paths.length) candidateBranch(candidate)?.invalidateInputs?.(paths); }
+			catch { invalid.add(candidate); }
 			// Once an Actor reserves a candidate, its freshness and compatibility checks
 			// are authoritative. Cache invalidation may only retire unclaimed work.
 			if (!reservationAvailable(candidate.work.reservation)) continue;
 			if (candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))) {
-				// Known writes retire supplied preimages before another prediction can borrow them.
-				if (candidateBranch(candidate)?.inputsOnly) invalid.add(candidate);
 				for (const descendant of candidates) {
 					// Completed shared outputs are checked against their sealed evidence at every adoption.
 					// Pending work and checkpoint descendants still retain conservative conflict invalidation.
