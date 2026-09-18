@@ -14,7 +14,7 @@ import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 13;
+const HELPER_PROTOCOL_VERSION = 14;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -82,7 +82,7 @@ export type HeldExecDecision =
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
 			readonly descriptorOffsets?: readonly {
 				readonly fd: number; readonly device: string; readonly inode: string;
-				readonly flags: number; readonly before: number; readonly after: number;
+				readonly flags: number; readonly before: number; readonly after: number; readonly afterFlags?: number;
 				/** Replace inode contents through a separate writer; never disturb OFD flags or position. */
 				readonly content?: Buffer;
 			}[];
@@ -245,22 +245,22 @@ export class LinuxHeldExecBoundary {
 				await observeCompletion(socket, decision.observeCompletion);
 				return;
 			}
-			const positions = decision.descriptorOffsets?.map(position => ({ ...position })) ?? [];
+			const positions = decision.descriptorOffsets?.map(position => ({ ...position, afterFlags: position.afterFlags ?? position.flags })) ?? [];
 			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0), 0);
 			const descriptors = new Set<number>();
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
 					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
 					return duplicate || position.content !== undefined && !Buffer.isBuffer(position.content) ||
-						![position.fd, position.flags, position.before, position.after].every(value => Number.isSafeInteger(value) && value >= 0) ||
-						position.fd > 0x7fffffff || position.flags > 0x7fffffff || ![position.device, position.inode].every(value =>
+						![position.fd, position.flags, position.before, position.after, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
 				})) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
 			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
 			for (const position of positions) {
-				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1}\n`));
+				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags}\n`));
 				if (position.content) await write(socket, position.content);
 			}
 			for (const event of decision.output) {

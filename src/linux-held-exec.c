@@ -35,7 +35,7 @@ static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 #define MAX_POSITIONS 64
 
 struct file_position {
-	int descriptor, duplicate, writer, flags, alias;
+	int descriptor, duplicate, writer, flags, after_flags, alias;
 	uintmax_t device, inode;
 	int64_t before, after;
 	int64_t content_length;
@@ -543,9 +543,10 @@ static int actor_decision(struct decision_job *job) {
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
 		if (read_line(connection, line, sizeof(line)) < 0 ||
-			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64, &position->descriptor,
-				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length) != 7 ||
+			sscanf(line, "S %d %ju %ju %d %" SCNd64 " %" SCNd64 " %" SCNd64 " %d", &position->descriptor,
+				&position->device, &position->inode, &position->flags, &position->before, &position->after, &position->content_length, &position->after_flags) != 8 ||
 			position->descriptor < 0 || position->before < 0 || position->after < 0 || position->content_length < -1 ||
+			position->after_flags < 0 || ((position->flags ^ position->after_flags) & ~(O_APPEND | O_NONBLOCK)) ||
 			(position->content_length >= 0 && (uint64_t)position->content_length > total - received)) goto decline;
 		if (position->content_length > 0) {
 			position->content = malloc((size_t)position->content_length);
@@ -589,7 +590,7 @@ static int actor_decision(struct decision_job *job) {
 			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, position->duplicate, other->duplicate);
 			if (same < 0) goto decline;
 			if (same == 0) {
-				if (position->before != other->before || position->after != other->after) goto decline;
+				if (position->before != other->before || position->after != other->after || position->after_flags != other->after_flags) goto decline;
 				position->alias = 1;
 			}
 		}
@@ -615,7 +616,10 @@ static int actor_decision(struct decision_job *job) {
 	}
 	for (unsigned index = 0; index < job->position_count; index++) {
 		const struct file_position *position = &job->positions[index];
-		if (!position->alias && lseek(position->duplicate, position->after, SEEK_SET) != position->after) return -2;
+		if (position->alias) continue;
+		if (position->after_flags != position->flags && (fcntl(position->duplicate, F_SETFL, position->after_flags) < 0 ||
+			fcntl(position->duplicate, F_GETFL) != position->after_flags)) return -2;
+		if (lseek(position->duplicate, position->after, SEEK_SET) != position->after) return -2;
 	}
 	/* Output may feed another tracee. Release the offset lease before a pipe write can block. */
 	if (job->domain && job->domain->enabled && request_tracer(job, 256) < 0) return -2;
@@ -918,7 +922,7 @@ fatal:
 	return 125;
 }
 
-/* Reproduce a complete regular-FD table at the existing sandboxed native outlet.
+/* Reproduce a complete inherited FD table at the existing sandboxed native outlet.
  * The supervisor alone keeps the pins, and drains descendants before reporting offsets. */
 static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command) {
 	struct file_position positions[MAX_POSITIONS];
@@ -1016,7 +1020,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("13");
+		puts("14");
 		return 0;
 	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {

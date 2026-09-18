@@ -325,14 +325,16 @@ export async function observeStrace(
 			}
 			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line)) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
-			// Descriptor-local state is internal. OFD flag reads require reproduced file images;
-			// locks, leases, shared flag changes and owners need effects beyond those snapshots.
+			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets.
+			// Locks, leases, async notifications and owners require additional effect evidence.
 			if (syscall === "flock") taints.add("ipc");
 			if (syscall === "fcntl" || syscall === "fcntl64") {
 				const command = line.args[1] ?? "";
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) taints.add("ipc");
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
-					!(command === "F_GETFL" && options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "")))
+					!((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
+						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
+						options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "")))
 					taints.add("unsupported_syscall");
 			}
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {

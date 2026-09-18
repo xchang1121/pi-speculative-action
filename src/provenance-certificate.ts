@@ -195,7 +195,7 @@ export interface ProcessResultRecord {
 	readonly journal: readonly OrderedEffectEvent[];
 	readonly exit: ExitOutcome;
 	readonly descriptorOffsets?: readonly { readonly fd: number; readonly before: number; readonly after: number;
-		readonly content?: ArtifactReference }[];
+		readonly afterFlags?: number; readonly content?: ArtifactReference }[];
 }
 
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
@@ -639,13 +639,15 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	let descriptorOffsets: ProcessResultRecord["descriptorOffsets"];
 	if (result.descriptorOffsets !== undefined) {
 		const descriptors = prototype.inheritedFDs.filter(({ alias }) => alias !== undefined);
-		descriptorOffsets = [...result.descriptorOffsets].map(({ fd, before, after, content }) => ({ fd, before, after,
+		descriptorOffsets = [...result.descriptorOffsets].map(({ fd, before, after, afterFlags, content }) => ({ fd, before, after,
+			...(afterFlags !== undefined ? { afterFlags } : {}),
 			...(content ? { content: { ...content } } : {}) })).sort((a, b) => a.fd - b.fd);
 		if (descriptorOffsets.length !== descriptors.length || descriptorOffsets.some((position, index) => {
 			const descriptor = descriptors[index]!;
 			const alias = descriptorOffsets!.find(({ fd }) => fd === descriptor.alias);
 			return position.fd !== descriptor.fd || position.before !== descriptor.offset ||
-				!Number.isSafeInteger(position.after) || position.after < 0 || !alias || alias.after !== position.after ||
+				!Number.isSafeInteger(position.after) || position.after < 0 || !alias || alias.after !== position.after || alias.afterFlags !== position.afterFlags ||
+				position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff) ||
 				descriptor.type === "null" && (position.after !== 0 || position.content !== undefined);
 		})) throw new Error("invalid inherited OFD result offsets");
 	} else if (prototype.inheritedFDs.some(({ alias }) => alias !== undefined)) throw new Error("missing inherited OFD result offsets");
