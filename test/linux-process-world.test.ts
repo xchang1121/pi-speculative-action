@@ -383,6 +383,46 @@ int main(int argc, char **argv) {
 				if (route) expect((await inspection!).outputRoute).toEqual(route);
 				else await expect(inspection).rejects.toThrow(/descriptors/);
 			}
+			const input = path.join(root, "ofd-input");
+			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure"]) {
+				await writeFile(input, "abcdef");
+				const accepted = mode === "shared" || mode === "unlinked";
+				let output = "", heldPid = 0;
+				const commit = vi.fn(async () => {
+					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
+					if (mode === "commit-failure") throw new Error("injected offset commit failure");
+				}), adopted = vi.fn();
+				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
+					heldPid = pid;
+					const descriptorOffsets = await Promise.all([3, 4, 5].map(async fd => {
+						const info = await filesystem.stat(`/proc/${pid}/fd/${fd}`, { bigint: true });
+						const text = await readFile(`/proc/${pid}/fdinfo/${fd}`, "utf8");
+						return { fd, device: info.dev.toString(), inode: info.ino.toString(),
+							flags: Number.parseInt(/^flags:\s*([0-7]+)/m.exec(text)![1]!, 8), before: 0, after: fd === 5 ? 1 : 3 };
+					}));
+					const first = descriptorOffsets[0]!;
+					if (mode === "unlinked") await rm(input);
+					if (mode === "offset") first.before = 1;
+					if (mode === "identity") first.inode = "0";
+					if (mode === "flags") first.flags ^= 0x800;
+					if (mode === "closed") descriptorOffsets[1]!.fd = 1000;
+					if (mode === "alias-conflict") descriptorOffsets[1]!.after = 4;
+					if (mode === "invalid") first.after = -1;
+					return { kind: "replay", descriptorOffsets, exitCode: 0,
+						output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted };
+				} });
+				const running = executor.execute({ command: `exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; /bin/true; ` +
+					`IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`,
+					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
+				if (mode === "commit-failure") {
+					await expect(running).rejects.toMatchObject({ disposition: "poisoned" }); expect(output).toBe("");
+				} else {
+					expect(await running).toEqual({ exitCode: 0 });
+					expect(output, mode).toBe(accepted ? "replayed:d:b:e" : "a:a:b");
+				}
+				expect(commit).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
+				expect(adopted).toHaveBeenCalledTimes(Number(accepted));
+			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
 				let callbacks = 0, observed = 0, closed = 0, output = "", heldPid = 0;
