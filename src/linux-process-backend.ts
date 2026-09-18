@@ -1186,8 +1186,8 @@ export class LinuxProcessReuseBackend {
 					// Only observed inputs need comparison; the transaction prestate includes predecessor effects.
 					await assertNoSymlinkPath(session.sourceRoot, changed);
 					const current = await captureStableFile(changed, MAX_REQUEST_BYTES);
-					this.addActor("validationFilesRead", 1);
-					this.addActor("validationBytesRead", current.bytesRead);
+					this.addActor("validationFilesRead", current.shared ? 0 : 1);
+					this.addActor("validationBytesRead", current.shared ? 0 : current.bytesRead);
 					if (sha256Digest(before) === `sha256:${current.hash}`) continue;
 					this.setActorError(`actor_running_input_changed:${changed}`);
 					return true;

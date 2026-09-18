@@ -8,7 +8,7 @@ import {
 	PI_ACTION_SEMANTICS,
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
-import { captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { type StableFileCapture, captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -934,7 +934,7 @@ async function fingerprintDependencies(
 				if (provided && !retain) throw new Error("resource_snapshot_budget_exceeded");
 				const bytes = provided && Buffer.from(provided);
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
-				const content = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
+				const content: StableFileCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
 					: await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
 				assertInside(realRoot, content.realPath);
 				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath, dependency }, retain ? provided?.byteLength ?? Number(info.size) : 0);
@@ -947,8 +947,8 @@ async function fingerprintDependencies(
 						resolved: filesystemPathKey(content.realPath),
 					},
 					stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
-					bytesRead: bytes ? 0 : content.bytesRead,
-					filesRead: bytes ? 0 : 1,
+					bytesRead: bytes || content.shared ? 0 : content.bytesRead,
+					filesRead: bytes || content.shared ? 0 : 1,
 				};
 			})().finally(() => files.delete(key));
 			files.set(key, pending);

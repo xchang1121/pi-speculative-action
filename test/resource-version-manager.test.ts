@@ -10,7 +10,8 @@ import { createFindTool, createGrepTool, createLsTool, createReadTool, createRea
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
-import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
+import { captureStableFile, hashExecutableFile, type StableFileCapture } from "../src/filesystem-evidence.ts";
+import { captureFileDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { THINKTHREAD_TOOL_RUNNER_VERSION } from "../src/thinkthread/tool-runner-protocol.ts";
@@ -804,10 +805,17 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
-	test.for(["shared", "distinct", "cancel-owner", "cancel-reader", "cancel-all", "changed", "late-change", "read-error"])("shares an ongoing image read with independent descriptor ownership (%s)", async mode => {
+	test.for([
+		...["shared", "distinct", "cancel-owner", "cancel-reader", "cancel-all", "changed", "late-change", "read-error"].map(mode => ["executable", mode]),
+		...["hash", "content", "mixed"].flatMap(kind => ["shared", "distinct", "changed", "late-change", "read-error"].map(mode => [kind, mode])),
+		["reverse", "shared"], ["validation", "shared"],
+	])("shares an ongoing file read with independent descriptor ownership (%s/%s)", async ([kind, mode]) => {
 		const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 43), root = await workspace({ image: payload });
 		const file = path.join(root, "image"), alias = path.join(root, "alias");
 		if (mode === "distinct") await fs.writeFile(alias, payload); else await fs.link(file, alias);
+		const manager = kind === "validation" ? new ResourceVersionManager(root, { watch: false }) : undefined;
+		const token = await manager?.capture([{ path: file, scope: "content" }]);
+		const dependency = kind === "validation" ? (await captureFileDependency(alias, alias)).dependency : undefined;
 		const gate = gated(), admitted = deferred(), controllers = [new AbortController(), new AbortController()];
 		const cancelled = controllers.map((_, index) => new Error("cancelled reader " + index));
 		const nativeOpen = fs.open.bind(fs), handles: Awaited<ReturnType<typeof fs.open>>[] = [];
@@ -822,30 +830,60 @@ describe("speculative action resource versions", () => {
 			}) as typeof handle.read);
 			vi.spyOn(handle, "stat").mockImplementation((async (...args: Parameters<typeof handle.stat>) => {
 				if (mode === "late-change" && index === 1 && ++inspections === 2) await fs.appendFile(file, "changed");
-				return stat(...args);
+				const observed = await stat(...args);
+				if (index === 1) admitted.resolve();
+				return observed;
 			}) as typeof handle.stat);
 			return handle;
 		});
 		const digest = (bytes: Buffer) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-		let settled: Promise<PromiseSettledResult<string>[]> | undefined;
+		let settled: Promise<PromiseSettledResult<string | StableFileCapture>[]> | undefined;
+		const capture = async (target: string, index: number) => {
+			if (kind === "validation") {
+				const result = index === 0 ? await manager!.validate(token!)
+					: await validateDynamicDependencyCertificate({ complete: true, dependencies: [dependency!], taints: [] });
+				expect(result).toMatchObject({ ...(index === 0 ? { expired: false } : { status: "valid" }), filesRead: index === 0 ? 1 : 0, bytesRead: index === 0 ? payload.length : 0 });
+				return digest(payload);
+			}
+			return kind === "executable" ? hashExecutableFile(target, { signal: controllers[index]!.signal, pinned: () => {} })
+				: captureStableFile(target, Infinity, kind === "content" || kind === "mixed" && index === 0 || kind === "reverse" && index === 1);
+		};
 		try {
-			const owner = hashExecutableFile(file, { signal: controllers[0]!.signal, pinned: () => {} }); await gate.entered;
-			const reader = hashExecutableFile(alias, { signal: controllers[1]!.signal, pinned: admitted.resolve });
+			const owner = capture(file, 0); await gate.entered;
+			const reader = capture(alias, 1);
 			settled = Promise.allSettled([owner, reader]); await admitted.promise; await nextTurn();
 			if (mode === "cancel-owner" || mode === "cancel-all") controllers[0]!.abort(cancelled[0]);
 			if (mode === "cancel-reader" || mode === "cancel-all") controllers[1]!.abort(cancelled[1]);
 			if (mode === "changed") await fs.appendFile(file, "changed");
 			gate.release();
-			for (const [index, result] of (await settled).entries()) {
+			const results = await settled;
+			for (const [index, result] of results.entries()) {
 				const error = controllers[index]!.signal.aborted ? cancelled[index]!.message : mode === "read-error" ? "shared read failed"
 					: mode === "changed" || mode === "late-change" && index === 1 ? "file_changed_during_capture" : undefined;
-				expect(result).toMatchObject(error ? { status: "rejected", reason: { message: error } } : { status: "fulfilled", value: digest(payload) });
+				// A pathname owner may also observe the late mutation in its final namespace fence.
+				if (!error && kind !== "executable" && mode === "late-change" && result.status === "rejected") {
+					expect(result.reason.message).toBe("file_changed_during_capture"); continue;
+				}
+				expect(result).toMatchObject(error ? { status: "rejected", reason: { message: error } } : { status: "fulfilled" });
+				if (result.status === "fulfilled") {
+					if (typeof result.value === "string") expect(result.value).toBe(digest(payload));
+					else {
+						expect(result.value).toMatchObject({ hash: digest(payload).slice(7), bytesRead: payload.length });
+						expect(result.value.shared).toBe(index === 1 && mode !== "distinct" && kind !== "reverse" ? true : undefined);
+						expect(result.value.content).toEqual(kind === "content" || kind === "mixed" && index === 0 || kind === "reverse" && index === 1 ? payload : undefined);
+					}
+				}
 			}
-			expect(vi.mocked(handles[1]!.read).mock.calls.length > 0).toBe(mode === "distinct");
+			if (kind === "content" && mode === "shared") {
+				const captures = results.map(result => (result as PromiseFulfilledResult<StableFileCapture>).value);
+				captures[0]!.content![0] = 0; captures[0]!.stat.mode = 0n;
+				expect(captures[1]!.content).toEqual(payload); expect(captures[1]!.stat.mode).not.toBe(0n);
+			}
+			expect(vi.mocked(handles[1]!.read).mock.calls.length > 0).toBe(mode === "distinct" || kind === "reverse");
 			for (const handle of handles) expect(handle.fd).toBe(-1);
 			expect(await hashExecutableFile(file)).toBe(digest(await fs.readFile(file)));
 			expect(handles.at(-1)!.read).toHaveBeenCalled(); expect(handles.at(-1)!.fd).toBe(-1);
-		} finally { gate.release(); await settled; open.mockRestore(); await Promise.allSettled(handles.map(handle => handle.close())); }
+		} finally { gate.release(); await settled; open.mockRestore(); await Promise.allSettled(handles.map(handle => handle.close())); await token?.release(); manager?.close(); }
 	});
 
 	test.runIf(process.platform === "linux")("distinguishes pinned images from pathname snapshots after alias targets change", async () => {
