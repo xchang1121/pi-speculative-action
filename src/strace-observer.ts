@@ -16,7 +16,7 @@ const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
 	"io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
 ]);
-const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,ioctl,prctl,fstat,fstatfs,getdents,getdents64,fcntl,fcntl64,flock,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,pipe2,splice,tee,ioctl,prctl,fstat,fstatfs,getdents,getdents64,fcntl,fcntl64,flock,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -334,7 +334,7 @@ export async function observeStrace(
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					!((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
-						options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "")))
+						options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "")))
 					taints.add("unsupported_syscall");
 			}
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
@@ -343,6 +343,7 @@ export async function observeStrace(
 			if (
 				resourceLimitMutation(line, syscall) ||
 				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) ||
+				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(line.args[1] ?? "")) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
 				taints.add("unsupported_syscall");
@@ -428,7 +429,7 @@ const UNMODELED_METADATA_SYSCALLS = new Set(["statx", "statfs", "fstatfs", "getd
 
 /** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
 const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
-	"fallocate",
+	"fallocate", "splice", "tee",
 	"fgetxattr",
 	"flistxattr",
 	"fremovexattr",

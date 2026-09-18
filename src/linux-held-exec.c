@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -33,9 +34,11 @@ static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 #define MAX_OUTPUT_EVENTS 65536
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
 #define MAX_POSITIONS 64
+#define MAX_INPUT_BYTES (2UL * 1024 * 1024)
+#define MAX_REQUEST_BYTES (MAX_INPUT_BYTES * 2 + MAX_LINE)
 
 struct file_position {
-	int descriptor, duplicate, writer, flags, after_flags, alias;
+	int descriptor, duplicate, writer, flags, after_flags, alias, pipe, queue_alias;
 	uintmax_t device, inode;
 	int64_t before, after;
 	int64_t content_length;
@@ -43,7 +46,7 @@ struct file_position {
 	char *path;
 };
 
-struct descriptor_origin { int fd, cloexec; unsigned long id; };
+struct descriptor_origin { int fd, cloexec; unsigned long id; int pipe; };
 struct descriptor_table {
 	unsigned references, count, active;
 	unsigned long epoch, generation;
@@ -74,6 +77,7 @@ struct decision_job {
 	unsigned position_count;
 	struct descriptor_domain *domain;
 	struct traced_process *process;
+	char *context;
 };
 
 struct traced_process {
@@ -86,6 +90,7 @@ struct traced_process {
 	int mutation, uncertain;
 	long syscall;
 	unsigned long arguments[3];
+	int pipe_fds[2];
 };
 
 static int replace_with_exit(pid_t pid, unsigned code) {
@@ -258,14 +263,14 @@ static struct descriptor_origin descriptor_origin(struct traced_process *process
 }
 
 static void set_descriptor_origin(struct traced_process *process, struct descriptor_domain *domain,
-	int fd, unsigned long id, int cloexec) {
+	int fd, unsigned long id, int cloexec, int pipe) {
 	struct descriptor_table *table = process->table;
 	for (unsigned index = 0; index < table->count; index++) if (table->entries[index].fd == fd) {
 		table->entries[index] = table->entries[--table->count]; break;
 	}
 	if (!id) return;
 	if (table->count == sizeof(table->entries) / sizeof(table->entries[0])) { domain->escaped = 1; return; }
-	table->entries[table->count++] = (struct descriptor_origin){fd, cloexec, id};
+	table->entries[table->count++] = (struct descriptor_origin){fd, cloexec, id, pipe};
 }
 
 static struct descriptor_table *copy_descriptor_table(struct traced_process *source) {
@@ -315,17 +320,22 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	int detached = (number == SYS_unshare && first == CLONE_FILES) || (number == SYS_close_range && (third & CLOSE_RANGE_UNSHARE));
 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
 		/* These can publish handles outside the traced tree or bypass its syscall stops. */
-		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_io_uring_setup ||
+		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_recvmsg || number == SYS_recvmmsg ||
+			number == SYS_pidfd_getfd || number == SYS_io_uring_setup ||
 			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
-			number == SYS_process_vm_writev || (number == SYS_unshare && (first & ~(unsigned long)CLONE_FILES)) || number == SYS_setns;
+			number == SYS_process_vm_writev || number == SYS_splice || number == SYS_tee ||
+			(number == SYS_unshare && (first & ~(unsigned long)CLONE_FILES)) || number == SYS_setns;
 		if (number == SYS_clone) escapes |= (first & 0x00800000) != 0; /* CLONE_UNTRACED */
+		/* Packet boundaries cannot be reconstructed from a byte snapshot. */
+		escapes |= (number == SYS_pipe2 && (second & ~(unsigned long)(O_CLOEXEC | O_NONBLOCK))) ||
+			(number == SYS_fcntl && second == F_SETFL && (third & O_DIRECT));
 		/* clone3 flags live in mutable shared memory: prove attachment from the kernel event instead. */
 		if (number == SYS_clone3 || number == SYS_ioctl) { process->uncertain = 1; domain->uncertain++; }
 		if (escapes) domain->escaped = 1;
 		process->call_epoch = table->epoch;
 		process->mutation = number == SYS_close || (number == SYS_close_range && !detached) || number == SYS_dup ||
 			number == SYS_dup2 || number == SYS_dup3 || number == SYS_open || number == SYS_openat ||
-			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create ||
+			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create || number == SYS_pipe || number == SYS_pipe2 ||
 			(number == SYS_fcntl && (second == F_SETFD || second == F_DUPFD || second == F_DUPFD_CLOEXEC));
 		if (process->mutation) {
 			table->epoch++;
@@ -335,9 +345,18 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 			else process->mutation_generation = table->generation;
 		}
 		/* Dropping uncertain provenance before a failing close/dup is safe; retaining a stale slot is not. */
-		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0);
+		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0, 0);
 		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
-			set_descriptor_origin(process, domain, (int)second, 0, 0);
+			set_descriptor_origin(process, domain, (int)second, 0, 0, 0);
+		if (number == SYS_pipe || number == SYS_pipe2) {
+			/* Derive kernel allocation slots, never trust the mutable userspace result array. */
+			process->pipe_fds[0] = process->pipe_fds[1] = -1;
+			for (int candidate = 0, found = 0; candidate < 256 && found < 2; candidate++) {
+				char name[64]; struct stat state;
+				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, candidate);
+				if (stat(name, &state) < 0 && errno == ENOENT) process->pipe_fds[found++] = candidate;
+			}
+		}
 	}
 	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
 	if (process->uncertain) {
@@ -358,21 +377,25 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		struct descriptor_origin *entry = &table->entries[index];
 		if ((unsigned)entry->fd < (unsigned)first || (unsigned)entry->fd > (unsigned)second) { index++; continue; }
 		if (third & CLOSE_RANGE_CLOEXEC) { entry->cloexec = 1; index++; }
-		else set_descriptor_origin(process, domain, entry->fd, 0, 0);
+		else set_descriptor_origin(process, domain, entry->fd, 0, 0, 0);
 	}
 	struct descriptor_origin source = descriptor_origin(process, (int)first);
 	int fd = (int)info.exit.rval;
-	if (number == SYS_fcntl && second == F_SETFD) {
-		set_descriptor_origin(process, domain, source.fd, source.id, (third & FD_CLOEXEC) != 0);
+	if (number == SYS_pipe || number == SYS_pipe2) {
+		if (process->pipe_fds[1] < 0) return 0;
+		for (unsigned index = 0; index < 2; index++) set_descriptor_origin(process, domain,
+			process->pipe_fds[index], ++domain->next, number == SYS_pipe2 && (second & O_CLOEXEC), 1);
+	} else if (number == SYS_fcntl && second == F_SETFD) {
+		set_descriptor_origin(process, domain, source.fd, source.id, (third & FD_CLOEXEC) != 0, source.pipe);
 	} else if (number == SYS_dup || number == SYS_dup2 || number == SYS_dup3 ||
 		(number == SYS_fcntl && (second == F_DUPFD || second == F_DUPFD_CLOEXEC))) {
 		set_descriptor_origin(process, domain, fd, source.id,
 			(number == SYS_dup2 && first == second && source.cloexec) ||
-			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC));
+			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC), source.pipe);
 	} else if (number == SYS_open || number == SYS_openat || number == SYS_creat || number == SYS_memfd_create) {
 		unsigned long flags = number == SYS_open ? second : number == SYS_openat ? third : 0;
 		set_descriptor_origin(process, domain, fd, ++domain->next,
-			(flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1)));
+			(flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1)), 0);
 	} else if (number == SYS_openat2) {
 		/* Read the installed flag, rather than racing the tracee's open_how memory. */
 		char name[64], line[256]; unsigned flags = 0; int found = 0;
@@ -380,7 +403,21 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		FILE *file = fopen(name, "re");
 		while (file && fgets(line, sizeof(line), file)) if (sscanf(line, "flags: %o", &flags) == 1) { found = 1; break; }
 		if (file) fclose(file);
-		set_descriptor_origin(process, domain, fd, found ? ++domain->next : 0, (flags & O_CLOEXEC) != 0);
+		set_descriptor_origin(process, domain, fd, found ? ++domain->next : 0, (flags & O_CLOEXEC) != 0, 0);
+	}
+	/* Reopening a pipe creates a new OFD, but only a live owned handle proves its queue. */
+	if (number == SYS_open || number == SYS_openat || number == SYS_openat2) {
+		char name[64]; struct stat state, other;
+		snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, fd);
+		if (stat(name, &state) == 0 && S_ISFIFO(state.st_mode)) for (unsigned index = 0; index < table->count; index++) {
+			struct descriptor_origin entry = table->entries[index];
+			if (!entry.pipe || entry.fd == fd) continue;
+			snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, entry.fd);
+			if (stat(name, &other) == 0 && other.st_dev == state.st_dev && other.st_ino == state.st_ino) {
+				struct descriptor_origin opened = descriptor_origin(process, fd);
+				set_descriptor_origin(process, domain, fd, opened.id, opened.cloexec, 1); break;
+			}
+		}
 	}
 	return 0;
 }
@@ -392,6 +429,25 @@ static int null_device(const struct stat *state) {
 /* O_PATH has no seekable position; zero is the descriptor-report sentinel. */
 static off_t descriptor_seek(int fd, int flags, off_t offset, int whence) {
 	return flags & O_PATH ? (offset ? -1 : 0) : lseek(fd, offset, whence);
+}
+
+/* tee pins a non-consuming byte copy. One complete transfer is required: repeating tee
+ * would copy the same prefix again. HUP proves EOF after the queued bytes are drained. */
+static int pipe_bytes(int fd, unsigned char **bytes) {
+	struct pollfd ready = {.fd = fd, .events = POLLIN};
+	int length, fds[2], result = -1;
+	*bytes = NULL;
+	if (poll(&ready, 1, 0) < 0 || !(ready.revents & POLLHUP) || ioctl(fd, FIONREAD, &length) < 0 ||
+		length < 0 || (unsigned)length > MAX_INPUT_BYTES) return -1;
+	if (!length) return 0;
+	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) return -1;
+	int capacity = fcntl(fd, F_GETPIPE_SZ);
+	if (capacity > 0 && (fcntl(fds[1], F_GETPIPE_SZ) >= capacity || fcntl(fds[1], F_SETPIPE_SZ, capacity) >= capacity) &&
+		(*bytes = malloc((size_t)length)) && tee(fd, fds[1], (size_t)length, SPLICE_F_NONBLOCK) == length &&
+		transfer(fds[0], *bytes, (size_t)length, 0) == 0) result = length;
+	close(fds[0]); close(fds[1]);
+	if (result < 0) { free(*bytes); *bytes = NULL; }
+	return result;
 }
 
 /* The entire owned tree is stopped until this job retires. External OFDs remain unknown. */
@@ -414,7 +470,8 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		struct stat state;
 		if (pin < 0) goto done;
 		if (fstat(pin, &state) < 0) { close(pin); goto done; }
-		if (!S_ISREG(state.st_mode) && !S_ISDIR(state.st_mode) && !(null_device(&state) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
+		if (!S_ISREG(state.st_mode) && !S_ISDIR(state.st_mode) &&
+			!((null_device(&state) || (S_ISFIFO(state.st_mode) && (!job->domain->enabled || descriptor_origin(job->process, (int)descriptor).pipe))) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
 		if (count == MAX_POSITIONS) { close(pin); goto done; }
 		if (!descriptor && null_device(&state)) null_input = count;
 		nulls[count] = null_device(&state); pins[count] = pin; fds[count++] = (int)descriptor;
@@ -438,8 +495,10 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 	for (int index = 0; index < count; index++) {
 		int pin = pins[index], alias = fds[index], owned = 0, flags = fcntl(pin, F_GETFL);
 		struct stat state;
-		off_t offset = descriptor_seek(pin, flags, 0, SEEK_CUR);
-		if (flags < 0 || offset < 0 || fstat(pin, &state) < 0) goto done;
+		if (flags < 0 || fstat(pin, &state) < 0) goto done;
+		int pipe = S_ISFIFO(state.st_mode);
+		off_t offset = pipe ? 0 : descriptor_seek(pin, flags, 0, SEEK_CUR);
+		if (offset < 0 || (pipe && (flags & ~(O_NONBLOCK | 0x8000)))) goto done;
 		for (int previous = 0; previous < index; previous++) {
 			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, pin, pins[previous]);
 			if (same < 0) goto done;
@@ -451,11 +510,24 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		owned = !job->domain->escaped && !job->domain->uncertain && job->process->table &&
 			!job->process->table->active && descriptor_origin(job->process, fds[index]).id != 0;
 		int length = snprintf(line + used, capacity - used,
-			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s%s}",
+			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s%s",
 			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags,
-			(intmax_t)offset, owned ? "true" : "false", null_device(&state) ? ",\"type\":\"null\"" : S_ISDIR(state.st_mode) ? ",\"type\":\"directory\"" : "");
+			(intmax_t)offset, owned ? "true" : "false", pipe ? ",\"type\":\"pipe\"" : null_device(&state) ? ",\"type\":\"null\"" : S_ISDIR(state.st_mode) ? ",\"type\":\"directory\"" : "");
 		if (length < 0 || (size_t)length >= capacity - used) goto done;
 		used += (size_t)length;
+		if (pipe) {
+			unsigned char *bytes;
+			int size = pipe_bytes(pin, &bytes);
+			if (size < 0) goto done;
+			if ((size_t)size * 2 + 16 >= capacity - used) { free(bytes); goto done; }
+			used += (size_t)sprintf(line + used, ",\"pipeHex\":\"");
+			for (int byte = 0; byte < size; byte++) {
+				line[used++] = "0123456789abcdef"[bytes[byte] >> 4]; line[used++] = "0123456789abcdef"[bytes[byte] & 15];
+			}
+			free(bytes); line[used++] = '"';
+		}
+		if (capacity - used < 2) goto done;
+		line[used++] = '}';
 	}
 	line[used] = 0;
 	result = 0;
@@ -479,7 +551,7 @@ static int open_tracee_output(struct decision_job *job, unsigned fd) {
 	struct stat state;
 	int flags = fcntl(output, F_GETFL);
 	if (fstat(output, &state) == 0 && S_ISFIFO(state.st_mode) && flags >= 0 &&
-		fcntl(output, F_SETFL, flags & ~O_NONBLOCK) >= 0) return output;
+		fcntl(output, F_SETFL, flags & ~(O_NONBLOCK | 0x8000)) >= 0) return output;
 	close(output);
 	return -1;
 }
@@ -487,6 +559,16 @@ static int open_tracee_output(struct decision_job *job, unsigned fd) {
 static int position_matches(const struct file_position *position) {
 	struct stat state, named;
 	if (fstat(position->duplicate, &state) < 0) return 0;
+	if (position->pipe) {
+		unsigned char *bytes;
+		int size = pipe_bytes(position->duplicate, &bytes);
+		int matches = S_ISFIFO(state.st_mode) && !position->before && position->content_length >= 0 &&
+			size == position->content_length && position->after <= size &&
+			(!size || !memcmp(bytes, position->content, (size_t)size)) &&
+			(uintmax_t)state.st_dev == position->device && (uintmax_t)state.st_ino == position->inode &&
+			fcntl(position->duplicate, F_GETFL) == position->flags && !(position->flags & ~(O_NONBLOCK | 0x8000)) && !(position->after_flags & ~(O_NONBLOCK | 0x8000));
+		free(bytes); return matches;
+	}
 	if ((position->flags & O_PATH) && (position->before || position->after ||
 		position->content_length != -1 || position->after_flags != position->flags)) return 0;
 	if (S_ISDIR(state.st_mode)) {
@@ -521,20 +603,22 @@ static int actor_decision(struct decision_job *job) {
 	struct sockaddr_un address = {.sun_family = AF_UNIX};
 	strcpy(address.sun_path, job->socket_path);
 	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) return -1;
-	char descriptors[MAX_LINE];
+	char *descriptors = job->context = job->domain ? malloc(MAX_REQUEST_BYTES) : NULL;
 	int captured = 0;
-	if (job->domain) {
+	if (descriptors) {
 		/* Temporary snapshot pins must close before cancellation can retire their job. */
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-		captured = descriptor_context(job, descriptors, sizeof(descriptors)) == 0;
+		captured = descriptor_context(job, descriptors, MAX_REQUEST_BYTES) == 0;
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 	}
 	int request_length = snprintf(line, sizeof(line),
-		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s%s%s}\n",
+		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s",
 		job->token, job->execution_id, (long)job->pid, (long)getpid(),
-		captured ? ",\"descriptors\":[" : "", captured ? descriptors : "", captured ? "]" : "");
-	if (request_length < 0 || request_length >= (int)sizeof(line) ||
-		transfer(connection, line, (size_t)request_length, 1) < 0 || read_line(connection, line, sizeof(line)) < 0) return -1;
+		captured ? ",\"descriptors\":[" : "");
+	int sent = request_length > 0 && request_length < (int)sizeof(line) && transfer(connection, line, (size_t)request_length, 1) == 0 &&
+		(!captured || transfer(connection, descriptors, strlen(descriptors), 1) == 0) && transfer(connection, captured ? "]}\n" : "}\n", captured ? 3 : 2, 1) == 0;
+	free(descriptors); job->context = NULL;
+	if (!sent || read_line(connection, line, sizeof(line)) < 0) return -1;
 	if (!strcmp(line, "C")) return -1;
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
@@ -595,13 +679,20 @@ static int actor_decision(struct decision_job *job) {
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 		position->duplicate = duplicate_tracee_fd(job, (unsigned)position->descriptor);
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		struct stat state;
+		position->pipe = position->duplicate >= 0 && fstat(position->duplicate, &state) == 0 && S_ISFIFO(state.st_mode);
+		if (position->pipe && (!job->domain || !descriptor_origin(job->process, position->descriptor).pipe)) goto decline;
 		if (position->duplicate < 0 || !position_matches(position)) goto decline;
 		if (job->domain && (job->domain->escaped || job->domain->uncertain || !job->process->table ||
 			job->process->table->active || !descriptor_origin(job->process, position->descriptor).id)) goto decline;
 		for (unsigned previous = 0; previous < index; previous++) {
 			const struct file_position *other = &job->positions[previous];
-			if (position->content_length >= 0 && other->content_length >= 0 &&
+			if (!position->pipe && position->content_length >= 0 && other->content_length >= 0 &&
 				position->device == other->device && position->inode == other->inode) goto decline;
+			if (position->pipe && position->device == other->device && position->inode == other->inode) {
+				if (!other->pipe || position->after != other->after) goto decline;
+				position->queue_alias = 1;
+			}
 			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, position->duplicate, other->duplicate);
 			if (same < 0) goto decline;
 			if (same == 0) {
@@ -609,7 +700,7 @@ static int actor_decision(struct decision_job *job) {
 				position->alias = 1;
 			}
 		}
-		if (position->content_length >= 0) {
+		if (!position->pipe && position->content_length >= 0) {
 			char path[64]; struct stat state;
 			snprintf(path, sizeof(path), "/proc/self/fd/%d", position->duplicate);
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
@@ -631,10 +722,11 @@ static int actor_decision(struct decision_job *job) {
 	}
 	for (unsigned index = 0; index < job->position_count; index++) {
 		const struct file_position *position = &job->positions[index];
+		if (position->pipe && !position->queue_alias && transfer(position->duplicate, position->content, (size_t)position->after, 0) < 0) return -2;
 		if (position->alias) continue;
 		if (position->after_flags != position->flags && (fcntl(position->duplicate, F_SETFL, position->after_flags) < 0 ||
 			fcntl(position->duplicate, F_GETFL) != position->after_flags)) return -2;
-		if (descriptor_seek(position->duplicate, position->after_flags, position->after, SEEK_SET) != position->after) return -2;
+		if (!position->pipe && descriptor_seek(position->duplicate, position->after_flags, position->after, SEEK_SET) != position->after) return -2;
 	}
 	/* Output may feed another tracee. Release the offset lease before a pipe write can block. */
 	if (job->domain && job->domain->enabled && request_tracer(job, 256) < 0) return -2;
@@ -667,6 +759,7 @@ static void free_job(struct decision_job *job) {
 		close(job->positions[index].duplicate); close(job->positions[index].writer); free(job->positions[index].content); free(job->positions[index].path);
 	}
 	free(job->positions);
+	free(job->context);
 	free_events(job->events, job->count);
 	free(job);
 }
@@ -894,7 +987,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
 			if (detach_descriptor_table(current, &domain) < 0) goto fatal;
 			for (unsigned index = 0; current->table && index < current->table->count;)
-				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain, current->table->entries[index].fd, 0, 0);
+				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain, current->table->entries[index].fd, 0, 0, 0);
 				else index++;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
@@ -950,20 +1043,20 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		count > MAX_POSITIONS || close_input > 1) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		struct file_position *position = &positions[index];
-		*position = (struct file_position){.duplicate = -1}; initialized++;
+		*position = (struct file_position){.duplicate = -1, .writer = -1}; initialized++;
 		unsigned length;
 		int alias;
-		if (!fgets(line, sizeof(line), input) || sscanf(line, "%d %d %d %" SCNd64 " %u",
-			&position->descriptor, &alias, &position->flags, &position->before, &length) != 5 ||
+		if (!fgets(line, sizeof(line), input) || sscanf(line, "%d %d %d %" SCNd64 " %u %d",
+			&position->descriptor, &alias, &position->flags, &position->before, &length, &position->pipe) != 6 ||
 			position->descriptor < 0 || position->descriptor == 1 || position->descriptor == 2 || position->descriptor == INT_MAX ||
 			(close_input && position->descriptor == 0) || (index && position->descriptor <= positions[index - 1].descriptor) ||
-			position->before < 0 || length >= PATH_MAX || alias > position->descriptor || alias < 0) goto done;
+			position->before < 0 || length >= PATH_MAX || alias > position->descriptor || alias < 0 || (position->pipe != 0 && position->pipe != 1)) goto done;
 		position->alias = (int)index;
 		if (alias != position->descriptor) {
 			unsigned previous = 0;
 			while (previous < index && positions[previous].descriptor != alias) previous++;
 			if (previous == index || positions[previous].alias != (int)previous || length ||
-				positions[previous].flags != position->flags || positions[previous].before != position->before) goto done;
+				positions[previous].flags != position->flags || positions[previous].before != position->before || positions[previous].pipe != position->pipe) goto done;
 			position->alias = (int)previous;
 		} else if (!length) goto done;
 		position->path = calloc((size_t)length + 1, 1);
@@ -989,6 +1082,39 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		struct file_position *position = &positions[index];
 		if (position->alias != (int)index) {
 			position->duplicate = fcntl(positions[position->alias].duplicate, F_DUPFD_CLOEXEC, minimum);
+			position->writer = positions[position->alias].writer;
+		} else if (position->pipe) {
+			if (position->before || (position->flags & ~(O_NONBLOCK | 0x8000))) goto done;
+			for (unsigned previous = 0; previous < index; previous++) if (positions[previous].pipe && !strcmp(position->path, positions[previous].path)) {
+				position->writer = positions[previous].writer; break;
+			}
+			int fd;
+			if (position->writer >= 0) {
+				snprintf(line, sizeof(line), "/proc/self/fd/%d", positions[position->writer].duplicate);
+				fd = open(line, position->flags | O_CLOEXEC);
+			} else {
+				struct stat state;
+				int source = open(position->path, O_RDONLY | O_CLOEXEC), fds[2];
+				if (source < 0) goto done;
+				int valid = fstat(source, &state) == 0 && S_ISREG(state.st_mode) && state.st_size >= 0 && (uint64_t)state.st_size <= MAX_INPUT_BYTES;
+				if (valid) {
+					position->content_length = state.st_size;
+					position->content = malloc((size_t)state.st_size + 1);
+					valid = position->content && transfer(source, position->content, (size_t)state.st_size, 0) == 0;
+				}
+				close(source);
+				if (!valid || pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) goto done;
+				if (fcntl(fds[1], F_GETPIPE_SZ) < state.st_size && fcntl(fds[1], F_SETPIPE_SZ, state.st_size) < state.st_size) valid = 0;
+				if (valid) valid = transfer(fds[1], position->content, (size_t)state.st_size, 1) == 0 && fcntl(fds[0], F_SETFL, position->flags) == 0;
+				close(fds[1]); fd = fds[0]; position->writer = (int)index;
+				if (!valid) { close(fd); goto done; }
+				if (position->flags & 0x8000) {
+					snprintf(line, sizeof(line), "/proc/self/fd/%d", fd);
+					int reopened = open(line, position->flags | O_CLOEXEC); close(fd); fd = reopened;
+				}
+			}
+			if (fd < 0) goto done;
+			position->duplicate = fcntl(fd, F_DUPFD_CLOEXEC, minimum); close(fd);
 		} else if (!(position->flags & O_PATH)) {
 			const int allowed = O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | 0x8000 /* kernel O_LARGEFILE */ | O_NOATIME | O_NOFOLLOW | O_DIRECT | O_DIRECTORY;
 			if ((position->flags & ~allowed) || (position->flags & O_ACCMODE) == O_ACCMODE) goto done;
@@ -998,10 +1124,10 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 			close(fd);
 		}
 		struct stat state;
-		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !(S_ISREG(state.st_mode) ||
+		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !(S_ISREG(state.st_mode) || (position->pipe && S_ISFIFO(state.st_mode)) ||
 			((null_device(&state) || S_ISDIR(state.st_mode)) && !position->before)) ||
 			fcntl(position->duplicate, F_GETFL) != position->flags ||
-			descriptor_seek(position->duplicate, position->flags, position->before, SEEK_SET) != position->before) goto done;
+			(!position->pipe && descriptor_seek(position->duplicate, position->flags, position->before, SEEK_SET) != position->before)) goto done;
 	}
 	output = open(report, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
 	if (output < 0 || prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) goto done;
@@ -1028,7 +1154,15 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 	for (unsigned index = 0; index < count; index++) {
 		struct file_position *position = &positions[index];
 		int flags = fcntl(position->duplicate, F_GETFL);
-		off_t offset = descriptor_seek(position->duplicate, flags, 0, SEEK_CUR);
+		off_t offset;
+		if (position->pipe) {
+			unsigned char *bytes;
+			int remaining = pipe_bytes(position->duplicate, &bytes);
+			const struct file_position *image = &positions[position->writer];
+			offset = image->content_length - remaining;
+			int valid = remaining >= 0 && offset >= 0 && (!remaining || !memcmp(bytes, image->content + offset, (size_t)remaining));
+			free(bytes); if (!valid) goto done;
+		} else offset = descriptor_seek(position->duplicate, flags, 0, SEEK_CUR);
 		struct stat state;
 		if (offset < 0 || flags < 0 || fstat(position->duplicate, &state) < 0 || dprintf(output, "%d %d %jd %ju %ju\n",
 			position->descriptor, flags, (intmax_t)offset, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino) < 0) goto done;
@@ -1037,7 +1171,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 done:
 	if (input) fclose(input);
 	if (output >= 0 && close(output) < 0) result = 70;
-	for (unsigned index = 0; index < initialized; index++) { free(positions[index].path); close(positions[index].duplicate); }
+	for (unsigned index = 0; index < initialized; index++) { free(positions[index].path); free(positions[index].content); close(positions[index].duplicate); }
 	if (root_status >= 0 && WIFSIGNALED(root_status)) { signal(WTERMSIG(root_status), SIG_DFL); raise(WTERMSIG(root_status)); }
 	return result;
 }
@@ -1046,7 +1180,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("16");
+		puts("17");
 		return 0;
 	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {

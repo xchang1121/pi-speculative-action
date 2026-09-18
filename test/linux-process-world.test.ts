@@ -106,12 +106,12 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
-		const opath = mode.includes("opath"), launcher = mode === "native-shared-table" || mode === "native-unshare" || opath;
+		const pipe = mode.includes("pipe"), opath = mode.includes("opath"), launcher = pipe || mode === "native-shared-table" || mode === "native-unshare" || opath;
 		const nullDevice = mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
 		const directory = mode.includes("directory");
 		const descriptors = mode === "native-descriptors" || launcher || nullDevice || directory;
@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <unistd.h>
 static void *duplicate(void *unused) { (void)unused; if (dup2(3, 9) < 0) _exit(73); return 0; }
@@ -161,7 +162,9 @@ int main(int argc, char **argv) {
 	pthread_t worker; if (pthread_create(&worker, 0, duplicate, 0) || pthread_join(worker, 0)) return 75;
 	${mode === "native-unshare" ? "if (unshare(CLONE_FILES)) return 77;" : ""}
 	${opath ? 'int directory = open(".", O_PATH | O_DIRECTORY), file = open("fd.txt", O_PATH);\n\tif (directory < 0 || file < 0 || dup2(directory, 10) < 0 || dup2(directory, 11) < 0 || dup2(file, 12) < 0) return 79;\n\tclose(directory); if (file != 12) close(file);' : ""}
+	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; close(fds[1]); if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
 	puts(argv[1]); fflush(stdout);
+	${pipe ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; return 0; }' : ""}
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
 `);
@@ -511,7 +514,7 @@ int main(void) {
 			await writeFile(input, "abcdef");
 			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
 			await writeFile(report, "");
-			await writeFile(manifest, `FD1 3 0\n0 0 32768 1 ${Buffer.byteLength(input)}\n${input}\n3 0 32768 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)}\n${input}\n`);
+			await writeFile(manifest, `FD1 3 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0\n${input}\n3 0 32768 1 0 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0\n${input}\n`);
 			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
 				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
 				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
@@ -673,6 +676,60 @@ int main(int argc, char **argv) {
 			expect(await piped.execute({ command: `exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`,
 				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { pipeOutput += data.toString(); } })).toEqual({ exitCode: 0 });
 			expect(pipeOutput).toBe("1048576\nb");
+			const pipeProbe = path.join(root, "pipe-probe");
+			await writeFile(`${pipeProbe}.c`, `#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+	if (argc != 2) return 70;
+	int fds[2]; if (pipe2(fds, O_CLOEXEC | (!strcmp(argv[1], "packet") ? O_DIRECT : 0))) return 71;
+	if (strcmp(argv[1], "empty") && write(fds[1], "abcdef", 6) != 6) return 72;
+	int writer = fcntl(fds[1], F_DUPFD_CLOEXEC, 20); close(fds[1]);
+	if (dup2(fds[0], 0) < 0) return 73;
+	close(fds[0]);
+	if (dup2(0, 3) < 0) return 74;
+	int fd = open("/proc/self/fd/0", O_RDONLY); if (fd < 0 || dup2(fd, 8) < 0) return 75; close(fd);
+	if (strcmp(argv[1], "live")) { close(writer); writer = -1; }
+	pid_t child = fork(); if (child < 0) return 76;
+	if (!child) { char *command[] = {"true", 0}; execv("/bin/true", command); _exit(77); }
+	int status; if (waitpid(child, &status, 0) != child || status) return 78; close(writer);
+	if (!strcmp(argv[1], "flags") && (!(fcntl(3, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK))) return 79;
+	char bytes[6]; ssize_t size = read(0, bytes, sizeof(bytes));
+	return size < 0 || write(1, bytes, (size_t)size) != size;
+}
+`);
+			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", `${pipeProbe}.c`, "-o", pipeProbe]);
+			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure"]) {
+				const accepted = ["partial", "empty", "flags"].includes(mode);
+				let output = "", descriptors: HeldExecProcess["descriptors"];
+				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("pipe commit failure"); });
+				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: mode === "inspect" ? () => "inspect" : true, decide: async process => {
+					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+					descriptors = process.descriptors;
+					if (mode === "stale") {
+						const reader = await filesystem.open(`/proc/${process.pid}/fd/0`, "r");
+						try { await reader.read(Buffer.alloc(1)); } finally { await reader.close(); }
+					}
+					const descriptorOffsets = await Promise.all([0, 3, 8].map(async fd => {
+						const state = await filesystem.stat(`/proc/${process.pid}/fd/${fd}`, { bigint: true });
+						const flags = fd === 8 ? 32768 : 0;
+						return { fd, flags, device: String(state.dev), inode: String(state.ino), before: 0,
+							after: mode === "empty" ? 0 : mode === "overrun" ? 7 : mode === "queue-conflict" && fd === 8 ? 2 : 3,
+							...(mode === "flags" && fd !== 8 ? { afterFlags: 2048 } : {}), content: Buffer.from(mode === "empty" ? "" : mode === "contents" ? "xxxxxx" : "abcdef") };
+					}));
+					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit };
+				} });
+				const running = executor.execute({ command: `'${pipeProbe}' ${mode}`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
+				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
+				else {
+					expect(await running, mode).toEqual({ exitCode: 0 });
+					expect(output, mode).toBe(accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef");
+				}
+				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
+				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
+			}
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",
 				"null", "null-offset", "null-content", "zero", "status-set", "status-clear", "status-conflict", "status-unsupported", "directory", "directory-offset", "directory-content", "directory-replaced", "directory-no-path", "opath", "opath-offset", "opath-content", "opath-flags", "directory-opath", "directory-symlink"]) {
 				await writeFile(input, "abcdef");

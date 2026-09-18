@@ -14,9 +14,9 @@ import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 16;
+const HELPER_PROTOCOL_VERSION = 17;
 const WIRE_PROTOCOL_VERSION = 1;
-const MAX_REQUEST_BYTES = 32768;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 const PRIVATE_ENV = {
@@ -44,7 +44,9 @@ export interface HeldExecProcess {
 }
 
 export interface HeldFileDescriptor {
-	readonly type?: "null" | "directory";
+	readonly type?: "null" | "directory" | "pipe";
+	/** Native non-consuming pipe snapshot; `owned` separately authorizes adoption. */
+	readonly pipeHex?: string;
 	readonly fd: number;
 	readonly alias: number;
 	readonly device: string;
@@ -83,7 +85,7 @@ export type HeldExecDecision =
 			readonly descriptorOffsets?: readonly {
 				readonly fd: number; readonly device: string; readonly inode: string;
 				readonly flags: number; readonly before: number; readonly after: number; readonly afterFlags?: number; readonly path?: string;
-				/** Replace inode contents through a separate writer; never disturb OFD flags or position. */
+				/** File replacement bytes, or the expected full pipe queue before consuming `after` bytes. */
 				readonly content?: Buffer;
 			}[];
 			/** Called only after the native tracer has made original execution impossible. */
@@ -363,6 +365,13 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
 			throw new Error("inherited descriptor refers to a denied resource");
 		if (descriptor.type) {
+			if (descriptor.type === "pipe") {
+				if (!/^pipe:\[\d+\]$/.test(endpoint) || descriptor.pipeHex === undefined) throw new Error("unproven inherited pipe");
+				const bytes = Buffer.from(descriptor.pipeHex, "hex"); remaining -= bytes.length;
+				if (remaining < 0) throw new Error("inherited pipe exceeds input budget");
+				const input = { ...identity, image: fd, contentDigest: sha256Digest(bytes), content: bytes.toString("base64") };
+				inputs.set(fd, input); images.set(file, input); continue;
+			}
 			if (descriptor.type === "directory") {
 				const metadata = await stat(endpoint, { bigint: true });
 				if (!metadata.isDirectory() || String(metadata.dev) !== descriptor.device || String(metadata.ino) !== descriptor.inode) throw new Error("held directory pathname changed");
@@ -416,7 +425,8 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (!descriptor || descriptor.type !== undefined && !["null", "directory"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
+		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
+			(descriptor.type === "pipe" ? typeof descriptor.pipeHex !== "string" || descriptor.pipeHex.length > 4 * 1024 * 1024 || descriptor.pipeHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.pipeHex) : descriptor.pipeHex !== undefined) ||
 			![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>

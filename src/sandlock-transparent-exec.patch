@@ -160,6 +160,45 @@ index 6e4ab93..23e21ac 100644
  }
  
  /// Open `virtual_path` within the child's virtual namespace, returning an fd to
+@@ -715,5 +737,4 @@ fn open_in_namespace(
+     // Category 2, named directly: skip the open and dup straight away.
+     if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
+-        return crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+-            .map_err(|_| libc::EBADF);
++        return open_owned_fd(child_pid, child_fd, flags);
+     }
+@@ -728,8 +749,7 @@ fn open_in_namespace(
+         // Category 2, reached through symlinks.
+         Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
+             match resolve_self_fd_magic(ctx, child_pid, &vp_str) {
+-                Some(child_fd) => crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+-                    .map_err(|_| errno),
++                Some(child_fd) => open_owned_fd(child_pid, child_fd, flags),
+                 None => Err(errno),
+             }
+         }
+@@ -740,3 +760,21 @@ fn open_in_namespace(
++fn open_owned_fd(pid: u32, fd: i32, flags: i32) -> Result<OwnedFd, i32> {
++    let pin = crate::seccomp::notif::dup_fd_from_pid(pid, fd).map_err(|_| libc::EBADF)?;
++    let mut state: libc::stat = unsafe { std::mem::zeroed() };
++    if unsafe { libc::fstat(pin.as_raw_fd(), &mut state) } == 0
++        && state.st_mode & libc::S_IFMT == libc::S_IFIFO
++        && flags & !(libc::O_NONBLOCK | libc::O_CLOEXEC | 0x8000) == 0
++        && unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY
++    {
++        // A proc-fd open creates an independent OFD over the same pipe queue.
++        // Reopen a pinned read end; never grant a writer or resolve another task's path.
++        let name = std::ffi::CString::new(format!("/proc/self/fd/{}", pin.as_raw_fd())).map_err(|_| libc::EINVAL)?;
++        let opened = unsafe { libc::open(name.as_ptr(), flags | libc::O_CLOEXEC) };
++        if opened < 0 { return Err(last_errno(libc::EIO)); }
++        return Ok(unsafe { OwnedFd::from_raw_fd(opened) });
++    }
++    Ok(pin)
++}
++
+ /// If `path` is a self-referential `/proc/.../fd/N` magic link for the calling
+ /// child (`/proc/self`, `/proc/thread-self`, or `/proc/<child_pid>`), return the
+ /// child fd `N`. The fd component must be a bare number (no trailing path).
 @@ -867,6 +889,12 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
      None
  }

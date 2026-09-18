@@ -141,15 +141,18 @@ describe("strace provenance decoder", () => {
 	});
 
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
-		for (const operand of ["3</work/input>", "9</work/input>", "3</work/other>", "3<pipe:[7]>", "3", "3</work/input (deleted)>"]) {
+		for (const operand of ["3</work/input>", "9</work/input>", "3</work/other>", "3<pipe:[7]>", "9<pipe:[7]>", "3<pipe:[8]>", "3", "3</work/input (deleted)>"]) {
 			const line = `fcntl(${operand}, F_GETFL) = 0x8000 (flags O_RDONLY|O_LARGEFILE)`;
 			expect((await observe({ 100: [EXEC, line] })).taints).toContain("unsupported_syscall");
-			const captured = await observe({ 100: [EXEC, line] }, { inheritedFileImages: ["/work/input"] });
-			expect(captured.taints.includes("unsupported_syscall")).toBe(!operand.endsWith("</work/input>"));
+			const captured = await observe({ 100: [EXEC, line] }, { inheritedFileImages: ["/work/input", "pipe:[7]"] });
+			expect(captured.taints.includes("unsupported_syscall")).toBe(!operand.endsWith("</work/input>") && !operand.endsWith("<pipe:[7]>"));
 		}
 		const filter = straceCommand("strace", "/trace", ["program"]).find(value => value.startsWith("trace="))!;
 		for (const syscall of ["fcntl", "fcntl64", "flock"]) expect(filter.split(/[,=]/)).toContain(syscall);
 		for (const [line, taints, semanticGap] of [
+			['pipe2([3, 4], O_DIRECT|O_CLOEXEC) = 0', ["unsupported_syscall"]],
+			['splice(3<pipe:[7]>, NULL, 4<pipe:[8]>, NULL, 1, 0) = 1', ["unsupported_syscall"]],
+			['tee(3<pipe:[7]>, 4<pipe:[8]>, 1, 0) = 1', ["unsupported_syscall"]],
 			['fcntl(3</work/input>, F_GETLK, {l_type=F_UNLCK, l_whence=SEEK_SET, l_start=0, l_len=0}) = 0', ["ipc"]],
 			['fcntl64(3</work/input>, F_OFD_GETLK, {l_type=F_WRLCK, l_pid=-1}) = 0', ["ipc"]],
 			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
