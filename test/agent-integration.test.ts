@@ -1195,10 +1195,12 @@ describe("speculative action host", () => {
 		const observe = (operations: readonly ReturnType<typeof binding>[]) => controller.source.observe!({ ...request, action, operations,
 			consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: concrete, tools: [tool] },
 			tool: "read", concrete, output: { result: textResult("ready"), isError: false }, durationMs: 20, order: 0 });
+		let proposedBindings: unknown[] = [];
 		const proposed = async () => {
 			const plan = await controller.source.propose(request);
 			if (!plan) return undefined;
 			if (!("actions" in plan)) throw new Error("Expected a Pattern proposal");
+			proposedBindings = plan.actions.flatMap(action => action.type === "operation" ? [action.operation] : []);
 			const internal = plan.actions.find(action => action.type === "operation");
 			return internal && { ...internal, proposalID: plan.id, actionID: internal.id, feedback: internal.feedback };
 		};
@@ -1209,6 +1211,7 @@ describe("speculative action host", () => {
 			controller.turnFinished(request.startInput, request.settings, false);
 			const internal = (await proposed())!;
 			expect(internal.operation).toBe(slow);
+			expect(proposedBindings).toEqual([slow, fast]);
 			slowMs = 1;
 			expect((await proposed())!.operation).toBe(fast);
 			slowMs = 12;
