@@ -260,6 +260,8 @@ export interface SpeculativeActionRuntimeAdapter<
 	}) => MaybePromise<CandidatePreflight>;
 	readonly executeCandidate: (input: Omit<RuntimeTurnContext<StartInput, StateData>, "settings"> & BoundCandidateCall & {
 		readonly parentWorld?: WorldBranch<Output>;
+		/** Sealed input owners leased until execution settles; the backend must retain any derived proof. */
+		readonly inputs?: (path: string) => Iterable<object>;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 		readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
 	}) => MaybePromise<WorldBranch<Output>>;

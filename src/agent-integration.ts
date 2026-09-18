@@ -352,7 +352,7 @@ export function createSpeculativeActionHost(
 		},
 		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
 			checkPermission(stateData.tools.get(toolName), { toolName, args: concrete, action, route, signal: signal ?? new AbortController().signal }, true),
-		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, onOperationAdopted, acceptOperationScope }) => {
+		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, inputs, onOperationAdopted, acceptOperationScope }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = structuredClone(concrete);
@@ -361,6 +361,7 @@ export function createSpeculativeActionHost(
 				route,
 				{
 					cwd: options.cwd, tool, toolName, args, action, callID, signal,
+					inputs,
 					onOperationAdopted,
 					acceptOperationScope,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },

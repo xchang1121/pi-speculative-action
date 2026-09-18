@@ -351,6 +351,19 @@ export class ResourceVersionManager {
 		return this.captureToken([]);
 	}
 
+	/** Own an evaluated query's evidence without keeping its input buffers or source branch alive. */
+	retain(token: ResourceVersionToken): ResourceVersionToken {
+		if (!this.open || token.manager !== this || token.root !== this.root || !token.observations.size)
+			throw new Error("resource_version_owner_changed");
+		token.view?.assertComplete(true);
+		const observations = new Map(token.observations);
+		this.references++;
+		return { ...token, observations, view: undefined, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => {
+			observations.clear();
+			if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.();
+		}) };
+	}
+
 	private async captureToken(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");

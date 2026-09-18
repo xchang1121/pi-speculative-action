@@ -309,6 +309,27 @@ describe("speculative action resource versions", () => {
 		} finally { gate.release(); await pending?.catch(() => {}); await token.release(); manager.close(); }
 	});
 
+	test("retains query evidence independently of sealed input buffers and releases its manager once", async () => {
+		const root = await workspace({ value: "A", unused: "B" }), idle = vi.fn();
+		const manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
+		const token = await manager.capture(undefined, 8192), view = token.view!;
+		let retained: ResourceVersionToken | undefined;
+		try {
+			await view.readFile(path.join(root, "value"));
+			await view.exists(path.join(root, "missing"));
+			expect(() => manager.retain(token)).toThrow("resource_snapshot_not_sealed");
+			view.seal(); retained = manager.retain(token);
+			expect(retained.view).toBeUndefined(); expect(retained.observations).not.toBe(token.observations);
+			await token.release(); expect(idle).not.toHaveBeenCalled();
+			await fs.writeFile(path.join(root, "unused"), "irrelevant");
+			expect((await manager.validate(retained)).expired).toBe(false);
+			await fs.writeFile(path.join(root, "missing"), "present");
+			expect((await manager.validate(retained)).expired).toBe(true);
+			await retained.release(); await retained.release(); expect(idle).toHaveBeenCalledOnce();
+			expect(() => manager.retain(retained!)).toThrow("resource_version_owner_changed");
+		} finally { await retained?.release(); await token.release(); manager.close(); }
+	});
+
 	test("confines borrowed names, aliases and negative observations to the current root", async () => {
 		const root = await workspace({ "inside/data.txt": "A", "outside/data.txt": "B" });
 		const inside = path.join(root, "inside"), outside = path.join(root, "outside"), link = path.join(inside, "link");
