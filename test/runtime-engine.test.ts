@@ -1308,6 +1308,31 @@ describe("structural speculative runtime", () => {
 		} finally { gate.release(); await pending; await runtime.dispose(); }
 	});
 
+	it("keeps a useful result under pressure after its other inputs release their budget", async () => {
+		let bytes = 2048, budget = 4096;
+		const dispose = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
+		const { runtime, ready } = harness({
+			settings: () => ({ ...settings, resourceCacheMaxBytes: budget }),
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "seed" ? plan("source") : undefined }),
+			executeCandidate: async () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
+				...world("retained", { validate: async () => validResource(), onDispose: dispose }),
+				get capturedBytes() { return bytes; },
+				invalidateInputs: paths => { expect(paths).toHaveLength(1); expect(paths[0]!.replaceAll("\\", "/")).toMatch(/\/workspace\/other.txt$/); bytes = 64; },
+			})),
+		});
+		try {
+			await runtime.startTurn(start("seed")); await ready.promise;
+			const mutation = await runtime.prepareActorCall({ ...call("seed"), tool: "write", input: { path: "other.txt", content: "changed" } });
+			expect(mutation?.output).toBeUndefined();
+			await mutation!.settle(new TimelineInterval(1, 2), "written");
+			expect(bytes).toBe(64); budget = 256;
+			await runtime.finishTurn(call("seed")); await runtime.startTurn(start("reuse"));
+			expect((await runtime.prepareActorCall(call("reuse")))?.output).toBe("retained");
+			expect(dispose).not.toHaveBeenCalled();
+		} finally { await runtime.dispose(); }
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	it.each([0, 40])("calibrates loss and recovery per Actor call across competing cached results with %ims capture", async (captureMs) => {
 		let now = 1, cost = 20;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);

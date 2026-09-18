@@ -302,17 +302,21 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
 	});
 
-	test("revokes changed inputs and preparations while retaining siblings and old result evidence", async () => {
+	test.each([false, true])("revokes changed inputs and reclaims preparations after borrowers finish (%s)", async (borrowed) => {
 		const root = await workspace({ a: "A", b: "B" }), a = path.join(root, "a"), b = path.join(root, "b");
 		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;
 		const binding = {}, dispose = vi.fn(), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations, file: string) =>
 			({ value: (await inputs.readFile(file)).toString(), bytes: 1, dispose }));
 		const prepare = (file: string) => view.evaluate(v => v.prepare(binding, file, v => build(v, file), async value => value));
-		const gate = gated(); let active: Promise<unknown> | undefined;
+		const gate = gated(), consuming = gated(); let active: Promise<unknown> | undefined, consumer: Promise<unknown> | undefined;
 		const capturing = await manager.capture(undefined, 8192);
 		try {
 			for (const file of [a, b]) await view.prepare(binding, file, v => build(v, file), async value => value);
 			view.seal(); const bytes = view.bytes;
+			if (borrowed) {
+				consumer = view.evaluate(v => v.prepare(binding, a, v => build(v, a), async value => { await consuming.wait(); return value; }));
+				await consuming.entered;
+			}
 			active = capturing.view!.prepare(binding, "in-flight", async inputs => {
 				const resource = await build(inputs, a); await gate.wait(); return resource;
 			}, async value => value);
@@ -326,13 +330,18 @@ describe("speculative action resource versions", () => {
 				expect(opened).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
 			} finally { opened.mockRestore(); stat.mockRestore(); }
 			await expect(prepare(a)).rejects.toThrow("resource_access_unproven");
-			expect(dispose).not.toHaveBeenCalled(); expect(view.bytes).toBe(bytes);
-			gate.release(); await active; expect(dispose).toHaveBeenCalledOnce();
+			expect(view.bytes).toBeLessThan(bytes);
+			expect(dispose).toHaveBeenCalledTimes(borrowed ? 0 : 1);
+			if (borrowed) {
+				const heldBytes = view.bytes; consuming.release(); expect(await consumer).toBe("A");
+				await nextTurn(); expect(dispose).toHaveBeenCalledOnce(); expect(view.bytes).toBeLessThan(heldBytes);
+			}
+			gate.release(); await active; expect(dispose).toHaveBeenCalledTimes(2);
 			capturing.view!.seal();
 			await expect(capturing.view!.evaluate(v => v.prepare(binding, "in-flight", v => build(v, a), async value => value))).rejects.toThrow("resource_access_unproven");
 			expect((await manager.validate(token)).expired).toBe(true);
 			await fs.writeFile(a, "A"); expect((await manager.validate(token)).expired).toBe(false);
-		} finally { gate.release(); await active?.catch(() => {}); await token.release(); await capturing.release(); manager.close(); }
+		} finally { consuming.release(); gate.release(); await consumer?.catch(() => {}); await active?.catch(() => {}); await token.release(); await capturing.release(); manager.close(); }
 		expect(dispose).toHaveBeenCalledTimes(3);
 	});
 

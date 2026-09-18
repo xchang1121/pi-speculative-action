@@ -135,7 +135,7 @@ export function createResourceSnapshotExecutionWorld(
 						captured?.view?.seal();
 						for (const version of query.versions) if (!captured || version.view !== captured.view) retained.push(version.manager.retain(version));
 						const branch = resourceSnapshotBranch(query.output, captured ? [captured, ...retained] : retained,
-							context.action, 0, actionSemantics, bytes);
+							context.action, 0, actionSemantics);
 						captured = undefined;
 						return branch;
 					} catch {
@@ -210,16 +210,20 @@ export async function createCommittedResourceInputs(
 	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
 	try {
 		if (!version.view) throw new Error("resource_snapshot_budget_exceeded");
-		return { ...resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS), inputsOnly: true,
-			commit: async () => { throw new Error("input_only_branch"); } };
+		return Object.assign(resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS), { inputsOnly: true as const,
+			commit: async () => { throw new Error("input_only_branch"); } });
 	} catch (error) { await version.release(); throw error; }
 }
 
 function resourceSnapshotBranch(
 	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, setupMs: number, semantics: ActionSemanticsRegistry,
-	capturedBytes = versions[0]!.view?.bytes ?? 0,
 ): WorldBranch<ToolSettlement> {
 	const version = versions[0]!;
+	// Input revocation releases data, not the old result's immutable freshness evidence.
+	let proofBytes = 0;
+	for (const token of versions) for (const [key, entry] of token.observations) {
+		proofBytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
+	}
 	const { executionFingerprint } = action, owner = { versions, executionFingerprint };
 	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, owner);
@@ -241,7 +245,7 @@ function resourceSnapshotBranch(
 		invalidateInputs: paths => { if (owned) invalidateResourceInputs(owned, paths); },
 		inputResources,
 		reconstructionScope: "current_action",
-		capturedBytes,
+		get capturedBytes() { return proofBytes + (version.view?.bytes ?? 0); },
 		executionMetrics: Object.freeze({ setupMs }),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: () => validate(owned),

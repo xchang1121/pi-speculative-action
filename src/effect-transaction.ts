@@ -188,6 +188,7 @@ export class EffectTransactionCoordinator<Output> {
 
 function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>): EffectTransaction<Output> {
 	const shared = attempt.descriptor.route.reuse === "shared_result";
+	const retainedBytes = Object.getOwnPropertyDescriptor(branch, "capturedBytes")?.get?.bind(branch);
 	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
 		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputsOnly: branch.inputsOnly, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
@@ -245,6 +246,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		get state() { return attempt.stateValue; },
 		get latestValidation() { return validation; },
 		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
+		get capturedBytes() { return retainedBytes ? retainedBytes() : sealed.capturedBytes; },
 		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
 		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
 		takeCommittedInputs: sealed.takeCommittedInputs ? async (maxBytes) => {
