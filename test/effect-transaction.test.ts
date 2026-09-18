@@ -128,10 +128,10 @@ describe("EffectTransactionCoordinator", () => {
 	it.each(["external", "callback"])("retires resources after admitted operations finish (close=%s)", async (closing) => {
 		for (const phase of ["reconstruction", "validation", "query-validation", "committing", "committed"] as const) for (const fails of [false, true]) {
 			const gate = gated();
-			const failure = new Error("borrow failed"), dispose = vi.fn();
+			const failure = new Error("borrow failed"), dispose = vi.fn(), queryDispose = vi.fn();
 			const borrow = async () => {
 				if (closing === "callback") void transaction.abort();
-				await gate.wait(); expect(dispose).not.toHaveBeenCalled(); if (fails) throw failure;
+				await gate.wait(); expect(dispose).not.toHaveBeenCalled(); expect(queryDispose).not.toHaveBeenCalled(); if (fails) throw failure;
 			};
 			const coordinator = new EffectTransactionCoordinator<string>();
 			const transaction = await coordinator.execute(coordinator.begin({ tool: "read", route: { ...route, reuse: "shared_result" } }), async () => branch({
@@ -139,7 +139,7 @@ describe("EffectTransactionCoordinator", () => {
 				validateAndCommit: closing === "callback" && phase === "validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined,
 				reconstruct: async () => {
 					if (phase !== "query-validation") await borrow();
-					return { output: "rebuilt", validate: phase === "query-validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined };
+					return { output: "rebuilt", dispose: queryDispose, validate: phase === "query-validation" ? async () => { await borrow(); return { status: "valid", metrics: metrics() }; } : undefined };
 				},
 				commit: async () => { if (phase === "committing") await borrow(); return "committed"; }, dispose,
 			}));
@@ -159,6 +159,7 @@ describe("EffectTransactionCoordinator", () => {
 			for (const result of await operations) expect(result.status).toBe(fails && phase !== "validation" && phase !== "query-validation" ? "rejected" : "fulfilled");
 			expect(await late).toMatchObject([{ status: "fulfilled", value: { status: "indeterminate" } }, { status: "fulfilled", value: undefined }]);
 			expect(dispose).toHaveBeenCalledOnce();
+			expect(queryDispose).toHaveBeenCalledTimes(phase === "query-validation" ? 1 : !fails && (phase === "reconstruction" || phase === "committed") ? closing === "external" ? 2 : 1 : 0);
 			expect(transaction.state).toBe(phase === "committed" || (phase === "committing" && !fails) ? "committed" : phase === "committing" ? "poisoned" : "aborted");
 			expect(await transaction.validate()).toMatchObject({ status: "indeterminate" });
 			if (query) expect(await query.validate!()).toMatchObject({ status: "indeterminate" });
@@ -240,7 +241,8 @@ describe("EffectTransactionCoordinator", () => {
 				compatibility: { status: "incompatible" as const, backend: "test", code: "sealed_incompatible" } };
 			const commit = vi.fn(async function (this: WorldBranch<typeof output>) { expect(this).toBe(source); return output; });
 			const dispose = vi.fn(function (this: WorldBranch<typeof output>) { expect(this).toBe(source); });
-			const query = { output: expected, validate: async function () { expect(this).toBe(query); return { status: "valid" as const, metrics: metrics() }; } };
+			const queryDispose = vi.fn(function (this: unknown) { expect(this).toBe(query); });
+			const query = { output: expected, dispose: queryDispose, validate: async function () { expect(this).toBe(query); return { status: "valid" as const, metrics: metrics() }; } };
 			const source: WorldBranch<typeof output> = { ...metadata, checkpoint, output, commit, dispose,
 				inputResources: [{ path: "/workspace/sealed.txt" }], reconstructionScope: "current_action",
 				reconstruct: async function () { expect(this).toBe(source); return query; },
@@ -281,11 +283,13 @@ describe("EffectTransactionCoordinator", () => {
 			const rebuilt = await transaction.reconstruct!({ action: buildPiActionKey("read", { path: "sealed.txt" }, "/workspace")!,
 				args: {}, callID: "actor", signal: new AbortController().signal });
 			expect(rebuilt?.output).toEqual(expected); expect(!!rebuilt?.validate).toBe(!captured);
-			Object.assign(query, { validate: replaced });
+			Object.assign(query, { validate: replaced, dispose: replaced });
 			if (!captured) {
 				expect((await rebuilt?.validate?.())?.status).toBe("valid");
 				expect(attempt.state).toBe("sealed");
 			}
+			await rebuilt?.dispose?.(); await rebuilt?.dispose?.();
+			if (!captured) expect((await rebuilt?.validate?.())?.status).toBe("indeterminate");
 			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
 			await transaction.validate!();
 			expect(attempt.state).toBe("validated"); expect(commit).toHaveBeenCalledTimes(Number(captured));
@@ -294,7 +298,7 @@ describe("EffectTransactionCoordinator", () => {
 			expect(transaction.commitMetrics).toMatchObject({ resourcesCommitted: 1 });
 			first.content.push("Actor edit"); (first.details as { value: string[] }).value.push("Actor edit");
 			expect(second).toEqual(expected); expect(commit).toHaveBeenCalledTimes(captured ? 2 : 1);
-			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce(); expect(replaced).not.toHaveBeenCalled();
+			await transaction.dispose(); expect(dispose).toHaveBeenCalledOnce(); expect(queryDispose).toHaveBeenCalledOnce(); expect(replaced).not.toHaveBeenCalled();
 		}
 		expect(getter).not.toHaveBeenCalled();
 	});

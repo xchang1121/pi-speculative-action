@@ -194,6 +194,8 @@ export interface WorldBranch<Output> {
 		readonly capturedBytes?: number;
 		/** A composed query cannot fall back to the source branch's narrower proof. */
 		readonly requiresQueryValidation?: true;
+		/** Caller-owned query resources; release after its last reader or retained view. */
+		readonly dispose?: () => void | Promise<void>;
 	} | undefined>;
 	/** Shared adoption returns the sealed output; only exclusive effects may return an updated settlement.
 	 * Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */

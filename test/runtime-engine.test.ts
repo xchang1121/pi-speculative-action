@@ -1156,13 +1156,13 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each((["legacy-miss", "valid", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
+	it.each((["legacy-miss", "valid", "proof-missing", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
 		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup", "input-scope"] as const)
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
-		const commit = vi.fn(async () => "committed");
+		const commit = vi.fn(async () => "committed"), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
 		const outputOnly = scenario.startsWith("output-");
@@ -1189,7 +1189,9 @@ describe("structural speculative runtime", () => {
 			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
 			await gate.wait();
 			if (scenario === "rejected") throw new Error("evaluation failed");
-			return scenario === "uncovered" ? undefined : { output: "narrow", ...(scoped ? { validate: queryValidate } : {}) };
+			if (scenario === "uncovered") return undefined;
+			const dispose = vi.fn(); queryDisposals.push(dispose);
+			return { output: "narrow", dispose, ...(scoped ? { validate: queryValidate } : {}), ...(scenario === "proof-missing" ? { requiresQueryValidation: true as const } : {}) };
 		});
 		const { runtime, events, ready: candidateReady } = harness({
 			source: planSource({
@@ -1255,9 +1257,10 @@ describe("structural speculative runtime", () => {
 			}
 		} finally {
 			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
-			await runtime.finishTurn({ ...actor, terminal: true });
+			await runtime.finishTurn({ ...actor, terminal: true }); await runtime.dispose();
 			admission.mockRestore(); adoption.mockRestore();
 		}
+		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
 		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? outputOnly ? 2 : 1 : 0);
 		if (scenario === "output-valid") expect(summarizeSpeculativeTrace(events)).toMatchObject({
 			actorActions: 2, speculativeHits: 2, exactReuseHits: 0, partialResultReuseHits: 2,
@@ -1439,12 +1442,12 @@ describe("structural speculative runtime", () => {
 	});
 
 	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
-		const disposed = vi.fn();
+		const disposed = vi.fn(), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const learned = entries === 2 && bytes === 4096 && !proofBytes, unretained = bytes === 128;
 		const queryValidate = vi.fn(async () => { now += 3; return validResource(); });
-		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; return { output: String((args as { offset: number }).offset), capturedBytes: proofBytes, ...(proofBytes ? { validate: queryValidate } : {}) }; });
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; const dispose = vi.fn(); queryDisposals.push(dispose); return { dispose, output: String((args as { offset: number }).offset), capturedBytes: proofBytes, ...(proofBytes ? { validate: queryValidate } : {}) }; });
 		const { runtime, events, executions: executionCount, ready } = harness({
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "first"
 				? plan("inputs", { path: "input", offset: 1, limit: 1 }) : undefined }),
@@ -1472,6 +1475,8 @@ describe("structural speculative runtime", () => {
 				}
 			}
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(executionCount()).toBe(1);
+			await nextTurn();
+			expect(queryDisposals.filter(dispose => dispose.mock.calls.length)).toHaveLength(proofBytes || unretained ? evaluations : entries === 1 ? evaluations - 1 : 0);
 			expect(queryValidate).not.toHaveBeenCalled(); // Oversized proof falls back to the full proof without repeating the query.
 			await runtime.finishTurn({ ...call("second"), terminal: true });
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
@@ -1488,6 +1493,35 @@ describe("structural speculative runtime", () => {
 			});
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
+		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it("keeps an Actor query proof alive while its cached view is evicted", async () => {
+		const gate = gated(), releases: ReturnType<typeof vi.fn>[] = [];
+		let validating = false;
+		const { runtime, ready, events } = harness({
+			source: planSource({ propose: () => plan("inputs", { path: "input", offset: 1, limit: 1 }) }),
+			settings: () => ({ ...settings, resourceCacheMaxEntries: 1, resourceCacheMaxBytes: 8192 }),
+			execute: () => ({ ...world("1"), inputResources: [{ path: "/workspace/input" }],
+				reconstruct: async ({ args }: Parameters<NonNullable<WorldBranch<string>["reconstruct"]>>[0]) => {
+					const offset = (args as { offset: number }).offset, dispose = vi.fn(); releases.push(dispose);
+					return { output: String(offset), dispose, capturedBytes: 4096, requiresQueryValidation: true,
+						validate: async () => { if (validating && offset === 2) await gate.wait(); expect(dispose).not.toHaveBeenCalled(); return validResource(); } };
+				} }),
+		});
+		let actor: ReturnType<typeof runtime.prepareActorCall> | undefined;
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			const query = call("turn", { path: "input", offset: 2, limit: 1 });
+			await runtime.previewActorCall(query); validating = true;
+			actor = runtime.prepareActorCall(query); await gate.entered;
+			await runtime.previewActorCall({ ...call("turn", { path: "input", offset: 3, limit: 1 }), id: "evict" });
+			await nextTurn(); expect(releases).toHaveLength(2); expect(releases[0]).not.toHaveBeenCalled();
+			gate.release(); expect((await actor)?.output).toBe("2");
+			await runtime.finishTurn({ ...query, terminal: false });
+			expect(events.at(-1)!.cache.resultBytes).toBeGreaterThanOrEqual(4096);
+		} finally { gate.release(); await actor; await runtime.dispose(); }
+		for (const dispose of releases) expect(dispose).toHaveBeenCalledOnce();
 	});
 
 	it.each(["input", "executor", "denied", "closing"])("keeps prepared intent non-authoritative through %s", async (phase) => {
