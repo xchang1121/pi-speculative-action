@@ -270,6 +270,12 @@ function resourceSnapshotBranch(
 			try {
 				const query = await evaluateResourceInputs(owner, request, semantics, undefined, retained);
 				if (!query) return undefined;
+				// Borrowed data is already evaluated; only its selected evidence must outlive the source view.
+				for (const [index, token] of query.versions.entries()) {
+					if (versions.some(owned => owned.release === token.release) || retained.includes(token)) continue;
+					const proof = token.manager.retain({ ...token, view: undefined });
+					retained.push(proof); query.versions[index] = proof;
+				}
 				const result = { output: query.output, validate: () => validate(released ? undefined : query.versions), capturedBytes: query.capturedBytes,
 					...(query.versions.length > 1 || retained.length ? { requiresQueryValidation: true as const } : {}),
 					...(retained.length ? { dispose } : {}),

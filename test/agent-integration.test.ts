@@ -503,7 +503,7 @@ describe("speculative action host", () => {
 		expect(worldDisposed).toHaveBeenCalledOnce();
 	});
 
-	it.for([false, true])("composes sealed names and bytes without dropping source proofs (oversized=%s)", async (oversized, { skip }) => {
+	it.for([false, true])("owns composed query proofs across turns and source retirement (oversized=%s)", async (oversized, { skip }) => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		await writeFile(path.join(cwd, ".ignore"), "# shared selection rules\n");
@@ -545,7 +545,7 @@ describe("speculative action host", () => {
 			const original = await fs.readFile(path.join(cwd, "notes.txt"));
 			const args = { pattern: "two", path: "." }, expected = await tools[0]!.execute("reference", args);
 			const actor = vi.fn(() => tools[0]!.execute("native", args));
-			const call = { turnID: "query", id: "query", tool: "grep", args, tools };
+			let call = { turnID: "query", id: "query", tool: "grep", args, tools };
 			await host.previewActorCall(call);
 			for (const id of ["query", "retained"]) expect(await host.execute({ ...call, id }, undefined, actor)).toEqual(expected);
 			expect(actor.mock.calls.length, JSON.stringify(events.filter(event => event.type === "actor_action").map(event => event.settlement))).toBe(0);
@@ -556,15 +556,21 @@ describe("speculative action host", () => {
 			await writeFile(path.join(cwd, "notes.txt"), original);
 			expect(await host.execute({ ...call, id: "restored-source" }, undefined, actor)).toEqual(expected);
 			expect(actor).toHaveBeenCalledOnce();
+			await host.finishTurn("query"); await host.startTurn({ ...startInput(tools[0]!, "again"), tools });
+			call = { ...call, turnID: "again" }; const beforeRetirement = evaluations;
 			await sources.get("read")!.dispose();
 			expect(await host.execute({ ...call, id: "retired-source" }, undefined, actor)).toEqual(expected);
-			expect(actor).toHaveBeenCalledTimes(2);
+			expect(actor).toHaveBeenCalledTimes(oversized ? 2 : 1);
+			if (!oversized) expect(evaluations).toBe(beforeRetirement);
+			await writeFile(path.join(cwd, "notes.txt"), "two changed after retirement\n");
+			expect(await host.execute({ ...call, id: "changed-after-retirement" }, undefined, actor)).toEqual(await tools[0]!.execute("reference", args));
+			expect(actor).toHaveBeenCalledTimes(oversized ? 3 : 2);
 			const find = { pattern: "notes.txt", path: "." }, findActor = vi.fn(() => tools[2]!.execute("native-find", find));
 			expect(await host.execute({ ...call, id: "surviving-source", tool: "find", args: find }, undefined, findActor))
 				.toEqual(await tools[2]!.execute("reference-find", find));
 			expect(findActor).not.toHaveBeenCalled();
-			await host.finishTurn("query", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 4, exactReuseHits: 0, predictionsMatched: 0 });
+			await host.finishTurn(call.turnID, true);
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: oversized ? 4 : 5, exactReuseHits: 0, predictionsMatched: 0 });
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 
