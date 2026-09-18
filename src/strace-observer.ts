@@ -54,7 +54,7 @@ export interface StraceObservationOptions {
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
 	 */
 	readonly guardFilesystemSemanticsWithin?: readonly string[];
-	/** Private regular-file images whose inherited OFD flags are reproduced and sealed by the caller. */
+	/** Private input images whose inherited OFD flags are reproduced and sealed by the caller. */
 	readonly inheritedFileImages?: readonly string[];
 }
 
@@ -355,6 +355,8 @@ export async function observeStrace(
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
 			if (MODELED_METADATA_SYSCALLS.has(syscall) && syscallSucceeded(line)) {
+				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
+				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd);
 				const digest = statObservationDigest(line.args[syscall === "newfstatat" ? 2 : 1] ?? "");
 				if (!metadataPaths.length || !digest) {

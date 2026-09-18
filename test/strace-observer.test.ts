@@ -174,6 +174,8 @@ describe("strace provenance decoder", () => {
 			['getrandom("abc", 3, 0) = 3', ["random"]],
 			['getpid() = 2', ["pid_observation"]],
 			['fstat(1<pipe:[7]>, ' + STAT + ') = 0', ["descriptor_observation"]],
+			['fstat(6</tmp/null<char 1:3>>, ' + STAT + ') = 0', ["descriptor_observation"]],
+			['newfstatat(6</tmp/null<char 1:3>>, "", ' + STAT + ', AT_EMPTY_PATH) = 0', ["descriptor_observation"]],
 			['prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) = 1', ["confinement_observation"]],
 			['openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)', ["confinement_observation"]],
 			['clone(child_stack=NULL, flags=SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable)', ["confinement_observation"]],

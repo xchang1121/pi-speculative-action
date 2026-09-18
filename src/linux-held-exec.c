@@ -17,6 +17,7 @@
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
@@ -391,13 +392,17 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	return 0;
 }
 
+static int null_device(const struct stat *state) {
+	return S_ISCHR(state->st_mode) && major(state->st_rdev) == 1 && minor(state->st_rdev) == 3;
+}
+
 /* The entire owned tree is stopped until this job retires. External OFDs remain unknown. */
 static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
 	char path[64];
 	snprintf(path, sizeof(path), "/proc/%ld/fd", (long)job->pid);
 	DIR *directory = opendir(path);
 	if (!directory) return -1;
-	int pins[MAX_POSITIONS], fds[MAX_POSITIONS], count = 0, result = -1;
+	int pins[MAX_POSITIONS], fds[MAX_POSITIONS], nulls[MAX_POSITIONS], count = 0, result = -1, null_input = -1;
 	struct dirent *entry;
 	size_t used = 0;
 	for (;;) {
@@ -411,9 +416,20 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		struct stat state;
 		if (pin < 0) goto done;
 		if (fstat(pin, &state) < 0) { close(pin); goto done; }
-		if (!S_ISREG(state.st_mode)) { close(pin); continue; }
+		if (!S_ISREG(state.st_mode) && !(null_device(&state) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
 		if (count == MAX_POSITIONS) { close(pin); goto done; }
-		pins[count] = pin; fds[count++] = (int)descriptor;
+		if (!descriptor && null_device(&state)) null_input = count;
+		nulls[count] = null_device(&state); pins[count] = pin; fds[count++] = (int)descriptor;
+	}
+	/* Ordinary stdin keeps its existing profile; include it only when an extra FD shares its OFD. */
+	if (null_input >= 0) {
+		int shared = 0;
+		for (int index = 0; index < count; index++) if (fds[index] > 2 && nulls[index]) {
+			long same = syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, pins[null_input], pins[index]);
+			if (same < 0) goto done;
+			if (!same) { shared = 1; break; }
+		}
+		if (!shared) { close(pins[null_input]); pins[null_input] = pins[--count]; fds[null_input] = fds[count]; }
 	}
 	/* Canonical alias representatives must not depend on procfs enumeration order. */
 	for (int index = 0; index < count; index++) for (int previous = index; previous > 0 && fds[previous] < fds[previous - 1]; previous--) {
@@ -437,9 +453,9 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		owned = !job->domain->escaped && !job->domain->uncertain && job->process->table &&
 			!job->process->table->active && descriptor_origin(job->process, fds[index]).id != 0;
 		int length = snprintf(line + used, capacity - used,
-			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s}",
+			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s%s}",
 			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags,
-			(intmax_t)offset, owned ? "true" : "false");
+			(intmax_t)offset, owned ? "true" : "false", null_device(&state) ? ",\"type\":\"null\"" : "");
 		if (length < 0 || (size_t)length >= capacity - used) goto done;
 		used += (size_t)length;
 	}
@@ -472,7 +488,8 @@ static int open_tracee_output(pid_t pid, unsigned fd) {
 
 static int position_matches(const struct file_position *position) {
 	struct stat state;
-	return fstat(position->duplicate, &state) == 0 && S_ISREG(state.st_mode) &&
+	return fstat(position->duplicate, &state) == 0 && (S_ISREG(state.st_mode) ||
+		(null_device(&state) && !position->before && !position->after && position->content_length == -1)) &&
 		(uintmax_t)state.st_dev == position->device && (uintmax_t)state.st_ino == position->inode &&
 		fcntl(position->duplicate, F_GETFL) == position->flags &&
 		lseek(position->duplicate, 0, SEEK_CUR) == position->before;
@@ -951,7 +968,8 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 			close(fd);
 		}
 		struct stat state;
-		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !S_ISREG(state.st_mode) ||
+		if (position->duplicate < 0 || fstat(position->duplicate, &state) < 0 || !(S_ISREG(state.st_mode) ||
+			(null_device(&state) && !position->before)) ||
 			fcntl(position->duplicate, F_GETFL) != position->flags ||
 			lseek(position->duplicate, position->before, SEEK_SET) != position->before) goto done;
 	}
@@ -998,7 +1016,7 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("12");
+		puts("13");
 		return 0;
 	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
