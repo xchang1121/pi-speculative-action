@@ -968,6 +968,9 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		try {
 			await assertChangeClockFilesystem();
 			await advanceChangeClock(lastStructure);
+			await captureTransitions((await (workspace.overlay ? collectOverlayChangeResources(workspace) : collectGitChangeResources(workspace)))
+				.filter(resource => !isSnapshotExcluded(slash(resource))),
+				lastStructure, false);
 			const verified = await captureStructure();
 			if (!sameWorkspaceChangeSnapshot(lastStructure, verified)) {
 				throw new Error("workspace changed while initializing transaction clock");

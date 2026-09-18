@@ -1056,12 +1056,14 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(root, "changed.txt"), "next baseline\n", "utf8");
 			await sandbox.prepare(root, { driver: "git" });
 			expect(workspace.sourceChanges?.().paths).toContain(path.join(root, "changed.txt"));
+			await writeFile(path.join(workspace.sandboxRoot, "untouched.txt"), "predecessor\n", "utf8");
 			const initial = await workspace.transactions.begin();
 			Reflect.set(workspace, "commit", "0".repeat(40));
 			expect((await stat(clock)).isFile()).toBe(true);
 			await initial.abort();
 			await expect(initial.readBefore!("changed.txt", 64)).rejects.toThrow("unavailable");
 			const capture = await workspace.transactions.begin();
+			expect(Buffer.from((await capture.readBefore!("untouched.txt", 64))!)).toEqual(Buffer.from("predecessor\n"));
 			await writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after!\n", "utf8");
 			await writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8");
 			await rm(path.join(workspace.sandboxRoot, "deleted.txt"));
