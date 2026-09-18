@@ -24,6 +24,7 @@ import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from ".
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import { ResourceVersionManager } from "../src/resource-version.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -564,6 +565,71 @@ describe("speculative action host", () => {
 			await host.finishTurn("query", true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 4, exactReuseHits: 0, predictionsMatched: 0 });
 		} finally { await host.dispose(); await profile.pool.dispose(); }
+	});
+
+	it.for(["prepared", "composed", "partial"] as const)("borrows inputs during prediction and owns its proof after source retirement (%s)", async (coverage, { skip }) => {
+		const partial = coverage === "partial";
+		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
+		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
+		await writeFile(path.join(cwd, "other.txt"), "two from another input\n");
+		await writeFile(path.join(cwd, "unused.log"), "original\n");
+		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd)];
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 });
+		const execute = world.speculation!.execute, sources: Awaited<ReturnType<typeof execute>>[] = [];
+		vi.spyOn(world.speculation!, "execute").mockImplementation(async context => {
+			const branch = await execute(context);
+			if (context.executionScope?.turnID === "seed") sources.push(branch);
+			return branch;
+		});
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), opened = vi.spyOn(fs, "open");
+		const directories = vi.spyOn(fs, "mkdtemp");
+		const preparations = () => directories.mock.calls.filter(([target]) => path.basename(String(target)) === "inputs-").length;
+		const events: SpeculativeActionEvent<string>[] = [];
+		const ready = (turnID: string, count: number) => expect.poll(() => events.filter(event =>
+			event.type === "candidate" && event.turnID === turnID && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(count);
+		const args = { pattern: "two", path: ".", glob: partial ? "*.txt" : "notes.txt" };
+		let stage: "seed" | "query" = "seed", permitted = true;
+		const host = createSpeculativeActionHost("prediction-inputs", {
+			cwd, draftModel: model("draft"), preflight: () => permitted,
+			getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, maxConcurrentActions: 2,
+				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 3, resourceCacheMaxBytes: 1024 * 1024 }),
+			complete: async () => assistant(stage === "seed" ? [
+				{ type: "toolCall", id: "names", name: "grep", arguments: { pattern: "seed", path: ".", glob: coverage === "prepared" ? args.glob : "*.absent" } },
+				{ type: "toolCall", id: "bytes", name: "read", arguments: { path: "notes.txt", limit: 1 } },
+			] : [{ type: "toolCall", id: "query", name: "grep", arguments: args }], "toolUse"),
+			resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
+			executionWorlds: [world],
+			onEvent: event => { events.push(event); },
+		});
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "seed"), tools }); await ready("seed", 2);
+			await host.execute({ turnID: "seed", id: "seed-read", tool: "read", args: { path: "notes.txt", limit: 1 }, tools },
+				undefined, () => { throw new Error("seed read should adopt its exact prediction"); });
+			await host.finishTurn("seed"); stage = "query";
+			const captured = captures.mock.calls.length, reads = opened.mock.calls.length, prepared = preparations();
+			await host.startTurn({ ...startInput(tools[0]!, "query"), tools }); await ready("query", 1);
+			expect(captures.mock.calls.length - captured).toBe(Number(partial));
+			expect(preparations() - prepared).toBe(coverage === "prepared" ? 0 : partial ? 2 : 1);
+			const sourceReads = opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "notes.txt"));
+			expect(sourceReads.length).toBe(partial ? 1 : 0);
+			for (const source of sources) await source.dispose();
+			const call = { turnID: "query", id: "first", tool: "grep", args, tools };
+			const current = async () => (await profile.invocations.get("grep")!.authoritative!({ args, callID: "reference", signal: new AbortController().signal })).result;
+			const expected = await current(), actor = vi.fn(current);
+			expect(await host.execute(call, undefined, actor)).toEqual(expected);
+			await writeFile(path.join(cwd, "unused.log"), "unrelated content changed\n");
+			expect(await host.execute({ ...call, id: "unrelated" }, undefined, actor)).toEqual(expected);
+			expect(actor).not.toHaveBeenCalled();
+			permitted = false;
+			expect(await host.execute({ ...call, id: "denied" }, undefined, actor)).toEqual(expected);
+			expect(actor).toHaveBeenCalledOnce(); permitted = true;
+			await writeFile(path.join(cwd, "notes.txt"), "two changed\n");
+			expect(await host.execute({ ...call, id: "changed" }, undefined, actor)).toEqual(await current());
+			expect(actor).toHaveBeenCalledTimes(2);
+			await host.finishTurn("query", true);
+			expect(events.filter(event => event.type === "prediction" && event.turnID === "query" && event.settlement.observation === "observed" &&
+				event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toHaveLength(1);
+		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
 	});
 
 	it("uses a completed search's inputs for current tools across turns without adopting its output or prediction", async ({ skip }) => {

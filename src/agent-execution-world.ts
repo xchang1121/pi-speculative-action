@@ -1,4 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import path from "node:path";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
@@ -30,6 +31,8 @@ export interface SpeculativeToolExecutionContext {
 	readonly action: ActionKey;
 	readonly callID: string;
 	readonly signal: AbortSignal;
+	/** Input owners remain leased for this execution; derived results must own their evidence. */
+	readonly inputs?: (path: string) => Iterable<object>;
 	readonly executionScope?: ExecutionScope;
 	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
@@ -76,7 +79,7 @@ export function createResourceSnapshotExecutionWorld(
 						const validation = await owned.manager.seal(owned);
 						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					}
-					return resourceSnapshotBranch(output, owned, context.action.executionFingerprint, setupMs, actionSemantics);
+					return resourceSnapshotBranch(output, [owned], context.action.executionFingerprint, setupMs, actionSemantics);
 				} catch (error) {
 					await releaseResourceVersion(owned);
 					throw error;
@@ -111,6 +114,24 @@ export function createResourceSnapshotExecutionWorld(
 				const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				context.signal.throwIfAborted();
+				const attempted = new Set<object>();
+				for (const resource of context.action.resources) for (const source of context.inputs?.(path.resolve(context.action.resourceRoot ?? context.cwd, resource)) ?? []) {
+					if (attempted.has(source)) continue;
+					attempted.add(source);
+					const owner = resourceVersions.get(source);
+					if (!owner) continue;
+					const retained: ResourceVersionToken[] = [];
+					try {
+						const query = await evaluateResourceInputs(owner, context, actionSemantics);
+						if (!query || query.capturedBytes > operations.maxBytes()) continue;
+						for (const version of query.versions) retained.push(version.manager.retain(version));
+						return resourceSnapshotBranch(query.output, retained, context.action.executionFingerprint, 0, actionSemantics, query.capturedBytes);
+					} catch {
+						await Promise.allSettled(retained.map(releaseResourceVersion));
+						context.signal.throwIfAborted();
+						// Incomplete input coverage falls through to the same bound capture executor.
+					}
+				}
 				const owned = await capture(context, operations.maxBytes(), true);
 				try {
 					if (!owned.view) throw new Error("resource_snapshot_budget_exceeded");
@@ -123,14 +144,51 @@ export function createResourceSnapshotExecutionWorld(
 	};
 }
 
-const resourceVersions = new WeakMap<object, ResourceVersionToken>();
+type ResourceInputOwner = { readonly version: ResourceVersionToken; readonly executionFingerprint: string };
+const resourceVersions = new WeakMap<object, ResourceInputOwner>();
+
+/** Actor reconstruction and predicted execution use the same confined inputs and dependency proof. */
+async function evaluateResourceInputs(
+	{ version, executionFingerprint }: ResourceInputOwner,
+	request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], semantics: ActionSemanticsRegistry,
+) {
+	request.signal.throwIfAborted();
+	const invocation = request.action.executionContext as ToolInvocation | undefined;
+	const execute = invocation?.filesystem, definition = request.action.semantics ?? semantics.definition(request.action);
+	const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
+	if (!version.view || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope) return undefined;
+	if (!effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
+	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>();
+	let capturedBytes = 0;
+	const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined) => {
+		let observations = proofs.get(token);
+		if (!observations) proofs.set(token, observations = new Map());
+		for (const key of dependencies ?? token.observations.keys()) {
+			const entry = token.observations.get(key);
+			if (!entry) throw new Error("resource_input_proof_missing");
+			if (!observations.has(key)) capturedBytes += key.length * 2 + 64;
+			observations.set(key, entry);
+		}
+	};
+	const output = await version.view.evaluate(view => execute(view, request), dependencies => observe(version, dependencies), root,
+		request.inputs && function* (target) {
+			for (const source of request.inputs!(target)) {
+				const token = resourceVersions.get(source)?.version;
+				if (token?.view) yield { view: token.view, observed: dependencies => observe(token, dependencies) };
+			}
+		});
+	request.signal.throwIfAborted();
+	return { output, capturedBytes, versions: [...proofs].map(([token, observations]) => ({ ...token, observations })) };
+}
 
 function resourceSnapshotBranch(
-	output: ToolSettlement, version: ResourceVersionToken, executionFingerprint: string, setupMs: number, semantics: ActionSemanticsRegistry,
+	output: ToolSettlement, versions: readonly ResourceVersionToken[], executionFingerprint: string, setupMs: number, semantics: ActionSemanticsRegistry,
+	capturedBytes = versions[0]!.view?.bytes ?? 0,
 ): WorldBranch<ToolSettlement> {
+	const version = versions[0]!;
 	const inputSource = Object.freeze({});
-	resourceVersions.set(inputSource, version);
-	let owned: ResourceVersionToken | undefined = version;
+	resourceVersions.set(inputSource, { version, executionFingerprint });
+	let owned: readonly ResourceVersionToken[] | undefined = versions;
 	const validate = async (token: ResourceVersionToken | readonly ResourceVersionToken[] | undefined) => {
 		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
 		return expired
@@ -141,40 +199,15 @@ function resourceSnapshotBranch(
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
 		inputResources: version.view?.resources,
 		reconstructionScope: "current_action",
-		capturedBytes: version.view?.bytes ?? 0,
+		capturedBytes,
 		executionMetrics: Object.freeze({ setupMs }),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
-			request.signal.throwIfAborted();
-			const invocation = request.action.executionContext as ToolInvocation | undefined;
-			const execute = invocation?.filesystem, definition = request.action.semantics ?? semantics.definition(request.action);
-			const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
-			if (!owned?.view || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope) return undefined;
-			if (!effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
-			const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>();
-			let capturedBytes = 0;
-			const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined) => {
-				let observations = proofs.get(token);
-				if (!observations) proofs.set(token, observations = new Map());
-				for (const key of dependencies ?? token.observations.keys()) {
-					const entry = token.observations.get(key);
-					if (!entry) throw new Error("resource_input_proof_missing");
-					if (!observations.has(key)) capturedBytes += key.length * 2 + 64;
-					observations.set(key, entry);
-				}
-			};
-			const result = await owned.view.evaluate((view) => execute(view, request), dependencies => observe(version, dependencies), root,
-				request.inputs && function* (target) {
-					for (const source of request.inputs!(target)) {
-						const token = resourceVersions.get(source);
-						if (token?.view) yield { view: token.view, observed: (dependencies) => observe(token, dependencies) };
-					}
-				});
-			request.signal.throwIfAborted();
-			const versions = [...proofs].map(([token, observations]) => ({ ...token, observations }));
-			return { output: result, validate: () => validate(versions), capturedBytes,
-				...(proofs.size > 1 ? { requiresQueryValidation: true as const } : {}),
+			if (!owned) return undefined;
+			const query = await evaluateResourceInputs({ version, executionFingerprint }, request, semantics);
+			return query && { output: query.output, validate: () => validate(query.versions), capturedBytes: query.capturedBytes,
+				...(query.versions.length > 1 ? { requiresQueryValidation: true as const } : {}),
 				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
 		} } : {}),
 		commit: async () => {
@@ -184,7 +217,7 @@ function resourceSnapshotBranch(
 		dispose: () => {
 			owned = undefined;
 			resourceVersions.delete(inputSource);
-			return version.release();
+			return versions.length === 1 ? version.release() : Promise.allSettled(versions.map(releaseResourceVersion)).then(() => {});
 		},
 	};
 }

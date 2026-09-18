@@ -1323,6 +1323,8 @@ export function makeSpeculativeActionRuntime<
 
 	const executeCandidate = async (session: Session, candidate: Candidate, startedAt: number): Promise<void> => {
 		let branch: WorldBranch<Output> | undefined;
+		const inputs = candidate.owner.draft.type === "tool_call" && candidate.route.reuse === "shared_result" && !candidateWorld(candidate)
+			? borrowCandidateInputs(session, candidate, `inputs:prediction:${candidate.id}`) : undefined;
 		try {
 			const parent = candidateWorld(candidate);
 			candidate.acceptOperationScope = scope => {
@@ -1356,10 +1358,12 @@ export function makeSpeculativeActionRuntime<
 				callID: candidate.id,
 				index: candidate.owner.index,
 				signal: candidate.work.controller.signal,
+				inputs: inputs?.lookup,
 				onOperationAdopted: candidate.onOperationAdopted,
 				acceptOperationScope: candidate.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
 			});
+			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
 			const output = branch.output;
 			const rejected = adapter.rejectCandidateOutput?.({
 				output,
@@ -1406,6 +1410,7 @@ export function makeSpeculativeActionRuntime<
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
 		} finally {
+			inputs?.dispose();
 			session.scheduler.complete(candidate);
 			dispatchReady(session);
 		}
