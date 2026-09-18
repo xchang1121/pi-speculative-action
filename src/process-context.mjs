@@ -3,10 +3,12 @@ import { fstatSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 
 /** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
+/** @typedef {import("./linux-held-exec.js").HeldFileDescriptor} HeldFileDescriptor */
 /** @typedef {{
  * readonly key: string, readonly launchKey: string, readonly umask: number,
  * readonly descriptorTypes: readonly [DescriptorType, DescriptorType, DescriptorType],
  * readonly outputEndpoints: readonly [string, string]
+ * readonly regularDescriptors?: readonly Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset">[]
  * }} ProcessExecutionContext */
 
 /**
@@ -17,11 +19,14 @@ import { readFile, readlink, stat } from "node:fs/promises";
  * Capture does not authorize reuse: the dispatcher reports unsupported streams for native fallback.
  * @param {number | "self"} pid
  * @param {readonly string[]} inheritedDescriptors
+ * @param {readonly HeldFileDescriptor[]} [regularDescriptors] Native OFD evidence held for this inspection.
  * @returns {Promise<ProcessExecutionContext>}
  */
-export async function captureProcessContext(pid, inheritedDescriptors) {
+export async function captureProcessContext(pid, inheritedDescriptors, regularDescriptors) {
 	if (inheritedDescriptors.some(name => !/^\d+$/.test(name)) ||
-		!["0,1,2", "1,2"].includes(inheritedDescriptors.map(Number).sort((a, b) => a - b).join(","))) {
+		!inheritedDescriptors.includes("1") || !inheritedDescriptors.includes("2") ||
+		inheritedDescriptors.some(name => Number(name) > 2 && !regularDescriptors?.some(({ fd }) => fd === Number(name))) ||
+		regularDescriptors?.some(({ fd }) => !inheritedDescriptors.includes(String(fd)))) {
 		throw new Error("held process has unmodeled inherited descriptors");
 	}
 	const root = `/proc/${pid}`;
@@ -34,7 +39,7 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 		text(`${root}/limits`),
 		text(`${root}/stat`),
 		statPath("/bin/sh", { bigint: true }),
-		Promise.all([0, 1, 2].map(async fd => {
+		Promise.all([...new Set([0, ...inheritedDescriptors.map(Number)])].sort((a, b) => a - b).map(async fd => {
 			if (fd === 0 && !inheritedDescriptors.includes("0")) return {
 				fd, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0,
 			};
@@ -49,9 +54,15 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 			/** @type {DescriptorType} */
 			const type = metadata.isFile() ? "regular" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
 				metadata.isCharacterDevice() ? (endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
+			const proof = regularDescriptors?.find(descriptor => descriptor.fd === fd);
+			if (type === "regular" && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
+				proof.flags !== (Number.parseInt(flags, 8) & ~0o2000000) || String(proof.offset) !== /^pos:\s*(\d+)/m.exec(info)?.[1])) {
+				throw new Error(`held descriptor ${fd} lacks matching native OFD evidence`);
+			}
+			if (proof && type !== "regular") throw new Error(`held descriptor ${fd} changed type`);
 			return {
 				fd, endpoint, type,
-				identity: `${metadata.dev}:${metadata.ino}`,
+				identity: proof ? `ofd:${proof.alias}` : `${metadata.dev}:${metadata.ino}`,
 				flags: Number.parseInt(flags, 8) & ~0o2000000,
 			};
 		})),
@@ -94,11 +105,12 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 		umask: Number.parseInt(field("Umask"), 8),
 		descriptorTypes: [input.type, output.type, error.type],
 		outputEndpoints: [output.endpoint ?? "", error.endpoint ?? ""],
+		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @returns {ProcessExecutionContext} */
-export function routedProcessContext(context, route, closeStdin = false) {
+/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @returns {ProcessExecutionContext} */
+export function routedProcessContext(context, route, closeStdin = false, regularDescriptors) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
@@ -108,6 +120,19 @@ export function routedProcessContext(context, route, closeStdin = false) {
 		{ ...semantic.descriptors[route[0]], fd: 1, alias: 1 },
 		{ ...semantic.descriptors[route[1]], fd: 2, alias: route[0] === route[1] ? 1 : 2 },
 	];
+	if (regularDescriptors?.length) {
+		for (const descriptor of regularDescriptors) {
+			const entry = { fd: descriptor.fd, type: "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}` };
+			if (descriptor.fd === 0) descriptors[0] = entry;
+			else if (descriptor.fd > 2) descriptors.push(entry);
+			else throw new Error("inherited output descriptor cannot use buffered routing");
+		}
+		const aliases = new Map();
+		for (const descriptor of descriptors) {
+			if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
+			descriptor.alias = aliases.get(descriptor.alias);
+		}
+	}
 	// libuv resets the signal mask and dispositions for every spawned target.
 	const signals = {
 		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
@@ -116,7 +141,8 @@ export function routedProcessContext(context, route, closeStdin = false) {
 	return {
 		...context,
 		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
-		descriptorTypes: [closeStdin ? "closed" : context.descriptorTypes[0], context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
+		descriptorTypes: [regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0], context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
+		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
 }
 
@@ -128,7 +154,8 @@ export function validProcessContext(value) {
 		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
 		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
 		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
-		["device", "closed"].includes(context.descriptorTypes[0]) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
+		(["device", "closed"].includes(context.descriptorTypes[0]) ||
+			(context.descriptorTypes[0] === "regular" && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
 		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
 		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);

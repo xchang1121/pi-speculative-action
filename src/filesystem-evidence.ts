@@ -84,6 +84,11 @@ export async function hashExecutableFile(target: string, observation?: {
 	return `sha256:${(await captureFile(target, Infinity, false, false, undefined, observation)).hash}`;
 }
 
+/** Read a held descriptor through a separate OFD, preserving its shared position. */
+export function captureHeldFile(pid: number, fd: number, maxBytes: number): Promise<StableFileCapture> {
+	return captureFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, false);
+}
+
 async function captureFile(
 	target: string,
 	maxBytes: number,

@@ -106,7 +106,7 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
@@ -118,6 +118,7 @@ int main(void) {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
+			if (mode === "native-descriptors") await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
 	for (volatile unsigned long iteration = 0; iteration < ${mode === "running" ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
 	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
+	${mode === "native-descriptors" ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
 	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
@@ -138,7 +140,8 @@ int main(int argc, char **argv) {
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
-			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'" +
+			const command = (mode === "native-descriptors" ? "exec 3<fd.txt; exec 4<&3; exec 8<fd.txt; IFS= read -r -N 1 discarded <&3; " : "") +
+				"export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'" +
 				(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
@@ -309,6 +312,75 @@ int main(int argc, char **argv) {
 		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
+	test.for(["read", "write", "path-write", "unlinked"] as const)("learns and adopts regular OFDs with shared positions and predecessor inputs (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-fd-binding-");
+		const writable = mode === "write" || mode === "unlinked";
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") throw new Error(status.detail);
+			const input = path.join(fixture.workspace, "input.txt");
+			await writeFile(input, "abcdef");
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <unistd.h>
+#include <fcntl.h>
+int main(void) {
+	char bytes[6] = {0, 0, 0, ':', 0, '\\n'};
+	if (read(3, bytes, 2) != 2 || read(4, bytes + 2, 1) != 1 || read(8, bytes + 4, 1) != 1) return 71;
+	${writable ? 'if (write(4, "XY", 2) != 2) return 72;' : mode === "path-write" ? 'int fd = open("input.txt", O_WRONLY); if (pwrite(fd, "Z", 1, 2) != 1) return 72; close(fd);' : ""}
+	for (volatile unsigned long i = 0; i < 50000000ul; ++i) {}
+	return write(1, bytes, sizeof(bytes)) != sizeof(bytes);
+}
+`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+			await commitBenchmarkFixture(fixture.workspace, "Inherited FD binding");
+			await prepareLinuxProcessReuse(fixture);
+			const scope = { sessionID: "fd-binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
+			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
+				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
+					executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
+			});
+			if (!("executor" in route)) throw new Error(route.detail);
+			const command = `exec 3<${writable ? ">" : ""}input.txt; exec 4<&3; exec 8<input.txt; IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; ` +
+				(mode === "unlinked" ? "rm input.txt; " : "") +
+				`printf 'parent\\n'; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"`;
+			const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
+				let output = "";
+				const result = await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope,
+					timeout: 10, onData: data => { output += data.toString(); } });
+				expect(result).toEqual({ exitCode: 0 }); return output;
+			};
+			const tail = writable ? ":c" : mode === "path-write" ? "e:Z" : "e:c";
+			expect(await fixture.backend.observeBindings(scope, () => execute(scope, command), () => {}, true)).toBe(`parent\nbcd:b\ntail:${tail}\n`);
+			const binding = fixture.backend.executionBindings(later).at(-1);
+			expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
+			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace,
+				environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			for (const changed of [false, true]) {
+				await writeFile(input, "abcdef");
+				await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+					const before = await readFile(path.join(workspace.sandboxRoot, "input.txt"));
+					const beforeMode = (await stat(path.join(workspace.sandboxRoot, "input.txt"))).mode & 0o777;
+					try {
+						const result = await session.executeBinding(binding!);
+						expect(result.exit).toEqual({ kind: "code", code: 0 });
+						expect(result.output.map(({ data }) => data.toString()).join("")).toBe("bcd:b\n");
+						const after = await readFile(path.join(workspace.sandboxRoot, "input.txt"));
+						await session.seal(before.equals(after) ? [] : [{ root: fixture.workspace, target: input, resource: "input.txt",
+							before, after, beforeMode, afterMode: beforeMode }]);
+						expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: "valid" });
+						const hits = fixture.backend.actorMetrics().hits;
+						if (changed) await writeFile(input, "uvwxyz");
+						expect(await execute(later, command.replace("parent", "changed-parent"))).toBe(changed
+							? `changed-parent\nvwx:v\ntail:${writable ? ":w" : mode === "path-write" ? "y:Z" : "y:w"}\n` : `changed-parent\nbcd:b\ntail:${tail}\n`);
+						expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() }))
+							.toBe(hits + Number(!changed));
+					} finally { await session.close(); }
+				});
+			}
+		} finally { await fixture.dispose(); }
+	});
+
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
@@ -374,6 +446,16 @@ int main(int argc, char **argv) {
 				await stopped;
 			}
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
+			const compat = path.join(root, "compat32");
+			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
+			execFileSync("cc", ["-nostdlib", "-m32", "-static", `${compat}.s`, "-o", compat]);
+			if (childProcess.spawnSync(compat).status === 7) for (const descriptors of [false, true]) {
+				const decide = vi.fn(async () => ({ kind: "continue" as const }));
+				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors, decide });
+				expect(await executor.execute({ command: `exec '${compat}'`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
+					timeout: 5, onData: () => {} })).toEqual({ exitCode: 7 });
+				expect(decide).not.toHaveBeenCalled();
+			}
 			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", undefined]] as const) {
 				let inspected = 0;
 				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
@@ -393,6 +475,96 @@ int main(int argc, char **argv) {
 				} else await expect(inspection).rejects.toThrow(/descriptors/);
 			}
 			const input = path.join(root, "ofd-input");
+			await writeFile(input, "abcdef");
+			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
+			await writeFile(report, "");
+			await writeFile(manifest, `FD1 3 0\n0 0 32768 1 ${Buffer.byteLength(input)}\n${input}\n3 0 32768 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)}\n${input}\n`);
+			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
+				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
+				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
+			expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
+			const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
+			expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
+				.toEqual(["FD1 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
+			const external = path.join(root, "external-fd");
+			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
+			for (const shell of [binary, external]) {
+				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [];
+				const inspecting = boundary.executor(adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell })), {
+					sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+						try {
+							const descriptors = process.descriptors!;
+							expect(descriptors).toBeDefined(); snapshots.push(descriptors);
+							const snapshot = await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), descriptors);
+							expect(snapshot.context.regularDescriptors).toEqual(descriptors);
+							const first = descriptors.find(({ fd }) => fd === 3)!;
+							expect(first).toMatchObject({ fd: 3, alias: 3, owned: true });
+							expect(descriptors.find(({ fd }) => fd === 4)).toEqual({ ...first, fd: 4 });
+							expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
+							if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
+							await new Promise(resolve => setTimeout(resolve, 30));
+							expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
+						} catch (error) { failures.push(error); }
+						return { kind: "continue" };
+					},
+				});
+				expect(await inspecting.execute({ command: `exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; ` +
+					`(while IFS= read -r -N 1 value <&4; do :; done) & /bin/true; wait; /bin/true`,
+					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				expect(failures).toEqual([]); expect(snapshots).toHaveLength(2);
+			}
+			const descriptorProbe = path.join(root, "descriptor-probe");
+			await writeFile(`${descriptorProbe}.c`, `#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+	if (argc != 3) return 70;
+	if (!strcmp(argv[1], "lock")) {
+		int fd = open(argv[2], O_RDWR); if (flock(fd, LOCK_EX) < 0) return 71; close(fd);
+		fd = open(argv[2], O_RDWR); return flock(fd, LOCK_EX | LOCK_NB) < 0 ? 72 : 0;
+	}
+	if (!strcmp(argv[1], "export")) {
+		int sockets[2]; char byte = 'x', control[CMSG_SPACE(sizeof(int))] = {0};
+		if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) < 0) return 73;
+		struct iovec vector = {&byte, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+		struct cmsghdr *header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(int));
+		int fd = 3; memcpy(CMSG_DATA(header), &fd, sizeof(fd)); if (sendmsg(sockets[0], &message, 0) < 0) return 74;
+		close(sockets[0]); close(sockets[1]);
+	} else if (dup2(3, 65) < 0 || dup3(3, 66, O_CLOEXEC) < 0 || fcntl(3, F_DUPFD, 67) != 67) return 75;
+	char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
+}
+`);
+			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", `${descriptorProbe}.c`, "-o", descriptorProbe]);
+			for (const mode of ["lock", "export", "table"]) {
+				let snapshot: HeldExecProcess["descriptors"], output = "";
+				const commit = vi.fn(async () => {});
+				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+					snapshot = process.descriptors;
+					return mode === "export" ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
+						({ ...descriptor, before: offset, after: offset + 1 })), exitCode: 0, output: [], commit } : { kind: "continue" };
+				} });
+				expect(await executor.execute({ command: `exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
+					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
+					timeout: 5, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
+				expect(output).toBe("a"); expect(commit).not.toHaveBeenCalled();
+				if (mode === "table") expect(snapshot?.map(({ fd, alias, owned }) => ({ fd, alias, owned }))).toEqual([
+					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: 3, owned: true },
+				]);
+				if (mode === "export") expect(snapshot).toMatchObject([{ fd: 3, owned: false }]);
+			}
+			let pipeOutput = "";
+			const piped = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+				return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(1024 * 1024, "x") }],
+					descriptorOffsets: process.descriptors!.map(({ offset, ...descriptor }) => ({ ...descriptor, before: offset, after: offset + 1 })), commit: async () => {} };
+			} });
+			expect(await piped.execute({ command: `exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`,
+				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { pipeOutput += data.toString(); } })).toEqual({ exitCode: 0 });
+			expect(pipeOutput).toBe("1048576\nb");
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure"]) {
 				await writeFile(input, "abcdef");
 				const accepted = mode === "shared" || mode === "unlinked";
@@ -652,7 +824,7 @@ int main(void) {
 				});
 				await expect(inspect()).resolves.toEqual({ kind: "continue" });
 				expect(history).toHaveBeenLastCalledWith(executable);
-				expect(scan).toHaveBeenCalledExactlyOnceWith(process.pid, executable);
+				expect(scan).toHaveBeenCalledExactlyOnceWith(process.pid, executable, undefined);
 				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 0, lastError: "actor_child:process context required" });
 			} finally {
 				if (work) handoffs.complete(key, work);

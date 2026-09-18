@@ -12,6 +12,7 @@ import {
 	lstat,
 	mkdir,
 	mkdtemp,
+	open,
 	readFile,
 	readdir,
 	realpath,
@@ -69,8 +70,9 @@ import {
 } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import {
+	captureHeldDescriptorInputs,
 	inspectHeldExecProcess,
 	LinuxHeldExecBoundary,
 	listenUnixSocket,
@@ -78,6 +80,7 @@ import {
 	type HeldExecDecision,
 	type HeldExecProcess,
 	type HeldExecSnapshot,
+	type FileDescriptorInput,
 } from "./linux-held-exec.ts";
 import {
 	emptyWorldReuseMetrics,
@@ -216,7 +219,9 @@ interface DispatcherRequest {
 
 type OutputRoute = readonly [1 | 2, 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
-type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & { readonly closeStdin?: boolean };
+type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
+	readonly closeStdin?: boolean; readonly descriptorInputs?: readonly FileDescriptorInput[];
+};
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
 	readonly executable: string;
@@ -403,6 +408,13 @@ export class LinuxProcessReuseBackend {
 				executor = boundary.executor(options.held.executor(boundary.shellPath), {
 					realShell: options.held.realShell,
 					sourceRoot: path.resolve(options.sourceRoot),
+					descriptors: request => {
+						if (request.scope) for (const binding of this.handoffs.bindings(request.scope)) {
+							const invocation = this.handoffs.resolveBinding(binding, request.scope);
+							if (invocation?.descriptorInputs?.length && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
+						}
+						return this.observations.getStore()?.learn ? "inspect" : false;
+					},
 					decide: (process) => this.decideHeldExec(process, process.scope),
 				}, host);
 				state = "ready";
@@ -1024,7 +1036,11 @@ export class LinuxProcessReuseBackend {
 				this.addActor("misses");
 				return { kind: "continue" };
 			}
-			const snapshot = await inspectHeldExecProcess(process.pid, executable);
+			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
+			const descriptorInputs = process.descriptors?.length
+				? await captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
+					sensitivePaths(this.options.storeRoot, this.options.deniedPaths)) : undefined;
+			const snapshot = { ...inspected, ...(descriptorInputs ? { descriptorInputs } : {}) };
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
 				this.addActor("bypasses");
 				return { kind: "continue" };
@@ -1038,10 +1054,11 @@ export class LinuxProcessReuseBackend {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
+					...(descriptorInputs ? { descriptorInputs } : {}),
 				}, durationMs);
 				if (binding) observation!.bindings.set(order, binding);
 			};
-			if (!available) {
+			if (!available || descriptorInputs && process.descriptors!.some(({ owned }) => !owned)) {
 				// Pin the actual image before resuming it. Learning must not wait for a large digest after a short native call.
 				const platform = await this.resolvePlatformFingerprint(), controller = new AbortController();
 				let pinned!: () => void, digest: Sha256Digest | undefined;
@@ -1085,6 +1102,11 @@ export class LinuxProcessReuseBackend {
 				kind: "replay",
 				exitCode: plan.certificate.result.exit.code,
 				output,
+				...(descriptorInputs ? { descriptorOffsets: plan.certificate.result.descriptorOffsets?.map(({ content, ...position }) => {
+					const descriptor = process.descriptors!.find(({ fd }) => fd === position.fd)!;
+					return { ...position, device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags,
+						...(content ? { content: plan.artifacts.read(content) } : {}) };
+				}) } : {}),
 				commit: async () => {
 					const started = performance.now();
 					try {
@@ -1158,6 +1180,7 @@ export class LinuxProcessReuseBackend {
 		const started = performance.now();
 		const transaction = await session.workspace.transactions.begin();
 		let traceRoot: string | undefined;
+		let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
@@ -1171,6 +1194,34 @@ export class LinuxProcessReuseBackend {
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd);
+			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
+			const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
+			if (request.descriptorInputs?.length) {
+				descriptorManifest = path.join(traceRoot, "fd-inputs");
+				descriptorReportPath = path.join(traceRoot, "fd-offsets");
+				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
+				let manifest = `FD1 ${request.descriptorInputs.length} ${Number(!!request.closeStdin)}\n`;
+				for (const descriptor of request.descriptorInputs) {
+					if (descriptor.fd === descriptor.image) {
+						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
+						const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
+						let state: import("node:fs").BigIntStats;
+						if (workspace) {
+							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
+							const captured = await captureStableFile(physical, MAX_REQUEST_BYTES);
+							if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== 1n) throw new Error("inherited FD predecessor changed");
+							state = captured.stat;
+						} else {
+							await writeFile(physical, Buffer.from(descriptor.content!, "base64"), { flag: "wx", mode: 0o600 });
+							state = await lstat(physical, { bigint: true });
+						}
+						descriptorImages.set(descriptor.image, { physical, logical: workspace ? descriptor.sourcePath! : physical, workspace, state });
+					}
+					const image = descriptor.fd === descriptor.alias ? descriptorImages.get(descriptor.image)!.logical : "";
+					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)}\n${image}\n`;
+				}
+				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
+			}
 			const changedInput = async () => {
 				const changes = session.workspace.sourceChanges?.();
 				if (!changes?.paths.length || !transaction.readBefore) return false;
@@ -1201,14 +1252,16 @@ export class LinuxProcessReuseBackend {
 				...sandboxPolicyArguments(
 					logicalCwd,
 					session.deniedPaths,
-					[session.workspace.sandboxRoot],
+					[session.workspace.sandboxRoot, ...(descriptorReportPath ? [descriptorReportPath] : []),
+						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
 					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false }],
 					[],
 				),
 				"--",
 				ready.dispatcher,
-				request.closeStdin ? "--exec-closed-input" : "--exec",
+				descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
 				outputRoute.join(""),
+				...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
 				request.argv0,
 				logicalExecutable,
 				...request.args,
@@ -1260,6 +1313,11 @@ export class LinuxProcessReuseBackend {
 					this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				}
 				const taints = new Set<ProvenanceTaint>(observation.taints);
+				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
+				if (request.descriptorInputs?.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
+					observed.path === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
+					taints.add("untracked_fd");
+				}
 				for (const taint of evidence.taints) taints.add(taint);
 				if (!observation.complete) {
 					taints.add("trace_incomplete");
@@ -1270,7 +1328,38 @@ export class LinuxProcessReuseBackend {
 					taints: [...taints],
 				};
 				stage = "artifacts";
-				const result = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
+				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
+				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), request.descriptorInputs!) : undefined;
+				if (descriptorOffsets) for (const position of descriptorOffsets) {
+					const input = request.descriptorInputs!.find(({ fd }) => fd === position.fd)!;
+					if (input.fd !== input.image) continue;
+					const image = descriptorImages.get(input.image)!;
+					const current = await lstat(image.physical, { bigint: true });
+					if (!current.isFile() || String(current.dev) !== position.device || String(current.ino) !== position.inode || current.nlink !== 1n ||
+						current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
+						throw new Error("inherited FD namespace changed during execution");
+					if (sameFilesystemIdentity(current, image.state)) continue;
+					const captured = await captureStableFile(image.physical, MAX_REQUEST_BYTES, true);
+					if (`sha256:${captured.hash}` !== input.contentDigest || current.mtimeNs !== image.state.mtimeNs) {
+						if (image.workspace) {
+							const journal = baseResult.journal as OrderedEffectEvent[];
+							let index = journal.findIndex(event => event.kind === "workspace" && event.path === image.logical);
+							if (index < 0 && `sha256:${captured.hash}` === input.contentDigest) {
+								const data = await this.store.artifacts.put(captured.content!), state = { kind: "file" as const, data, mode: Number(current.mode & 0o777n) };
+								index = journal.findIndex(event => event.kind === "output");
+								if (index < 0) index = journal.length;
+								journal.splice(index, 0, { sequence: index, kind: "workspace", path: image.logical, before: state, after: state });
+								for (let sequence = index + 1; sequence < journal.length; sequence++) journal[sequence] = { ...journal[sequence]!, sequence };
+							}
+							const event = journal[index];
+							if (event?.kind !== "workspace" || event.before.kind !== "file" || event.after.kind !== "file" ||
+								event.before.data.digest !== input.contentDigest || event.after.data.digest !== `sha256:${captured.hash}`)
+								throw new Error("inherited FD write lacks a workspace transition");
+							journal[index] = { ...event, operation: "write_contents" };
+						} else position.content = await this.store.artifacts.put(captured.content!);
+					} else throw new Error("unmodeled inherited FD metadata effect");
+				}
+				const result = { ...baseResult, ...(descriptorOffsets ? { descriptorOffsets } : {}) };
 				stage = "certificate";
 				const certificate = sealProcessCertificate({
 					prototype,
@@ -1294,6 +1383,7 @@ export class LinuxProcessReuseBackend {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
 							...(request.closeStdin ? { closeStdin: true } : {}),
+								...(request.descriptorInputs ? { descriptorInputs: request.descriptorInputs } : {}),
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
@@ -1315,6 +1405,7 @@ export class LinuxProcessReuseBackend {
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
+			try { await descriptorReport?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
 			releaseInputs?.();
 			await inputCheck;
 			const durationMs = Math.max(0, performance.now() - started);
@@ -1408,7 +1499,8 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin),
+			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, request.descriptorInputs),
+			...(request.descriptorInputs ? { descriptorInputs: request.descriptorInputs } : {}),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
 }
@@ -1420,6 +1512,7 @@ function bufferedProcessPrototype(
 	platformFingerprint: string,
 ): ExecPrototype {
 	const { context } = snapshot;
+	const input = snapshot.descriptorInputs?.find(({ fd }) => fd === 0);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
 		executableDigest,
@@ -1430,15 +1523,34 @@ function bufferedProcessPrototype(
 		),
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
-		stdin: { type: "closed", eof: true },
+		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: true } : { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
-		inheritedFDs: context.descriptorTypes.map((type, fd) => ({
+		inheritedFDs: [...context.descriptorTypes.map((type, fd) => ({
 			fd,
 			type,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`),
 			...(fd === 0 ? { eof: true } : {}),
-		})),
+		})), ...(snapshot.descriptorInputs ?? []).filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
+			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
+			const input = snapshot.descriptorInputs?.find(({ fd }) => fd === descriptor.fd);
+			return input ? { ...descriptor, alias: input.alias, contentDigest: input.contentDigest, offset: input.offset,
+				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}) } : descriptor;
+		}),
 		platformFingerprint,
+	});
+}
+
+function parseDescriptorOffsets(report: string, inputs: readonly FileDescriptorInput[]): Array<{
+	fd: number; before: number; after: number; device: string; inode: string;
+	content?: import("./provenance-certificate.ts").ArtifactReference;
+}> {
+	const [header, ...lines] = report.trimEnd().split("\n");
+	if (header !== `FD1 ${inputs.length}` || lines.length !== inputs.length) throw new Error("incomplete inherited OFD result");
+	return lines.map((line, index) => {
+		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(line)) throw new Error("invalid inherited OFD result");
+		const fields = line.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number), input = inputs[index]!;
+		if (fd !== input.fd || flags !== input.flags || !Number.isSafeInteger(after)) throw new Error("inherited OFD flags changed");
+		return { fd, before: input.offset, after: after!, device: fields[3]!, inode: fields[4]! };
 	});
 }
 
@@ -1738,6 +1850,7 @@ async function replayFilesystemEffects(
 			root: workspaceRoot,
 			target,
 			resource,
+			...(event.operation ? { operation: event.operation } : {}),
 			...(event.before.kind === "file" ? { before: artifacts.read(event.before.data), beforeMode: event.before.mode } : {}),
 			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode } : {}),
 		});
