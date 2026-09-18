@@ -14,15 +14,16 @@ const directories = temporaryDirectories("pi-actor-write-");
 afterEach(() => directories.dispose());
 
 describe("stock Pi invocation identity", () => {
-	it.each(["write", "edit", "over-budget", "failed", "aborted", "ignored", "foreign", "disposed"])("retains only completed Actor write bytes (%s)", async (mode) => {
-		const cwd = await directories.create(), file = path.join(cwd, "input.txt"), original = "\uFEFFbefore\r\nsecond\r\n";
-		await fs.writeFile(file, original);
+	it.each(["write", "nested", "edit", "over-budget", "failed", "aborted", "ignored", "foreign", "disposed"])("retains only completed Actor write poststates (%s)", async (mode) => {
+		const cwd = await directories.create(), target = mode === "nested" ? "new/nested/input.txt" : "input.txt";
+		const file = path.join(cwd, target), original = "\uFEFFbefore\r\nsecond\r\n";
+		if (mode !== "nested") await fs.writeFile(file, original);
 		const tool = mode === "edit" || mode === "failed" ? "edit" : "write";
-		const args = { path: "@input.txt", ...(tool === "write" ? { content: original.replace("before", "after") }
+		const args = { path: "@" + target, ...(tool === "write" ? { content: original.replace("before", "after") }
 			: { edits: [{ oldText: mode === "failed" ? "absent" : "before", newText: "after" }] }) };
 		const invocation = resolvePiToolInvocation(tool, args, { cwd, environment: {} })!;
 		const capture = invocation.captureInputs!(buildPiActionKey(tool, args, cwd)!, mode === "over-budget" ? 1 : 65536, mode);
-		const abort = new AbortController(), writes = vi.spyOn(fs, "writeFile"), reads = vi.spyOn(fs, "readFile"), opened = vi.spyOn(fs, "open");
+		const abort = new AbortController(), writes = vi.spyOn(fs, "writeFile"), reads = vi.spyOn(fs, "readFile"), opened = vi.spyOn(fs, "open"), scanned = vi.spyOn(fs, "readdir");
 		let branch: Awaited<ReturnType<typeof capture.seal>> | undefined;
 		try {
 			if (mode === "aborted") abort.abort(new Error("cancelled"));
@@ -35,17 +36,27 @@ describe("stock Pi invocation identity", () => {
 			}
 			expect(writes).toHaveBeenCalledTimes(["failed", "aborted", "ignored"].includes(mode) ? 0 : 1);
 			const readsBefore = reads.mock.calls.length, openedBefore = opened.mock.calls.length;
-			if (mode === "write" || mode === "edit") {
+			if (mode === "write" || mode === "nested" || mode === "edit") {
 				const sealing = capture.seal(output);
 				await expect(capture.seal(output)).rejects.toThrow("unavailable");
 				branch = await sealing;
 				expect(branch.inputsOnly).toBe(true);
 				expect(reads.mock.calls.length).toBe(readsBefore); expect(opened.mock.calls.length).toBe(openedBefore);
+				if (mode === "nested") for (const directory of ["new", "new/nested"]) {
+					const args = { path: directory }, action = buildPiActionKey("ls", args, cwd)!;
+					const query = await branch.reconstruct!({ action: { ...action, executionContext: resolvePiToolInvocation("ls", args, { cwd, environment: {} }) },
+						args, callID: "listing", signal: abort.signal });
+					expect(query?.output.result.content).toEqual([{ type: "text", text: directory === "new" ? "nested/" : "input.txt" }]);
+				}
+				expect(scanned).not.toHaveBeenCalled();
 				expect((await branch.validate!()).status).toBe("valid");
+				if (mode === "nested") {
+					await fs.writeFile(path.join(cwd, "new/extra"), "external"); expect((await branch.validate!()).status).toBe("stale");
+				}
 				await expect(branch.commit()).rejects.toThrow("input_only");
 			} else await expect(capture.seal(output)).rejects.toThrow("unavailable");
 			expect(await fs.readFile(file, "utf8")).toBe(["failed", "aborted", "ignored"].includes(mode) ? original : original.replace("before", "after"));
-		} finally { await branch?.dispose(); await capture.dispose(); writes.mockRestore(); reads.mockRestore(); opened.mockRestore(); }
+		} finally { await branch?.dispose(); await capture.dispose(); writes.mockRestore(); reads.mockRestore(); opened.mockRestore(); scanned.mockRestore(); }
 	});
 
 	it.each(["read", "ls", "write", "edit"] as const)("borrows only the filesystem capabilities needed by %s", async (tool) => {
