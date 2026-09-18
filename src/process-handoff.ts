@@ -1,7 +1,7 @@
 import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
-import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
+import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
@@ -143,6 +143,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (!isImmutableSnapshot(value)) return;
 		const bytes = Buffer.byteLength(JSON.stringify(value));
 		if (bytes > this.maxBindingBytes) return;
+		// Repeated native learning shares its launch capability; result owners remain distinct.
+		if (record.state.status === "retained" && !record.state.candidate) for (const previous of this.byKey.get(key)?.values() ?? []) {
+			if (previous !== record && previous.state.status === "retained" && !previous.state.candidate &&
+				previous.scope?.sessionID === record.scope.sessionID && previous.executablePath === record.executablePath &&
+				previous.binding && stableEqual(this.invocations.get(previous.binding)?.value, value)) {
+				this.remove(record); return previous.binding;
+			}
+		}
 		const owner = new WeakRef(this.invocations);
 		const binding = Object.freeze({ key, executionMs, scope: record.scope,
 			get available(): boolean { return owner.deref()?.has(this) ?? false; } });

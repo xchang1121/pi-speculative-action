@@ -104,6 +104,59 @@ describe("ProcessHandoffRegistry", () => {
 		}
 	});
 
+	it.each(["count", "bytes"])("shares native learning without evicting a distinct binding under %s pressure", async limit => {
+		const invocation = { argv: ["private"], environment: { TOKEN: "secret" } };
+		const bytes = Buffer.byteLength(JSON.stringify(invocation));
+		const registry = new ProcessHandoffRegistry<unknown>(limit === "count" ? 2 : 8, limit === "bytes" ? bytes * 2 : bytes * 8);
+		try {
+			const sibling = registry.observe(digest("sibling"), "/usr/bin/sibling", SCOPE, invocation, 20)!;
+			let current = registry.observe(digest("repeated"), "/usr/bin/tool", SCOPE, invocation, 10)!;
+			const admitted = registry.resolveBinding(current, SCOPE);
+			for (let turn = 0; turn < 4; turn++) {
+				const previous = current;
+				current = registry.observe(current.key, "/usr/bin/tool", { ...SCOPE, turnID: String(turn) },
+					{ environment: { TOKEN: "secret" }, argv: ["private"] }, 30 + turn)!;
+				expect(current).toBe(previous);
+				expect(current).toMatchObject({ available: true, executionMs: 10, scope: SCOPE });
+				expect(registry.bindings(SCOPE)).toEqual([sibling, current]);
+				expect(registry.resolveBinding(previous, SCOPE)).toEqual(invocation);
+			}
+			expect(admitted).toEqual(invocation); // Other parents and admitted work retain the same capability.
+			for (const invalid of [new Map(), { argv: ["x".repeat(bytes * 9)] }]) {
+				expect(registry.observe(current.key, "/usr/bin/tool", SCOPE, invalid, 40)).toBeUndefined();
+				expect(registry.bindings(SCOPE)).toEqual([sibling, current]);
+			}
+			await expect(registry.acquire({ key: current.key, scope: SCOPE, role: "actor", lookup: livePlan,
+				waitForRunning: async () => { throw new Error("native learning cannot transfer a result"); } })).resolves.toMatchObject({ kind: "miss" });
+			registry.clearCompleted();
+			expect([sibling.available, current.available]).toEqual([false, false]);
+			registry.configure(1, bytes);
+			expect(registry.observe(current.key, "/usr/bin/tool", SCOPE, invocation, 1)?.available).toBe(true);
+		} finally { registry.dispose(); }
+	});
+
+	it("keeps distinct launches, sessions and result owners when sharing native learning", async () => {
+		const registry = new ProcessHandoffRegistry<unknown>(16, 4096), invocation = { argv: ["private"] };
+		const completed = await producer(true, registry), consumed = await producer(true, registry);
+		try {
+			await completed.publish(); await consumed.publish();
+			const completedBinding = registry.bind(completed.key, completed.work, invocation)!;
+			const consumedBinding = registry.bind(consumed.key, consumed.work, invocation)!;
+			await expect(consumed.actor(live => livePlan(live?.filter(item => item === consumed.certificate)))).resolves.toMatchObject({ kind: "hit" });
+			const running = await producer(true, registry);
+			const native = (value: unknown, scope = SCOPE, executable = "/usr/bin/tool") => registry.observe(completed.key, executable, scope, value, 5)!;
+			const distinct = [native({ argv: ["different"] }), native(invocation, { ...SCOPE, sessionID: "foreign" }),
+				native(invocation, SCOPE, "/usr/bin/different"), completedBinding, consumedBinding];
+			const previous = native(invocation), refreshed = native(invocation, OTHER_SCOPE);
+			expect(refreshed).toBe(previous);
+			expect([refreshed, ...distinct].every(binding => binding.available)).toBe(true);
+			await expect(completed.actor(live => livePlan(live?.filter(item => item === completed.certificate)))).resolves.toMatchObject({ kind: "hit" });
+			await running.publish();
+			await expect(running.actor()).resolves.toMatchObject({ kind: "hit" });
+			await expect(running.actor()).resolves.toMatchObject({ kind: "miss" });
+		} finally { registry.dispose(); }
+	});
+
 	it("excludes attempted disk copies and still finds a candidate completed during history lookup", async () => {
 		const previous = await producer();
 		await previous.publish();

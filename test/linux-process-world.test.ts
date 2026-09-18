@@ -164,6 +164,17 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(native ? 0 : 1);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
+			if (mode === "native") for (const turnID of ["repeated-native-1", "repeated-native-2"]) {
+				const repeatedScope = { ...scope, turnID }; let output = "";
+				let learned: readonly ProcessExecutionBinding[] = [];
+				await fixture.backend.observeBindings(repeatedScope, () => route.executor.execute({
+					command: command.replace("parent", turnID), cwd: fixture.workspace, environment: fixture.environment,
+					scope: repeatedScope, onData: data => { output += data.toString(); },
+				}), bindings => { learned = bindings; }, true);
+				expect(learned).toContain(binding);
+				expect(output).toBe(`${turnID}\nafter\n`);
+				expect(fixture.backend.executionBindings(later).filter(item => item.key === binding!.key)).toEqual([binding]);
+			}
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
