@@ -221,6 +221,7 @@ async function projectOutput<Output>(
 	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
 ): Promise<ProjectionResult<Output>> {
 	const branch = candidateBranch(candidate)!;
+	if (branch.inputsOnly && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	if (match.kind === "exact") return { ok: true, output: branch.output };
 	const retained = candidate.resultViews?.get(actor.key);
 	if (retained) return { ok: true, ...retained, output: cloneSharedData(retained.output) };
@@ -672,6 +673,7 @@ export function makeSpeculativeActionRuntime<
 			const { entry: candidate, inserted } = candidateStore.getOrCreate(session.id, input.key, create, (existing, match) => {
 					const execution = existing.work.execution;
 					return existing.owner.draft.type === (input.kind ?? "tool_call") &&
+						!candidateBranch(existing)?.inputsOnly &&
 						!rejected?.has(existing) && activeExecution(existing) && candidateWorld(existing) === input.worldParent &&
 						(sameSpeculativeExecutionRoute(existing.route, input.route) ||
 							(existing.route.reuse === "shared_result" && input.route.reuse === "shared_result" && execution.status === "succeeded" &&
@@ -1809,7 +1811,16 @@ export function makeSpeculativeActionRuntime<
 				}
 
 				reservation.adopt();
+				reconcileAdoptedCandidate(state.session, actualKey, candidate);
 				if (reservation.kind === "exclusive") {
+					const budget = cacheLimits(state.settings);
+					if (branch.takeCommittedInputs && budget.maxEntries > 0 && budget.maxBytes > 0) {
+						const inputs = await branch.takeCommittedInputs(budget.maxBytes).catch(() => undefined);
+						if (inputs) await promoteAuthoritativeResult(state, candidate.key, inputs.output, 0, execution.toolExecution, {
+							route: { ...candidate.route, backend: inputs.backend, isolation: "resource_snapshot", reuse: "shared_result" },
+							seal: () => inputs, dispose: inputs.dispose,
+						});
+					}
 					removeCandidate(state.session.id, candidate);
 				} else {
 					if (preview) candidate.previews?.delete(preview);
@@ -1956,7 +1967,6 @@ export function makeSpeculativeActionRuntime<
 				const adoption = actorAction.settleSelection(predictionIdentities, previewed ? "preview" : "speculative");
 				if (!adoption) return Object.freeze(prepared);
 				state.actorActions.delete(actorAction);
-				reconcileAdoptedCandidate(state.session, actualKey, selected.candidate);
 				if (!previewed) queueCandidateContinuations(
 					state.session,
 					matchingPredictions.map(({ node }) => node),
@@ -2438,6 +2448,10 @@ export function makeSpeculativeActionRuntime<
 			.flatMap(({ entry: candidate, match }) => {
 				const execution = candidate.work.execution;
 				if (candidate.owner.draft.type !== "tool_call" || !activeExecution(candidate) || candidateWorld(candidate) !== undefined) return [];
+				if (candidateBranch(candidate)?.inputsOnly) {
+					if (semantics.effect(action) !== "observation") return [];
+					match = { kind: "inputs", distance: match.distance };
+				}
 				const remainingMs =
 					execution.status === "running"
 						? Math.max(0, candidate.expectedDurationMs - (now - execution.startedAt))
@@ -2593,6 +2607,8 @@ export function makeSpeculativeActionRuntime<
 			// are authoritative. Cache invalidation may only retire unclaimed work.
 			if (!reservationAvailable(candidate.work.reservation)) continue;
 			if (candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(resource, path)))) {
+				// Known writes retire supplied preimages before another prediction can borrow them.
+				if (candidateBranch(candidate)?.inputsOnly) invalid.add(candidate);
 				for (const descendant of candidates) {
 					// Completed shared outputs are checked against their sealed evidence at every adoption.
 					// Pending work and checkpoint descendants still retain conservative conflict invalidation.

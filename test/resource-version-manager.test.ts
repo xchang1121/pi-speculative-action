@@ -33,6 +33,22 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
+	test("owns supplied bytes without reading payloads or claiming a host observation window", async () => {
+		const root = await workspace({ "value.txt": "A" }), file = path.join(root, "value.txt"), bytes = Buffer.from("A");
+		const opened = vi.spyOn(fs, "open");
+		const token = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, 8192, new Map([[file, bytes]]));
+		try {
+			expect(opened.mock.calls.filter(([, flags]) => isDataOpen(flags))).toHaveLength(0);
+			expect(token.watching).toBe(false); expect(token.preciseContent).toEqual([]);
+			bytes[0] = 66; expect(await token.view!.readFile(file)).toEqual(Buffer.from("A"));
+			expect((await token.manager.validate(token)).expired).toBe(false);
+			await fs.writeFile(file, "B"); expect((await token.manager.validate(token)).expired).toBe(true);
+			await expect(captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, 0, new Map([[file, bytes]]))).rejects.toThrow("budget");
+			await fs.unlink(file); await fs.mkdir(file);
+			await expect(captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, 8192, new Map([[file, bytes]]))).rejects.toThrow("resource_input_not_regular");
+		} finally { opened.mockRestore(); await token.release(); }
+	});
+
 	test.each([true, false])("seals eager observations and on-demand inputs (watch=%s)", async (watch) => {
 		for (const onDemand of [false, true]) for (const change of ["unchanged", "ancestor", "sibling", "write", "restore", "replace", "kind", "entries"] as const) {
 			const parent = await workspace({ "workspace/value.txt": "A" }), root = path.join(parent, "workspace");

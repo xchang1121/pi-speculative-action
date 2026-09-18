@@ -184,7 +184,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	const shared = attempt.descriptor.route.reuse === "shared_result";
 	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
-		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
+		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputsOnly: branch.inputsOnly, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
 			reconstructionScope: shared && branch.reconstruct && !validateAndCommit ? branch.reconstructionScope : undefined,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
@@ -194,16 +194,18 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
 		validate: validateAndCommit ?? branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
 		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
+		takeCommittedInputs: branch.takeCommittedInputs?.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
 	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
+	let inputTransfer: ReturnType<NonNullable<WorldBranch<Output>["takeCommittedInputs"]>> | undefined;
 	const reconstructions = new Set<ReturnType<NonNullable<WorldBranch<Output>["reconstruct"]>>>();
 	const abort = (): Promise<void> => {
 		if (cleanupPromise) return cleanupPromise;
 		if (!["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
 		cleanupPromise = (async () => {
 			try {
-				await Promise.allSettled([validationPromise, commitPromise, ...reconstructions]);
+				await Promise.allSettled([validationPromise, commitPromise, inputTransfer, ...reconstructions]);
 				await sealed.dispose();
 			} finally {
 				if (!["committed", "poisoned"].includes(attempt.stateValue)) attempt.stateValue = "aborted";
@@ -238,6 +240,13 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
 		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
 		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
+		takeCommittedInputs: sealed.takeCommittedInputs ? async (maxBytes) => {
+			if (cleanupPromise || attempt.stateValue !== "committed" || inputTransfer) return undefined;
+			return inputTransfer = Promise.resolve().then(() => sealed.takeCommittedInputs!(maxBytes)).then(async inputs => {
+				if (!cleanupPromise) return inputs;
+				await inputs?.dispose(); return undefined;
+			});
+		} : undefined,
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
 			// Borrowing sealed inputs grants no commit authority; freshness is checked after evaluation.
 			if (cleanupPromise || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;

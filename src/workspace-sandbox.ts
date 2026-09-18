@@ -7,7 +7,7 @@ import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
-import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
+import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type {
 	WorldBranch,
 	WorldCheckpoint,
@@ -459,15 +459,16 @@ function createWorkspaceSandboxFor(
 function workspaceBranch(
 	snapshot: WorkspaceExecutionSnapshot,
 	sourceRoot: string,
-	executionFingerprint: string,
+	action: SpeculativeToolExecutionContext["action"],
 	owner: WorkspaceSandboxState,
 	parent?: WorkspaceCheckpoint,
 	validate?: () => Promise<ResourceValidation>,
 ): WorldBranch<ToolSettlement> {
-	const { changes } = snapshot, backend = "git_worktree", id = randomUUID();
+	const { changes } = snapshot, { executionFingerprint } = action, backend = "git_worktree", id = randomUUID();
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
 	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
 	let commitMetrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	let disposed = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
 		backend, checkpoint, output: snapshot.output, validate,
 		resources: Object.freeze([...new Set(changes.filter((change) => !change.validationOnly).map((change) => change.resource))]),
@@ -479,8 +480,18 @@ function workspaceBranch(
 			commitMetrics = metrics;
 			return output;
 		}),
-		// The private worktree was removed during fork; no filesystem handles remain.
-		dispose() {},
+		takeCommittedInputs: async (maxBytes) => {
+			if (disposed || !commitMetrics || transferred) return undefined;
+			return transferred = (async () => {
+				const inputs = new Map(changes.flatMap(change => !change.validationOnly && change.kind !== "directory" && change.after !== undefined
+					? [[change.target, change.after] as const] : []));
+				if (!inputs.size) return undefined;
+				const branch = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, inputs, maxBytes);
+				if (!disposed) return branch;
+				await branch.dispose(); return undefined;
+			})();
+		},
+		dispose() { disposed = true; return transferred?.then(() => {}, () => {}); },
 	};
 }
 
@@ -663,7 +674,7 @@ async function forkSandboxWorkspaceFor(
 	return workspaceBranch(
 		snapshot,
 		sourceRoot,
-		options.action.executionFingerprint,
+		options.action,
 		state,
 		parent,
 		options.validate,

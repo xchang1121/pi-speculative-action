@@ -199,6 +199,18 @@ async function evaluateResourceInputs(
 	return { output, capturedBytes, versions: [...proofs].map(([token, observations]) => ({ ...token, observations })) };
 }
 
+/** Committed bytes enter the same read view and exact dependency validation as captured inputs. */
+export async function createCommittedResourceInputs(
+	output: ToolSettlement, action: ActionKey, root: string, inputs: ReadonlyMap<string, Uint8Array>, maxBytes: number,
+): Promise<WorldBranch<ToolSettlement> & { readonly inputsOnly: true }> {
+	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
+	try {
+		if (!version.view) throw new Error("resource_snapshot_budget_exceeded");
+		return { ...resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS), inputsOnly: true,
+			commit: async () => { throw new Error("input_only_branch"); } };
+	} catch (error) { await version.release(); throw error; }
+}
+
 function resourceSnapshotBranch(
 	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, setupMs: number, semantics: ActionSemanticsRegistry,
 	capturedBytes = versions[0]!.view?.bytes ?? 0,

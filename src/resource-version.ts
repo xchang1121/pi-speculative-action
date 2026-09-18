@@ -356,9 +356,12 @@ export class ResourceVersionManager {
 	}
 
 	/** Undefined dependencies grant only bounded on-demand captures; observation of host tools stays eager. */
-	async capture(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
+	async capture(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number,
+		providedInputs?: ReadonlyMap<string, Uint8Array>): Promise<ResourceVersionToken> {
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
-		return this.captureToken(dependencies, retainBytes);
+		if (providedInputs && retainBytes === undefined) throw new Error("resource_snapshot_budget_invalid");
+		return this.captureToken(dependencies, retainBytes, providedInputs && new Map([...providedInputs]
+			.map(([target, bytes]) => [filesystemPathKey(path.resolve(this.root, target)), bytes])));
 	}
 
 	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
@@ -379,13 +382,15 @@ export class ResourceVersionManager {
 		}) };
 	}
 
-	private async captureToken(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number): Promise<ResourceVersionToken> {
+	private async captureToken(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number,
+		providedInputs?: ReadonlyMap<string, Uint8Array>): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
 		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>();
 		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;
 		this.references++;
 		let view: ResourceReadView | undefined;
+		const observing = dependencies !== undefined && !providedInputs;
 		const release = releaseOnce(() => {
 			const finish = () => {
 				observations.clear(); precise?.release();
@@ -395,14 +400,14 @@ export class ResourceVersionManager {
 			return pending ? pending.then(finish) : finish();
 		});
 		try {
-			if (dependencies) await (this.ready ??= this.startWatching());
+			if (observing) await (this.ready ??= this.startWatching());
 			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
 			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
 				const normalized = normalizeDependencies(this.root, requested).filter((dependency) => !observations.has(dependencyKey(dependency)));
 				if (!normalized.length) return;
-				if (dependencies && this.reliable) precise = this.acquirePreciseWatches(normalized);
+				if (observing && this.reliable) precise = this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
-					dependencies && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined)) observations.set(dependencyKey(observation), observation);
+					observing && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined, providedInputs)) observations.set(dependencyKey(observation), observation);
 			};
 			const boundary = { path: this.root, scope: "resolution" as const }, boundaryKey = dependencyKey(boundary);
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]),
@@ -410,12 +415,12 @@ export class ResourceVersionManager {
 			if (view) observations.set(boundaryKey, { ...boundary, stamp: filesystemPathKey(physicalRoot),
 				fingerprint: digest({ path: filesystemPathKey(this.root), scope: "resolution", value: filesystemPathKey(physicalRoot) }) });
 			if (dependencies) await capture(dependencies);
-			if (dependencies) await watcherTurn();
+			if (observing) await watcherTurn();
 			const retained = view?.retained ? view : undefined;
 			if (dependencies) retained?.seal();
 			return {
 				root: this.root, physicalRoot, observations, epoch: this.epoch,
-				watching: Boolean(dependencies && this.reliable), preciseContent: Object.freeze(precise?.paths ?? []),
+				watching: Boolean(observing && this.reliable), preciseContent: Object.freeze(precise?.paths ?? []),
 				manager: this, ...(retained ? { view: retained } : {}), release,
 			};
 		} catch (error) {
@@ -567,8 +572,10 @@ export async function captureResourceVersion(
 	root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
 	retainBytes?: number,
+	providedInputs?: ReadonlyMap<string, Uint8Array>,
 ) {
-	const dependencies = action ? resourceDependencies(action, root, actionSemantics) : undefined;
+	const dependencies = providedInputs ? [...providedInputs.keys()].map(path => ({ path, scope: "content" as const }))
+		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 	const normalized = path.resolve(root);
 	let manager = managers.get(normalized);
@@ -579,7 +586,7 @@ export async function captureResourceVersion(
 		});
 		managers.set(normalized, manager);
 	}
-	return manager.capture(dependencies, retainBytes);
+	return manager.capture(dependencies, retainBytes, providedInputs);
 }
 
 export async function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
@@ -677,6 +684,7 @@ type FingerprintResult = {
 async function fingerprintDependencies(
 	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
 	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
+	providedInputs?: ReadonlyMap<string, Uint8Array>,
 ) {
 	const files = new Map<string, Promise<FingerprintResult>>(), nearestExisting = missingResourceResolver(realRoot);
 	const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
@@ -722,6 +730,7 @@ async function fingerprintDependencies(
 			captured = await captureEntry(target, scope);
 		} catch (error) {
 			if (!missingResource(error)) throw error;
+			if (providedInputs) throw error;
 			const nearest = await nearestExisting(target);
 			view?.capture(target, { type: "missing", realPath: nearest.realPath, dependency });
 			return {
@@ -732,6 +741,7 @@ async function fingerprintDependencies(
 			};
 		}
 		const { info, link } = captured;
+		if (providedInputs && (!info.isFile() || !providedInputs.has(filesystemPathKey(target)))) throw new Error("resource_input_not_regular");
 		const realTarget = info.isSymbolicLink()
 			? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
 			: await fingerprintIO(() => fs.realpath(target));
@@ -772,8 +782,13 @@ async function fingerprintDependencies(
 			if (existing) return { ...await existing, bytesRead: 0, filesRead: 0 };
 			const pending = (async () => {
 				// Join only concurrent reads of this identity; settled captures never authorize a later read.
-				const retain = view?.reserve(Number(info.size)) ?? false;
-				const content = await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
+				const provided = providedInputs?.get(filesystemPathKey(target));
+				const retain = view?.reserve(provided?.byteLength ?? Number(info.size)) ?? false;
+				if (provided && !retain) throw new Error("resource_snapshot_budget_exceeded");
+				const bytes = provided && Buffer.from(provided);
+				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
+				const content = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
+					: await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
 				assertInside(realRoot, content.realPath);
 				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath, dependency });
 				return {
@@ -785,8 +800,8 @@ async function fingerprintDependencies(
 						resolved: filesystemPathKey(content.realPath),
 					},
 					stamp: digest(["file", statStamp(content.stat), filesystemPathKey(content.realPath)]),
-					bytesRead: content.bytesRead,
-					filesRead: 1,
+					bytesRead: bytes ? 0 : content.bytesRead,
+					filesRead: bytes ? 0 : 1,
 				};
 			})().finally(() => files.delete(key));
 			files.set(key, pending);
