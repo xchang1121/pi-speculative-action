@@ -742,9 +742,13 @@ async function executeMutation(
 			};
 			const targetRecord = (target: string) => ({ root: sourceRoot, target, resource: slash(path.relative(sourceRoot, target)) });
 			const fileInput = async (target: string) => {
-				const file = await physical(target), before = await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES), key = filesystemPathKey(target);
+				const file = await physical(target), key = filesystemPathKey(target);
 				const previous = changes.get(key);
 				if (previous?.kind === "directory") throw new Error("Workspace file input changed type");
+				// Access/read/write preparation shares one preimage; writes revoke this read-only view.
+				const before = previous?.validationOnly
+					? previous.before === undefined ? undefined : { content: previous.before, mode: previous.beforeMode! }
+					: await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES);
 				const captured: SandboxFileChange = previous ?? { ...targetRecord(target), validationOnly: true, before: before?.content, beforeMode: before?.mode };
 				record(key, captured);
 				return { file, before, key, captured };

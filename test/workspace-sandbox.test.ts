@@ -483,11 +483,19 @@ describe("workspace-branch ExecutionWorld", () => {
 				};
 				if (phase === "preparation") { await alter(); delayed = true; }
 				const branch = await world.speculation.execute(boundContext(root, async (view) => {
-					await view.access(input, true);
-					await view.access(directory);
-					const bytes = await view.readFile(input);
-					await view.writeFile!(target, bytes.toString());
-					return settlement((await view.readFile(target)).toString());
+					const captures = vi.spyOn(await import("../src/filesystem-evidence.ts"), "captureStableFile");
+					try {
+						await view.access(input, true);
+						await view.access(directory);
+						const bytes = await view.readFile(input);
+						await view.access(target, true);
+						expect((await view.readFile(target)).toString()).toBe("before\n");
+						await view.writeFile!(target, bytes.toString());
+						const result = settlement((await view.readFile(target)).toString());
+						expect(captures.mock.calls.filter(([file]) => path.basename(file) === "input.txt")).toHaveLength(1);
+						expect(captures.mock.calls.filter(([file]) => path.basename(file) === "output.txt")).toHaveLength(2);
+						return result;
+					} finally { captures.mockRestore(); }
 				}));
 				delayed = false;
 				expect(branch.resources).toEqual(["output.txt"]);
