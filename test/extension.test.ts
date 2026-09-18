@@ -507,7 +507,7 @@ describe("zero-modification Pi extension", () => {
 function searchProfile() {
 	const authoritative = vi.fn(async () => ({ result: textResult("selected search"), isError: false }));
 	return { profile: { id: "test-search", pi: "0.84.1", limits: { inputBytes: 1024 }, grep: { versions: {}, flags: [] } },
-		pool: { run: authoritative, dispose: vi.fn(async () => {}) }, invocations: new Map(["find"].map((tool) => [tool, {
+		pool: { prepare: vi.fn(), run: authoritative, dispose: vi.fn(async () => {}) }, invocations: new Map(["find"].map((tool) => [tool, {
 			executor: "test-search", authoritative, filesystem: authoritative,
 			semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "captured_inputs" as const },
 		}])) };

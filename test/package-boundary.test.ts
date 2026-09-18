@@ -1,5 +1,6 @@
 import { gated, nextTurn } from "./async.ts";
-import { execFile } from "node:child_process";
+import childProcess, { execFile, type ChildProcess } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +9,7 @@ import { promisify } from "node:util";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { createClosedSearchProfile, runCapturedSearchProcess } from "../src/pi-tool-invocation.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const execFileAsync = promisify(execFile);
@@ -72,6 +73,37 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 				if (fault !== "rollback") await expect(fs.stat(path.join(root, "txn"))).rejects.toThrow();
 			} finally { await fs.rm(root, { recursive: true, force: true }); }
 		}
+	});
+
+	test.each(["profile", "unused", "dead", "rejected"])("owns and reuses prestarted search capacity (%s)", async mode => {
+		const { ClosedSearchProcessPool } = await import(new URL("../src/closed-search-process.mjs", import.meta.url).href);
+		const children: ChildProcess[] = [], closures: Promise<void>[] = [], nativeFork = childProcess.fork;
+		const fork = vi.spyOn(childProcess, "fork").mockImplementation(((entry, args, options) => {
+			const child = nativeFork(mode === "dead" && !children.length ? new URL("./missing-search-worker.mjs", import.meta.url) : entry, args, options);
+			children.push(child); closures.push(new Promise(resolve => child.once("close", () => resolve()))); return child;
+		}) as typeof childProcess.fork);
+		const readFile = mode === "rejected" ? vi.spyOn(fs, "readFile").mockRejectedValue(new Error("profile qualification denied")) : undefined;
+		syncBuiltinESMExports();
+		let pool: Awaited<ReturnType<typeof createClosedSearchProfile>>["pool"] | undefined;
+		try {
+			if (mode === "rejected") {
+				await expect(createClosedSearchProfile(packageRoot)).rejects.toThrow("profile qualification denied");
+				expect(children).toHaveLength(1); expect(children[0]!.exitCode !== null || children[0]!.signalCode !== null).toBe(true); return;
+			}
+			pool = mode === "profile" ? (await createClosedSearchProfile(packageRoot)).pool : new ClosedSearchProcessPool();
+			if (mode === "profile") expect(children).toHaveLength(1); // Profile preparation starts capacity before any search request.
+			pool!.prepare(); pool!.prepare(); expect(children).toHaveLength(1);
+			if (mode === "dead") { await closures[0]; await nextTurn(); pool!.prepare(); expect(children).toHaveLength(2); }
+			if (mode !== "unused") {
+				await pool!.run("actor", async () => ({ result: { content: [], details: undefined }, isError: false }));
+				expect(children).toHaveLength(mode === "dead" ? 2 : 1); // Preparing capacity is claimable, not locked behind readiness.
+			}
+		} finally {
+			await pool?.dispose(); fork.mockRestore(); readFile?.mockRestore(); syncBuiltinESMExports();
+			if (mode === "rejected") for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			await Promise.all(closures);
+		}
+		for (const child of children) expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 	});
 
 	test("loads Pi and executes captured find with only Pi's installed dependencies", async () => {

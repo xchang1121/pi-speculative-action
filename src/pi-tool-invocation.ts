@@ -210,67 +210,72 @@ export async function createClosedSearchProfile(cwd: string) {
 		loadSearchEngines(): Promise<unknown>;
 	};
 	assert.equal(VERSION, profile.pi, "Closed search requires its qualified Pi version");
-	await loadSearchEngines();
 	const { resolvePath } = await import(new URL("./utils/paths.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 	const { ClosedSearchProcessPool } = await import(new URL("./closed-search-process.mjs", import.meta.url).href);
-	const semantics = new Map(await Promise.all(PI_CLOSED_SEARCH_TOOLS.map(async (tool) => [tool, await createClosedSearchSemantics(tool, cwd, home)] as const)));
-	const grep = await prepareGrepEngine(home, profile.grep);
-	const pool = new ClosedSearchProcessPool(grep?.release) as {
+	let grep: Awaited<ReturnType<typeof prepareGrepEngine>>;
+	const pool = new ClosedSearchProcessPool(() => grep?.release()) as {
+		prepare(): void;
 		run(role: "actor" | "producer", operation: (worker: {
 			request(input: unknown, options?: { signal?: AbortSignal; onInput: (operation: string, target: unknown, signal: AbortSignal, emit: (output: SearchOutput) => void) => Promise<unknown> }): Promise<ToolSettlement>;
 			dispose(): Promise<void>;
 		}, signal: AbortSignal) => Promise<ToolSettlement>, signal?: AbortSignal): Promise<ToolSettlement>;
 		dispose(): Promise<void>;
 	};
-	const invocations = new Map<string, ToolInvocation>();
-	for (const tool of PI_CLOSED_SEARCH_TOOLS) {
-		const engine = tool === "grep" ? grep : undefined;
-		if (tool === "grep" && !engine) continue;
-		const execute = (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => pool.run(view ? "producer" : "actor", async (worker, signal) => {
-			const capture = view || engine ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
-			const run = (prepared?: { readonly root: string; readonly cwd: string; readonly path: string }) => {
-				const directory = prepared?.cwd ?? cwd, args = prepared ? { ...request.args as GrepInput, path: prepared.path } : request.args;
-				return worker.request({ kind: tool, root: directory, home, args }, {
-					signal, onInput: async (operation, target, signal, emit) => {
-						if (engine && operation === "process") {
-							const command = target as { file: string; args: string[]; options: unknown };
-							assert.equal(command.file, "rg"); assert.deepEqual(command.options, { stdio: ["ignore", "pipe", "pipe"] });
-							return engine.execute(view ? "producer" : "actor", directory, command.args, signal, emit);
-						}
-						assert.equal(typeof target, "string");
-						if (!engine) return readClosedSearchInput((view ?? capture?.view)!, cwd, operation, target as string, profile.limits.inputBytes);
-						assert.ok(operation === "stat" || operation === "readFile", "grep input operation denied");
-						if (prepared) assert.ok(relativeFilesystemPath(prepared.root, target as string) !== undefined, "grep input escaped its owned tree");
-						return operation === "stat" ? { directory: (await fs.stat(target as string)).isDirectory() } : fs.readFile(target as string, { signal });
-					},
-				});
-			};
-			try {
-				if (!engine || !view) return await run();
-				const query = request.args as GrepInput;
-				const target = resolvePath(query.path || ".", cwd, { homeDir: home, normalizeUnicodeSpaces: true, stripAtPrefix: true });
-				const build = async (inputs: ToolFilesystemOperations) => {
-					const root = await fs.mkdtemp(path.join(engine.root, "inputs-"));
-					const dispose = async () => { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); };
-					try {
-						const prepared = await prepareCapturedGrep(inputs, cwd, root, { ...query, path: target }, signal,
-							(directory, args, signal, emit) => engine.execute("selection", directory, args, signal, emit));
-						return { value: { root, cwd: prepared.cwd, path: prepared.path }, bytes: prepared.bytes, dispose };
-					} catch (error) { await dispose(); throw error; }
+	try {
+		pool.prepare();
+		await loadSearchEngines();
+		const semantics = new Map(await Promise.all(PI_CLOSED_SEARCH_TOOLS.map(async (tool) => [tool, await createClosedSearchSemantics(tool, cwd, home)] as const)));
+		grep = await prepareGrepEngine(home, profile.grep);
+		const invocations = new Map<string, ToolInvocation>();
+		for (const tool of PI_CLOSED_SEARCH_TOOLS) {
+			const engine = tool === "grep" ? grep : undefined;
+			if (tool === "grep" && !engine) continue;
+			const execute = (request: Parameters<NonNullable<ToolInvocation["authoritative"]>>[0], view?: ToolFilesystemOperations) => pool.run(view ? "producer" : "actor", async (worker, signal) => {
+				const capture = view || engine ? undefined : await captureResourceVersion(undefined, cwd, PI_ACTION_SEMANTICS, profile.limits.inputBytes);
+				const run = (prepared?: { readonly root: string; readonly cwd: string; readonly path: string }) => {
+					const directory = prepared?.cwd ?? cwd, args = prepared ? { ...request.args as GrepInput, path: prepared.path } : request.args;
+					return worker.request({ kind: tool, root: directory, home, args }, {
+						signal, onInput: async (operation, target, signal, emit) => {
+							if (engine && operation === "process") {
+								const command = target as { file: string; args: string[]; options: unknown };
+								assert.equal(command.file, "rg"); assert.deepEqual(command.options, { stdio: ["ignore", "pipe", "pipe"] });
+								return engine.execute(view ? "producer" : "actor", directory, command.args, signal, emit);
+							}
+							assert.equal(typeof target, "string");
+							if (!engine) return readClosedSearchInput((view ?? capture?.view)!, cwd, operation, target as string, profile.limits.inputBytes);
+							assert.ok(operation === "stat" || operation === "readFile", "grep input operation denied");
+							if (prepared) assert.ok(relativeFilesystemPath(prepared.root, target as string) !== undefined, "grep input escaped its owned tree");
+							return operation === "stat" ? { directory: (await fs.stat(target as string)).isDirectory() } : fs.readFile(target as string, { signal });
+						},
+					});
 				};
-				if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target);
-				const prepared = await build(view);
-				try { return await run(prepared.value); } finally { await prepared.dispose(); }
-			} finally { await capture?.release(); }
-		}, request.signal);
-		invocations.set(tool, Object.freeze({
-			executor: profile.id, identity: Object.freeze({ profile, cwd, home, ...(engine ? { engine: engine.identity } : {}) }),
-			filesystemRoot: engine ? path.parse(cwd).root : cwd,
-			semantics: semantics.get(tool),
-			authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
-		} satisfies ToolInvocation));
-	}
-	return { profile, pool, invocations: invocations as ReadonlyMap<string, ToolInvocation> };
+				try {
+					if (!engine || !view) return await run();
+					const query = request.args as GrepInput;
+					const target = resolvePath(query.path || ".", cwd, { homeDir: home, normalizeUnicodeSpaces: true, stripAtPrefix: true });
+					const build = async (inputs: ToolFilesystemOperations) => {
+						const root = await fs.mkdtemp(path.join(engine.root, "inputs-"));
+						const dispose = async () => { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); };
+						try {
+							const prepared = await prepareCapturedGrep(inputs, cwd, root, { ...query, path: target }, signal,
+								(directory, args, signal, emit) => engine.execute("selection", directory, args, signal, emit));
+							return { value: { root, cwd: prepared.cwd, path: prepared.path }, bytes: prepared.bytes, dispose };
+						} catch (error) { await dispose(); throw error; }
+					};
+					if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target);
+					const prepared = await build(view);
+					try { return await run(prepared.value); } finally { await prepared.dispose(); }
+				} finally { await capture?.release(); }
+			}, request.signal);
+			invocations.set(tool, Object.freeze({
+				executor: profile.id, identity: Object.freeze({ profile, cwd, home, ...(engine ? { engine: engine.identity } : {}) }),
+				filesystemRoot: engine ? path.parse(cwd).root : cwd,
+				semantics: semantics.get(tool),
+				authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
+			} satisfies ToolInvocation));
+		}
+		return { profile, pool, invocations: invocations as ReadonlyMap<string, ToolInvocation> };
+	} catch (error) { await pool.dispose(); throw error; }
 }
 
 /** Pin only an already-installed qualified rg; failure leaves the independent find executor available. */
