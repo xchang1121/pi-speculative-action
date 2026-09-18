@@ -106,12 +106,13 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-shared-table", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
-		const descriptors = mode === "native-descriptors" || mode === "native-shared-table";
+		const launcher = mode === "native-shared-table" || mode === "native-unshare";
+		const descriptors = mode === "native-descriptors" || launcher;
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
@@ -138,14 +139,17 @@ int main(int argc, char **argv) {
 }
 `);
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
-			if (mode === "native-shared-table") {
-				await writeFile(path.join(fixture.workspace, "fd-launch.c"), `#include <pthread.h>
+			if (launcher) {
+				await writeFile(path.join(fixture.workspace, "fd-launch.c"), `#define _GNU_SOURCE
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <unistd.h>
 static void *duplicate(void *unused) { (void)unused; if (dup2(3, 9) < 0) _exit(73); return 0; }
 int main(int argc, char **argv) {
 	if (argc != 2) return 74;
 	pthread_t worker; if (pthread_create(&worker, 0, duplicate, 0) || pthread_join(worker, 0)) return 75;
+	${mode === "native-unshare" ? "if (unshare(CLONE_FILES)) return 77;" : ""}
 	puts(argv[1]); fflush(stdout);
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
@@ -156,7 +160,7 @@ int main(int argc, char **argv) {
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
 			const command = (descriptors ? "exec 3<fd.txt; exec 4<&3; exec 8<fd.txt; IFS= read -r -N 1 discarded <&3; " : "") +
-				"export BOUND_SECRET='private value'; " + (mode === "native-shared-table" ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
+				"export BOUND_SECRET='private value'; " + (launcher ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
 				(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
@@ -312,7 +316,7 @@ int main(int argc, char **argv) {
 			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
 				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBe(stalePreparation ? 1 : 2);
 			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
-			expect(events.filter(event => event.type === "operation_prediction").filter(event => mode !== "native-shared-table" || event.settlement.observation === "observed")).toMatchObject([{ settlement: stalePreparation ? { observation: "unobserved" } : {
+			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || event.settlement.observation === "observed")).toMatchObject([{ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 			} }]);
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command, changedParent]);
@@ -551,6 +555,17 @@ static void *thread(void *execute) {
 	return 0;
 }
 static int shared_exec(void *unused) { (void)unused; thread((void *)1); return 76; }
+static int split_exec(void *argument) {
+	const char *mode = argument;
+	if (!strcmp(mode, "unshare")) {
+		if (unshare(CLONE_FILES) || close(65) || dup2(3, 68) < 0) return 85;
+	} else if (!strcmp(mode, "unshare-noop")) {
+		if (unshare(0) || dup2(3, 68) < 0) return 86;
+	} else if (!strcmp(mode, "range-invalid")) {
+		if (close_range(67, 65, CLOSE_RANGE_UNSHARE) != -1 || dup2(3, 68) < 0) return 87;
+	} else if (close_range(65, 67, CLOSE_RANGE_UNSHARE | (!strcmp(mode, "range-cloexec") ? CLOSE_RANGE_CLOEXEC : 0))) return 88;
+	char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
+}
 static void *blocked_open(void *file) { int fd = open(file, O_RDONLY); if (fd < 0) _exit(79); close(fd); return 0; }
 int main(int argc, char **argv) {
 	if (argc != 3) return 70;
@@ -574,6 +589,14 @@ int main(int argc, char **argv) {
 		if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 78;
 		if (fcntl(66, F_GETFD) != FD_CLOEXEC) return 80;
 		free(stack);
+	} else if (!strncmp(argv[1], "unshare", 7) || !strncmp(argv[1], "range-", 6)) {
+		char *stack = malloc(65536); int status;
+		if (aliases(0)) return 75;
+		pid_t child = stack ? clone(split_exec, stack + 65536, CLONE_FILES | SIGCHLD, argv[1]) : -1;
+		if (child < 0 || waitpid(child, &status, 0) != child || status) return 89;
+		if (fcntl(65, F_GETFD) != 0 || fcntl(66, F_GETFD) != FD_CLOEXEC || fcntl(67, F_GETFD) != 0) return 90;
+		if ((fcntl(68, F_GETFD) >= 0) != (!strcmp(argv[1], "unshare-noop") || !strcmp(argv[1], "range-invalid"))) return 91;
+		free(stack);
 	} else if (!strcmp(argv[1], "overlap")) {
 		pthread_t worker; int status; const char *fifo = "overlap-fifo";
 		if (mkfifo(fifo, 0600) || pthread_create(&worker, 0, blocked_open, (void *)fifo)) return 81;
@@ -588,24 +611,33 @@ int main(int argc, char **argv) {
 }
 `);
 			execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", `${descriptorProbe}.c`, "-o", descriptorProbe]);
-			for (const mode of ["lock", "export", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap"]) {
+			for (const mode of ["lock", "export", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
+				"unshare", "unshare-noop", "range-close", "range-cloexec", "range-invalid"]) {
 				let snapshot: HeldExecProcess["descriptors"], output = "";
+				const split = mode.startsWith("unshare") || mode.startsWith("range-");
+				const shared = mode === "unshare-noop" || mode === "range-invalid", slots: number[][] = [];
 				const ownership: boolean[] = [];
 				const commit = vi.fn(async () => {});
 				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					snapshot = process.descriptors;
+					slots.push(snapshot!.map(({ fd }) => fd));
 					ownership.push(snapshot!.find(({ fd }) => fd === 3)!.owned);
-					return mode === "export" ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
+					return mode === "export" || split ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
 						({ ...descriptor, before: offset, after: offset + 1 })), exitCode: 0, output: [], commit } : { kind: "continue" };
 				} });
 				expect(await executor.execute({ command: `exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
 					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
 					timeout: 5, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
-				expect(output).toBe("a"); expect(commit).not.toHaveBeenCalled();
+				expect(output, mode).toBe(split ? "c" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : 0);
 				if (!["lock", "export", "overlap"].includes(mode)) expect(snapshot?.map(({ fd, alias, owned }) => ({ fd, alias, owned })), mode).toEqual([
 					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: 3, owned: true },
+					...(shared ? [{ fd: 68, alias: 3, owned: true }] : []),
 				]);
+				if (split) {
+					expect(ownership, mode).toEqual([true, true]);
+					expect(slots[0], mode).toEqual(shared ? [3, 65, 67, 68] : mode === "unshare" ? [3, 67, 68] : [3]);
+				}
 				if (mode === "export") expect(snapshot).toMatchObject([{ fd: 3, owned: false }]);
 				if (mode === "overlap") expect(ownership).toEqual([false, true]);
 			}
