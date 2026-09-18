@@ -1280,6 +1280,7 @@ export class LinuxProcessReuseBackend {
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical]),
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {

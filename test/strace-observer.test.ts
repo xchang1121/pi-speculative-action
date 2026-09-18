@@ -141,6 +141,12 @@ describe("strace provenance decoder", () => {
 	});
 
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
+		for (const operand of ["3</work/input>", "9</work/input>", "3</work/other>", "3<pipe:[7]>", "3", "3</work/input (deleted)>"]) {
+			const line = `fcntl(${operand}, F_GETFL) = 0x8000 (flags O_RDONLY|O_LARGEFILE)`;
+			expect((await observe({ 100: [EXEC, line] })).taints).toContain("unsupported_syscall");
+			const captured = await observe({ 100: [EXEC, line] }, { inheritedFileImages: ["/work/input"] });
+			expect(captured.taints.includes("unsupported_syscall")).toBe(!operand.endsWith("</work/input>"));
+		}
 		const filter = straceCommand("strace", "/trace", ["program"]).find(value => value.startsWith("trace="))!;
 		for (const syscall of ["fcntl", "fcntl64", "flock"]) expect(filter.split(/[,=]/)).toContain(syscall);
 		for (const [line, taints, semanticGap] of [
@@ -149,6 +155,7 @@ describe("strace provenance decoder", () => {
 			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
 			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', ["ipc"]],
 			['fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
+			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
 			['fcntl(3</work/input>, F_GETLEASE) = 2 (F_UNLCK)', ["unsupported_syscall"]],
 			['fcntl(1<pipe:[7]>, 0xffff /* F_??? */, 0) = -1 EINVAL (Invalid argument)', ["unsupported_syscall"]],
 			['fcntl(1<pipe:[7]>, F_GETFD) = 0', []],
@@ -180,7 +187,7 @@ describe("strace provenance decoder", () => {
 			['openat(AT_FDCWD, ".", O_RDWR|O_TMPFILE, 0600) = -1 EOPNOTSUPP (Operation not supported)', ["trace_incomplete", "unsupported_syscall"], "openat"],
 			['rename("/outside/source", "/outside/moved") = -1 EXDEV (Invalid cross-device link)', []],
 		] as const) {
-			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: ["/work"] });
+			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: ["/work"], inheritedFileImages: ["/work/input"] });
 			expect(observation, line).toMatchObject({ complete: !semanticGap, taints: [...new Set(["clock", "random", ...taints])].sort(),
 				incompleteReasons: semanticGap ? [`filesystem_semantics:${semanticGap}:100`] : [] });
 			if (line.includes('"/work/input"')) expect(observation.paths).toContainEqual({ path: "/work/input", role: "input" });

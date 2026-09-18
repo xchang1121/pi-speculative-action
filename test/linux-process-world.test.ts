@@ -132,6 +132,7 @@ int main(int argc, char **argv) {
 	for (volatile unsigned long iteration = 0; iteration < ${mode === "running" ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
 	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
 	${descriptors ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
+	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != O_RDONLY) return 74; close(alias);' : ""}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
 	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;

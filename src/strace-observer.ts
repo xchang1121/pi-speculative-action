@@ -54,6 +54,8 @@ export interface StraceObservationOptions {
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
 	 */
 	readonly guardFilesystemSemanticsWithin?: readonly string[];
+	/** Private regular-file images whose inherited OFD flags are reproduced and sealed by the caller. */
+	readonly inheritedFileImages?: readonly string[];
 }
 
 interface TraceFile {
@@ -323,13 +325,15 @@ export async function observeStrace(
 			}
 			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line)) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
-			// Descriptor-local flags and duplication stay within the traced process tree. OFD controls
-			// can observe or mutate locks, leases, shared flags and owners that file snapshots do not seal.
+			// Descriptor-local state is internal. OFD flag reads require reproduced file images;
+			// locks, leases, shared flag changes and owners need effects beyond those snapshots.
 			if (syscall === "flock") taints.add("ipc");
 			if (syscall === "fcntl" || syscall === "fcntl64") {
 				const command = line.args[1] ?? "";
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) taints.add("ipc");
-				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command)) taints.add("unsupported_syscall");
+				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
+					!(command === "F_GETFL" && options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "")))
+					taints.add("unsupported_syscall");
 			}
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
 				taints.add("confinement_observation");
