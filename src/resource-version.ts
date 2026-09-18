@@ -171,20 +171,27 @@ export class ResourceReadView {
 			let retained = false;
 			try {
 				await this.borrow(async view => { resource = await build(view); }, (observed) => { dependencies = observed; inherit(observed); });
-				this.assertComplete();
 				if (!resource) throw new Error("resource_preparation_missing");
 				const bytes = resource.bytes + key.length * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
-				if (!owner.sealed && !cached && owner.bytes + bytes <= owner.maxBytes) {
-					let entries = prepared.bindings.get(binding);
-					if (!entries) prepared.bindings.set(binding, entries = new Map());
+				const destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
+				this.assertComplete(); destination.assertComplete();
+				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
+				if (!destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
+					let entries = retention.bindings.get(binding);
+					if (!entries) retention.bindings.set(binding, entries = new Map());
 					if (!entries.has(key)) {
-						entries.set(key, { value: resource.value, dispose: resource.dispose, dependencies, boundary: this.boundary });
-						owner.capturedBytes += bytes; retained = true;
+						// A composed preparation needs all source proofs, not keys from only its new owner.
+						entries.set(key, { value: resource.value, dispose: resource.dispose,
+							dependencies: destination === owner ? dependencies : undefined, boundary: this.boundary });
+						destination.capturedBytes += bytes; retained = true;
 					}
 				}
-				const result = await consume(resource.value);
-				this.assertComplete(); return result;
+				const consumeResource = async () => {
+					const result = await consume(resource!.value);
+					this.assertComplete(); destination.assertComplete(); return result;
+				};
+				return await (destination === owner ? consumeResource() : retention.lifetime.admit(consumeResource));
 			} finally { if (!retained) await resource?.dispose(); }
 		});
 	};

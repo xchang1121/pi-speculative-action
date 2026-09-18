@@ -79,7 +79,7 @@ export function createResourceSnapshotExecutionWorld(
 						const validation = await owned.manager.seal(owned);
 						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					}
-					return resourceSnapshotBranch(output, [owned], context.action.executionFingerprint, setupMs, actionSemantics);
+					return resourceSnapshotBranch(output, [owned], context.action, setupMs, actionSemantics);
 				} catch (error) {
 					await releaseResourceVersion(owned);
 					throw error;
@@ -129,9 +129,9 @@ export function createResourceSnapshotExecutionWorld(
 						const bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
 						if (!query || bytes > operations.maxBytes()) continue;
 						captured?.view?.seal();
-						for (const version of query.versions) if (version.view !== captured?.view) retained.push(version.manager.retain(version));
+						for (const version of query.versions) if (!captured || version.view !== captured.view) retained.push(version.manager.retain(version));
 						const branch = resourceSnapshotBranch(query.output, captured ? [captured, ...retained] : retained,
-							context.action.executionFingerprint, 0, actionSemantics, bytes);
+							context.action, 0, actionSemantics, bytes);
 						captured = undefined;
 						return branch;
 					} catch {
@@ -152,16 +152,17 @@ export function createResourceSnapshotExecutionWorld(
 	};
 }
 
-type ResourceInputOwner = { readonly version: ResourceVersionToken; readonly executionFingerprint: string };
+type ResourceInputOwner = { readonly versions: readonly ResourceVersionToken[]; readonly executionFingerprint: string };
 const resourceVersions = new WeakMap<object, ResourceInputOwner>();
 
 /** Actor reconstruction and predicted execution use the same confined inputs and dependency proof. */
 async function evaluateResourceInputs(
-	{ version, executionFingerprint }: ResourceInputOwner,
+	{ versions, executionFingerprint }: ResourceInputOwner,
 	request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], semantics: ActionSemanticsRegistry,
 	captureMissing?: () => Promise<ResourceVersionToken>,
 ) {
 	request.signal.throwIfAborted();
+	const version = versions[0]!;
 	const invocation = request.action.executionContext as ToolInvocation | undefined;
 	const execute = invocation?.filesystem, definition = request.action.semantics ?? semantics.definition(request.action);
 	const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
@@ -179,11 +180,15 @@ async function evaluateResourceInputs(
 			observations.set(key, entry);
 		}
 	};
-	const output = await version.view.evaluate(view => execute(view, request), dependencies => observe(version, dependencies), root,
+	const observeOwner = (tokens: readonly ResourceVersionToken[], dependencies: ReadonlySet<string> | undefined) => {
+		if (dependencies) observe(tokens[0]!, dependencies);
+		else for (const token of tokens) observe(token, undefined);
+	};
+	const output = await version.view.evaluate(view => execute(view, request), dependencies => observeOwner(versions, dependencies), root,
 		request.inputs && function* (target) {
 			for (const source of request.inputs!(target)) {
-				const token = resourceVersions.get(source)?.version;
-				if (token?.view) yield { view: token.view, observed: dependencies => observe(token, dependencies) };
+				const owner = resourceVersions.get(source), view = owner?.versions[0]?.view;
+				if (view) yield { view, observed: dependencies => observeOwner(owner!.versions, dependencies) };
 			}
 		}, captureMissing && (async () => {
 			const token = await captureMissing();
@@ -195,12 +200,19 @@ async function evaluateResourceInputs(
 }
 
 function resourceSnapshotBranch(
-	output: ToolSettlement, versions: readonly ResourceVersionToken[], executionFingerprint: string, setupMs: number, semantics: ActionSemanticsRegistry,
+	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, setupMs: number, semantics: ActionSemanticsRegistry,
 	capturedBytes = versions[0]!.view?.bytes ?? 0,
 ): WorldBranch<ToolSettlement> {
 	const version = versions[0]!;
+	const { executionFingerprint } = action, owner = { versions, executionFingerprint };
 	const inputSource = Object.freeze({});
-	resourceVersions.set(inputSource, { version, executionFingerprint });
+	resourceVersions.set(inputSource, owner);
+	const inputResources = version.view?.resources;
+	// A preparation-only owner still needs a lookup hint; reconstruction proves actual coverage.
+	if (inputResources && versions.length > 1) for (const resource of action.resources) {
+		const target = path.resolve(action.resourceRoot ?? version.root, resource);
+		if (!inputResources.some(input => input.path === target)) inputResources.push({ path: target, descendants: false });
+	}
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
 	const validate = async (token: ResourceVersionToken | readonly ResourceVersionToken[] | undefined) => {
 		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
@@ -210,7 +222,7 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
-		inputResources: version.view?.resources,
+		inputResources,
 		reconstructionScope: "current_action",
 		capturedBytes,
 		executionMetrics: Object.freeze({ setupMs }),
@@ -218,7 +230,7 @@ function resourceSnapshotBranch(
 		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			if (!owned) return undefined;
-			const query = await evaluateResourceInputs({ version, executionFingerprint }, request, semantics);
+			const query = await evaluateResourceInputs(owner, request, semantics);
 			return query && { output: query.output, validate: () => validate(query.versions), capturedBytes: query.capturedBytes,
 				...(query.versions.length > 1 ? { requiresQueryValidation: true as const } : {}),
 				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };

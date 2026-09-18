@@ -309,6 +309,43 @@ describe("speculative action resource versions", () => {
 		} finally { gate.release(); await pending?.catch(() => {}); await token.release(); manager.close(); }
 	});
 
+	test.each(["retained", "budget", "build", "consume"])("transfers composed preparations into their capture lifetime (%s)", async (phase) => {
+		const root = await workspace({ value: "A", "inside/other": "B" }), manager = new ResourceVersionManager(root, { watch: false });
+		const source = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192);
+		const binding = {}, dispose = vi.fn(), gate = gated();
+		await source.view!.readFile(path.join(root, "value")); source.view!.seal();
+		const build = vi.fn(async (view: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+			const value = (await view.readFile(path.join(root, "value"))).toString();
+			if (phase === "build") await gate.wait();
+			return { value, bytes: phase === "budget" ? 8192 : 1, dispose };
+		});
+		let pending: Promise<unknown> | undefined, release: void | Promise<void>;
+		try {
+			pending = source.view!.evaluate(view => view.prepare(binding, "selection", build, async value => {
+				if (phase === "consume") await gate.wait(); return value;
+			}), undefined, root, undefined, async () => ({ view: destination.view!, observed: () => {} }));
+			if (phase === "build" || phase === "consume") {
+				const settled = Promise.allSettled([pending]); await gate.entered;
+				let released = false; release = destination.release(); void Promise.resolve(release).then(() => { released = true; });
+				await nextTurn(); expect(released).toBe(phase === "build"); expect(dispose).not.toHaveBeenCalled();
+				gate.release(); expect(await settled).toMatchObject([{ status: "rejected", reason: new Error("resource_snapshot_disposed") }]);
+				await release;
+			} else {
+				expect(await pending).toBe("A"); destination.view!.seal();
+				await source.release();
+				const query = (identity = binding, key = "selection", rootOverride = root) => destination.view!.evaluate(
+					view => view.prepare(identity, key, build, async value => value), observed => { expect(observed).toBeUndefined(); }, rootOverride);
+				if (phase === "retained") {
+					expect(await query()).toBe("A"); expect(build).toHaveBeenCalledOnce(); expect(dispose).not.toHaveBeenCalled();
+					for (const [identity, key, boundary] of [[{}, "selection", root], [binding, "different", root], [binding, "selection", path.join(root, "inside")]] as const)
+						await expect(query(identity, key, boundary)).rejects.toThrow("resource_access_unproven");
+					expect(await query()).toBe("A");
+				} else await expect(query()).rejects.toThrow("resource_access_unproven");
+			}
+		} finally { gate.release(); await pending?.catch(() => {}); await source.release(); await destination.release(); manager.close(); }
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	test("retains query evidence independently of sealed input buffers and releases its manager once", async () => {
 		const root = await workspace({ value: "A", unused: "B" }), idle = vi.fn();
 		const manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
