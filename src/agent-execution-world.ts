@@ -194,7 +194,8 @@ async function evaluateResourceInputs(
 	};
 	const output = await version.view.evaluate(view => execute(view, request), dependencies => observeOwner(versions, dependencies), root,
 		function* (target) {
-			for (const token of versions) if (token.view) yield { view: token.view, observed: (dependencies: ReadonlySet<string> | undefined) => observe(token, dependencies) };
+			for (const token of versions) if (token.view) yield { view: token.view,
+				observed: (dependencies: ReadonlySet<string> | undefined) => dependencies ? observe(token, dependencies) : observeOwner(versions, undefined) };
 			for (const source of request.inputs?.(target) ?? []) {
 				const owner = resourceVersions.get(source);
 				if (owner) for (const token of owner.versions) if (token.view) yield { view: token.view,
@@ -234,11 +235,6 @@ function resourceSnapshotBranch(
 	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, owner);
 	const inputResources = version.view && versions.flatMap(token => token.view?.resources ?? []);
-	// A preparation-only owner still needs a lookup hint; reconstruction proves actual coverage.
-	if (inputResources && versions.length > 1) for (const resource of action.resources) {
-		const target = path.resolve(action.resourceRoot ?? version.root, resource);
-		if (!inputResources.some(input => input.path === target)) inputResources.push({ path: target, descendants: false });
-	}
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
 	const validate = async (token: ResourceVersionToken | readonly ResourceVersionToken[] | undefined) => {
 		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
@@ -248,7 +244,13 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
-		invalidateInputs: paths => owned ? invalidateResourceInputs(owned, paths) : [],
+		invalidateInputs: paths => {
+			if (!owned) return [];
+			const removed = invalidateResourceInputs(owned, paths);
+			if (!removed.length) return removed;
+			const remaining = new Set(owned.flatMap(token => token.view?.resources.map(input => input.path) ?? []));
+			return removed.filter(target => !remaining.has(target));
+		},
 		inputResources,
 		reconstructionScope: "current_action",
 		get capturedBytes() { return versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), proofBytes); },

@@ -574,7 +574,7 @@ describe("speculative action host", () => {
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		await writeFile(path.join(cwd, "other.txt"), "two from another input\n");
 		await writeFile(path.join(cwd, "unused.log"), "original\n");
-		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd)];
+		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd), createLsTool(cwd)];
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 });
 		const execute = world.speculation!.execute, sources: Awaited<ReturnType<typeof execute>>[] = [];
 		let successor: Awaited<ReturnType<typeof execute>> | undefined;
@@ -591,15 +591,15 @@ describe("speculative action host", () => {
 		const ready = (turnID: string, count: number) => expect.poll(() => events.filter(event =>
 			event.type === "candidate" && event.turnID === turnID && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(count);
 		const args = { pattern: "two", path: ".", glob: partial ? "*.txt" : "notes.txt" };
-		let stage: "seed" | "query" = "seed", permitted = true;
+		let stage: "seed" | "query" | "names" = "seed", permitted = true;
 		const host = createSpeculativeActionHost("prediction-inputs", {
 			cwd, draftModel: model("draft"), preflight: () => permitted,
 			getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, maxConcurrentActions: 2,
-				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 1024 * 1024 }),
+				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 6, resourceCacheMaxBytes: 1024 * 1024 }),
 			complete: async () => assistant(stage === "seed" ? [
 				{ type: "toolCall", id: "names", name: "grep", arguments: { pattern: "seed", path: ".", glob: coverage === "prepared" ? args.glob : "*.absent" } },
 				{ type: "toolCall", id: "bytes", name: "read", arguments: { path: "notes.txt", limit: 1 } },
-			] : [{ type: "toolCall", id: "query", name: "grep", arguments: args }], "toolUse"),
+			] : [{ type: "toolCall", id: "query", name: stage === "names" ? "ls" : "grep", arguments: stage === "names" ? { path: "." } : args }], "toolUse"),
 			resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 			executionWorlds: [world],
 			onEvent: event => { events.push(event); },
@@ -634,10 +634,16 @@ describe("speculative action host", () => {
 			expect(await host.execute({ ...call, id: "denied" }, undefined, actor)).toEqual(expected);
 			expect(actor).toHaveBeenCalledOnce(); permitted = true;
 			if (coverage !== "prepared") {
-				const capturesBefore = captures.mock.calls.length, preparedBefore = preparations();
+				let capturesBefore = captures.mock.calls.length; const preparedBefore = preparations();
 				args.pattern = "one|another";
 				expect(await host.execute({ ...call, id: "reconstructed" }, undefined, actor)).toEqual(await current());
-				await host.finishTurn("query"); args.pattern = "three|another";
+				await host.finishTurn("query"); stage = "names";
+				await host.startTurn({ ...startInput(tools[2]!, "names"), tools }); await ready("names", 1);
+				const names = { ...call, turnID: "names", id: "newer-names", tool: "ls", args: { path: "." } };
+				await host.execute(names, undefined, () => { throw new Error("the names prediction must supply its result"); });
+				await host.finishTurn("names"); stage = "query";
+				capturesBefore = captures.mock.calls.length;
+				args.pattern = "three|another";
 				await host.startTurn({ ...startInput(tools[0]!, "again"), tools }); await ready("again", 1);
 				call = { ...call, turnID: "again" };
 				const validation = await successor!.validate!(); expect(validation.status, JSON.stringify(validation)).toBe("valid");
