@@ -242,7 +242,7 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
-		invalidateInputs: paths => { if (owned) invalidateResourceInputs(owned, paths); },
+		invalidateInputs: paths => owned ? invalidateResourceInputs(owned, paths) : [],
 		inputResources,
 		reconstructionScope: "current_action",
 		get capturedBytes() { return proofBytes + (version.view?.bytes ?? 0); },

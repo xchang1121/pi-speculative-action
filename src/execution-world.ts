@@ -158,8 +158,8 @@ export interface WorldBranch<Output> {
 	readonly inputResources?: readonly { readonly path: string; readonly descendants?: boolean }[];
 	/** Opaque backend input owner; preserved through transactions, never result adoption authority. */
 	readonly inputSource?: object;
-	/** Known host mutations revoke borrowable inputs without erasing sealed result evidence. */
-	readonly invalidateInputs?: (paths: readonly string[]) => void;
+	/** Revoke borrowable inputs, optionally returning removed indexed names; sealed output proofs remain. */
+	readonly invalidateInputs?: (paths: readonly string[]) => void | readonly string[];
 	/** Retained data may serve proven queries, never the source action's result or effects. */
 	readonly inputsOnly?: true;
 	/** Transfer one input owner after a successful commit; the receiver owns its cleanup. */

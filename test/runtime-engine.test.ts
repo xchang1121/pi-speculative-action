@@ -1351,16 +1351,20 @@ describe("structural speculative runtime", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	it("keeps a useful result under pressure after its other inputs release their budget", async () => {
+	it.each([false, true])("keeps independent results and inputs after revocation (indexed=%s)", async indexed => {
 		let bytes = 2048, budget = 4096;
 		const dispose = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();
+		const reconstruct = vi.fn(async ({ args }: { args: unknown }) => (args as { path: string }).path === "sibling.txt"
+			? { output: "sibling", validate: async () => validResource() } : undefined);
 		const { runtime, ready } = harness({
 			settings: () => ({ ...settings, resourceCacheMaxBytes: budget }),
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "seed" ? plan("source") : undefined }),
 			executeCandidate: async () => coordinator.execute(coordinator.begin({ tool: "read", route: RESOURCE_ROUTE }), async () => ({
 				...world("retained", { validate: async () => validResource(), onDispose: dispose }),
+				inputSource: {}, inputResources: [{ path: "/workspace/other.txt" }, { path: "/workspace/sibling.txt" }], reconstruct,
 				get capturedBytes() { return bytes; },
-				invalidateInputs: paths => { expect(paths).toHaveLength(1); expect(paths[0]!.replaceAll("\\", "/")).toMatch(/\/workspace\/other.txt$/); bytes = 64; },
+				invalidateInputs: paths => { expect(paths).toHaveLength(1); expect(paths[0]!.replaceAll("\\", "/")).toMatch(/\/workspace\/other.txt$/);
+					bytes = 64; return indexed ? paths : undefined; },
 			})),
 		});
 		try {
@@ -1368,8 +1372,12 @@ describe("structural speculative runtime", () => {
 			const mutation = await runtime.prepareActorCall({ ...call("seed"), tool: "write", input: { path: "other.txt", content: "changed" } });
 			expect(mutation?.output).toBeUndefined();
 			await mutation!.settle(new TimelineInterval(1, 2), "written");
-			expect(bytes).toBe(64); budget = 256;
+			expect(bytes).toBe(64); budget = 512;
 			await runtime.finishTurn(call("seed")); await runtime.startTurn(start("reuse"));
+			expect((await runtime.prepareActorCall(call("reuse", { path: "other.txt" })))?.output).toBeUndefined();
+			expect(reconstruct).toHaveBeenCalledTimes(indexed ? 0 : 1);
+			expect((await runtime.prepareActorCall({ ...call("reuse", { path: "sibling.txt" }), id: "sibling" }))?.output).toBe("sibling");
+			expect(reconstruct).toHaveBeenCalledTimes(indexed ? 1 : 2);
 			expect((await runtime.prepareActorCall(call("reuse")))?.output).toBe("retained");
 			expect(dispose).not.toHaveBeenCalled();
 		} finally { await runtime.dispose(); }

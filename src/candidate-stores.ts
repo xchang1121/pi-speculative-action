@@ -98,6 +98,25 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			.map(([{ entry }]) => entry);
 	}
 
+	/** Backend-confirmed name revocation does not erase the owner's output evidence or other inputs. */
+	invalidateInputs(scope: Scope, entry: Entry, resources: readonly string[]): void {
+		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
+		if (!indexed || !state || !resources.length) return;
+		const keys = new Set(resources.flatMap(resource => [inputPartition(resource), inputPartition(resource, true)]));
+		this.unindex(indexed, (index, key) => index === state.partitions && keys.has(key));
+	}
+
+	/** Sealed queries remain addressable after their reconstruction inputs are revoked. */
+	indexView(scope: Scope, entry: Entry, actionKey: string, retained: boolean): void {
+		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
+		if (!indexed || !state) return;
+		const key = `view:${actionKey}`, members = state.partitions.get(key) ?? new Set();
+		if (!retained) this.unindex(indexed, (index, name) => index === state.partitions && name === key);
+		else if (!members.has(indexed)) {
+			members.add(indexed); state.partitions.set(key, members); indexed.memberships.push([state.partitions, key]);
+		}
+	}
+
 	touch(scope: Scope, entry: Entry): boolean {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state) return false;
@@ -115,11 +134,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (!indexed || !state) return false;
 		state.entries.delete(entry.id);
 		state.pending.delete(indexed);
-		for (const [index, key] of indexed.memberships) {
-			const members = index.get(key)!;
-			members.delete(indexed);
-			if (!members.size) index.delete(key);
-		}
+		this.unindex(indexed);
 		if (!state.entries.size) this.scopes.delete(scope);
 		return true;
 	}
@@ -194,6 +209,18 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return record?.entry === entry ? record : undefined;
 	}
 
+	private unindex(indexed: IndexedEntry<Entry>, remove?: (index: Map<string, Set<IndexedEntry<Entry>>>, key: string) => boolean): void {
+		let kept = 0;
+		for (const membership of indexed.memberships) {
+			const [index, key] = membership;
+			if (remove && !remove(index, key)) { indexed.memberships[kept++] = membership; continue; }
+			const members = index.get(key)!;
+			members.delete(indexed);
+			if (!members.size) index.delete(key);
+		}
+		indexed.memberships.length = kept;
+	}
+
 	private inputRecords(scope: Scope, resources: readonly string[]) {
 		const state = this.scopes.get(scope);
 		const inputs = new Map<IndexedEntry<Entry>, number>();
@@ -218,14 +245,16 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (!state) return [];
 		const inputs = this.inputRecords(scope, includeInputs ? action.resources.flatMap(resource =>
 			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : []) : []);
-		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys()]);
+		const views = includeInputs ? state.partitions.get(`view:${action.key}`) : undefined;
+		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys(), ...(views ?? [])]);
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
 		const ranked: (CandidateLookup<Entry> & { readonly indexed: IndexedEntry<Entry> })[] = [];
 		for (const indexed of candidates) {
 			if (this.record(scope, indexed.entry) !== indexed) continue;
 			const coverage = requireCoverage?.(indexed.entry) ?? false;
 			const match = actionKeyMatch(indexed.entry.key, action, this.projectors, coverage) ??
-				(!coverage && inputs.has(indexed) ? { kind: "inputs" as const, distance: Number.MAX_SAFE_INTEGER - 1024 + Math.min(inputs.get(indexed)!, 1024) } : undefined);
+				(!coverage && (inputs.has(indexed) || views?.has(indexed))
+					? { kind: "inputs" as const, distance: Number.MAX_SAFE_INTEGER - 1024 + Math.min(inputs.get(indexed) ?? 0, 1024) } : undefined);
 			if (match) ranked.push({ entry: indexed.entry, match, indexed });
 		}
 		// Provider callbacks may retire or replace a registration, even with the same object and ID.
