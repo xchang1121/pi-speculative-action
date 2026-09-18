@@ -41,10 +41,16 @@ struct file_position {
 };
 
 struct descriptor_origin { int fd, cloexec; unsigned long id; };
+struct descriptor_table {
+	unsigned references, count, active;
+	unsigned long epoch, generation;
+	struct descriptor_origin entries[256];
+};
 
 /* Track provenance without keeping kernel handles alive beyond their native lifetime. */
 struct descriptor_domain {
 	int enabled, escaped;
+	unsigned uncertain;
 	unsigned long next;
 };
 
@@ -72,8 +78,9 @@ struct traced_process {
 	int fd, armed, stopped, pending, delivered, listening, historical, awaiting_parent;
 	struct decision_job *job;
 	struct traced_process *next;
-	unsigned descriptor_count;
-	struct descriptor_origin descriptors[256];
+	struct descriptor_table *table;
+	unsigned long call_epoch, mutation_generation;
+	int mutation, uncertain;
 	long syscall;
 	unsigned long arguments[3];
 };
@@ -250,19 +257,40 @@ static int duplicate_tracee_fd(pid_t pid, unsigned fd) {
 }
 
 static struct descriptor_origin descriptor_origin(struct traced_process *process, int fd) {
-	for (unsigned index = 0; index < process->descriptor_count; index++)
-		if (process->descriptors[index].fd == fd) return process->descriptors[index];
+	for (unsigned index = 0; process->table && index < process->table->count; index++)
+		if (process->table->entries[index].fd == fd) return process->table->entries[index];
 	return (struct descriptor_origin){.fd = fd};
 }
 
 static void set_descriptor_origin(struct traced_process *process, struct descriptor_domain *domain,
 	int fd, unsigned long id, int cloexec) {
-	for (unsigned index = 0; index < process->descriptor_count; index++) if (process->descriptors[index].fd == fd) {
-		process->descriptors[index] = process->descriptors[--process->descriptor_count]; break;
+	struct descriptor_table *table = process->table;
+	for (unsigned index = 0; index < table->count; index++) if (table->entries[index].fd == fd) {
+		table->entries[index] = table->entries[--table->count]; break;
 	}
 	if (!id) return;
-	if (process->descriptor_count == sizeof(process->descriptors) / sizeof(process->descriptors[0])) { domain->escaped = 1; return; }
-	process->descriptors[process->descriptor_count++] = (struct descriptor_origin){fd, cloexec, id};
+	if (table->count == sizeof(table->entries) / sizeof(table->entries[0])) { domain->escaped = 1; return; }
+	table->entries[table->count++] = (struct descriptor_origin){fd, cloexec, id};
+}
+
+static struct descriptor_table *copy_descriptor_table(struct traced_process *source) {
+	struct descriptor_table *table = calloc(1, sizeof(*table));
+	if (!table) return NULL;
+	if (source && source->table && !source->table->active && source->call_epoch == source->table->epoch) {
+		table->count = source->table->count;
+		memcpy(table->entries, source->table->entries, table->count * sizeof(*table->entries));
+	}
+	table->references = 1; table->generation = 1;
+	return table;
+}
+
+static void drop_descriptor_table(struct traced_process *process, struct descriptor_domain *domain) {
+	if (process->uncertain) { domain->uncertain--; process->uncertain = 0; domain->escaped = 1; }
+	struct descriptor_table *table = process->table;
+	if (!table) return;
+	if (process->mutation) { table->active--; table->count = 0; table->generation++; process->mutation = 0; }
+	if (!--table->references) free(table);
+	process->table = NULL;
 }
 
 /* Called at syscall stops, on the tracer thread. No tracing cost in the ordinary mode. */
@@ -272,6 +300,8 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	struct __ptrace_syscall_info info;
 	if (ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info) < 0) return -1;
 	if (info.arch != AUDIT_ARCH_X86_64) { domain->escaped = 1; return 0; }
+	if (!process->table && !(process->table = copy_descriptor_table(NULL))) return -1;
+	struct descriptor_table *table = process->table;
 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
 		process->syscall = (long)info.entry.nr;
 		for (unsigned index = 0; index < 3; index++) process->arguments[index] = info.entry.args[index];
@@ -283,30 +313,44 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_io_uring_setup ||
 			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
 			number == SYS_process_vm_writev || number == SYS_unshare || number == SYS_setns;
-		/* Shared fd tables can race a syscall-exit observation; shared OFDs through fork are supported. */
-		if (number == SYS_clone) escapes |= (first & (0x00800000 | 0x400)) != 0 ||
-			((first & 0x100) && !(first & 0x4000)); /* Shared VM can race clone3 arguments; vfork suspends its parent. */
-		if (number == SYS_clone3) {
-			errno = 0;
-			long flags = ptrace(PTRACE_PEEKDATA, pid, first, 0);
-			escapes |= errno != 0 || (flags & (0x00800000 | 0x400)) != 0 ||
-				((flags & 0x100) && !(flags & 0x4000));
-		}
+		if (number == SYS_clone) escapes |= (first & 0x00800000) != 0; /* CLONE_UNTRACED */
+		if (number == SYS_close_range) escapes |= (third & 2) != 0; /* CLOSE_RANGE_UNSHARE */
+		/* clone3 flags live in mutable shared memory: prove attachment from the kernel event instead. */
+		if (number == SYS_clone3 || number == SYS_ioctl) { process->uncertain = 1; domain->uncertain++; }
 		if (escapes) domain->escaped = 1;
+		process->call_epoch = table->epoch;
+		process->mutation = number == SYS_close || number == SYS_close_range || number == SYS_dup ||
+			number == SYS_dup2 || number == SYS_dup3 || number == SYS_open || number == SYS_openat ||
+			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create ||
+			(number == SYS_fcntl && (second == F_SETFD || second == F_DUPFD || second == F_DUPFD_CLOEXEC));
+		if (process->mutation) {
+			table->epoch++;
+			/* Exit-stop order cannot prove overlapping mutations' kernel order.
+			 * Later uncontended calls can establish fresh origins without disabling the domain. */
+			if (table->active++) { table->count = 0; table->generation++; process->mutation_generation = 0; }
+			else process->mutation_generation = table->generation;
+		}
 		/* Dropping uncertain provenance before a failing close/dup is safe; retaining a stale slot is not. */
 		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0);
 		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
 			set_descriptor_origin(process, domain, (int)second, 0, 0);
-		if (number == SYS_close_range) for (unsigned index = 0; index < process->descriptor_count;) {
-			struct descriptor_origin *entry = &process->descriptors[index];
+		if (number == SYS_close_range) for (unsigned index = 0; index < table->count;) {
+			struct descriptor_origin *entry = &table->entries[index];
 			if ((unsigned)entry->fd < first || (unsigned)entry->fd > second) { index++; continue; }
 			if (third & 4) { entry->cloexec = 1; index++; }
 			else set_descriptor_origin(process, domain, entry->fd, 0, 0);
 		}
 	}
-	if (info.op != PTRACE_SYSCALL_INFO_EXIT || info.exit.is_error || domain->escaped) return 0;
-	/* Unknown successful ioctl protocols may transfer a handle (for example Binder). */
-	if (number == SYS_ioctl) { domain->escaped = 1; return 0; }
+	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
+	if (process->uncertain) {
+		domain->uncertain--; process->uncertain = 0;
+		if (!info.exit.is_error) domain->escaped = 1;
+	}
+	if (process->mutation) {
+		process->mutation = 0; table->active--;
+		if (!process->mutation_generation || process->mutation_generation != table->generation) return 0;
+	}
+	if (info.exit.is_error || domain->escaped) return 0;
 	struct descriptor_origin source = descriptor_origin(process, (int)first);
 	int fd = (int)info.exit.rval;
 	if (number == SYS_fcntl && second == F_SETFD) {
@@ -375,7 +419,8 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 			if (origin && other && ((same == 0) != (origin == other))) goto done;
 			if (!same) { alias = fds[previous]; break; }
 		}
-		owned = !job->domain->escaped && descriptor_origin(job->process, fds[index]).id != 0;
+		owned = !job->domain->escaped && !job->domain->uncertain && job->process->table &&
+			!job->process->table->active && descriptor_origin(job->process, fds[index]).id != 0;
 		int length = snprintf(line + used, capacity - used,
 			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%jd,\"owned\":%s}",
 			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags,
@@ -503,7 +548,8 @@ static int actor_decision(struct decision_job *job) {
 		position->duplicate = duplicate_tracee_fd(job->pid, (unsigned)position->descriptor);
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 		if (position->duplicate < 0 || !position_matches(position)) goto decline;
-		if (job->domain && (job->domain->escaped || !descriptor_origin(job->process, position->descriptor).id)) goto decline;
+		if (job->domain && (job->domain->escaped || job->domain->uncertain || !job->process->table ||
+			job->process->table->active || !descriptor_origin(job->process, position->descriptor).id)) goto decline;
 		for (unsigned previous = 0; previous < index; previous++) {
 			const struct file_position *other = &job->positions[previous];
 			if (position->content_length >= 0 && other->content_length >= 0 &&
@@ -600,7 +646,7 @@ static int track_process(struct traced_process **processes, pid_t pid) {
 	return 0;
 }
 
-static void release_process(struct traced_process **processes, pid_t pid) {
+static void release_process(struct traced_process **processes, pid_t pid, struct descriptor_domain *domain) {
 	struct traced_process **cursor = processes;
 	while (*cursor) {
 		struct traced_process *observer = *cursor;
@@ -619,6 +665,7 @@ static void release_process(struct traced_process **processes, pid_t pid) {
 			sent += (size_t)moved;
 		}
 		close(observer->fd);
+		drop_descriptor_table(observer, domain);
 		free(observer);
 	}
 }
@@ -741,7 +788,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (pid == root) root_status = status;
 			for (struct traced_process *item = processes; item; item = item->next)
 				if (item->pid == pid && item->armed) goto fatal;
-			release_process(&processes, pid);
+			release_process(&processes, pid, &domain);
 			continue;
 		}
 		if (!WIFSTOPPED(status)) continue;
@@ -768,8 +815,13 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (!known && track_process(&processes, (pid_t)child) < 0) goto fatal;
 			if (!known) known = processes;
 			known->awaiting_parent = 0;
-			known->descriptor_count = current->descriptor_count;
-			memcpy(known->descriptors, current->descriptors, sizeof(current->descriptors));
+			if (descriptors && !domain.escaped) {
+				if (current->uncertain && current->syscall == SYS_clone3) { current->uncertain = 0; domain.uncertain--; }
+				long shared = syscall(SYS_kcmp, pid, child, KCMP_FILES, 0, 0);
+				if (shared < 0) domain.escaped = 1;
+				else if (!shared && current->table) { known->table = current->table; known->table->references++; }
+				else if (!(known->table = copy_descriptor_table(current))) goto fatal;
+			}
 		}
 		if (event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
 			if (descriptors) { current->listening = 1; continue; }
@@ -780,9 +832,22 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			unsigned long previous;
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &previous) < 0) goto fatal;
 			/* A non-leader exec replaces its TID without a separate death notification. */
-			if ((pid_t)previous != pid) release_process(&processes, (pid_t)previous);
-			for (unsigned index = 0; index < current->descriptor_count;)
-				if (current->descriptors[index].cloexec) set_descriptor_origin(current, &domain, current->descriptors[index].fd, 0, 0);
+			if ((pid_t)previous != pid) {
+				for (struct traced_process *item = processes; item; item = item->next) if (item->pid == (pid_t)previous && !item->historical) {
+					drop_descriptor_table(current, &domain);
+					current->table = item->table; item->table = NULL; current->call_epoch = item->call_epoch;
+					break;
+				}
+				release_process(&processes, (pid_t)previous, &domain);
+			}
+			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
+			if (current->table && (current->table->references > 1 || current->table->active || current->call_epoch != current->table->epoch)) {
+				struct descriptor_table *table = copy_descriptor_table(current);
+				if (!table) goto fatal;
+				drop_descriptor_table(current, &domain); current->table = table;
+			}
+			for (unsigned index = 0; current->table && index < current->table->count;)
+				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain, current->table->entries[index].fd, 0, 0);
 				else index++;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
@@ -794,9 +859,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 					if (item->fd >= 0) {
 						if (track_process(&processes, pid) < 0) goto fatal;
 						item->historical = 1;
-						processes->descriptor_count = item->descriptor_count;
-						memcpy(processes->descriptors, item->descriptors, sizeof(item->descriptors));
-						item->descriptor_count = 0;
+						processes->table = item->table; item->table = NULL;
 						item = processes;
 						item->stopped = 1;
 					}
@@ -811,7 +874,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
 	held:;
 	}
-	while (processes) release_process(&processes, processes->pid);
+	while (processes) release_process(&processes, processes->pid, &domain);
 	free(polling); close(signals);
 	pthread_sigmask(SIG_SETMASK, &original, NULL);
 	if (root_status < 0) return 125;
@@ -822,7 +885,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 fatal:
 	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
 	while (waitpid(-1, &status, __WALL) > 0 || errno == EINTR) {}
-	while (processes) release_process(&processes, processes->pid);
+	while (processes) release_process(&processes, processes->pid, &domain);
 	free(polling); close(signals);
 	return 125;
 }

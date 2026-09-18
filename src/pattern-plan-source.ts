@@ -136,28 +136,32 @@ export function createPatternPlanSource({
 		...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false,
 	});
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
-		schemaHashes: Readonly<Record<string, string>>, dependsOn?: PlanAction["dependsOn"], parentID?: string) => {
-		let operations: Map<string, ObservedOperation> | undefined;
-		return candidates.map(candidate => {
+		schemaHashes: Readonly<Record<string, string>>, operationLimit: number, dependsOn?: PlanAction["dependsOn"], parentID?: string) => {
+		let operations: Map<string, ObservedOperation[]> | undefined;
+		return candidates.flatMap(candidate => {
 			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
 			// Only root background probes may use smaller units; scan their live bindings once per batch.
-			if (!candidate.background || dependsOn?.length || !operationBindings.size) return action;
+			if (!candidate.background || dependsOn?.length || !operationBindings.size) return [action];
 			const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
 			if (!operations) {
 				operations = new Map();
 				for (const item of operationBindings.values()) {
 					if (item.binding.available === false) operationBindings.delete(item.key);
-					else if (item.binding.executionMs > (operations.get(item.parentHash)?.binding.executionMs ?? 0)) operations.set(item.parentHash, item);
+					else if (item.binding.executionMs > 0) {
+						const choices = operations.get(item.parentHash) ?? [];
+						choices.push(item); operations.set(item.parentHash, choices);
+					}
 				}
+				for (const choices of operations.values()) choices.sort((left, right) => right.binding.executionMs - left.binding.executionMs);
 			}
-			const operation = parentHash === undefined ? undefined : operations.get(parentHash);
-			if (!operation) return action;
-			const { binding } = operation;
-			return { ...action, id: `${action.id}:operation:${binding.identity}`, type: "operation" as const, operation: binding,
-				expectedDurationMs: binding.expectedDurationMs,
-				expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * binding.executionMs),
+			const choices = parentHash === undefined ? undefined : operations.get(parentHash);
+			if (!choices?.length) return [action];
+			return choices.slice(0, operationLimit).map(operation => ({ ...action,
+				id: `${action.id}:operation:${operation.binding.identity}`, type: "operation" as const, operation: operation.binding,
+				expectedDurationMs: operation.binding.expectedDurationMs,
+				expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * operation.binding.executionMs),
 				feedback: { ...action.feedback, operation },
-			};
+			}));
 		});
 	};
 
@@ -182,7 +186,7 @@ export function createPatternPlanSource({
 				id: `pattern:${startInput.turnID}`,
 				source: "pattern_aware",
 				revision: nextRevision(startInput.sessionID, startInput.turnID),
-				actions: planActions(candidates, store, data.schemaHashes),
+				actions: planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth),
 			};
 		}),
 		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
@@ -199,7 +203,7 @@ export function createPatternPlanSource({
 			if (!candidates.length) return undefined;
 			const dependencies = batch.map(({ identity }) => ({ proposalID: identity.proposalID, actionID: identity.actionID,
 				identity: identity.id, condition: "execution_succeeded" as const }));
-			return { id, source: "pattern_aware", revision: 0, actions: planActions(candidates, store, data.schemaHashes, dependencies) };
+			return { id, source: "pattern_aware", revision: 0, actions: planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth, dependencies) };
 		}),
 		continue: ({
 			startInput,
@@ -231,7 +235,7 @@ export function createPatternPlanSource({
 				proposalID,
 				source: "pattern_aware",
 				revision,
-				upsert: planActions(next, context.store, data.schemaHashes, [{ actionID, condition: "execution_succeeded" }], actionID),
+				upsert: planActions(next, context.store, data.schemaHashes, patternSettings.beamWidth, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
 		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations }) => admit(settings, async (patternSettings) => {
@@ -264,7 +268,7 @@ export function createPatternPlanSource({
 				data.schemaHashes,
 				patternSettings,
 			);
-			const actions = planActions(candidates, store, data.schemaHashes);
+			const actions = planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth);
 			// An observation can finish after its turn closes, or lose individual actions during admission.
 			const carried = { signature: patternPredictionSignature(candidates),
 				pending: new Set(actions.map((action) => action.feedback)), abandoned: false };
