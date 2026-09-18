@@ -359,29 +359,6 @@ function inputIndexBytes(branch: WorldBranch<unknown>): number {
 	return branch.reconstruct ? branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0 : 0;
 }
 
-/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
-function retainResultView<Output>(
-	candidate: CandidateRecord<Output>, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
-	settings: SpeculativeActionSettings,
-): boolean {
-	if (!projection.execution || candidate.resultViews?.has(action.key) || candidate.outputStale && !projection.validate) return false;
-	try {
-		const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
-		let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
-		const views = candidate.resultViews ??= new Map();
-		if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
-		while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
-			const [key, previous] = views.entries().next().value!;
-			views.delete(key); candidate.estimatedBytes -= previous.bytes;
-		}
-		if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-			views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate }); candidate.estimatedBytes += bytes;
-			return true;
-		}
-	} catch { /* Optional retention cannot alter an already committed result. */ }
-	return false;
-}
-
 function resourcePathsOverlap(left: string, right: string): boolean {
 	return containsLogicalPath(left, right) || containsLogicalPath(right, left);
 }
@@ -575,6 +552,32 @@ export function makeSpeculativeActionRuntime<
 	}
 	const projectionRules = resolveActionProjectionRules(adapter.projectionRules ?? [], semantics);
 	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue);
+
+	/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
+	function retainResultView(
+		sessionID: SessionID, candidate: Candidate, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
+		settings: SpeculativeActionSettings,
+	): boolean {
+		if (!projection.execution || candidate.resultViews?.has(action.key) || candidate.outputStale && !projection.validate) return false;
+		try {
+			const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
+			let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
+			const views = candidate.resultViews ??= new Map();
+			if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
+			while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
+				const [key, previous] = views.entries().next().value!;
+				views.delete(key); candidate.estimatedBytes -= previous.bytes;
+				candidateStore.indexView(sessionID, candidate, key, false);
+			}
+			if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
+				views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate }); candidate.estimatedBytes += bytes;
+				candidateStore.indexView(sessionID, candidate, action.key, true);
+				return true;
+			}
+		} catch { /* Optional retention cannot alter an already committed result. */ }
+		return false;
+	}
+
 	const sessionStates = new Map<SessionID, Session>();
 	let masterEnabled: boolean | undefined;
 	const masterDisabled = () => masterEnabled === false;
@@ -1510,8 +1513,10 @@ export function makeSpeculativeActionRuntime<
 				const projected = await projectOutput(candidate, action, match,
 					projectionRules, { action, args: action.input, callID: actualCall.id!,
 						signal: signal ?? state.generation.signal, inputs: inputs?.lookup });
-				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate &&
-					retainResultView(candidate, action, projected, state.settings)) trimResults(state.session, state.settings);
+				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate) {
+					const retained = retainResultView(state.sessionID, candidate, action, projected, state.settings);
+					if (retained) trimResults(state.session, state.settings);
+				}
 			} finally {
 				inputs?.dispose();
 				lease.release();
@@ -1793,7 +1798,8 @@ export function makeSpeculativeActionRuntime<
 					actorAction.rejectCandidate(candidate.id, choice.match, validation.cause);
 					if (validation.status === "stale") {
 						const retained = candidate.resultViews?.get(actualKey.key);
-						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes; }
+						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes;
+							candidateStore.indexView(state.sessionID, candidate, actualKey.key, false); }
 						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
 						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause, true);
 					}
@@ -1829,7 +1835,7 @@ export function makeSpeculativeActionRuntime<
 					removeCandidate(state.session.id, candidate);
 				} else {
 					if (preview) candidate.previews?.delete(preview);
-					const retained = retainResultView(candidate, actualKey, projection, state.settings);
+					const retained = retainResultView(state.sessionID, candidate, actualKey, projection, state.settings);
 					candidateStore.recordActorHit(state.sessionID, candidate, cacheLimits(state.settings));
 					if (retained) trimResults(state.session, state.settings);
 				}
@@ -2570,6 +2576,7 @@ export function makeSpeculativeActionRuntime<
 				// Independent query proofs survive; views backed only by the old output proof do not.
 				for (const [key, view] of candidate.resultViews ?? []) if (!view.validate) {
 					candidate.resultViews!.delete(key); candidate.estimatedBytes -= view.bytes;
+					candidateStore.indexView(session.id, candidate, key, false);
 				}
 			} else discardCandidate(session, candidate, failure, false);
 			session.plan.rearmExecution(candidate.id);
@@ -2618,7 +2625,10 @@ export function makeSpeculativeActionRuntime<
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
 			if (candidate === adopted || (adopted && descendsFrom(candidate, adopted))) continue;
-			try { if (paths.length) candidateBranch(candidate)?.invalidateInputs?.(paths); }
+			try {
+				const removed = paths.length ? candidateBranch(candidate)?.invalidateInputs?.(paths) : undefined;
+				if (removed) candidateStore.invalidateInputs(session.id, candidate, removed);
+			}
 			catch { invalid.add(candidate); }
 			// Once an Actor reserves a candidate, its freshness and compatibility checks
 			// are authoritative. Cache invalidation may only retire unclaimed work.

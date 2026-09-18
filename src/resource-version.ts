@@ -99,13 +99,14 @@ export class ResourceReadView {
 		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
 	}
 	/** Revoke data only; old outputs keep their immutable observations for exact validation. */
-	invalidate(dependencies: ReadonlySet<string>): void {
-		if (!dependencies.size) return;
+	invalidate(dependencies: ReadonlySet<string>): readonly string[] {
+		const removed: string[] = [];
+		if (!dependencies.size) return removed;
 		this.inputEpoch++;
 		if (this.boundary?.dependency && dependencies.has(this.boundary.dependency)) this.boundary = undefined;
 		for (const [target, entry] of this.entries) if (!entry.dependency || dependencies.has(entry.dependency) ||
 			entry.metadataDependency && dependencies.has(entry.metadataDependency)) {
-			this.entries.delete(target); this.capturedBytes -= entry.bytes;
+			this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target);
 		}
 		for (const entries of this.prepared?.bindings.values() ?? []) for (const [key, cached] of entries) {
 			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
@@ -113,6 +114,7 @@ export class ResourceReadView {
 				if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
 			}
 		}
+		return removed;
 	}
 
 	reserve(bytes: number): boolean {
@@ -649,13 +651,13 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 }
 
 
-export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[], paths: readonly string[]): void {
+export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[], paths: readonly string[]): readonly string[] {
 	const dependencies = new Set<string>(), precise = new Set<string>();
 	for (const token of tokens) for (const [key, dependency] of token.observations) {
 		if (paths.some(changed => dependency.scope === "resolution" ? containsFilesystemPath(changed, dependency.path)
 			: affects(dependency, { path: changed, type: "rename", epoch: 0 }, precise))) dependencies.add(key);
 	}
-	for (const token of tokens) token.view?.invalidate(dependencies);
+	return [...new Set(tokens.flatMap(token => token.view?.invalidate(dependencies) ?? []))];
 }
 
 export function releaseResourceVersion(token: unknown): void | Promise<void> {

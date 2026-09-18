@@ -324,7 +324,9 @@ describe("speculative action resource versions", () => {
 			await fs.writeFile(a, "changed");
 			const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat");
 			try {
-				invalidateResourceInputs([token, capturing], [a]);
+				const removed = invalidateResourceInputs([token, capturing], [a]).map(file => file.replaceAll("\\", "/"));
+				expect(removed).toContain(a.replaceAll("\\", "/")); expect(removed).not.toContain(b.replaceAll("\\", "/"));
+				expect(invalidateResourceInputs([token, capturing], [a])).toEqual([]);
 				expect(await prepare(b)).toBe("B"); expect(build).toHaveBeenCalledTimes(3);
 				expect(await view.evaluate(v => v.readFile(b))).toEqual(Buffer.from("B"));
 				expect(opened).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
