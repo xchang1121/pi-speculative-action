@@ -609,9 +609,10 @@ describe("speculative action host", () => {
 			const captured = captures.mock.calls.length, reads = opened.mock.calls.length, prepared = preparations();
 			await host.startTurn({ ...startInput(tools[0]!, "query"), tools }); await ready("query", 1);
 			expect(captures.mock.calls.length - captured).toBe(Number(partial));
-			expect(preparations() - prepared).toBe(coverage === "prepared" ? 0 : partial ? 2 : 1);
+			expect(preparations() - prepared).toBe(coverage === "prepared" ? 0 : 1);
 			const sourceReads = opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "notes.txt"));
-			expect(sourceReads.length).toBe(partial ? 1 : 0);
+			expect(sourceReads).toHaveLength(0);
+			expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "other.txt"))).toHaveLength(Number(partial));
 			for (const source of sources) await source.dispose();
 			const call = { turnID: "query", id: "first", tool: "grep", args, tools };
 			const current = async () => (await profile.invocations.get("grep")!.authoritative!({ args, callID: "reference", signal: new AbortController().signal })).result;
@@ -623,7 +624,7 @@ describe("speculative action host", () => {
 			permitted = false;
 			expect(await host.execute({ ...call, id: "denied" }, undefined, actor)).toEqual(expected);
 			expect(actor).toHaveBeenCalledOnce(); permitted = true;
-			await writeFile(path.join(cwd, "notes.txt"), "two changed\n");
+			await writeFile(path.join(cwd, partial ? "other.txt" : "notes.txt"), "two changed\n");
 			expect(await host.execute({ ...call, id: "changed" }, undefined, actor)).toEqual(await current());
 			expect(actor).toHaveBeenCalledTimes(2);
 			await host.finishTurn("query", true);
