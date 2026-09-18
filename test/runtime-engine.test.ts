@@ -1270,6 +1270,44 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
+	it.each((["joined", "failed", "denied", "aborted", "unbound", "retained"] as const).flatMap(mode => [false, true].map(preview => [mode, preview] as const)))(
+	"joins an exact input consumer before rebuilding its source: %s (preview=%s)", async (mode, preview) => {
+		const source = {}, gate = gated(), entered = barrier(), controller = new AbortController();
+		const reconstruct = vi.fn(async () => ({ output: "reconstructed", capturedBytes: 16 }));
+		const query = { path: "README.md", offset: 10, limit: 1 };
+		let second = false;
+		const { runtime, ready } = harness({
+			source: planSource({ propose: () => plan(second ? "query" : "source", second ? query : { path: "README.md", offset: 1, limit: 1 }) }),
+			authorizeCandidate: ({ candidate }) => ({ ok: mode !== "denied" || Number(candidate.input.offset) !== 10, reason: "denied" }),
+			executeCandidate: async ({ concrete, action, inputs }) => {
+				if (Number(concrete.offset) === 1) return { ...world("source", { executionFingerprint: action.executionFingerprint, validate: async () => validResource() }),
+					inputSource: source, inputResources: [{ path: "/workspace/README.md" }], capturedBytes: 64, reconstruct };
+				if (mode !== "unbound") expect([...inputs!("/workspace/README.md")]).toContain(source);
+				entered.arrive(); await gate.wait();
+				if (mode === "failed") throw new Error("consumer failed");
+				return world("joined", { executionFingerprint: action.executionFingerprint, validate: async () => validResource() });
+			},
+		});
+		let pending: ReturnType<typeof runtime.prepareActorCall> | undefined;
+		try {
+			await runtime.startTurn(start("seed")); await ready.promise;
+			const seed = call("seed", { path: "README.md", offset: 1, limit: 1 });
+			expect((await runtime.prepareActorCall(seed))?.output).toBe("source");
+			if (mode === "retained") expect((await runtime.prepareActorCall({ ...seed, id: "cached", input: query }))?.output).toBe("reconstructed");
+			await runtime.finishTurn(seed); second = true;
+			await runtime.startTurn(start("query")); await entered.promise;
+			if (preview) await runtime.previewActorCall(call("query", query), controller.signal);
+			pending = runtime.prepareActorCall(call("query", query), controller.signal);
+			await nextTurn(); await nextTurn();
+			if (["joined", "failed", "aborted"].includes(mode)) expect(reconstruct).not.toHaveBeenCalled();
+			else expect((await pending)?.output).toBe("reconstructed");
+			if (mode === "aborted") controller.abort();
+			gate.release();
+			expect((await pending)?.output).toBe(mode === "joined" ? "joined" : mode === "aborted" ? undefined : "reconstructed");
+			expect(reconstruct).toHaveBeenCalledTimes(["joined", "aborted"].includes(mode) ? 0 : 1);
+		} finally { gate.release(); await pending; await runtime.dispose(); }
+	});
+
 	it.each([0, 40])("calibrates loss and recovery per Actor call across competing cached results with %ims capture", async (captureMs) => {
 		let now = 1, cost = 20;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
