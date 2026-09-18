@@ -354,6 +354,48 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledTimes(3);
 	});
 
+	test.each(["capturing", "transient", "transferred", "composed", "revoked", "cancelled"])("shares concurrent preparation with independent consumers and owned proof (%s)", async mode => {
+		const root = await workspace({ value: "A" }), file = path.join(root, "value"), manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture(undefined, 8192), extra = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192);
+		const view = token.view!, binding = {}, gate = gated(), consuming = gated(), dispose = vi.fn(), observed = [vi.fn(), vi.fn()];
+		await (mode === "composed" ? extra.view! : view).readFile(file); extra.view!.seal();
+		if (mode === "transient") await view.readdir(root);
+		const capturing = mode === "capturing" || mode === "revoked";
+		if (!capturing) view.seal();
+		const build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+			const value = (await inputs.readFile(file)).toString(); await gate.wait(); return { value, bytes: 1, dispose };
+		});
+		const query = (index: number) => {
+			const operation = (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => inputs.prepare!(binding, "shared", build, async value => {
+				if (index === 1) await consuming.wait();
+				if (index === 0 && mode === "cancelled") throw new Error("consumer cancelled");
+				return value;
+			}, root);
+			return capturing ? operation(view) : view.evaluate(operation, observed[index], root,
+				mode === "composed" ? () => [{ view: extra.view!, observed: observed[index]! }] : undefined,
+				["transferred", "composed"].includes(mode) ? async () => ({ view: destination.view!, observed: () => {} }) : undefined);
+		};
+		const first = query(0); await gate.entered;
+		const second = query(1), settled = Promise.allSettled([first, second]);
+		try {
+			await nextTurn(); expect(build).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1);
+			if (mode === "revoked") { await fs.writeFile(file, "changed"); invalidateResourceInputs([token], [file]); }
+			gate.release(); await consuming.entered; await first.catch(() => {});
+			if (mode === "transient") expect(view.invalidate(new Set([`names:${root.replaceAll(path.sep, "/")}`])))
+				.toContain(root.replaceAll(path.sep, "/")); // A temporary preparation must not keep a revoked name indexed.
+			expect(build).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1); expect(dispose).not.toHaveBeenCalled();
+			consuming.release(); expect(await settled).toMatchObject([
+				mode === "cancelled" ? { status: "rejected", reason: new Error("consumer cancelled") } : { status: "fulfilled", value: "A" },
+				{ status: "fulfilled", value: "A" },
+			]);
+			if (!capturing) for (const observer of observed.slice(mode === "cancelled" ? 1 : 0)) expect(observer).toHaveBeenCalled();
+			if (capturing) view.seal();
+			expect((await manager.validate(token)).expired).toBe(mode === "revoked");
+			if (mode === "composed") expect(observed.every(observer => observer.mock.calls.some(([keys]) => keys?.has(`content:${file.replaceAll(path.sep, "/")}`)))).toBe(true);
+		} finally { gate.release(); consuming.release(); await settled; await token.release(); await extra.release(); await destination.release(); manager.close(); }
+		expect(dispose).toHaveBeenCalledTimes(mode === "composed" ? 2 : 1);
+	});
+
 	test.each(["build", "consume"])("drains prepared input %s before releasing its owner", async (phase) => {
 		const root = await workspace({ value: "A" }), manager = new ResourceVersionManager(root, { watch: false });
 		const token = await manager.capture(undefined, 8192), view = token.view!, binding = {}, gate = gated(), dispose = vi.fn();
@@ -369,7 +411,7 @@ describe("speculative action resource versions", () => {
 				await expect(view.evaluate(v => v.prepare(binding, "input", build, async () => { throw new Error("consumer cancelled"); }))).rejects.toThrow("consumer cancelled");
 				expect(dispose).not.toHaveBeenCalled();
 			}
-			pending = view.prepare(binding, "input", build, async value => { if (phase === "consume") await gate.wait(); return value; });
+			pending = Promise.all([0, 1].map(() => view.prepare(binding, "input", build, async value => { if (phase === "consume") await gate.wait(); return value; })));
 			const settled = Promise.allSettled([pending]); await gate.entered;
 			let released = false; release = token.release(); void Promise.resolve(release).then(() => { released = true; });
 			await nextTurn(); expect(released).toBe(false); expect(dispose).not.toHaveBeenCalled();

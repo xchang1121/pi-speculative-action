@@ -67,10 +67,11 @@ type ResourceInputSource = {
 };
 type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
-	readonly value: unknown; readonly dispose: () => void | Promise<void>;
+	value?: unknown; readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
-	readonly dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
-	borrowers: number; revoked?: boolean;
+	dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
+	readonly origin: ResourceReadView; destination: ResourceReadView; ready?: Promise<void>; readonly declined: Promise<void>;
+	borrowers: number; revoked?: boolean; retained?: boolean; local?: boolean;
 };
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
@@ -86,6 +87,8 @@ export class ResourceReadView {
 	private dependencies?: Set<string>;
 	private lookup?: ResourceInputLookup;
 	private missing?: () => Promise<ResourceInputSource>;
+	private foreignInputs = false;
+	private onForeignInputs?: () => void;
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
@@ -102,7 +105,7 @@ export class ResourceReadView {
 		this.assertComplete(true);
 		const resources = [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
 		for (const entries of this.prepared?.bindings.values() ?? []) for (const cached of entries.values()) {
-			if (cached.resource && !this.entries.has(cached.resource)) resources.push({ path: cached.resource, descendants: false });
+			if (cached.retained && cached.resource && !this.entries.has(cached.resource)) resources.push({ path: cached.resource, descendants: false });
 		}
 		return resources;
 	}
@@ -137,11 +140,11 @@ export class ResourceReadView {
 			this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target);
 		}
 		for (const entries of this.prepared?.bindings.values() ?? []) for (const [key, cached] of entries) {
-			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
+			if (cached.destination !== cached.origin || !cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
 				cached.revoked = true; entries.delete(key);
 				if (cached.resource) removed.push(cached.resource);
 				if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
-			} else if (cached.resource) preparedNames.add(cached.resource);
+			} else if (cached.retained && cached.resource) preparedNames.add(cached.resource);
 		}
 		return [...new Set(removed)].filter(target => !this.entries.has(target) && !preparedNames.has(target));
 	}
@@ -218,52 +221,70 @@ export class ResourceReadView {
 				if (!dependencies) this.dependencies = undefined;
 				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
 			};
-			if (owner.sealed && cached && compatible(cached)) {
-				inherit(cached.dependencies);
+			const release = (cached: PreparedResource) => {
+				if (--cached.borrowers || cached.retained && !cached.revoked) return;
+				if (prepared.bindings.get(binding)?.get(key) === cached) prepared.bindings.get(binding)!.delete(key);
+				return (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached);
+			};
+			const consumePrepared = async (cached: PreparedResource) => {
+				inherit(cached.origin === owner ? cached.dependencies : undefined);
+				const run = async () => {
+					this.assertComplete(); cached.destination.assertComplete();
+					const result = await consume(cached.value as Parameters<typeof consume>[0]);
+					this.assertComplete(); cached.destination.assertComplete(); return result;
+				};
+				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
+			};
+			if (cached && compatible(cached)) {
 				cached.borrowers++;
 				try {
-					const result = await consume(cached.value as Parameters<typeof consume>[0]);
-					this.assertComplete(); return result;
-				} finally { if (--cached.borrowers === 0 && cached.revoked) void prepared.lifetime.release(cached); }
+					// A pending composed build has not yet published the other owners' proofs.
+					if (cached.retained && cached.destination === owner ||
+						await Promise.race([cached.ready!.then(() => cached.local), cached.declined.then(() => cached.local)])) return await consumePrepared(cached);
+				} finally { await release(cached); }
 			}
 			if (target) for (const source of this.lookup?.(target) ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
-					!compatible(source.view.prepared?.bindings.get(binding)?.get(key))) continue;
+					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
+					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;
+				this.usesForeignInputs();
 				const result = await source.view.borrow(view => view.prepare(binding, key, build, consume), source.observed, this.boundary);
 				this.assertComplete(); return result;
 			}
-			let dependencies: ReadonlySet<string> | undefined;
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
-			let retained: PreparedResource | undefined, destination = owner;
-			try {
-				await this.borrow(async view => { resource = await build(view); }, (observed) => { dependencies = observed; inherit(observed); });
+			let bytes = 0;
+			let decline!: () => void;
+			const name = target && filesystemPathKey(target);
+			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 1, boundary: this.boundary,
+				declined: new Promise<void>(resolve => { decline = resolve; }),
+				dispose: async () => { try { await resource?.dispose(); } finally { if (pending.retained) pending.destination.capturedBytes -= bytes; } } };
+			let entries = prepared.bindings.get(binding);
+			if (!entries) prepared.bindings.set(binding, entries = new Map());
+			if (!entries.has(key)) entries.set(key, pending);
+			pending.ready = (async () => {
+				await this.borrow(async view => {
+					const foreign = view.onForeignInputs; view.onForeignInputs = () => { decline(); foreign?.(); };
+					resource = await build(view); pending.local = !view.foreignInputs;
+				}, observed => { pending.dependencies = observed; });
 				if (!resource) throw new Error("resource_preparation_missing");
-				const name = target && filesystemPathKey(target);
-				const bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				pending.value = resource.value;
+				bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 128 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
-				destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
+				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
 				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
 					let entries = retention.bindings.get(binding);
 					if (!entries) retention.bindings.set(binding, entries = new Map());
-					if (!entries.has(key)) {
-						// A composed preparation needs all source proofs, not keys from only its new owner.
-						retained = { value: resource.value, resource: name, borrowers: 1, dispose: async () => {
-							try { await resource!.dispose(); } finally { destination.capturedBytes -= bytes; }
-						}, dependencies: destination === owner ? dependencies : undefined, boundary: this.boundary };
-						entries.set(key, retained); destination.capturedBytes += bytes;
+					if (!entries.has(key) || entries.get(key) === pending) {
+						pending.retained = true; entries.set(key, pending); destination.capturedBytes += bytes;
 					}
 				}
-				const consumeResource = async () => {
-					const result = await consume(resource!.value);
-					this.assertComplete(); destination.assertComplete(); return result;
-				};
-				return await (destination === owner ? consumeResource() : retention.lifetime.admit(consumeResource));
-			} finally {
-				if (!retained) await resource?.dispose();
-				else if (--retained.borrowers === 0 && retained.revoked) void destination.prepared!.lifetime.release(retained);
-			}
+				if (destination !== owner && entries.get(key) === pending) entries.delete(key);
+			})();
+			void pending.ready.then(decline, decline);
+			try { await pending.ready; return await consumePrepared(pending); }
+			finally { await release(pending); }
 		});
 	};
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
@@ -271,6 +292,7 @@ export class ResourceReadView {
 		this.assertComplete();
 		const view = new ResourceReadView(0);
 		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
+		view.onForeignInputs = this.onForeignInputs;
 		try {
 			if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 			else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
@@ -285,6 +307,7 @@ export class ResourceReadView {
 			}
 			const output = await operation(view);
 			view.assertComplete();
+			this.foreignInputs ||= view.foreignInputs;
 			observed?.(view.dependencies);
 			return output;
 		} finally { view.dispose(); }
@@ -333,17 +356,20 @@ export class ResourceReadView {
 				// The caller already owns the boundary proof; the source contributes only its resource evidence.
 				const boundary = this.boundary && query !== target
 					? { root: this.boundary.physicalRoot, physicalRoot: this.boundary.physicalRoot } : this.boundary;
+				this.usesForeignInputs();
 				return await source.view.borrow(view => view.get(query, scope), source.observed, boundary);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
 		}
 		if (this.missing) {
 			try {
+				this.usesForeignInputs();
 				const source = await this.missing();
 				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary);
 			} catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 		}
 		return this.unproven(target);
 	}
+	private usesForeignInputs(): void { this.foreignInputs = true; this.onForeignInputs?.(); }
 	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): { entry?: CapturedResource; resolved: string } {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
