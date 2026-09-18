@@ -1172,19 +1172,21 @@ export class LinuxProcessReuseBackend {
 			const changedInput = async () => {
 				const changes = session.workspace.sourceChanges?.();
 				if (!changes?.paths.length || !transaction.readBefore) return false;
+				let inputs: Set<string> | undefined;
 				for (const changed of changes.paths) {
 					const relative = relativeFilesystemPath(session.sourceRoot, changed);
 					if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
+					inputs ??= new Set((await observeStrace(tracePrefix, logicalExecutable, logicalCwd, { previewBytes: 1024 * 1024 }))
+						.paths.filter(observed => observed.role === "input").map(observed => observed.path));
+					if (!inputs.has(changed)) continue;
 					const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
 					if (!before) continue;
-					// One regular input bounds lookup cost. Its transaction prestate includes valid predecessor effects.
+					// Only observed inputs need comparison; the transaction prestate includes predecessor effects.
 					await assertNoSymlinkPath(session.sourceRoot, changed);
 					const current = await captureStableFile(changed, MAX_REQUEST_BYTES);
 					this.addActor("validationFilesRead", 1);
 					this.addActor("validationBytesRead", current.bytesRead);
-					if (sha256Digest(before) === `sha256:${current.hash}`) return false;
-					const observation = await observeStrace(tracePrefix, logicalExecutable, logicalCwd, { previewBytes: 1024 * 1024 });
-					if (!observation.paths.some(observed => observed.role === "input" && observed.path === changed)) return false;
+					if (sha256Digest(before) === `sha256:${current.hash}`) continue;
 					this.setActorError(`actor_running_input_changed:${changed}`);
 					return true;
 				}

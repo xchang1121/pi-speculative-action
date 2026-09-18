@@ -43,6 +43,69 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test.for(["git", "auto"] as const)("selects changed running inputs after unrelated hints and compares the predecessor state (%s)", { timeout: 20_000 }, async (driver, { skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-running-inputs-", driver);
+		let pending: ReturnType<typeof forkReusableBash> | undefined, sandboxRoot: string | undefined;
+		let check: (() => Promise<boolean>) | undefined;
+		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
+		const observe = registry.observeInputs.bind(registry), open = fixture.backend.open.bind(fixture.backend);
+		const observing = vi.spyOn(registry, "observeInputs").mockImplementation((key, owner, changed) => {
+			check = changed; return observe(key, owner, changed);
+		});
+		const hints = ["ignored.txt", "stable.txt", "input.txt"].map(name => path.join(fixture.workspace, name));
+		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
+			sandboxRoot = input.workspace.sandboxRoot;
+			return open({ ...input, workspace: { ...input.workspace, sourceChanges: () => ({ uncertain: false, paths: hints }) } });
+		});
+		try {
+			const status = await fixture.backend.check(true);
+			if (status.state !== "ready") return skip(status.detail);
+			for (const file of hints) await writeFile(file, "baseline");
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+	char value[32];
+	int stable = open("stable.txt", O_RDONLY);
+	if (stable < 0 || read(stable, value, sizeof(value)) <= 0) return 1;
+	close(stable);
+	int input = open("input.txt", O_RDONLY);
+	ssize_t length = input < 0 ? -1 : read(input, value, sizeof(value));
+	if (length <= 0) return 2;
+	close(input);
+	int ready = open("ready", O_WRONLY | O_CREAT, 0600);
+	if (ready < 0) return 3;
+	close(ready);
+	while (access("release", F_OK) != 0) usleep(1000);
+	return write(1, value, (size_t)length) == length ? 0 : 4;
+}
+`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+			await commitBenchmarkFixture(fixture.workspace, "Running predecessor inputs");
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			pending = forkReusableBash(fixture, { label: "inputs", command: "printf predecessor > input.txt; worker",
+				actionNamespace: "running-inputs", executionFingerprint });
+			void pending.catch(() => {});
+			await expect.poll(() => Boolean(sandboxRoot && existsSync(path.join(sandboxRoot, "ready"))), { timeout: 5000 }).toBe(true);
+			expect(check).toBeDefined();
+			await writeFile(hints[0]!, "unrelated"); await writeFile(hints[2]!, "predecessor");
+			const opened = vi.spyOn(filesystem, "open"), reads = opened.mock.calls.length;
+			try {
+				expect(await check!()).toBe(false); // The child's transaction starts after the shell's write.
+				await writeFile(hints[2]!, "after");
+				expect(await check!()).toBe(true);
+				expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === hints[0])).toHaveLength(0);
+				expect(fixture.backend.actorMetrics().lastError).toContain("actor_running_input_changed:");
+			} finally { opened.mockRestore(); }
+			await writeFile(path.join(sandboxRoot!, "release"), "");
+			expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
+		} finally {
+			if (sandboxRoot) await writeFile(path.join(sandboxRoot, "release"), "").catch(() => {});
+			await (await pending?.catch(() => undefined))?.dispose();
+			opening.mockRestore(); observing.mockRestore(); await fixture.dispose();
+		}
+	});
+
 	test.for(["completed", "running", "native", "native-merged", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
