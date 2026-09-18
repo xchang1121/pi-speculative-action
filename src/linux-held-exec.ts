@@ -11,7 +11,7 @@ import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transactio
 import type { ProcessExecutor } from "./process-execution.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 10;
+const HELPER_PROTOCOL_VERSION = 11;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 2048;
 const MAX_OUTPUT_EVENTS = 65_536;
