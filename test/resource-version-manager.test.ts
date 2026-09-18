@@ -411,18 +411,27 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
-	test("retains query evidence independently of sealed input buffers and releases its manager once", async () => {
+	test.each([undefined, 1, 8192])("retains query evidence and bounded directory metadata independently (%s)", async metadataBytes => {
 		const root = await workspace({ value: "A", unused: "B" }), idle = vi.fn();
 		const manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
 		const token = await manager.capture(undefined, 8192), view = token.view!;
 		let retained: ResourceVersionToken | undefined;
 		try {
+			await view.stat(root, "type");
 			await view.readFile(path.join(root, "value"));
 			await view.exists(path.join(root, "missing"));
 			expect(() => manager.retain(token)).toThrow("resource_snapshot_not_sealed");
-			view.seal(); retained = manager.retain(token);
-			expect(retained.view).toBeUndefined(); expect(retained.observations).not.toBe(token.observations);
+			view.seal(); retained = manager.retain(token, metadataBytes);
+			expect(Boolean(retained.view)).toBe(metadataBytes === 8192); expect(retained.observations).not.toBe(token.observations);
 			await token.release(); expect(idle).not.toHaveBeenCalled();
+			if (retained.view) {
+				const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat");
+				try {
+					expect((await retained.view.evaluate(v => v.stat(root, "type"))).isDirectory()).toBe(true);
+					await expect(retained.view.evaluate(v => v.readFile(path.join(root, "value")))).rejects.toThrow("resource_access_unproven");
+					expect(opened).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
+				} finally { opened.mockRestore(); stat.mockRestore(); }
+			}
 			await fs.writeFile(path.join(root, "unused"), "irrelevant");
 			expect((await manager.validate(retained)).expired).toBe(false);
 			await fs.writeFile(path.join(root, "missing"), "present");
@@ -462,24 +471,30 @@ describe("speculative action resource versions", () => {
 		} finally { opened.mockRestore(); await source.release(); await extra.release(); manager.close(); }
 	});
 
-	test("confines borrowed names, aliases and negative observations to the current root", async () => {
+	test.each([false, true])("confines names, aliases and negative observations to the current root (composed=%s)", async composed => {
 		const root = await workspace({ "inside/data.txt": "A", "outside/data.txt": "B" });
 		const inside = path.join(root, "inside"), outside = path.join(root, "outside"), link = path.join(inside, "link");
 		const directoryLink = process.platform === "win32" ? "junction" : "dir";
 		await fs.symlink(outside, link, directoryLink);
 		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 8192), view = token.view!;
+		const boundaryManager = new ResourceVersionManager(inside, { watch: false }), boundary = await boundaryManager.capture(undefined, 8192);
+		boundary.view!.seal();
+		const evaluate = <T>(operation: (v: typeof view) => Promise<T>) => composed
+			? boundary.view!.evaluate(operation, keys => { expect([...keys!].map(key => boundary.observations.get(key)?.scope)).toContain("resolution"); }, inside,
+				() => [{ view, observed: keys => { expect([...keys!].every(key => token.observations.has(key))).toBe(true); } }])
+			: view.evaluate(operation, undefined, inside);
 		try {
-			await view.stat(inside, "type");
+			if (!composed) await view.stat(inside, "type");
 			for (const target of [path.join(inside, "data.txt"), path.join(outside, "data.txt"), path.join(link, "data.txt")]) await view.readFile(target);
 			for (const target of [path.join(inside, "missing"), path.join(link, "missing")]) expect(await view.exists(target)).toBe(false);
 			view.seal();
-			expect((await view.evaluate(v => v.readFile(path.join(inside, "data.txt")), undefined, inside)).toString()).toBe("A");
-			expect(await view.evaluate(v => v.exists(path.join(inside, "missing")), undefined, inside)).toBe(false);
+			expect((await evaluate(v => v.readFile(path.join(inside, "data.txt")))).toString()).toBe("A");
+			expect(await evaluate(v => v.exists(path.join(inside, "missing")))).toBe(false);
 			for (const [target, missing] of [[path.join(outside, "data.txt"), false], [path.join(link, "data.txt"), false], [path.join(link, "missing"), true]] as const)
-				await expect(view.evaluate(async v => missing ? await v.exists(target) : await v.readFile(target), undefined, inside)).rejects.toThrow("resource_access_unproven");
+				await expect(evaluate(async v => missing ? await v.exists(target) : await v.readFile(target))).rejects.toThrow("resource_access_unproven");
 			expect((await view.evaluate(v => v.readFile(path.join(outside, "data.txt")))).toString()).toBe("B");
 			expect((await manager.validate(token)).expired).toBe(false);
-		} finally { await token.release(); manager.close(); }
+		} finally { await token.release(); await boundary.release(); manager.close(); boundaryManager.close(); }
 
 		// The same leaf can remain reachable after the root redirects elsewhere and a child points back.
 		const alias = path.join(root, "scope"), bounce = path.join(outside, "bounce");

@@ -130,10 +130,13 @@ export function createResourceSnapshotExecutionWorld(
 						const query = await evaluateResourceInputs(owner, context, actionSemantics, () => missing ??= captureResourceVersion(undefined,
 							(context.action.executionContext as ToolInvocation).filesystemRoot ?? context.cwd, actionSemantics, operations.maxBytes())
 							.then(token => captured = token));
-						const bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
+						let bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
 						if (!query || bytes > operations.maxBytes()) continue;
 						captured?.view?.seal();
-						for (const version of query.versions) if (!captured || version.view !== captured.view) retained.push(version.manager.retain(version));
+						for (const version of query.versions) if (!captured || version.view !== captured.view) {
+							const proof = version.manager.retain(version, operations.maxBytes() - bytes);
+							retained.push(proof); bytes += proof.view?.bytes ?? 0;
+						}
 						const branch = resourceSnapshotBranch(query.output, captured ? [captured, ...retained] : retained,
 							context.action, 0, actionSemantics);
 						captured = undefined;
@@ -189,10 +192,12 @@ async function evaluateResourceInputs(
 		else for (const token of tokens) observe(token, undefined);
 	};
 	const output = await version.view.evaluate(view => execute(view, request), dependencies => observeOwner(versions, dependencies), root,
-		request.inputs && function* (target) {
-			for (const source of request.inputs!(target)) {
-				const owner = resourceVersions.get(source), view = owner?.versions[0]?.view;
-				if (view) yield { view, observed: dependencies => observeOwner(owner!.versions, dependencies) };
+		function* (target) {
+			for (const token of versions) if (token.view) yield { view: token.view, observed: (dependencies: ReadonlySet<string> | undefined) => observe(token, dependencies) };
+			for (const source of request.inputs?.(target) ?? []) {
+				const owner = resourceVersions.get(source);
+				if (owner) for (const token of owner.versions) if (token.view) yield { view: token.view,
+					observed: dependencies => dependencies ? observe(token, dependencies) : observeOwner(owner.versions, undefined) };
 			}
 		}, captureMissing && (async () => {
 			const token = await captureMissing();
@@ -227,7 +232,7 @@ function resourceSnapshotBranch(
 	const { executionFingerprint } = action, owner = { versions, executionFingerprint };
 	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, owner);
-	const inputResources = version.view?.resources;
+	const inputResources = version.view && versions.flatMap(token => token.view?.resources ?? []);
 	// A preparation-only owner still needs a lookup hint; reconstruction proves actual coverage.
 	if (inputResources && versions.length > 1) for (const resource of action.resources) {
 		const target = path.resolve(action.resourceRoot ?? version.root, resource);
@@ -245,7 +250,7 @@ function resourceSnapshotBranch(
 		invalidateInputs: paths => owned ? invalidateResourceInputs(owned, paths) : [],
 		inputResources,
 		reconstructionScope: "current_action",
-		get capturedBytes() { return proofBytes + (version.view?.bytes ?? 0); },
+		get capturedBytes() { return versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), proofBytes); },
 		executionMetrics: Object.freeze({ setupMs }),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: () => validate(owned),
