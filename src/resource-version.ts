@@ -98,20 +98,22 @@ export class ResourceReadView {
 		this.assertComplete(true);
 		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
 	}
-	/** Keep only proven directory metadata; payloads and preparations remain with their original owner. */
+	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
 	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
 		this.assertComplete(true);
 		if (maxBytes <= 0) return undefined;
 		let retained: ResourceReadView | undefined;
-		for (const observation of observations.values()) {
-			const target = filesystemPathKey(observation.path), entry = this.entries.get(target);
-			if (entry?.type !== "directory" || retained?.entries.has(target)) continue;
+		for (const observation of observations.values()) for (let target: string | undefined = filesystemPathKey(observation.path); target;) {
+			const entry = this.entries.get(target);
+			if (!entry || (entry.type !== "directory" && entry.type !== "alias" && entry.type !== "file") || retained?.entries.has(target)) break;
 			const dependency = entry.metadataDependency && observations.has(entry.metadataDependency) ? entry.metadataDependency : entry.dependency;
-			if (!dependency || !observations.has(dependency)) continue;
+			if (!dependency || !observations.has(dependency)) break;
 			retained ??= new ResourceReadView(maxBytes, undefined,
 				this.boundary?.dependency && observations.has(this.boundary.dependency) ? this.boundary : undefined);
-			retained.capture(target, { type: "directory", realPath: entry.realPath, dependency });
+			retained.capture(target, entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency,
+				...(entry.type === "file" ? { size: entry.size ?? entry.content?.length } : {}) });
 			if (!retained.retained) { void retained.dispose(); return undefined; }
+			target = entry.type === "alias" ? entry.target : undefined;
 		}
 		retained?.seal(); return retained;
 	}
@@ -292,7 +294,7 @@ export class ResourceReadView {
 		if (this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
-				const entry = this.entry(target, scope !== "entry");
+				const { entry } = this.entry(target, scope !== "entry");
 				// Existing input evidence also owns the metadata derivable from those bytes or names.
 				if (resourceCovers(entry, scope)) return;
 				return this.load!({ path: target, scope });
@@ -302,14 +304,17 @@ export class ResourceReadView {
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		const entry = this.entry(target, scope !== "entry", scope);
+		const { entry, resolved } = this.entry(target, scope !== "entry", scope);
 		if (resourceCovers(entry, scope)) return entry!;
-		for (const source of this.lookup?.(target) ?? []) {
+		// The local alias proof owns this translation; the source owns the resolved resource.
+		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target]) for (const source of this.lookup?.(query) ?? []) {
 			if (source.view.entries === this.entries || !source.view.retained) continue;
 			try {
 				source.view.assertComplete(true);
 				// The caller already owns the boundary proof; the source contributes only its resource evidence.
-				return await source.view.borrow(view => view.get(target, scope), source.observed, this.boundary);
+				const boundary = this.boundary && query !== target
+					? { root: this.boundary.physicalRoot, physicalRoot: this.boundary.physicalRoot } : this.boundary;
+				return await source.view.borrow(view => view.get(query, scope), source.observed, boundary);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
 		}
 		if (this.missing) {
@@ -320,7 +325,7 @@ export class ResourceReadView {
 		}
 		return this.unproven(target);
 	}
-	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): CapturedResource | undefined {
+	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): { entry?: CapturedResource; resolved: string } {
 		this.assertComplete();
 		let current = filesystemPathKey(target);
 		const visited = new Set<string>();
@@ -328,7 +333,7 @@ export class ResourceReadView {
 			visited.add(current);
 			const exact = this.observe(this.entries.get(current), scope);
 			if (exact?.type === "alias" && follow) { if (!exact.target) break; current = exact.target; continue; }
-			if (exact) return exact;
+			if (exact) return { entry: exact, resolved: exact.type !== "alias" && exact.realPath ? filesystemPathKey(exact.realPath) : current };
 			let parent = path.dirname(current);
 			while (parent !== path.dirname(parent) && this.entries.get(parent)?.type !== "alias") parent = path.dirname(parent);
 			const alias = this.entries.get(parent);
@@ -336,6 +341,7 @@ export class ResourceReadView {
 			this.observe(alias);
 			current = filesystemPathKey(path.resolve(alias.target, path.relative(parent, current)));
 		}
+		return { resolved: current };
 	}
 	private observe(entry: CapturedResource | undefined, scope?: ResourceDependency["scope"]): CapturedResource | undefined {
 		if (this.owner && this.boundary && entry?.realPath && (entry.type !== "alias" || scope === "entry") &&

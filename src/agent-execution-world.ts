@@ -175,7 +175,8 @@ async function evaluateResourceInputs(
 	const root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
 	if (!version.view || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope) return undefined;
 	if (!effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
-	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>();
+	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
+	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
 	let capturedBytes = 0;
 	const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined) => {
 		let observations = proofs.get(token);
@@ -205,7 +206,7 @@ async function evaluateResourceInputs(
 			return { view: token.view, observed: dependencies => observe(token, dependencies) };
 		}));
 	request.signal.throwIfAborted();
-	return { output, capturedBytes, versions: [...proofs].map(([token, observations]) => ({ ...token, observations })) };
+	return { output, capturedBytes, versions: [...proofs].filter(([, observations]) => observations.size).map(([token, observations]) => ({ ...token, observations })) };
 }
 
 /** Committed bytes enter the same read view and exact dependency validation as captured inputs. */
