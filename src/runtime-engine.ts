@@ -355,8 +355,8 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 	return Object.entries(value).reduce((sum, [key, item]) => sum + key.length * 2 + estimateValueBytes(item, seen), 0);
 }
 
-function retainedBranchBytes(branch: WorldBranch<unknown>): number {
-	return branch.capturedBytes + (branch.reconstruct ? branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0 : 0);
+function inputIndexBytes(branch: WorldBranch<unknown>): number {
+	return branch.reconstruct ? branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0 : 0;
 }
 
 /** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
@@ -642,7 +642,8 @@ export function makeSpeculativeActionRuntime<
 			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "estimatedBytes" | "projectionCoverage">>,
 	): Candidate => {
 		const sequence = ++session.candidateSequence;
-		return {
+		let resultBytes = input.estimatedBytes ?? 0;
+		const candidate: Candidate = {
 			id: `${input.origin === "prediction" ? "spec" : input.origin === "actor_preview" ? "actor" : input.origin}_${sequence}_${input.key.hash.slice(0, 12)}`,
 			work: new CandidateExecution<WorldBranch<Output>>(input.origin !== "actor_result" && input.route.reuse === "exclusive_branch" ? "exclusive" : "shared"),
 			actorAdopted: input.origin === "actor_result",
@@ -651,14 +652,16 @@ export function makeSpeculativeActionRuntime<
 			predictionLatencyMs: 0,
 			draftTokens: 0,
 			totalDraftTokens: session.tokenTotal,
-			estimatedBytes: 0,
 			projectionCoverage: [],
 			validationMs: 0,
 			validationBytes: 0,
 			validationFiles: 0,
 			projectionMs: 0,
 			...input,
+			get estimatedBytes() { return resultBytes + (candidateBranch(candidate)?.capturedBytes ?? 0); },
+			set estimatedBytes(bytes) { resultBytes = bytes - (candidateBranch(candidate)?.capturedBytes ?? 0); },
 		};
+		return candidate;
 	};
 
 	/** Every producer joins or registers work before yielding. Validation never grants a second launch. */
@@ -1374,7 +1377,7 @@ export function makeSpeculativeActionRuntime<
 			});
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
-			candidate.estimatedBytes = estimateValueBytes(output) + retainedBranchBytes(branch);
+			candidate.estimatedBytes = estimateValueBytes(output) + inputIndexBytes(branch);
 			const completedAt = performance.now();
 			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, branch.computationDependencies), completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
@@ -2031,7 +2034,7 @@ export function makeSpeculativeActionRuntime<
 				route: capture.route,
 				attemptStartedAt: toolExecution.startedAt,
 				expectedDurationMs: durationMs,
-					estimatedBytes: estimateValueBytes(output) + retainedBranchBytes(branch),
+					estimatedBytes: estimateValueBytes(output) + inputIndexBytes(branch),
 				projectionCoverage: captureCoverage(action, output, projectionRules),
 			});
 			candidate.work.start(toolExecution.startedAt);

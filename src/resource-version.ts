@@ -63,10 +63,15 @@ type ResourceInputSource = {
 	readonly observed: (dependencies: ReadonlySet<string> | undefined) => void;
 };
 type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
+type PreparedResource = {
+	readonly value: unknown; readonly dispose: () => void | Promise<void>;
+	readonly dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
+	borrowers: number; revoked?: boolean;
+};
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
-	private entries = new Map<string, CapturedResource>();
+	private entries = new Map<string, CapturedResource & { readonly bytes: number }>();
 	private owner?: ResourceReadView;
 	private failure?: Error;
 	private capturedBytes = 0;
@@ -77,11 +82,7 @@ export class ResourceReadView {
 	private dependencies?: Set<string>;
 	private lookup?: ResourceInputLookup;
 	private missing?: () => Promise<ResourceInputSource>;
-	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, {
-		readonly value: unknown; readonly dispose: () => void | Promise<void>;
-		readonly dependencies?: ReadonlySet<string>; readonly boundary: ResourceReadView["boundary"];
-		revoked?: boolean;
-	}>> };
+	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
@@ -103,9 +104,14 @@ export class ResourceReadView {
 		this.inputEpoch++;
 		if (this.boundary?.dependency && dependencies.has(this.boundary.dependency)) this.boundary = undefined;
 		for (const [target, entry] of this.entries) if (!entry.dependency || dependencies.has(entry.dependency) ||
-			entry.metadataDependency && dependencies.has(entry.metadataDependency)) this.entries.delete(target);
-		for (const entries of this.prepared?.bindings.values() ?? []) for (const cached of entries.values()) {
-			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) cached.revoked = true;
+			entry.metadataDependency && dependencies.has(entry.metadataDependency)) {
+			this.entries.delete(target); this.capturedBytes -= entry.bytes;
+		}
+		for (const entries of this.prepared?.bindings.values() ?? []) for (const [key, cached] of entries) {
+			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
+				cached.revoked = true; entries.delete(key);
+				if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
+			}
 		}
 	}
 
@@ -122,7 +128,7 @@ export class ResourceReadView {
 		this.capturedBytes += bytes;
 		return true;
 	}
-	capture(target: string, entry: CapturedResource): void {
+	capture(target: string, entry: CapturedResource, reservedBytes = 0): void {
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		const sameMetadata = previous?.type === entry.type && previous?.realPath === entry.realPath && entry.type !== "alias";
 		const metadataDependency = /^(entry|type|stat):/.test(entry.dependency ?? "") ? entry.dependency
@@ -130,11 +136,15 @@ export class ResourceReadView {
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined);
-		if (!this.reserve(redundant ? metadataDependency && metadataDependency !== previous?.metadataDependency ? Buffer.byteLength(metadataDependency) + 16 : 0
-			: Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(entry.dependency ?? "") + 64 + (entry.type === "directory"
-			? entry.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
-			: entry.type === "alias" ? Buffer.byteLength(entry.target ?? "") + Buffer.byteLength(entry.link) : 0))) return;
-		if (!redundant || sameMetadata) this.entries.set(key, { ...(redundant ? previous! : entry), metadataDependency });
+		const retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadataDependency };
+		const bytes = Buffer.byteLength(key) + Buffer.byteLength(retained.realPath ?? "") + Buffer.byteLength(retained.dependency ?? "") +
+			Buffer.byteLength(retained.metadataDependency ?? "") + 64 + (retained.type === "file" ? retained.content?.length ?? 0 : retained.type === "directory"
+				? retained.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
+				: retained.type === "alias" ? Buffer.byteLength(retained.target ?? "") + Buffer.byteLength(retained.link) : 0);
+		const additional = bytes - (previous?.bytes ?? 0) - reservedBytes;
+		if (!this.reserve(Math.max(0, additional))) return;
+		this.capturedBytes += Math.min(0, additional);
+		this.entries.set(key, { ...retained, bytes });
 	}
 	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
 	stat = async (target: string, fields?: "type" | "entry"): Promise<ToolFilesystemStat> => {
@@ -177,18 +187,21 @@ export class ResourceReadView {
 			};
 			if (owner.sealed && cached && !cached.revoked && cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot) {
 				inherit(cached.dependencies);
-				const result = await consume(cached.value as Parameters<typeof consume>[0]);
-				this.assertComplete(); return result;
+				cached.borrowers++;
+				try {
+					const result = await consume(cached.value as Parameters<typeof consume>[0]);
+					this.assertComplete(); return result;
+				} finally { if (--cached.borrowers === 0 && cached.revoked) void prepared.lifetime.release(cached); }
 			}
 			let dependencies: ReadonlySet<string> | undefined;
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
-			let retained = false;
+			let retained: PreparedResource | undefined, destination = owner;
 			try {
 				await this.borrow(async view => { resource = await build(view); }, (observed) => { dependencies = observed; inherit(observed); });
 				if (!resource) throw new Error("resource_preparation_missing");
 				const bytes = resource.bytes + key.length * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
-				const destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
+				destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
 				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
@@ -196,9 +209,10 @@ export class ResourceReadView {
 					if (!entries) retention.bindings.set(binding, entries = new Map());
 					if (!entries.has(key)) {
 						// A composed preparation needs all source proofs, not keys from only its new owner.
-						entries.set(key, { value: resource.value, dispose: resource.dispose,
-							dependencies: destination === owner ? dependencies : undefined, boundary: this.boundary });
-						destination.capturedBytes += bytes; retained = true;
+						retained = { value: resource.value, borrowers: 1, dispose: async () => {
+							try { await resource!.dispose(); } finally { destination.capturedBytes -= bytes; }
+						}, dependencies: destination === owner ? dependencies : undefined, boundary: this.boundary };
+						entries.set(key, retained); destination.capturedBytes += bytes;
 					}
 				}
 				const consumeResource = async () => {
@@ -206,7 +220,10 @@ export class ResourceReadView {
 					this.assertComplete(); destination.assertComplete(); return result;
 				};
 				return await (destination === owner ? consumeResource() : retention.lifetime.admit(consumeResource));
-			} finally { if (!retained) await resource?.dispose(); }
+			} finally {
+				if (!retained) await resource?.dispose();
+				else if (--retained.borrowers === 0 && retained.revoked) void destination.prepared!.lifetime.release(retained);
+			}
 		});
 	};
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
@@ -813,7 +830,7 @@ async function fingerprintDependencies(
 				const content = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
 					: await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, { stat: info, realPath: realTarget }));
 				assertInside(realRoot, content.realPath);
-				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath, dependency });
+				view?.capture(target, { type: "file", content: content.content, realPath: content.realPath, dependency }, retain ? provided?.byteLength ?? Number(info.size) : 0);
 				return {
 					value: {
 						type: "file",
