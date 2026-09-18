@@ -158,6 +158,10 @@ export interface WorldBranch<Output> {
 	readonly inputResources?: readonly { readonly path: string; readonly descendants?: boolean }[];
 	/** Opaque backend input owner; preserved through transactions, never result adoption authority. */
 	readonly inputSource?: object;
+	/** Retained data may serve proven queries, never the source action's result or effects. */
+	readonly inputsOnly?: true;
+	/** Transfer one input owner after a successful commit; the receiver owns its cleanup. */
+	readonly takeCommittedInputs?: (maxBytes: number) => Promise<(WorldBranch<Output> & { readonly inputsOnly: true }) | undefined>;
 	/** May evaluate the current action instead of only the source executor. Still requires query evidence. */
 	readonly reconstructionScope?: "current_action";
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */

@@ -6,7 +6,7 @@ import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, r
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { createEditTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createReadTool, createWriteTool, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { ActionSemanticsRegistry, buildPiActionKey } from "../src/action-semantics.ts";
@@ -268,6 +268,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				.rejects.toThrow("explicitly bound");
 			const branch = await world.speculation.execute(request);
 			expect(branch.output).toEqual({ result: expected, isError: false });
+			expect(await branch.takeCommittedInputs!(8192)).toBeUndefined();
 			if (initial === undefined) await expect(stat(target)).rejects.toThrow();
 			else expect(await readFile(target, "utf8")).toBe(initial);
 			const first = branch.commit();
@@ -275,6 +276,18 @@ describe("workspace-branch ExecutionWorld", () => {
 			await first;
 			expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: initial === undefined ? 2 : 1 });
 			expect(await readFile(target)).toEqual(expectedBytes);
+			const inputs = await branch.takeCommittedInputs!(8192);
+			expect(inputs?.inputsOnly).toBe(true); expect(await branch.takeCommittedInputs!(8192)).toBeUndefined();
+			await branch.dispose();
+			try {
+				const args = { path: target }, invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} });
+				const query = await inputs!.reconstruct!({ action: { ...buildPiActionKey("read", args, root)!, executionContext: invocation },
+					args, callID: "after-write", signal: new AbortController().signal });
+				expect(query?.output).toEqual({ result: await createReadTool(root).execute("oracle", args), isError: false });
+				expect((await query!.validate!()).status).toBe("valid");
+				await expect(inputs!.commit()).rejects.toThrow("input_only_branch");
+				await writeFile(target, "external change"); expect((await query!.validate!()).status).toBe("stale");
+			} finally { await inputs?.dispose(); await writeFile(target, expectedBytes); }
 		}
 		expect(forbidden.execute).not.toHaveBeenCalled();
 	});

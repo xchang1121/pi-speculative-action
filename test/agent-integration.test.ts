@@ -25,6 +25,7 @@ import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import {
 	normalizeSelfSpeculationSettings,
 	SELF_SPECULATION_DEFAULTS,
@@ -654,6 +655,51 @@ describe("speculative action host", () => {
 			expect(events.filter(event => event.type === "prediction" && event.turnID === "query" && event.settlement.observation === "observed" &&
 				event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toHaveLength(1);
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
+	});
+
+	it("reuses committed write inputs across turns while repeating mutations and rejecting stale reads", async () => {
+		const cwd = await temporaryWorkspace(), sandbox = new WorkspaceSandboxService();
+		const tools = [createWriteTool(cwd), createReadTool(cwd)], args = { path: "notes.txt", content: "committed\nsecond\n" };
+		const world = sandbox.createExecutionWorld({ driver: "git" }), events: SpeculativeActionEvent<string>[] = [];
+		let predict = true, readNext = false;
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		const host = createSpeculativeActionHost("committed-inputs", {
+			cwd, draftModel: model("draft"), preflight: () => true, getSettings: () => ({ ...settings(), tools: ["write", "read"],
+				drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 1024 * 1024 }),
+			complete: async () => assistant([{ type: "toolCall", id: "next", name: readNext ? "read" : "write", arguments: readNext ? { path: args.path } : args }], "toolUse"),
+			resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
+			// Isolate the committed owner from optional host-observation captures on Linux.
+			executionWorlds: [world, { ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 }), observation: undefined }],
+			onEvent: event => { events.push(event); },
+		});
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "write"), tools });
+			await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 5000, message: "committed-input prediction" }).toHaveLength(1);
+			await host.execute({ turnID: "write", id: "write", tool: "write", args, tools }, undefined, () => { throw new Error("write prediction must commit"); });
+			await host.finishTurn("write"); predict = false;
+			const captured = captures.mock.calls.length;
+			await host.startTurn({ ...startInput(tools[1]!, "read"), tools });
+			const query = { path: args.path, offset: 2 }, read = vi.fn(() => tools[1]!.execute("native", query as never));
+			const call = { turnID: "read", id: "read", tool: "read", args: query, tools };
+			expect(await host.execute(call, undefined, read)).toEqual(await tools[1]!.execute("oracle", query as never));
+			expect(read).not.toHaveBeenCalled(); expect(captures.mock.calls.length).toBe(captured);
+			await writeFile(path.join(cwd, args.path), "external\nchanged\n");
+			expect(await host.execute({ ...call, id: "stale" }, undefined, read)).toEqual(await tools[1]!.execute("oracle", query as never));
+			expect(read).toHaveBeenCalledOnce();
+			const write = vi.fn(() => tools[0]!.execute("native", args as never));
+			await host.execute({ turnID: "read", id: "repeat", tool: "write", args, tools }, undefined, write);
+			expect(write).toHaveBeenCalledOnce(); expect(await fs.readFile(path.join(cwd, args.path), "utf8")).toBe(args.content);
+			const nextArgs = { ...args, content: "latest\nstate\n" };
+			await host.execute({ turnID: "read", id: "replace", tool: "write", args: nextArgs, tools }, undefined, () => tools[0]!.execute("native", nextArgs as never));
+			await host.finishTurn("read");
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 1, exactReuseHits: 1 });
+			predict = true; readNext = true;
+			await host.startTurn({ ...startInput(tools[1]!, "predict-read"), tools });
+			await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "predict-read" && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(1);
+			expect(await host.execute({ ...call, turnID: "predict-read", id: "new", args: { path: args.path } }, undefined, read))
+				.toEqual(await tools[1]!.execute("oracle", { path: args.path } as never));
+			expect(read).toHaveBeenCalledOnce(); await host.finishTurn("predict-read", true);
+		} finally { await host.dispose(); await sandbox.dispose(); captures.mockRestore(); }
 	});
 
 	it("uses a completed search's inputs for current tools across turns without adopting its output or prediction", async ({ skip }) => {

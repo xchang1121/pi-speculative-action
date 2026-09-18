@@ -55,6 +55,36 @@ describe("EffectTransactionCoordinator", () => {
 		}
 	});
 
+	it.each(["success", "failed", "closing", "throw"])("transfers committed inputs once (%s)", async (phase) => {
+		const gate = gated(), dispose = vi.fn(), release = vi.fn();
+		const inputs = { ...branch({ dispose: release }), inputsOnly: true as const };
+		const takeCommittedInputs = vi.fn(() => {
+			if (phase === "throw") throw new Error("transfer failed");
+			return (async () => { if (phase === "closing") await gate.wait(); return inputs; })();
+		});
+		const coordinator = new EffectTransactionCoordinator<string>();
+		const transaction = await coordinator.execute(coordinator.begin({ tool: "write", callID: "write", route }),
+			async () => branch({ dispose, takeCommittedInputs, commit: async () => {
+				if (phase === "failed") throw new Error("commit failed"); return "sealed";
+			} }));
+		expect(await transaction.takeCommittedInputs!(100)).toBeUndefined();
+		await transaction.validate();
+		if (phase === "failed") await expect(transaction.commit()).rejects.toThrow("commit failed");
+		else await transaction.commit();
+		const pending = transaction.takeCommittedInputs!(100);
+		const result = Promise.allSettled([pending]);
+		if (phase === "closing") await gate.entered;
+		const closing = phase === "closing" ? transaction.dispose() : undefined;
+		expect(await transaction.takeCommittedInputs!(100)).toBeUndefined();
+		gate.release();
+		const [settled] = await result;
+		expect(settled).toMatchObject(phase === "throw" ? { status: "rejected" } : { status: "fulfilled", value: phase === "success" ? inputs : undefined });
+		await closing; await transaction.dispose();
+		expect(dispose).toHaveBeenCalledOnce(); expect(takeCommittedInputs).toHaveBeenCalledTimes(Number(phase !== "failed"));
+		expect(release).toHaveBeenCalledTimes(Number(phase === "closing"));
+		if (phase === "success") await inputs.dispose();
+	});
+
 	it.each(["sealed", "reserved", "committed"] as const)("owns each validation window across %s adoption", async (phase) => {
 		for (const reuse of ["shared_result", "exclusive_branch"] as const) for (const changed of [false, true]) {
 			const gate = gated();
