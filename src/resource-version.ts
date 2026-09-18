@@ -65,6 +65,7 @@ type ResourceInputSource = {
 type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly value: unknown; readonly dispose: () => void | Promise<void>;
+	readonly resource?: string;
 	readonly dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
 	borrowers: number; revoked?: boolean;
 };
@@ -96,7 +97,11 @@ export class ResourceReadView {
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
 	get resources() {
 		this.assertComplete(true);
-		return [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
+		const resources = [...this.entries].map(([path, entry]) => ({ path, descendants: entry.type === "alias" && entry.target !== undefined }));
+		for (const entries of this.prepared?.bindings.values() ?? []) for (const cached of entries.values()) {
+			if (cached.resource && !this.entries.has(cached.resource)) resources.push({ path: cached.resource, descendants: false });
+		}
+		return resources;
 	}
 	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
 	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
@@ -121,6 +126,7 @@ export class ResourceReadView {
 	invalidate(dependencies: ReadonlySet<string>): readonly string[] {
 		const removed: string[] = [];
 		if (!dependencies.size) return removed;
+		const preparedNames = new Set<string>();
 		this.inputEpoch++;
 		if (this.boundary?.dependency && dependencies.has(this.boundary.dependency)) this.boundary = undefined;
 		for (const [target, entry] of this.entries) if (!entry.dependency || dependencies.has(entry.dependency) ||
@@ -130,10 +136,11 @@ export class ResourceReadView {
 		for (const entries of this.prepared?.bindings.values() ?? []) for (const [key, cached] of entries) {
 			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
 				cached.revoked = true; entries.delete(key);
+				if (cached.resource) removed.push(cached.resource);
 				if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
-			}
+			} else if (cached.resource) preparedNames.add(cached.resource);
 		}
-		return removed;
+		return [...new Set(removed)].filter(target => !this.entries.has(target) && !preparedNames.has(target));
 	}
 
 	reserve(bytes: number): boolean {
@@ -193,7 +200,7 @@ export class ResourceReadView {
 		return this.borrow(operation, observed, root, lookup, missing);
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
-	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume) => {
+	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target) => {
 		this.assertComplete();
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
@@ -202,11 +209,13 @@ export class ResourceReadView {
 			this.assertComplete();
 			const inputEpoch = owner.inputEpoch;
 			const cached = prepared.bindings.get(binding)?.get(key);
+			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked &&
+				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
 			const inherit = (dependencies: ReadonlySet<string> | undefined) => {
 				if (!dependencies) this.dependencies = undefined;
 				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
 			};
-			if (owner.sealed && cached && !cached.revoked && cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot) {
+			if (owner.sealed && cached && compatible(cached)) {
 				inherit(cached.dependencies);
 				cached.borrowers++;
 				try {
@@ -214,13 +223,20 @@ export class ResourceReadView {
 					this.assertComplete(); return result;
 				} finally { if (--cached.borrowers === 0 && cached.revoked) void prepared.lifetime.release(cached); }
 			}
+			if (target) for (const source of this.lookup?.(target) ?? []) {
+				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
+					!compatible(source.view.prepared?.bindings.get(binding)?.get(key))) continue;
+				const result = await source.view.borrow(view => view.prepare(binding, key, build, consume), source.observed, this.boundary);
+				this.assertComplete(); return result;
+			}
 			let dependencies: ReadonlySet<string> | undefined;
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
 			let retained: PreparedResource | undefined, destination = owner;
 			try {
 				await this.borrow(async view => { resource = await build(view); }, (observed) => { dependencies = observed; inherit(observed); });
 				if (!resource) throw new Error("resource_preparation_missing");
-				const bytes = resource.bytes + key.length * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				const name = target && filesystemPathKey(target);
+				const bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 128 + [...dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
 				destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				this.assertComplete(); destination.assertComplete();
@@ -230,7 +246,7 @@ export class ResourceReadView {
 					if (!entries) retention.bindings.set(binding, entries = new Map());
 					if (!entries.has(key)) {
 						// A composed preparation needs all source proofs, not keys from only its new owner.
-						retained = { value: resource.value, borrowers: 1, dispose: async () => {
+						retained = { value: resource.value, resource: name, borrowers: 1, dispose: async () => {
 							try { await resource!.dispose(); } finally { destination.capturedBytes -= bytes; }
 						}, dependencies: destination === owner ? dependencies : undefined, boundary: this.boundary };
 						entries.set(key, retained); destination.capturedBytes += bytes;

@@ -373,7 +373,7 @@ describe("speculative action resource versions", () => {
 
 	test.each(["retained", "budget", "build", "consume"])("transfers composed preparations into their capture lifetime (%s)", async (phase) => {
 		const root = await workspace({ value: "A", "inside/other": "B" }), manager = new ResourceVersionManager(root, { watch: false });
-		const source = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192);
+		const source = await manager.capture(undefined, 8192), destination = await manager.capture(undefined, 8192), reader = await manager.capture(undefined, 8192);
 		const binding = {}, dispose = vi.fn(), gate = gated();
 		await source.view!.readFile(path.join(root, "value")); source.view!.seal();
 		const proof = manager.retain(source);
@@ -386,7 +386,7 @@ describe("speculative action resource versions", () => {
 		try {
 			pending = source.view!.evaluate(view => view.prepare(binding, "selection", build, async value => {
 				if (phase === "consume") await gate.wait(); return value;
-			}), undefined, root, undefined, async () => ({ view: destination.view!, observed: () => {} }));
+			}, root), undefined, root, undefined, async () => ({ view: destination.view!, observed: () => {} }));
 			if (phase === "build" || phase === "consume") {
 				const settled = Promise.allSettled([pending]); await gate.entered;
 				let released = false; release = destination.release(); void Promise.resolve(release).then(() => { released = true; });
@@ -400,14 +400,21 @@ describe("speculative action resource versions", () => {
 					view => view.prepare(identity, key, build, async value => value), observed => { expect(observed).toBeUndefined(); }, rootOverride);
 				if (phase === "retained") {
 					expect(await query()).toBe("A"); expect(build).toHaveBeenCalledOnce(); expect(dispose).not.toHaveBeenCalled();
+					reader.view!.seal(); const observed = vi.fn();
+					const borrowed = () => reader.view!.evaluate(view => view.prepare(binding, "selection", build, async value => value, root),
+						undefined, root, () => [{ view: destination.view!, observed }]);
+					expect(destination.view!.resources).toContainEqual({ path: root.replaceAll("\\", "/"), descendants: false });
+					expect(await borrowed()).toBe("A"); expect(build).toHaveBeenCalledOnce(); expect(observed).toHaveBeenCalledWith(undefined);
 					for (const [identity, key, boundary] of [[{}, "selection", root], [binding, "different", root], [binding, "selection", path.join(root, "inside")]] as const)
 						await expect(query(identity, key, boundary)).rejects.toThrow("resource_access_unproven");
 					expect(await query()).toBe("A");
-					invalidateResourceInputs([destination, proof], [path.join(root, "value")]);
+					expect(invalidateResourceInputs([destination, proof], [path.join(root, "value")])).toContain(root.replaceAll("\\", "/"));
+					expect(destination.view!.resources).toEqual([]);
+					await expect(borrowed()).rejects.toThrow("resource_access_unproven");
 					await expect(query()).rejects.toThrow("resource_access_unproven");
 				} else await expect(query()).rejects.toThrow("resource_access_unproven");
 			}
-		} finally { gate.release(); await pending?.catch(() => {}); await source.release(); await destination.release(); await proof.release(); manager.close(); }
+		} finally { gate.release(); await pending?.catch(() => {}); await source.release(); await destination.release(); await proof.release(); await reader.release(); manager.close(); }
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 

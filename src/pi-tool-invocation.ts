@@ -246,7 +246,7 @@ export async function createClosedSearchProfile(cwd: string) {
 						return { value: { root, cwd: prepared.cwd, path: prepared.path }, bytes: prepared.bytes, dispose };
 					} catch (error) { await dispose(); throw error; }
 				};
-				if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run);
+				if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target);
 				const prepared = await build(view);
 				try { return await run(prepared.value); } finally { await prepared.dispose(); }
 			} finally { await capture?.release(); }
