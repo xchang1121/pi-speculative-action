@@ -208,12 +208,14 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
 	let inputTransfer: ReturnType<NonNullable<WorldBranch<Output>["takeCommittedInputs"]>> | undefined;
 	const reconstructions = new Set<ReturnType<NonNullable<WorldBranch<Output>["reconstruct"]>>>();
+	const queryResources = new Set<() => Promise<void>>();
 	const abort = (): Promise<void> => {
 		if (cleanupPromise) return cleanupPromise;
 		if (!["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
 		cleanupPromise = (async () => {
 			try {
 				await Promise.allSettled([validationPromise, commitPromise, inputTransfer, ...reconstructions]);
+				await Promise.allSettled([...queryResources].map(dispose => dispose()));
 				await sealed.dispose();
 			} finally {
 				if (!["committed", "poisoned"].includes(attempt.stateValue)) attempt.stateValue = "aborted";
@@ -259,13 +261,20 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
 			// Borrowing sealed inputs grants no commit authority; freshness is checked after evaluation.
 			if (cleanupPromise || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;
-			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then((result) => {
+			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then(async (result) => {
 				if (!result) return undefined;
 				// An atomic validation/commit callback retains its complete proof and effect ownership.
 				const proof = !validateAndCommit && result.validate?.bind(result);
-				return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes, requiresQueryValidation: result.requiresQueryValidation,
-					compatibility: proof ? immutableSnapshot(result.compatibility) : undefined,
-					...(proof ? { validate: () => validate(proof) } : {}) });
+				const release = result.dispose?.bind(result);
+				let released: Promise<void> | undefined;
+				const dispose = () => released ??= Promise.resolve().then(release).finally(() => queryResources.delete(dispose));
+				if (release) queryResources.add(dispose);
+				try {
+					return Object.freeze({ output: cloneSharedData(result.output), capturedBytes: result.capturedBytes, requiresQueryValidation: result.requiresQueryValidation,
+						compatibility: proof ? immutableSnapshot(result.compatibility) : undefined,
+						...(proof ? { validate: () => validate(() => released ? Promise.resolve({ status: "indeterminate", cause: cause("freshness", "query_disposed"), metrics: zeroValidationMetrics() }) : proof()) } : {}),
+						...(release ? { dispose } : {}) });
+				} catch (error) { await dispose().catch(() => {}); throw error; }
 			});
 			reconstructions.add(task);
 			try { return await task; } finally { reconstructions.delete(task); }

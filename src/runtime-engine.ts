@@ -225,13 +225,19 @@ async function projectOutput<Output>(
 	if ((branch.inputsOnly || candidate.outputStale) && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	if (match.kind === "exact") return { ok: true, output: branch.output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained && (!candidate.outputStale || retained.validate)) return { ok: true, ...retained, output: cloneSharedData(retained.output) };
+	if (retained && (!candidate.outputStale || retained.validate)) {
+		const output = cloneSharedData(retained.output);
+		if (retained.resource) retained.resource.references++;
+		return { ok: true, ...retained, output };
+	}
 	const reconstruct = branch.reconstruct;
 	const rule = match.kind === "projected" ? rules.find((item) => item.id === match.projector) : undefined;
 	if (match.kind === "projected" && !rule) return { ok: false, cause: cause("projection", "rule_missing") };
 	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule?.id);
 	if (!reconstruct && (!coverage || !rule?.projectOutput)) return { ok: false, cause: cause("projection", "coverage_missing") };
 	const startedAt = performance.now();
+	let rebuilt: Awaited<ReturnType<NonNullable<typeof reconstruct>>>;
+	let transferred = false;
 	try {
 		let projected: Output | undefined = match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
 			speculative: candidate.key,
@@ -240,17 +246,19 @@ async function projectOutput<Output>(
 			coverage: cloneSharedData(coverage.value),
 			keyMatch: match,
 		})) : undefined;
-		const rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
+		rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
 		if ((rebuilt?.requiresQueryValidation || candidate.outputStale) && !rebuilt?.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (rebuilt) projected = rebuilt.output;
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const execution = new TimelineInterval(startedAt, performance.now());
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
+		const resource = rebuilt?.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
+		transferred = true;
 		return { ok: true, output: projected, execution, inputs: !!rebuilt, compatibility: rebuilt?.compatibility,
-			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes, requiresQueryValidation: rebuilt?.requiresQueryValidation };
+			validate: rebuilt?.validate, capturedBytes: rebuilt?.capturedBytes, requiresQueryValidation: rebuilt?.requiresQueryValidation, resource };
 	} catch (error) {
 		return { ok: false, cause: cause("projection", "reconstruction_failed", errorDetail(error)) };
-	}
+	} finally { if (!transferred) await Promise.resolve().then(() => rebuilt?.dispose?.()).catch(() => {}); }
 }
 
 function callKey(turnID: string, callID: string): string {
@@ -429,7 +437,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
 	outputStale?: boolean;
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"] }>;
+	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly resource?: ProjectionResource; readonly capturedBytes?: number; readonly requiresQueryValidation?: true }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	acceptOperationScope?: (scope: ExecutionScope) => boolean;
@@ -502,8 +510,13 @@ interface ClaimedPrediction {
 	readonly opportunity: PredictionOpportunity;
 }
 
+interface ProjectionResource {
+	readonly dispose: () => void | Promise<void>;
+	references: number;
+}
+
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true; readonly resource?: ProjectionResource }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
@@ -552,6 +565,9 @@ export function makeSpeculativeActionRuntime<
 	}
 	const projectionRules = resolveActionProjectionRules(adapter.projectionRules ?? [], semantics);
 	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue);
+	const releaseProjectionResource = (sessionID: SessionID, resource?: ProjectionResource) => {
+		if (resource && --resource.references === 0) sessionStates.get(sessionID)?.lifecycle.release(resource);
+	};
 
 	/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
 	function retainResultView(
@@ -561,16 +577,19 @@ export function makeSpeculativeActionRuntime<
 		if (!projection.execution || candidate.resultViews?.has(action.key) || candidate.outputStale && !projection.validate) return false;
 		try {
 			const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
-			let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate;
+			let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate, resource = projection.resource;
 			const views = candidate.resultViews ??= new Map();
-			if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; }
+			if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; resource = undefined; }
 			while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
 				const [key, previous] = views.entries().next().value!;
 				views.delete(key); candidate.estimatedBytes -= previous.bytes;
+				releaseProjectionResource(sessionID, previous.resource);
 				candidateStore.indexView(sessionID, candidate, key, false);
 			}
 			if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-				views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate }); candidate.estimatedBytes += bytes;
+				if (resource) resource.references++;
+				views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate, resource,
+					capturedBytes: bytes - outputBytes, requiresQueryValidation: projection.requiresQueryValidation }); candidate.estimatedBytes += bytes;
 				candidateStore.indexView(sessionID, candidate, action.key, true);
 				return true;
 			}
@@ -614,6 +633,7 @@ export function makeSpeculativeActionRuntime<
 
 	const removeCandidate = (sessionID: SessionID, candidate: Candidate): void => {
 		candidateStore.delete(sessionID, candidate);
+		for (const view of candidate.resultViews?.values() ?? []) releaseProjectionResource(sessionID, view.resource);
 		candidate.resultViews?.clear();
 		sessionStates.get(sessionID)?.lifecycle.release(candidateBranch(candidate));
 	};
@@ -1507,10 +1527,11 @@ export function makeSpeculativeActionRuntime<
 			if (!lease) return;
 			const inputs = execution.output.inputSource
 				? borrowCandidateInputs(state.session, candidate, `inputs:preview:${callKey(state.turnID, actualCall.id!)}`) : undefined;
+			let projected: ProjectionResult<Output> | undefined;
 			try {
 				if (await authorize(state, input, action, actualCall, candidate, signal) || !active()) return;
 				// A streamed intent may prepare sealed data, but grants no freshness or commit authority.
-				const projected = await projectOutput(candidate, action, match,
+				projected = await projectOutput(candidate, action, match,
 					projectionRules, { action, args: action.input, callID: actualCall.id!,
 						signal: signal ?? state.generation.signal, inputs: inputs?.lookup });
 				if (projected.ok && active() && candidateStore.get(state.sessionID, candidate.id) === candidate) {
@@ -1518,6 +1539,7 @@ export function makeSpeculativeActionRuntime<
 					if (retained) trimResults(state.session, state.settings);
 				}
 			} finally {
+				if (projected?.ok) releaseProjectionResource(state.sessionID, projected.resource);
 				inputs?.dispose();
 				lease.release();
 			}
@@ -1703,6 +1725,7 @@ export function makeSpeculativeActionRuntime<
 			}
 			const attemptStartedAt = performance.now();
 			let inputs: ReturnType<typeof borrowCandidateInputs> | undefined;
+			let projection: ProjectionResult<Output> | undefined;
 			let waitMs = 0;
 			try {
 				if (candidate.work.execution.status === "queued") {
@@ -1771,7 +1794,7 @@ export function makeSpeculativeActionRuntime<
 				// Evaluate sealed data first, then prove freshness once immediately before commit.
 				if (choice.match.kind !== "exact" && branch.inputSource && !candidate.resultViews?.has(actualKey.key))
 					inputs = borrowCandidateInputs(state.session, candidate, `inputs:${actorAction.identity.id}`);
-				const projection = await projectOutput(
+				projection = await projectOutput(
 					candidate,
 					actualKey,
 					choice.match,
@@ -1799,6 +1822,7 @@ export function makeSpeculativeActionRuntime<
 					if (validation.status === "stale") {
 						const retained = candidate.resultViews?.get(actualKey.key);
 						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes;
+							releaseProjectionResource(state.sessionID, retained.resource);
 							candidateStore.indexView(state.sessionID, candidate, actualKey.key, false); }
 						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
 						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause, true);
@@ -1856,6 +1880,7 @@ export function makeSpeculativeActionRuntime<
 				});
 				break;
 			} finally {
+				if (projection?.ok) releaseProjectionResource(state.sessionID, projection.resource);
 				inputs?.dispose();
 				reservation.release();
 				state.session.scheduler.observeAdoption(adoptionIdentity, Math.max(0, performance.now() - attemptStartedAt - waitMs));
@@ -2576,6 +2601,7 @@ export function makeSpeculativeActionRuntime<
 				// Independent query proofs survive; views backed only by the old output proof do not.
 				for (const [key, view] of candidate.resultViews ?? []) if (!view.validate) {
 					candidate.resultViews!.delete(key); candidate.estimatedBytes -= view.bytes;
+					releaseProjectionResource(session.id, view.resource);
 					candidateStore.indexView(session.id, candidate, key, false);
 				}
 			} else discardCandidate(session, candidate, failure, false);

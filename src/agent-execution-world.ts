@@ -264,10 +264,18 @@ function resourceSnapshotBranch(
 		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			if (!owned) return undefined;
-			const query = await evaluateResourceInputs(owner, request, semantics);
-			return query && { output: query.output, validate: () => validate(query.versions), capturedBytes: query.capturedBytes,
-				...(query.versions.length > 1 ? { requiresQueryValidation: true as const } : {}),
-				compatibility: { status: "compatible", backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
+			const retained: ResourceVersionToken[] = [];
+			let released: Promise<void> | undefined, transferred = false;
+			const dispose = () => released ??= Promise.allSettled(retained.splice(0).map(releaseResourceVersion)).then(() => {});
+			try {
+				const query = await evaluateResourceInputs(owner, request, semantics, undefined, retained);
+				if (!query) return undefined;
+				const result = { output: query.output, validate: () => validate(released ? undefined : query.versions), capturedBytes: query.capturedBytes,
+					...(query.versions.length > 1 || retained.length ? { requiresQueryValidation: true as const } : {}),
+					...(retained.length ? { dispose } : {}),
+					compatibility: { status: "compatible" as const, backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
+				transferred = true; return result;
+			} finally { if (!transferred) await dispose(); }
 		} } : {}),
 		commit: async () => {
 			if (!owned) throw new Error("resource snapshot is disposed");
