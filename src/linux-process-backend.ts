@@ -216,7 +216,7 @@ interface DispatcherRequest {
 
 type OutputRoute = readonly [1 | 2, 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
-type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment">;
+type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & { readonly closeStdin?: boolean };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
 	readonly executable: string;
@@ -834,7 +834,8 @@ export class LinuxProcessReuseBackend {
 			session.incompleteReasons.add(`broker_bypass:${request.name}:${eligibility.reason}`);
 			return { version: 2, kind: "bypass", executable };
 		}
-		return this.executeRequest(session, request, executable, eligibility.route, requestID);
+		const { argv0, args, cwd, environment } = request;
+		return this.executeRequest(session, { argv0, args, cwd, environment }, executable, eligibility.route, requestID);
 	}
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
@@ -1036,6 +1037,7 @@ export class LinuxProcessReuseBackend {
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
+					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 				}, durationMs);
 				if (binding) observation!.bindings.set(order, binding);
 			};
@@ -1205,7 +1207,7 @@ export class LinuxProcessReuseBackend {
 				),
 				"--",
 				ready.dispatcher,
-				"--exec",
+				request.closeStdin ? "--exec-closed-input" : "--exec",
 				outputRoute.join(""),
 				request.argv0,
 				logicalExecutable,
@@ -1291,6 +1293,7 @@ export class LinuxProcessReuseBackend {
 						const binding = this.handoffs.bind(weakKey, work, {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
+							...(request.closeStdin ? { closeStdin: true } : {}),
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
@@ -1405,7 +1408,7 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute),
+			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
 }

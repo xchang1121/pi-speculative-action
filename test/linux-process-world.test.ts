@@ -106,7 +106,7 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
@@ -118,7 +118,8 @@ int main(void) {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -126,7 +127,9 @@ int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
 	for (volatile unsigned long iteration = 0; iteration < ${mode === "running" ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
+	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
+	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
 	return ${mode === "native-merged" ? 'write(2, "stderr\\n", 7) != 7' : "0"};
 }
@@ -135,7 +138,8 @@ int main(int argc, char **argv) {
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
-			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'" + (mode === "native-merged" ? " 2>&1" : "");
+			const command = "export BOUND_SECRET='private value'; printf 'parent\\n'; exec -a bound-name worker 'private argument'" +
+				(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
 				sourceRoot: fixture.workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
 					executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
@@ -370,7 +374,7 @@ int main(int argc, char **argv) {
 				await stopped;
 			}
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
-			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", undefined], ["1>/dev/null", undefined]] as const) {
+			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", undefined]] as const) {
 				let inspected = 0;
 				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
 				const inspecting = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
@@ -383,8 +387,10 @@ int main(int argc, char **argv) {
 					environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
 				expect(inspected).toBe(1);
 				// Assert outside the advisory callback, whose failures intentionally preserve native execution.
-				if (route) expect((await inspection!).outputRoute).toEqual(route);
-				else await expect(inspection).rejects.toThrow(/descriptors/);
+				if (route) {
+					expect((await inspection!).outputRoute).toEqual(route);
+					expect((await inspection!).context.descriptorTypes[0]).toBe(redirection === "0<&-" ? "closed" : "device");
+				} else await expect(inspection).rejects.toThrow(/descriptors/);
 			}
 			const input = path.join(root, "ofd-input");
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure"]) {

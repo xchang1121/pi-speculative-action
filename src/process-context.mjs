@@ -21,7 +21,7 @@ import { readFile, readlink, stat } from "node:fs/promises";
  */
 export async function captureProcessContext(pid, inheritedDescriptors) {
 	if (inheritedDescriptors.some(name => !/^\d+$/.test(name)) ||
-		inheritedDescriptors.map(Number).sort((a, b) => a - b).join(",") !== "0,1,2") {
+		!["0,1,2", "1,2"].includes(inheritedDescriptors.map(Number).sort((a, b) => a - b).join(","))) {
 		throw new Error("held process has unmodeled inherited descriptors");
 	}
 	const root = `/proc/${pid}`;
@@ -35,6 +35,9 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 		text(`${root}/stat`),
 		statPath("/bin/sh", { bigint: true }),
 		Promise.all([0, 1, 2].map(async fd => {
+			if (fd === 0 && !inheritedDescriptors.includes("0")) return {
+				fd, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0,
+			};
 			const [metadata, endpoint, info] = await Promise.all([
 				// Inside the sandbox inspect the inherited handle, without resolving its proc magic link.
 				pid === "self" ? fstatSync(fd, { bigint: true }) : stat(`${root}/fd/${fd}`, { bigint: true }),
@@ -94,14 +97,14 @@ export async function captureProcessContext(pid, inheritedDescriptors) {
 	};
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @returns {ProcessExecutionContext} */
-export function routedProcessContext(context, route) {
+/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @returns {ProcessExecutionContext} */
+export function routedProcessContext(context, route, closeStdin = false) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
 		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) throw new Error("invalid probed execution context");
 	const descriptors = [
-		semantic.descriptors[0],
+		closeStdin ? { fd: 0, type: "closed", flags: 0, alias: 0 } : semantic.descriptors[0],
 		{ ...semantic.descriptors[route[0]], fd: 1, alias: 1 },
 		{ ...semantic.descriptors[route[1]], fd: 2, alias: route[0] === route[1] ? 1 : 2 },
 	];
@@ -113,7 +116,7 @@ export function routedProcessContext(context, route) {
 	return {
 		...context,
 		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
-		descriptorTypes: [context.descriptorTypes[0], context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
+		descriptorTypes: [closeStdin ? "closed" : context.descriptorTypes[0], context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
 	};
 }
 
@@ -125,7 +128,7 @@ export function validProcessContext(value) {
 		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
 		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
 		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
-		context.descriptorTypes[0] === "device" && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
+		["device", "closed"].includes(context.descriptorTypes[0]) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
 		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
 		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);

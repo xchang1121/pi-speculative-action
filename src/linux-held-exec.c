@@ -562,10 +562,10 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		puts("10");
+		puts("11");
 		return 0;
 	}
-	if (argc >= 2 && !strcmp(argv[1], "--exec")) {
+	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input"))) {
 		if (argc < 5 || strlen(argv[2]) != 2 || strspn(argv[2], "12") != 2) return 64;
 		/* Save stdout's source before changing either endpoint, including swapped routes. */
 		int output = fcntl(argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
@@ -573,6 +573,8 @@ int main(int argc, char **argv) {
 		int routed = dup2(argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
 		close(output);
 		if (!routed) return 70;
+		/* Close only at the native outlet: Node and the sandbox launcher may fill vacant stdio. */
+		if (!strcmp(argv[1], "--exec-closed-input") && close(0) < 0 && errno != EBADF) return 70;
 		/* Preserve the former libuv outlet's empty mask and default dispositions. */
 		sigset_t empty;
 		sigemptyset(&empty);
