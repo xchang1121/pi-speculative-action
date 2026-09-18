@@ -413,11 +413,16 @@ describe("speculative action resource versions", () => {
 
 	test.each([undefined, 1, 8192])("retains query evidence and bounded directory metadata independently (%s)", async metadataBytes => {
 		const root = await workspace({ value: "A", unused: "B" }), idle = vi.fn();
+		const alias = path.join(root, "alias"), data = path.join(root, "data");
+		await fs.mkdir(data); await fs.writeFile(path.join(data, "value"), "C");
+		await fs.symlink(data, alias, process.platform === "win32" ? "junction" : "dir");
 		const manager = new ResourceVersionManager(root, { watch: false, onIdle: idle });
 		const token = await manager.capture(undefined, 8192), view = token.view!;
+		const payload = await manager.capture([{ path: path.join(data, "value"), scope: "content" }], 8192);
 		let retained: ResourceVersionToken | undefined;
 		try {
 			await view.stat(root, "type");
+			await view.stat(alias, "type");
 			await view.readFile(path.join(root, "value"));
 			await view.exists(path.join(root, "missing"));
 			expect(() => manager.retain(token)).toThrow("resource_snapshot_not_sealed");
@@ -428,17 +433,62 @@ describe("speculative action resource versions", () => {
 				const opened = vi.spyOn(fs, "open"), stat = vi.spyOn(fs, "lstat");
 				try {
 					expect((await retained.view.evaluate(v => v.stat(root, "type"))).isDirectory()).toBe(true);
+					const observed = new Set<string>(), lookup = vi.fn((_target: string) => [{ view: payload.view!, observed: (keys: ReadonlySet<string> | undefined) => {
+						for (const key of keys ?? []) observed.add(key);
+					} }]);
+					for (const boundary of [root, alias]) expect((await retained.view.evaluate(v => v.readFile(path.join(alias, "value")), keys => {
+						for (const key of keys ?? []) observed.add(key);
+					}, boundary, lookup)).toString()).toBe("C");
+					expect(path.resolve(lookup.mock.calls[0]![0])).toBe(path.join(data, "value"));
+					expect([...observed].some(key => retained!.observations.get(key)?.path === alias)).toBe(true);
+					expect([...observed].some(key => payload.observations.get(key)?.path === path.join(data, "value"))).toBe(true);
 					await expect(retained.view.evaluate(v => v.readFile(path.join(root, "value")))).rejects.toThrow("resource_access_unproven");
 					expect(opened).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled();
 				} finally { opened.mockRestore(); stat.mockRestore(); }
 			}
 			await fs.writeFile(path.join(root, "unused"), "irrelevant");
 			expect((await manager.validate(retained)).expired).toBe(false);
+			await fs.unlink(alias); await fs.symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
+			expect((await manager.validate(retained)).expired).toBe(true);
+			await fs.unlink(alias); await fs.symlink(data, alias, process.platform === "win32" ? "junction" : "dir");
 			await fs.writeFile(path.join(root, "missing"), "present");
 			expect((await manager.validate(retained)).expired).toBe(true);
-			await retained.release(); await retained.release(); expect(idle).toHaveBeenCalledOnce();
+			await payload.release(); await retained.release(); await retained.release(); expect(idle).toHaveBeenCalledOnce();
 			expect(() => manager.retain(retained!)).toThrow("resource_version_owner_changed");
-		} finally { await retained?.release(); await token.release(); manager.close(); }
+		} finally { await payload.release(); await retained?.release(); await token.release(); manager.close(); }
+	});
+
+	test.each(["physical", "logical"])("composes alias metadata and %s bytes after the namespace source retires", async location => {
+		const root = await workspace({ unused: "A" }), data = path.join(root, "data"), alias = path.join(root, "alias");
+		await fs.mkdir(data); await fs.writeFile(path.join(data, "value.txt"), "first\nsecond\nthird\n");
+		await fs.symlink(data, alias, process.platform === "win32" ? "junction" : "dir");
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["ls", "read"], maxBytes: () => 65536 });
+		const request = (toolName: "ls" | "read", args: { path: string; offset?: number }) => {
+			const invocation = resolvePiToolInvocation(toolName, args, { cwd: root, environment: {} })!;
+			return { cwd: root, tool: toolName === "ls" ? createLsTool(root) : createReadTool(root), toolName, args,
+				action: PI_ACTION_SEMANTICS.buildKey(toolName, args, root, "", { fingerprint: toolName, context: invocation })!,
+				callID: toolName, signal: new AbortController().signal };
+		};
+		const execute = world.speculation!.execute, namespace = await execute(request("ls", { path: alias }));
+		const payload = await execute(request("read", { path: path.join(location === "physical" ? data : alias, "value.txt") }));
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
+		let composed: Awaited<ReturnType<typeof execute>> | undefined;
+		try {
+			const query = request("read", { path: path.join(alias, "value.txt") });
+			composed = await execute({ ...query, inputs: () => [namespace.inputSource!, payload.inputSource!] });
+			expect(captures).not.toHaveBeenCalled();
+			await namespace.dispose();
+			expect((await composed.validate!()).status).toBe("valid");
+			expect(composed.inputResources?.some(input => path.resolve(input.path) === query.args.path)).toBe(true);
+			const next = request("read", { path: path.join(alias, "value.txt"), offset: 2 });
+			const result = await composed.reconstruct!({ ...next, inputs: () => [payload.inputSource!] });
+			expect(result?.output.result).toEqual(await createReadTool(root).execute("reference", next.args));
+			expect((await result?.validate?.())?.status).toBe("valid"); expect(captures).not.toHaveBeenCalled();
+			await fs.unlink(alias); await fs.symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
+			expect((await composed.validate!()).status).toBe("stale");
+			expect((await result?.validate?.())?.status).toBe("stale");
+			await composed.dispose(); expect((await result?.validate?.())?.status).toBe("stale");
+		} finally { captures.mockRestore(); await composed?.dispose(); await payload.dispose(); await namespace.dispose(); }
 	});
 
 	test("fills only missing inputs within one evaluation without expanding sealed read authority", async () => {
