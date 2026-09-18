@@ -14,7 +14,7 @@ import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 14;
+const HELPER_PROTOCOL_VERSION = 15;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -44,7 +44,7 @@ export interface HeldExecProcess {
 }
 
 export interface HeldFileDescriptor {
-	readonly type?: "null";
+	readonly type?: "null" | "directory";
 	readonly fd: number;
 	readonly alias: number;
 	readonly device: string;
@@ -82,7 +82,7 @@ export type HeldExecDecision =
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
 			readonly descriptorOffsets?: readonly {
 				readonly fd: number; readonly device: string; readonly inode: string;
-				readonly flags: number; readonly before: number; readonly after: number; readonly afterFlags?: number;
+				readonly flags: number; readonly before: number; readonly after: number; readonly afterFlags?: number; readonly path?: string;
 				/** Replace inode contents through a separate writer; never disturb OFD flags or position. */
 				readonly content?: Buffer;
 			}[];
@@ -246,12 +246,13 @@ export class LinuxHeldExecBoundary {
 				return;
 			}
 			const positions = decision.descriptorOffsets?.map(position => ({ ...position, afterFlags: position.afterFlags ?? position.flags })) ?? [];
-			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0), 0);
+			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0);
 			const descriptors = new Set<number>();
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
 					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
-					return duplicate || position.content !== undefined && !Buffer.isBuffer(position.content) ||
+					return duplicate || position.path !== undefined && (typeof position.path !== "string" || !path.isAbsolute(position.path) || position.path.includes("\0") || Buffer.byteLength(position.path) >= 4096) ||
+						position.content !== undefined && !Buffer.isBuffer(position.content) ||
 						![position.fd, position.flags, position.before, position.after, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
@@ -260,7 +261,8 @@ export class LinuxHeldExecBoundary {
 			prepared = true;
 			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
 			for (const position of positions) {
-				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags}\n`));
+				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")}\n`));
+				if (position.path) await write(socket, Buffer.from(position.path));
 				if (position.content) await write(socket, position.content);
 			}
 			for (const event of decision.output) {
@@ -343,7 +345,7 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 	};
 }
 
-/** Capture one image per inode; null devices need no payload. Only a native lease authorizes adoption. */
+/** Capture one image per inode; directory anchors and null devices need no payload. Only a native lease authorizes adoption. */
 export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = []): Promise<readonly FileDescriptorInput[]> {
 	const inputs = new Map<number, FileDescriptorInput>();
 	const images = new Map<string, FileDescriptorInput>();
@@ -353,13 +355,22 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		const identity = { fd, alias: representative, flags, offset, ...(descriptor.type ? { type: descriptor.type } : {}) };
 		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
 		const file = `${descriptor.device}:${descriptor.inode}`, image = images.get(file);
+		if (image && descriptor.type === "directory" && fd === representative && await readlink(`/proc/${pid}/fd/${fd}`) !== image.sourcePath)
+			throw new Error("inherited directory namespace aliases are unproven");
 		if (image) { inputs.set(descriptor.fd, { ...identity, image: image.image, contentDigest: image.contentDigest,
 			...(image.sourcePath ? { sourcePath: image.sourcePath } : {}) }); continue; }
 		const endpoint = await readlink(`/proc/${pid}/fd/${fd}`);
 		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
 			throw new Error("inherited descriptor refers to a denied resource");
-		if (descriptor.type === "null") {
-			inputs.set(fd, { ...identity, image: fd, contentDigest: sha256Digest("") }); continue;
+		if (descriptor.type) {
+			if (descriptor.type === "directory") {
+				const metadata = await stat(endpoint, { bigint: true });
+				if (!metadata.isDirectory() || String(metadata.dev) !== descriptor.device || String(metadata.ino) !== descriptor.inode) throw new Error("held directory pathname changed");
+			}
+			const input = { ...identity, image: fd, contentDigest: sha256Digest(""), ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) };
+			inputs.set(fd, input);
+			if (descriptor.type === "directory") images.set(file, input);
+			continue;
 		}
 		const captured = await captureHeldFile(pid, descriptor.fd, remaining);
 		if (String(captured.stat.dev) !== descriptor.device || String(captured.stat.ino) !== descriptor.inode || !captured.content) {
@@ -405,7 +416,7 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (!descriptor || descriptor.type !== undefined && descriptor.type !== "null" || descriptor.type === "null" && descriptor.offset !== 0 ||
+		if (!descriptor || descriptor.type !== undefined && !["null", "directory"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
 			![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>

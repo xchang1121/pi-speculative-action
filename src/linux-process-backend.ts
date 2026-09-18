@@ -1105,6 +1105,7 @@ export class LinuxProcessReuseBackend {
 				...(descriptorInputs ? { descriptorOffsets: plan.certificate.result.descriptorOffsets?.map(({ content, ...position }) => {
 					const descriptor = process.descriptors!.find(({ fd }) => fd === position.fd)!;
 					return { ...position, device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags,
+						...(descriptor.type === "directory" ? { path: descriptorInputs.find(input => input.fd === position.fd)!.sourcePath! } : {}),
 						...(content ? { content: plan.artifacts.read(content) } : {}) };
 				}) } : {}),
 				commit: async () => {
@@ -1206,7 +1207,12 @@ export class LinuxProcessReuseBackend {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
 						const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
 						let state: import("node:fs").BigIntStats;
-						if (workspace) {
+						if (descriptor.type === "directory") {
+							if (!workspace) throw new Error("inherited directory is outside the workspace");
+							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
+							state = await lstat(physical, { bigint: true });
+							if (!state.isDirectory()) throw new Error("inherited directory predecessor changed");
+						} else if (workspace) {
 							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
 							const captured = await captureStableFile(physical, MAX_REQUEST_BYTES);
 							if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== 1n) throw new Error("inherited FD predecessor changed");
@@ -1337,10 +1343,10 @@ export class LinuxProcessReuseBackend {
 					if (input.type === "null" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
 					const current = await lstat(image.physical, { bigint: true });
-					if (!current.isFile() || String(current.dev) !== position.device || String(current.ino) !== position.inode || current.nlink !== 1n ||
+					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile() || current.nlink !== 1n) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
 						current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
 						throw new Error("inherited FD namespace changed during execution");
-					if (sameFilesystemIdentity(current, image.state)) continue;
+					if (input.type === "directory" || sameFilesystemIdentity(current, image.state)) continue;
 					const captured = await captureStableFile(image.physical, MAX_REQUEST_BYTES, true);
 					if (`sha256:${captured.hash}` !== input.contentDigest || current.mtimeNs !== image.state.mtimeNs) {
 						if (image.workspace) {

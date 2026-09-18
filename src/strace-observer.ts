@@ -333,7 +333,7 @@ export async function observeStrace(
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) taints.add("ipc");
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					!((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
-						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
+						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
 						options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "")))
 					taints.add("unsupported_syscall");
 			}
