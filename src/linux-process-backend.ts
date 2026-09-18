@@ -1543,7 +1543,7 @@ function bufferedProcessPrototype(
 }
 
 function parseDescriptorOffsets(report: string, inputs: readonly FileDescriptorInput[]): Array<{
-	fd: number; before: number; after: number; device: string; inode: string;
+	fd: number; before: number; after: number; device: string; inode: string; afterFlags?: number;
 	content?: import("./provenance-certificate.ts").ArtifactReference;
 }> {
 	const [header, ...lines] = report.trimEnd().split("\n");
@@ -1551,8 +1551,9 @@ function parseDescriptorOffsets(report: string, inputs: readonly FileDescriptorI
 	return lines.map((line, index) => {
 		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(line)) throw new Error("invalid inherited OFD result");
 		const fields = line.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number), input = inputs[index]!;
-		if (fd !== input.fd || flags !== input.flags || !Number.isSafeInteger(after)) throw new Error("inherited OFD flags changed");
-		return { fd, before: input.offset, after: after!, device: fields[3]!, inode: fields[4]! };
+		if (fd !== input.fd || !Number.isSafeInteger(flags) || flags! > 0x7fffffff ||
+			((flags! ^ input.flags) & ~0xc00 /* O_APPEND | O_NONBLOCK */) || !Number.isSafeInteger(after)) throw new Error("inherited OFD flags changed");
+		return { fd, before: input.offset, after: after!, ...(flags !== input.flags ? { afterFlags: flags! } : {}), device: fields[3]!, inode: fields[4]! };
 	});
 }
 

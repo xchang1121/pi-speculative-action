@@ -309,7 +309,7 @@ describe("process provenance certificates", () => {
 		const input = processPrototype({ inheritedFDs: [3, 4, 8].map(fd => ({ fd, type, alias: fd === 4 ? 3 : fd,
 			offset: before, contentDigest: sha256Digest(type === "null" ? "" : "before"), flagsDigest: sha256Digest(`flags:${fd}`) })) });
 		const content = { digest: sha256Digest("after"), size: 5 };
-		const positions = [3, 4, 8].map(fd => ({ fd, before, after: type === "null" ? 0 : fd === 8 ? 2 : 4, ...(fd === 3 && type === "regular" ? { content } : {}) }));
+		const positions = [3, 4, 8].map(fd => ({ fd, before, afterFlags: fd === 8 ? 32768 : 35840, after: type === "null" ? 0 : fd === 8 ? 2 : 4, ...(fd === 3 && type === "regular" ? { content } : {}) }));
 		const seal = (descriptorOffsets: typeof positions | undefined) => processCertificate(input, { result: {
 			replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 }, descriptorOffsets,
 		} });
@@ -318,7 +318,9 @@ describe("process provenance certificates", () => {
 		expect(referencedArtifacts(certificate)).toEqual(type === "null" ? [] : [content]);
 		for (const malformed of [undefined, positions.slice(1), [...positions, positions[0]!],
 			positions.map(position => ({ ...position, before: before + 1 })), positions.map(position => ({ ...position, after: -1 })),
-			positions.map(position => position.fd === 4 ? { ...position, after: 5 } : position)]) expect(() => seal(malformed)).toThrow(/OFD/);
+			positions.map(position => position.fd === 4 ? { ...position, after: 5 } : position),
+			positions.map(position => position.fd === 4 ? { ...position, afterFlags: 32768 } : position),
+			...[NaN, -1, 0x80000000, 1.5].map(afterFlags => positions.map(position => ({ ...position, afterFlags })))]) expect(() => seal(malformed)).toThrow(/OFD/);
 		if (type === "null") expect(() => seal(positions.map(position => ({ ...position, content })))).toThrow(/OFD/);
 		positions[0]!.after = 99;
 		expect(certificate.result.descriptorOffsets![0]!.after).toBe(type === "null" ? 0 : 4);
