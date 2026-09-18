@@ -1182,6 +1182,7 @@ export class LinuxProcessReuseBackend {
 		const transaction = await session.workspace.transactions.begin();
 		let traceRoot: string | undefined;
 		let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
+		const inheritedFiles: Awaited<ReturnType<typeof open>>[] = [];
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
@@ -1224,6 +1225,8 @@ export class LinuxProcessReuseBackend {
 						descriptorImages.set(descriptor.image, { physical, logical: workspace ? descriptor.sourcePath! : physical, workspace, state });
 					}
 					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
+					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
+						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
 					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)}\n${image}\n`;
 				}
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
@@ -1263,6 +1266,7 @@ export class LinuxProcessReuseBackend {
 					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false }],
 					[],
 				),
+				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
 				"--",
 				ready.dispatcher,
 				descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
@@ -1277,6 +1281,7 @@ export class LinuxProcessReuseBackend {
 				cwd: request.cwd,
 				environment: request.environment,
 				signal: session.signal,
+				inheritedFiles: inheritedFiles.map(file => file.fd),
 			});
 			const observedProcessMs = Math.max(0, performance.now() - processStarted);
 			releaseInputs();
@@ -1413,7 +1418,7 @@ export class LinuxProcessReuseBackend {
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
-			try { await descriptorReport?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
+			try { await Promise.all([descriptorReport?.close(), ...inheritedFiles.map(file => file.close())]); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
 			releaseInputs?.();
 			await inputCheck;
 			const durationMs = Math.max(0, performance.now() - started);
@@ -2212,6 +2217,7 @@ async function runSpawn(
 		readonly timeoutSeconds?: number;
 		readonly onOutput?: (event: BufferedOutput) => void;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
+		readonly inheritedFiles?: readonly number[];
 	},
 ): Promise<SpawnOutcome> {
 	throwIfAborted(options.signal);
@@ -2223,7 +2229,7 @@ async function runSpawn(
 			cwd: options.cwd,
 			env: options.environment,
 			detached: true,
-			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const)],
+			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const), ...(options.inheritedFiles ?? [])],
 		});
 		const output: BufferedOutput[] = [];
 		child.once("spawn", () => channels?.releaseWriters());

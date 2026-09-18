@@ -106,12 +106,12 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
-		const launcher = mode === "native-shared-table" || mode === "native-unshare";
+		const opath = mode.includes("opath"), launcher = mode === "native-shared-table" || mode === "native-unshare" || opath;
 		const nullDevice = mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
 		const directory = mode.includes("directory");
 		const descriptors = mode === "native-descriptors" || launcher || nullDevice || directory;
@@ -123,7 +123,8 @@ int main(void) {
 			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 			if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <errno.h>
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,7 @@ int main(int argc, char **argv) {
 	${mode === "native-status" ? 'if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK) || fcntl(6, F_SETFL, fcntl(6, F_GETFL) | O_APPEND | O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK)) return 77;' : ""}
 	${mode === "native-null-stdin" ? 'if (read(0, &byte, 1) != 0) return 76;' : ""}
 	${directory ? 'if (fchdir(10) || fcntl(10, F_GETFL) != fcntl(11, F_GETFL)) return 78;' : ""}
+	${opath ? 'char probe; if (fcntl(12, F_GETFL) != O_PATH || read(12, &probe, 1) != -1 || errno != EBADF) return 79;' : ""}
 	char text[32]; int fd = ${directory ? 'openat(11, "input.txt", O_RDONLY)' : 'open("input.txt", O_RDONLY)'}; ssize_t size = read(fd, text, sizeof(text));
 	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
@@ -148,6 +150,7 @@ int main(int argc, char **argv) {
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
 			if (launcher) {
 				await writeFile(path.join(fixture.workspace, "fd-launch.c"), `#define _GNU_SOURCE
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -157,6 +160,7 @@ int main(int argc, char **argv) {
 	if (argc != 2) return 74;
 	pthread_t worker; if (pthread_create(&worker, 0, duplicate, 0) || pthread_join(worker, 0)) return 75;
 	${mode === "native-unshare" ? "if (unshare(CLONE_FILES)) return 77;" : ""}
+	${opath ? 'int directory = open(".", O_PATH | O_DIRECTORY), file = open("fd.txt", O_PATH);\n\tif (directory < 0 || file < 0 || dup2(directory, 10) < 0 || dup2(directory, 11) < 0 || dup2(file, 12) < 0) return 79;\n\tclose(directory); if (file != 12) close(file);' : ""}
 	puts(argv[1]); fflush(stdout);
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
@@ -325,9 +329,9 @@ int main(int argc, char **argv) {
 			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
 				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBe(stalePreparation ? 1 : 2);
 			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
-			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || event.settlement.observation === "observed")).toMatchObject([{ settlement: stalePreparation ? { observation: "unobserved" } : {
+			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed")).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
-			} }]);
+			} })));
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command, changedParent]);
 			expect(JSON.stringify(events.filter(event => event.type === "candidate" && event.candidate.kind === "operation"))).not.toContain("private value");
 			await fixture.backend.storage.maintain("clear");
@@ -579,6 +583,11 @@ static int split_exec(void *argument) {
 static void *blocked_open(void *file) { int fd = open(file, O_RDONLY); if (fd < 0) _exit(79); close(fd); return 0; }
 int main(int argc, char **argv) {
 	if (argc != 3) return 70;
+	if (!strcmp(argv[1], "opath")) {
+		int fd = open(argv[2], O_PATH); if (fd < 0 || dup2(fd, 3) < 0 || dup2(fd, 4) < 0 || dup2(fd, 5) < 0) return 92;
+		if (fd > 5) close(fd);
+		char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
+	}
 	if (!strcmp(argv[1], "status")) {
 		if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_APPEND | O_NONBLOCK)) return 89;
 		char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
@@ -665,11 +674,11 @@ int main(int argc, char **argv) {
 				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { pipeOutput += data.toString(); } })).toEqual({ exitCode: 0 });
 			expect(pipeOutput).toBe("1048576\nb");
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",
-				"null", "null-offset", "null-content", "zero", "status-set", "status-clear", "status-conflict", "status-unsupported", "directory", "directory-offset", "directory-content", "directory-replaced", "directory-no-path", "directory-symlink"]) {
+				"null", "null-offset", "null-content", "zero", "status-set", "status-clear", "status-conflict", "status-unsupported", "directory", "directory-offset", "directory-content", "directory-replaced", "directory-no-path", "opath", "opath-offset", "opath-content", "opath-flags", "directory-opath", "directory-symlink"]) {
 				await writeFile(input, "abcdef");
-				const directory = mode.startsWith("directory"), device = directory || mode.startsWith("null") || mode === "zero";
-				const target = directory ? directoryInput : device ? mode === "zero" ? "/dev/zero" : "/dev/null" : input;
-				const accepted = mode === "shared" || mode === "unlinked" || mode === "null" || mode === "status-set" || mode === "status-clear" || mode === "directory";
+				const directory = mode.startsWith("directory"), opath = mode.includes("opath"), device = directory || opath || mode.startsWith("null") || mode === "zero";
+				const target = directory ? directoryInput : opath ? input : device ? mode === "zero" ? "/dev/zero" : "/dev/null" : input;
+				const accepted = mode === "shared" || mode === "unlinked" || mode === "null" || mode === "status-set" || mode === "status-clear" || mode === "directory" || mode === "opath" || mode === "directory-opath";
 				let output = "", heldPid = 0;
 				const commit = vi.fn(async () => {
 					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
@@ -685,7 +694,7 @@ int main(int argc, char **argv) {
 							flags: Number.parseInt(/^flags:\s*([0-7]+)/m.exec(text)![1]!, 8), before: 0, after: device ? 0 : fd === 5 ? 1 : 3,
 							...(mode.startsWith("status-") && fd !== 5 ? { afterFlags: 32768 | (mode === "status-clear" ? 0 : mode === "status-unsupported" ? 0x2000 : mode === "status-conflict" && fd === 4 ? 0 : 0xc00) } : {}),
 							...(directory && mode !== "directory-no-path" ? { path: directoryInput } : {}),
-							...((mode === "null-content" || mode === "directory-content") && fd === 3 ? { content: Buffer.from("x") } : {}) };
+							...((mode === "null-content" || mode === "directory-content" || mode === "opath-content") && fd === 3 ? { content: Buffer.from("x") } : {}) };
 					}));
 					const first = descriptorOffsets[0]!;
 					if (mode === "unlinked") await rm(input);
@@ -695,13 +704,14 @@ int main(int argc, char **argv) {
 					if (mode === "closed") descriptorOffsets[1]!.fd = 1000;
 					if (mode === "alias-conflict") descriptorOffsets[1]!.after = 4;
 					if (mode === "invalid") first.after = -1;
-					if (mode === "null-offset" || mode === "directory-offset") first.after = 1;
+					if (mode === "null-offset" || mode === "directory-offset" || mode === "opath-offset") first.after = 1;
+					if (mode === "opath-flags") first.afterFlags = first.flags ^ 0x800;
 					if (mode === "directory-replaced") { await filesystem.rename(directoryInput, `${directoryInput}-old`); await mkdir(directoryInput); }
 					if (mode === "directory-symlink") { await filesystem.rename(directoryInput, `${directoryInput}-target`); await filesystem.symlink(`${directoryInput}-target`, directoryInput); }
 					return { kind: "replay", descriptorOffsets, exitCode: 0,
 						output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted };
 				} });
-				const running = executor.execute({ command: `exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
+				const running = executor.execute({ command: `exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
 					(mode.startsWith("status-") ? `for fd in 3 4 5; do while read -r key value; do if [[ $key == flags: ]]; then (( (8#$value & 3072) == (${mode === "status-set" ? 3072 : 0} * (fd != 5)) )) || exit 90; fi; done </proc/self/fdinfo/$fd; done; ` : "") +
 					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`),
 					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });

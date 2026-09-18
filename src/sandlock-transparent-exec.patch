@@ -1,8 +1,8 @@
 diff --git a/crates/sandlock-cli/src/main.rs b/crates/sandlock-cli/src/main.rs
-index 96309ec..1925e1c 100644
+index 96309ec..cd4394c 100644
 --- a/crates/sandlock-cli/src/main.rs
 +++ b/crates/sandlock-cli/src/main.rs
-@@ -98,6 +98,10 @@ struct RunArgs {
+@@ -98,6 +98,14 @@ struct RunArgs {
      #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST[:ro]")]
      fs_mount: Vec<String>,
  
@@ -10,10 +10,14 @@ index 96309ec..1925e1c 100644
 +    #[arg(long = "exec-mount", value_name = "VIRTUAL:HOST")]
 +    exec_mount: Vec<String>,
 +
++    /// Retain explicitly supplied descriptors through the existing child FD table.
++    #[arg(long = "preserve-fd", value_parser = clap::value_parser!(i32).range(3..))]
++    preserve_fd: Vec<i32>,
++
      /// COW branch action on normal sandbox exit: commit | abort | keep
      /// (default: commit).
      #[arg(long = "on-exit", value_name = "ACTION")]
-@@ -644,6 +648,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -644,6 +652,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
              builder.fs_mount(virt, host)
          };
      }
@@ -27,6 +31,12 @@ index 96309ec..1925e1c 100644
      if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
      match &args.gpu {
          // `all` maps to an empty device list, which the core expands to every
+@@ -745,3 +760,5 @@ async fn run_command(args: RunArgs) -> Result<i32> {
++    if !args.preserve_fd.is_empty() { policy.preserve_fds(&args.preserve_fd)?; }
++
+     let result = if args.dry_run {
+         if policy.workdir.is_none() {
+             return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
 index 6e4ab93..23e21ac 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
@@ -263,7 +273,7 @@ index 398d45a..56daf44 100644
              virtual_hostname: None,
              has_http_acl: false,
 diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
-index 8d06d60..a9fb7b0 100644
+index 8d06d60..7dbc1f8 100644
 --- a/crates/sandlock-core/src/sandbox.rs
 +++ b/crates/sandlock-core/src/sandbox.rs
 @@ -179,6 +179,7 @@ impl TryFrom<&Sandbox> for Confinement {
@@ -291,7 +301,18 @@ index 8d06d60..a9fb7b0 100644
              chroot: self.chroot.clone(),
              in_child_main: self.in_child_main,
              clean_env: self.clean_env,
-@@ -2136,6 +2140,7 @@ impl Sandbox {
+@@ -1203,3 +1207,10 @@ impl Sandbox {
++    /// Preserve caller-owned descriptors using the existing child FD table.
++    pub fn preserve_fds(&mut self, fds: &[i32]) -> Result<(), crate::error::SandlockError> {
++        self.ensure_runtime()?;
++        self.rt_mut().extra_fds = fds.iter().map(|&fd| (fd, fd)).collect();
++        Ok(())
++    }
++
+     /// Like `create_with_io` but also maps extra fds into the child.
+     #[doc(hidden)]
+     pub async fn create_with_gather_io(
+@@ -2136,6 +2147,7 @@ impl Sandbox {
                  chroot_denied: self.fs_denied.clone(),
                  chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
                  chroot_mount_ro: self.fs_mount_ro.clone(),
