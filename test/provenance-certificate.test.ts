@@ -304,22 +304,24 @@ describe("process provenance certificates", () => {
 			after: { ...state, mode: 0o400 }, operation: "write_contents" }])).toThrow("in-place");
 	});
 
-	it("seals complete OFD transitions and includes private inode contents in the artifact closure", () => {
-		const input = processPrototype({ inheritedFDs: [3, 4, 8].map(fd => ({ fd, type: "regular", alias: fd === 4 ? 3 : fd,
-			offset: 1, contentDigest: sha256Digest("before"), flagsDigest: sha256Digest(`flags:${fd}`) })) });
+	it.each(["regular", "null"] as const)("seals complete OFD transitions and their artifact closure (%s)", type => {
+		const before = type === "null" ? 0 : 1;
+		const input = processPrototype({ inheritedFDs: [3, 4, 8].map(fd => ({ fd, type, alias: fd === 4 ? 3 : fd,
+			offset: before, contentDigest: sha256Digest(type === "null" ? "" : "before"), flagsDigest: sha256Digest(`flags:${fd}`) })) });
 		const content = { digest: sha256Digest("after"), size: 5 };
-		const positions = [3, 4, 8].map(fd => ({ fd, before: 1, after: fd === 8 ? 2 : 4, ...(fd === 3 ? { content } : {}) }));
+		const positions = [3, 4, 8].map(fd => ({ fd, before, after: type === "null" ? 0 : fd === 8 ? 2 : 4, ...(fd === 3 && type === "regular" ? { content } : {}) }));
 		const seal = (descriptorOffsets: typeof positions | undefined) => processCertificate(input, { result: {
 			replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 }, descriptorOffsets,
 		} });
 		const certificate = seal(positions);
 		expect(parseProcessCertificate(certificate)).toEqual(certificate);
-		expect(referencedArtifacts(certificate)).toEqual([content]);
+		expect(referencedArtifacts(certificate)).toEqual(type === "null" ? [] : [content]);
 		for (const malformed of [undefined, positions.slice(1), [...positions, positions[0]!],
-			positions.map(position => ({ ...position, before: 0 })), positions.map(position => ({ ...position, after: -1 })),
+			positions.map(position => ({ ...position, before: before + 1 })), positions.map(position => ({ ...position, after: -1 })),
 			positions.map(position => position.fd === 4 ? { ...position, after: 5 } : position)]) expect(() => seal(malformed)).toThrow(/OFD/);
+		if (type === "null") expect(() => seal(positions.map(position => ({ ...position, content })))).toThrow(/OFD/);
 		positions[0]!.after = 99;
-		expect(certificate.result.descriptorOffsets![0]!.after).toBe(4);
+		expect(certificate.result.descriptorOffsets![0]!.after).toBe(type === "null" ? 0 : 4);
 		expect(() => processWeakKey({ ...input, inheritedFDs: input.inheritedFDs.map(fd => ({ ...fd, alias: 9 })) })).toThrow(/alias/);
 	});
 });

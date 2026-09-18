@@ -106,13 +106,14 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
 		const launcher = mode === "native-shared-table" || mode === "native-unshare";
-		const descriptors = mode === "native-descriptors" || launcher;
+		const nullDevice = mode === "native-null" || mode === "native-null-stdin";
+		const descriptors = mode === "native-descriptors" || launcher || nullDevice;
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
@@ -133,6 +134,8 @@ int main(int argc, char **argv) {
 	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
 	${descriptors ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
 	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != O_RDONLY) return 74; close(alias);' : ""}
+	${nullDevice ? 'char byte; if (write(6, "discard", 7) != 7 || read(7, &byte, 1) != 0 || lseek(6, 100, SEEK_SET) != 0 || fcntl(6, F_GETFL) != fcntl(7, F_GETFL)) return 75;' : ""}
+	${mode === "native-null-stdin" ? 'if (read(0, &byte, 1) != 0) return 76;' : ""}
 	char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t size = read(fd, text, sizeof(text));
 	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
@@ -161,6 +164,7 @@ int main(int argc, char **argv) {
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
 			const command = (descriptors ? "exec 3<fd.txt; exec 4<&3; exec 8<fd.txt; IFS= read -r -N 1 discarded <&3; " : "") +
+				(nullDevice ? (mode === "native-null-stdin" ? "exec 0<>/dev/null; exec 6<&0; " : "exec 6<>/dev/null; ") + "exec 7<&6; " : "") +
 				"export BOUND_SECRET='private value'; " + (launcher ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
 				(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 			const route = await fixture.backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
@@ -651,9 +655,11 @@ int main(int argc, char **argv) {
 			expect(await piped.execute({ command: `exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`,
 				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { pipeOutput += data.toString(); } })).toEqual({ exitCode: 0 });
 			expect(pipeOutput).toBe("1048576\nb");
-			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure"]) {
+			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",
+				"null", "null-offset", "null-content", "zero"]) {
 				await writeFile(input, "abcdef");
-				const accepted = mode === "shared" || mode === "unlinked";
+				const device = mode.startsWith("null") || mode === "zero", target = device ? mode === "zero" ? "/dev/zero" : "/dev/null" : input;
+				const accepted = mode === "shared" || mode === "unlinked" || mode === "null";
 				let output = "", heldPid = 0;
 				const commit = vi.fn(async () => {
 					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
@@ -665,7 +671,8 @@ int main(int argc, char **argv) {
 						const info = await filesystem.stat(`/proc/${pid}/fd/${fd}`, { bigint: true });
 						const text = await readFile(`/proc/${pid}/fdinfo/${fd}`, "utf8");
 						return { fd, device: info.dev.toString(), inode: info.ino.toString(),
-							flags: Number.parseInt(/^flags:\s*([0-7]+)/m.exec(text)![1]!, 8), before: 0, after: fd === 5 ? 1 : 3 };
+							flags: Number.parseInt(/^flags:\s*([0-7]+)/m.exec(text)![1]!, 8), before: 0, after: device ? 0 : fd === 5 ? 1 : 3,
+							...(mode === "null-content" && fd === 3 ? { content: Buffer.from("x") } : {}) };
 					}));
 					const first = descriptorOffsets[0]!;
 					if (mode === "unlinked") await rm(input);
@@ -675,17 +682,18 @@ int main(int argc, char **argv) {
 					if (mode === "closed") descriptorOffsets[1]!.fd = 1000;
 					if (mode === "alias-conflict") descriptorOffsets[1]!.after = 4;
 					if (mode === "invalid") first.after = -1;
+					if (mode === "null-offset") first.after = 1;
 					return { kind: "replay", descriptorOffsets, exitCode: 0,
 						output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted };
 				} });
-				const running = executor.execute({ command: `exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; /bin/true; ` +
-					`IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`,
+				const running = executor.execute({ command: `exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; /bin/true; ` +
+					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`),
 					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
 				if (mode === "commit-failure") {
 					await expect(running).rejects.toMatchObject({ disposition: "poisoned" }); expect(output).toBe("");
 				} else {
 					expect(await running).toEqual({ exitCode: 0 });
-					expect(output, mode).toBe(accepted ? "replayed:d:b:e" : "a:a:b");
+					expect(output, mode).toBe(device ? (accepted ? "replayed:native" : "native") : accepted ? "replayed:d:b:e" : "a:a:b");
 				}
 				expect(commit).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
 				expect(adopted).toHaveBeenCalledTimes(Number(accepted));

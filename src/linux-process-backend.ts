@@ -1202,7 +1202,7 @@ export class LinuxProcessReuseBackend {
 				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
 				let manifest = `FD1 ${request.descriptorInputs.length} ${Number(!!request.closeStdin)}\n`;
 				for (const descriptor of request.descriptorInputs) {
-					if (descriptor.fd === descriptor.image) {
+					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
 						const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
 						let state: import("node:fs").BigIntStats;
@@ -1217,7 +1217,7 @@ export class LinuxProcessReuseBackend {
 						}
 						descriptorImages.set(descriptor.image, { physical, logical: workspace ? descriptor.sourcePath! : physical, workspace, state });
 					}
-					const image = descriptor.fd === descriptor.alias ? descriptorImages.get(descriptor.image)!.logical : "";
+					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
 					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)}\n${image}\n`;
 				}
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
@@ -1280,7 +1280,8 @@ export class LinuxProcessReuseBackend {
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
-						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical]),
+						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
+							.concat(request.descriptorInputs?.some(input => input.type === "null") ? ["/dev/null"] : []),
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
@@ -1333,7 +1334,7 @@ export class LinuxProcessReuseBackend {
 				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), request.descriptorInputs!) : undefined;
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
 					const input = request.descriptorInputs!.find(({ fd }) => fd === position.fd)!;
-					if (input.fd !== input.image) continue;
+					if (input.type === "null" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
 					const current = await lstat(image.physical, { bigint: true });
 					if (!current.isFile() || String(current.dev) !== position.device || String(current.ino) !== position.inode || current.nlink !== 1n ||
@@ -1534,7 +1535,7 @@ function bufferedProcessPrototype(
 		})), ...(snapshot.descriptorInputs ?? []).filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
 			const input = snapshot.descriptorInputs?.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, alias: input.alias, contentDigest: input.contentDigest, offset: input.offset,
+			return input ? { ...descriptor, type: input.type ?? descriptor.type, alias: input.alias, contentDigest: input.contentDigest, offset: input.offset,
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}) } : descriptor;
 		}),
 		platformFingerprint,

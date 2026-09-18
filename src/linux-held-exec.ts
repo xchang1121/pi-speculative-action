@@ -10,11 +10,11 @@ import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
 import { captureHeldFile } from "./filesystem-evidence.ts";
-import type { Sha256Digest } from "./provenance-certificate.ts";
+import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 12;
+const HELPER_PROTOCOL_VERSION = 13;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -44,6 +44,7 @@ export interface HeldExecProcess {
 }
 
 export interface HeldFileDescriptor {
+	readonly type?: "null";
 	readonly fd: number;
 	readonly alias: number;
 	readonly device: string;
@@ -53,7 +54,7 @@ export interface HeldFileDescriptor {
 	readonly owned: boolean;
 }
 
-export interface FileDescriptorInput extends Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset"> {
+export interface FileDescriptorInput extends Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> {
 	readonly contentDigest: Sha256Digest;
 	/** One image per inode; distinct OFDs open it independently. */
 	readonly image: number;
@@ -342,14 +343,14 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 	};
 }
 
-/** Capture one image per OFD. This is input evidence; only a native lease can authorize adoption. */
+/** Capture one image per inode; null devices need no payload. Only a native lease authorizes adoption. */
 export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = []): Promise<readonly FileDescriptorInput[]> {
 	const inputs = new Map<number, FileDescriptorInput>();
 	const images = new Map<string, FileDescriptorInput>();
 	let remaining = maxBytes;
 	for (const descriptor of descriptors) {
 		const { fd, alias: representative, flags, offset } = descriptor;
-		const identity = { fd, alias: representative, flags, offset };
+		const identity = { fd, alias: representative, flags, offset, ...(descriptor.type ? { type: descriptor.type } : {}) };
 		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
 		const file = `${descriptor.device}:${descriptor.inode}`, image = images.get(file);
 		if (image) { inputs.set(descriptor.fd, { ...identity, image: image.image, contentDigest: image.contentDigest,
@@ -357,6 +358,9 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		const endpoint = await readlink(`/proc/${pid}/fd/${fd}`);
 		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
 			throw new Error("inherited descriptor refers to a denied resource");
+		if (descriptor.type === "null") {
+			inputs.set(fd, { ...identity, image: fd, contentDigest: sha256Digest("") }); continue;
+		}
 		const captured = await captureHeldFile(pid, descriptor.fd, remaining);
 		if (String(captured.stat.dev) !== descriptor.device || String(captured.stat.ino) !== descriptor.inode || !captured.content) {
 			throw new Error("held descriptor identity changed");
@@ -401,13 +405,14 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (!descriptor || ![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
+		if (!descriptor || descriptor.type !== undefined && descriptor.type !== "null" || descriptor.type === "null" && descriptor.offset !== 0 ||
+			![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>
 				typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn)) return false;
 		const alias = aliases.get(descriptor.alias);
 		if (descriptor.alias !== descriptor.fd && (!alias || alias.device !== descriptor.device || alias.inode !== descriptor.inode ||
-			alias.flags !== descriptor.flags || alias.offset !== descriptor.offset || alias.owned !== descriptor.owned)) return false;
+			alias.type !== descriptor.type || alias.flags !== descriptor.flags || alias.offset !== descriptor.offset || alias.owned !== descriptor.owned)) return false;
 		if (descriptor.alias === descriptor.fd) aliases.set(descriptor.fd, descriptor);
 		previous = descriptor.fd;
 	}
