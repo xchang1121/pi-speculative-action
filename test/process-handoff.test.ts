@@ -112,12 +112,12 @@ describe("ProcessHandoffRegistry", () => {
 			const sibling = registry.observe(digest("sibling"), "/usr/bin/sibling", SCOPE, invocation, 20)!;
 			let current = registry.observe(digest("repeated"), "/usr/bin/tool", SCOPE, invocation, 10)!;
 			const admitted = registry.resolveBinding(current, SCOPE);
-			for (let turn = 0; turn < 4; turn++) {
+			for (const [turn, executionMs] of [30, 1, 0, 33].entries()) {
 				const previous = current;
 				current = registry.observe(current.key, "/usr/bin/tool", { ...SCOPE, turnID: String(turn) },
-					{ environment: { TOKEN: "secret" }, argv: ["private"] }, 30 + turn)!;
+					{ environment: { TOKEN: "secret" }, argv: ["private"] }, executionMs)!;
 				expect(current).toBe(previous);
-				expect(current).toMatchObject({ available: true, executionMs: 10, scope: SCOPE });
+				expect(current).toMatchObject({ available: true, executionMs, scope: SCOPE });
 				expect(registry.bindings(SCOPE)).toEqual([sibling, current]);
 				expect(registry.resolveBinding(previous, SCOPE)).toEqual(invocation);
 			}

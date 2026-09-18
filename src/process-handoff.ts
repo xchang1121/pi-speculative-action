@@ -56,6 +56,7 @@ export interface ProcessHandoff {
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
 export interface ProcessExecutionBinding {
 	readonly key: Sha256Digest;
+	/** Latest completed native observation, or the owned result's execution time. */
 	readonly executionMs: number;
 	readonly scope: ExecutionScope;
 	readonly available: boolean;
@@ -99,7 +100,7 @@ type AcquireOptions<Plan> = {
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
-	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number }>();
+	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
 	private maxCompleted: number;
 	private maxBindingBytes: number;
 	private bindingBytes = 0;
@@ -148,13 +149,15 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			if (previous !== record && previous.state.status === "retained" && !previous.state.candidate &&
 				previous.scope?.sessionID === record.scope.sessionID && previous.executablePath === record.executablePath &&
 				previous.binding && stableEqual(this.invocations.get(previous.binding)?.value, value)) {
+				this.invocations.get(previous.binding)!.executionMs = executionMs;
 				this.remove(record); return previous.binding;
 			}
 		}
 		const owner = new WeakRef(this.invocations);
-		const binding = Object.freeze({ key, executionMs, scope: record.scope,
+		const binding = Object.freeze({ key, scope: record.scope,
+			get executionMs(): number { return owner.deref()?.get(this)?.executionMs ?? 0; },
 			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
-		this.invocations.set(binding, { value, bytes });
+		this.invocations.set(binding, { value, bytes, executionMs });
 		record.binding = binding;
 		this.bindingBytes += bytes;
 		this.trim();

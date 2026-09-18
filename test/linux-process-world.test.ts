@@ -17,13 +17,13 @@ import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
-import { ProcessHandoffOwnership, type ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { sha256Digest } from "../src/provenance-certificate.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
-import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
+import { emptyWorldReuseMetrics, type ExecutionOperationBinding } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
@@ -227,14 +227,17 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(native ? 0 : 1);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
+			let retainedOperation: ExecutionOperationBinding | undefined;
 			if (mode === "native") for (const turnID of ["repeated-native-1", "repeated-native-2"]) {
 				const repeatedScope = { ...scope, turnID }; let output = "";
-				let learned: readonly ProcessExecutionBinding[] = [];
-				await fixture.backend.observeBindings(repeatedScope, () => route.executor.execute({
+				const previousMs = binding!.executionMs;
+				const action = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding")!;
+				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({
 					command: command.replace("parent", turnID), cwd: fixture.workspace, environment: fixture.environment,
 					scope: repeatedScope, onData: data => { output += data.toString(); },
-				}), bindings => { learned = bindings; }, true);
-				expect(learned).toContain(binding);
+				}), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
+				expect(binding!.executionMs).not.toBe(previousMs);
+				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, expectedDurationMs: binding!.executionMs });
 				expect(output).toBe(`${turnID}\nafter\n`);
 				expect(fixture.backend.executionBindings(later).filter(item => item.key === binding!.key)).toEqual([binding]);
 			}
@@ -1044,11 +1047,13 @@ int main(void) {
 		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
 		let payload = "", ownedAtClose = false;
 		const ownership = new ProcessHandoffOwnership();
+		const registry = new ProcessHandoffRegistry<null>(1, 16), scope = { sessionID: "cost", turnID: "first" };
+		const binding = registry.observe(sha256Digest("cost"), "/worker", scope, null, 10)!;
 		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
 			ownership,
 			executeBinding: async () => { throw new Error("unexpected process binding"); },
-			executionBindings: () => [],
+			executionBindings: () => [binding],
 			computationDependencies: () => [],
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
@@ -1064,6 +1069,11 @@ int main(void) {
 				tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal });
 			try {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]);
+				const operation = branch.operations![0]!, preparedMs = operation.expectedDurationMs;
+				expect(operation.executionMs).toBe(10);
+				expect(registry.observe(binding.key, "/worker", scope, null, 30)).toBe(binding);
+				expect(operation.executionMs).toBe(30);
+				expect(operation.expectedDurationMs).toBeCloseTo(preparedMs + 20);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				expect(branch.commitMetrics).toBeDefined();
@@ -1075,6 +1085,7 @@ int main(void) {
 			expect(ownedAtClose).toBe(true);
 		} finally {
 			await world.dispose?.();
+			registry.dispose();
 			await rm(root, { recursive: true, force: true });
 		}
 	});
