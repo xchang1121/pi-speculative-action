@@ -36,12 +36,16 @@ export function createLinuxProcessExecutionWorld(
 	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary };
 	const roots = new Set<string>();
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
-	const operationCosts = new WeakMap<ProcessExecutionBinding, number>();
+	const operationOverheads = new WeakMap<ProcessExecutionBinding, number>();
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
-		const expectedDurationMs = operationCosts.get(binding) ?? binding.executionMs;
 		const reference = new WeakRef(binding);
+		const overheads = new WeakRef(operationOverheads);
 		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash,
-			executionMs: binding.executionMs, expectedDurationMs,
+			get executionMs() { return reference.deref()?.executionMs ?? 0; },
+			get expectedDurationMs() {
+				const current = reference.deref();
+				return current ? (overheads.deref()?.get(current) ?? 0) + current.executionMs : 0;
+			},
 			get available() { return reference.deref()?.available ?? false; } });
 		operations.set(descriptor, { binding: reference, permissionKey: permission.key });
 		return descriptor;
@@ -194,8 +198,7 @@ export function createLinuxProcessExecutionWorld(
 				Object.assign(branch, {
 					computationDependencies: session.computationDependencies(),
 					operations: Object.freeze(session.executionBindings().map(binding => {
-						const executionMs = binding.executionMs;
-						operationCosts.set(binding, overheadMs + executionMs);
+						operationOverheads.set(binding, overheadMs);
 						return describeOperation(binding, context.action);
 					})),
 					commit: () => {

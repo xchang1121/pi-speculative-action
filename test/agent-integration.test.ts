@@ -1121,7 +1121,9 @@ describe("speculative action host", () => {
 		const binding = (identity: string, executionMs: number, permissionHash = action.hash, available = () => true) =>
 			Object.freeze({ backend: "test", identity, executionMs, expectedDurationMs: executionMs + 10, permissionHash,
 				get available() { return available(); } });
-		const slow = binding("slow", 8), fast = binding("fast", 3);
+		let slowMs = 8;
+		const slow = Object.freeze({ ...binding("slow", slowMs), get executionMs() { return slowMs; },
+			get expectedDurationMs() { return slowMs + 10; } }), fast = binding("fast", 3);
 		const observe = (operations: readonly ReturnType<typeof binding>[]) => controller.source.observe!({ ...request, action, operations,
 			consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: concrete, tools: [tool] },
 			tool: "read", concrete, output: { result: textResult("ready"), isError: false }, durationMs: 20, order: 0 });
@@ -1139,6 +1141,11 @@ describe("speculative action host", () => {
 			controller.turnFinished(request.startInput, request.settings, false);
 			const internal = (await proposed())!;
 			expect(internal.operation).toBe(slow);
+			slowMs = 1;
+			expect((await proposed())!.operation).toBe(fast);
+			slowMs = 12;
+			expect(await proposed()).toMatchObject({ operation: slow, expectedDurationMs: 22 });
+			expect(internal.expectedDurationMs).toBe(18); // Issued plans keep their admission estimate.
 			const snapshot = store.snapshot(), prediction = { id: "internal", source: "pattern_aware", proposalID: internal.proposalID, actionID: internal.id };
 			await controller.source.onIssued!(internal);
 			const settle = (stage: "matching" | "execution") => controller.source.onSettled!({ ...internal,
