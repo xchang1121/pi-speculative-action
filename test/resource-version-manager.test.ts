@@ -804,6 +804,50 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
+	test.for(["shared", "distinct", "cancel-owner", "cancel-reader", "cancel-all", "changed", "late-change", "read-error"])("shares an ongoing image read with independent descriptor ownership (%s)", async mode => {
+		const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 43), root = await workspace({ image: payload });
+		const file = path.join(root, "image"), alias = path.join(root, "alias");
+		if (mode === "distinct") await fs.writeFile(alias, payload); else await fs.link(file, alias);
+		const gate = gated(), admitted = deferred(), controllers = [new AbortController(), new AbortController()];
+		const cancelled = controllers.map((_, index) => new Error("cancelled reader " + index));
+		const nativeOpen = fs.open.bind(fs), handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+		const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, permissions) => {
+			const handle = await nativeOpen(target, flags, permissions);
+			if (!isDataOpen(flags)) return handle;
+			const index = handles.length; handles.push(handle);
+			const read = handle.read.bind(handle), stat = handle.stat.bind(handle); let reads = 0, inspections = 0;
+			vi.spyOn(handle, "read").mockImplementation((async (...args: Parameters<typeof handle.read>) => {
+				if (index === 0 && ++reads === 1) { await gate.wait(); if (mode === "read-error") throw new Error("shared read failed"); }
+				return read(...args);
+			}) as typeof handle.read);
+			vi.spyOn(handle, "stat").mockImplementation((async (...args: Parameters<typeof handle.stat>) => {
+				if (mode === "late-change" && index === 1 && ++inspections === 2) await fs.appendFile(file, "changed");
+				return stat(...args);
+			}) as typeof handle.stat);
+			return handle;
+		});
+		const digest = (bytes: Buffer) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
+		let settled: Promise<PromiseSettledResult<string>[]> | undefined;
+		try {
+			const owner = hashExecutableFile(file, { signal: controllers[0]!.signal, pinned: () => {} }); await gate.entered;
+			const reader = hashExecutableFile(alias, { signal: controllers[1]!.signal, pinned: admitted.resolve });
+			settled = Promise.allSettled([owner, reader]); await admitted.promise; await nextTurn();
+			if (mode === "cancel-owner" || mode === "cancel-all") controllers[0]!.abort(cancelled[0]);
+			if (mode === "cancel-reader" || mode === "cancel-all") controllers[1]!.abort(cancelled[1]);
+			if (mode === "changed") await fs.appendFile(file, "changed");
+			gate.release();
+			for (const [index, result] of (await settled).entries()) {
+				const error = controllers[index]!.signal.aborted ? cancelled[index]!.message : mode === "read-error" ? "shared read failed"
+					: mode === "changed" || mode === "late-change" && index === 1 ? "file_changed_during_capture" : undefined;
+				expect(result).toMatchObject(error ? { status: "rejected", reason: { message: error } } : { status: "fulfilled", value: digest(payload) });
+			}
+			expect(vi.mocked(handles[1]!.read).mock.calls.length > 0).toBe(mode === "distinct");
+			for (const handle of handles) expect(handle.fd).toBe(-1);
+			expect(await hashExecutableFile(file)).toBe(digest(await fs.readFile(file)));
+			expect(handles.at(-1)!.read).toHaveBeenCalled(); expect(handles.at(-1)!.fd).toBe(-1);
+		} finally { gate.release(); await settled; open.mockRestore(); await Promise.allSettled(handles.map(handle => handle.close())); }
+	});
+
 	test.runIf(process.platform === "linux")("distinguishes pinned images from pathname snapshots after alias targets change", async () => {
 		for (const change of ["replace", "unlink", "rewrite"]) {
 			const root = await workspace({ image: "old" }), file = path.join(root, "image"), handle = await fs.open(file, "r");
