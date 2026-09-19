@@ -107,6 +107,7 @@ import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type Proces
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
+	sameSandboxState,
 	type SandboxDirectoryChange,
 	type SandboxFileChange,
 	type SandboxWorkspaceChange,
@@ -472,7 +473,7 @@ export class LinuxProcessReuseBackend {
 				let committed = false;
 				let timing: ServiceTimingIdentity | undefined;
 				try {
-					throwIfAborted(request.signal);
+					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
 					if (!invocation) return this.actorReplayMiss(host, request);
 					assertInvocationMatches(invocation, request);
@@ -491,12 +492,15 @@ export class LinuxProcessReuseBackend {
 					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
 					if (!plan?.certificate.result.exit) return this.actorReplayMiss(host, request, timing);
-					throwIfAborted(request.signal);
+					request.signal?.throwIfAborted();
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
+					const observation = this.observations.getStore();
+					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
+						observation.computations.push(reusedComputation(plan.certificate.result, requestStarted));
 					this.addActor("wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					this.addActor("wholeCommandHits");
@@ -526,7 +530,7 @@ export class LinuxProcessReuseBackend {
 	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
 		if (this.disposed) throw new Error("Linux process backend is disposed");
 		const ready = await this.resolveReady();
-		throwIfAborted(input.signal);
+		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
 		const projection = new ExecutionPathProjection({
 			sourceRoot,
@@ -574,7 +578,7 @@ export class LinuxProcessReuseBackend {
 				return Promise.reject(new Error("process session execution boundary is already consumed"));
 			executionKind = kind;
 			const pending = Promise.resolve().then(async () => {
-				throwIfAborted(session.signal);
+				session.signal?.throwIfAborted();
 				// A bound operation already names its executable; only enclosing tools need PATH interception.
 				if (kind === "tool") await (dispatch ??= createProcessInterposition({
 					privateRoot: input.workspace.processRoot,
@@ -589,7 +593,7 @@ export class LinuxProcessReuseBackend {
 					dispatcherBinary: ready.dispatcher,
 					excludedExecutables: [input.invocation.shell, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
 				}).then(interposition => {
-					throwIfAborted(session.signal);
+					session.signal?.throwIfAborted();
 					session.interposition = interposition;
 					return listenUnixSocket(server, socketPath);
 				}));
@@ -692,7 +696,7 @@ export class LinuxProcessReuseBackend {
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
 		if (session.closing) throw new Error("Linux process session is closed");
 		const signal = AbortSignal.any([session.signal, ...(request.signal ? [request.signal] : [])]);
-		throwIfAborted(signal);
+		signal?.throwIfAborted();
 		const ready = await this.resolveReady();
 		assertInvocationMatches(session.invocation, request);
 		const invocationCwd = path.resolve(request.cwd);
@@ -713,7 +717,7 @@ export class LinuxProcessReuseBackend {
 			(candidate) => compatibleProducer(session.producer, candidate),
 			session,
 		);
-		throwIfAborted(signal);
+		signal?.throwIfAborted();
 		if (plan?.kind === "completed_replay") return this.replayTopLevel(session, plan, request);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
@@ -766,7 +770,7 @@ export class LinuxProcessReuseBackend {
 		} finally {
 			await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
-		throwIfAborted(signal);
+		signal?.throwIfAborted();
 		return { exitCode: outcome.signal ? null : outcome.code };
 	}
 
@@ -802,6 +806,7 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 		this.add(session, "wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
+		session.computations.push(reusedComputation(plan.certificate.result, replayStarted));
 		return { exitCode: plan.certificate.result.exit?.kind === "code" ? plan.certificate.result.exit.code : null };
 	}
 
@@ -847,7 +852,7 @@ export class LinuxProcessReuseBackend {
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
 		const received = parseDispatcherRequest(body);
 		if (!received || received.token !== session.token || session.closing) throw new Error("invalid dispatcher request");
-		throwIfAborted(session.signal);
+		session.signal?.throwIfAborted();
 		const request = materializeDispatcherRequest(session, received);
 		if (!request) throw new Error("dispatcher cwd is unmapped");
 		this.add(session, "requests");
@@ -898,7 +903,6 @@ export class LinuxProcessReuseBackend {
 			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 			const result = await this.replay(session, acquired.plan, weakKey, acquired);
 			if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
-			if (acquired.producer?.computation) session.computations.push({ computation: acquired.producer.computation });
 			const binding = acquired.producer?.binding;
 			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
 			return result;
@@ -955,7 +959,7 @@ export class LinuxProcessReuseBackend {
 					waits.push({ handoff: running, interval });
 					waitedMs += interval.completedAt - interval.startedAt;
 					if (finished.status === "completed") return "completed";
-					throwIfAborted(signal);
+					signal?.throwIfAborted();
 					return "miss";
 				},
 			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
@@ -1044,7 +1048,7 @@ export class LinuxProcessReuseBackend {
 		const requestStarted = performance.now();
 		this.addActor("requests");
 		try {
-			throwIfAborted(process.signal);
+			process.signal?.throwIfAborted();
 			const sourceRoot = path.resolve(process.sourceRoot);
 			const executable = await realpath(`/proc/${process.pid}/exe`);
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
@@ -1148,7 +1152,7 @@ export class LinuxProcessReuseBackend {
 				commit: async () => {
 					const started = performance.now();
 					try {
-						throwIfAborted(process.signal);
+						process.signal?.throwIfAborted();
 						await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					} catch (error) {
 						this.setActorError(`actor_child_commit:${errorMessage(error)}`);
@@ -1162,9 +1166,7 @@ export class LinuxProcessReuseBackend {
 					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
 						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
 							observation.bindings.set(order, binding);
-						if (acquired.producer?.computation) observation.computations.push({
-							computation: acquired.producer.computation, shared: acquired.waiting,
-						});
+						observation.computations.push(reusedComputation(plan.certificate.result, requestStarted, acquired));
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
@@ -1184,7 +1186,7 @@ export class LinuxProcessReuseBackend {
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
-		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff },
+		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] },
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
 		let replayed = false;
@@ -1194,6 +1196,7 @@ export class LinuxProcessReuseBackend {
 			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
+			session.computations.push(reusedComputation(certificate.result, started, acquired));
 			replayed = true;
 			return { version: 2, kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
@@ -1796,6 +1799,13 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 	return positions;
 }
 
+function reusedComputation(result: ProcessResultRecord, startedAt: number,
+	acquired?: { readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] }): TimelineDependency {
+	if (acquired?.producer?.computation) return { computation: acquired.producer.computation, shared: acquired.waiting };
+	const computation = new TimelineInterval(startedAt, performance.now());
+	return { computation, shared: [computation], expectedActorMs: result.observedProcessMs };
+}
+
 function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
 	return {
 		tool: "process",
@@ -1893,7 +1903,7 @@ async function sourceDirectoryChanges(
 		const before = effect.change.before ? directoryState(effect.change.before) : undefined;
 		if (before === undefined) {
 			if (sourceBefore !== undefined) throw new Error(`directory creation baseline changed: ${resource}`);
-		} else if (!sameDirectoryStateValue(sourceBefore, before)) {
+		} else if (!sameSandboxState(sourceBefore, before)) {
 			throw new Error(`source directory differs from execution baseline: ${resource}`);
 		}
 		changes.push({
@@ -1906,19 +1916,6 @@ async function sourceDirectoryChanges(
 		});
 	}
 	return Object.freeze(changes);
-}
-
-function sameDirectoryStateValue(
-	left: Awaited<ReturnType<typeof readSandboxDirectoryState>>,
-	right: NonNullable<Awaited<ReturnType<typeof readSandboxDirectoryState>>>,
-): boolean {
-	return (
-		left !== undefined &&
-		left.entriesDigest === right.entriesDigest &&
-		left.mode === right.mode &&
-		left.uid === right.uid &&
-		left.gid === right.gid
-	);
 }
 
 function transactionDependencySource(
@@ -2190,7 +2187,7 @@ async function createProcessInterposition(input: {
 	const directories: InterposedDirectory[] = [];
 	const seenTargets = new Set<string>();
 	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
-		throwIfAborted(input.signal);
+		input.signal?.throwIfAborted();
 		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
 		const logicalDirectory = path.resolve(rawDirectory);
 		if (seenTargets.has(logicalDirectory)) continue;
@@ -2214,7 +2211,7 @@ async function createProcessInterposition(input: {
 		});
 	}
 	const configurationPath = path.join(root, "configuration.json");
-	throwIfAborted(input.signal);
+	input.signal?.throwIfAborted();
 	const configuration = {
 		version: 2,
 		socketPath: input.socketPath,
@@ -2242,7 +2239,7 @@ async function createProcessInterposition(input: {
 	}
 	for (const [source, aliases] of sources) {
 		for (const directory of aliases) {
-			throwIfAborted(input.signal);
+			input.signal?.throwIfAborted();
 			await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
 			await writeFile(
 				path.join(directory.view, ".pi-spec-dispatch"),
@@ -2259,7 +2256,7 @@ async function createProcessInterposition(input: {
 		// Each physical entry is probed once; aliases retain independent exec-only mappings.
 		// Bound preparation and settle every alias link before capturing directory evidence.
 		await mapFilesystem(entries, async (name) => {
-			throwIfAborted(input.signal);
+			input.signal?.throwIfAborted();
 			if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
 			const sourceEntry = path.join(source, name);
 			try {
@@ -2283,7 +2280,7 @@ async function createProcessInterposition(input: {
 				}
 			}
 		});
-		throwIfAborted(input.signal);
+		input.signal?.throwIfAborted();
 		dependencies.push(
 			await captureDirectoryDependency(
 				source,
@@ -2464,10 +2461,10 @@ async function runSpawn(
 		readonly onControl?: (channel: import("node:stream").Duplex, wake: () => boolean) => (() => void | Promise<void>);
 	},
 ): Promise<SpawnOutcome> {
-	throwIfAborted(options.signal);
+	options.signal?.throwIfAborted();
 	const channels = options.onOutputEndpoints ? await acquireOutputChannels(options.signal) : undefined;
 	try {
-		throwIfAborted(options.signal);
+		options.signal?.throwIfAborted();
 		if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
 		const child = spawn(executable, args, {
 			cwd: options.cwd,
@@ -2550,7 +2547,7 @@ async function acquireOutputChannels(signal?: AbortSignal) {
 	};
 	try {
 		for (const fd of [1, 2]) {
-			throwIfAborted(signal);
+			signal?.throwIfAborted();
 			const socketPath = path.join(root, String(fd));
 			const entry = { server: net.createServer({ pauseOnConnect: true }), source: new net.Socket({ signal }), endpoint: "" } as typeof entries[number];
 			entries.push(entry);
@@ -2836,9 +2833,6 @@ function sensitivePaths(storeRoot: string, additional: readonly string[] | undef
 	);
 }
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw signal.reason ?? new Error("aborted");
-}
 
 function permissionDenied(error: unknown): boolean {
 	return Boolean(error && typeof error === "object" && "code" in error && (error.code === "EACCES" || error.code === "EPERM"));

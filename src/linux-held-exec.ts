@@ -345,7 +345,7 @@ export class LinuxHeldExecBoundary {
 			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) {
 				return void socket.end("C\n");
 			}
-			throwIfAborted(active.signal);
+			active.signal?.throwIfAborted();
 			const decision = await active.decide({
 				id: `${request.execution}:${++active.sequence}`,
 				sequence: active.sequence,
@@ -409,7 +409,7 @@ export class LinuxHeldExecBoundary {
 			const acknowledgement = await readLine(socket);
 			if (acknowledgement === "N") { prepared = false; return void socket.end(); }
 			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
-			throwIfAborted(active.signal);
+			active.signal?.throwIfAborted();
 			await decision.commit();
 			await write(socket, Buffer.from("R\n"));
 			if ((await readLine(socket)) !== "D") throw new Error("held-exec adoption completion is unknown");
@@ -491,6 +491,12 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {};
 	const images = new Map<string, number>();
 	let remaining = maxBytes;
+	const storeObject = (file: string, fd: number, object: Omit<ProcessResourceGraph["objects"][number], "contentDigest" | "content">, bytes?: Buffer) => {
+		remaining -= bytes?.length ?? 0;
+		if (remaining < 0) throw new Error(`inherited ${object.type} exceeds input budget`);
+		objects[fd] = { ...object, contentDigest: sha256Digest(bytes ?? ""), ...(bytes ? { content: bytes.toString("base64") } : {}) };
+		images.set(file, fd);
+	};
 	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
 	for (const descriptor of descriptors) {
 		const { fd, alias: representative, flags, offset } = descriptor;
@@ -514,30 +520,26 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 			if (descriptor.type === "eventfd") {
 				if (endpoint !== "anon_inode:[eventfd]" || !descriptor.counter) throw new Error("unproven inherited counter");
 				const bytes = Buffer.alloc(9); bytes.writeBigUInt64LE(BigInt(descriptor.counter.value)); bytes[8] = descriptor.counter.semaphore;
-				remaining -= bytes.length; if (remaining < 0) throw new Error("inherited counter exceeds input budget");
-				objects[fd] = { type: "eventfd", counter: { value: descriptor.counter.value, semaphore: descriptor.counter.semaphore },
-					contentDigest: sha256Digest(bytes), content: bytes.toString("base64") };
-				images.set(file, fd); continue;
+				storeObject(file, fd, { type: "eventfd", counter: { value: descriptor.counter.value, semaphore: descriptor.counter.semaphore } }, bytes);
+				continue;
 			}
 			if (descriptor.type === "pipe" || descriptor.type === "socket") {
 				if (!/^(pipe|socket):\[\d+\]$/.test(endpoint) || descriptor.queueHex === undefined) throw new Error("unproven inherited stream");
-				const bytes = Buffer.from(descriptor.queueHex, "hex"); remaining -= bytes.length;
-				if (remaining < 0) throw new Error("inherited stream exceeds input budget");
-				objects[fd] = { type: descriptor.type, contentDigest: sha256Digest(bytes), content: bytes.toString("base64"),
+				const bytes = Buffer.from(descriptor.queueHex, "hex");
+				storeObject(file, fd, { type: descriptor.type,
 					queue: { eof: descriptor.eof!, bytes: bytes.length, capacity: descriptor.capacity!, producer: descriptor.eof ? "closed" : "live", outside: descriptor.outside ?? 3,
 						...(descriptor.messages ? { messages: descriptor.messages } : {}) },
 					...(descriptor.socket ? { socket: { ...(descriptor.socket.type ? { type: descriptor.socket.type } : {}), shutdown: descriptor.socket.shutdown, allocated: descriptor.socket.allocated,
-						peer: { connected: !!descriptor.socket.peerInode, shutdown: descriptor.socket.peerShutdown, bytes: descriptor.socket.peerQueued } } } : {}) };
-				images.set(file, fd); continue;
+						peer: { connected: !!descriptor.socket.peerInode, shutdown: descriptor.socket.peerShutdown, bytes: descriptor.socket.peerQueued } } } : {}) }, bytes);
+				continue;
 			}
 			if (descriptor.type === "directory") {
 				const metadata = await stat(endpoint, { bigint: true });
 				if (!metadata.isDirectory() || String(metadata.dev) !== descriptor.device || String(metadata.ino) !== descriptor.inode) throw new Error("held directory pathname changed");
 				const directoryHex = descriptors.find(other => other.device === descriptor.device && other.inode === descriptor.inode && other.directoryHex !== undefined)?.directoryHex;
 				if (directoryHex !== undefined) {
-					const bytes = Buffer.from(directoryHex, "hex"); remaining -= bytes.length;
-					if (remaining < 0) throw new Error("inherited directory exceeds input budget");
-					objects[fd] = { type: "directory", sourcePath: endpoint, contentDigest: sha256Digest(bytes), content: bytes.toString("base64") };
+					const bytes = Buffer.from(directoryHex, "hex");
+					storeObject(file, fd, { type: "directory", sourcePath: endpoint }, bytes);
 					if (inputs) {
 						const borrowed = await borrowResourceObject(inputs(endpoint), endpoint, metadata, bytes.length);
 						if (!borrowed?.content?.equals(bytes)) {
@@ -545,11 +547,10 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 							if (captured && !retainResourceObject(inputs(endpoint), endpoint, captured)) await captured.object?.dispose();
 						}
 					}
-					images.set(file, fd); continue;
+					continue;
 				}
 			}
-			objects[fd] = { type: descriptor.type, contentDigest: sha256Digest(""), ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) };
-			images.set(file, fd);
+			storeObject(file, fd, { type: descriptor.type, ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) });
 			continue;
 		}
 		let captured = inputs && await borrowResourceObject(inputs(endpoint), endpoint, await stat(heldPath, { bigint: true }), remaining);
@@ -714,8 +715,4 @@ function execute(command: string, args: readonly string[]): Promise<{ stdout: st
 			resolve({ stdout, code: error && typeof error.code === "number" ? error.code : 0, signal: error?.signal ?? null });
 		});
 	});
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw signal.reason ?? new Error("aborted");
 }

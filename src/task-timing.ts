@@ -2,6 +2,8 @@ import { nonNegativeFinite as metric } from "./number-utils.ts";
 
 export interface TimelineDependency {
 	readonly computation: TimelineInterval;
+	/** Existing native-service evidence when the retained result has no original interval. */
+	readonly expectedActorMs?: number;
 	/** Parts already included in the enclosing execution, or spent waiting for this computation. */
 	readonly shared?: readonly TimelineInterval[];
 }
@@ -18,6 +20,7 @@ export class TimelineInterval {
 		this.completedAt = Math.max(this.startedAt, metric(completedAt));
 		if (inputs.length) dependencies.set(this, Object.freeze(inputs.map(input => Object.freeze({
 			computation: TimelineInterval.from(input.computation),
+			...(input.expectedActorMs === undefined ? {} : { expectedActorMs: metric(input.expectedActorMs) }),
 			shared: Object.freeze((input.shared ?? []).map(TimelineInterval.from)),
 		}))));
 		Object.freeze(this);
@@ -36,6 +39,7 @@ export class TaskTimeline {
 	private readonly actorPhases: number[] = [];
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[] }[] = [];
 	private readonly computations = new WeakSet<TimelineInterval>();
+	private estimatedSavingsMs = 0;
 	readonly startedAt: number;
 
 	constructor(startedAt: number) { this.startedAt = metric(startedAt); }
@@ -44,16 +48,31 @@ export class TaskTimeline {
 		this.actorPhases.push(startedAt, completedAt);
 	}
 
-	recordTool(interval: TimelineInterval): void {
-		if (this.computations.has(interval)) return;
-		this.computations.add(interval);
-		const inputs = dependencies.get(interval) ?? [];
-		const shared = inputs.flatMap(({ computation, shared }) => (shared ?? []).map(part => ({
-			startedAt: Math.max(computation.startedAt, part.startedAt),
-			completedAt: Math.min(computation.completedAt, part.completedAt),
-		}))).filter(part => part.completedAt > part.startedAt);
-		this.authoritativeTools.push({ startedAt: interval.startedAt, endpoints: exclusiveEndpoints(interval, shared) });
-		for (const input of inputs) this.recordTool(input.computation);
+	/** Call once per settled Actor operation; adoption includes its actual waiting and validation time. */
+	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number }): void {
+		const costs = new Map<TimelineInterval, number>();
+		const visit = (computation: TimelineInterval): number => {
+			const cached = costs.get(computation);
+			if (cached !== undefined) return cached;
+			const inputs = dependencies.get(computation) ?? [];
+			const shared = inputs.map(({ computation, shared }) => (shared ?? []).map(part => ({
+				startedAt: Math.max(computation.startedAt, part.startedAt),
+				completedAt: Math.min(computation.completedAt, part.completedAt),
+			})).filter(part => part.completedAt > part.startedAt));
+			if (!this.computations.has(computation)) {
+				this.computations.add(computation);
+				this.authoritativeTools.push({ startedAt: computation.startedAt, endpoints: exclusiveEndpoints(computation, shared.flat()) });
+			}
+			const cost = computation.completedAt - computation.startedAt
+				+ inputs.reduce((total, input) => total + nonNegativeDifference(Math.max(visit(input.computation), metric(input.expectedActorMs)), unionDuration(input.shared ?? [])), 0);
+			costs.set(computation, cost);
+			return cost;
+		};
+		const serialMs = visit(interval);
+		// Per-call credit includes retained work from earlier tasks. Native parents already include child waits.
+		const referenceMs = Math.max(serialMs, metric(adoption?.expectedActorMs));
+		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
+		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs);
 	}
 
 	measure(endedAt: number) {
@@ -81,6 +100,8 @@ export class TaskTimeline {
 			toolExecutionMs,
 			serializedMs,
 			hiddenLatencyMs,
+			/** Optimistic avoided service time, not a measured no-speculation counterfactual. */
+			estimatedSavingsMs: this.estimatedSavingsMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
 		});

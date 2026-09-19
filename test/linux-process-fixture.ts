@@ -112,6 +112,10 @@ export async function createLinuxProcessBenchmark(
 		world,
 		workspaceSandbox,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
+		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(adaptProcessToolOperations(localOperations), {
+			sourceRoot: workspace, invocation: () => undefined, held: { realShell: shellPath,
+				executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
+		}, refresh),
 		dispose: async () => {
 			if (disposed) return;
 			disposed = true;
