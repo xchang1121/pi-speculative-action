@@ -27,6 +27,25 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("orders inherited stream transfers across processes and preserves binary iovecs", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stream-order-")), prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(prefix + ".stream", [
+				`100 ${EXEC}`, "100 clone(child_stack=NULL, flags=SIGCHLD) = 101",
+				'101 read(4<UNIX-STREAM:[91->92]>,  <unfinished ...>',
+				'100 writev(3<UNIX-STREAM:[92->91]>, [{iov_base="\\000", iov_len=1}, {iov_base="\\377", iov_len=1}], 2) = 2',
+				'101 <... read resumed>"\\000\\377", 2) = 2',
+				'101 shutdown(4<UNIX-STREAM:[91->92]>, SHUT_WR) = 0',
+				'101 +++ exited with 0 +++', '100 +++ exited with 0 +++',
+			].join("\n"));
+			const observed = await observeStrace(prefix, "/usr/bin/example", "/work", { inheritedStreams: ["91", "92"] });
+			expect(observed).toMatchObject({ complete: true, taints: ["clock", "random"], streamJournal: [
+				{ inode: "92", kind: "produce", data: Buffer.from([0, 255]) },
+				{ inode: "91", kind: "consume", data: Buffer.from([0, 255]) },
+				{ inode: "91", kind: "shutdown", data: Buffer.from([2]) },
+			] });
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
 	test("separates pathname and descriptor data from syscall evidence", async () => {
 		for (const name of ["st_ino=99", "AT_SYMLINK_NOFOLLOW", "<unfinished ...>", 'nested(,){ }[ ] "quote"', "café", "result=-1", "ending-"]) {
 			const target = "/work/" + name;
