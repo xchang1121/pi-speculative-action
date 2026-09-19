@@ -11,6 +11,9 @@ import { fileURLToPath } from "node:url";
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
 const SANDLOCK_PATCH = fileURLToPath(new URL("./sandlock-transparent-exec.patch", import.meta.url));
+const STRACE_RELEASE = "6.8";
+const STRACE_SHA256 = "ba6950a96824cdf93a584fa04f0a733896d2a6bc5f0ad9ffe505d9b41e970149";
+const STRACE_PATCH = fileURLToPath(new URL("./strace-handoff.patch", import.meta.url));
 const FUSE_OVERLAYFS_RELEASE = "v1.18";
 const FUSE_OVERLAYFS_ASSETS = Object.freeze({
 	x64: {
@@ -33,7 +36,8 @@ const sandlock = path.join(localBin, "pi-speculative-sandlock");
 const heldExec = path.join(localBin, "pi-speculative-held-exec");
 await mkdir(localBin, { recursive: true });
 const held = await optional("Actor child handoff", installHeldExec);
-const missing = await missingExecutables(["strace", "git"]);
+const tracing = held && await optional("Running process handoff tracer", installStrace);
+const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
 let producer = false;
 if (!held)
 	console.warn("Speculative Bash producer unavailable because its transparent exec boundary is unavailable.");
@@ -42,7 +46,7 @@ else if (missing.length)
 else producer = await optional("Speculative Bash producer", installSandlock);
 const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
 console.log(
-	`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
+	`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; running process capture ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
 );
 
 async function installSandlock() {
@@ -130,12 +134,12 @@ async function qualifySandlock(binary) {
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
 	const content = await readFile(source);
-	const sourceDigest = sha256("static-pthread", content);
+	const sourceDigest = sha256("static-pthread+shared-image", content);
 	const target = heldExec;
 	const stamp = `${target}.sha256`;
 	try {
-		const [installedStamp, installed] = await Promise.all([readFile(stamp, "utf8"), readFile(target)]);
-		if (installedStamp.trim() !== `${sourceDigest}:${sha256(installed)}`) throw new Error("installation changed");
+		const [installedStamp, installed, library] = await Promise.all([readFile(stamp, "utf8"), readFile(target), readFile(`${target}.so`)]);
+		if (installedStamp.trim() !== `${sourceDigest}:${sha256(installed, library)}`) throw new Error("installation changed");
 		await qualifyHeldExec(target);
 		console.log(`Held-exec Actor boundary ready: ${target}`);
 		return;
@@ -146,12 +150,14 @@ async function installHeldExec() {
 	const temporary = `${target}.${process.pid}.tmp`;
 	try {
 		await run(compiler, ["-static", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
+		await run(compiler, ["-shared", "-fPIC", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", `${temporary}.so`]);
 		await chmod(temporary, 0o755);
 		await qualifyHeldExec(temporary);
+		await rename(`${temporary}.so`, `${target}.so`);
 		await rename(temporary, target);
-		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target))}\n`, { mode: 0o600 });
+		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target), await readFile(`${target}.so`))}\n`, { mode: 0o600 });
 	} finally {
-		await rm(temporary, { force: true }).catch(() => undefined);
+		await Promise.all([temporary, `${temporary}.so`].map(file => rm(file, { force: true }).catch(() => undefined)));
 	}
 	console.log(`Held-exec Actor boundary ready: ${target}`);
 }
@@ -159,6 +165,36 @@ async function installHeldExec() {
 async function qualifyHeldExec(binary) {
 	await run(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
 	await run(binary, ["--exec", "21", "pi-exec-probe", binary, "--probe-clean-fds"]);
+}
+
+async function installStrace() {
+	if (process.arch !== "x64") throw new Error("running process capture requires x86-64 Linux");
+	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
+	const target = path.join(localBin, "pi-speculative-strace"), stamp = `${target}.sha256`;
+	const qualify = async binary => {
+		await run(binary, ["--handoff-version"]);
+		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
+			`--handoff-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
+	};
+	try {
+		if ((await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${sha256(await readFile(target))}`) throw new Error("installation changed");
+		await qualify(target); return;
+	} catch { /* Build the pinned tracer extension with the packaged native image ABI. */ }
+	const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);
+	const buildRoot = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-strace-")), temporary = `${target}.${process.pid}.tmp`;
+	try {
+		const archive = path.join(buildRoot, "source.tar.xz"), source = path.join(buildRoot, `strace-${STRACE_RELEASE}`);
+		await writeFile(archive, await downloadPinned(`https://strace.io/files/${STRACE_RELEASE}/strace-${STRACE_RELEASE}.tar.xz`, STRACE_SHA256));
+		await run(tar, ["-xJf", archive, "-C", buildRoot]);
+		await run(git, ["-C", source, "apply", "--whitespace=error-all", STRACE_PATCH]);
+		await run(path.join(source, "configure"), ["--enable-mpers=no", "--without-libunwind", "--without-libdw"], 0, source);
+		await run(make, ["-j", String(Math.min(4, os.availableParallelism()))], 0, source);
+		await copyFile(path.join(source, "src", "strace"), temporary, fsConstants.COPYFILE_EXCL);
+		await chmod(temporary, 0o755); await qualify(temporary); await rename(temporary, target);
+		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target))}\n`, { mode: 0o600 });
+	} finally {
+		await Promise.all([rm(buildRoot, { recursive: true, force: true }), rm(temporary, { force: true })]);
+	}
 }
 
 async function installFuseOverlayfs() {
@@ -179,11 +215,7 @@ async function installFuseOverlayfs() {
 	await executable(["fusermount3", "fusermount"]);
 	const url = `https://github.com/containers/fuse-overlayfs/releases/download/${FUSE_OVERLAYFS_RELEASE}/${asset.name}`;
 	console.log(`Installing fuse-overlayfs ${FUSE_OVERLAYFS_RELEASE} into ${localRoot} ...`);
-	const response = await fetch(url, { redirect: "follow" });
-	if (!response.ok) throw new Error(`download failed (${response.status} ${response.statusText})`);
-	const bytes = Buffer.from(await response.arrayBuffer());
-	const digest = sha256(bytes);
-	if (digest !== asset.sha256) throw new Error(`fuse-overlayfs checksum mismatch: ${digest}`);
+	const bytes = await downloadPinned(url, asset.sha256);
 	const temporary = `${target}.${process.pid}.tmp`;
 	try {
 		await writeFile(temporary, bytes, { mode: 0o700, flag: "wx" });
@@ -242,9 +274,17 @@ function sha256(...values) {
 	return hash.digest("hex");
 }
 
-function run(command, args, expected = 0) {
+async function downloadPinned(url, expected) {
+	const response = await fetch(url, { redirect: "follow" });
+	if (!response.ok) throw new Error(`download failed (${response.status} ${response.statusText})`);
+	const bytes = Buffer.from(await response.arrayBuffer()), digest = sha256(bytes);
+	if (digest !== expected) throw new Error(`download checksum mismatch: ${digest}`);
+	return bytes;
+}
+
+function run(command, args, expected = 0, cwd) {
 	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, { stdio: "inherit" });
+		const child = spawn(command, args, { stdio: "inherit", cwd });
 		child.once("error", reject);
 		child.once("exit", (code, signal) => {
 			if (code === expected && signal === null) resolve();

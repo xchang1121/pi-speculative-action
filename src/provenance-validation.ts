@@ -1,7 +1,7 @@
 import { directoryEntriesDigest } from "./process-observation.ts";
 import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureFilesystemEntry, captureStableFile } from "./filesystem-evidence.ts";
+import { captureFilesystemEntry, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import {
 	type DynamicDependency,
@@ -47,7 +47,7 @@ export type ProvenanceValidation =
 	| Exclude<DynamicDependencyValidation, { status: "valid" }>;
 
 const OBSERVATION_FIELDS = {
-	file: ["contentDigest", "metadataDigest"],
+	file: ["contentDigest", "metadataDigest", "aliases"],
 	directory: ["entriesDigest", "metadataDigest"],
 	absence: ["parentEntriesDigest"],
 	symlink: ["targetDigest", "target"],
@@ -105,6 +105,7 @@ export async function validateDynamicDependencyCertificate(
 						const captured = await captureFileDependency(physicalPath, expected.path, expected.role, {
 							includeMetadata: expected.metadataDigest !== undefined,
 							maxFileBytes: context.maxFileBytes,
+							aliases: expected.aliases, resolvePath: context.resolvePath,
 						});
 						filesRead += captured.filesRead;
 						bytesRead += captured.bytesRead;
@@ -173,10 +174,20 @@ export async function captureFileDependency(
 	physicalPath: string,
 	logicalPath: string,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
-	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number } = {},
+	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number; readonly aliases?: readonly string[];
+		readonly resolvePath?: ProvenanceValidationContext["resolvePath"] } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
 	const maxBytes = finiteLimit(options.maxFileBytes ?? Number.POSITIVE_INFINITY);
 	const content = await captureStableFile(physicalPath, maxBytes);
+	let aliases = options.aliases;
+	if (aliases) {
+		const states = await Promise.all(aliases.map(async logical => {
+			const physical = options.resolvePath ? options.resolvePath(logical) : path.resolve(logical);
+			if (!physical) throw new Error(`alias_unmapped:${logical}`);
+			return lstat(physical, { bigint: true });
+		}));
+		if (content.stat.nlink !== BigInt(aliases.length) || states.some(state => !state.isFile() || !sameFilesystemIdentity(content.stat, state))) aliases = [];
+	}
 	return {
 		dependency: {
 			kind: "file",
@@ -184,6 +195,7 @@ export async function captureFileDependency(
 			role,
 			contentDigest: `sha256:${content.hash}`,
 			...(options.includeMetadata ? { metadataDigest: filesystemMetadataDigest(content.stat) } : {}),
+			...(aliases ? { aliases } : {}),
 		},
 		bytesRead: content.shared ? 0 : content.bytesRead,
 		filesRead: content.shared ? 0 : 1,

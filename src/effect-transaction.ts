@@ -124,6 +124,8 @@ export class EffectTransactionCoordinator<Output> {
 		let consumed = false;
 		const inputsOnly = capture.inputsOnly;
 		return Object.freeze({
+			...(inputsOnly ? { inputsOnly } : {}),
+			get inputSource() { return !consumed && inputsOnly ? capture.inputSource : undefined; },
 			seal: async (output: Output) => {
 				if (consumed) throw new Error("effect transaction capture is already consumed");
 				consumed = true;

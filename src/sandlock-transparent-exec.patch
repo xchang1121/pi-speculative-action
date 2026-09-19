@@ -1,8 +1,8 @@
 diff --git a/crates/sandlock-cli/src/main.rs b/crates/sandlock-cli/src/main.rs
-index 96309ec..cd4394c 100644
+index 96309ec..87fcccb 100644
 --- a/crates/sandlock-cli/src/main.rs
 +++ b/crates/sandlock-cli/src/main.rs
-@@ -98,6 +98,14 @@ struct RunArgs {
+@@ -98,6 +98,18 @@ struct RunArgs {
      #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST[:ro]")]
      fs_mount: Vec<String>,
  
@@ -14,10 +14,14 @@ index 96309ec..cd4394c 100644
 +    #[arg(long = "preserve-fd", value_parser = clap::value_parser!(i32).range(3..))]
 +    preserve_fd: Vec<i32>,
 +
++    /// Reproduce captured directory entries on a private directory object.
++    #[arg(long = "directory-image", value_name = "DIRECTORY:IMAGE")]
++    directory_image: Vec<String>,
++
      /// COW branch action on normal sandbox exit: commit | abort | keep
      /// (default: commit).
      #[arg(long = "on-exit", value_name = "ACTION")]
-@@ -644,6 +652,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -644,6 +656,18 @@ async fn run_command(args: RunArgs) -> Result<i32> {
              builder.fs_mount(virt, host)
          };
      }
@@ -28,37 +32,47 @@ index 96309ec..cd4394c 100644
 +        }
 +        builder = builder.exec_mount(virt, host);
 +    }
++    for spec in &args.directory_image {
++        let (directory, image, read_only) = profile::parse_mount_spec(spec)?;
++        if read_only || std::fs::metadata(&image)?.len() > 2 * 1024 * 1024 { return Err(anyhow!("invalid directory image")); }
++        builder = builder.directory_image(directory, std::fs::read(image)?);
++    }
      if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
      match &args.gpu {
          // `all` maps to an empty device list, which the core expands to every
-@@ -745,3 +760,5 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -742,6 +766,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+         policy
+     };
+ 
 +    if !args.preserve_fd.is_empty() { policy.preserve_fds(&args.preserve_fd)?; }
 +
      let result = if args.dry_run {
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..23e21ac 100644
+index 6e4ab93..010139b 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
-@@ -76,6 +76,8 @@ pub(crate) struct ChrootCtx<'a> {
+@@ -76,6 +76,9 @@ pub(crate) struct ChrootCtx<'a> {
      pub mounts: &'a [(PathBuf, PathBuf)],
      /// Virtual paths of read-only mounts: reads allowed, writes denied.
      pub mount_ro: &'a [PathBuf],
 +    /// Exact exec-only substitutions; ordinary path operations remain untouched.
 +    pub exec_mounts: &'a [(PathBuf, PathBuf)],
++    pub directory_images: &'a [(PathBuf, Vec<u8>)],
      /// Per-process supervisor state, for handlers that track the caller's
      /// filesystem context rather than just resolving one path.
      pub processes: &'a Arc<ProcessIndex>,
-@@ -94,6 +96,7 @@ impl<'a> ChrootCtx<'a> {
+@@ -94,6 +97,8 @@ impl<'a> ChrootCtx<'a> {
              denied: &policy.chroot_denied,
              mounts: &policy.chroot_mounts,
              mount_ro: &policy.chroot_mount_ro,
 +            exec_mounts: &policy.chroot_exec_mounts,
++            directory_images: &policy.chroot_directory_images,
              processes,
          }
      }
-@@ -203,6 +206,12 @@ impl ChrootCtx<'_> {
+@@ -203,6 +208,12 @@ impl ChrootCtx<'_> {
      fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
          crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
      }
@@ -71,7 +85,7 @@ index 6e4ab93..23e21ac 100644
  }
  
  // ============================================================
-@@ -563,6 +572,32 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
+@@ -563,6 +574,32 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
  // openat handler
  // ============================================================
  
@@ -104,7 +118,7 @@ index 6e4ab93..23e21ac 100644
  pub(crate) async fn handle_chroot_open(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -591,16 +626,20 @@ pub(crate) async fn handle_chroot_open(
+@@ -591,16 +628,20 @@ pub(crate) async fn handle_chroot_open(
      // Resolve to get the virtual path for access control.
      let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
          Some(r) => r,
@@ -132,7 +146,7 @@ index 6e4ab93..23e21ac 100644
          return NotifAction::Errno(libc::EACCES);
      }
  
-@@ -657,25 +696,8 @@ pub(crate) async fn handle_chroot_open(
+@@ -657,25 +698,8 @@ pub(crate) async fn handle_chroot_open(
      }
  
      // Resolve the path to an fd to hand the child: either a freshly opened tree
@@ -160,14 +174,17 @@ index 6e4ab93..23e21ac 100644
  }
  
  /// Open `virtual_path` within the child's virtual namespace, returning an fd to
-@@ -715,5 +737,4 @@ fn open_in_namespace(
+@@ -714,8 +738,7 @@ fn open_in_namespace(
+ 
      // Category 2, named directly: skip the open and dup straight away.
      if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
 -        return crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
 -            .map_err(|_| libc::EBADF);
 +        return open_owned_fd(child_pid, child_fd, flags);
      }
-@@ -728,8 +749,7 @@ fn open_in_namespace(
+ 
+     let (root, sub) = match ctx.mount_target(virtual_path) {
+@@ -728,8 +751,7 @@ fn open_in_namespace(
          // Category 2, reached through symlinks.
          Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
              match resolve_self_fd_magic(ctx, child_pid, &vp_str) {
@@ -177,7 +194,10 @@ index 6e4ab93..23e21ac 100644
                  None => Err(errno),
              }
          }
-@@ -740,3 +760,21 @@ fn open_in_namespace(
+@@ -737,6 +759,24 @@ fn open_in_namespace(
+     }
+ }
+ 
 +fn open_owned_fd(pid: u32, fd: i32, flags: i32) -> Result<OwnedFd, i32> {
 +    let pin = crate::seccomp::notif::dup_fd_from_pid(pid, fd).map_err(|_| libc::EBADF)?;
 +    let mut state: libc::stat = unsafe { std::mem::zeroed() };
@@ -199,7 +219,7 @@ index 6e4ab93..23e21ac 100644
  /// If `path` is a self-referential `/proc/.../fd/N` magic link for the calling
  /// child (`/proc/self`, `/proc/thread-self`, or `/proc/<child_pid>`), return the
  /// child fd `N`. The fd component must be a bare number (no trailing path).
-@@ -867,6 +889,12 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
+@@ -867,6 +907,12 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
      None
  }
  
@@ -212,7 +232,7 @@ index 6e4ab93..23e21ac 100644
  /// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
  /// Uses sendfile for efficient kernel-to-kernel copy, then patches the
  /// interpreter path in place.
-@@ -974,22 +1002,32 @@ pub(crate) async fn handle_chroot_exec(
+@@ -974,29 +1020,41 @@ pub(crate) async fn handle_chroot_exec(
          return NotifAction::Errno(libc::EACCES);
      }
  
@@ -259,15 +279,17 @@ index 6e4ab93..23e21ac 100644
  
      // Read PT_INTERP from the binary. If it has one, open the image's
      // interpreter and create a memfd copy with PT_INTERP patched to
-@@ -996,5 +1034,6 @@ pub(crate) async fn handle_chroot_exec(
      // point at the injected interpreter fd. This ensures the kernel loads
      // the image's ld-linux (not the host's), avoiding glibc version
      // mismatches between ld.so and libc.so.
 -    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = read_pt_interp(src_fd) {
-+    let interpreter = executable_is_elf.then(|| read_pt_interp(src_fd)).flatten();
++    // A host-root sandbox already resolves PT_INTERP in the kernel's root.
++    let interpreter = (executable_is_elf && ctx.root != Path::new("/")).then(|| read_pt_interp(src_fd)).flatten();
 +    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = interpreter {
          // Open the image's interpreter from the chroot root (intentionally
-@@ -1019,7 +1058,7 @@ pub(crate) async fn handle_chroot_exec(
+         // NOT mount-aware ��� the dynamic linker should come from the base
+         // image, not from workspace mounts).
+@@ -1019,7 +1077,7 @@ pub(crate) async fn handle_chroot_exec(
              flags: 0,
              srcfd: interp_src as u32,
              newfd: 0,
@@ -276,7 +298,7 @@ index 6e4ab93..23e21ac 100644
          };
          let child_interp_fd = unsafe {
              libc::ioctl(
-@@ -1068,7 +1107,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1068,7 +1126,7 @@ pub(crate) async fn handle_chroot_exec(
          flags: 0,
          srcfd: exec_fd.as_raw_fd() as u32,
          newfd: 0,
@@ -285,157 +307,105 @@ index 6e4ab93..23e21ac 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
-@@ -1727,4 +1766,4 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +1784,7 @@ pub(crate) async fn handle_chroot_readlink(
+ 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
 -        Err(_) => return NotifAction::Errno(libc::ENOENT),
 +        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EIO)),
      };
-@@ -2482,6 +2521,7 @@ mod mount_ro_tests {
+ 
+     // Strip chroot/mount prefix from absolute targets
+@@ -1940,18 +1998,70 @@ pub(crate) async fn handle_chroot_xattr(
+ // ============================================================
+ 
+ pub(crate) async fn handle_chroot_getdents(
+-    _notif: &SeccompNotif,
+-    _chroot_state: &Arc<Mutex<ChrootState>>,
++    notif: &SeccompNotif,
++    chroot_state: &Arc<Mutex<ChrootState>>,
+     _cow_state: &Arc<Mutex<CowState>>,
+-    _notif_fd: RawFd,
+-    _ctx: &ChrootCtx<'_>,
++    notif_fd: RawFd,
++    ctx: &ChrootCtx<'_>,
+ ) -> NotifAction {
+-    // The child's fd already points to the real host directory (injected
+-    // by the chroot openat handler).  Let the kernel handle getdents
+-    // directly — it returns the correct entries from the host path.
+-    // No filtering or caching needed; denied paths are enforced at open
+-    // time, not at directory listing time.
+-    NotifAction::Continue
++    use std::os::unix::fs::MetadataExt;
++    if ctx.directory_images.is_empty() { return NotifAction::Continue; }
++    // getdents and seek share the OFD cursor, including dup and fork aliases.
++    let _cursor_guard = chroot_state.lock().await;
++    let pin = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
++        Ok(pin) => pin, Err(_) => return NotifAction::Errno(libc::EBADF),
++    };
++    let mut state: libc::stat = unsafe { std::mem::zeroed() };
++    if unsafe { libc::fstat(pin.as_raw_fd(), &mut state) } != 0 { return NotifAction::Errno(libc::EBADF); }
++    let image = ctx.directory_images.iter().find_map(|(directory, bytes)| {
++        let named = std::fs::metadata(directory).ok()?;
++        (named.dev() == state.st_dev && named.ino() == state.st_ino).then_some(bytes)
++    });
++    let Some(image) = image else { return NotifAction::Continue; };
++    if unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH != 0 { return NotifAction::Errno(libc::EBADF); }
++    if notif.data.nr as i64 == libc::SYS_lseek {
++        let position = unsafe { libc::lseek(pin.as_raw_fd(), notif.data.args[1] as i64, notif.data.args[2] as i32) };
++        return if position < 0 { NotifAction::Errno(last_errno(libc::EINVAL)) } else { NotifAction::ReturnValue(position) };
++    }
++    let cursor = unsafe { libc::lseek(pin.as_raw_fd(), 0, libc::SEEK_CUR) };
++    if cursor < 0 { return NotifAction::Errno(last_errno(libc::EIO)); }
++    let capacity = notif.data.args[2] as u32 as usize;
++    if capacity > i32::MAX as usize || image.len() > 2 * 1024 * 1024 { return NotifAction::Errno(libc::EINVAL); }
++    let mut entries = Vec::new();
++    let (mut offset, mut previous, mut used, mut next) = (0usize, 0i64, 0usize, cursor);
++    let mut reached = cursor == 0;
++    while offset < image.len() {
++        if image.len() - offset < 20 { return NotifAction::Errno(libc::EIO); }
++        let size = u16::from_le_bytes(image[offset+16..offset+18].try_into().unwrap()) as usize;
++        let cookie = i64::from_le_bytes(image[offset+8..offset+16].try_into().unwrap());
++        if size < 24 || size % 8 != 0 || size > image.len() - offset || cookie <= previous { return NotifAction::Errno(libc::EIO); }
++        let Some(name) = image[offset+19..offset+size].iter().position(|&byte| byte == 0) else { return NotifAction::Errno(libc::EIO); };
++        reached |= cursor == previous;
++        if reached {
++            if size > capacity - used { break; }
++            entries.push((offset, size, name)); used += size; next = cookie;
++        }
++        previous = cookie; offset += size;
++    }
++    if !reached && cursor != previous { return NotifAction::Errno(libc::EINVAL); }
++    if used == 0 { return if offset == image.len() { NotifAction::ReturnValue(0) } else { NotifAction::Errno(libc::EINVAL) }; }
++    // Preserve untouched user padding, just as the kernel does. No buffer read or
++    // write may silently turn a fault into a successful enumeration.
++    let mut output = match read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], used) {
++        Ok(bytes) => bytes, Err(_) => return NotifAction::Errno(libc::EFAULT),
++    };
++    let legacy = Some(notif.data.nr as i64) == crate::arch::sys_getdents();
++    let mut destination = 0;
++    for (source, size, name) in entries {
++        output[destination..destination+18].copy_from_slice(&image[source..source+18]);
++        let name_start = if legacy { 18 } else { 19 };
++        output[destination+name_start..destination+name_start+name+1].copy_from_slice(&image[source+19..source+20+name]);
++        output[destination+if legacy { size-1 } else { 18 }] = image[source+18];
++        destination += size;
++    }
++    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &output).is_err() { return NotifAction::Errno(libc::EFAULT); }
++    if unsafe { libc::lseek(pin.as_raw_fd(), next, libc::SEEK_SET) } != next { return NotifAction::Errno(libc::EIO); }
++    NotifAction::ReturnValue(used as i64)
+ }
+ 
+ // ============================================================
+@@ -2482,6 +2592,8 @@ mod mount_ro_tests {
              denied: &[],
              mounts,
              mount_ro,
 +            exec_mounts: &[],
++            directory_images: &[],
              processes,
          }
      }
-diff --git a/crates/sandlock-core/src/resource.rs b/crates/sandlock-core/src/resource.rs
-index 398d45a..56daf44 100644
---- a/crates/sandlock-core/src/resource.rs
-+++ b/crates/sandlock-core/src/resource.rs
-@@ -961,6 +961,7 @@ mod tests {
-             chroot_denied: Vec::new(),
-             chroot_mounts: Vec::new(),
-             chroot_mount_ro: Vec::new(),
-+            chroot_exec_mounts: Vec::new(),
-             deterministic_dirs: false,
-             virtual_hostname: None,
-             has_http_acl: false,
-diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
-index 8d06d60..7dbc1f8 100644
---- a/crates/sandlock-core/src/sandbox.rs
-+++ b/crates/sandlock-core/src/sandbox.rs
-@@ -179,6 +179,7 @@ impl TryFrom<&Sandbox> for Confinement {
-         if sandbox.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
-         if sandbox.on_error != BranchAction::Abort { unsupported.push("on_error"); }
-         if !sandbox.fs_mount.is_empty() { unsupported.push("fs_mount"); }
-+        if !sandbox.exec_mount.is_empty() { unsupported.push("exec_mount"); }
-         if sandbox.chroot.is_some() { unsupported.push("chroot"); }
-         if sandbox.clean_env { unsupported.push("clean_env"); }
-         if !sandbox.env.is_empty() { unsupported.push("env"); }
-@@ -498,6 +499,8 @@ pub struct Sandbox {
-     // Virtual paths (a subset of fs_mount destinations) mounted read-only:
-     // reads allowed, writes denied even on a writable rootfs.
-     pub fs_mount_ro: Vec<PathBuf>,
-+    /// Exec-only substitutions: (virtual executable, host executable/script).
-+    pub exec_mount: Vec<(PathBuf, PathBuf)>,
- 
-     // Environment
-     pub chroot: Option<PathBuf>,
-@@ -644,6 +647,7 @@ impl Clone for Sandbox {
-             on_error: self.on_error.clone(),
-             fs_mount: self.fs_mount.clone(),
-             fs_mount_ro: self.fs_mount_ro.clone(),
-+            exec_mount: self.exec_mount.clone(),
-             chroot: self.chroot.clone(),
-             in_child_main: self.in_child_main,
-             clean_env: self.clean_env,
-@@ -1203,3 +1207,10 @@ impl Sandbox {
-+    /// Preserve caller-owned descriptors using the existing child FD table.
-+    pub fn preserve_fds(&mut self, fds: &[i32]) -> Result<(), crate::error::SandlockError> {
-+        self.ensure_runtime()?;
-+        self.rt_mut().extra_fds = fds.iter().map(|&fd| (fd, fd)).collect();
-+        Ok(())
-+    }
-+
-     /// Like `create_with_io` but also maps extra fds into the child.
-     #[doc(hidden)]
-     pub async fn create_with_gather_io(
-@@ -2136,6 +2147,7 @@ impl Sandbox {
-                 chroot_denied: self.fs_denied.clone(),
-                 chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
-                 chroot_mount_ro: self.fs_mount_ro.clone(),
-+                chroot_exec_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.exec_mount),
-                 deterministic_dirs: self.deterministic_dirs,
-                 virtual_hostname: Some(rt_name),
-                 has_http_acl: resolved.features.http_acl,
-diff --git a/crates/sandlock-core/src/sandbox/builder.rs b/crates/sandlock-core/src/sandbox/builder.rs
-index 6eaa211..12fd461 100644
---- a/crates/sandlock-core/src/sandbox/builder.rs
-+++ b/crates/sandlock-core/src/sandbox/builder.rs
-@@ -169,6 +169,10 @@ pub struct SandboxBuilder {
-     #[cfg_attr(feature = "cli", clap(skip))]
-     pub fs_mount_ro: Vec<PathBuf>,
- 
-+    // Exec-only substitutions: ordinary filesystem operations keep seeing the virtual path.
-+    #[cfg_attr(feature = "cli", clap(skip))]
-+    pub exec_mount: Vec<(PathBuf, PathBuf)>,
-+
-     #[cfg_attr(feature = "cli", arg(long = "chroot"))]
-     pub chroot: Option<PathBuf>,
- 
-@@ -293,6 +297,7 @@ impl Default for SandboxBuilder {
-             on_error: None,
-             fs_mount: Vec::new(),
-             fs_mount_ro: Vec::new(),
-+            exec_mount: Vec::new(),
-             chroot: None,
-             clean_env: false,
-             env: std::collections::HashMap::new(),
-@@ -357,6 +362,7 @@ impl Clone for SandboxBuilder {
-             on_error: self.on_error.clone(),
-             fs_mount: self.fs_mount.clone(),
-             fs_mount_ro: self.fs_mount_ro.clone(),
-+            exec_mount: self.exec_mount.clone(),
-             chroot: self.chroot.clone(),
-             clean_env: self.clean_env,
-             env: self.env.clone(),
-@@ -696,6 +702,12 @@ impl SandboxBuilder {
-         self
-     }
- 
-+    /// Substitute one virtual executable without changing how that path is opened or inspected.
-+    pub fn exec_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
-+        self.exec_mount.push((virtual_path.into(), host_path.into()));
-+        self
-+    }
-+
-     pub fn clean_env(mut self, v: bool) -> Self {
-         self.clean_env = v;
-         self
-@@ -1047,6 +1059,7 @@ impl SandboxBuilder {
-             on_error: self.on_error.unwrap_or_default(),
-             fs_mount: self.fs_mount,
-             fs_mount_ro: self.fs_mount_ro,
-+            exec_mount: self.exec_mount,
-             chroot: self.chroot,
-             in_child_main: None,
-             clean_env: self.clean_env,
-diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
-index 3673d84..a6d0051 100644
---- a/crates/sandlock-core/src/seccomp/dispatch.rs
-+++ b/crates/sandlock-core/src/seccomp/dispatch.rs
-@@ -1146,6 +1146,7 @@ mod handler_tests {
-                 chroot_denied: Vec::new(),
-                 chroot_mounts: Vec::new(),
-                 chroot_mount_ro: Vec::new(),
-+                chroot_exec_mounts: Vec::new(),
-                 deterministic_dirs: false,
-                 virtual_hostname: None,
-                 has_http_acl: false,
-diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..3ccac11 100644
---- a/crates/sandlock-core/src/seccomp/notif.rs
-+++ b/crates/sandlock-core/src/seccomp/notif.rs
-@@ -787,6 +787,8 @@ pub struct NotifPolicy {
-     /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
-     /// e.g. `/proc/sys/*` writable.
-     pub chroot_mount_ro: Vec<std::path::PathBuf>,
-+    /// Exact exec-only substitutions; other syscalls continue to resolve the original path.
-+    pub chroot_exec_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-     pub deterministic_dirs: bool,
-     pub virtual_hostname: Option<String>,
-     pub has_http_acl: bool,
 diff --git a/crates/sandlock-core/src/chroot/resolve.rs b/crates/sandlock-core/src/chroot/resolve.rs
 index f796767..d448105 100644
 --- a/crates/sandlock-core/src/chroot/resolve.rs
@@ -444,9 +414,9 @@ index f796767..d448105 100644
  use std::path::{Path, PathBuf};
 +use std::os::fd::AsRawFd;
 +use std::os::unix::fs::OpenOptionsExt;
-
+ 
  use crate::sys::fs::openat2_in_root;
-
+ 
 @@ -186,10 +188,15 @@ pub fn resolve_chroot_mounts(mounts: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, Pat
      mounts
          .iter()
@@ -501,5 +471,202 @@ index f796767..d448105 100644
 +            assert_eq!(resolve_chroot_mounts(&[(destination.clone(), source)]), vec![(destination, expected)]);
 +        }
      }
-
+ 
      #[test]
+diff --git a/crates/sandlock-core/src/resolved.rs b/crates/sandlock-core/src/resolved.rs
+index 634755e..38fd708 100644
+--- a/crates/sandlock-core/src/resolved.rs
++++ b/crates/sandlock-core/src/resolved.rs
+@@ -40,6 +40,7 @@ pub(crate) struct SandboxFeatures {
+     pub(crate) virtual_hostname: bool,
+     pub(crate) cow: bool,
+     pub(crate) chroot: bool,
++    pub(crate) directory_images: bool,
+     pub(crate) fs_denies: bool,
+     pub(crate) policy_fn: bool,
+     pub(crate) port_remap: bool,
+@@ -78,6 +79,7 @@ impl SandboxFeatures {
+             virtual_hostname: sandbox_name.is_some(),
+             cow: sandbox.workdir.is_some(),
+             chroot: sandbox.chroot.is_some(),
++            directory_images: !sandbox.directory_images.is_empty(),
+             fs_denies: !sandbox.fs_denied.is_empty(),
+             policy_fn: sandbox.policy_fn.is_some(),
+             port_remap: sandbox.port_remap,
+diff --git a/crates/sandlock-core/src/resource.rs b/crates/sandlock-core/src/resource.rs
+index 398d45a..b5844a9 100644
+--- a/crates/sandlock-core/src/resource.rs
++++ b/crates/sandlock-core/src/resource.rs
+@@ -961,6 +961,8 @@ mod tests {
+             chroot_denied: Vec::new(),
+             chroot_mounts: Vec::new(),
+             chroot_mount_ro: Vec::new(),
++            chroot_exec_mounts: Vec::new(),
++                chroot_directory_images: Vec::new(),
+             deterministic_dirs: false,
+             virtual_hostname: None,
+             has_http_acl: false,
+diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
+index 8d06d60..ef03092 100644
+--- a/crates/sandlock-core/src/sandbox.rs
++++ b/crates/sandlock-core/src/sandbox.rs
+@@ -179,6 +179,7 @@ impl TryFrom<&Sandbox> for Confinement {
+         if sandbox.on_exit != BranchAction::Commit { unsupported.push("on_exit"); }
+         if sandbox.on_error != BranchAction::Abort { unsupported.push("on_error"); }
+         if !sandbox.fs_mount.is_empty() { unsupported.push("fs_mount"); }
++        if !sandbox.exec_mount.is_empty() { unsupported.push("exec_mount"); }
+         if sandbox.chroot.is_some() { unsupported.push("chroot"); }
+         if sandbox.clean_env { unsupported.push("clean_env"); }
+         if !sandbox.env.is_empty() { unsupported.push("env"); }
+@@ -498,6 +499,9 @@ pub struct Sandbox {
+     // Virtual paths (a subset of fs_mount destinations) mounted read-only:
+     // reads allowed, writes denied even on a writable rootfs.
+     pub fs_mount_ro: Vec<PathBuf>,
++    /// Exec-only substitutions: (virtual executable, host executable/script).
++    pub exec_mount: Vec<(PathBuf, PathBuf)>,
++    pub directory_images: Vec<(PathBuf, Vec<u8>)>,
+ 
+     // Environment
+     pub chroot: Option<PathBuf>,
+@@ -644,6 +648,8 @@ impl Clone for Sandbox {
+             on_error: self.on_error.clone(),
+             fs_mount: self.fs_mount.clone(),
+             fs_mount_ro: self.fs_mount_ro.clone(),
++            exec_mount: self.exec_mount.clone(),
++            directory_images: self.directory_images.clone(),
+             chroot: self.chroot.clone(),
+             in_child_main: self.in_child_main,
+             clean_env: self.clean_env,
+@@ -1200,6 +1206,13 @@ impl Sandbox {
+         self.do_create(cmd, false).await
+     }
+ 
++    /// Preserve caller-owned descriptors using the existing child FD table.
++    pub fn preserve_fds(&mut self, fds: &[i32]) -> Result<(), crate::error::SandlockError> {
++        self.ensure_runtime()?;
++        self.rt_mut().extra_fds = fds.iter().map(|&fd| (fd, fd)).collect();
++        Ok(())
++    }
++
+     /// Like `create_with_io` but also maps extra fds into the child.
+     #[doc(hidden)]
+     pub async fn create_with_gather_io(
+@@ -2136,6 +2149,8 @@ impl Sandbox {
+                 chroot_denied: self.fs_denied.clone(),
+                 chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
+                 chroot_mount_ro: self.fs_mount_ro.clone(),
++                chroot_exec_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.exec_mount),
++                chroot_directory_images: self.directory_images.clone(),
+                 deterministic_dirs: self.deterministic_dirs,
+                 virtual_hostname: Some(rt_name),
+                 has_http_acl: resolved.features.http_acl,
+diff --git a/crates/sandlock-core/src/sandbox/builder.rs b/crates/sandlock-core/src/sandbox/builder.rs
+index 6eaa211..4142dd4 100644
+--- a/crates/sandlock-core/src/sandbox/builder.rs
++++ b/crates/sandlock-core/src/sandbox/builder.rs
+@@ -169,6 +169,12 @@ pub struct SandboxBuilder {
+     #[cfg_attr(feature = "cli", clap(skip))]
+     pub fs_mount_ro: Vec<PathBuf>,
+ 
++    // Exec-only substitutions: ordinary filesystem operations keep seeing the virtual path.
++    #[cfg_attr(feature = "cli", clap(skip))]
++    pub exec_mount: Vec<(PathBuf, PathBuf)>,
++    #[cfg_attr(feature = "cli", arg(skip))]
++    pub directory_images: Vec<(PathBuf, Vec<u8>)>,
++
+     #[cfg_attr(feature = "cli", arg(long = "chroot"))]
+     pub chroot: Option<PathBuf>,
+ 
+@@ -293,6 +299,8 @@ impl Default for SandboxBuilder {
+             on_error: None,
+             fs_mount: Vec::new(),
+             fs_mount_ro: Vec::new(),
++            exec_mount: Vec::new(),
++            directory_images: Vec::new(),
+             chroot: None,
+             clean_env: false,
+             env: std::collections::HashMap::new(),
+@@ -357,6 +365,8 @@ impl Clone for SandboxBuilder {
+             on_error: self.on_error.clone(),
+             fs_mount: self.fs_mount.clone(),
+             fs_mount_ro: self.fs_mount_ro.clone(),
++            exec_mount: self.exec_mount.clone(),
++            directory_images: self.directory_images.clone(),
+             chroot: self.chroot.clone(),
+             clean_env: self.clean_env,
+             env: self.env.clone(),
+@@ -696,6 +706,18 @@ impl SandboxBuilder {
+         self
+     }
+ 
++    /// Substitute one virtual executable without changing how that path is opened or inspected.
++    pub fn exec_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
++        self.exec_mount.push((virtual_path.into(), host_path.into()));
++        self
++    }
++
++    /// Attach exact kernel entries to one private directory; never exposes a host FD.
++    pub fn directory_image(mut self, directory: impl Into<PathBuf>, bytes: Vec<u8>) -> Self {
++        self.directory_images.push((directory.into(), bytes));
++        self
++    }
++
+     pub fn clean_env(mut self, v: bool) -> Self {
+         self.clean_env = v;
+         self
+@@ -1047,6 +1069,8 @@ impl SandboxBuilder {
+             on_error: self.on_error.unwrap_or_default(),
+             fs_mount: self.fs_mount,
+             fs_mount_ro: self.fs_mount_ro,
++            exec_mount: self.exec_mount,
++            directory_images: self.directory_images,
+             chroot: self.chroot,
+             in_child_main: None,
+             clean_env: self.clean_env,
+diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
+index 3673d84..f638d32 100644
+--- a/crates/sandlock-core/src/seccomp/dispatch.rs
++++ b/crates/sandlock-core/src/seccomp/dispatch.rs
+@@ -956,6 +956,7 @@ fn register_chroot_handlers(
+ 
+     // getdents
+     let mut getdents_nrs = vec![libc::SYS_getdents64];
++    if !policy.chroot_directory_images.is_empty() { getdents_nrs.push(libc::SYS_lseek); }
+     if let Some(getdents) = arch::sys_getdents() {
+         getdents_nrs.push(getdents);
+     }
+@@ -1146,6 +1147,8 @@ mod handler_tests {
+                 chroot_denied: Vec::new(),
+                 chroot_mounts: Vec::new(),
+                 chroot_mount_ro: Vec::new(),
++                chroot_exec_mounts: Vec::new(),
++                chroot_directory_images: Vec::new(),
+                 deterministic_dirs: false,
+                 virtual_hostname: None,
+                 has_http_acl: false,
+diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
+index abcd92c..b896889 100644
+--- a/crates/sandlock-core/src/seccomp/notif.rs
++++ b/crates/sandlock-core/src/seccomp/notif.rs
+@@ -787,6 +787,9 @@ pub struct NotifPolicy {
+     /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
+     /// e.g. `/proc/sys/*` writable.
+     pub chroot_mount_ro: Vec<std::path::PathBuf>,
++    /// Exact exec-only substitutions; other syscalls continue to resolve the original path.
++    pub chroot_exec_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
++    pub chroot_directory_images: Vec<(std::path::PathBuf, Vec<u8>)>,
+     pub deterministic_dirs: bool,
+     pub virtual_hostname: Option<String>,
+     pub has_http_acl: bool,
+diff --git a/crates/sandlock-core/src/seccomp_plan.rs b/crates/sandlock-core/src/seccomp_plan.rs
+index 03fc456..f2efc5c 100644
+--- a/crates/sandlock-core/src/seccomp_plan.rs
++++ b/crates/sandlock-core/src/seccomp_plan.rs
+@@ -415,6 +415,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
+     // Chroot path interception
+     if features.chroot {
+         nrs.extend(&chroot_path_syscalls());
++        if features.directory_images { nrs.push(libc::SYS_lseek); }
+     }
+ 
+     // Explicit deny-paths need path-bearing syscalls intercepted.

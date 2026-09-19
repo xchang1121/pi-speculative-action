@@ -96,8 +96,9 @@ export class ToolExecutionGateway<Context, Output> {
 	}
 
 	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false): Promise<Value> {
-		return this.router.observeOperations(action, scope, execute, observe, learn);
+		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
+		inputs?: (path: string) => Iterable<object>): Promise<Value> {
+		return this.router.observeOperations(action, scope, execute, observe, learn, inputs);
 	}
 
 	captureAuthoritativeResult(

@@ -641,7 +641,7 @@ export function makeSpeculativeActionRuntime<
 	const acquireCandidate = (session: Session, candidate: Candidate, owner: string) =>
 		candidateStore.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
 
-	const borrowCandidateInputs = (session: Session, source: Candidate, owner: string) => {
+	const borrowCandidateInputs = (session: Session, source: Candidate | undefined, owner: string) => {
 		const leases = new Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>>();
 		let closed = false;
 		return {
@@ -1621,7 +1621,7 @@ export function makeSpeculativeActionRuntime<
 		actorAction: ActorAction<Candidate, Output>,
 		action: ActionKey,
 		signal?: AbortSignal,
-	): Promise<void> => {
+	): Promise<AuthoritativeResultCapture<Output> | undefined> => {
 		if (!adapter.captureAuthoritativeResult || !state.actorActions.has(actorAction)) return;
 		const concrete = asConcreteInput(actualCall.input);
 		if (!concrete) return;
@@ -1654,6 +1654,7 @@ export function makeSpeculativeActionRuntime<
 			state.session.lifecycle.release(capture);
 			return;
 		}
+		return capture;
 	};
 
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
@@ -1933,8 +1934,15 @@ export function makeSpeculativeActionRuntime<
 		state.actorActions.add(actorAction);
 		state.actorObservation ??= actualKey ? identity : null;
 		let capturePreparationMs = 0;
-		const prepared: { output?: Output; observeOperations: boolean; settle: PreparedActorCall<Output>["settle"] } = {
+		let captureInputSource: object | undefined;
+		const prepared: PreparedActorCall<Output> & { output?: Output } = {
 			observeOperations: state.settings.enabled && sources.some(source => source.observesOperations && source.observe && source.enabled(state.settings)),
+			withInputs: async execute => {
+				const inputs = borrowCandidateInputs(state.session, undefined, `inputs:actor:${identity.id}`);
+				try { return await execute(function* (target) {
+					yield* inputs.lookup(target); if (captureInputSource) yield captureInputSource;
+				}); } finally { inputs.dispose(); }
+			},
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
 				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]))),
 		};
@@ -2029,9 +2037,9 @@ export function makeSpeculativeActionRuntime<
 			const effect = semantics.effect(actualKey);
 			preemptForActor(state.session, state.settings);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
-			if (adapter.captureAuthoritativeResult && (effect === "observation" || effect === "workspace_mutation")) {
+			if (adapter.captureAuthoritativeResult && (effect === "observation" || effect === "workspace_mutation" || prepared.observeOperations)) {
 				const startedAt = performance.now();
-				await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal);
+				captureInputSource = (await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal))?.inputSource;
 				capturePreparationMs = Math.max(0, performance.now() - startedAt);
 			}
 			return Object.freeze(prepared);

@@ -3,7 +3,7 @@ import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
-import type { StableFileCapture } from "./filesystem-evidence.ts";
+import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
 import {
@@ -88,7 +88,7 @@ export async function captureWorkspaceStructure(
 		const batch = pending.slice(cursor, cursor + FILESYSTEM_CONCURRENCY);
 		cursor += batch.length;
 		const captured = await mapFilesystem(batch, async (relative) => {
-			const target = path.join(absoluteRoot, relative), stat = await lstat(target);
+			const target = path.join(absoluteRoot, relative), stat = await lstat(target, { bigint: true });
 			const children = !relative || stat.isDirectory() ? await readdir(target, { withFileTypes: true }) : [];
 			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
 			return { relative, entry, children };
@@ -103,7 +103,24 @@ export async function captureWorkspaceStructure(
 			}
 		}
 	}
-	return Object.freeze({ root: absoluteRoot, entries, files, bytesRead: 0, complete });
+	return workspaceStructureSnapshot(absoluteRoot, entries, complete);
+}
+
+/** Resolve namespace aliases in the same captured structure, including layered mutation frontiers. */
+export function workspaceStructureSnapshot(root: string, entries: Map<string, WorkspaceStructureEntry>, complete: boolean): WorkspaceStructureSnapshot {
+	const objects = new Map<string, string[]>();
+	for (const [name, entry] of entries) if (entry.kind === "file" && entry.links > 1 && entry.object) {
+		const aliases = objects.get(entry.object) ?? []; aliases.push(name); objects.set(entry.object, aliases);
+	}
+	for (const names of objects.values()) {
+		const aliases = Object.freeze(names.map(name => path.join(root, name)).sort());
+		for (const name of names) {
+			const entry = entries.get(name)! as Extract<WorkspaceStructureEntry, { kind: "file" }>;
+			if (entry.links !== names.length) complete = false;
+			entries.set(name, { ...entry, aliases });
+		}
+	}
+	return Object.freeze({ root, entries, files: Math.max(0, entries.size - 1), bytesRead: 0, complete });
 }
 
 /** Capture one path without walking its descendants; used by typed mutation-frontier drivers. */
@@ -111,9 +128,9 @@ export async function captureWorkspaceStructureEntry(
 	target: string,
 	excludeEntries: readonly string[] = [],
 ): Promise<WorkspaceStructureEntry | undefined> {
-	let stat: Stats;
+	let stat: BigIntStats;
 	try {
-		stat = await lstat(target);
+		stat = await lstat(target, { bigint: true });
 	} catch (error) {
 		if (isMissing(error)) return undefined;
 		throw error;
@@ -123,11 +140,11 @@ export async function captureWorkspaceStructureEntry(
 
 async function captureExistingWorkspaceStructureEntry(
 	target: string,
-	stat: Stats,
+	stat: BigIntStats,
 	excludeEntries: readonly string[] = [],
 	children?: readonly Dirent[],
 ): Promise<WorkspaceStructureEntry> {
-	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: stat.ctimeMs };
+	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: statMilliseconds(stat, "ctime") };
 	if (stat.isSymbolicLink()) {
 		const linkTarget = await readlink(target);
 		return {
@@ -145,9 +162,9 @@ async function captureExistingWorkspaceStructureEntry(
 			entriesDigest: directoryEntriesDigest(entries),
 			metadataDigest: filesystemMetadataDigest(stat),
 			...change,
-			mode: stat.mode & 0o777,
-			uid: stat.uid,
-			gid: stat.gid,
+			mode: Number(stat.mode & 0o777n),
+			uid: Number(stat.uid),
+			gid: Number(stat.gid),
 		};
 	}
 	if (stat.isFile()) {
@@ -155,9 +172,12 @@ async function captureExistingWorkspaceStructureEntry(
 			kind: "file",
 			metadataDigest: filesystemMetadataDigest(stat),
 			...change,
-			mode: stat.mode & 0o777,
-			size: stat.size,
-			links: stat.nlink,
+			mode: Number(stat.mode & 0o777n),
+			size: Number(stat.size),
+			links: Number(stat.nlink),
+			object: `${stat.dev}:${stat.ino}`,
+			modified: String(stat.mtimeNs),
+			ownership: `${stat.uid}:${stat.gid}:${stat.mode & 0o7000n}`,
 		};
 	}
 	return {
@@ -212,6 +232,15 @@ export function diffWorkspaceStructures(
 
 	const effects: WorkspaceTransactionEffect[] = [];
 	const names = [...new Set([...before.entries.keys(), ...after.entries.keys(), ...byPath.keys()])].sort();
+	const anchors = (snapshot: WorkspaceStructureSnapshot) => {
+		const result = new Map<string, string>();
+		for (const name of names) {
+			const entry = snapshot.entries.get(name);
+			if (entry?.kind === "file" && entry.object && !result.has(entry.object)) result.set(entry.object, name);
+		}
+		return result;
+	};
+	const originals = anchors(before), results = anchors(after);
 	for (const relativePath of names) {
 		if (!relativePath) continue;
 		const previous = before.entries.get(relativePath);
@@ -220,7 +249,21 @@ export function diffWorkspaceStructures(
 		if (delta) {
 			const reason = regularDeltaFailure(relativePath, previous, current, delta);
 			if (reason) return { effects: [], complete: false, reason };
-			effects.push({ logicalPath: projection.toLogical(path.join(after.root, relativePath)), relativePath, change: delta });
+			let change: WorkspaceRegularDelta = delta;
+			if (previous?.kind === "file" && previous.aliases) change = { ...change, aliases: previous.aliases.map(name => projection.toLogical(name)).sort() };
+			if (current?.kind === "file" && current.object) {
+				const original = originals.get(current.object), anchor = original ?? results.get(current.object)!;
+				if (original !== undefined || anchor !== relativePath) {
+					if (!byPath.has(anchor)) return { effects: [], complete: false, reason: `object_anchor_missing:${anchor}` };
+					change = { ...change, object: { path: projection.toLogical(path.join(after.root, anchor)), before: original !== undefined } };
+				}
+				const source = original === undefined ? undefined : before.entries.get(original);
+				if (source?.kind === "file" &&
+					(source.modified !== current.modified || !Buffer.from(byPath.get(anchor)!.before!).equals(Buffer.from(delta.after!)))) {
+					change = { ...change, operation: "write_contents" };
+				}
+			}
+			effects.push({ logicalPath: projection.toLogical(path.join(after.root, relativePath)), relativePath, change });
 			continue;
 		}
 		if (sameStructureEntry(previous, current)) continue;
@@ -256,7 +299,7 @@ export function diffWorkspaceStructures(
 
 export function hydrateWorkspaceFileEntry(
 	entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
-	content: Uint8Array | StableFileCapture,
+	content: Uint8Array | StableFilesystemCapture,
 ): Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined {
 	if ("hash" in content) {
 		if (statChangeDigest(content.stat) !== entry.changeDigest) return undefined;
@@ -275,7 +318,7 @@ function regularDeltaFailure(
 		if (previous !== undefined) return `delta_before_missing:${relativePath}`;
 	} else {
 		if (previous?.kind !== "file") return `delta_before_type:${relativePath}`;
-		if (previous.links !== 1) return `unsupported_hardlink:${relativePath}`;
+		if (previous.links > 1 && previous.aliases?.length !== previous.links) return `unproven_aliases:${relativePath}`;
 		if (delta.beforeMode !== undefined && delta.beforeMode !== previous.mode) {
 			return `delta_before_mode:${relativePath}`;
 		}
@@ -286,7 +329,8 @@ function regularDeltaFailure(
 		return delta.before === undefined || current !== undefined ? `delta_delete_shape:${relativePath}` : undefined;
 	}
 	if (current?.kind !== "file") return `delta_after_type:${relativePath}`;
-	if (current.links !== 1) return `unsupported_hardlink:${relativePath}`;
+	if (previous?.kind === "file" && previous.ownership !== current.ownership) return `unsupported_file_ownership:${relativePath}`;
+	if (current.links > 1 && current.aliases?.length !== current.links) return `unproven_aliases:${relativePath}`;
 	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) {
 		return `delta_after_mode:${relativePath}`;
 	}
@@ -321,6 +365,7 @@ export function snapshotDependency(
 				role,
 				contentDigest: entry.digest,
 				metadataDigest: entry.metadataDigest,
+				...(entry.aliases ? { aliases: entry.aliases } : {}),
 			};
 		case "directory":
 			return {
@@ -347,7 +392,8 @@ function sameStructureEntry(
 	switch (left.kind) {
 		case "file": {
 			const value = right as Extract<WorkspaceStructureEntry, { kind: "file" }>;
-			return left.size === value.size && left.metadataDigest === value.metadataDigest;
+			return left.size === value.size && left.metadataDigest === value.metadataDigest && left.object === value.object &&
+				JSON.stringify(left.aliases) === JSON.stringify(value.aliases);
 		}
 		case "directory": {
 			const value = right as Extract<WorkspaceStructureEntry, { kind: "directory" }>;
@@ -377,18 +423,19 @@ export function directoryEntriesDigest(entries: readonly (FilesystemTypeEvidence
 }
 
 /** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */
+function statMilliseconds(stat: Stats | BigIntStats, field: "ctime" | "mtime"): number {
+	const ns = (stat as BigIntStats)[`${field}Ns`];
+	if (ns === undefined) return Number(stat[`${field}Ms`]);
+	const remainder = (ns % 1_000_000_000n + 1_000_000_000n) % 1_000_000_000n;
+	return Number((ns - remainder) / 1_000_000_000n) * 1_000 + Number(remainder) / 1_000_000;
+}
+
 function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
-	const milliseconds = (field: "ctime" | "mtime") => {
-		const ns = (stat as BigIntStats)[`${field}Ns`];
-		if (ns === undefined) return stat[`${field}Ms`];
-		const remainder = (ns % 1_000_000_000n + 1_000_000_000n) % 1_000_000_000n;
-		return Number((ns - remainder) / 1_000_000_000n) * 1_000 + Number(remainder) / 1_000_000;
-	};
 	return digestObject({
 		dev: Number(stat.dev),
 		ino: Number(stat.ino),
-		ctimeMs: milliseconds("ctime"),
-		mtimeMs: milliseconds("mtime"),
+		ctimeMs: statMilliseconds(stat, "ctime"),
+		mtimeMs: statMilliseconds(stat, "mtime"),
 		mode: Number(stat.mode),
 		size: Number(stat.size),
 		links: Number(stat.nlink),

@@ -23,6 +23,21 @@ type TestWorld = BaseTestWorld & { readonly speculation: NonNullable<BaseTestWor
 const preparation = { cwd: "/workspace" };
 
 describe("ExecutionWorldRouter", () => {
+	it("admits process input observation without granting process execution or result replay", async () => {
+		const request = { effect: "unbounded" as const, requirements: UNRESTRICTED_PROCESS_EFFECTS };
+		let inputsOnly = false;
+		const dispose = vi.fn(), base = fallback("inputs", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
+		const router = new ExecutionWorldRouter([{ ...base, observation: { capabilities: [], inputsOnly: () => true,
+			capture: async () => ({ ...(inputsOnly ? { inputsOnly: true as const } : {}), dispose,
+				seal: async () => { throw new Error("unused"); } }) } }]);
+		expect(await router.resolve(request, preparation)).toBeUndefined();
+		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" })).toBeUndefined();
+		expect(dispose).toHaveBeenCalledOnce(); inputsOnly = true;
+		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" }))
+			.toMatchObject({ route: { reuse: "shared_result" }, capture: { inputsOnly: true } });
+		await router.dispose();
+	});
+
 	it("uses one runtime sandbox for every effect, then exact local fallbacks, then blocks", async () => {
 		const resource = fallback("resource", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
 		const workspace = fallback("workspace", "workspace_branch", WORKSPACE_PATH_MUTATION_EFFECTS.capabilities);

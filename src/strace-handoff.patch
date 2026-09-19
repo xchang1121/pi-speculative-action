@@ -1,0 +1,242 @@
+--- a/src/strace.c
++++ b/src/strace.c
+@@ -27,6 +27,10 @@
+ #include <locale.h>
+ #include <sys/utsname.h>
+ #include <sys/prctl.h>
++#include <sys/user.h>
++#include <stddef.h>
++#include <dlfcn.h>
++#include <sys/socket.h>
+ 
+ #include "kill_save_errno.h"
+ #include "exitkill.h"
+@@ -2231,6 +2235,110 @@
+  * Don't want main() to inline us and defeat the reason
+  * we have a separate function.
+  */
++static int handoff_fd = -1;
++static const char *handoff_library, *handoff_image;
++static int (*handoff_capture)(pid_t, const char *, unsigned long);
++static int (*handoff_frontier)(long);
++static struct tcb *pid2tcb(const int pid);
++static pid_t handoff_pid;
++static volatile sig_atomic_t handoff_requested;
++
++struct handoff_reply { int32_t pid, fd, syscall, reserved; uint64_t bytes, started, frontier; };
++static uint64_t handoff_clock(void)
++{
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now)) perror_msg_and_die("handoff clock");
++    return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++}
++static void handoff_reply(struct handoff_reply reply)
++{
++    unsigned char *bytes = (unsigned char *)&reply;
++    size_t left = sizeof(reply);
++    while (left) {
++        ssize_t size = write(handoff_fd, bytes, left);
++        if (size < 0 && errno == EINTR) continue;
++        if (size <= 0) perror_msg_and_die("handoff reply");
++        left -= size; bytes += size;
++    }
++}
++static void handoff_signal(int sig) { (void)sig; handoff_requested = 1; }
++
++static void handoff_watch(struct tcb *tcp)
++{
++    struct user_regs_struct regs;
++    if (handoff_fd < 0 || entering(tcp) || tcp->scno != 218 || ptrace(PTRACE_GETREGS, tcp->pid, 0, &regs) < 0 ||
++        regs.orig_rax != 218 || (long)regs.rax < 0) return;
++    if (tcp->handoff_tid_state || !regs.rdi || (regs.rdi & 3) || regs.cs != 0x33) {
++        tcp->handoff_tid_state = 3;
++        return;
++    }
++    tcp->handoff_tid = regs.rdi; tcp->handoff_tid_value = regs.rax;
++    tcp->handoff_tid_state = 1;
++    if (ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[0]), regs.rdi) < 0 ||
++        ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[6]), 0) < 0 ||
++        ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[7]), 1 | (3 << 16) | (3 << 18)) < 0)
++        tcp->handoff_tid_state = 3;
++}
++
++static bool handoff_watch_stop(struct tcb *tcp, int status)
++{
++    if (handoff_fd < 0 || !tcp || !tcp->handoff_tid_state || !WIFSTOPPED(status) ||
++        WSTOPSIG(status) != SIGTRAP || (unsigned)status >> 16) return false;
++    errno = 0;
++    long cause = ptrace(PTRACE_PEEKUSER, tcp->pid, offsetof(struct user, u_debugreg[6]), 0);
++    if (errno || !(cause & 1)) return false;
++    struct user_regs_struct regs;
++    long value = ptrace(PTRACE_PEEKDATA, tcp->pid, tcp->handoff_tid, 0);
++    if (tcp->handoff_tid_state == 1 && !errno && (unsigned int)value == tcp->handoff_tid_value &&
++        ptrace(PTRACE_GETREGS, tcp->pid, 0, &regs) == 0) {
++        unsigned long words[2];
++        words[0] = ptrace(PTRACE_PEEKTEXT, tcp->pid, regs.rip - 8, 0);
++        words[1] = ptrace(PTRACE_PEEKTEXT, tcp->pid, regs.rip, 0);
++        const unsigned char *bytes = (const unsigned char *)words;
++        int32_t store_offset, kill_offset;
++        memcpy(&store_offset, bytes + 4, 4); memcpy(&kill_offset, bytes + 11, 4);
++        /* Kernel TID flows directly from syscall to the watched word, then RAX
++         * is overwritten without reading it. Unknown instruction shapes decline. */
++        if (!errno && !memcmp(bytes, "\x0f\x05\x89\x83", 4) && !memcmp(bytes + 8, "\x48\x8d\x83", 3) &&
++            regs.rbx + store_offset == tcp->handoff_tid && (unsigned int)regs.rax == tcp->handoff_tid_value) {
++            struct user_regs_struct after;
++            int stepped; pid_t waited;
++            if (ptrace(PTRACE_SINGLESTEP, tcp->pid, 0, 0) < 0) perror_msg_and_die("handoff initialization step");
++            do { waited = waitpid(tcp->pid, &stepped, __WALL); } while (waited < 0 && errno == EINTR);
++            if (waited != tcp->pid ||
++                !WIFSTOPPED(stepped) || WSTOPSIG(stepped) != SIGTRAP || (unsigned)stepped >> 16 ||
++                ptrace(PTRACE_GETREGS, tcp->pid, 0, &after) < 0 || after.rip != regs.rip + 7 || after.rax != regs.rbx + kill_offset)
++                error_msg_and_die("handoff TID initialization interrupted");
++            tcp->handoff_tid_state = 2;
++        } else tcp->handoff_tid_state = 3;
++    } else {
++        tcp->handoff_tid_state = 3;
++        ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[7]), 0);
++    }
++    if (tcp->handoff_tid_state == 3) {
++        if (ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[7]), 0) < 0) perror_msg_and_die("handoff watch disarm");
++        if (handoff_pid == tcp->pid) { handoff_pid = 0; handoff_reply((struct handoff_reply){0}); }
++    }
++    if (ptrace(PTRACE_POKEUSER, tcp->pid, offsetof(struct user, u_debugreg[6]), 0) < 0 ||
++        ptrace(PTRACE_SYSCALL, tcp->pid, 0, 0) < 0) perror_msg_and_die("handoff watch restart");
++    return true;
++}
++
++static void handoff_request(void)
++{
++    if (!handoff_requested) return;
++    handoff_requested = 0;
++    pid_t pid;
++    ssize_t size = recv(handoff_fd, &pid, sizeof(pid), MSG_DONTWAIT);
++    if (size < 0 && (errno == EAGAIN || errno == EINTR)) return;
++    if (size != sizeof(pid) || pid <= 0 || handoff_pid) error_msg_and_die("invalid handoff request");
++    struct tcb *tcp = pid2tcb(pid);
++    if (!tcp || tcp->handoff_tid_state == 1 || tcp->handoff_tid_state == 3 || ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0) {
++        handoff_reply((struct handoff_reply){0}); return;
++    }
++    handoff_pid = pid;
++}
++
+ static void ATTRIBUTE_NOINLINE
+ init(int argc, char *argv[])
+ {
+@@ -2364,6 +2472,10 @@
+ 		{ "help",		no_argument,	   0, 'h' },
+ 		{ "instruction-pointer", no_argument,      0, 'i' },
+ 		{ "interruptible",	required_argument, 0, 'I' },
++		{ "handoff-fd", required_argument, 0, 0x4000 },
++        { "handoff-library", required_argument, 0, 0x4001 },
++        { "handoff-image", required_argument, 0, 0x4002 },
++        { "handoff-version", no_argument, 0, 0x4003 },
+ 		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
+ 		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
+ 		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
+@@ -2564,6 +2676,14 @@
+ 					  "by this build of strace");
+ #endif
+ 			break;
++        case 0x4000:
++            handoff_fd = string_to_uint(optarg);
++            if (handoff_fd < 3 || fcntl(handoff_fd, F_SETFD, FD_CLOEXEC) < 0)
++                error_opt_arg(c, lopt, optarg);
++            break;
++        case 0x4001: handoff_library = optarg; break;
++        case 0x4002: handoff_image = optarg; break;
++        case 0x4003: puts("2"); exit(0);
+ 		case GETOPT_KILL_ON_EXIT:
+ 			opt_kill_on_exit = true;
+ 			break;
+@@ -3007,6 +3127,9 @@
+ 
+ 	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
+ 	test_ptrace_seize();
++    if (handoff_fd >= 0 && (!use_seize || !opt_kill_on_exit || followfork != 1 || daemonized_tracer || !handoff_library || !handoff_image)) {
++        error_msg_and_die("handoff requires seized, non-daemonized -f --kill-on-exit");
++    }
+ 	test_ptrace_get_syscall_info();
+ 
+ 	/*
+@@ -3588,6 +3711,7 @@
+ static const struct tcb_wait_data *
+ next_event(void)
+ {
++	handoff_request();
+ 	if (interrupted)
+ 		return NULL;
+ 
+@@ -3913,6 +4037,26 @@
+ 	 * around union wait fixed by glibc commit glibc-2.24~391
+ 	 */
+ 	int status = wd ? wd->status : 0;
++    if (handoff_watch_stop(current_tcp, status)) return true;
++    if (current_tcp && current_tcp->pid == handoff_pid && WIFSTOPPED(status) &&
++        ((unsigned)status >> 16 == PTRACE_EVENT_STOP || WSTOPSIG(status) == syscall_trap_sig)) {
++        pid_t pid = handoff_pid; handoff_pid = 0;
++        struct user_regs_struct regs;
++        if (current_tcp->handoff_tid_state == 1 || current_tcp->handoff_tid_state == 3 || !current_tcp->handoff_started ||
++            !current_tcp->handoff_entered || ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0 || !handoff_frontier(regs.orig_rax) ||
++            ((long)regs.rax != -512 && (long)regs.rax != -514)) {
++            handoff_reply((struct handoff_reply){0});
++        } else {
++            if (fflush(current_tcp->outf)) perror_msg_and_die("handoff trace flush");
++            off_t boundary = ftello(current_tcp->outf);
++            struct handoff_reply reply = {.pid = pid, .fd = regs.rdi, .syscall = regs.orig_rax, .bytes = boundary,
++                .started = current_tcp->handoff_started, .frontier = current_tcp->handoff_entered};
++            if (boundary < 0 || handoff_capture(pid, handoff_image, current_tcp->handoff_tid_state == 2 ? current_tcp->handoff_tid : 0)) reply.pid = -pid;
++            if (kill(pid, SIGKILL)) perror_msg_and_die("handoff retirement");
++            handoff_reply(reply);
++            return true;
++        }
++    }
+ 
+ 	if (current_tcp && has_seccomp_filter(current_tcp))
+ 		restart_op = seccomp_filter_restart_operator(current_tcp);
+@@ -3951,6 +4095,8 @@
+ 		ATTRIBUTE_FALLTHROUGH;
+ 
+ 	case TE_SYSCALL_STOP:
++        if (handoff_fd >= 0 && entering(current_tcp)) current_tcp->handoff_entered = handoff_clock();
++        handoff_watch(current_tcp);
+ 		if (trace_syscall(current_tcp, &restart_sig) < 0) {
+ 			/*
+ 			 * ptrace() failed in trace_syscall().
+@@ -4034,6 +4180,9 @@
+ 		return true;
+ 
+ 	case TE_STOP_BEFORE_EXECVE:
++        current_tcp->handoff_tid = 0;
++        current_tcp->handoff_tid_state = 0;
++        if (handoff_fd >= 0) { current_tcp->handoff_started = handoff_clock(); current_tcp->handoff_entered = 0; }
+ 		/* The syscall succeeded, clear the flag.  */
+ 		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
+ 		/*
+@@ -4231,6 +4380,15 @@
+ {
+ 	setlocale(LC_ALL, "");
+ 	init(argc, argv);
++	if (handoff_library) {
++        void *library = dlopen(handoff_library, RTLD_NOW | RTLD_LOCAL);
++        if (!library || !handoff_image) error_msg_and_die("invalid handoff library: %s", dlerror());
++        handoff_capture = dlsym(library, "pi_capture_process_image");
++        unsigned (*protocol)(void) = dlsym(library, "pi_process_image_protocol");
++        handoff_frontier = dlsym(library, "pi_process_image_frontier");
++        if (!handoff_capture || !handoff_frontier || !protocol || protocol() != 34) error_msg_and_die("incompatible capture ABI");
++    }
++	if (handoff_fd >= 0) set_sighandler(SIGUSR2, handoff_signal, NULL);
+ 
+ 	exit_code = !nprocs;
+ 
+--- a/src/defs.h
++++ b/src/defs.h
+@@ -267,6 +267,9 @@
+ struct tcb {
+ 	int flags;		/* See below for TCB_ values */
+ 	int pid;		/* If 0, this tcb is free */
++	unsigned long handoff_tid;
++	unsigned int handoff_tid_value, handoff_tid_state;
++	uint64_t handoff_started, handoff_entered;
+ 	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
+ # if SUPPORTED_PERSONALITIES > 1
+ 	unsigned int currpers;	/* Personality at the time of scno update */

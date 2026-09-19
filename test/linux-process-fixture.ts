@@ -70,6 +70,7 @@ export async function createLinuxProcessBenchmark(
 		storeRoot,
 		...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
 		...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}),
+		...(process.env.PI_SPEC_STRACE ? { straceBinary: process.env.PI_SPEC_STRACE } : {}),
 	});
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {

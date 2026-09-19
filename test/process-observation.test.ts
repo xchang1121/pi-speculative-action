@@ -46,7 +46,7 @@ describe("process observation", () => {
 		expect(diff.complete).toBe(true);
 		expect(diff.effects).toHaveLength(1);
 		expect(diff.effects[0]).toMatchObject({ logicalPath: projection.toLogical(target), relativePath: "value.bin" });
-		expect(diff.effects[0]?.change).toBe(delta);
+		expect(diff.effects[0]?.change).toMatchObject({ ...delta, operation: "write_contents", object: { path: projection.toLogical(target), before: true } });
 		const input = hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
 		expect(hydrateWorkspaceFileEntry(beforeEntry, captured)).toEqual(input);
 		expect(hydrateWorkspaceFileEntry(beforeEntry, await captureStableFile(target))).toBeUndefined();
@@ -108,7 +108,7 @@ describe("process observation", () => {
 			projection,
 		);
 
-		expect(diff).toMatchObject({ complete: false, reason: expect.stringContaining("unsupported_hardlink") });
+		expect(diff).toMatchObject({ complete: false, reason: expect.stringContaining("object_anchor_missing") });
 	});
 });
 

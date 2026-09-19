@@ -220,6 +220,8 @@ export async function validateWorldBranch<Output>(branch: Pick<WorldBranch<Outpu
 export interface WorldResultCapture<Output> {
 	/** The capture retains inputs only; it cannot authorize reuse of the captured action's output. */
 	readonly inputsOnly?: true;
+	/** Revocable input sink available during the authoritative execution. */
+	readonly inputSource?: object;
 	/** Transfer the captured baseline into a normal branch. May be called at most once. */
 	readonly seal: (output: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;
 	/** Release an unsealed baseline. Idempotent; a sealed branch owns its own cleanup. */
@@ -341,6 +343,8 @@ export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWor
 }
 
 export interface ExecutionWorldObservation<Context, Output> extends ExecutionWorldOperation {
+	/** Observe inputs without claiming authority over the action's other effects or output. */
+	readonly inputsOnly?: (request: ExecutionWorldRequest) => boolean;
 	/** Capture freshness before a host-authoritative execution without executing the tool again. */
 	readonly capture: (context: Context) => Promise<WorldResultCapture<Output>>;
 }
@@ -353,7 +357,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
-	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope; readonly learn?: boolean },
+	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path: string) => Iterable<object> },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
@@ -409,13 +413,14 @@ export class ExecutionWorldRouter<Context, Output> {
 	}
 
 	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false): Promise<Value> {
+		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
+		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations || !supportsTool(world.speculation ?? world.observation!, action.tool)) continue;
 			let learning = false;
 			try { learning = learn && this.speculationEnabled(world.id); } catch { /* Optional observation cannot deny the Actor call. */ }
 			const next = execute;
-			execute = () => world.observeOperations!({ action, scope, learn: learning }, next, observe);
+			execute = () => world.observeOperations!({ action, scope, learn: learning, inputs }, next, observe);
 		}
 		return execute();
 	}
@@ -432,6 +437,9 @@ export class ExecutionWorldRouter<Context, Output> {
 			preparation,
 			async (world, route) => {
 				const capture = await world.observation!.capture(context);
+				if (!effectCapabilitiesCover(world.observation!.capabilities, request.requirements) && !capture.inputsOnly) {
+					await capture.dispose(); throw new Error("input_only_capture_required");
+				}
 				return Object.freeze({ route: capture.inputsOnly ? Object.freeze({ ...route, reuse: "shared_result" as const }) : route, capture });
 			},
 		));
@@ -503,7 +511,8 @@ export class ExecutionWorldRouter<Context, Output> {
 				if (!operation) continue;
 				try {
 					if (!supportsTool(operation, request.action?.tool ?? request.tool)) continue;
-					if (!effectCapabilitiesCover(operation.capabilities, request.requirements)) continue;
+					if (!effectCapabilitiesCover(operation.capabilities, request.requirements) &&
+						!(kind === "observation" && world.observation?.inputsOnly?.(request))) continue;
 					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await operation.prepare?.(preparation);
 					this.observeRoute(world.id, kind, preparation.cwd, "ready", "Route prepared successfully");

@@ -57,6 +57,14 @@ export interface ProcessHandoff {
 	readonly startedAt: number;
 	/** A running owner's bounded negative lookup; false never authorizes adoption. */
 	readonly inputsChanged?: () => Promise<boolean>;
+	/** Owned producer may freeze a proved frontier; completion still seals its evidence. */
+	readonly suspend?: (signal?: AbortSignal) => Promise<void>;
+}
+
+export interface ProcessContinuation {
+	readonly image: Buffer;
+	readonly physicalRoot: string;
+	readonly computation: TimelineInterval;
 }
 
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
@@ -69,7 +77,7 @@ export interface ProcessExecutionBinding {
 }
 
 type HandoffState =
-	| { readonly status: "running"; inputsChanged?: () => Promise<boolean> }
+	| { readonly status: "running"; inputsChanged?: () => Promise<boolean>; suspend?: () => Promise<void> }
 	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
@@ -80,10 +88,11 @@ interface HandoffRecord extends ProcessHandoff {
 	computation?: TimelineInterval;
 	readonly executablePath: string;
 	readonly settle: () => void;
+	continuation?: ProcessContinuation;
 }
 
 export type ProcessHandoffAcquisition<Plan> =
-	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff }
+	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation }
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
 
@@ -109,19 +118,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
 	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
 	private maxCompleted: number;
-	private maxBindingBytes: number;
-	private bindingBytes = 0;
+	private maxRetainedBytes: number;
+	private retainedBytes = 0;
 	private completedCount = 0;
 	private disposed = false;
 
-	constructor(maxCompleted: number, maxBindingBytes = 0) {
+	constructor(maxCompleted: number, maxRetainedBytes = 0) {
 		this.maxCompleted = maxCompleted;
-		this.maxBindingBytes = maxBindingBytes;
+		this.maxRetainedBytes = maxRetainedBytes;
 	}
 
-	configure(maxCompleted: number, maxBindingBytes = this.maxBindingBytes): void {
+	configure(maxCompleted: number, maxRetainedBytes = this.maxRetainedBytes): void {
 		this.maxCompleted = maxCompleted;
-		this.maxBindingBytes = maxBindingBytes;
+		this.maxRetainedBytes = maxRetainedBytes;
 		this.trim();
 	}
 
@@ -146,11 +155,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private retainBinding(key: Sha256Digest, record: HandoffRecord, invocation: Invocation, executionMs: number): ProcessExecutionBinding | undefined {
-		if (!record.scope || record.binding || this.maxBindingBytes <= 0) return;
+		if (!record.scope || record.binding || this.maxRetainedBytes <= 0) return;
 		const value = immutableSnapshot(invocation);
 		if (!isImmutableSnapshot(value)) return;
 		const bytes = Buffer.byteLength(JSON.stringify(value));
-		if (bytes > this.maxBindingBytes) return;
+		if (bytes > this.maxRetainedBytes) return;
 		// Repeated native learning shares its launch capability; result owners remain distinct.
 		if (record.state.status === "retained" && !record.state.candidate) for (const previous of this.byKey.get(key)?.values() ?? []) {
 			if (previous !== record && previous.state.status === "retained" && !previous.state.candidate &&
@@ -166,7 +175,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
 		this.invocations.set(binding, { value, bytes, executionMs });
 		record.binding = binding;
-		this.bindingBytes += bytes;
+		this.retainedBytes += bytes;
 		this.trim();
 		return this.invocations.has(binding) ? binding : undefined;
 	}
@@ -201,6 +210,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return () => { if (state.inputsChanged === check) state.inputsChanged = undefined; };
 	}
 
+	observeSuspension(key: Sha256Digest, handoff: ProcessHandoff, suspend: NonNullable<ProcessHandoff["suspend"]>): () => void {
+		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
+		if (!record || state?.status !== "running") return () => {};
+		const owned: NonNullable<ProcessHandoff["suspend"]> = signal => record.state === state && state.suspend === owned ? suspend(signal) : Promise.resolve();
+		state.suspend = owned;
+		return () => { if (state.suspend === owned) state.suspend = undefined; };
+	}
+
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
 		let joined = false, historyChecked = false;
@@ -211,7 +228,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			const completed = [...records].reverse().flatMap((record) => {
 				const state = record.state;
 				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
-				const oneShot = state.candidate.dependencyCertificate.taints.length > 0;
+					const oneShot = state.candidate.dependencyCertificate.taints.length > 0 || !!state.candidate.result.continuation;
+					if (state.candidate.result.continuation && !record.continuation) return [];
 				return oneShot && (!record.ownership.acceptsScope(record.scope, scope) || record.ownership.wholeClaimed)
 					? [] : [{ record, state, candidate: state.candidate, oneShot }];
 			});
@@ -223,7 +241,9 @@ export class ProcessHandoffRegistry<Invocation = never> {
 					(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope) && selected.record.ownership.claimChild()))) {
 					// Retain bounded launch parameters without granting another transfer of this result.
 					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
-					return { kind: "hit", plan, joined, producer: selected.record };
+					const continuation = selected.record.continuation;
+					if (continuation) { this.retainedBytes -= continuation.image.length; selected.record.continuation = undefined; }
+					return { kind: "hit", plan, joined, producer: selected.record, ...(continuation ? { continuation } : {}) };
 				}
 				continue;
 			}
@@ -253,17 +273,21 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		handoff: ProcessHandoff,
 		candidate: ProcessProvenanceCertificate,
 		persist: () => Promise<boolean>,
+		continuation?: ProcessContinuation,
 	): Promise<boolean> {
-		if (!this.complete(key, handoff, candidate)) throw new Error("process handoff is no longer running");
+		if (!this.complete(key, handoff, candidate, continuation)) throw new Error("process handoff is no longer running");
 		return persist();
 	}
 
-	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate): boolean {
+	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate, continuation?: ProcessContinuation): boolean {
 		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
+		if (!!candidate?.result.continuation !== !!continuation || continuation &&
+			(continuation.image.length !== candidate!.result.continuation!.imageBytes || continuation.image.length > this.maxRetainedBytes)) return false;
+		if (continuation) { record.continuation = continuation; this.retainedBytes += continuation.image.length; }
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
 		this.completedCount++;
-		if (candidate) record.computation = new TimelineInterval(record.startedAt, performance.now());
+		if (candidate) record.computation = continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
 		if (!candidate || !record.scope) this.remove(record);
 		else this.trim();
@@ -300,6 +324,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			startedAt: performance.now(),
 			state: { status: "running" },
 			get inputsChanged() { return record.state.status === "running" ? record.state.inputsChanged : undefined; },
+			get suspend() { return record.state.status === "running" ? record.state.suspend : undefined; },
 			settle,
 		};
 		const records = this.byKey.get(key) ?? new Map();
@@ -320,16 +345,17 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private trim(limit = this.maxCompleted): void {
-		if (this.completedCount <= limit && this.bindingBytes <= this.maxBindingBytes) return;
+		if (this.completedCount <= limit && this.retainedBytes <= this.maxRetainedBytes) return;
 		for (const record of this.records()) {
 			if (record.state.status !== "running" && this.completedCount > limit) this.remove(record);
-			else if (this.bindingBytes > this.maxBindingBytes) this.revokeBinding(record);
+			else if (this.retainedBytes > this.maxRetainedBytes) this.revokeBinding(record);
 		}
 	}
 
 	private revokeBinding(record: HandoffRecord): void {
+		if (record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
 		if (!record.binding) return;
-		this.bindingBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
+		this.retainedBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
 		this.invocations.delete(record.binding);
 		record.binding = undefined;
 	}

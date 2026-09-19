@@ -53,9 +53,9 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
 			const proof = regularDescriptors?.find(descriptor => descriptor.fd === fd);
 			/** @type {DescriptorType} */
-			const type = metadata.isFile() ? "regular" : metadata.isDirectory() ? "directory" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
+			const type = endpoint === "anon_inode:[eventfd]" ? "eventfd" : metadata.isFile() ? "regular" : metadata.isDirectory() ? "directory" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
 				metadata.isCharacterDevice() ? (proof?.type === "null" && metadata.rdev === 259n ? "null" : endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
-			if ((["regular", "null", "directory"].includes(type) || (type === "pipe" || type === "socket") && proof) && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
+			if ((["regular", "null", "directory", "eventfd"].includes(type) || (type === "pipe" || type === "socket") && proof) && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
 				proof.flags !== (Number.parseInt(flags, 8) & ~0o2000000) || String(proof.offset) !== /^pos:\s*(\d+)/m.exec(info)?.[1])) {
 				throw new Error(`held descriptor ${fd} lacks matching native OFD evidence`);
 			}
@@ -114,8 +114,8 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	};
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @returns {ProcessExecutionContext} */
-export function routedProcessContext(context, route, closeStdin = false, regularDescriptors) {
+/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @returns {ProcessExecutionContext} */
+export function routedProcessContext(context, route, closeStdin = false, regularDescriptors, outputPipes) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
@@ -125,6 +125,7 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 		{ ...semantic.descriptors[route[0]], fd: 1, alias: 1 },
 		{ ...semantic.descriptors[route[1]], fd: 2, alias: route[0] === route[1] ? 1 : 2 },
 	];
+	for (let index = 0; index < 2; index++) if (outputPipes?.[index]) Object.assign(descriptors[index + 1], { type: "pipe", flags: 1 });
 	if (regularDescriptors?.length) {
 		for (const descriptor of regularDescriptors) {
 			const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
@@ -147,7 +148,8 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 	return {
 		...context,
 		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
-		descriptorTypes: [regularDescriptors?.find(({ fd }) => fd === 0)?.type ?? (regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0]), context.descriptorTypes[route[0]], context.descriptorTypes[route[1]]],
+		descriptorTypes: [regularDescriptors?.find(({ fd }) => fd === 0)?.type ?? (regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0]),
+			outputPipes?.[0] ? "pipe" : context.descriptorTypes[route[0]], outputPipes?.[1] ? "pipe" : context.descriptorTypes[route[1]]],
 		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
 }
@@ -161,7 +163,7 @@ export function validProcessContext(value) {
 		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
 		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
 		(["device", "closed"].includes(context.descriptorTypes[0]) ||
-			(["regular", "null", "directory", "pipe", "socket"].includes(context.descriptorTypes[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
+			(["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(context.descriptorTypes[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
 		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
 		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);
