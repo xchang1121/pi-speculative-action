@@ -251,7 +251,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed; same-run accounting): ${formatDuration(metrics.endToEndMs)} wall time; ${formatDuration(metrics.serializedMs)} serialized counterfactual; ${formatDuration(metrics.hiddenLatencyMs)} observed overlap; ${formatDuration(metrics.nonToolMs)} non-tool; ${formatDuration(metrics.toolExecutionMs)} authoritative tools. Overlap is not a causal speedup estimate.`
+			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Estimated savings are optimistic, not a measured no-speculation comparison.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
 		`Draft tokens: ${metrics.totalDraftTokens}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
@@ -1276,11 +1276,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 	const parts = [`[${event.type}]`, `session ${compactEventText(String(event.sessionID))}`, `turn ${compactEventText(event.turnID)}`];
 	switch (event.type) {
 		case "task":
-			parts.push(
-				`${formatDuration(event.timing.endToEndMs)} wall`,
-				`${formatDuration(event.timing.serializedMs)} serialized counterfactual`,
-				`${formatDuration(event.timing.hiddenLatencyMs)} observed overlap (not causal speedup)`,
-			);
+			parts.push(formatTaskTiming(event.timing));
 			break;
 		case "source_request":
 			parts.push(
@@ -1557,7 +1553,7 @@ function formatSpeculativeFooter(
 		"spec: on",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
-		metrics.tasks > 0 ? `${formatDuration(metrics.hiddenLatencyMs)} observed overlap` : "timing n/a",
+		metrics.tasks > 0 ? `${formatDuration(metrics.estimatedSavingsMs ?? NaN)} estimated savings (optimistic)` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
 		providers > 0 ? `providers ${ready}/${providers} ready` : "providers probing",
@@ -1611,6 +1607,12 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 		right === left ? leftKey.localeCompare(rightKey) : right - left,
 	);
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
+}
+
+function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs">): string {
+	const savings = timing.estimatedSavingsMs ?? NaN;
+	const ratio = timing.endToEndMs > 0 && Number.isFinite(savings) ? `${formatNumber(1 + savings / timing.endToEndMs)}×` : "n/a";
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(savings)} estimated savings, ${ratio} optimistic speedup; ${formatDuration(timing.hiddenLatencyMs)} observed overlap`;
 }
 
 function formatDuration(ms: number): string {

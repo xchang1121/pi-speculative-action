@@ -198,7 +198,7 @@ describe("ablation suite report", () => {
 	it("retains repeats in nearest-rank p95 and total-time ratios", () => {
 		const report = summarizeSuite(
 			[
-				run("task-a", 1, { actualEndToEndMs: 5, serializedCounterfactualMs: 10 }),
+				run("task-a", 1, { actualEndToEndMs: 5, serializedCounterfactualMs: 10, estimatedSavingsMs: 15 }),
 				run("task-a", 2, { actualEndToEndMs: 10, serializedCounterfactualMs: 20 }),
 				run("task-b", 1, { actualEndToEndMs: 15, serializedCounterfactualMs: 30 }),
 				run("task-b", 2, { actualEndToEndMs: 20, serializedCounterfactualMs: 40 }),
@@ -209,6 +209,7 @@ describe("ablation suite report", () => {
 		expect(report.pooled).toMatchObject({
 			instanceClusters: 2,
 			accelerationRatio: 2,
+			estimatedSavingsMs: 15, optimisticAccelerationRatio: 1.3,
 			actualEndToEndP95Ms: 20,
 			serializedCounterfactualP95Ms: 40,
 		});
@@ -218,10 +219,11 @@ describe("ablation suite report", () => {
 		const report = summarizeSuite([
 			run("short", 1, { serializedCounterfactualMs: 1, actualEndToEndMs: 0.5 }),
 			run("long", 1, { serializedCounterfactualMs: 100, actualEndToEndMs: 200 }),
-			run("long", 2, { serializedCounterfactualMs: 300, actualEndToEndMs: 600 }),
+			run("long", 2, { serializedCounterfactualMs: 300, actualEndToEndMs: 600, estimatedSavingsMs: undefined }),
 			run("missing", 1, { actualEndToEndMs: invalid }),
 		]);
 		expect(report.pooled?.accelerationRatio).toBeCloseTo(401 / 800.5, 12);
+		expect(report.pooled?.optimisticAccelerationRatio).toBeUndefined(); // Older traces must not silently become zero savings.
 		expect(report.pooled?.meanLatencyDifferenceMs).toBeCloseTo(399.5 / 3, 12);
 		expect(report).toMatchObject({ runs: 4, unmeasuredRuns: 1, pooled: { runs: 3 }, byInstance: { missing: null },
 			invalidRuns: [{ instance: "missing", reasons: ["unavailable_timing"] }] });
@@ -238,6 +240,7 @@ function run(instance: string, repeat: number, overrides: Partial<SuiteBenchmark
 			actualEndToEndMs: 1,
 			serializedCounterfactualMs: 1,
 			hiddenLatencyMs: 0,
+			estimatedSavingsMs: 0,
 			executionAheadMs: 0,
 			actorActions: 1,
 			speculativeHits: 0,

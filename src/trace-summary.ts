@@ -58,6 +58,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		toolExecutionMs: 0,
 		serializedMs: 0,
 		hiddenLatencyMs: 0,
+		estimatedSavingsMs: 0 as number | undefined,
 		speculativeExecutionMs: 0,
 		actorExecutionMs: 0,
 		executionAheadMs: 0,
@@ -93,6 +94,8 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.toolExecutionMs += metric(event.timing.toolExecutionMs);
 			next.serializedMs += metric(event.timing.serializedMs);
 			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);
+			next.estimatedSavingsMs = current.estimatedSavingsMs !== undefined && Number.isFinite(event.timing.estimatedSavingsMs)
+				? current.estimatedSavingsMs + metric(event.timing.estimatedSavingsMs) : undefined;
 			break;
 		case "source_request":
 			next.sourceRequests++;

@@ -1973,7 +1973,7 @@ export async function readSandboxDirectoryState(target: string, captureNames?: (
 }
 
 
-function sameSandboxState(
+export function sameSandboxState(
 	left: RegularFileState | SandboxDirectoryState | undefined,
 	right: RegularFileState | SandboxDirectoryState | undefined,
 ): boolean {

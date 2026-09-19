@@ -2135,8 +2135,8 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		state.session.timeline?.recordTool(settlement.provider.toolExecution);
-		if (selection?.projection) state.session.timeline?.recordTool(selection.projection);
+		state.session.timeline?.recordTool(settlement.provider.toolExecution, selection?.timing);
+		if (selection?.projection && selection.projection !== settlement.provider.toolExecution) state.session.timeline?.recordTool(selection.projection);
 		const key = actorAction.actionKey;
 		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)

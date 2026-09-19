@@ -1490,7 +1490,11 @@ describe("structural speculative runtime", () => {
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
 				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0,
+				estimatedSavingsMs: unretained ? 0 : 17,
 			});
+			const legacy = structuredClone(events);
+			for (const event of legacy) if (event.type === "task") Reflect.deleteProperty(event.timing, "estimatedSavingsMs");
+			expect(summarizeSpeculativeTrace(legacy).estimatedSavingsMs).toBeUndefined();
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
