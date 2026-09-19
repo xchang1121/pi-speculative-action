@@ -106,7 +106,7 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
@@ -154,6 +154,8 @@ int main(int argc, char **argv) {
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -166,7 +168,18 @@ int main(int argc, char **argv) {
 	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; ' + (mode.includes("pipe-live") ? '' : 'close(fds[1]); ') + 'if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
 	${mixed ? 'int writable = open("anonymous", O_RDWR | O_CREAT | O_EXCL, 0600); if (writable < 0 || unlink("anonymous") || write(writable, "abcdef", 6) != 6 || lseek(writable, 0, SEEK_SET) != 0 || dup2(writable, 16) < 0 || dup2(writable, 17) < 0) return 87; close(writable); int reader = open("/proc/self/fd/16", O_RDONLY); if (reader < 0 || dup2(reader, 18) < 0) return 88; close(reader);' : ""}
 	puts(argv[1]); fflush(stdout);
+	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8}; char byte = 'x', control[CMSG_SPACE(sizeof(passed))] = {0};
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) return 89;
+	struct iovec vector = {&byte, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+	struct cmsghdr *header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(passed));
+	memcpy(CMSG_DATA(header), passed, sizeof(passed)); if (sendmsg(sockets[0], &message, 0) != 1) return 90; close(sockets[0]);` : ""}
 	${pipe ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; return 0; }' : ""}
+	${mode === "native-pipe-live-transfer" ? `for (unsigned index = 0; index < 4; index++) close(passed[index]);
+	if (recvmsg(sockets[1], &message, MSG_CMSG_CLOEXEC) != 1) return 91;
+	int received[4], saved[4]; memcpy(received, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(received));
+	for (unsigned index = 0; index < 4; index++) { saved[index] = fcntl(received[index], F_DUPFD_CLOEXEC, 100); if (saved[index] < 0) return 92; close(received[index]); }
+	for (unsigned index = 0; index < 4; index++) { if (dup2(saved[index], passed[index]) < 0) return 93; close(saved[index]); }
+	close(sockets[1]);` : ""}
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
 `);
@@ -585,9 +598,11 @@ int main(void) {
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static int aliases(void *unused) {
@@ -615,6 +630,54 @@ static int split_exec(void *argument) {
 static void *blocked_open(void *file) { int fd = open(file, O_RDONLY); if (fd < 0) _exit(79); close(fd); return 0; }
 int main(int argc, char **argv) {
 	if (argc != 3) return 70;
+	if (!strncmp(argv[1], "rights", 6) || !strcmp(argv[1], "pidfd")) {
+		int sockets[2], status, copying = !strcmp(argv[1], "pidfd"); char byte = 'x';
+		if (socketpair(AF_UNIX, strstr(argv[1], "batch") ? SOCK_SEQPACKET : SOCK_STREAM, 0, sockets)) return 93;
+		pid_t child = fork(); if (child < 0) return 94;
+		if ((child != 0) != copying) {
+			close(sockets[1]); int fd = strstr(argv[1], "unowned") ? dup(9) : open(argv[2], O_RDONLY);
+			if (fd < 0 || dup2(fd, 8) < 0) return 95;
+			if (fd != 8) close(fd);
+			if (copying) {
+				if (write(sockets[0], &byte, 1) != 1 || read(sockets[0], &byte, 1) != 1) return 96;
+				return 0;
+			}
+			int passed[] = {3, 3, 8}; char control[CMSG_SPACE(sizeof(passed))] = {0};
+			struct iovec vector = {&byte, 1}; struct mmsghdr message = {.msg_hdr = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)}};
+			struct cmsghdr *header = CMSG_FIRSTHDR(&message.msg_hdr); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(passed));
+			memcpy(CMSG_DATA(header), passed, sizeof(passed));
+			if ((strstr(argv[1], "batch") ? sendmmsg(sockets[0], &message, 1, 0) : sendmsg(sockets[0], &message.msg_hdr, 0)) != 1) return 97;
+			if (strstr(argv[1], "orphan")) { close(8); if (shutdown(sockets[0], SHUT_WR)) return 108; }
+			close(sockets[0]); if (waitpid(child, &status, 0) != child || status) return 98;
+			return 0;
+		}
+		close(sockets[0]); close(3); close(9); int received[3], saved[3];
+		if (copying) {
+			if (read(sockets[1], &byte, 1) != 1) return 99;
+			int target = (int)syscall(SYS_pidfd_open, child, 0); if (target < 0) return 100;
+			for (int index = 0; index < 3; index++) if ((received[index] = (int)syscall(SYS_pidfd_getfd, target, index == 2 ? 8 : 3, 0)) < 0) return 101;
+			close(target);
+		} else {
+			if (strstr(argv[1], "orphan")) { struct pollfd ready = {.fd = sockets[1], .events = POLLRDHUP}; if (poll(&ready, 1, -1) != 1) return 109; }
+			char control[CMSG_SPACE(sizeof(received))] = {0}; struct iovec vector = {&byte, 1};
+			struct mmsghdr message = {.msg_hdr = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)}};
+			if (strstr(argv[1], "failed") && recvmsg(-1, &message.msg_hdr, 0) != -1) return 102;
+			int flags = MSG_CMSG_CLOEXEC;
+			if ((strstr(argv[1], "batch") ? recvmmsg(sockets[1], &message, 1, flags, 0) : recvmsg(sockets[1], &message.msg_hdr, flags)) != 1) return 103;
+			struct cmsghdr *header = CMSG_FIRSTHDR(&message.msg_hdr);
+			if (!header || header->cmsg_len != CMSG_LEN(sizeof(received))) return 104;
+			memcpy(received, CMSG_DATA(header), sizeof(received));
+		}
+		for (int index = 0; index < 3; index++) {
+			if (fcntl(received[index], F_GETFD) != FD_CLOEXEC || (saved[index] = fcntl(received[index], F_DUPFD_CLOEXEC, 100)) < 0) return 105;
+			close(received[index]);
+		}
+		if (copying && (write(sockets[1], &byte, 1) != 1 || waitpid(child, &status, 0) != child || status)) return 106;
+		close(sockets[1]);
+		if (dup2(saved[0], 3) < 0 || dup2(saved[1], 65) < 0 || dup2(saved[2], 67) < 0 || dup3(saved[0], 66, O_CLOEXEC) < 0) return 107;
+		for (int index = 0; index < 3; index++) close(saved[index]);
+		char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
+	}
 	if (!strcmp(argv[1], "opath")) {
 		int fd = open(argv[2], O_PATH); if (fd < 0 || dup2(fd, 3) < 0 || dup2(fd, 4) < 0 || dup2(fd, 5) < 0) return 92;
 		if (fd > 5) close(fd);
@@ -666,27 +729,29 @@ int main(int argc, char **argv) {
 }
 `);
 			execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", `${descriptorProbe}.c`, "-o", descriptorProbe]);
-			for (const mode of ["lock", "export", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
+			for (const mode of ["lock", "export", "rights", "rights-batch", "rights-failed", "rights-unowned", "rights-orphan", "pidfd", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
 				"unshare", "unshare-noop", "range-close", "range-cloexec", "range-invalid"]) {
 				let snapshot: HeldExecProcess["descriptors"], output = "";
 				const split = mode.startsWith("unshare") || mode.startsWith("range-");
+				const imported = mode.startsWith("rights") || mode === "pidfd";
+				const unknown = mode === "rights-unowned" || mode === "rights-orphan";
 				const shared = mode === "unshare-noop" || mode === "range-invalid", slots: number[][] = [];
 				const ownership: boolean[] = [];
 				const commit = vi.fn(async () => {});
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				const executor = boundary.executor(mode === "rights-unowned" ? adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })) : native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					snapshot = process.descriptors;
 					slots.push(snapshot!.map(({ fd }) => fd));
 					ownership.push(snapshot!.find(({ fd }) => fd === 3)!.owned);
-					return mode === "export" || split ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
+					return mode === "export" || split || imported ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
 						({ ...descriptor, before: offset, after: offset + 1 })), exitCode: 0, output: [], commit } : { kind: "continue" };
 				} });
 				expect(await executor.execute({ command: `exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
 					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
 					timeout: 5, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
-				expect(output, mode).toBe(split ? "c" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : 0);
+				expect(output, mode).toBe(split ? "c" : imported && !unknown ? "b" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : imported && !unknown ? 1 : 0);
 				if (!["lock", "export", "overlap"].includes(mode)) expect(snapshot?.map(({ fd, alias, owned }) => ({ fd, alias, owned })), mode).toEqual([
-					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: 3, owned: true },
+					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: imported ? 67 : 3, owned: !unknown },
 					...(shared ? [{ fd: 68, alias: 3, owned: true }] : []),
 				]);
 				if (split) {

@@ -34,6 +34,7 @@ static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 #define MAX_OUTPUT_EVENTS 65536
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
 #define MAX_POSITIONS 64
+#define MAX_HANDLES 256
 #define MAX_INPUT_BYTES (2UL * 1024 * 1024)
 #define MAX_REQUEST_BYTES (MAX_INPUT_BYTES * 2 + MAX_LINE)
 
@@ -46,11 +47,11 @@ struct file_position {
 	char *path;
 };
 
-struct descriptor_origin { int fd, cloexec; unsigned long id; int pipe; };
+struct descriptor_origin { int fd, cloexec; unsigned long id, channel; int pipe; };
 struct descriptor_table {
 	unsigned references, count, active;
 	unsigned long epoch, generation;
-	struct descriptor_origin entries[256];
+	struct descriptor_origin entries[MAX_HANDLES];
 };
 
 /* Track provenance without keeping kernel handles alive beyond their native lifetime. */
@@ -58,6 +59,7 @@ struct descriptor_domain {
 	int enabled, escaped;
 	unsigned uncertain;
 	unsigned long next;
+	struct traced_process **processes;
 };
 
 struct output_event {
@@ -90,7 +92,7 @@ struct traced_process {
 	int mutation, uncertain;
 	long syscall;
 	unsigned long arguments[3];
-	int pipe_fds[2];
+	int descriptor_count, descriptors[MAX_HANDLES], internal_message;
 };
 
 static int replace_with_exit(pid_t pid, unsigned code) {
@@ -263,14 +265,57 @@ static struct descriptor_origin descriptor_origin(struct traced_process *process
 }
 
 static void set_descriptor_origin(struct traced_process *process, struct descriptor_domain *domain,
-	int fd, unsigned long id, int cloexec, int pipe) {
+	struct descriptor_origin entry) {
 	struct descriptor_table *table = process->table;
-	for (unsigned index = 0; index < table->count; index++) if (table->entries[index].fd == fd) {
+	for (unsigned index = 0; index < table->count; index++) if (table->entries[index].fd == entry.fd) {
 		table->entries[index] = table->entries[--table->count]; break;
 	}
-	if (!id) return;
+	if (!entry.id) return;
 	if (table->count == sizeof(table->entries) / sizeof(table->entries[0])) { domain->escaped = 1; return; }
-	table->entries[table->count++] = (struct descriptor_origin){fd, cloexec, id, pipe};
+	table->entries[table->count++] = entry;
+}
+
+static int descriptor_numbers(pid_t pid, int *fds, unsigned capacity) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+	DIR *directory = opendir(path);
+	if (!directory) return -1;
+	unsigned count = 0; int error = 0;
+	for (;;) {
+		errno = 0; struct dirent *entry = readdir(directory);
+		if (!entry) { error = errno; break; }
+		char *end; long fd = strtol(entry->d_name, &end, 10);
+		if (!*entry->d_name || *end || fd < 0 || fd > INT_MAX) continue;
+		if (count == capacity) { error = E2BIG; break; }
+		fds[count++] = (int)fd;
+	}
+	closedir(directory);
+	return error ? -1 : (int)count;
+}
+
+/* Read installed flags, never a tracee's mutable result/control buffer. */
+static int descriptor_flags(pid_t pid, int fd) {
+	char name[64], line[256]; unsigned flags; int result = -1;
+	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
+	FILE *file = fopen(name, "re");
+	while (file && fgets(line, sizeof(line), file)) if (sscanf(line, "flags: %o", &flags) == 1) { result = (int)flags; break; }
+	if (file) fclose(file);
+	return result;
+}
+
+/* A received handle inherits an OFD only from a live, uncontended kernel witness.
+ * No extra pins extend file/pipe/socket lifetimes; an unmatched import stays unknown. */
+static struct descriptor_origin received_origin(struct traced_process *process, struct descriptor_domain *domain, int fd) {
+	int flags = descriptor_flags(process->pid, fd);
+	if (flags >= 0) for (struct traced_process *source = *domain->processes; source; source = source->next) {
+		if (source->historical || !source->table || source->table->active) continue;
+		for (unsigned index = 0; index < source->table->count; index++) {
+			struct descriptor_origin entry = source->table->entries[index];
+			if (source->table == process->table && entry.fd == fd) continue;
+			if (syscall(SYS_kcmp, process->pid, source->pid, KCMP_FILE, fd, entry.fd) != 0) continue;
+			entry.fd = fd; entry.cloexec = !!(flags & O_CLOEXEC); return entry;
+		}
+	}
+	return (struct descriptor_origin){.fd = fd};
 }
 
 static struct descriptor_table *copy_descriptor_table(struct traced_process *source) {
@@ -317,11 +362,13 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	}
 	long number = process->syscall;
 	unsigned long first = process->arguments[0], second = process->arguments[1], third = process->arguments[2];
+	int receiving = number == SYS_recvmsg || number == SYS_recvmmsg;
+	int message = receiving || number == SYS_sendmsg || number == SYS_sendmmsg;
+	int pair = number == SYS_pipe || number == SYS_pipe2 || number == SYS_socketpair;
 	int detached = (number == SYS_unshare && first == CLONE_FILES) || (number == SYS_close_range && (third & CLOSE_RANGE_UNSHARE));
 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
 		/* These can publish handles outside the traced tree or bypass its syscall stops. */
-		int escapes = number == SYS_sendmsg || number == SYS_sendmmsg || number == SYS_recvmsg || number == SYS_recvmmsg ||
-			number == SYS_pidfd_getfd || number == SYS_io_uring_setup ||
+		int escapes = number == SYS_io_uring_setup ||
 			number == SYS_io_uring_enter || number == SYS_io_uring_register || number == SYS_ptrace ||
 			number == SYS_process_vm_writev || number == SYS_splice || number == SYS_tee ||
 			(number == SYS_unshare && (first & ~(unsigned long)CLONE_FILES)) || number == SYS_setns;
@@ -330,12 +377,13 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		escapes |= (number == SYS_pipe2 && (second & ~(unsigned long)(O_CLOEXEC | O_NONBLOCK))) ||
 			(number == SYS_fcntl && second == F_SETFL && (third & O_DIRECT));
 		/* clone3 flags live in mutable shared memory: prove attachment from the kernel event instead. */
-		if (number == SYS_clone3 || number == SYS_ioctl) { process->uncertain = 1; domain->uncertain++; }
+		process->internal_message = message && !table->active && descriptor_origin(process, (int)first).channel != 0;
+		if (number == SYS_clone3 || number == SYS_ioctl || message) { process->uncertain = 1; domain->uncertain++; }
 		if (escapes) domain->escaped = 1;
 		process->call_epoch = table->epoch;
 		process->mutation = number == SYS_close || (number == SYS_close_range && !detached) || number == SYS_dup ||
 			number == SYS_dup2 || number == SYS_dup3 || number == SYS_open || number == SYS_openat ||
-			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create || number == SYS_pipe || number == SYS_pipe2 ||
+			number == SYS_openat2 || number == SYS_creat || number == SYS_memfd_create || pair || receiving || number == SYS_pidfd_getfd ||
 			(number == SYS_fcntl && (second == F_SETFD || second == F_DUPFD || second == F_DUPFD_CLOEXEC));
 		if (process->mutation) {
 			table->epoch++;
@@ -345,23 +393,18 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 			else process->mutation_generation = table->generation;
 		}
 		/* Dropping uncertain provenance before a failing close/dup is safe; retaining a stale slot is not. */
-		if (number == SYS_close) set_descriptor_origin(process, domain, (int)first, 0, 0, 0);
+		if (number == SYS_close) set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)first});
 		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
-			set_descriptor_origin(process, domain, (int)second, 0, 0, 0);
-		if (number == SYS_pipe || number == SYS_pipe2) {
-			/* Derive kernel allocation slots, never trust the mutable userspace result array. */
-			process->pipe_fds[0] = process->pipe_fds[1] = -1;
-			for (int candidate = 0, found = 0; candidate < 256 && found < 2; candidate++) {
-				char name[64]; struct stat state;
-				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, candidate);
-				if (stat(name, &state) < 0 && errno == ENOENT) process->pipe_fds[found++] = candidate;
-			}
-		}
+			set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)second});
+		if (pair || receiving) process->descriptor_count = descriptor_numbers(pid, process->descriptors, MAX_HANDLES);
 	}
 	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
 	if (process->uncertain) {
 		domain->uncertain--; process->uncertain = 0;
-		if (!info.exit.is_error) domain->escaped = 1;
+		/* A channel cannot change peers, but a shared table could replace its FD
+		 * while the kernel reads it. An in-flight call never grants adoption. */
+		if (!info.exit.is_error && !(message && process->internal_message &&
+			table->epoch == process->call_epoch + (unsigned)receiving && table->active == (unsigned)receiving)) domain->escaped = 1;
 	}
 	if (process->mutation) {
 		process->mutation = 0; table->active--;
@@ -377,33 +420,45 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		struct descriptor_origin *entry = &table->entries[index];
 		if ((unsigned)entry->fd < (unsigned)first || (unsigned)entry->fd > (unsigned)second) { index++; continue; }
 		if (third & CLOSE_RANGE_CLOEXEC) { entry->cloexec = 1; index++; }
-		else set_descriptor_origin(process, domain, entry->fd, 0, 0, 0);
+		else set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = entry->fd});
 	}
 	struct descriptor_origin source = descriptor_origin(process, (int)first);
 	int fd = (int)info.exit.rval;
-	if (number == SYS_pipe || number == SYS_pipe2) {
-		if (process->pipe_fds[1] < 0) return 0;
-		for (unsigned index = 0; index < 2; index++) set_descriptor_origin(process, domain,
-			process->pipe_fds[index], ++domain->next, number == SYS_pipe2 && (second & O_CLOEXEC), 1);
+	if (pair || receiving) {
+		int installed[MAX_HANDLES], count = descriptor_numbers(pid, installed, MAX_HANDLES), added = 0;
+		if (count < 0 || process->descriptor_count < 0) return 0;
+		for (int index = 0; index < count; index++) {
+			int previous = 0;
+			while (previous < process->descriptor_count && installed[index] != process->descriptors[previous]) previous++;
+			if (previous == process->descriptor_count) installed[added++] = installed[index];
+		}
+		if (pair && added != 2) return 0;
+		/* Only stream/seqpacket socketpairs have immutable, tree-owned peers.
+		 * Datagram destinations can be changed by sendmsg's address argument. */
+		unsigned long type = second & ~(unsigned long)(SOCK_CLOEXEC | SOCK_NONBLOCK);
+		unsigned long channel = number == SYS_socketpair && first == AF_UNIX && !third &&
+			(type == SOCK_STREAM || type == SOCK_SEQPACKET) ? ++domain->next : 0;
+		for (int index = 0; index < added; index++) set_descriptor_origin(process, domain, receiving
+			? received_origin(process, domain, installed[index])
+			: (struct descriptor_origin){.fd = installed[index], .id = ++domain->next, .channel = channel,
+				.cloexec = number != SYS_pipe && (second & O_CLOEXEC), .pipe = number != SYS_socketpair});
+	} else if (number == SYS_pidfd_getfd) {
+		set_descriptor_origin(process, domain, received_origin(process, domain, fd));
 	} else if (number == SYS_fcntl && second == F_SETFD) {
-		set_descriptor_origin(process, domain, source.fd, source.id, (third & FD_CLOEXEC) != 0, source.pipe);
+		source.cloexec = (third & FD_CLOEXEC) != 0; set_descriptor_origin(process, domain, source);
 	} else if (number == SYS_dup || number == SYS_dup2 || number == SYS_dup3 ||
 		(number == SYS_fcntl && (second == F_DUPFD || second == F_DUPFD_CLOEXEC))) {
-		set_descriptor_origin(process, domain, fd, source.id,
-			(number == SYS_dup2 && first == second && source.cloexec) ||
-			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC), source.pipe);
+		source.fd = fd; source.cloexec = (number == SYS_dup2 && first == second && source.cloexec) ||
+			(number == SYS_dup3 && (third & O_CLOEXEC)) || (number == SYS_fcntl && second == F_DUPFD_CLOEXEC);
+		set_descriptor_origin(process, domain, source);
 	} else if (number == SYS_open || number == SYS_openat || number == SYS_creat || number == SYS_memfd_create) {
 		unsigned long flags = number == SYS_open ? second : number == SYS_openat ? third : 0;
-		set_descriptor_origin(process, domain, fd, ++domain->next,
-			(flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1)), 0);
+		set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = fd, .id = ++domain->next,
+			.cloexec = (flags & O_CLOEXEC) || (number == SYS_memfd_create && (second & 1))});
 	} else if (number == SYS_openat2) {
-		/* Read the installed flag, rather than racing the tracee's open_how memory. */
-		char name[64], line[256]; unsigned flags = 0; int found = 0;
-		snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-		FILE *file = fopen(name, "re");
-		while (file && fgets(line, sizeof(line), file)) if (sscanf(line, "flags: %o", &flags) == 1) { found = 1; break; }
-		if (file) fclose(file);
-		set_descriptor_origin(process, domain, fd, found ? ++domain->next : 0, (flags & O_CLOEXEC) != 0, 0);
+		int flags = descriptor_flags(pid, fd);
+		set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = fd, .id = flags >= 0 ? ++domain->next : 0,
+			.cloexec = (flags & O_CLOEXEC) != 0});
 	}
 	/* Reopening a pipe creates a new OFD, but only a live owned handle proves its queue. */
 	if (number == SYS_open || number == SYS_openat || number == SYS_openat2) {
@@ -415,7 +470,7 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 			snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, entry.fd);
 			if (stat(name, &other) == 0 && other.st_dev == state.st_dev && other.st_ino == state.st_ino) {
 				struct descriptor_origin opened = descriptor_origin(process, fd);
-				set_descriptor_origin(process, domain, fd, opened.id, opened.cloexec, 1); break;
+				opened.pipe = 1; set_descriptor_origin(process, domain, opened); break;
 			}
 		}
 	}
@@ -453,20 +508,12 @@ static int pipe_bytes(int fd, unsigned char **bytes, int *eof) {
 
 /* The entire owned tree is stopped until this job retires. External OFDs remain unknown. */
 static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
-	char path[64];
-	snprintf(path, sizeof(path), "/proc/%ld/fd", (long)job->pid);
-	DIR *directory = opendir(path);
-	if (!directory) return -1;
+	int installed[MAX_HANDLES], total = descriptor_numbers(job->pid, installed, MAX_HANDLES);
+	if (total < 0) return -1;
 	int pins[MAX_POSITIONS], fds[MAX_POSITIONS], nulls[MAX_POSITIONS], count = 0, result = -1, null_input = -1;
-	struct dirent *entry;
 	size_t used = 0;
-	for (;;) {
-		errno = 0;
-		entry = readdir(directory);
-		if (!entry) { if (errno) goto done; break; }
-		char *end;
-		long descriptor = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || descriptor < 0 || descriptor > INT_MAX) continue;
+	for (int index = 0; index < total; index++) {
+		int descriptor = installed[index];
 		int pin = duplicate_tracee_fd(job, (unsigned)descriptor);
 		struct stat state;
 		if (pin < 0) goto done;
@@ -534,7 +581,6 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 	result = 0;
 done:
 	while (count) close(pins[--count]);
-	closedir(directory);
 	return result;
 }
 
@@ -851,6 +897,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	int status = 0, root_status = -1;
 	unsigned exec_events = 0;
 	struct traced_process *processes = NULL;
+	domain.processes = &processes;
 	struct pollfd *polling = NULL;
 	size_t capacity = 0;
 	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); goto fatal; }
@@ -989,7 +1036,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
 			if (detach_descriptor_table(current, &domain) < 0) goto fatal;
 			for (unsigned index = 0; current->table && index < current->table->count;)
-				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain, current->table->entries[index].fd, 0, 0, 0);
+				if (current->table->entries[index].cloexec) set_descriptor_origin(current, &domain,
+					(struct descriptor_origin){.fd = current->table->entries[index].fd});
 				else index++;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
