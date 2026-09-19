@@ -9,8 +9,9 @@ import { promisify } from "node:util";
 import { createFindTool, createGrepTool, createLsTool, createReadTool, createReadToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
-import { captureStableFile, hashExecutableFile, type StableFileCapture } from "../src/filesystem-evidence.ts";
+import { borrowResourceObject, createCommittedResourceInputs, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { captureHeldDescriptorInputs } from "../src/linux-held-exec.ts";
+import { captureStableFile, hashExecutableFile, type StableFilesystemCapture } from "../src/filesystem-evidence.ts";
 import { captureFileDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
@@ -30,12 +31,144 @@ const directories = temporaryDirectories("pi-resource-version-", path.join(proce
 const execFileAsync = promisify(execFile);
 const isDataOpen = (flags: unknown) => typeof flags !== "number" || !(flags & 0x200000); // Linux O_PATH has no I/O authority.
 
+function directoryImage(names: readonly string[]): Buffer {
+	return Buffer.concat([".", "..", ...names].map((name, index) => {
+		const record = Buffer.alloc(Math.ceil((20 + Buffer.byteLength(name)) / 8) * 8);
+		record.writeBigUInt64LE(BigInt(index + 1)); record.writeBigInt64LE(BigInt(index + 1), 8);
+		record.writeUInt16LE(record.length, 16); record[18] = index < 2 ? 4 : 8; record.write(name, 19); return record;
+	}));
+}
+
 afterEach(async () => {
 	closeResourceVersionManagers();
 	await directories.dispose();
 });
 
 describe("speculative action resource versions", () => {
+	test("binds hardlink topology even when every name, byte and link count stays equal", async () => {
+		const root = await directories.create(), manager = new ResourceVersionManager(root);
+		const named = (name: string) => path.join(root, name);
+		await fs.writeFile(named("a"), "same"); await fs.writeFile(named("c"), "same");
+		await fs.link(named("a"), named("b")); await fs.link(named("c"), named("d"));
+		const first = await manager.capture([{ path: root, scope: "tree_content" }]);
+		let second: ResourceVersionToken | undefined;
+		try {
+			const observation = [...first.observations.values()].find(value => value.scope === "tree_content")!;
+			expect(observation.aliases?.map(group => group.paths.map(name => path.basename(name)))).toEqual([["a", "b"], ["c", "d"]]);
+			await fs.unlink(named("b")); await fs.unlink(named("d"));
+			await fs.link(named("c"), named("b")); await fs.link(named("a"), named("d"));
+			second = await manager.capture([{ path: root, scope: "tree_content" }]);
+			expect([...second.observations.values()].find(value => value.scope === "tree_content")!.fingerprint).not.toBe(observation.fingerprint);
+			expect((await manager.validate(first)).expired).toBe(true);
+		} finally { await first.release(); await second?.release(); manager.close(); }
+	});
+
+	test.for((["retain", "cancel", "budget", "outside"] as const).flatMap(mode => (["file", "directory"] as const).map(type => ({ mode, type }))))(
+		"owns passive process input pins through $mode ($type)", async ({ mode, type }, { skip }) => {
+		if (process.platform !== "linux") return skip("Linux object pins");
+		const root = await workspace({ data: "shared" }), outside = await workspace({ data: "outside" });
+		const file = path.join(mode === "outside" ? outside : root, type === "file" ? "data" : ""), args = { command: "worker" };
+		const content = type === "file" ? Buffer.from(mode === "outside" ? "outside" : "shared") : directoryImage(["data"]);
+		const invocation = resolvePiToolInvocation("bash", args, { cwd: root, environment: {} })!;
+		const action = PI_ACTION_SEMANTICS.buildKey("bash", args, root, "", { fingerprint: "process", context: invocation })!;
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => mode === "budget" ? 0 : 65536 });
+		const capture = await world.observation!.capture({ cwd: root, tool: createReadTool(root), toolName: "bash", args, action,
+			callID: "capture", signal: new AbortController().signal });
+		const handle = await fs.open(file, "r"), metadata = await handle.stat({ bigint: true });
+		const sources = [capture.inputSource!], opened = vi.spyOn(fs, "open"), handles: import("node:fs/promises").FileHandle[] = [];
+		let branch: Awaited<ReturnType<typeof capture.seal>> | undefined;
+		try {
+			expect(capture.inputsOnly).toBe(true);
+			for (const repeated of [false, true]) {
+				if (mode === "cancel" && repeated) await capture.dispose();
+				opened.mockClear();
+				await captureHeldDescriptorInputs(process.pid, [{ fd: handle.fd, alias: handle.fd, flags: 0, offset: 0,
+					device: String(metadata.dev), inode: String(metadata.ino), owned: true,
+					...(type === "directory" ? { type, directoryHex: content.toString("hex") } : {}) }], 1024, [], () => sources);
+				expect(opened).toHaveBeenCalledTimes(mode === "retain" && repeated ? 0 : type === "file" ? 2 : 1);
+				handles.push(...await Promise.all(opened.mock.results.map(result => result.value)));
+			}
+			const output = { result: { content: [], details: {} }, isError: false };
+			if (mode !== "retain") { await expect(capture.seal(output)).rejects.toThrow(); return; }
+			branch = await capture.seal(output);
+			expect(branch.inputsOnly).toBe(true); await expect(branch.commit()).rejects.toThrow("input_only_branch");
+			expect(await borrowResourceObject(sources, file, metadata, 1024)).toBeUndefined();
+			expect((await borrowResourceObject([branch.inputSource!], file, metadata, 1024))?.content).toEqual(content);
+			expect(await branch.validate!()).toMatchObject({ status: "valid" });
+			await fs.writeFile(type === "directory" ? path.join(file, "new") : file, "mutate"); expect(await branch.validate!()).toMatchObject({ status: "stale" });
+			await branch.dispose(); expect(await borrowResourceObject([branch.inputSource!], file, metadata, 1024)).toBeUndefined();
+		} finally {
+			opened.mockRestore(); await handle.close(); await branch?.dispose(); await capture.dispose();
+			expect(handles.every(handle => handle.fd === -1), "every retained or declined kernel pin is closed").toBe(true);
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")("promotes a directory pin only into an equal pre-budgeted names view", async () => {
+		const root = await workspace({ "a": "one", "\ue000": "two", "\u{10000}": "three" });
+		const names = await fs.readdir(root), content = directoryImage(names);
+		const manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture([{ path: root, scope: "names" }], 8192), bytes = token.view!.bytes;
+		const handle = await fs.open(root, "r"), metadata = await handle.stat({ bigint: true });
+		const { captureHeldDirectory } = await import("../src/filesystem-evidence.ts");
+		let pin: import("node:fs/promises").FileHandle | undefined;
+		try {
+			const forged = await captureHeldDirectory(process.pid, handle.fd, directoryImage(["forged"]), metadata, root);
+			expect(token.view!.retainObject(root, forged)).toBe(false); await forged.object!.dispose();
+			const actual = await captureHeldDirectory(process.pid, handle.fd, content, metadata, root);
+			expect(actual.entries).toEqual(names); expect(token.view!.retainObject(root, actual)).toBe(true);
+			expect(token.view!.bytes).toBe(bytes);
+			await token.view!.borrowObject(root, async (capture, handle) => { pin = handle; expect(capture.content).toEqual(content); });
+			expect(await token.view!.readdir(root)).toEqual(names);
+		} finally { await token.release(); await handle.close(); manager.close(); expect(pin!.fd).toBe(-1); }
+	});
+
+	test.skipIf(process.platform !== "linux")("revokes pinned input objects while draining an admitted borrower", async () => {
+		const root = await workspace({ data: "shared" }), file = path.join(root, "data");
+		const token = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, 8192);
+		await token.view!.readFile(file); token.view!.seal();
+		const entered = deferred<void>(), finish = deferred<void>();
+		let descriptor: import("node:fs/promises").FileHandle | undefined;
+		const borrowed = token.view!.borrowObject(file, async (capture, handle) => {
+			descriptor = handle; expect(capture.content?.toString()).toBe("shared"); entered.resolve();
+			await finish.promise; expect((await handle.stat()).isFile()).toBe(true);
+		});
+		await entered.promise;
+		const disposed = token.release();
+		await expect(token.view!.borrowObject(file, async () => {})).rejects.toThrow("disposed");
+		expect(descriptor!.fd).toBeGreaterThanOrEqual(0); finish.resolve();
+		await borrowed; await disposed; expect(descriptor!.fd).toBe(-1);
+	});
+
+	test.for(["read", "write", "stale"] as const)("shares %s inputs with FD capture and rejects replacement or revoked owners", async (source, { skip }) => {
+		if (process.platform !== "linux") return skip("Linux object pins");
+		const root = await workspace({ data: "shared" }), file = path.join(root, "data"), args = { path: file };
+		const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 65536 });
+		const action = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { fingerprint: "read", context: invocation })!;
+		const branch = source === "read" ? await world.speculation!.execute({ cwd: root, tool: createReadTool(root), toolName: "read", args,
+			action, callID: "read", signal: new AbortController().signal }) : await createCommittedResourceInputs(
+			{ result: { content: [], details: {} }, isError: false }, action, root,
+			new Map([[file, Buffer.from(source === "stale" ? "forged" : "shared")]]), 65536);
+		const capturedBytes = branch.capturedBytes;
+		const handle = await fs.open(file, "r"), expected = await handle.stat({ bigint: true }), sources = [branch.inputSource!];
+		const opened = vi.spyOn(fs, "open");
+		try {
+			expect((await borrowResourceObject(sources, file, expected, 16))?.content?.toString()).toBe(source === "read" ? "shared" : undefined);
+			for (const repeated of [false, true]) {
+				opened.mockClear();
+				const graph = await captureHeldDescriptorInputs(process.pid, [{ fd: handle.fd, alias: handle.fd, flags: 0,
+					offset: 0, device: String(expected.dev), inode: String(expected.ino), owned: true }], 16, [], () => sources);
+				expect(Buffer.from(graph.objects[handle.fd]!.content!, "base64").toString()).toBe("shared");
+				expect(opened).toHaveBeenCalledTimes(source === "read" || repeated && source === "write" ? 0 : 2);
+				expect((await borrowResourceObject(sources, file, expected, 16))?.content?.toString()).toBe(source === "stale" ? undefined : "shared");
+				expect(branch.capturedBytes, "pin admission uses its existing byte budget").toBe(capturedBytes);
+			}
+			await fs.writeFile(path.join(root, "replacement"), "shared"); await fs.rename(path.join(root, "replacement"), file);
+			expect(await borrowResourceObject(sources, file, await fs.stat(file, { bigint: true }), 16)).toBeUndefined();
+			await branch.dispose(); expect(await borrowResourceObject(sources, file, expected, 16)).toBeUndefined();
+		} finally { opened.mockRestore(); await handle.close(); await branch.dispose(); }
+	});
+
 	test("owns supplied poststates without reading payloads, scanning directories or claiming a host observation window", async () => {
 		const root = await workspace({ "value.txt": "A" }), file = path.join(root, "value.txt"), bytes = Buffer.from("A");
 		const absent = path.join(root, "deleted"), names = ["value.txt"], opened = vi.spyOn(fs, "open"), scanned = vi.spyOn(fs, "readdir");
@@ -837,7 +970,7 @@ describe("speculative action resource versions", () => {
 			return handle;
 		});
 		const digest = (bytes: Buffer) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-		let settled: Promise<PromiseSettledResult<string | StableFileCapture>[]> | undefined;
+		let settled: Promise<PromiseSettledResult<string | StableFilesystemCapture>[]> | undefined;
 		const capture = async (target: string, index: number) => {
 			if (kind === "validation") {
 				const result = index === 0 ? await manager!.validate(token!)
@@ -875,7 +1008,7 @@ describe("speculative action resource versions", () => {
 				}
 			}
 			if (kind === "content" && mode === "shared") {
-				const captures = results.map(result => (result as PromiseFulfilledResult<StableFileCapture>).value);
+				const captures = results.map(result => (result as PromiseFulfilledResult<StableFilesystemCapture>).value);
 				captures[0]!.content![0] = 0; captures[0]!.stat.mode = 0n;
 				expect(captures[1]!.content).toEqual(payload); expect(captures[1]!.stat.mode).not.toBe(0n);
 			}

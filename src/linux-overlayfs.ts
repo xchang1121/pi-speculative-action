@@ -278,6 +278,10 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== `${marker}\n`) {
 			throw new Error("OverlayFS lower view did not preserve file content");
 		}
+		const [lowerIdentity, mountedIdentity, mountedRoot] = await Promise.all([
+			lstat(path.join(lowerRoot, "copy-up.txt"), { bigint: true }), lstat(path.join(root, "copy-up.txt"), { bigint: true }), lstat(root, { bigint: true }),
+		]);
+		if (lowerIdentity.ino !== mountedIdentity.ino || mountedRoot.dev !== mountedIdentity.dev) throw new Error("OverlayFS inode projection is unavailable");
 		await mapFilesystem([
 			() => writeFile(path.join(root, "copy-up.txt"), "changed\n", "utf8"),
 			() => rm(path.join(root, "whiteout.txt")),
@@ -292,6 +296,8 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== "changed\n") {
 			throw new Error("OverlayFS copy-up was not visible");
 		}
+		const copiedIdentity = await lstat(path.join(root, "copy-up.txt"), { bigint: true });
+		if (copiedIdentity.dev !== mountedIdentity.dev || copiedIdentity.ino !== mountedIdentity.ino) throw new Error("OverlayFS copy-up changed object identity");
 		const clock = await openLinuxAnonymousWorkspaceFile(upperRoot);
 		try {
 			const [lower, upper, work, workspace, anonymous, ...beforeEntries] = await Promise.all([

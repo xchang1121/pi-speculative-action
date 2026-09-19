@@ -1,5 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import path from "node:path";
+import type { BigIntStats } from "node:fs";
+import { sameFilesystemIdentity, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type {
@@ -61,27 +63,33 @@ export function createResourceSnapshotExecutionWorld(
 			detail: "Sealed file inputs; host reads may update access times (not an OS snapshot)",
 		}),
 	};
-	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
+	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false,
+		inputsOnly = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
 		if (!onDemand && !canObserve) throw new Error("Windows path binding stamps cannot certify host execution windows");
 		const setupStarted = performance.now();
 		const root = onDemand ? (context.action.executionContext as ToolInvocation | undefined)?.filesystemRoot ?? context.cwd : context.cwd;
 		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, root, actionSemantics, retainBytes);
+		const inputSource = inputsOnly ? Object.freeze({}) : undefined;
+		if (inputSource) resourceVersions.set(inputSource, { versions: [version], executionFingerprint: context.action.executionFingerprint });
 		let disposal: void | Promise<void>;
 		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
 			view: version.view,
+			...(inputsOnly ? { inputsOnly: true as const, inputSource } : {}),
 			seal: async (output) => {
 				const owned = version;
 				version = undefined;
+				if (inputSource) resourceVersions.delete(inputSource);
 				if (!owned) throw new Error("resource snapshot capture is already consumed");
 				try {
 					owned.view?.seal();
+					if (inputsOnly && !owned.view?.resources.length) throw new Error("resource_inputs_empty");
 					// Bound execution already owns its inputs; adoption checks their current versions.
 					if (!onDemand) {
 						const validation = await owned.manager.seal(owned);
 						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					}
-					return resourceSnapshotBranch(output, [owned], context.action, setupMs, actionSemantics);
+					return resourceSnapshotBranch(output, [owned], context.action, setupMs, actionSemantics, inputsOnly);
 				} catch (error) {
 					await releaseResourceVersion(owned);
 					throw error;
@@ -90,6 +98,7 @@ export function createResourceSnapshotExecutionWorld(
 			dispose: () => {
 				const released = version;
 				version = undefined;
+				if (inputSource) resourceVersions.delete(inputSource);
 				return disposal ??= releaseResourceVersion(released);
 			},
 		};
@@ -99,10 +108,12 @@ export function createResourceSnapshotExecutionWorld(
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, capabilities: [...(canObserve ? route.capabilities : []), ...(operations ? WORKSPACE_PATH_MUTATION_EFFECTS.capabilities : [])],
+			inputsOnly: request => process.platform === "linux" && !!operations && !!(request.action?.executionContext as ToolInvocation | undefined)?.process,
 			diagnostics: () => canObserve ? route.diagnostics() : { state: operations ? "ready" : "unavailable", detail: "Only explicit write-byte retention is available; host read windows remain unproven on Windows" },
 			capture: async (context) => {
 				const invocation = context.action.executionContext as ToolInvocation | undefined;
 				if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID);
+				if (process.platform === "linux" && operations && invocation?.process) return capture(context, operations.maxBytes(), true, true);
 				if (actionSemantics.definition(context.action)?.effect !== "observation") throw new Error("Actor input capture requires an explicit binding");
 				return capture(context, operations?.tools.includes(context.toolName) && invocation?.filesystem ? operations.maxBytes() : undefined);
 			} },
@@ -163,6 +174,29 @@ export function createResourceSnapshotExecutionWorld(
 type ResourceInputOwner = { readonly versions: readonly ResourceVersionToken[]; readonly executionFingerprint: string };
 const resourceVersions = new WeakMap<object, ResourceInputOwner>();
 
+/** The input capability, pinned object and current FD must all identify this content version. */
+export async function borrowResourceObject(sources: Iterable<object>, target: string, expected: BigIntStats, maxBytes: number): Promise<StableFilesystemCapture | undefined> {
+	for (const source of sources) for (const version of resourceVersions.get(source)?.versions ?? []) {
+		if (!version.view?.retained) continue;
+		try {
+			const captured = await version.view.borrowObject(target, async (capture, handle) => {
+				if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
+					!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
+				return { ...capture, content: Buffer.from(capture.content), shared: true as const };
+			});
+			if (captured) return captured;
+		} catch { /* Revocation or a different version leaves the normal FD capture authoritative. */ }
+	}
+	return undefined;
+}
+
+/** Transfer a verified pin into the existing input owner; no second resource cache. */
+export function retainResourceObject(sources: Iterable<object>, target: string, capture: StableFilesystemCapture): boolean {
+	for (const source of sources) for (const version of resourceVersions.get(source)?.versions ?? [])
+		if (version.view?.retainObject(target, capture)) return true;
+	return false;
+}
+
 /** Actor reconstruction and predicted execution use the same confined inputs and dependency proof. */
 async function evaluateResourceInputs(
 	{ versions, executionFingerprint }: ResourceInputOwner,
@@ -222,13 +256,13 @@ export async function createCommittedResourceInputs(
 	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
 	try {
 		if (!version.view) throw new Error("resource_snapshot_budget_exceeded");
-		return Object.assign(resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS), { inputsOnly: true as const,
-			commit: async () => { throw new Error("input_only_branch"); } });
+		return Object.assign(resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS, true), { inputsOnly: true as const });
 	} catch (error) { await version.release(); throw error; }
 }
 
 function resourceSnapshotBranch(
 	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, setupMs: number, semantics: ActionSemanticsRegistry,
+	inputsOnly = false,
 ): WorldBranch<ToolSettlement> {
 	const version = versions[0]!;
 	// Input revocation releases data, not the old result's immutable freshness evidence.
@@ -249,6 +283,7 @@ function resourceSnapshotBranch(
 	};
 	return {
 		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
+		...(inputsOnly ? { inputsOnly: true as const } : {}),
 		invalidateInputs: paths => {
 			if (!owned) return [];
 			const removed = invalidateResourceInputs(owned, paths);
@@ -265,18 +300,23 @@ function resourceSnapshotBranch(
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			if (!owned) return undefined;
 			const retained: ResourceVersionToken[] = [];
+			let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
 			let released: Promise<void> | undefined, transferred = false;
 			const dispose = () => released ??= Promise.allSettled(retained.splice(0).map(releaseResourceVersion)).then(() => {});
 			try {
-				const query = await evaluateResourceInputs(owner, request, semantics, undefined, retained);
+				const query = await evaluateResourceInputs(owner, request, semantics, () => missing ??= captureResourceVersion(undefined,
+					(request.action.executionContext as ToolInvocation).filesystemRoot ?? version.root, semantics,
+					Math.max(0, version.view!.remainingBytes - versions.slice(1).reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0)))
+					.then(token => { retained.push(token); return captured = token; }), retained);
 				if (!query) return undefined;
+				captured?.view?.seal();
 				// Borrowed data is already evaluated; only its selected evidence must outlive the source view.
 				for (const [index, token] of query.versions.entries()) {
-					if (versions.some(owned => owned.release === token.release) || retained.includes(token)) continue;
+					if (versions.some(owned => owned.release === token.release) || retained.some(owned => owned.release === token.release)) continue;
 					const proof = token.manager.retain({ ...token, view: undefined });
 					retained.push(proof); query.versions[index] = proof;
 				}
-				const result = { output: query.output, validate: () => validate(released ? undefined : query.versions), capturedBytes: query.capturedBytes,
+				const result = { output: query.output, validate: () => validate(released ? undefined : query.versions), capturedBytes: query.capturedBytes + (captured?.view?.bytes ?? 0),
 					...(query.versions.length > 1 || retained.length ? { requiresQueryValidation: true as const } : {}),
 					...(retained.length ? { dispose } : {}),
 					compatibility: { status: "compatible" as const, backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
@@ -284,6 +324,7 @@ function resourceSnapshotBranch(
 			} finally { if (!transferred) await dispose(); }
 		} } : {}),
 		commit: async () => {
+			if (inputsOnly) throw new Error("input_only_branch");
 			if (!owned) throw new Error("resource snapshot is disposed");
 			return output;
 		},

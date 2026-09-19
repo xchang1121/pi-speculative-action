@@ -2,7 +2,7 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { gated, nextTurn } from "./async.ts";
 import { runProgram, shellQuote } from "./command.ts";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, type FileHandle, link, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -19,7 +19,7 @@ import {
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock, captureStableFile } from "../src/filesystem-evidence.ts";
-import { hydrateWorkspaceFileEntry } from "../src/process-observation.ts";
+import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry } from "../src/process-observation.ts";
 import { deferredWorkspaceTransactionDriver } from "../src/workspace-transaction.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
@@ -47,6 +47,86 @@ afterEach(async () => {
 });
 
 describe("workspace-branch ExecutionWorld", () => {
+	it("shares write/edit contents with aliases and speculative descendant checkpoints", async () => {
+		const root = await temporaryRoot(), file = path.join(root, "a"), alias = path.join(root, "b");
+		await writeFile(file, "before\n"); await link(file, alias);
+		const world = sandbox.createExecutionWorld({ driver: "git" });
+		const branch = await world.speculation.execute(context(root, "write", writeTool, { path: "a", content: "first\n" }));
+		try {
+			const childContext = context(root, "edit", editTool, { path: "b", edits: [{ oldText: "first", newText: "second" }] });
+			const child = await world.speculation.execute({ ...childContext, parentCheckpoint: branch.checkpoint });
+			try {
+				expect(await readFile(file, "utf8")).toBe("before\n");
+				await branch.commit(); await child.commit();
+				expect(await readFile(file, "utf8")).toBe("second\n"); expect(await readFile(alias, "utf8")).toBe("second\n");
+				expect((await stat(file, { bigint: true })).ino).toBe((await stat(alias, { bigint: true })).ino);
+			} finally { await child.dispose(); }
+		} finally { await branch.dispose(); }
+	});
+	it.each((["git", ...(process.platform === "linux" ? ["overlayfs"] : [])] as Array<"git" | "overlayfs">).flatMap(driver =>
+		["write", "replace", "unlink", "rename", "swap", "join", "create", ...(process.platform === "linux" ? ["chmod"] : [])].map(mode => [driver, mode] as const)))("commits %s %s through the same file object and namespace transaction", async (driver, mode) => {
+		const root = await temporaryRoot(), a = path.join(root, "a"), b = path.join(root, "b"), c = path.join(root, "c");
+		await writeFile(a, "shared"); await link(a, b); await writeFile(c, "other");
+		const held = await open(a, "r"), initial = await held.stat({ bigint: true });
+		try {
+			const branch = await sandbox.fork({ cwd: root, driver, action: requiredAction("write", { path: "a", content: "after" }, root), execute: async ({ sandboxRoot, structure }) => {
+				const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+				const projection = new ExecutionPathProjection({ sourceRoot: root, workspaceRoot: sandboxRoot });
+				const before = await structure.capture();
+				const bytes = new Map(await Promise.all([...before.entries].filter(([, entry]) => entry.kind === "file")
+					.map(async ([name]) => [name, await readFile(path.join(sandboxRoot, name))] as const)));
+				const x = (name: string) => path.join(sandboxRoot, name);
+				if (mode === "write") await writeFile(x("a"), "updated");
+				if (mode === "chmod") await chmod(x("a"), 0o600);
+				if (mode === "replace") { await unlink(x("a")); await writeFile(x("a"), "private"); }
+				if (mode === "unlink") await unlink(x("a"));
+				if (mode === "rename") { await fs.rename(x("a"), x("d")); await fs.rename(x("b"), x("e")); await writeFile(x("d"), "moved"); }
+				if (mode === "swap") { await fs.rename(x("a"), x("tmp")); await fs.rename(x("c"), x("a")); await fs.rename(x("tmp"), x("c")); }
+				if (mode === "join") { await unlink(x("c")); await link(x("a"), x("c")); }
+				if (mode === "create") { await writeFile(x("d"), "new"); await link(x("d"), x("e")); }
+				const after = await structure.capture();
+				const deltas = await Promise.all([...new Set([...before.entries.keys(), ...after.entries.keys()])].filter(name => name && name !== ".git")
+					.map(async relativePath => ({ relativePath, before: bytes.get(relativePath),
+						after: after.entries.get(relativePath)?.kind === "file" ? await readFile(x(relativePath)) : undefined,
+						beforeMode: before.entries.get(relativePath)?.kind === "file" ? (before.entries.get(relativePath) as { mode: number }).mode : undefined,
+						afterMode: after.entries.get(relativePath)?.kind === "file" ? (after.entries.get(relativePath) as { mode: number }).mode : undefined })));
+				const diff = diffWorkspaceStructures(before, after, deltas, projection);
+				expect(diff.complete, diff.reason).toBe(true);
+				return { output: settlement(mode), changes: diff.effects.map(({ relativePath, change }) => ({ ...change, root, target: path.join(root, relativePath), resource: relativePath })) };
+			} });
+			expect(await readFile(a, "utf8")).toBe("shared");
+			try { await branch.commit().catch(error => { throw new Error(`${mode}: ${String(error.cause ?? error)}`, { cause: error }); }); }
+			finally { await branch.dispose(); }
+			const observed = await held.readFile({ encoding: "utf8" });
+			expect(observed).toBe(mode === "write" ? "updated" : mode === "rename" ? "moved" : "shared");
+			const survivor = mode === "rename" ? "d" : mode === "swap" ? "c" : "b";
+			expect((await stat(path.join(root, survivor), { bigint: true })).ino).toBe(initial.ino);
+			if (mode === "chmod") expect((await held.stat()).mode & 0o777).toBe(0o600);
+			if (mode === "replace") expect(await readFile(a, "utf8")).toBe("private");
+			if (mode === "unlink" || mode === "rename") await expect(stat(a)).rejects.toMatchObject({ code: "ENOENT" });
+			if (mode === "swap") expect(await readFile(a, "utf8")).toBe("other");
+			if (mode === "join") expect((await stat(c, { bigint: true })).ino).toBe(initial.ino);
+			if (mode === "create") expect((await stat(path.join(root, "d"), { bigint: true })).ino).toBe((await stat(path.join(root, "e"), { bigint: true })).ino);
+		} finally { await held.close(); }
+	});
+	it("preserves closed hardlink groups in private snapshots and invalidates byte-identical topology changes", async () => {
+		const root = await temporaryRoot(), file = path.join(root, "a"), alias = path.join(root, "b");
+		await writeFile(file, "same"); await link(file, alias);
+		await sandbox.prepare(root, { driver: "git" });
+		await sandbox.withWorkspace(root, async workspace => {
+			const a = path.join(workspace.sandboxRoot, "a"), b = path.join(workspace.sandboxRoot, "b");
+			const [left, right, original] = await Promise.all([stat(a, { bigint: true }), stat(b, { bigint: true }), stat(file, { bigint: true })]);
+			expect(left.ino).toBe(right.ino); expect(left.nlink).toBe(2n); expect(left.ino).not.toBe(original.ino);
+			await writeFile(a, "private"); expect(await readFile(b, "utf8")).toBe("private"); expect(await readFile(file, "utf8")).toBe("same");
+		});
+		await unlink(alias); await writeFile(alias, "same");
+		await sandbox.withWorkspace(root, async workspace => {
+			const a = path.join(workspace.sandboxRoot, "a"), b = path.join(workspace.sandboxRoot, "b");
+			expect((await stat(a, { bigint: true })).ino).not.toBe((await stat(b, { bigint: true })).ino);
+			await writeFile(a, "private"); expect(await readFile(b, "utf8")).toBe("same");
+		});
+	});
+
 	it.each(["external", "factory"])("joins one driver cleanup after %s retirement during construction", async (retirement) => {
 		const gate = gated(), begin = vi.fn(), dispose = vi.fn(gate.wait);
 		const create = vi.fn(async () => {
@@ -76,8 +156,8 @@ describe("workspace-branch ExecutionWorld", () => {
 			const root = await temporaryRoot(), controller = new AbortController();
 			let workspaces = 0, captures = 0;
 			const gate = gated();
-			const capture = ResourceVersionManager.prototype.observeChanges;
-			const observer = vi.spyOn(ResourceVersionManager.prototype, "observeChanges").mockImplementation(async function (this: ResourceVersionManager, ...args) {
+			const capture = ResourceVersionManager.prototype.capture;
+			const observer = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementation(async function (this: ResourceVersionManager, ...args) {
 				captures++;
 				const token = await capture.apply(this, args);
 				if (phase === "baseline") await gate.wait();
@@ -119,7 +199,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const firstWorld = first.createExecutionWorld({ driver: "git" });
 		const firstSibling = first.createExecutionWorld({ driver: "git" });
 		const secondWorld = second.createExecutionWorld({ driver: "git" });
-		const signal = new AbortController().signal, observations = vi.spyOn(ResourceVersionManager.prototype, "observeChanges");
+		const signal = new AbortController().signal, observations = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince");
 		const gate = gated(), schedule = globalThis.setTimeout;
 		let expire: (() => void) | undefined, pool: string | undefined, closed = false;
@@ -137,7 +217,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				secondWorld.speculation.prepare?.({ cwd: root, signal }),
 			]);
 			await firstSibling.speculation.prepare?.({ cwd: root, signal: new AbortController().signal });
-			expect(observations).toHaveBeenCalledTimes(2); // One notification cursor per service, shared across warm generations.
+			expect(observations).toHaveBeenCalledTimes(2); // One namespace capture per service, shared across warm generations.
 			changes.mockReturnValue({ uncertain: true, paths: [] });
 			await writeFile(path.join(root, "value.txt"), "changed\n");
 			const failure = new Error("baseline observation failed");
@@ -890,7 +970,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			captures.mockClear();
 			await writeFile(path.join(root, ".git", "audit-cache"), "metadata changed\n");
 			await sandbox.prepare(root, { driver: "git" });
-			expect(captures).not.toHaveBeenCalled();
+			expect(captures.mock.calls.every(([dependencies]) => dependencies?.every(dependency => dependency.scope === "tree_entries"))).toBe(true);
 			const args = { path: "created.txt", content: "speculative\n" };
 			await sandbox.createExecutionWorld().speculation.execute(context(root, "write", writeTool, args));
 			expect(await readFile(index)).toEqual(beforeIndex);
@@ -995,7 +1075,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
 		const root = await temporaryRoot(), gate = gated();
 		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-		const observations = vi.spyOn(ResourceVersionManager.prototype, "observeChanges"), pending: Promise<unknown>[] = [];
+		const observations = vi.spyOn(ResourceVersionManager.prototype, "capture"), pending: Promise<unknown>[] = [];
 		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockReturnValue({ uncertain: true, paths: [] });
 		let heldRoot: string | undefined, removals = 0;
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
@@ -1023,7 +1103,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			expect(observations).toHaveBeenCalledTimes(1);
 			const third = sandbox.prepare(root, { driver: "git" }); pending.push(third);
 			await third;
-			expect(observations).toHaveBeenCalledTimes(1);
+			expect(observations).toHaveBeenCalledTimes(1); // Immutable preparation remains reusable; adoption proves its inputs.
 			gate.release(); await Promise.all(pending);
 			expect(removals).toBe(1);
 			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))

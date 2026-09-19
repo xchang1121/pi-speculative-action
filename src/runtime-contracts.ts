@@ -313,6 +313,8 @@ export interface SpeculativeRuntimeInspection {
 export interface PreparedActorCall<Output> {
 	readonly output?: Output;
 	readonly observeOperations?: boolean;
+	/** Internal Actor operations borrow the same input owners as predicted tool calls. */
+	readonly withInputs?: <Value>(execute: (inputs: (path: string) => Iterable<object>) => Promise<Value>) => Promise<Value>;
 	readonly settle: (toolExecution: TimelineInterval, output?: Output, operations?: readonly ExecutionOperationBinding[]) => Promise<void>;
 }
 

@@ -71,9 +71,9 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
-		observeOperations: ({ action, scope, learn }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
+		observeOperations: ({ action, scope, learn, inputs }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
 			observe(bindings.map(binding => describeOperation(binding, action)), computations);
-		}, learn),
+		}, learn, inputs),
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			tools: options.tools,
@@ -153,7 +153,7 @@ export function createLinuxProcessExecutionWorld(
 							},
 				afterCapture: async (_workspace, capture) => {
 					if (!session) throw new Error("process evidence sealer is missing");
-					return [...capture.changes, ...await session.seal(capture.changes)];
+					return session.seal(capture.changes);
 				},
 				execute: async (workspace) => {
 					session = await backend.open({
@@ -171,7 +171,7 @@ export function createLinuxProcessExecutionWorld(
 						if (operation) {
 							const result = await session.executeBinding(operation);
 							// Scheduler-only output. The held native exec consumes the original ordered byte journal.
-							return { result: { content: [], details: { exit: result.exit } }, isError: false };
+							return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false };
 						}
 						const result = await options.coordinator.runWith(
 							{

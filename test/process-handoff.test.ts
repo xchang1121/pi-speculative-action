@@ -3,6 +3,7 @@ import { processPrototype, processCertificate as sealFixture } from "./process-f
 import { describe, expect, it, vi } from "vitest";
 import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import {
 	sha256Digest as digest,
 	type ProcessProvenanceCertificate,
@@ -14,6 +15,31 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("owns continuation memory once, within scope and the common retention budget", async () => {
+		for (const revoke of ["consume", "clear", "budget", "dispose"]) {
+			const fixture = await producer(false, new ProcessHandoffRegistry<unknown>(8, 100));
+			const image = Buffer.from("private live state"), computation = new TimelineInterval(2, 5);
+			const certificate = sealFixture(fixture.certificate.prototype, { producer: fixture.certificate.producer,
+				dependencyCertificate: fixture.certificate.dependencyCertificate,
+				result: { replayProfile: "buffered_noninteractive", journal: [], continuation: { imageDigest: digest(image), imageBytes: image.length } } });
+			const suspend = vi.fn(async () => { await fixture.registry.publish(fixture.key, fixture.work, certificate, async () => false,
+				{ image, physicalRoot: "/private/workspace", computation }); });
+			fixture.registry.observeSuspension(fixture.key, fixture.work, suspend);
+			const borrowed = fixture.work.suspend!;
+			await borrowed(); await borrowed(); expect(suspend).toHaveBeenCalledOnce();
+			expect(fixture.work.computation).toBe(computation);
+			await expect(fixture.actor(undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+			if (revoke === "clear") fixture.registry.clearCompleted();
+			if (revoke === "budget") fixture.registry.configure(8, 0);
+			if (revoke === "dispose") fixture.registry.dispose();
+			const actors = await Promise.all([fixture.actor(), fixture.actor()]);
+			expect(actors.filter(result => result.kind === "hit")).toHaveLength(revoke === "consume" ? 1 : 0);
+			if (revoke === "consume") expect(actors.find(result => result.kind === "hit")).toMatchObject({ continuation: { image, computation } });
+			await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
+			fixture.registry.dispose();
+		}
+	});
+
 	it("revokes active production on disposal and prevents concurrent or repeated whole transfers", async () => {
 		const fixture = await producer();
 		fixture.registry.dispose();

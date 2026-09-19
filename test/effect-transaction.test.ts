@@ -214,8 +214,11 @@ describe("EffectTransactionCoordinator", () => {
 	it("rejects an input-only capture that supplies a reusable action result", async () => {
 		const coordinator = new EffectTransactionCoordinator<string>(), dispose = vi.fn();
 		const attempt = coordinator.begin({ tool: "write", route: { ...route, reuse: "shared_result" } });
-		const capture = coordinator.capture(attempt, { inputsOnly: true, seal: () => branch({ dispose }), dispose: () => {} });
+		const inputSource = {};
+		const capture = coordinator.capture(attempt, { inputsOnly: true, inputSource, seal: () => branch({ dispose }), dispose: () => {} });
+		expect(capture.inputSource).toBe(inputSource);
 		await expect(capture.seal("written")).rejects.toThrow("input_only_capture_required");
+		expect(capture.inputSource).toBeUndefined();
 		expect(dispose).toHaveBeenCalledOnce(); expect(attempt.state).toBe("failed");
 	});
 

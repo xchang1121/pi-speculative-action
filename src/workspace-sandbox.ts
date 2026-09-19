@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
-import { access, chmod, type FileHandle, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -17,6 +17,7 @@ import type {
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
+import type { WorkspaceFileMutation } from "./workspace-state.ts";
 import {
 	LinuxOverlayfsCapabilityRegistry,
 	LinuxOverlayfsUnsafeCleanupError,
@@ -28,6 +29,7 @@ import {
 import {
 	captureWorkspaceStructure,
 	captureWorkspaceStructureEntry,
+	workspaceStructureSnapshot,
 	directoryEntriesDigest,
 	type WorkspaceStructureEntry,
 	type WorkspaceStructureSnapshot,
@@ -56,10 +58,8 @@ interface SandboxChangeTarget {
 	readonly accessMode?: number;
 }
 
-export interface SandboxFileChange extends SandboxChangeTarget {
+export interface SandboxFileChange extends SandboxChangeTarget, WorkspaceFileMutation {
 	readonly kind?: "file";
-	/** A native content write preserves the existing inode and checks its write permission. */
-	readonly operation?: "write_contents";
 	readonly before?: Uint8Array;
 	readonly after?: Uint8Array;
 	readonly beforeMode?: number;
@@ -116,6 +116,8 @@ export interface SandboxWorkspaceContext {
 	readonly structure: WorkspaceStructureDriver;
 	/** Content-addressed mutation intervals, independent of any process or tool implementation. */
 	readonly transactions: WorkspaceTransactionDriver;
+	/** Capture named object/namespace transitions omitted by a content-only change index. */
+	readonly captureChanges?: (frontier: readonly string[]) => Promise<readonly SandboxFileChange[]>;
 	/** Source notifications since this fork's baseline; lookup hints, never freshness authority. */
 	readonly sourceChanges?: () => ResourceChangeSet;
 }
@@ -171,7 +173,7 @@ interface PooledGitRepository {
 	readonly git: ReturnType<typeof bindGit>;
 	readonly index: ReturnType<typeof bindGit>;
 	readonly versions: ResourceVersionManager;
-	baseline?: { readonly commit: string; readonly tree: string; readonly version: ResourceVersionToken };
+	baseline?: { readonly commit: string; readonly tree: string; readonly version: ResourceVersionToken; readonly aliases: readonly (readonly string[])[] };
 	active: number;
 	readonly idleWaiters: Set<() => void>;
 	lock: Promise<void>;
@@ -513,13 +515,15 @@ async function commitSandboxExecution(
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
 			const applied: SandboxWorkspaceChange[] = [];
 			const createdDirectories: string[] = [];
+			const objects = new Map<string, { source: SandboxFileChange; write?: SandboxFileChange; handle?: FileHandle; mode?: number }>();
+			let nativeStarted = false;
 			let bytesValidated = 0;
 			let validationMs = 0;
 			let resourcesCommitted = 0;
 			try {
 				for (const change of changes) await assertCommitTarget(change);
 				await mapFilesystem(changes, async (change) => {
-					if (!change.validationOnly && change.kind !== "directory" && !change.operation && change.after !== undefined) {
+					if (!change.validationOnly && change.kind !== "directory" && !change.operation && !change.object && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				});
@@ -535,20 +539,74 @@ async function commitSandboxExecution(
 						throw new Error(`resource changed before commit: ${change.resource}`);
 					}
 					if (change.accessMode) await access(change.target, change.accessMode);
-					if (!change.validationOnly && change.kind !== "directory" && change.operation) {
+					if (change.kind !== "directory" && change.aliases) {
+						const identity = (current as RegularFileState | undefined)?.identity;
+						if (!identity || identity.nlink !== BigInt(change.aliases.length) || !change.aliases.includes(change.target)) throw new Error("file alias set changed");
+						for (const alias of change.aliases) {
+							await assertNoSymlinkPath(change.root, alias);
+							if (!sameFilesystemIdentity(identity, await lstat(alias, { bigint: true }))) throw new Error("file alias identity changed");
+						}
+					}
+					if (!change.validationOnly && change.kind !== "directory" && change.operation && !change.object) {
 						if (change.after === undefined) throw new Error("A content write cannot delete a file");
 						const before = current as RegularFileState | undefined;
 						if (before) {
 							const descriptor = await open(change.target, fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
 							descriptors.set(change, descriptor);
 							const identity = await descriptor.stat({ bigint: true });
-							if (identity.nlink !== 1n || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
+							if (identity.nlink !== BigInt(change.aliases?.length ?? 1) || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
 								throw new Error(`content write identity is not representable: ${change.resource}`);
 							}
 						}
 					}
 				}
+				for (const change of changes) if (change.kind !== "directory" && change.object) {
+					const reference = change.object, key = `${Number(reference.before)}:${reference.path}`;
+					const source = changes.find(candidate => candidate.target === reference.path);
+					if (!source || source.kind === "directory" || change.after === undefined ||
+						(reference.before ? source.before === undefined : source.after === undefined || source.object)) throw new Error("file object anchor is unavailable");
+					const group = objects.get(key) ?? { source };
+					if (reference.before) {
+						if (change.operation) {
+							if (group.write && (!sameOptionalBytes(group.write.after, change.after) || group.write.afterMode !== change.afterMode)) throw new Error("inconsistent object contents");
+							group.write = change;
+						} else if (!sameOptionalBytes(source.before, change.after)) throw new Error("object change lacks a write");
+						if (source.beforeMode !== change.afterMode) {
+							if (group.mode !== undefined && group.mode !== change.afterMode) throw new Error("inconsistent object permissions");
+							group.mode = change.afterMode;
+						}
+					} else if (!sameOptionalBytes(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
+					objects.set(key, group);
+				}
+				for (const [key, group] of objects) if (key.startsWith("1:")) {
+					const before = baselines.get(group.source) as RegularFileState;
+					group.handle = await open(group.source.target, (group.write ? fsConstants.O_RDWR : fsConstants.O_RDONLY) | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+					descriptors.set(group.source, group.handle);
+					const identity = await group.handle.stat({ bigint: true });
+					if (!before.identity || identity.nlink !== BigInt(group.source.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity)) throw new Error("file object predecessor changed");
+				}
 				validationMs = Math.max(0, performance.now() - validationStarted);
+				// Pin every source name before any destination is removed or replaced; cycles use the same transaction.
+				for (const change of changes) if (change.kind !== "directory" && change.object) {
+					const reference = change.object, group = objects.get(`${Number(reference.before)}:${reference.path}`)!;
+					const prior = baselines.get(change) as RegularFileState | undefined;
+					const sourceState = baselines.get(group.source) as RegularFileState | undefined;
+					if (reference.before && prior?.identity && sourceState?.identity && prior.identity.dev === sourceState.identity.dev && prior.identity.ino === sourceState.identity.ino) continue;
+					const source = reference.before ? reference.path : staged.get(group.source)!;
+					const temporary = path.join(change.root, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
+					if (reference.before) nativeStarted = true;
+					await link(source, temporary); staged.set(change, temporary);
+					if (reference.before) {
+						const linked = await lstat(temporary, { bigint: true });
+						if (linked.dev !== sourceState!.identity!.dev || linked.ino !== sourceState!.identity!.ino) throw new Error("file object changed while linking");
+					}
+				}
+				for (const group of objects.values()) if (group.write || group.mode !== undefined) {
+					nativeStarted = true;
+					if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
+					if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
+					resourcesCommitted++;
+				}
 				for (const change of orderSandboxChanges(changes)) {
 					await assertCommitTarget(change);
 					if (change.kind === "directory") {
@@ -567,7 +625,8 @@ async function commitSandboxExecution(
 						resourcesCommitted++;
 						continue;
 					}
-					if (change.operation) {
+					if (change.object && !staged.has(change)) continue;
+					if (change.operation && !change.object) {
 						// Native writes are authoritative from their first possible effect, including mkdir.
 						applied.push(change);
 						await createParentDirectories(change.root, change.target, createdDirectories);
@@ -586,7 +645,13 @@ async function commitSandboxExecution(
 					const temporary = staged.get(change);
 					if (temporary) {
 						await createParentDirectories(change.root, change.target, createdDirectories);
-						await replaceFile(temporary, change.target, resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change));
+						const mode = resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change);
+						try { await replaceFile(temporary, change.target, mode); }
+						catch (error) {
+							if (process.platform !== "win32" || !(change.object || change.aliases) || !hasErrorCode(error, "EPERM")) throw error;
+							// NTFS can deny replacement of an open name while allowing its unlink. Retained handles stay on the old object.
+							nativeStarted = true; await unlink(change.target); await replaceFile(temporary, change.target, mode);
+						}
 						staged.delete(change);
 					} else {
 						await rm(change.target, { force: true });
@@ -612,7 +677,7 @@ async function commitSandboxExecution(
 				}
 			} catch (error) {
 				inputs?.clear();
-				if (applied.some((change) => change.kind !== "directory" && change.operation)) {
+				if (nativeStarted || applied.some((change) => change.kind !== "directory" && (change.operation || change.aliases))) {
 					throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
 				}
 				try {
@@ -714,17 +779,17 @@ async function prepareSandboxWorkspaceFor(
 			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
 		);
 		throwIfAborted(options.signal);
-		const baseline = await acquireSandboxBaseline(repository, true), { commit } = baseline;
+		const baseline = await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
-			const baseline = await acquireOverlayBaseline(repository, commit);
+			const overlay = await acquireOverlayBaseline(repository, baseline);
 			try {
 				throwIfAborted(options.signal);
-				await overlayBaselineStructure(baseline);
+				await overlayBaselineStructure(overlay);
 			} finally {
-				releaseOverlayBaseline(baseline);
+				releaseOverlayBaseline(overlay);
 			}
-		} else await ensurePreparedSandbox(repository, commit, options.signal);
+		} else await ensurePreparedSandbox(repository, baseline, options.signal);
 		throwIfAborted(options.signal);
 		const prepared = Object.freeze({ ...resolved });
 		preparedWorkspaceBaselines.set(prepared, { repository, baseline });
@@ -749,6 +814,7 @@ async function executeMutation(
 		...options,
 		execute: async (workspace) => {
 			const changes = new Map<string, SandboxWorkspaceChange>();
+			let namespace: Promise<WorkspaceStructureSnapshot> | undefined;
 			const lifetime = new RuntimeLifecycleLane();
 			let bytes = 0, failure: { error: unknown } | undefined;
 			const record = (key: string, change: SandboxWorkspaceChange) => {
@@ -777,7 +843,15 @@ async function executeMutation(
 				const before = previous?.validationOnly
 					? previous.before === undefined ? undefined : { content: previous.before, mode: previous.beforeMode! }
 					: await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES);
-				const captured: SandboxFileChange = previous ?? { ...targetRecord(target), validationOnly: true, before: before?.content, beforeMode: before?.mode };
+				let aliases: readonly string[] | undefined;
+				if (!previous && before && "identity" in before && before.identity && before.identity.nlink > 1n) {
+					const snapshot = await (namespace ??= workspace.structure.capture());
+					const entry = snapshot.entries.get(path.relative(workspace.sandboxRoot, file));
+					if (!snapshot.complete || entry?.kind !== "file" || entry.aliases?.length !== Number(before.identity.nlink)) throw new Error("workspace file alias namespace is not closed");
+					aliases = entry.aliases.map(name => path.resolve(sourceRoot, path.relative(workspace.sandboxRoot, name)));
+				}
+				const captured: SandboxFileChange = previous ?? { ...targetRecord(target), validationOnly: true, before: before?.content, beforeMode: before?.mode,
+					...(aliases ? { aliases } : {}) };
 				record(key, captured);
 				return { file, before, key, captured };
 			};
@@ -885,12 +959,25 @@ async function createPrivateSandboxWorkspace(
 		let openTransactionClock: () => Promise<FileHandle>;
 		let transactionClockLinks: 0 | 1;
 		let transactionClockRoots: readonly string[];
+		let overlayDevice: string | undefined;
 		const observationExcludes: readonly string[] = SNAPSHOT_EXCLUDES;
 		if (driver === "overlayfs") {
-			sharedBaseline = await acquireOverlayBaseline(pool, commit);
+			sharedBaseline = await acquireOverlayBaseline(pool, baseline);
 			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
 			processRoot = path.join(overlayStorageRoot, "process");
 			await mkdir(processRoot);
+			// Lower-layer copy-up can split hardlinks. Materialize only shared objects in the private upper layer.
+			const upper = path.join(overlayStorageRoot, "upper"), directories = new Set<string>();
+			for (const aliases of baseline.aliases) {
+				for (const name of aliases) {
+					for (let parent = path.dirname(name); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
+					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
+				}
+				await copyFile(path.join(sharedBaseline.sandboxRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
+				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
+			}
+			for (const directory of [...directories].sort((a, b) => b.length - a.length))
+				await chmod(path.join(upper, directory), (await lstat(path.join(sharedBaseline.sandboxRoot, directory))).mode & 0o777);
 			const mounted = await mountLinuxOverlayfs({
 				lowerRoot: sharedBaseline.sandboxRoot,
 				privateRoot: overlayStorageRoot,
@@ -898,13 +985,14 @@ async function createPrivateSandboxWorkspace(
 				capabilityRegistry: state.overlayfsCapabilities,
 			});
 			overlay = mounted;
+			overlayDevice = String((await lstat(mounted.root, { bigint: true })).dev);
 			sandboxRoot = mounted.root;
 			gitDirectory = sharedBaseline.gitDirectory;
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot);
 			transactionClockLinks = 0;
 			transactionClockRoots = Object.freeze([sharedBaseline.sandboxRoot, mounted.upperRoot, mounted.workRoot]);
 		} else {
-			const prepared = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, commit));
+			const prepared = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, baseline));
 			attached = prepared;
 			sandboxRoot = prepared.sandboxRoot;
 			processRoot = prepared.processRoot;
@@ -932,7 +1020,7 @@ async function createPrivateSandboxWorkspace(
 				}
 				if (!workspace.sharedBaseline) throw new Error("OverlayFS shared baseline is unavailable");
 				return overlayBaselineStructure(workspace.sharedBaseline).then((baseline) =>
-					captureOverlayWorkspaceStructure(workspace, baseline),
+					captureOverlayWorkspaceStructure(workspace, baseline, overlayDevice!),
 				);
 			},
 		};
@@ -944,6 +1032,7 @@ async function createPrivateSandboxWorkspace(
 			observationExcludes,
 			structure,
 			transactions,
+			captureChanges: frontier => collectSandboxChanges(workspace, frontier),
 			sourceChanges: () => pool.versions.changesSince(baseline.version),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
 			pool,
@@ -1182,7 +1271,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 			if (captureBefore) afterBytes += current?.content.byteLength ?? 0;
 			retainedBytes = unchangedBytes + (current?.content.byteLength ?? 0);
 			frontier.set(relativePath, current);
-			if (captureBefore && !sameSandboxState(previous, current)) {
+			if (captureBefore) {
 				changes.push({
 					relativePath,
 					...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
@@ -1270,9 +1359,9 @@ async function acquireSandboxBaseline(
 			// Quiet notifications reuse preparation; fresh allocations check exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
-			if (warmup) {
-				if (!(await sandboxIndexChanges(repository)).length) return baseline;
-			} else if (baseline.version.observations.size) {
+			// A preparation owns an immutable namespace. Borrowers prove the captured alias set at adoption.
+			if (warmup && !(await sandboxIndexChanges(repository)).length) return baseline;
+			if (!warmup && [...baseline.version.observations.values()].some(entry => entry.scope === "tree_content")) {
 				const [version, paths] = await Promise.all([
 					repository.versions.validate(baseline.version), sandboxIndexChanges(repository),
 				]);
@@ -1282,14 +1371,21 @@ async function acquireSandboxBaseline(
 		for (let attempt = 0; attempt < 3; attempt++) {
 			// Preparation owns immutable bytes, not source freshness. Actual allocations capture exact
 			// evidence; borrowed process preparations validate their observed inputs and effects at adoption.
-			const version = warmup ? await repository.versions.observeChanges()
-				: await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
+			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: warmup ? "tree_entries" : "tree_content" }]);
 			try {
+				const aliases = [...version.observations.values()].flatMap(entry => entry.aliases ?? []).map(group => {
+					if (group.paths.length !== group.links) throw new Error("workspace hardlink namespace is not closed");
+					return group.paths.map(target => {
+						const relative = relativeFilesystemPath(repository.sourceRoot, target);
+						if (!relative || isSnapshotExcluded(slash(relative))) throw new Error("workspace hardlink escapes snapshot");
+						return relative;
+					});
+				});
 				// Events and Git stat data can both miss changes. A changed baseline owns a fresh index.
 				await repository.index(["read-tree", "--empty"]);
 				await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
-				const commit = tree === baseline?.tree ? baseline.commit : (await repository.git(
+				const commit = tree === baseline?.tree && JSON.stringify(aliases) === JSON.stringify(baseline.aliases) ? baseline.commit : (await repository.git(
 					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
 					{ environment: SANDBOX_AUTHOR_ENVIRONMENT },
 				)).toString("utf8").trim();
@@ -1297,7 +1393,7 @@ async function acquireSandboxBaseline(
 				// An ABA during staging can restore captured source bytes after Git copied different bytes.
 				if (!warmup && (await sandboxIndexChanges(repository)).length) continue;
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
-				repository.baseline = { commit, tree, version };
+				repository.baseline = { commit, tree, version, aliases };
 				baseline?.version.release();
 				return repository.baseline;
 			} finally {
@@ -1308,7 +1404,8 @@ async function acquireSandboxBaseline(
 	});
 }
 
-async function ensurePreparedSandbox(repository: PooledGitRepository, commit: string, signal?: AbortSignal): Promise<void> {
+async function ensurePreparedSandbox(repository: PooledGitRepository, baseline: NonNullable<PooledGitRepository["baseline"]>, signal?: AbortSignal): Promise<void> {
+	const { commit } = baseline;
 	const existing = repository.prepared;
 	if (existing?.commit === commit) {
 		await existing.workspace;
@@ -1317,7 +1414,7 @@ async function ensurePreparedSandbox(repository: PooledGitRepository, commit: st
 	const stale = await takePreparedSandbox(repository);
 	await stale?.dispose();
 	throwIfAborted(signal);
-	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, commit) };
+	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, baseline) };
 	try {
 		await pending.workspace;
 	} catch (error) {
@@ -1346,14 +1443,20 @@ async function takePreparedSandbox(
 
 async function attachSandboxWorkspace(
 	repository: PooledGitRepository,
-	commit: string,
+	baseline: NonNullable<PooledGitRepository["baseline"]>,
 	ownedProcessRoot?: string,
 ): Promise<PreparedGitWorkspace> {
+	const { commit } = baseline;
 	const processRoot = ownedProcessRoot ?? (await mkdtemp(path.join(repository.parent, "action-")));
 	const sandboxRoot = path.join(processRoot, "workspace");
 	try {
 		if (ownedProcessRoot) await mkdir(processRoot, { recursive: true });
 		await repository.git(["worktree", "add", "--detach", sandboxRoot, commit], { cwd: processRoot });
+		for (const aliases of baseline.aliases) {
+			const paths = aliases.map(relative => path.resolve(sandboxRoot, relative));
+			for (const target of paths) await assertNoSymlinkPath(sandboxRoot, target);
+			for (const target of paths.slice(1)) { await unlink(target); await link(paths[0]!, target); }
+		}
 		const gitDirectory = (
 			await bindGit(repository.gitBinary, sandboxRoot, ["-C", sandboxRoot])(["rev-parse", "--absolute-git-dir"])
 		)
@@ -1379,8 +1482,9 @@ async function attachSandboxWorkspace(
 
 async function acquireOverlayBaseline(
 	repository: PooledGitRepository,
-	commit: string,
+	snapshot: NonNullable<PooledGitRepository["baseline"]>,
 ): Promise<SharedOverlayBaseline> {
+	const { commit } = snapshot;
 	return withWorkspaceLock(repository, async () => {
 		for (const [candidateCommit, pending] of repository.overlayBaselines) {
 			if (candidateCommit === commit) continue;
@@ -1391,7 +1495,7 @@ async function acquireOverlayBaseline(
 		}
 		let pending = repository.overlayBaselines.get(commit);
 		if (!pending) {
-			pending = attachSandboxWorkspace(repository, commit, path.join(repository.parent, `overlay-baseline-${commit}`))
+			pending = attachSandboxWorkspace(repository, snapshot, path.join(repository.parent, `overlay-baseline-${commit}`))
 				.then(workspace => ({ ...workspace, active: 0 }));
 			repository.overlayBaselines.set(commit, pending);
 			void pending.catch(() => {
@@ -1563,42 +1667,26 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 		lineage.push(current);
 	}
 	for (const ancestor of lineage.reverse()) {
-		for (const change of orderSandboxChanges(ancestor.changes)) {
-			const target = path.resolve(workspace.sandboxRoot, change.resource);
-			if (!containsFilesystemPath(workspace.sandboxRoot, target) || target === workspace.sandboxRoot) {
-				throw new Error(`execution checkpoint escapes workspace: ${change.resource}`);
-			}
-			await assertNoSymlinkPath(workspace.sandboxRoot, target);
-			if (change.kind === "directory") {
-				if (!change.after) await rmdir(target);
-				else if (!change.before) {
-					await createParentDirectories(workspace.sandboxRoot, target);
-					await mkdir(target, change.operation ? undefined : { mode: change.after.mode });
-					if (!change.operation && process.platform !== "win32") await chmod(target, change.after.mode);
-				} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
-					await chmod(target, change.after.mode);
-				}
-				continue;
-			}
-			if (change.after === undefined) await rm(target, { force: true });
-			else await atomicWrite(target, change.after, change.afterMode, workspace.sandboxRoot);
-			workspace.baselineFrontier.set(change.resource, await readRegularState(target));
-		}
-		for (const change of ancestor.changes) {
-			if (change.validationOnly || change.kind !== "directory") continue;
-			const target = path.resolve(workspace.sandboxRoot, change.resource);
-			if (!(await sameDirectoryAfter(target, change))) {
-				throw new Error(`execution checkpoint directory mismatch: ${change.resource}`);
-			}
+		const project = (name: string) => {
+			const relative = relativeFilesystemPath(ancestor.sourceRoot, name);
+			if (relative === undefined) throw new Error("checkpoint object escapes workspace");
+			return path.resolve(workspace.sandboxRoot, relative);
+		};
+		const changes = ownSandboxChanges(ancestor.changes.map(change => ({ ...change, root: workspace.sandboxRoot, target: project(change.target),
+			...(change.kind !== "directory" ? { ...(change.object ? { object: { ...change.object, path: project(change.object.path) } } : {}),
+				...(change.aliases ? { aliases: change.aliases.map(project) } : {}) } : {}) })));
+		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes });
+		for (const change of changes) if (!change.validationOnly && change.kind !== "directory") {
+			workspace.baselineFrontier.set(change.resource, await readRegularState(change.target));
 		}
 	}
 }
 
-async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promise<readonly SandboxFileChange[]> {
-	const detected = workspace.overlay
+async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontier?: readonly string[]): Promise<readonly SandboxFileChange[]> {
+	const detected = frontier ?? (workspace.overlay
 		? await collectOverlayChangeResources(workspace)
-		: await collectGitChangeResources(workspace);
-	const resources = [...new Set([...detected, ...workspace.baselineFrontier.keys()])]
+		: await collectGitChangeResources(workspace));
+	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])]
 		.filter((resource) => !isSnapshotExcluded(slash(resource)))
 		.sort();
 	const changes: SandboxFileChange[] = [];
@@ -1615,7 +1703,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace): Promis
 		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
 		const before = await readFrontierState(workspace.pool.git, workspace.commit, workspace.baselineFrontier, resource, 64 * 1024 * 1024);
 		const after = await readRegularState(sandboxTarget);
-		if (!sameSandboxState(before, after)) {
+		if (frontier || !sameSandboxState(before, after)) {
 			changes.push({
 				root: workspace.sourceRoot,
 				target,
@@ -1664,10 +1752,12 @@ type OverlayUpperEntry =
 async function captureOverlayWorkspaceStructure(
 	workspace: PrivateSandboxWorkspace,
 	baseline: WorkspaceStructureSnapshot,
+	device: string,
 ): Promise<WorkspaceStructureSnapshot> {
 	if (!workspace.overlay) throw new Error("OverlayFS structure frontier is unavailable");
 	const frontier = await inspectOverlayStructureFrontier(workspace.overlay.upperRoot);
-	const entries = new Map(baseline.entries);
+	const entries = new Map([...baseline.entries].map(([name, entry]) => [name, entry.kind === "file" && entry.object
+		? { ...entry, object: `${device}:${entry.object.split(":")[1]}` } : entry]));
 	for (const removal of frontier.removals) {
 		const normalized = path.normalize(removal.resource);
 		const prefix = normalized ? `${normalized}${path.sep}` : "";
@@ -1691,13 +1781,7 @@ async function captureOverlayWorkspaceStructure(
 		else entries.delete(resource);
 	}
 	const files = Math.max(0, entries.size - 1);
-	return Object.freeze({
-		root: workspace.sandboxRoot,
-		entries,
-		files,
-		bytesRead: 0,
-		complete: baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES,
-	});
+	return workspaceStructureSnapshot(workspace.sandboxRoot, entries, baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES);
 }
 
 async function inspectOverlayStructureFrontier(upperRoot: string): Promise<OverlayStructureFrontier> {
@@ -1859,6 +1943,9 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 	if (change.kind === "directory" && change.operation && (change.before || !change.after)) {
 		throw new Error("Native directory creation requires an absent baseline and a sealed result");
 	}
+	if (change.kind !== "directory") for (const name of [...(change.aliases ?? []), ...(change.object ? [change.object.path] : [])]) {
+		if (!path.isAbsolute(name) || !containsFilesystemPath(root, name) || path.resolve(name) === root) throw new Error("file object name escapes workspace");
+	}
 	await assertNoSymlinkPath(root, target);
 }
 
@@ -1937,7 +2024,8 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 		if (
 			filesystemPathKey(previous.root) !== filesystemPathKey(change.root) ||
 			(previous.kind === "directory") !== (change.kind === "directory") || previous.validationOnly !== change.validationOnly ||
-			previous.operation !== change.operation
+			previous.operation !== change.operation || previous.kind !== "directory" && change.kind !== "directory" &&
+				(JSON.stringify(previous.object) !== JSON.stringify(change.object) || JSON.stringify(previous.aliases) !== JSON.stringify(change.aliases))
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
@@ -1964,7 +2052,9 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 		const target = { root: path.resolve(change.root), target: path.resolve(change.target) };
 		return change.kind === "directory"
 			? { ...change, ...target, before: change.before && { ...change.before }, after: change.after && { ...change.after } }
-			: { ...change, ...target, before: change.before && Buffer.from(change.before), after: change.after && Buffer.from(change.after) };
+			: { ...change, ...target, ...(change.object ? { object: { ...change.object, path: path.resolve(change.object.path) } } : {}),
+				...(change.aliases ? { aliases: change.aliases.map(name => path.resolve(name)) } : {}),
+				before: change.before && Buffer.from(change.before), after: change.after && Buffer.from(change.after) };
 	}).sort((left, right) =>
 		filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target)),
 	);

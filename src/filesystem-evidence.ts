@@ -3,6 +3,7 @@ import { constants, type BigIntStats, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 export const FILESYSTEM_CONCURRENCY = 12;
@@ -25,15 +26,34 @@ export async function mapFilesystem<Input, Output>(
 	return output;
 }
 
-export type StableFileCapture = {
+export type StableFilesystemCapture = {
 	readonly hash: string;
 	readonly bytesRead: number;
 	readonly realPath: string;
 	readonly stat: BigIntStats;
 	readonly content?: Buffer;
+	/** Directory names use the same byte order as libuv scandir; content retains the kernel image. */
+	readonly entries?: readonly string[];
 	/** Content bytes came from another ongoing capture; bytesRead still describes logical size. */
 	readonly shared?: true;
+	/** Optional real open file description, owned by the input version rather than its pathname. */
+	readonly object?: CapturedFilesystemObject;
 };
+
+/** A content version and its kernel object share one revocable borrowing lifetime. */
+export class CapturedFilesystemObject {
+	private readonly lifetime = new RuntimeLifecycleLane();
+	private readonly handle: FileHandle;
+	private readonly capture: StableFilesystemCapture;
+	constructor(handle: FileHandle, capture: StableFilesystemCapture) { this.handle = handle; this.capture = capture; }
+	get bytes(): number { return this.capture.content?.byteLength ?? 0; }
+	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T> {
+		return this.lifetime.admit(() => consume(this.capture, this.handle));
+	}
+	dispose(): Promise<void> {
+		return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); });
+	}
+}
 
 export function sameFilesystemIdentity(
 	left: BigIntStats,
@@ -72,8 +92,8 @@ export function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
-	observed?: Pick<StableFileCapture, "stat" | "realPath">,
-): Promise<StableFileCapture> {
+	observed?: Pick<StableFilesystemCapture, "stat" | "realPath"> & { readonly retainObject?: boolean },
+): Promise<StableFilesystemCapture> {
 	return captureFile(target, maxBytes, retainContent, true, observed);
 }
 
@@ -85,8 +105,32 @@ export async function hashExecutableFile(target: string, observation?: {
 }
 
 /** Read a held descriptor through a separate OFD, preserving its shared position. */
-export function captureHeldFile(pid: number, fd: number, maxBytes: number): Promise<StableFileCapture> {
-	return captureFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, false);
+export function captureHeldFile(pid: number, fd: number, maxBytes: number, retainObject = false): Promise<StableFilesystemCapture> {
+	return captureFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, false, { retainObject });
+}
+
+/** Import the helper's complete getdents64 image without enumerating the directory again. */
+export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
+	const names: Buffer[] = [];
+	for (let offset = 0; offset < content.length;) {
+		if (content.length - offset < 24) throw new Error("invalid_directory_image");
+		const length = content.readUInt16LE(offset + 16), end = offset + length, zero = content.indexOf(0, offset + 19);
+		if (length < 24 || length % 8 || end > content.length || zero < offset + 20 || zero >= end) throw new Error("invalid_directory_image");
+		const name = content.subarray(offset + 19, zero), decoded = name.toString("utf8");
+		if (decoded.includes("/") || !Buffer.from(decoded).equals(name)) throw new Error("unrepresentable_directory_name");
+		if (decoded !== "." && decoded !== "..") names.push(name);
+		offset = end;
+	}
+	names.sort(Buffer.compare);
+	const entries = names.map(name => name.toString("utf8"));
+	if (new Set(entries).size !== entries.length || !stat.isDirectory()) throw new Error("invalid_directory_image");
+	const handle = await fs.open(`/proc/${pid}/fd/${fd}`, 0x200000);
+	try {
+		if (!sameFilesystemIdentity(stat, await handle.stat({ bigint: true })) ||
+			!sameFilesystemIdentity(stat, await fs.stat(realPath, { bigint: true }))) throw new Error("directory_changed_during_capture");
+		const capture = { content, entries, stat, realPath, bytesRead: content.length, hash: createHash("sha256").update(content).digest("hex") };
+		return { ...capture, object: new CapturedFilesystemObject(handle, capture) };
+	} catch (error) { await handle.close(); throw error; }
 }
 
 async function captureFile(
@@ -94,18 +138,18 @@ async function captureFile(
 	maxBytes: number,
 	retainContent: boolean,
 	verifyPath: boolean,
-	observed?: Pick<StableFileCapture, "stat" | "realPath">,
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean },
 	observation?: { readonly pinned: () => void; readonly signal: AbortSignal },
-): Promise<StableFileCapture> {
+): Promise<StableFilesystemCapture> {
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
-	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
+	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
 	let handle: FileHandle | undefined;
 	try {
 		const before = binding ? await binding.stat({ bigint: true })
 			: observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
 		if (!before.isFile()) throw new Error("not_regular_file");
-		if (observed && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
+		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
 			throw new Error(`file_too_large:${before.size}`);
@@ -127,7 +171,7 @@ async function captureFile(
 			})).finally(() => { if (fileCaptures.get(key) === pending) fileCaptures.delete(key); }) };
 			fileCaptures.set(key, pending);
 		} else pending.borrowers.add(borrower);
-		let captured: Omit<StableFileCapture, "realPath">;
+		let captured: Omit<StableFilesystemCapture, "realPath">;
 		try {
 			const result = await pending.result;
 			// Retained buffers belong to individual snapshots; hash-only borrowers retain no payload.
@@ -143,7 +187,13 @@ async function captureFile(
 			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
 		}
-		return { ...captured, realPath: beforePath };
+		const result = { ...captured, realPath: beforePath };
+		if (observed?.retainObject && retainContent && binding) {
+			await handle.close(); handle = undefined;
+			const object = new CapturedFilesystemObject(binding, result); binding = undefined;
+			return { ...result, object };
+		}
+		return result;
 	} catch (error) { observation?.signal.throwIfAborted(); throw error; } finally {
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
@@ -152,7 +202,7 @@ async function captureFile(
 /** Share only ongoing file reads; every borrower pins and fences its own descriptor. */
 const fileCaptures = new Map<string, {
 	readonly borrowers: Set<{ readonly signal: AbortSignal | undefined }>;
-	readonly result: Promise<Omit<StableFileCapture, "realPath">>;
+	readonly result: Promise<Omit<StableFilesystemCapture, "realPath">>;
 }>();
 
 async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void) {

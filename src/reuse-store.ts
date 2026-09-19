@@ -163,6 +163,7 @@ export class ProvenanceCertificateStore {
 	}
 
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
+		if (certificate.result.continuation) return false;
 		const owned = parseProcessCertificate(certificate);
 		if (!owned) throw new Error("invalid process provenance certificate");
 		const published = await this.exclusive(async () => {

@@ -1,8 +1,16 @@
 import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
+import type { WorkspaceFileMutation } from "./workspace-state.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 9 as const;
+export const PROCESS_CERTIFICATE_VERSION = 16 as const;
+
+/** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
+export type OFDPosition = number | string;
+export function isOFDPosition(value: unknown): value is OFDPosition {
+	return typeof value === "number" ? Number.isSafeInteger(value) && value >= 0 :
+		typeof value === "string" && /^[1-9][0-9]{15,18}$/.test(value) && BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER) && BigInt(value) <= 0x7fffffffffffffffn;
+}
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -44,16 +52,19 @@ export interface SemanticEnvironmentEntry {
 
 export interface InheritedFileDescriptor {
 	readonly fd: number;
-	readonly type: "closed" | "regular" | "null" | "directory" | "pipe" | "socket" | "tty" | "device" | "other";
+	/** Native boundary projection: false identifies a queued-only OFD, not an FD table entry. */
+	readonly installed?: false;
+	readonly type: "closed" | "regular" | "null" | "directory" | "pipe" | "socket" | "eventfd" | "tty" | "device" | "other";
 	readonly flagsDigest: Sha256Digest;
 	readonly endpointDigest?: Sha256Digest;
 	readonly contentDigest?: Sha256Digest;
-	readonly offset?: number;
+	readonly offset?: OFDPosition;
 	/** Canonical descriptor representing this inherited open-file description. */
 	readonly alias?: number;
 	/** Kernel object representative, independent of the OFD representative. */
 	readonly object?: number;
 	readonly resourcePath?: string;
+	readonly resourceAliases?: readonly string[];
 	readonly eof?: boolean;
 }
 
@@ -105,6 +116,7 @@ export type DynamicDependency =
 			readonly role: DependencyRole;
 			readonly contentDigest: Sha256Digest;
 			readonly metadataDigest?: Sha256Digest;
+			readonly aliases?: readonly string[];
 	  }
 	| {
 			readonly kind: "directory";
@@ -176,34 +188,36 @@ export type WorkspaceEffectState =
 
 export type OrderedEffectEvent =
 	| { readonly sequence: number; readonly kind: "output"; readonly fd: 1 | 2; readonly data: ArtifactReference }
-	| {
+	| ({
 			readonly sequence: number;
 			readonly kind: "workspace";
 			readonly path: string;
-			readonly operation?: "write_contents";
 			readonly before: WorkspaceEffectState;
 			readonly after: WorkspaceEffectState;
-	  };
+	  } & WorkspaceFileMutation);
 
 export type ExitOutcome =
 	| { readonly kind: "code"; readonly code: number }
 	| { readonly kind: "signal"; readonly signal: number; readonly coreDumped: boolean };
 
+export const RESOURCE_TRANSITIONS = ["consume", "peek", "produce", "shutdown", "release", "ready", "flags", "failure", "receive_message", "peek_message", "send_message", "splice", "tee", "lock"] as const;
+export type ResourceTransitionKind = typeof RESOURCE_TRANSITIONS[number];
+
 export interface ProcessResourceEffects {
-	readonly descriptions: readonly { readonly id: number; readonly position?: { readonly before: number; readonly after: number }; readonly flags?: number }[];
+	readonly descriptions: readonly { readonly id: number; readonly position?: { readonly before: OFDPosition; readonly after: OFDPosition }; readonly flags?: number }[];
 	readonly objects: readonly { readonly id: number; readonly consumed?: number; readonly content?: ArtifactReference }[];
-	readonly streams?: readonly { readonly id: number; readonly kind: "consume" | "peek" | "produce" | "shutdown"; readonly data: ArtifactReference }[];
+	readonly transitions?: readonly { readonly id: number; readonly kind: ResourceTransitionKind; readonly data: ArtifactReference; readonly requested?: number }[];
 }
 
-export interface ProcessResultRecord {
+export type ProcessResultRecord = {
 	readonly replayProfile: "buffered_noninteractive";
 	/** Producer process wall time; observational only and never used to authorize replay. */
 	readonly observedProcessMs?: number;
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
-	readonly exit: ExitOutcome;
 	readonly resources?: ProcessResourceEffects;
-}
+} & ({ readonly exit: ExitOutcome; readonly continuation?: never } |
+	{ readonly exit?: never; readonly continuation: { readonly imageDigest: Sha256Digest; readonly imageBytes: number } });
 
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
 export interface ProcessProvenanceCertificate {
@@ -250,6 +264,7 @@ export function dependencyPathsetKey(certificate: DynamicDependencyCertificate):
 						path: dependency.path,
 						role: dependency.role,
 						metadata: dependency.metadataDigest !== undefined,
+						...(dependency.aliases ? { aliases: dependency.aliases } : {}),
 					};
 				case "directory":
 					return {
@@ -368,7 +383,7 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 		}
 	}
 	for (const object of certificate.result.resources?.objects ?? []) if (object.content) unique.set(object.content.digest, object.content);
-	for (const event of certificate.result.resources?.streams ?? []) unique.set(event.data.digest, event.data);
+	for (const event of certificate.result.resources?.transitions ?? []) unique.set(event.data.digest, event.data);
 	return [...unique.values()];
 }
 
@@ -477,6 +492,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 			if (!Number.isSafeInteger(fd.fd) || fd.fd < 0 || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
 				throw new Error("process prototype descriptor table is invalid");
 			}
+			if (fd.installed !== undefined && (fd.installed !== false || fd.fd < 3 || fd.alias !== fd.fd)) throw new Error("invalid queued OFD projection");
 			descriptors.add(fd.fd);
 			for (const digest of [fd.endpointDigest, fd.contentDigest]) {
 				if (digest !== undefined && !isSha256Digest(digest)) throw new Error("process descriptor digest is invalid");
@@ -486,17 +502,22 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		.sort((left, right) => left.fd - right.fd);
 	for (const descriptor of inheritedFDs) {
 		if (descriptor.resourcePath !== undefined && !validLogicalPath(descriptor.resourcePath)) throw new Error("invalid inherited descriptor path");
+		if (descriptor.resourceAliases && (descriptor.type !== "regular" || !descriptor.resourcePath || descriptor.resourceAliases.length < 2 ||
+			!descriptor.resourceAliases.includes(descriptor.resourcePath) || descriptor.resourceAliases.some((name, index) =>
+				!validLogicalPath(name) || index > 0 && name <= descriptor.resourceAliases![index - 1]!))) throw new Error("invalid inherited descriptor aliases");
 		if (descriptor.alias === undefined) continue;
 		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
 		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
-		if (!["regular", "null", "directory", "pipe", "socket"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
-			(descriptor.type === "pipe" || descriptor.type === "socket") && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
-			(descriptor.type === "null" || descriptor.type === "directory") && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
+		if (!["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(descriptor.type) || !isOFDPosition(descriptor.offset) ||
+			(descriptor.type === "pipe" || descriptor.type === "socket" || descriptor.type === "eventfd") && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
+			descriptor.type === "null" && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
+			descriptor.type === "directory" && !isSha256Digest(descriptor.contentDigest) ||
 			descriptor.type === "directory" && (!descriptor.resourcePath || descriptor.resourcePath !== alias?.resourcePath) ||
 			!alias || alias.fd > descriptor.fd || alias.alias !== alias.fd || alias.type !== descriptor.type ||
 			alias.offset !== descriptor.offset || alias.object !== descriptor.object || alias.contentDigest !== descriptor.contentDigest ||
 			!object || object.fd > descriptor.fd || object.object !== object.fd || object.type !== descriptor.type ||
-			object.contentDigest !== descriptor.contentDigest || object.endpointDigest !== descriptor.endpointDigest || object.resourcePath !== descriptor.resourcePath || object.eof !== descriptor.eof) throw new Error("invalid inherited OFD alias or object");
+			object.contentDigest !== descriptor.contentDigest || object.endpointDigest !== descriptor.endpointDigest || object.resourcePath !== descriptor.resourcePath ||
+			!stableEqual(object.resourceAliases, descriptor.resourceAliases) || object.eof !== descriptor.eof) throw new Error("invalid inherited OFD alias or object");
 	}
 	if (
 		!rawStdin || typeof stdin.eof !== "boolean" ||
@@ -594,7 +615,9 @@ function validateDependency(dependency: DynamicDependency): void {
 			if (
 				!["input", "executable", "shared_object"].includes(dependency.role) ||
 				!isSha256Digest(dependency.contentDigest) ||
-				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest))
+				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest)) ||
+				(dependency.aliases !== undefined && (!Array.isArray(dependency.aliases) || dependency.aliases.length < 2 ||
+					!dependency.aliases.includes(dependency.path) || dependency.aliases.some((name, index) => !validLogicalPath(name) || index > 0 && name <= dependency.aliases![index - 1]!)))
 			) {
 				throw new Error("invalid file dependency");
 			}
@@ -643,6 +666,10 @@ function validExcludedEntries(entries: readonly string[] | undefined): boolean {
 
 function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype): ProcessResultRecord {
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
+	if (result.continuation && (result.exit !== undefined || !isSha256Digest(result.continuation.imageDigest) ||
+		!Number.isSafeInteger(result.continuation.imageBytes) || result.continuation.imageBytes <= 0 || result.continuation.imageBytes > 65 * 1024 * 1024))
+		throw new Error("invalid process continuation");
+	if (!result.continuation && !result.exit) throw new Error("process has neither exit nor continuation");
 	if (
 		result.observedProcessMs !== undefined &&
 		(!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)
@@ -662,8 +689,8 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			throw new Error("incomplete inherited OFD resource effects");
 		resources.descriptions.forEach((effect, index) => {
 			const descriptor = descriptions[index]!;
-			if (effect.id !== descriptor.fd || (descriptor.type === "regular"
-				? !effect.position || effect.position.before !== descriptor.offset || !Number.isSafeInteger(effect.position.after) || effect.position.after < 0
+			if (effect.id !== descriptor.fd || (descriptor.type === "regular" || descriptor.type === "directory"
+				? !effect.position || effect.position.before !== descriptor.offset || !isOFDPosition(effect.position.after)
 				: effect.position !== undefined) || effect.flags !== undefined && (!Number.isSafeInteger(effect.flags) || effect.flags < 0 || effect.flags > 0x7fffffff))
 				throw new Error("invalid inherited OFD state transition");
 		});
@@ -674,12 +701,17 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 				effect.content !== undefined && descriptor.type !== "regular") throw new Error("invalid inherited OFD object transition");
 			if (effect.content) validateArtifact(effect.content, artifactSizes);
 		});
-		if (resources.streams && (!Array.isArray(resources.streams) || resources.streams.length > 1024)) throw new Error("invalid stream journal");
-		for (const event of resources.streams ?? []) {
+		if (resources.transitions && (!Array.isArray(resources.transitions) || resources.transitions.length > 1024)) throw new Error("invalid stream journal");
+		for (const event of resources.transitions ?? []) {
 			const descriptor = descriptions.find(descriptor => descriptor.fd === event.id);
-			if (!descriptor || !["pipe", "socket"].includes(descriptor.type) || !["consume", "peek", "produce", "shutdown"].includes(event.kind) ||
+			if (!descriptor || !(descriptor.type === "regular" ? event.kind === "lock" || event.kind === "release" : ["pipe", "socket", "eventfd"].includes(descriptor.type) && event.kind !== "lock") || !RESOURCE_TRANSITIONS.includes(event.kind) ||
+				event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024 || event.kind === "produce" && event.requested < event.data.size) ||
 				event.data.size > (event.kind === "produce" ? 4096 : 2 * 1024 * 1024) ||
-				event.kind === "shutdown" && (descriptor.type !== "socket" || event.data.size !== 1)) throw new Error("invalid stream transition");
+				(event.kind === "shutdown" || event.kind === "release") && (event.data.size !== 1 || event.kind === "shutdown" && descriptor.type !== "socket") ||
+				event.kind.endsWith("_message") && (descriptor.type !== "socket" || event.data.size < 4) ||
+				(event.kind === "splice" || event.kind === "tee") && (descriptor.type !== "pipe" || event.data.size < 4 || event.data.size > 4100) ||
+				(event.kind === "ready" ? event.data.size !== 12 : event.kind === "flags" || event.kind === "failure" ? event.data.size !== 4 &&
+					!(descriptor.type === "eventfd" && event.kind === "failure" && event.data.size === 12) : false)) throw new Error("invalid stream transition");
 			validateArtifact(event.data, artifactSizes);
 		}
 	}
@@ -692,9 +724,15 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			if (!validLogicalPath(event.path)) throw new Error("invalid effect path");
 			const before = normalizeWorkspaceEffectState(event.before, artifactSizes);
 			const after = normalizeWorkspaceEffectState(event.after, artifactSizes);
-			if (event.operation !== undefined && (event.operation !== "write_contents" || before.kind !== "file" ||
-				after.kind !== "file" || before.mode !== after.mode)) throw new Error("invalid in-place file effect");
-			if (!event.operation && before.kind === after.kind && stableEqual(before, after)) {
+			const anchor = event.object && journal.find(candidate => candidate.kind === "workspace" && candidate.path === event.object!.path);
+			if (event.object && (!validLogicalPath(event.object.path) || typeof event.object.before !== "boolean" || anchor?.kind !== "workspace" ||
+				after.kind !== "file" || anchor[event.object.before ? "before" : "after"].kind !== "file" || !event.object.before && anchor.object)) throw new Error("invalid file object anchor");
+			const predecessor = event.object?.before && anchor?.kind === "workspace" ? anchor.before : before;
+			if (event.operation !== undefined && (event.operation !== "write_contents" || predecessor.kind !== "file" ||
+				after.kind !== "file" || !event.object && predecessor.mode !== after.mode)) throw new Error("invalid in-place file effect");
+			if (event.aliases && (before.kind !== "file" || event.aliases.length < 2 || !event.aliases.includes(event.path) ||
+				event.aliases.some((name, index) => !validLogicalPath(name) || index > 0 && name <= event.aliases![index - 1]!))) throw new Error("invalid effect alias set");
+			if (!event.operation && !event.object && before.kind === after.kind && stableEqual(before, after)) {
 				throw new Error("workspace effect does not change state");
 			}
 			journal[index] = { ...event, before, after };
@@ -704,7 +742,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		replayProfile: result.replayProfile,
 		...(result.observedProcessMs !== undefined ? { observedProcessMs: result.observedProcessMs } : {}),
 		journal,
-		exit: { ...result.exit },
+		...(result.continuation ? { continuation: { ...result.continuation } } : { exit: { ...result.exit! } }),
 		...(resources ? { resources } : {}),
 	});
 }

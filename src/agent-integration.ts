@@ -436,11 +436,12 @@ export function createSpeculativeActionHost(
 			const computations: TimelineDependency[] = [];
 			return executionGateway.executeAuthoritative(operation, async () => {
 				const bound = await bind();
-				return bound.action && input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
+				const execute = (inputs?: (path: string) => Iterable<object>) => bound.action && input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);
-					}, prepared?.observeOperations) : executor(bound);
+					}, prepared?.observeOperations, inputs) : executor(bound);
+				return prepared?.withInputs ? prepared.withInputs(execute) : execute();
 			}, {
 				computationDependencies: () => computations,
 				...(actorCall

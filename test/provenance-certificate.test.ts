@@ -1,4 +1,4 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
@@ -32,6 +32,17 @@ const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
+	it("invalidates a byte-identical change of file aliases", async () => {
+		const root = await workspace(), resolvePath = (logical: string) => path.join(root, path.posix.relative("/workspace", logical));
+		for (const name of ["a", "c"]) await writeFile(path.join(root, name), "same");
+		await link(path.join(root, "a"), path.join(root, "b")); await link(path.join(root, "c"), path.join(root, "d"));
+		const { dependency } = await captureFileDependency(path.join(root, "a"), "/workspace/a", "input", { includeMetadata: true, aliases: ["/workspace/a", "/workspace/b"], resolvePath });
+		const certificate = processCertificate(prototype(), { dependencyCertificate: { complete: true, dependencies: [dependency], taints: [] } });
+		expect(await validateProcessCertificate(certificate, { resolvePath })).toMatchObject({ status: "valid" });
+		await unlink(path.join(root, "b")); await unlink(path.join(root, "d"));
+		await link(path.join(root, "a"), path.join(root, "d")); await link(path.join(root, "c"), path.join(root, "b"));
+		expect(await validateProcessCertificate(certificate, { resolvePath })).toMatchObject({ status: "stale" });
+	});
 	it("shares queue consumption across independent OFDs while retaining independent flags", () => {
 		const graph: ProcessResourceGraph = { handles: [0, 3, 8].map(fd => ({ fd, description: fd === 3 ? 0 : fd })),
 			descriptions: { 0: { object: 0, flags: 0 }, 8: { object: 0, flags: 32768 } },
@@ -155,8 +166,8 @@ describe("process provenance certificates", () => {
 	});
 
 	it.each([
-		["a", "b", "sha256:fcc227bb1b57ebf1f1c402c387ad9ce4b801a3e6db85f6fe58001abe46265329"],
-		["e\u0301", "\u00e9", "sha256:4d7f0e9a1d9c7f97f23deeb2c6862291e41aaa80890c30ff9362464a7c7ecf54"],
+		["a", "b", "sha256:b95734cb1c7755c46af9754cd6519dc51b02034c44ca02496f45b5c822ea7da5"],
+		["e\u0301", "\u00e9", "sha256:d91e5de48608fd53ab76de2ac5832b1ec587639dba49c8398ddedf585c028a2f"],
 	] as const)("owns an exact dependency set independently of capture order (%s, %s)", (left, right, id) => {
 		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };
@@ -322,17 +333,20 @@ describe("process provenance certificates", () => {
 			contentDigest: sha256Digest(type === "regular" || type === "pipe" || type === "socket" ? "before" : ""), flagsDigest: sha256Digest("flags") })) });
 		const content = { digest: sha256Digest("after"), size: 5 };
 		const effects: ProcessResourceEffects = {
-			descriptions: [3, 8].map(id => ({ id, flags: 32768, ...(type === "regular" ? { position: { before: 1, after: id === 3 ? 4 : 2 } } : {}) })),
+			descriptions: [3, 8].map(id => ({ id, flags: 32768, ...(type === "regular" ? { position: { before: 1, after: id === 3 ? 4 : 2 } } :
+				type === "directory" ? { position: { before: 0, after: "9223372036854775807" } } : {}) })),
 			objects: [{ id: 3, ...(type === "pipe" || type === "socket" ? { consumed: 3 } : type === "regular" ? { content } : {}) }],
-			...(type === "socket" ? { streams: [{ id: 3, kind: "produce" as const, data: content }] } : {}),
+			...(type === "socket" ? { transitions: [{ id: 3, kind: "produce" as const, data: content }] } : {}),
 		};
 		const seal = (resources?: ProcessResourceEffects) => processCertificate(input, { result: {
 			replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 }, resources,
 		} });
 		const certificate = seal(effects);
+		if (type === "directory") for (const after of [Number.MAX_SAFE_INTEGER + 1, "0", "01", "9007199254740991", "9223372036854775808"])
+			expect(() => seal({ ...effects, descriptions: effects.descriptions.map(effect => ({ ...effect, position: { before: 0, after } })) })).toThrow(/OFD/);
 		expect(parseProcessCertificate(certificate)).toEqual(certificate);
 		expect(referencedArtifacts(certificate)).toEqual(type === "regular" || type === "socket" ? [content] : []);
-		for (const id of [4, 17]) expect(() => seal({ ...effects, streams: [{ id, kind: "produce", data: content }] })).toThrow("stream");
+		for (const id of [4, 17]) expect(() => seal({ ...effects, transitions: [{ id, kind: "produce", data: content }] })).toThrow("stream");
 		for (const malformed of [undefined, { ...effects, descriptions: effects.descriptions.slice(1) },
 			{ ...effects, objects: [...effects.objects, effects.objects[0]!] },
 			...[NaN, -1, 0x80000000, 1.5].map(flags => ({ ...effects, descriptions: effects.descriptions.map(effect => ({ ...effect, flags })) }))])

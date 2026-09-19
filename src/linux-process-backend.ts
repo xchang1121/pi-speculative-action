@@ -3,6 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
 import {
 	access,
@@ -36,6 +37,7 @@ import {
 	type ExecPrototype,
 	type ExitOutcome,
 	type OrderedEffectEvent,
+	type OFDPosition,
 	type ProcessProducerProof,
 	type ProcessProvenanceCertificate,
 	type ProcessResultRecord,
@@ -101,7 +103,7 @@ import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } fr
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
 import {
 	WorkspaceSandboxService,
 	readSandboxDirectoryState,
@@ -116,6 +118,8 @@ const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
+const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
 const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>([
@@ -167,12 +171,13 @@ export interface LinuxProcessSession {
 	/** Execute one retained exec unit in this fresh sandbox; its output is not the enclosing tool's result. */
 	readonly executeBinding: (binding: ProcessExecutionBinding) => Promise<{
 		readonly output: readonly BufferedOutput[];
-		readonly exit: ExitOutcome;
+		readonly exit?: ExitOutcome;
+		readonly suspended?: true;
 	}>;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly metrics: () => LinuxProcessReuseMetrics;
 	/** Join the outer workspace transaction delta to the process observation before validation. */
-	readonly seal: (changes: readonly SandboxWorkspaceChange[]) => Promise<readonly SandboxDirectoryChange[]>;
+	readonly seal: (changes: readonly SandboxWorkspaceChange[]) => Promise<readonly SandboxWorkspaceChange[]>;
 	/** Revalidate every observed input immediately before Actor adoption. */
 	readonly validate: () => Promise<ResourceValidation>;
 	readonly close: () => Promise<void>;
@@ -186,6 +191,7 @@ interface ReadyBackend {
 	readonly observerFingerprint: Sha256Digest;
 	readonly executionContext: ProcessExecutionContext;
 	readonly dispatcher: string;
+	readonly imageLibrary?: string;
 }
 
 interface InterposedDirectory {
@@ -221,7 +227,7 @@ interface DispatcherRequest {
 type OutputRoute = readonly [1 | 2, 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
-	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph;
+	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean];
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
@@ -237,7 +243,7 @@ interface BufferedOutput {
 
 interface DispatcherResponse {
 	readonly version: 2;
-	readonly kind: "hit" | "executed" | "bypass";
+	readonly kind: "hit" | "executed" | "bypass" | "suspended";
 	readonly executable?: string;
 	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
 	readonly exit?: ExitOutcome;
@@ -273,7 +279,7 @@ interface ActiveSession {
 	};
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: readonly [string, string];
-	sealPromise?: Promise<readonly SandboxDirectoryChange[]>;
+	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
 	closing?: Promise<void>;
 }
 
@@ -289,18 +295,19 @@ interface SpawnOutcome {
 	readonly output: readonly BufferedOutput[];
 }
 
-type CompletedProcessPlan = Extract<ProcessReusePlan, { kind: "completed_replay" }>;
+type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
 	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean;
-		learn: boolean; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
+		learn: boolean; inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
 
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false): Promise<Value> {
+		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
+		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			learn, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
+			learn, inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
@@ -317,7 +324,7 @@ export class LinuxProcessReuseBackend {
 	private platformFingerprint?: Promise<Sha256Digest>;
 	private heldExec?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
-	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation>;
+	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
 	private readonly processScheduler = new SpeculationScheduler<object>();
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
@@ -329,11 +336,11 @@ export class LinuxProcessReuseBackend {
 		this.options = options;
 		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
-		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_REQUEST_BYTES, this.store.limits.maxBytes));
+		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
 		this.storage = {
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
-				this.handoffs.configure(this.store.limits.maxCertificates, Math.min(MAX_REQUEST_BYTES, this.store.limits.maxBytes));
+				this.handoffs.configure(this.store.limits.maxCertificates, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
 			},
 			maintain: async (operation) => {
 				this.handoffs.clearCompleted();
@@ -354,7 +361,8 @@ export class LinuxProcessReuseBackend {
 			const ready = await this.resolveReady();
 			return {
 				state: "ready",
-				detail: "Landlock/seccomp virtual filesystem + strace provenance ready",
+				detail: `Landlock/seccomp virtual filesystem + strace provenance ready; ${ready.imageLibrary
+					? "single-thread live I/O continuation available" : "live I/O continuation unavailable; setup:linux enables the capture tier"}`,
 				fingerprint: ready.fingerprint,
 				sandlockBinary: ready.sandlock,
 				straceBinary: ready.strace,
@@ -380,7 +388,10 @@ export class LinuxProcessReuseBackend {
 
 	/** Scoped launches; sandbox bindings are still speculative until adopted. Raw parameters are never persisted. */
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
-		return this.handoffs.bindings(scope);
+		return this.handoffs.bindings(scope).filter(binding => {
+			const invocation = this.handoffs.resolveBinding(binding, scope);
+			return invocation && !("trackingOnly" in invocation);
+		});
 	}
 
 	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
@@ -412,7 +423,7 @@ export class LinuxProcessReuseBackend {
 					descriptors: request => {
 						if (request.scope) for (const binding of this.handoffs.bindings(request.scope)) {
 							const invocation = this.handoffs.resolveBinding(binding, request.scope);
-							if (invocation?.resources?.handles.length && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
+							if (invocation && ("trackingOnly" in invocation || invocation.resources?.handles.length) && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
 						}
 						return this.observations.getStore()?.learn ? "inspect" : false;
 					},
@@ -479,7 +490,7 @@ export class LinuxProcessReuseBackend {
 					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded" });
 					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
-					if (!plan) return this.actorReplayMiss(host, request, timing);
+					if (!plan?.certificate.result.exit) return this.actorReplayMiss(host, request, timing);
 					throwIfAborted(request.signal);
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
@@ -638,7 +649,7 @@ export class LinuxProcessReuseBackend {
 			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [
 				path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock"),
 			]),
-			resolveHostExecutable(this.options.straceBinary, "strace"),
+			resolveHostExecutable(this.options.straceBinary, "strace", [path.join(os.homedir(), ".local", "bin", "pi-speculative-strace")]),
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
 		const [sandlockCheck, sandlockVersion, straceVersion, platformFingerprint] = await Promise.all([
@@ -648,6 +659,8 @@ export class LinuxProcessReuseBackend {
 			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
+		const imageLibrary = await Promise.all([execText(strace, ["--handoff-version"]), access(`${dispatcher}.so`)]).then(
+			([version]) => version.trim() === "2" ? `${dispatcher}.so` : undefined, () => undefined);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
 		try {
@@ -672,7 +685,7 @@ export class LinuxProcessReuseBackend {
 		});
 		return {
 			sandlock, strace, fingerprint, platformFingerprint, observerFingerprint,
-			executionContext, dispatcher,
+			executionContext, dispatcher, ...(imageLibrary ? { imageLibrary } : {}),
 		};
 	}
 
@@ -701,7 +714,7 @@ export class LinuxProcessReuseBackend {
 			session,
 		);
 		throwIfAborted(signal);
-		if (plan) return this.replayTopLevel(session, plan, request);
+		if (plan?.kind === "completed_replay") return this.replayTopLevel(session, plan, request);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -760,14 +773,14 @@ export class LinuxProcessReuseBackend {
 	private async seal(
 		session: ActiveSession,
 		changes: readonly SandboxWorkspaceChange[],
-	): Promise<readonly SandboxDirectoryChange[]> {
-		const directories = await sealSessionEvidence(session, changes);
+	): Promise<readonly SandboxWorkspaceChange[]> {
+		const refined = await sealSessionEvidence(session, changes);
 		try {
-			await this.publishTopLevel(session, changes);
+			await this.publishTopLevel(session, refined);
 		} catch (error) {
 			this.setError(session, `top_publish:${errorMessage(error)}`);
 		}
-		return directories;
+		return refined;
 	}
 
 	private async replayTopLevel(
@@ -789,7 +802,7 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 		this.add(session, "wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
-		return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
+		return { exitCode: plan.certificate.result.exit?.kind === "code" ? plan.certificate.result.exit.code : null };
 	}
 
 	private async publishTopLevel(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<void> {
@@ -853,7 +866,7 @@ export class LinuxProcessReuseBackend {
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
 		const invocation = this.handoffs.resolveBinding(binding, session.scope);
-		if (!invocation || invocation.sourceRoot !== session.sourceRoot ||
+		if (!invocation || "trackingOnly" in invocation || invocation.sourceRoot !== session.sourceRoot ||
 			invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
 			throw new Error("process execution binding is unavailable in this scope");
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
@@ -865,7 +878,8 @@ export class LinuxProcessReuseBackend {
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
 			capture => { session.topLevelCapture = { ...capture,
 				observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } }; });
-		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })), exit: result.exit! };
+		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
+			...(result.kind === "suspended" ? { suspended: true as const } : { exit: result.exit! }) };
 	}
 
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
@@ -880,7 +894,7 @@ export class LinuxProcessReuseBackend {
 			session.scope,
 			{ ownership: session.ownership, executablePath: prototype.executablePath },
 		);
-		if (acquired.plan) {
+		if (acquired.plan?.kind === "completed_replay") {
 			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 			const result = await this.replay(session, acquired.plan, weakKey, acquired);
 			if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
@@ -902,11 +916,11 @@ export class LinuxProcessReuseBackend {
 
 	private async acquireProcessResult(
 		weakKey: Sha256Digest,
-		lookup: ProcessHandoffLookup<CompletedProcessPlan>,
+		lookup: ProcessHandoffLookup<ReadyProcessPlan>,
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
-	): Promise<{ readonly plan?: CompletedProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff;
+	): Promise<{ readonly plan?: ReadyProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
 		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number }> {
 		let waitedMs = 0;
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
@@ -934,7 +948,9 @@ export class LinuxProcessReuseBackend {
 						finally { this.addActor("validationMs", Math.max(0, performance.now() - started)); }
 					}
 					const waitStarted = performance.now();
-					const finished = await waitForCandidate(running.completion, signal, admission.waitBudgetMs);
+					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
+					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
+					const finished = await waitForCandidate(completion, signal, admission.waitBudgetMs).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
 					waitedMs += interval.completedAt - interval.startedAt;
@@ -945,7 +961,7 @@ export class LinuxProcessReuseBackend {
 			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
 		});
 		return {
-			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer,
+			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer, continuation: acquired.continuation,
 				waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : {}),
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
@@ -961,7 +977,8 @@ export class LinuxProcessReuseBackend {
 		session?: ActiveSession,
 		live?: readonly ProcessProvenanceCertificate[],
 		excludedCertificates?: ReadonlySet<Sha256Digest>,
-	): Promise<CompletedProcessPlan | undefined> {
+		continuation = false,
+	): Promise<ReadyProcessPlan | undefined> {
 		const plan = await this.planner.plan({
 			weakKey,
 			executablePath,
@@ -971,6 +988,7 @@ export class LinuxProcessReuseBackend {
 				sink: "buffered",
 				orderedJournal: true,
 				transactionalEffects: true,
+				...(continuation ? { continuation: true as const } : {}),
 			},
 			validation: {
 				resolvePath: (logicalPath) => projection.toPhysical(logicalPath),
@@ -986,7 +1004,7 @@ export class LinuxProcessReuseBackend {
 			if (session) this.setError(session, detail);
 			else this.setActorError(`actor_${detail}`);
 		}
-		return plan.kind === "completed_replay" ? plan : undefined;
+		return plan.kind !== "miss" ? plan : undefined;
 	}
 
 	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
@@ -1031,6 +1049,11 @@ export class LinuxProcessReuseBackend {
 			const executable = await realpath(`/proc/${process.pid}/exe`);
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 			const executablePath = projection.toLogical(executable);
+			if (learning && process.trackQueues) {
+				// An acquisition hint lives in the existing bounded binding owner, never in a prediction or result cache.
+				this.handoffs.observe(sha256Digest(`queue-tracking:${sourceRoot}`), executablePath, scope!, { trackingOnly: true, sourceRoot }, 0);
+				this.addActor("misses"); return { kind: "continue" };
+			}
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath);
 			if (!learning && !available) {
@@ -1040,7 +1063,7 @@ export class LinuxProcessReuseBackend {
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const resources = process.descriptors?.length
 				? await captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
-					sensitivePaths(this.options.storeRoot, this.options.deniedPaths)) : undefined;
+					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.tracerPid, sourceRoot) : undefined;
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
 				this.addActor("bypasses");
@@ -1054,6 +1077,7 @@ export class LinuxProcessReuseBackend {
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
+					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}),
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 					...(resources ? { resources } : {}),
 				}, durationMs);
@@ -1085,13 +1109,15 @@ export class LinuxProcessReuseBackend {
 				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(
 				weakKey,
-				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded),
+				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true),
 				process.signal,
 				scope,
 				{ timing },
 			);
 			const plan = acquired.plan;
-			if (!plan || plan.certificate.result.exit.kind !== "code") {
+			const continuation = acquired.continuation;
+			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
+				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
 				return {
 					kind: "continue",
@@ -1101,10 +1127,10 @@ export class LinuxProcessReuseBackend {
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
 			return {
 				kind: "replay",
-				exitCode: plan.certificate.result.exit.code,
+				...(continuation ? { continuation } : { exitCode: (plan.certificate.result.exit as Extract<ExitOutcome, { kind: "code" }>).code }),
 				output,
-				...(plan.certificate.result.resources?.streams ? { resourceEvents: plan.certificate.result.resources.streams.map(event =>
-					({ fd: event.id, kind: event.kind, data: plan.artifacts.read(event.data) })) } : {}),
+				...(plan.certificate.result.resources?.transitions ? { resourceEvents: plan.certificate.result.resources.transitions.map(event =>
+					({ fd: event.id, kind: event.kind, data: plan.artifacts.read(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) })) } : {}),
 				...(resources ? { descriptorOffsets: descriptorInputs(resources).map(input => {
 					const descriptor = process.descriptors!.find(({ fd }) => fd === input.fd)!;
 					const effects = plan.certificate.result.resources!;
@@ -1112,9 +1138,11 @@ export class LinuxProcessReuseBackend {
 					const object = effects.objects.find(effect => effect.id === input.image)!;
 					return { fd: input.fd, before: input.offset, after: object.consumed ?? ofd.position?.after ?? 0,
 						device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags, afterFlags: ofd.flags,
-						...(input.type === "directory" ? { path: input.sourcePath! } : {}),
+						...(input.type === "directory" ? { path: input.sourcePath!, ...(!(input.flags & 0x200000) && resources.objects[input.image]!.content !== undefined ?
+							{ content: Buffer.from(resources.objects[input.image]!.content!, "base64") } : {}) } : {}),
+						...(input.type === "eventfd" ? { event: descriptor.counter!.id + 1, content: Buffer.from(resources.objects[input.image]!.content!, "base64") } : {}),
 						...(input.type === "pipe" || input.type === "socket" ? { content: Buffer.from(resources.objects[input.image]!.content!, "base64"), eof: resources.objects[input.image]!.queue!.eof,
-							capacity: descriptor.capacity, socket: descriptor.socket }
+							capacity: descriptor.capacity, socket: descriptor.socket, messages: descriptor.messages }
 							: input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
 				}) } : {}),
 				commit: async () => {
@@ -1196,6 +1224,8 @@ export class LinuxProcessReuseBackend {
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
+		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; syscall: string; bytes: number } | undefined;
+		let suspensionAttempted = false;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
 			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
 			executable: prototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
@@ -1206,14 +1236,22 @@ export class LinuxProcessReuseBackend {
 			const logicalExecutable = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
+			const directoryImages: Array<readonly [string, string]> = [];
 			const inputs = descriptorInputs(request.resources);
-			const streamJournal = inputs.some(input => input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
+			const outputPipes = request.outputPipes?.some(Boolean);
+			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false) &&
+				inputs.some(input => input.type === "eventfd" || (input.type === "pipe" || input.type === "socket") && !request.resources!.objects[input.image]!.queue!.eof);
+			const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
+			const streamIdentity = (position: { fd: number; inode: string }) => {
+				const input = inputs.find(input => input.fd === position.fd)!;
+				return !input.type ? `file:${position.inode}` : input.type === "eventfd" ? `eventfd:${input.image}` : position.inode;
+			};
 			const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
-			if (inputs.length) {
+			if (inputs.length || outputPipes) {
 				descriptorManifest = path.join(traceRoot, "fd-inputs");
 				descriptorReportPath = path.join(traceRoot, "fd-offsets");
 				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
-				let manifest = `FD2 ${inputs.length} ${Number(!!request.closeStdin)} ${Number(streamJournal)}\n`;
+				let manifest = `FD6 ${inputs.length} ${Number(!!request.closeStdin)} ${Number(resourceJournal)}\n`;
 				for (const descriptor of inputs) {
 					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
@@ -1224,10 +1262,20 @@ export class LinuxProcessReuseBackend {
 							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
 							state = await lstat(physical, { bigint: true });
 							if (!state.isDirectory()) throw new Error("inherited directory predecessor changed");
+							if (descriptor.content !== undefined) {
+								const raw = path.join(traceRoot, `directory-${descriptor.image}`);
+								await writeFile(raw, Buffer.from(descriptor.content, "base64"), { flag: "wx", mode: 0o600 });
+								directoryImages.push([physical, raw]);
+							}
 						} else if (workspace) {
 							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
 							const captured = await captureStableFile(physical, MAX_REQUEST_BYTES);
-							if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== 1n) throw new Error("inherited FD predecessor changed");
+							if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== BigInt(descriptor.sourceAliases?.length ?? 1)) throw new Error("inherited FD predecessor changed");
+							for (const alias of descriptor.sourceAliases ?? []) {
+								const target = session.projection.toPhysical(alias)!;
+								await assertNoSymlinkPath(session.workspace.sandboxRoot, target);
+								if (!sameFilesystemIdentity(captured.stat, await lstat(target, { bigint: true }))) throw new Error("inherited FD alias changed");
+							}
 							state = captured.stat;
 						} else {
 							await writeFile(physical, Buffer.from(descriptor.content!, "base64"), { flag: "wx", mode: 0o600 });
@@ -1239,9 +1287,13 @@ export class LinuxProcessReuseBackend {
 					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
 						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
 					const object = request.resources!.objects[descriptor.image]!;
-					const stream = object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
-					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1}\n${image}\n`;
+					const stream = object.counter ? 6 : object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
+					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1} ${descriptor.outside ?? object.queue?.outside ?? 3} ${Number(descriptor.installed !== false)} ${object.socket ? object.socket.type ?? 1 : 0}\n${image}\n`;
 				}
+				for (const [image, object] of Object.entries(request.resources!.objects)) for (const message of object.queue?.messages ?? [])
+					manifest += `M ${image} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`;
+				for (const descriptor of inputs) if (descriptor.fd === descriptor.alias) for (const lock of descriptor.locks ?? [])
+					manifest += `L ${descriptor.fd} ${lock.kind} ${lock.type} ${lock.start} ${lock.length}\n`;
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
 			}
 			const changedInput = async () => {
@@ -1269,6 +1321,7 @@ export class LinuxProcessReuseBackend {
 			};
 			releaseInputs = this.handoffs.observeInputs(weakKey, work, () => inputCheck ??=
 				changedInput().catch(() => false).finally(() => { inputCheck = undefined; }));
+			const imagePath = path.join(traceRoot, "continuation");
 			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,
 				...sandboxPolicyArguments(
@@ -1280,38 +1333,86 @@ export class LinuxProcessReuseBackend {
 					[],
 				),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
+				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
 				"--",
 				ready.dispatcher,
 				descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
-				outputRoute.join(""),
+				outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : ""),
 				...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
 				request.argv0,
 				logicalExecutable,
 				...request.args,
-			], streamJournal);
+			], resourceJournal, live);
 			const processStarted = performance.now();
-			outcome = await runSpawn(ready.strace, command.slice(1), {
+			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
+			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				cwd: request.cwd,
 				environment: request.environment,
 				signal: AbortSignal.any([session.signal, work.signal]),
 				inheritedFiles: inheritedFiles.map(file => file.fd),
+				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
+					let suspended: Promise<void> | undefined;
+					const release = this.handoffs.observeSuspension(weakKey, work, joinSignal => suspended ??= (async () => {
+						const stop = AbortSignal.any([session.signal, work.signal, ...(joinSignal ? [joinSignal] : [])]);
+						let pid = 0;
+						// Only probe while an Actor already waits within its join budget. A CPU
+						// prefix must be allowed to reach I/O instead of waiting forever for EOF.
+						while (!stop.aborted) {
+							const report = await readFile(descriptorReportPath!, "utf8").catch(() => ""), ready = /^RUN1 (\d+)\n$/.exec(report);
+							if (ready) {
+								pid = Number(ready[1]);
+								const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => ""), syscall = Number(state.split(" ", 1)[0]);
+								if (!state) return;
+								if (IO_FRONTIERS.has(syscall)) break;
+								if (syscall >= 0) return;
+							} else if (report.startsWith("FD4 ")) return;
+							await delay(10, undefined, { signal: stop }).catch(() => undefined);
+						}
+						if (stop.aborted) return;
+						suspensionAttempted = true;
+						const reply = await requestProcessImage(pid, channel, wake, AbortSignal.any([session.signal, work.signal]));
+						if (reply.readInt32LE(0) !== pid) return;
+						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
+							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = IO_FRONTIERS.get(reply.readInt32LE(8));
+						if (!syscall || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < 0 || begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
+						const file = await open(imagePath, "r");
+						let image: Buffer;
+						try {
+							if ((await file.stat()).size > Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes)) throw new Error("continuation exceeds retained resource budget");
+							image = await file.readFile();
+						} finally { await file.close(); }
+						continuation = { image, physicalRoot: session.workspace.sandboxRoot, computation: new TimelineInterval(begin, end) };
+						frozen = { pid, fd, syscall, bytes };
+					})().catch(error => { this.setActorError(`actor_suspend:${errorMessage(error)}`); }).finally(() => {
+						if (!suspensionAttempted) suspended = undefined;
+					}));
+					return () => { release(); return suspended; };
+				} } : {}),
 			});
-			const observedProcessMs = Math.max(0, performance.now() - processStarted);
+			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
 			releaseInputs();
 			try {
-				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), inputs) : undefined;
+				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
+				const descriptorOffsets = descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
 				transactionFinishing = true;
 				const captures = [
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
+						...(frozen ? { frozen } : {}),
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
 							.concat(inputs.some(input => input.type === "null") ? ["/dev/null"] : [])
 							.concat((descriptorOffsets ?? []).filter(position => inputs.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
-						inheritedStreams: streamJournal ? descriptorOffsets?.filter(position => {
+						inheritedStreams: resourceJournal ? descriptorOffsets?.filter(position => {
 							const input = inputs.find(input => input.fd === position.fd)!;
-							return input.type === "socket" || input.type === "pipe";
-						}).map(position => position.inode) : undefined,
+							return input.type === "socket" || input.type === "pipe" || input.type === "eventfd";
+						}).map(streamIdentity) : undefined,
+						inheritedHandles: resourceJournal ? descriptorOffsets?.flatMap(position => {
+							const input = inputs.find(input => input.fd === position.fd)!, object = request.resources!.objects[input.image]!;
+							return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? object.queue?.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
+								queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
+						}) : undefined,
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
@@ -1320,6 +1421,12 @@ export class LinuxProcessReuseBackend {
 						result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
 					throw error;
 				});
+				if (continuation) continuation = { ...continuation, image: bindContinuationDescriptors(continuation.image, frozen!, inputs,
+					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets!) };
+				// A destroyed OFD has no observable final position. If it escaped into a
+				// surviving message, its position instead needs a kernel observation.
+				if (!continuation && inputs.some(input => input.outside === 0 && observation.retainedDescriptions?.includes(input.alias)))
+					throw new Error("queued file description has no final position observation");
 				if (observation.incompleteReasons.length) {
 					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
 					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
@@ -1361,43 +1468,51 @@ export class LinuxProcessReuseBackend {
 				};
 				stage = "artifacts";
 				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
+				const finalObjects = new Map([...after.entries].flatMap(([name, entry]) => entry.kind === "file" && entry.object ? [[entry.object, name] as const] : []));
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
 					const input = inputs.find(({ fd }) => fd === position.fd)!;
-					if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.fd !== input.image) continue;
+					if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.type === "eventfd" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
-					const current = await lstat(image.physical, { bigint: true });
-					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile() || current.nlink !== 1n) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
+					const finalName = image.workspace && !input.type ? finalObjects.get(`${position.device}:${position.inode}`) : undefined;
+					if (position.detached) {
+						const final = position.detached;
+						if (final.mode !== image.state.mode || final.uid !== image.state.uid || final.gid !== image.state.gid ||
+							!effects.complete) throw new Error("detached file object transition is incomplete");
+						if (!finalName) {
+							if (sha256Digest(final.content) !== input.contentDigest || final.modified !== image.state.mtimeNs) position.content = await this.store.artifacts.put(final.content);
+							continue;
+						}
+						const event = baseResult.journal.find(event => event.kind === "workspace" && event.path === session.projection.toLogical(path.join(after.root, finalName)));
+						if (sha256Digest(final.content) !== (event?.kind === "workspace" && event.after.kind === "file" ? event.after.data.digest : input.contentDigest)) throw new Error("file object and remaining aliases diverged");
+					}
+					const physical = finalName ? path.join(after.root, finalName) : image.physical;
+					const current = await lstat(physical, { bigint: true });
+					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
 						current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
 						throw new Error("inherited FD namespace changed during execution");
+					if (input.type === "directory" && !sameFilesystemIdentity(current, image.state)) throw new Error("inherited directory changed during enumeration");
+					// The common workspace object transaction owns every named inode write and namespace edge.
+					if (image.workspace && !input.type) {
+						if (!finalName || !effects.complete) throw new Error("inherited file object transition is incomplete");
+						continue;
+					}
 					if (input.type === "directory" || sameFilesystemIdentity(current, image.state)) continue;
-					const captured = await captureStableFile(image.physical, MAX_REQUEST_BYTES, true);
+					const captured = await captureStableFile(physical, MAX_REQUEST_BYTES, true);
 					if (`sha256:${captured.hash}` !== input.contentDigest || current.mtimeNs !== image.state.mtimeNs) {
-						if (image.workspace) {
-							const journal = baseResult.journal as OrderedEffectEvent[];
-							let index = journal.findIndex(event => event.kind === "workspace" && event.path === image.logical);
-							if (index < 0 && `sha256:${captured.hash}` === input.contentDigest) {
-								const data = await this.store.artifacts.put(captured.content!), state = { kind: "file" as const, data, mode: Number(current.mode & 0o777n) };
-								index = journal.findIndex(event => event.kind === "output");
-								if (index < 0) index = journal.length;
-								journal.splice(index, 0, { sequence: index, kind: "workspace", path: image.logical, before: state, after: state });
-								for (let sequence = index + 1; sequence < journal.length; sequence++) journal[sequence] = { ...journal[sequence]!, sequence };
-							}
-							const event = journal[index];
-							if (event?.kind !== "workspace" || event.before.kind !== "file" || event.after.kind !== "file" ||
-								event.before.data.digest !== input.contentDigest || event.after.data.digest !== `sha256:${captured.hash}`)
-								throw new Error("inherited FD write lacks a workspace transition");
-							journal[index] = { ...event, operation: "write_contents" };
-						} else position.content = await this.store.artifacts.put(captured.content!);
+						position.content = await this.store.artifacts.put(captured.content!);
 					} else throw new Error("unmodeled inherited FD metadata effect");
 				}
-				const streams: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["streams"]>[number][] = [];
-				for (const event of observation.streamJournal ?? []) {
-					const input = inputs.find(input => descriptorOffsets!.find(position => position.fd === input.fd)!.inode === event.inode &&
-						(event.kind === "produce" ? (input.flags & 3) !== 0 : event.kind === "shutdown" || (input.flags & 3) !== 1));
+				const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
+				for (const event of observation.resourceJournal ?? []) {
+					const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
+						(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
+							!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
 					if (!input) throw new Error("unbound stream transition");
-					streams.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data) });
+					transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
 				}
-				const result = { ...baseResult, ...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(streamJournal ? { streams } : {}) } } : {}) };
+				const { exit, ...prefixResult } = baseResult;
+				const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
+					...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
 				stage = "certificate";
 				const certificate = sealProcessCertificate({
 					prototype,
@@ -1417,9 +1532,11 @@ export class LinuxProcessReuseBackend {
 					work,
 					certificate,
 					() => {
+						if (continuation) return Promise.resolve(false);
 						const binding = this.handoffs.bind(weakKey, work, {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
+							...(request.outputPipes ? { outputPipes: request.outputPipes } : {}),
 							...(request.closeStdin ? { closeStdin: true } : {}),
 								...(request.resources ? { resources: request.resources } : {}),
 						});
@@ -1431,6 +1548,7 @@ export class LinuxProcessReuseBackend {
 							return false;
 						});
 					},
+					continuation,
 				)) {
 					this.add(session, "published");
 				}
@@ -1440,6 +1558,7 @@ export class LinuxProcessReuseBackend {
 				this.setError(session, `post_execution_capture:${detail}`);
 				session.incompleteReasons.add(`nested_capture:${detail}`);
 			}
+			if (continuation) return { version: 2, kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
 			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
 		} finally {
@@ -1537,7 +1656,7 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources)),
+			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources).filter(input => input.installed !== false), request.outputPipes),
 			...(request.resources ? { resources: request.resources } : {}),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
@@ -1572,27 +1691,109 @@ function bufferedProcessPrototype(
 		})), ...inputs.filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
 			const input = inputs.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
+			return input ? { ...descriptor, flagsDigest: input.locks || input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
 				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
 				...(snapshot.resources!.objects[input.image]!.queue ? { endpointDigest: digestObject({ queue: snapshot.resources!.objects[input.image]!.queue, socket: snapshot.resources!.objects[input.image]!.socket }) } : {}),
-				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}) } : descriptor;
+				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}),
+				...(input.sourceAliases ? { resourceAliases: input.sourceAliases.map(name => projection.toLogical(name)).sort() } : {}) } : descriptor;
 		}),
 		platformFingerprint,
 	});
 }
 
-function parseDescriptorOffsets(report: string, inputs: ReturnType<typeof descriptorInputs>): Array<{
-	fd: number; before: number; after: number; device: string; inode: string; afterFlags?: number;
-	content?: import("./provenance-certificate.ts").ArtifactReference;
-}> {
-	const [header, ...lines] = report.trimEnd().split("\n");
-	if (header !== `FD2 ${inputs.length}` || lines.length !== inputs.length) throw new Error("incomplete inherited OFD result");
-	return lines.map((line, index) => {
-		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(line)) throw new Error("invalid inherited OFD result");
-		const fields = line.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number), input = inputs[index]!;
-		if (fd !== input.fd) throw new Error("inherited descriptor report changed order");
-		return { fd, before: input.offset, after: after!, ...(flags !== input.flags ? { afterFlags: flags! } : {}), device: fields[3]!, inode: fields[4]! };
+function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
+	handles: NonNullable<import("./strace-observer.ts").StraceObservation["finalHandles"]>, positions: ReturnType<typeof parseDescriptorOffsets>) {
+	let cursor = 0;
+	const line = () => {
+		const end = image.indexOf(10, cursor);
+		if (end < 0 || end - cursor > 256) throw new Error("invalid continuation header");
+		const text = image.toString("ascii", cursor, end); cursor = end + 1; return text;
+	};
+	const first = line(), header = /^PIIMAGE3 (\d+) (\d+) (\d+) (\d+)$/.exec(first);
+	if (!header || Number(header[1]) !== frontier.pid || Number(header[2]) > 256) throw new Error("unbound continuation image");
+	const records = new Map<number, string[]>(), bound: string[] = [], descriptions = new Map<number, string[]>();
+	for (let index = 0; index < Number(header[2]); index++) {
+		const row = line(), match = /^(\d+) \d+ \d+ \d+ \d+ \d+$/.exec(row), fd = Number(match?.[1]);
+		if (!match || !Number.isSafeInteger(fd) || records.has(fd)) throw new Error("invalid continuation FD table");
+		const fields = row.split(" "), handle = handles.find(handle => handle.fd === fd);
+		if (Number(fields[5]) !== fd) throw new Error("continuation image was already bound");
+		const input = handle?.description !== undefined ? inputs.find(input => input.alias === handle.description) : undefined;
+		if (input) {
+			const before = positions.find(position => position.fd === input.fd)!;
+			if (fields[3] !== before.device || fields[4] !== before.inode || Boolean(Number(fields[1]) & 0x80000) !== handle!.cloexec)
+				throw new Error("continuation descriptor identity changed");
+			const state = [String(Number(fields[1]) & ~0x80000), ...fields.slice(2, 5)], previous = descriptions.get(input.alias);
+			if (previous && previous.join(" ") !== state.join(" ")) throw new Error("continuation shared OFD diverged");
+			descriptions.set(input.alias, state); fields[5] = String(input.fd);
+		} else if (fd > 2 || fd === 0 && closedInput) throw new Error("unbound continuation handle");
+		records.set(fd, fields); bound.push(fields.join(" "));
+	}
+	const pending = inputs.find(input => input.fd === Number(records.get(frontier.fd)?.[5]));
+	if (!pending || !["pipe", "socket", "eventfd"].includes(pending.type ?? "") ||
+		[...(closedInput ? [] : [0]), 1, 2, ...handles.map(handle => handle.fd)].some(fd => !records.has(fd)) ||
+		cursor + Number(header[3]) + Number(header[4]) !== image.length) throw new Error("incomplete continuation FD table");
+	for (const position of positions) {
+		const input = inputs.find(input => input.fd === position.fd)!, state = descriptions.get(input.alias);
+		if (!state) continue;
+		const after = Number(state[1]); position.after = Number.isSafeInteger(after) ? after : state[1]!;
+		position.afterFlags = Number(state[0]) !== input.flags ? Number(state[0]) : undefined;
+	}
+	return Buffer.concat([Buffer.from(`${first}\n${bound.join("\n")}\n`), image.subarray(cursor)]);
+}
+
+function requestProcessImage(pid: number, channel: import("node:stream").Duplex, wake: () => boolean, signal: AbortSignal): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		let reply = Buffer.alloc(0), settled = false;
+		const finish = (error?: Error) => {
+			if (settled) return; settled = true;
+			channel.off("data", data); channel.off("error", failed); channel.off("close", closed); signal.removeEventListener("abort", closed);
+			if (error) reject(error); else resolve(reply);
+		};
+		const data = (bytes: Buffer) => {
+			reply = Buffer.concat([reply, bytes]);
+			if (reply.length >= 40) finish(reply.length === 40 ? undefined : new Error("invalid continuation reply"));
+		};
+		const failed = (error: Error) => finish(error), closed = () => finish(new Error("continuation producer closed"));
+		channel.on("data", data); channel.once("error", failed); channel.once("close", closed); signal.addEventListener("abort", closed, { once: true });
+		if (signal.aborted) return closed();
+		const request = Buffer.alloc(4); request.writeInt32LE(pid);
+		channel.write(request, error => {
+			if (error) finish(error);
+			else { try { if (!wake()) closed(); } catch (error) { finish(error as Error); } }
+		});
 	});
+}
+
+function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descriptorInputs>): Array<{
+	fd: number; before: OFDPosition; after: OFDPosition; device: string; inode: string; afterFlags?: number;
+	content?: import("./provenance-certificate.ts").ArtifactReference;
+	detached?: { content: Buffer; mode: bigint; uid: bigint; gid: bigint; modified: bigint };
+}> {
+	let cursor = 0, bytes = 0;
+	const line = () => {
+		const end = report.indexOf(10, cursor);
+		if (end < 0 || end - cursor > 256) throw new Error("incomplete inherited OFD result");
+		const value = report.toString("ascii", cursor, end); cursor = end + 1; return value;
+	};
+	if (line() !== `FD4 ${inputs.length}`) throw new Error("invalid inherited OFD header");
+	const positions: ReturnType<typeof parseDescriptorOffsets> = inputs.map(input => {
+		const value = line();
+		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(value)) throw new Error("invalid inherited OFD result");
+		const fields = value.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number);
+		if (fd !== input.fd) throw new Error("inherited descriptor report changed order");
+		return { fd, before: input.offset, after: Number.isSafeInteger(after) ? after! : fields[2]!, ...(flags !== input.flags ? { afterFlags: flags! } : {}), device: fields[3]!, inode: fields[4]! };
+	});
+	while (cursor < report.length) {
+		const value = line();
+		if (!/^F \d+ \d+ \d+ \d+ -?\d+ \d+ \d+$/.test(value)) throw new Error("invalid detached file image");
+		const [, fd, mode, uid, gid, seconds, nanos, length] = value.split(" "), size = Number(length);
+		const input = inputs.find(input => input.fd === Number(fd)), position = positions.find(position => position.fd === Number(fd));
+		if (!input || input.type || input.fd !== input.image || !position || position.detached || !Number.isSafeInteger(size) ||
+			size < 0 || (bytes += size) > MAX_REQUEST_BYTES / 2 || cursor + size >= report.length || report[cursor + size] !== 10 || Number(nanos) >= 1e9) throw new Error("unbound detached file image");
+		position.detached = { content: report.subarray(cursor, cursor + size), mode: BigInt(mode!), uid: BigInt(uid!), gid: BigInt(gid!), modified: BigInt(seconds!) * 1_000_000_000n + BigInt(nanos!) };
+		cursor += size + 1;
+	}
+	return positions;
 }
 
 function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
@@ -1612,12 +1813,20 @@ function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest):
 async function sealSessionEvidence(
 	session: ActiveSession,
 	changes: readonly SandboxWorkspaceChange[],
-): Promise<readonly SandboxDirectoryChange[]> {
+): Promise<readonly SandboxWorkspaceChange[]> {
 	const capture = session.topLevelCapture;
 	if (!capture) {
 		session.incompleteReasons.add("top_capture_missing");
 		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 		throw new Error("top-level workspace capture is missing");
+	}
+	const frontier = [...new Set([...capture.before.entries.keys(), ...capture.after.entries.keys()])].filter(name => {
+		const before = capture.before.entries.get(name), after = capture.after.entries.get(name);
+		return name && (before?.kind === "file" || after?.kind === "file") && before?.changeDigest !== after?.changeDigest && !changes.some(change => path.normalize(change.resource) === name);
+	});
+	if (frontier.length) {
+		if (!session.workspace.captureChanges) throw new Error("workspace object frontier is unavailable");
+		changes = [...changes, ...await session.workspace.captureChanges(frontier)];
 	}
 	const regularDeltas = changes.flatMap((change) => change.kind === "directory" ? [] : [{
 		relativePath: change.resource,
@@ -1663,7 +1872,9 @@ async function sealSessionEvidence(
 		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
 		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 	}
-	return directoryChanges;
+	return [...effects.effects.flatMap(({ relativePath, change }) => change.kind === "directory" ? [] : [{
+		...change, root: session.sourceRoot, target: path.resolve(session.sourceRoot, relativePath), resource: relativePath,
+	}]), ...directoryChanges];
 }
 
 async function sourceDirectoryChanges(
@@ -1744,7 +1955,8 @@ async function captureDependencies(
 	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">) => {
 		const [entry, parent] = await Promise.all([before(physical),
 			path.resolve(physical) === path.resolve(session.workspace.sandboxRoot) ? undefined : before(path.dirname(physical))]);
-		return snapshotDependency(logical, entry, parent, role, {
+		return snapshotDependency(logical, entry?.kind === "file" && entry.aliases ? { ...entry,
+			aliases: entry.aliases.map(name => session.projection.toLogical(name)).sort() } : entry, parent, role, {
 			excludedEntries: workspaceMetadataExclusions(session, physical),
 			parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)),
 		});
@@ -1892,6 +2104,8 @@ async function replayFilesystemEffects(
 			target,
 			resource,
 			...(event.operation ? { operation: event.operation } : {}),
+			...(event.object ? { object: { ...event.object, path: projection.toPhysical(event.object.path)! } } : {}),
+			...(event.aliases ? { aliases: event.aliases.map(name => projection.toPhysical(name)!) } : {}),
 			...(event.before.kind === "file" ? { before: artifacts.read(event.before.data), beforeMode: event.before.mode } : {}),
 			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode } : {}),
 		});
@@ -1909,9 +2123,9 @@ async function captureProcessResult(
 	outcome: SpawnOutcome,
 	observedProcessMs: number,
 	effects: readonly { readonly logicalPath: string; readonly change:
-		| Pick<SandboxFileChange, "kind" | "before" | "after" | "beforeMode" | "afterMode">
+		| Pick<SandboxFileChange, "kind" | "before" | "after" | "beforeMode" | "afterMode" | "operation" | "object" | "aliases">
 		| Pick<SandboxDirectoryChange, "kind" | "before" | "after"> }[],
-): Promise<ProcessResultRecord> {
+): Promise<Extract<ProcessResultRecord, { readonly exit: ExitOutcome }>> {
 	const journal: OrderedEffectEvent[] = [];
 	for (const { logicalPath, change } of effects) {
 		const state = async (side: "before" | "after"): Promise<WorkspaceEffectState> => {
@@ -1921,7 +2135,9 @@ async function captureProcessResult(
 			if (mode === undefined) throw new Error("transaction file mode is unavailable");
 			return { kind: "file", data: await store.artifacts.put(content), mode };
 		};
-		journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after") });
+		journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after"),
+			...(change.kind !== "directory" ? { ...(change.operation ? { operation: change.operation } : {}),
+				...(change.object ? { object: change.object } : {}), ...(change.aliases ? { aliases: change.aliases } : {}) } : {}) });
 	}
 	for (const event of outcome.output) {
 		journal.push({ sequence: journal.length, kind: "output", fd: event.fd, data: await store.artifacts.put(event.data) });
@@ -2245,6 +2461,7 @@ async function runSpawn(
 		readonly onOutput?: (event: BufferedOutput) => void;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 		readonly inheritedFiles?: readonly number[];
+		readonly onControl?: (channel: import("node:stream").Duplex, wake: () => boolean) => (() => void | Promise<void>);
 	},
 ): Promise<SpawnOutcome> {
 	throwIfAborted(options.signal);
@@ -2256,7 +2473,8 @@ async function runSpawn(
 			cwd: options.cwd,
 			env: options.environment,
 			detached: true,
-			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const), ...(options.inheritedFiles ?? [])],
+			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const),
+				...(options.inheritedFiles ?? []), ...(options.onControl ? ["pipe" as const] : [])],
 		});
 		const output: BufferedOutput[] = [];
 		child.once("spawn", () => channels?.releaseWriters());
@@ -2300,7 +2518,9 @@ async function runSpawn(
 				child.once("close", (code, signal) => resolve({ code, signal }));
 			},
 		);
+		let releaseControl: (() => void | Promise<void>) | undefined;
 		try {
+			if (options.onControl) releaseControl = options.onControl(child.stdio.at(-1) as import("node:stream").Duplex, () => child.kill("SIGUSR2"));
 			const [result] = await Promise.all([completed, drained]);
 			if (options.signal?.aborted) throw new Error("aborted");
 			if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
@@ -2312,6 +2532,7 @@ async function runSpawn(
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			options.signal?.removeEventListener("abort", onAbort);
+			await releaseControl?.();
 		}
 	} finally { await channels?.dispose(); }
 }
@@ -2563,7 +2784,7 @@ function mergeDependencyEvidence(
 				existing?.kind === "file" &&
 				dependency.kind === "file" &&
 				existing.contentDigest === dependency.contentDigest &&
-				existing.metadataDigest === dependency.metadataDigest
+				existing.metadataDigest === dependency.metadataDigest && stableEqual(existing.aliases, dependency.aliases)
 			) {
 				if (existing.role !== "executable" && dependency.role === "executable") {
 					dependencies.set(identity, dependency);

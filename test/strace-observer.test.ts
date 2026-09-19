@@ -27,6 +27,33 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("accepts directory enumeration only with its exact broker image and successful result", async () => {
+		for (const syscall of ["getdents", "getdents64"]) for (const configured of [false, true]) for (const failed of [false, true]) {
+			const observation = await observe({ 100: [EXEC, `${syscall}(10</work/anchor>, [], 512) = ${failed ? "-1 EINVAL (Invalid argument)" : "0"}`] }, {
+				inheritedDirectoryImages: configured ? ["/work/anchor"] : [],
+			});
+			expect(observation.taints.includes("unsupported_syscall"), `${syscall}:${configured}:${failed}`).toBe(configured === failed);
+		}
+	});
+	test("releases stream references after aliases, copied tables and shared tables close", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stream-lifetime-")), prefix = path.join(root, "process");
+		try {
+			for (const shared of [false, true]) {
+				await fs.writeFile(prefix + ".stream", [
+					`100 ${EXEC}`, '100 dup(3<UNIX-STREAM:[91->92]>) = 5<UNIX-STREAM:[91->92]>',
+					`100 clone(child_stack=NULL, flags=${shared ? "CLONE_FILES|" : ""}SIGCHLD) = 101`,
+					'100 close(3<UNIX-STREAM:[91->92]>) = 0', '100 close(5<UNIX-STREAM:[91->92]>) = 0',
+					...(!shared ? ['101 close(3<UNIX-STREAM:[91->92]>) = 0', '101 close(5<UNIX-STREAM:[91->92]>) = 0'] : []),
+					'101 read(4<UNIX-STREAM:[92->91]>, "", 1) = 0', '101 +++ exited with 0 +++', '100 +++ exited with 0 +++',
+				].join("\n"));
+				const observed = await observeStrace(prefix, "/usr/bin/example", "/work", { inheritedStreams: ["91", "92"],
+					inheritedHandles: [{ fd: 3, inode: "91", flags: 2, outside: 0 }, { fd: 4, inode: "92", flags: 2, outside: 3 }] });
+				expect(observed).toMatchObject({ complete: true, taints: ["clock", "random"], resourceJournal: [
+					{ inode: "91", kind: "release", data: Buffer.from([3]) }, { inode: "92", kind: "consume", data: Buffer.alloc(0) },
+				] });
+			}
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
 	test("orders inherited stream transfers across processes and preserves binary iovecs", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stream-order-")), prefix = path.join(root, "process");
 		try {
@@ -39,7 +66,7 @@ describe("strace provenance decoder", () => {
 				'101 +++ exited with 0 +++', '100 +++ exited with 0 +++',
 			].join("\n"));
 			const observed = await observeStrace(prefix, "/usr/bin/example", "/work", { inheritedStreams: ["91", "92"] });
-			expect(observed).toMatchObject({ complete: true, taints: ["clock", "random"], streamJournal: [
+			expect(observed).toMatchObject({ complete: true, taints: ["clock", "random"], resourceJournal: [
 				{ inode: "92", kind: "produce", data: Buffer.from([0, 255]) },
 				{ inode: "91", kind: "consume", data: Buffer.from([0, 255]) },
 				{ inode: "91", kind: "shutdown", data: Buffer.from([2]) },

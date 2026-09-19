@@ -1,4 +1,4 @@
-import type { WorkspaceStructureSnapshot } from "./workspace-state.ts";
+import type { WorkspaceFileMutation, WorkspaceStructureSnapshot } from "./workspace-state.ts";
 
 /** Apply removals child first and creations parent first, preserving each caller's path order. */
 export function orderWorkspaceChanges<Value>(
@@ -20,7 +20,7 @@ export function orderWorkspaceChanges<Value>(
 }
 
 /** Exact regular-file transition captured around one workspace operation. */
-export interface WorkspaceRegularDelta {
+export interface WorkspaceRegularDelta extends WorkspaceFileMutation {
 	readonly relativePath: string;
 	readonly before?: Uint8Array;
 	readonly after?: Uint8Array;

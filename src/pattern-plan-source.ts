@@ -140,8 +140,9 @@ export function createPatternPlanSource({
 		let operations: Map<string, ObservedOperation[]> | undefined;
 		return candidates.flatMap(candidate => {
 			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
-			// Only root background probes may use smaller units; scan their live bindings once per batch.
-			if (!candidate.background || dependsOn?.length || !operationBindings.size) return [action];
+			// Both recurring predictions and background probes may reuse a root's native
+			// operations. Dependent steps still need their parent's complete tool result.
+			if (dependsOn?.length || !operationBindings.size) return [action];
 			const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
 			if (!operations) {
 				operations = new Map();

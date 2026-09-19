@@ -19,6 +19,19 @@ const { create: temporaryRoot, dispose } = temporaryDirectories("pi-reuse-planne
 afterEach(dispose);
 
 describe("ProcessReusePlanner", () => {
+	it("admits continuation certificates only from a live owner and never persists them", async () => {
+		const root = await temporaryRoot(), store = new ProvenanceCertificateStore(root), planner = new ProcessReusePlanner({ store });
+		const certificate = processCertificate(processPrototype(), { result: { replayProfile: "buffered_noninteractive", journal: [],
+			continuation: { imageDigest: sha256Digest("state"), imageBytes: 5 } } });
+		const request = { weakKey: certificate.weakKey, executablePath: certificate.prototype.executablePath, contract: contract(),
+			live: { certificate, acceptedTaints: [] } };
+		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["observation_contract_incompatible"] });
+		expect(await planner.plan({ ...request, contract: { ...request.contract, continuation: true } })).toMatchObject({ kind: "running_resume", source: "live" });
+		expect(await planner.publishCompleted(certificate)).toBe(false);
+		expect(await store.put(certificate)).toBe(false);
+		expect(await planner.plan({ ...request, live: undefined, contract: { ...request.contract, continuation: true } })).toMatchObject({ kind: "miss" });
+	});
+
 	it("reuses the same nested exec across different parent commands after strong validation", async () => {
 		const fixture = await fixtureWithCertificate();
 		const { planner, request } = fixture;
@@ -66,7 +79,7 @@ describe("ProcessReusePlanner", () => {
 		expect(await readFile(file, "utf8")).toBe(bytes);
 		await expect(store.get(legacy.id)).rejects.toThrow("certificate integrity check failed");
 		await store.put(certificate);
-		expect(await planner.plan(request)).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: certificate.id, version: 9 } });
+		expect(await planner.plan(request)).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: certificate.id, version: 16 } });
 		await store.stats();
 	});
 

@@ -7,13 +7,13 @@ import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
+import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
@@ -769,6 +769,34 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); directories.mockRestore(); }
 	});
 
+	it.skipIf(process.platform !== "linux")("leases captured file objects to internal Actor operations across turns", async () => {
+		const cwd = await temporaryWorkspace(), file = path.join(cwd, "notes.txt"), tools = [createReadTool(cwd), createBashTool(cwd)];
+		const base = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 65536 });
+		let lookup: ((path: string) => Iterable<object>) | undefined, borrowed: Buffer | undefined, predict = true;
+		const world: SpeculativeAgentExecutionWorld = { ...base, speculation: { ...base.speculation!, tools: ["read", "bash"] },
+			observeOperations: async ({ action, inputs }, execute) => {
+				if (action.tool === "bash") { lookup = inputs; borrowed = (await borrowResourceObject(inputs?.(file) ?? [], file, await fs.stat(file, { bigint: true }), 65536))?.content; }
+				return execute();
+			} };
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("actor-object-inputs", { cwd, draftModel: model("draft"), preflight: () => true,
+			getSettings: () => ({ ...settings(), tools: ["read", "bash"], drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
+				resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 65536 }),
+			complete: async () => assistant([{ type: "toolCall", id: "read", name: "read", arguments: { path: "notes.txt" } }], "toolUse"),
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			executionWorlds: [world], onEvent: event => { events.push(event); } });
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "read"), tools });
+			await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(1);
+			await host.execute({ turnID: "read", id: "read", tool: "read", args: { path: "notes.txt" }, tools }, undefined, () => { throw new Error("expected prediction"); });
+			await host.finishTurn("read"); predict = false;
+			await host.startTurn({ ...startInput(tools[1]!, "bash"), tools });
+			await host.execute({ turnID: "bash", id: "bash", tool: "bash", args: { command: "cat notes.txt" }, tools }, undefined, async () => textResult("native"));
+			expect(borrowed).toEqual(await fs.readFile(file)); expect(lookup).toBeDefined(); expect([...lookup!(file)]).toEqual([]);
+			await host.finishTurn("bash", true);
+		} finally { await host.dispose(); }
+	});
+
 	it.each(["write", "edit"])("hands Actor %s inputs across turns without rereading or replaying the mutation", async (tool) => {
 		const cwd = await temporaryWorkspace(), tools = [createWriteTool(cwd), createEditTool(cwd), createReadTool(cwd)] as const;
 		const args = tool === "write" ? { path: "notes.txt", content: "after\nsecond\n" }
@@ -1179,7 +1207,7 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); await lease.release(); }
 	});
 
-	it("retires failed internal bindings without training misses or discarding a newer observation", async () => {
+	it.each([false, true])("retires failed internal bindings without training misses or discarding a newer observation (recurring=%s)", async (recurring) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
@@ -1207,6 +1235,8 @@ describe("speculative action host", () => {
 		try {
 			for (const turnID of ["common-1", "common-2"]) store.observe({ sessionID: "session", turnID, tool: "read",
 				input: { path: "notes.txt" }, outcome: "success", durationMs: 20, schemaHash: "schema" });
+			if (recurring) store.observe({ sessionID: "session", turnID: "discovery", tool: "read",
+				input: concrete, outcome: "success", durationMs: 20, schemaHash: "schema" });
 			await observe([fast, slow, binding("wrong permission", 100, "foreign")]);
 			controller.turnFinished(request.startInput, request.settings, false);
 			const internal = (await proposed())!;

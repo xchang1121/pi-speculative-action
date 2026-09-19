@@ -21,6 +21,8 @@ export interface ReplayObservationContract {
 	readonly sink: "buffered" | "pipe" | "tty" | "interactive";
 	readonly orderedJournal: boolean;
 	readonly transactionalEffects: boolean;
+	/** Only a held native exec can consume a same-scope continuation. */
+	readonly continuation?: true;
 }
 
 export interface ProcessReuseRequest {
@@ -61,9 +63,7 @@ export interface ProcessReuseLookupMetrics {
 	readonly durationMs: number;
 }
 
-export type ProcessReusePlan =
-	| {
-			readonly kind: "completed_replay";
+interface ReadyProcessPlan {
 			readonly source: "live" | "l2";
 			readonly weakKey: Sha256Digest;
 			readonly certificate: ProcessProvenanceCertificate;
@@ -71,6 +71,9 @@ export type ProcessReusePlan =
 			readonly artifacts: VerifiedArtifactClosure;
 			readonly lookup: ProcessReuseLookupMetrics;
 	  }
+export type ProcessReusePlan =
+	| (ReadyProcessPlan & { readonly kind: "completed_replay" })
+	| (ReadyProcessPlan & { readonly kind: "running_resume" })
 	| {
 			readonly kind: "miss";
 			readonly weakKey: Sha256Digest;
@@ -122,7 +125,7 @@ export class ProcessReusePlanner {
 				reasons.add("certificate_tainted");
 				continue;
 			}
-			if (!contractCompatible(request.contract, certificate)) {
+			if (!contractCompatible(request.contract, certificate) || certificate.result.continuation && !live.includes(certificate)) {
 				reasons.add("observation_contract_incompatible");
 				continue;
 			}
@@ -177,7 +180,7 @@ export class ProcessReusePlanner {
 				metrics.artifactsLoaded += artifacts.artifacts;
 				metrics.artifactBytesRead += artifacts.bytes;
 				return {
-					kind: "completed_replay",
+					kind: certificate.result.continuation ? "running_resume" : "completed_replay",
 					source: live.length ? "live" : "l2",
 					weakKey,
 					certificate,
@@ -203,7 +206,7 @@ export class ProcessReusePlanner {
 		certificate: ProcessProvenanceCertificate,
 		acceptedTaints: readonly ProvenanceTaint[] = [],
 	): Promise<boolean> {
-		if (!certificateReplayable(certificate, acceptedTaints)) return false;
+		if (certificate.result.continuation || !certificateReplayable(certificate, acceptedTaints)) return false;
 		return this.store.put(certificate);
 	}
 }
@@ -214,5 +217,7 @@ function contractCompatible(
 ): boolean {
 	if (!contract.orderedJournal || !contract.transactionalEffects) return false;
 	if (contract.sink !== "buffered") return false;
+	if (certificate.result.continuation && (!contract.continuation || certificate.dependencyCertificate.taints.some(
+		taint => taint === "pid_observation" || taint === "descriptor_observation"))) return false;
 	return certificate.result.replayProfile === "buffered_noninteractive";
 }

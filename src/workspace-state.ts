@@ -15,6 +15,11 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 			readonly mode: number;
 			readonly size: number;
 			readonly links: number;
+			/** Snapshot-local object identity and its closed set of names. */
+			readonly object?: string;
+			readonly aliases?: readonly string[];
+			readonly modified?: string;
+			readonly ownership?: string;
 	  }
 	| {
 			readonly kind: "directory";
@@ -44,4 +49,11 @@ export interface WorkspaceStructureSnapshot {
 	readonly files: number;
 	readonly bytesRead: number;
 	readonly complete: boolean;
+}
+
+/** A name refers to an object from either endpoint of the same workspace transaction. */
+export interface WorkspaceFileMutation {
+	readonly operation?: "write_contents";
+	readonly object?: { readonly path: string; readonly before: boolean };
+	readonly aliases?: readonly string[];
 }
