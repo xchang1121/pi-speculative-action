@@ -14,6 +14,20 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("revokes active production on disposal and prevents concurrent or repeated whole transfers", async () => {
+		const fixture = await producer();
+		fixture.registry.dispose();
+		expect(fixture.work.signal.aborted).toBe(true);
+		await fixture.work.completion;
+		const owner = new ProcessHandoffOwnership(), gate = gated(), effects = vi.fn(async () => { await gate.wait(); });
+		const first = owner.commit(effects);
+		await gate.entered;
+		const joined = owner.commit(effects);
+		await expect(owner.commit(async () => {})).rejects.toMatchObject({ disposition: "recoverable" });
+		gate.release(); await first; await joined;
+		await expect(owner.commit(effects)).resolves.toBeUndefined();
+		expect(effects).toHaveBeenCalledOnce();
+	});
 	it.each(["completed", "running"])("transfers %s work across a live consumer's turn and rechecks revocation", async phase => {
 		let active = false;
 		const acceptScope = (scope: typeof SCOPE) => active && scope.turnID === OTHER_SCOPE.turnID;

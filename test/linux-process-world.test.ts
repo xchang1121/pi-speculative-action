@@ -106,14 +106,14 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const native = mode.startsWith("native");
-		const pipe = mode.includes("pipe"), opath = mode.includes("opath"), launcher = pipe || mode === "native-shared-table" || mode === "native-unshare" || opath;
-		const nullDevice = mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
-		const directory = mode.includes("directory");
+		const mixed = mode.endsWith("mixed"), pipe = mode.includes("pipe"), opath = mode.includes("opath") || mixed, launcher = pipe || mode === "native-shared-table" || mode === "native-unshare" || opath;
+		const nullDevice = mixed || mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
+		const directory = mode.includes("directory") || mixed;
 		const descriptors = mode === "native-descriptors" || launcher || nullDevice || directory;
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
@@ -137,9 +137,10 @@ int main(int argc, char **argv) {
 	${descriptors ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
 	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != O_RDONLY) return 74; close(alias);' : ""}
 	${nullDevice ? 'char byte; if (write(6, "discard", 7) != 7 || read(7, &byte, 1) != 0 || lseek(6, 100, SEEK_SET) != 0 || fcntl(6, F_GETFL) != fcntl(7, F_GETFL)) return 75;' : ""}
-	${mode === "native-status" ? 'if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK) || fcntl(6, F_SETFL, fcntl(6, F_GETFL) | O_APPEND | O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK)) return 77;' : ""}
+	${mode === "native-status" || mixed ? 'if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK) || fcntl(6, F_SETFL, fcntl(6, F_GETFL) | O_APPEND | O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK)) return 77;' : ""}
 	${mode === "native-null-stdin" ? 'if (read(0, &byte, 1) != 0) return 76;' : ""}
 	${directory ? 'if (fchdir(10) || fcntl(10, F_GETFL) != fcntl(11, F_GETFL)) return 78;' : ""}
+	${mixed ? 'if (pwrite(16, "Q", 1, 2) != 1 || lseek(17, 4, SEEK_SET) != 4 || lseek(18, 0, SEEK_CUR) != 0) return 86;' : ""}
 	${opath ? 'char probe; if (fcntl(12, F_GETFL) != O_PATH || read(12, &probe, 1) != -1 || errno != EBADF) return 79;' : ""}
 	char text[32]; int fd = ${directory ? 'openat(11, "input.txt", O_RDONLY)' : 'open("input.txt", O_RDONLY)'}; ssize_t size = read(fd, text, sizeof(text));
 	${mode === "native-closed-input" ? 'if (fd != 0) return 73;' : ""}
@@ -162,9 +163,10 @@ int main(int argc, char **argv) {
 	pthread_t worker; if (pthread_create(&worker, 0, duplicate, 0) || pthread_join(worker, 0)) return 75;
 	${mode === "native-unshare" ? "if (unshare(CLONE_FILES)) return 77;" : ""}
 	${opath ? 'int directory = open(".", O_PATH | O_DIRECTORY), file = open("fd.txt", O_PATH);\n\tif (directory < 0 || file < 0 || dup2(directory, 10) < 0 || dup2(directory, 11) < 0 || dup2(file, 12) < 0) return 79;\n\tclose(directory); if (file != 12) close(file);' : ""}
-	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; close(fds[1]); if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
+	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; ' + (mode.includes("pipe-live") ? '' : 'close(fds[1]); ') + 'if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
+	${mixed ? 'int writable = open("anonymous", O_RDWR | O_CREAT | O_EXCL, 0600); if (writable < 0 || unlink("anonymous") || write(writable, "abcdef", 6) != 6 || lseek(writable, 0, SEEK_SET) != 0 || dup2(writable, 16) < 0 || dup2(writable, 17) < 0) return 87; close(writable); int reader = open("/proc/self/fd/16", O_RDONLY); if (reader < 0 || dup2(reader, 18) < 0) return 88; close(reader);' : ""}
 	puts(argv[1]); fflush(stdout);
-	${pipe ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; return 0; }' : ""}
+	${pipe ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; return 0; }' : ""}
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
 `);
@@ -286,6 +288,7 @@ int main(int argc, char **argv) {
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", command]);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
+			const publicationStart = publishing.mock.calls.length;
 			if (mode === "running") publication = holdProcessPublication(fixture.backend);
 			if (mode.includes("prepared-")) {
 				const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
@@ -299,6 +302,8 @@ int main(int argc, char **argv) {
 			if (mode === "running") await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
 			else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
+			if (launcher) await expect.poll(() => publishing.mock.calls.slice(publicationStart).some(([certificate]) =>
+				certificate.prototype.executablePath === path.join(fixture.workspace, "worker")), { timeout: 5000 }).toBe(true);
 			if (mode.includes("prepared-")) {
 				expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed after preparation\n");
 				restorePreparation?.(); restorePreparation = undefined;
@@ -444,6 +449,30 @@ int main(void) {
 			}
 			for (const args of [["--exec"], ["--exec", "13", "invalid", "/bin/true"]])
 				expect(childProcess.spawnSync(binary, args).status).toBe(64);
+			const queueImage = path.join(root, "queue"), queueManifest = path.join(root, "queue-queueManifest"), queueReport = path.join(root, "queue-queueReport");
+			await writeFile(queueImage, "abc");
+			for (const producer of [1, 2]) {
+				await writeFile(queueReport, "");
+				await writeFile(queueManifest, `FD1 1 0\n0 0 0 0 ${Buffer.byteLength(queueImage)} ${producer}\n${queueImage}\n`);
+				const child = childProcess.spawn(binary, ["--exec-fds", "12", queueManifest, queueReport, "consumer", "/bin/sh", "-c", "echo $$ >&2; exec /bin/cat"], { detached: true });
+				let output = "", childPID = "", completed = false;
+				child.stdout.on("data", data => { output += data.toString(); });
+				child.stderr.on("data", data => { childPID += data.toString(); });
+				const closed = once(child, "close").then(value => { completed = true; return value; });
+				try {
+					await expect.poll(() => output).toBe("abc");
+					if (producer === 1) {
+						expect(await closed).toEqual([0, null]);
+						expect(await readFile(queueReport, "utf8")).toMatch(/^FD1 1\n0 0 3 /);
+					} else {
+						await new Promise(resolve => setTimeout(resolve, 30));
+						expect(completed, "exhausted active input must block, never fabricate EOF").toBe(false);
+						process.kill(-child.pid!, "SIGKILL"); await closed;
+						await expect.poll(async () => (await readFile(`/proc/${Number(childPID)}/stat`, "utf8").catch(() => "")).split(") ")[1]?.[0] ?? "").not.toMatch(/[RSDT]/);
+						expect(await readFile(queueReport, "utf8")).toBe("");
+					}
+				} finally { if (!completed) { process.kill(-child.pid!, "SIGKILL"); await closed; } }
+			}
 			expect(childProcess.spawnSync(binary, ["--exec", "12", "missing", path.join(root, "missing")]).status).toBe(127);
 			for (const signal of ["TERM", "PIPE", "XFSZ"])
 				expect(childProcess.spawnSync("/bin/bash", ["-c", `trap '' ${signal}; exec "$@"`, "outer", binary,

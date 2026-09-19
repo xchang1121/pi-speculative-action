@@ -80,7 +80,8 @@ import {
 	type HeldExecDecision,
 	type HeldExecProcess,
 	type HeldExecSnapshot,
-	type FileDescriptorInput,
+	descriptorInputs, descriptorEffects,
+	type ProcessResourceGraph,
 } from "./linux-held-exec.ts";
 import {
 	emptyWorldReuseMetrics,
@@ -220,7 +221,7 @@ interface DispatcherRequest {
 type OutputRoute = readonly [1 | 2, 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
-	readonly closeStdin?: boolean; readonly descriptorInputs?: readonly FileDescriptorInput[];
+	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph;
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
@@ -411,7 +412,7 @@ export class LinuxProcessReuseBackend {
 					descriptors: request => {
 						if (request.scope) for (const binding of this.handoffs.bindings(request.scope)) {
 							const invocation = this.handoffs.resolveBinding(binding, request.scope);
-							if (invocation?.descriptorInputs?.length && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
+							if (invocation?.resources?.handles.length && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
 						}
 						return this.observations.getStore()?.learn ? "inspect" : false;
 					},
@@ -1037,10 +1038,10 @@ export class LinuxProcessReuseBackend {
 				return { kind: "continue" };
 			}
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
-			const descriptorInputs = process.descriptors?.length
+			const resources = process.descriptors?.length
 				? await captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
 					sensitivePaths(this.options.storeRoot, this.options.deniedPaths)) : undefined;
-			const snapshot = { ...inspected, ...(descriptorInputs ? { descriptorInputs } : {}) };
+			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
 			if (!pathContains(sourceRoot, snapshot.cwd)) {
 				this.addActor("bypasses");
 				return { kind: "continue" };
@@ -1054,11 +1055,11 @@ export class LinuxProcessReuseBackend {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
-					...(descriptorInputs ? { descriptorInputs } : {}),
+					...(resources ? { resources } : {}),
 				}, durationMs);
 				if (binding) observation!.bindings.set(order, binding);
 			};
-			if (!available || descriptorInputs && process.descriptors!.some(({ owned }) => !owned)) {
+			if (!available || resources && process.descriptors!.some(({ owned }) => !owned)) {
 				// Pin the actual image before resuming it. Learning must not wait for a large digest after a short native call.
 				const platform = await this.resolvePlatformFingerprint(), controller = new AbortController();
 				let pinned!: () => void, digest: Sha256Digest | undefined;
@@ -1102,11 +1103,16 @@ export class LinuxProcessReuseBackend {
 				kind: "replay",
 				exitCode: plan.certificate.result.exit.code,
 				output,
-				...(descriptorInputs ? { descriptorOffsets: plan.certificate.result.descriptorOffsets?.map(({ content, ...position }) => {
-					const descriptor = process.descriptors!.find(({ fd }) => fd === position.fd)!;
-					return { ...position, device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags,
-						...(descriptor.type === "directory" ? { path: descriptorInputs.find(input => input.fd === position.fd)!.sourcePath! } : {}),
-						...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.pipeHex!, "hex") } : content ? { content: plan.artifacts.read(content) } : {}) };
+				...(resources ? { descriptorOffsets: descriptorInputs(resources).map(input => {
+					const descriptor = process.descriptors!.find(({ fd }) => fd === input.fd)!;
+					const effects = plan.certificate.result.resources!;
+					const ofd = effects.descriptions.find(effect => effect.id === input.alias)!;
+					const object = effects.objects.find(effect => effect.id === input.image)!;
+					return { fd: input.fd, before: input.offset, after: object.consumed ?? ofd.position?.after ?? 0,
+						device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags, afterFlags: ofd.flags,
+						...(input.type === "directory" ? { path: input.sourcePath! } : {}),
+						...(input.type === "pipe" ? { content: Buffer.from(resources.objects[input.image]!.content!, "base64"), eof: resources.objects[input.image]!.queue!.eof }
+							: input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
 				}) } : {}),
 				commit: async () => {
 					const started = performance.now();
@@ -1197,13 +1203,14 @@ export class LinuxProcessReuseBackend {
 			const logicalExecutable = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
+			const inputs = descriptorInputs(request.resources);
 			const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
-			if (request.descriptorInputs?.length) {
+			if (inputs.length) {
 				descriptorManifest = path.join(traceRoot, "fd-inputs");
 				descriptorReportPath = path.join(traceRoot, "fd-offsets");
 				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
-				let manifest = `FD1 ${request.descriptorInputs.length} ${Number(!!request.closeStdin)}\n`;
-				for (const descriptor of request.descriptorInputs) {
+				let manifest = `FD1 ${inputs.length} ${Number(!!request.closeStdin)}\n`;
+				for (const descriptor of inputs) {
 					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
 						const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
@@ -1227,7 +1234,7 @@ export class LinuxProcessReuseBackend {
 					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
 					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
 						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
-					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${Number(descriptor.type === "pipe")}\n${image}\n`;
+					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${descriptor.type === "pipe" ? request.resources!.objects[descriptor.image]!.queue!.eof ? 1 : 2 : 0}\n${image}\n`;
 				}
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
 			}
@@ -1280,21 +1287,21 @@ export class LinuxProcessReuseBackend {
 			outcome = await runSpawn(ready.strace, command.slice(1), {
 				cwd: request.cwd,
 				environment: request.environment,
-				signal: session.signal,
+				signal: AbortSignal.any([session.signal, work.signal]),
 				inheritedFiles: inheritedFiles.map(file => file.fd),
 			});
 			const observedProcessMs = Math.max(0, performance.now() - processStarted);
 			releaseInputs();
 			try {
-				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), request.descriptorInputs!) : undefined;
+				const descriptorOffsets = descriptorReport ? parseDescriptorOffsets(await descriptorReport.readFile("utf8"), inputs) : undefined;
 				transactionFinishing = true;
 				const captures = [
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
-							.concat(request.descriptorInputs?.some(input => input.type === "null") ? ["/dev/null"] : [])
-							.concat((descriptorOffsets ?? []).filter(position => request.descriptorInputs!.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
+							.concat(inputs.some(input => input.type === "null") ? ["/dev/null"] : [])
+							.concat((descriptorOffsets ?? []).filter(position => inputs.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
@@ -1329,7 +1336,7 @@ export class LinuxProcessReuseBackend {
 				}
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
-				if (request.descriptorInputs?.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
+				if (inputs.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
 					observed.path === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
 					taints.add("untracked_fd");
 				}
@@ -1345,7 +1352,7 @@ export class LinuxProcessReuseBackend {
 				stage = "artifacts";
 				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
-					const input = request.descriptorInputs!.find(({ fd }) => fd === position.fd)!;
+					const input = inputs.find(({ fd }) => fd === position.fd)!;
 					if (input.type === "null" || input.type === "pipe" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
 					const current = await lstat(image.physical, { bigint: true });
@@ -1373,7 +1380,7 @@ export class LinuxProcessReuseBackend {
 						} else position.content = await this.store.artifacts.put(captured.content!);
 					} else throw new Error("unmodeled inherited FD metadata effect");
 				}
-				const result = { ...baseResult, ...(descriptorOffsets ? { descriptorOffsets } : {}) };
+				const result = { ...baseResult, ...(descriptorOffsets ? { resources: descriptorEffects(request.resources!, descriptorOffsets) } : {}) };
 				stage = "certificate";
 				const certificate = sealProcessCertificate({
 					prototype,
@@ -1397,7 +1404,7 @@ export class LinuxProcessReuseBackend {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
 							...(request.closeStdin ? { closeStdin: true } : {}),
-								...(request.descriptorInputs ? { descriptorInputs: request.descriptorInputs } : {}),
+								...(request.resources ? { resources: request.resources } : {}),
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
@@ -1513,8 +1520,8 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, request.descriptorInputs),
-			...(request.descriptorInputs ? { descriptorInputs: request.descriptorInputs } : {}),
+			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources)),
+			...(request.resources ? { resources: request.resources } : {}),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
 }
@@ -1526,7 +1533,8 @@ function bufferedProcessPrototype(
 	platformFingerprint: string,
 ): ExecPrototype {
 	const { context } = snapshot;
-	const input = snapshot.descriptorInputs?.find(({ fd }) => fd === 0);
+	const inputs = descriptorInputs(snapshot.resources);
+	const input = inputs.find(({ fd }) => fd === 0);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
 		executableDigest,
@@ -1537,24 +1545,25 @@ function bufferedProcessPrototype(
 		),
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
-		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: true } : { type: "closed", eof: true },
+		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: snapshot.resources!.objects[input.image]!.queue?.eof ?? true } : { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [...context.descriptorTypes.map((type, fd) => ({
 			fd,
 			type,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`),
 			...(fd === 0 ? { eof: true } : {}),
-		})), ...(snapshot.descriptorInputs ?? []).filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
+		})), ...inputs.filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
-			const input = snapshot.descriptorInputs?.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, type: input.type ?? descriptor.type, alias: input.alias, contentDigest: input.contentDigest, offset: input.offset,
+			const input = inputs.find(({ fd }) => fd === descriptor.fd);
+			return input ? { ...descriptor, type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
+				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}) } : descriptor;
 		}),
 		platformFingerprint,
 	});
 }
 
-function parseDescriptorOffsets(report: string, inputs: readonly FileDescriptorInput[]): Array<{
+function parseDescriptorOffsets(report: string, inputs: ReturnType<typeof descriptorInputs>): Array<{
 	fd: number; before: number; after: number; device: string; inode: string; afterFlags?: number;
 	content?: import("./provenance-certificate.ts").ArtifactReference;
 }> {
@@ -1563,8 +1572,7 @@ function parseDescriptorOffsets(report: string, inputs: readonly FileDescriptorI
 	return lines.map((line, index) => {
 		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(line)) throw new Error("invalid inherited OFD result");
 		const fields = line.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number), input = inputs[index]!;
-		if (fd !== input.fd || !Number.isSafeInteger(flags) || flags! > 0x7fffffff ||
-			((flags! ^ input.flags) & ~0xc00 /* O_APPEND | O_NONBLOCK */) || !Number.isSafeInteger(after)) throw new Error("inherited OFD flags changed");
+		if (fd !== input.fd) throw new Error("inherited descriptor report changed order");
 		return { fd, before: input.offset, after: after!, ...(flags !== input.flags ? { afterFlags: flags! } : {}), device: fields[3]!, inode: fields[4]! };
 	});
 }

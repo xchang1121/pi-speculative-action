@@ -2,7 +2,7 @@ import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 7 as const;
+export const PROCESS_CERTIFICATE_VERSION = 8 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -51,6 +51,8 @@ export interface InheritedFileDescriptor {
 	readonly offset?: number;
 	/** Canonical descriptor representing this inherited open-file description. */
 	readonly alias?: number;
+	/** Kernel object representative, independent of the OFD representative. */
+	readonly object?: number;
 	readonly resourcePath?: string;
 	readonly eof?: boolean;
 }
@@ -187,6 +189,11 @@ export type ExitOutcome =
 	| { readonly kind: "code"; readonly code: number }
 	| { readonly kind: "signal"; readonly signal: number; readonly coreDumped: boolean };
 
+export interface ProcessResourceEffects {
+	readonly descriptions: readonly { readonly id: number; readonly position?: { readonly before: number; readonly after: number }; readonly flags?: number }[];
+	readonly objects: readonly { readonly id: number; readonly consumed?: number; readonly content?: ArtifactReference }[];
+}
+
 export interface ProcessResultRecord {
 	readonly replayProfile: "buffered_noninteractive";
 	/** Producer process wall time; observational only and never used to authorize replay. */
@@ -194,8 +201,7 @@ export interface ProcessResultRecord {
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
 	readonly exit: ExitOutcome;
-	readonly descriptorOffsets?: readonly { readonly fd: number; readonly before: number; readonly after: number;
-		readonly afterFlags?: number; readonly content?: ArtifactReference }[];
+	readonly resources?: ProcessResourceEffects;
 }
 
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
@@ -360,7 +366,7 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 			if (state.kind === "file") unique.set(state.data.digest, state.data);
 		}
 	}
-	for (const position of certificate.result.descriptorOffsets ?? []) if (position.content) unique.set(position.content.digest, position.content);
+	for (const object of certificate.result.resources?.objects ?? []) if (object.content) unique.set(object.content.digest, object.content);
 	return [...unique.values()];
 }
 
@@ -368,9 +374,12 @@ export function certificateReplayable(
 	certificate: ProcessProvenanceCertificate,
 	acceptedTaints: readonly ProvenanceTaint[] = [],
 ): boolean {
+	const input = certificate.prototype.inheritedFDs.find(({ fd }) => fd === 0);
 	const stdinReplayable =
 		certificate.prototype.stdin.type === "closed" ||
-		(certificate.prototype.stdin.eof && isSha256Digest(certificate.prototype.stdin.digest));
+		(isSha256Digest(certificate.prototype.stdin.digest) && (certificate.prototype.stdin.eof ||
+			input?.type === "pipe" && input.eof === false && input.contentDigest === certificate.prototype.stdin.digest &&
+			certificate.result.resources?.objects.some(effect => effect.id === input.object && effect.consumed !== undefined) === true));
 	const accepted = new Set(acceptedTaints);
 	return (
 		certificate.dependencyCertificate.complete &&
@@ -477,15 +486,18 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		if (descriptor.resourcePath !== undefined && !validLogicalPath(descriptor.resourcePath)) throw new Error("invalid inherited descriptor path");
 		if (descriptor.alias === undefined) continue;
 		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
+		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
 		if (!["regular", "null", "directory", "pipe"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
 			descriptor.type === "pipe" && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
 			(descriptor.type === "null" || descriptor.type === "directory") && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
 			descriptor.type === "directory" && (!descriptor.resourcePath || descriptor.resourcePath !== alias?.resourcePath) ||
 			!alias || alias.fd > descriptor.fd || alias.alias !== alias.fd || alias.type !== descriptor.type ||
-			alias.offset !== descriptor.offset || alias.contentDigest !== descriptor.contentDigest) throw new Error("invalid inherited OFD alias");
+			alias.offset !== descriptor.offset || alias.object !== descriptor.object || alias.contentDigest !== descriptor.contentDigest ||
+			!object || object.fd > descriptor.fd || object.object !== object.fd || object.type !== descriptor.type ||
+			object.contentDigest !== descriptor.contentDigest || object.resourcePath !== descriptor.resourcePath || object.eof !== descriptor.eof) throw new Error("invalid inherited OFD alias or object");
 	}
 	if (
-		!rawStdin ||
+		!rawStdin || typeof stdin.eof !== "boolean" ||
 		(stdin.type === "bytes" && !isSha256Digest(stdin.digest)) ||
 		(stdin.digest !== undefined && !isSha256Digest(stdin.digest))
 	) {
@@ -638,24 +650,28 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	const journal = [...result.journal]
 		.map((event) => ({ ...event }))
 		.sort((left, right) => left.sequence - right.sequence);
-	let descriptorOffsets: ProcessResultRecord["descriptorOffsets"];
-	if (result.descriptorOffsets !== undefined) {
-		const descriptors = prototype.inheritedFDs.filter(({ alias }) => alias !== undefined);
-		descriptorOffsets = [...result.descriptorOffsets].map(({ fd, before, after, afterFlags, content }) => ({ fd, before, after,
-			...(afterFlags !== undefined ? { afterFlags } : {}),
-			...(content ? { content: { ...content } } : {}) })).sort((a, b) => a.fd - b.fd);
-		if (descriptorOffsets.length !== descriptors.length || descriptorOffsets.some((position, index) => {
-			const descriptor = descriptors[index]!;
-			const alias = descriptorOffsets!.find(({ fd }) => fd === descriptor.alias);
-			return position.fd !== descriptor.fd || position.before !== descriptor.offset ||
-				!Number.isSafeInteger(position.after) || position.after < 0 || !alias || alias.after !== position.after || alias.afterFlags !== position.afterFlags ||
-				position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff) ||
-				descriptor.type !== "regular" && (descriptor.type !== "pipe" && position.after !== 0 || position.content !== undefined);
-		})) throw new Error("invalid inherited OFD result offsets");
-	} else if (prototype.inheritedFDs.some(({ alias }) => alias !== undefined)) throw new Error("missing inherited OFD result offsets");
+	const descriptors = prototype.inheritedFDs.filter(({ alias }) => alias !== undefined);
+	const resources = result.resources ? cloneSharedData(result.resources) : undefined;
 	const artifactSizes = new Map<Sha256Digest, number>();
-	for (const position of descriptorOffsets ?? []) {
-		if (position.content) validateArtifact(position.content, artifactSizes);
+	if (!resources && descriptors.length) throw new Error("missing inherited OFD resource effects");
+	if (resources) {
+		const descriptions = descriptors.filter(fd => fd.alias === fd.fd), objects = descriptors.filter(fd => fd.object === fd.fd);
+		if (resources.descriptions.length !== descriptions.length || resources.objects.length !== objects.length)
+			throw new Error("incomplete inherited OFD resource effects");
+		resources.descriptions.forEach((effect, index) => {
+			const descriptor = descriptions[index]!;
+			if (effect.id !== descriptor.fd || (descriptor.type === "regular"
+				? !effect.position || effect.position.before !== descriptor.offset || !Number.isSafeInteger(effect.position.after) || effect.position.after < 0
+				: effect.position !== undefined) || effect.flags !== undefined && (!Number.isSafeInteger(effect.flags) || effect.flags < 0 || effect.flags > 0x7fffffff))
+				throw new Error("invalid inherited OFD state transition");
+		});
+		resources.objects.forEach((effect, index) => {
+			const descriptor = objects[index]!;
+			if (effect.id !== descriptor.fd || (descriptor.type === "pipe"
+				? !Number.isSafeInteger(effect.consumed) || effect.consumed! < 0 : effect.consumed !== undefined) ||
+				effect.content !== undefined && descriptor.type !== "regular") throw new Error("invalid inherited OFD object transition");
+			if (effect.content) validateArtifact(effect.content, artifactSizes);
+		});
 	}
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
@@ -679,7 +695,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		...(result.observedProcessMs !== undefined ? { observedProcessMs: result.observedProcessMs } : {}),
 		journal,
 		exit: { ...result.exit },
-		...(descriptorOffsets ? { descriptorOffsets } : {}),
+		...(resources ? { resources } : {}),
 	});
 }
 

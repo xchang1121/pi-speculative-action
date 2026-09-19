@@ -7,6 +7,7 @@ import { TimelineInterval } from "./task-timing.ts";
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
+	private transfer?: { readonly apply: WeakRef<() => Promise<unknown>>; readonly result: Promise<unknown> };
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope) => boolean>;
 
@@ -33,16 +34,21 @@ export class ProcessHandoffOwnership {
 	}
 
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
-		if (this.state === "partial") throw effectCommitFailure(new Error("process execution was partially consumed"), "recoverable");
+		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
+		if (this.state !== "available") throw effectCommitFailure(new Error(this.state === "partial" ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
 		this.state = "whole";
-		try { return await apply(); } catch (error) {
-			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") this.state = "available";
+		const result = Promise.resolve().then(apply).catch(error => {
+			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { this.state = "available"; this.transfer = undefined; }
 			throw error;
-		}
+		});
+		this.transfer = { apply: new WeakRef(apply), result };
+		return result;
 	}
 }
 
 export interface ProcessHandoff {
+	/** The registry owns production; disposal revokes work as well as its lookup capability. */
+	readonly signal: AbortSignal;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly binding?: ProcessExecutionBinding;
 	readonly computation?: TimelineInterval;
@@ -67,6 +73,7 @@ type HandoffState =
 	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
+	readonly controller: AbortController;
 	readonly key: Sha256Digest;
 	state: HandoffState;
 	binding?: ProcessExecutionBinding;
@@ -270,6 +277,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	dispose(): void {
 		this.disposed = true;
 		for (const record of this.records()) {
+			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
 			this.revokeBinding(record);
 			this.complete(record.key, record);
 		}
@@ -281,7 +289,9 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
+		const controller = new AbortController();
 		const record: HandoffRecord = {
+			controller, signal: controller.signal,
 			key,
 			completion,
 			executablePath,

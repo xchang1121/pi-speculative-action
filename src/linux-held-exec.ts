@@ -10,11 +10,11 @@ import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { ProcessExecutor } from "./process-execution.ts";
 import { captureHeldFile } from "./filesystem-evidence.ts";
-import { sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
+import { sha256Digest, type Sha256Digest, type ProcessResourceEffects, type ArtifactReference } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 17;
+const HELPER_PROTOCOL_VERSION = 18;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -47,6 +47,7 @@ export interface HeldFileDescriptor {
 	readonly type?: "null" | "directory" | "pipe";
 	/** Native non-consuming pipe snapshot; `owned` separately authorizes adoption. */
 	readonly pipeHex?: string;
+	readonly eof?: boolean;
 	readonly fd: number;
 	readonly alias: number;
 	readonly device: string;
@@ -56,12 +57,63 @@ export interface HeldFileDescriptor {
 	readonly owned: boolean;
 }
 
-export interface FileDescriptorInput extends Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> {
+/** IDs are canonical FD representatives, not reusable kernel identities or PIDs. */
+export interface ProcessResourceGraph {
+	readonly handles: readonly { readonly fd: number; readonly description: number }[];
+	readonly descriptions: Readonly<Record<number, {
+		readonly object: number; readonly flags: number; readonly position?: number;
+	}>>;
+	readonly objects: Readonly<Record<number, {
+		readonly type: "regular" | "null" | "directory" | "pipe";
+		readonly contentDigest: Sha256Digest; readonly sourcePath?: string; readonly content?: string;
+		/** A queue belongs to the kernel object, independently of its read OFDs. */
+		readonly queue?: { readonly eof: boolean; readonly bytes: number; readonly producer: "closed" | "live" };
+	}>>;
+}
+
+/** Flatten only at existing native/context protocol boundaries; bindings retain the graph. */
+interface FileDescriptorInput extends Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> {
 	readonly contentDigest: Sha256Digest;
 	/** One image per inode; distinct OFDs open it independently. */
 	readonly image: number;
 	readonly sourcePath?: string;
 	readonly content?: string;
+}
+
+export function descriptorInputs(graph?: ProcessResourceGraph): readonly FileDescriptorInput[] {
+	return graph?.handles.map(({ fd, description }) => {
+		const ofd = graph.descriptions[description]!, object = graph.objects[ofd.object]!;
+		return { fd, alias: description, flags: ofd.flags, offset: ofd.position ?? 0, image: ofd.object,
+			...(object.type === "regular" ? {} : { type: object.type }), contentDigest: object.contentDigest,
+			...(object.sourcePath ? { sourcePath: object.sourcePath } : {}),
+			...(fd === ofd.object && object.content !== undefined ? { content: object.content } : {}) };
+	}) ?? [];
+}
+
+/** Reduce the native per-handle report to one transition per OFD and kernel object. */
+export function descriptorEffects(graph: ProcessResourceGraph, report: readonly {
+	readonly fd: number; readonly before: number; readonly after: number; readonly afterFlags?: number; readonly content?: ArtifactReference;
+}[]): ProcessResourceEffects {
+	if (report.length !== graph.handles.length) throw new Error("incomplete resource transition");
+	const descriptions = new Map<number, ProcessResourceEffects["descriptions"][number]>();
+	const objects = new Map<number, ProcessResourceEffects["objects"][number]>();
+	for (const [index, handle] of graph.handles.entries()) {
+		const position = report[index]!, ofd = graph.descriptions[handle.description]!, object = graph.objects[ofd.object]!;
+		if (position.fd !== handle.fd || position.before !== (ofd.position ?? 0) || !Number.isSafeInteger(position.after) || position.after < 0 ||
+			position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff ||
+				((position.afterFlags ^ ofd.flags) & ~0xc00))) throw new Error("invalid resource transition");
+		const previous = descriptions.get(handle.description), shared = objects.get(ofd.object);
+		if (previous && (previous.position?.after !== (ofd.position === undefined ? undefined : position.after) || previous.flags !== position.afterFlags) ||
+			object.queue && (position.after > object.queue.bytes || shared && shared.consumed !== position.after) ||
+			!object.queue && ofd.position === undefined && position.after !== 0 ||
+			position.content && (object.type !== "regular" || handle.fd !== ofd.object)) throw new Error("inconsistent shared resource transition");
+		if (!previous) descriptions.set(handle.description, { id: handle.description,
+			...(ofd.position !== undefined ? { position: { before: ofd.position, after: position.after } } : {}),
+			...(position.afterFlags !== undefined ? { flags: position.afterFlags } : {}) });
+		if (!shared) objects.set(ofd.object, { id: ofd.object, ...(object.queue ? { consumed: position.after } : {}),
+			...(position.content ? { content: position.content } : {}) });
+	}
+	return { descriptions: [...descriptions.values()], objects: [...objects.values()] };
 }
 
 export interface HeldExecSnapshot {
@@ -72,7 +124,7 @@ export interface HeldExecSnapshot {
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
 	readonly context: Pick<ProcessExecutionContext, "key" | "umask" | "descriptorTypes" | "regularDescriptors">;
-	readonly descriptorInputs?: readonly FileDescriptorInput[];
+	readonly resources?: ProcessResourceGraph;
 }
 
 export type HeldExecDecision =
@@ -87,6 +139,7 @@ export type HeldExecDecision =
 				readonly flags: number; readonly before: number; readonly after: number; readonly afterFlags?: number; readonly path?: string;
 				/** File replacement bytes, or the expected full pipe queue before consuming `after` bytes. */
 				readonly content?: Buffer;
+				readonly eof?: boolean;
 			}[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
@@ -263,7 +316,7 @@ export class LinuxHeldExecBoundary {
 			prepared = true;
 			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
 			for (const position of positions) {
-				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")}\n`));
+				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)}\n`));
 				if (position.path) await write(socket, Buffer.from(position.path));
 				if (position.content) await write(socket, position.content);
 			}
@@ -348,19 +401,22 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 }
 
 /** Capture one image per inode; directory anchors and null devices need no payload. Only a native lease authorizes adoption. */
-export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = []): Promise<readonly FileDescriptorInput[]> {
-	const inputs = new Map<number, FileDescriptorInput>();
-	const images = new Map<string, FileDescriptorInput>();
+export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = []): Promise<ProcessResourceGraph> {
+	const handles: Array<ProcessResourceGraph["handles"][number]> = [];
+	const descriptions: Record<number, ProcessResourceGraph["descriptions"][number]> = {};
+	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {};
+	const images = new Map<string, number>();
 	let remaining = maxBytes;
 	for (const descriptor of descriptors) {
 		const { fd, alias: representative, flags, offset } = descriptor;
-		const identity = { fd, alias: representative, flags, offset, ...(descriptor.type ? { type: descriptor.type } : {}) };
 		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
 		const file = `${descriptor.device}:${descriptor.inode}`, image = images.get(file);
-		if (image && descriptor.type === "directory" && fd === representative && await readlink(`/proc/${pid}/fd/${fd}`) !== image.sourcePath)
+		const object = image ?? fd;
+		handles.push({ fd, description: representative });
+		if (fd === representative) descriptions[representative] = { object, flags, ...(descriptor.type ? {} : { position: offset }) };
+		if (image !== undefined && descriptor.type === "directory" && fd === representative && await readlink(`/proc/${pid}/fd/${fd}`) !== objects[image]!.sourcePath)
 			throw new Error("inherited directory namespace aliases are unproven");
-		if (image) { inputs.set(descriptor.fd, { ...identity, image: image.image, contentDigest: image.contentDigest,
-			...(image.sourcePath ? { sourcePath: image.sourcePath } : {}) }); continue; }
+		if (image !== undefined) continue;
 		const endpoint = await readlink(`/proc/${pid}/fd/${fd}`);
 		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
 			throw new Error("inherited descriptor refers to a denied resource");
@@ -369,16 +425,16 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 				if (!/^pipe:\[\d+\]$/.test(endpoint) || descriptor.pipeHex === undefined) throw new Error("unproven inherited pipe");
 				const bytes = Buffer.from(descriptor.pipeHex, "hex"); remaining -= bytes.length;
 				if (remaining < 0) throw new Error("inherited pipe exceeds input budget");
-				const input = { ...identity, image: fd, contentDigest: sha256Digest(bytes), content: bytes.toString("base64") };
-				inputs.set(fd, input); images.set(file, input); continue;
+				objects[fd] = { type: "pipe", contentDigest: sha256Digest(bytes), content: bytes.toString("base64"),
+					queue: { eof: descriptor.eof!, bytes: bytes.length, producer: descriptor.eof ? "closed" : "live" } };
+				images.set(file, fd); continue;
 			}
 			if (descriptor.type === "directory") {
 				const metadata = await stat(endpoint, { bigint: true });
 				if (!metadata.isDirectory() || String(metadata.dev) !== descriptor.device || String(metadata.ino) !== descriptor.inode) throw new Error("held directory pathname changed");
 			}
-			const input = { ...identity, image: fd, contentDigest: sha256Digest(""), ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) };
-			inputs.set(fd, input);
-			if (descriptor.type === "directory") images.set(file, input);
+			objects[fd] = { type: descriptor.type, contentDigest: sha256Digest(""), ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) };
+			images.set(file, fd);
 			continue;
 		}
 		const captured = await captureHeldFile(pid, descriptor.fd, remaining);
@@ -392,11 +448,11 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 			if (metadata.dev !== captured.stat.dev || metadata.ino !== captured.stat.ino) throw new Error("held descriptor pathname changed");
 		}
 		remaining -= captured.content.byteLength;
-		const capturedInput: FileDescriptorInput = { ...identity, image: fd, ...(sourcePath ? { sourcePath } : {}),
+		objects[fd] = { type: "regular", ...(sourcePath ? { sourcePath } : {}),
 			contentDigest: `sha256:${captured.hash}`, content: captured.content.toString("base64") };
-		inputs.set(descriptor.fd, capturedInput); images.set(file, capturedInput);
+		images.set(file, fd);
 	}
-	return [...inputs.values()];
+	return { handles, descriptions, objects };
 }
 
 function decodeNullFields(bytes: Buffer): string[] {
@@ -426,7 +482,7 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
 		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
-			(descriptor.type === "pipe" ? typeof descriptor.pipeHex !== "string" || descriptor.pipeHex.length > 4 * 1024 * 1024 || descriptor.pipeHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.pipeHex) : descriptor.pipeHex !== undefined) ||
+			(descriptor.type === "pipe" ? typeof descriptor.eof !== "boolean" || typeof descriptor.pipeHex !== "string" || descriptor.pipeHex.length > 4 * 1024 * 1024 || descriptor.pipeHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.pipeHex) : descriptor.pipeHex !== undefined || descriptor.eof !== undefined) ||
 			![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>

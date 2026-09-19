@@ -4,11 +4,13 @@ import { processPrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
+import { descriptorEffects, type ProcessResourceGraph } from "../src/linux-held-exec.ts";
 import {
 	createExecPrototype,
 	dependencyPathsetKey,
 	type DynamicDependency,
 	type OrderedEffectEvent,
+	type ProcessResourceEffects,
 	parseProcessCertificate,
 	processStrongKey,
 	processWeakKey,
@@ -30,6 +32,16 @@ const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
+	it("shares queue consumption across independent OFDs while retaining independent flags", () => {
+		const graph: ProcessResourceGraph = { handles: [0, 3, 8].map(fd => ({ fd, description: fd === 3 ? 0 : fd })),
+			descriptions: { 0: { object: 0, flags: 0 }, 8: { object: 0, flags: 32768 } },
+			objects: { 0: { type: "pipe", contentDigest: sha256Digest("abc"), queue: { eof: false, bytes: 3, producer: "live" } } } };
+		const report = [0, 3, 8].map(fd => ({ fd, before: 0, after: 2, ...(fd !== 8 ? { afterFlags: 2048 } : {}) }));
+		expect(descriptorEffects(graph, report)).toEqual({ descriptions: [{ id: 0, flags: 2048 }, { id: 8 }], objects: [{ id: 0, consumed: 2 }] });
+		for (const malformed of [report.slice(1), report.map(row => row.fd === 8 ? { ...row, after: 1 } : row),
+			report.map(row => ({ ...row, after: 4 })), report.map(row => row.fd === 3 ? { ...row, afterFlags: 0 } : row)])
+			expect(() => descriptorEffects(graph, malformed)).toThrow(/transition/);
+	});
 	it("owns validation inputs and detects filesystem changes", async () => {
 		const root = await workspace();
 		await mkdir(path.join(root, "lib"));
@@ -143,8 +155,8 @@ describe("process provenance certificates", () => {
 	});
 
 	it.each([
-		["a", "b", "sha256:f89e6e11beed7ddb8bc4c8a7a0bb8e5fe192215f54c0e85a6d2073a9245d8e1b"],
-		["e\u0301", "\u00e9", "sha256:d0cb9f31cc7f472b0fc83c7e892a03a0685dae8cb85bfd8d35ec5f72d5f83f1e"],
+		["a", "b", "sha256:ea942b8ec325d893c35d0be60788aaed2c0ec727df7fc13c8aa27946a47edf10"],
+		["e\u0301", "\u00e9", "sha256:000380c70c853dcdf5277c965be11bc0b91c3556433fb3b706a9ce3c9ce4baa1"],
 	] as const)("owns an exact dependency set independently of capture order (%s, %s)", (left, right, id) => {
 		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };
@@ -304,28 +316,32 @@ describe("process provenance certificates", () => {
 			after: { ...state, mode: 0o400 }, operation: "write_contents" }])).toThrow("in-place");
 	});
 
-	it.each(["regular", "null", "directory"] as const)("seals complete OFD transitions and their artifact closure (%s)", type => {
-		const before = type === "regular" ? 1 : 0;
-		const input = processPrototype({ inheritedFDs: [3, 4, 8].map(fd => ({ fd, type, alias: fd === 4 ? 3 : fd,
-			offset: before, ...(type === "directory" ? { resourcePath: "/workspace/anchor" } : {}), contentDigest: sha256Digest(type === "regular" ? "before" : ""), flagsDigest: sha256Digest(`flags:${fd}`) })) });
+	it.each(["regular", "null", "directory", "pipe"] as const)("seals OFD state separately from shared object effects (%s)", type => {
+		const input = processPrototype({ inheritedFDs: [3, 4, 8].map(fd => ({ fd, type, alias: fd === 4 ? 3 : fd, object: 3,
+			offset: type === "regular" ? 1 : 0, ...(type === "directory" ? { resourcePath: "/workspace/anchor" } : {}),
+			contentDigest: sha256Digest(type === "regular" || type === "pipe" ? "before" : ""), flagsDigest: sha256Digest("flags") })) });
 		const content = { digest: sha256Digest("after"), size: 5 };
-		const positions = [3, 4, 8].map(fd => ({ fd, before, afterFlags: fd === 8 ? 32768 : 35840, after: type !== "regular" ? 0 : fd === 8 ? 2 : 4, ...(fd === 3 && type === "regular" ? { content } : {}) }));
-		const seal = (descriptorOffsets: typeof positions | undefined) => processCertificate(input, { result: {
-			replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 }, descriptorOffsets,
+		const effects: ProcessResourceEffects = {
+			descriptions: [3, 8].map(id => ({ id, flags: 32768, ...(type === "regular" ? { position: { before: 1, after: id === 3 ? 4 : 2 } } : {}) })),
+			objects: [{ id: 3, ...(type === "pipe" ? { consumed: 3 } : type === "regular" ? { content } : {}) }],
+		};
+		const seal = (resources?: ProcessResourceEffects) => processCertificate(input, { result: {
+			replayProfile: "buffered_noninteractive", journal: [], exit: { kind: "code", code: 0 }, resources,
 		} });
-		const certificate = seal(positions);
+		const certificate = seal(effects);
 		expect(parseProcessCertificate(certificate)).toEqual(certificate);
-		expect(referencedArtifacts(certificate)).toEqual(type !== "regular" ? [] : [content]);
-		for (const malformed of [undefined, positions.slice(1), [...positions, positions[0]!],
-			positions.map(position => ({ ...position, before: before + 1 })), positions.map(position => ({ ...position, after: -1 })),
-			positions.map(position => position.fd === 4 ? { ...position, after: 5 } : position),
-			positions.map(position => position.fd === 4 ? { ...position, afterFlags: 32768 } : position),
-			...[NaN, -1, 0x80000000, 1.5].map(afterFlags => positions.map(position => ({ ...position, afterFlags })))]) expect(() => seal(malformed)).toThrow(/OFD/);
-		if (type !== "regular") expect(() => seal(positions.map(position => ({ ...position, content })))).toThrow(/OFD/);
-		if (type === "directory") expect(() => processWeakKey({ ...input, inheritedFDs: input.inheritedFDs.map(fd => ({ ...fd, resourcePath: undefined })) })).toThrow(/alias/);
-		positions[0]!.after = 99;
-		expect(certificate.result.descriptorOffsets![0]!.after).toBe(type !== "regular" ? 0 : 4);
+		expect(referencedArtifacts(certificate)).toEqual(type === "regular" ? [content] : []);
+		for (const malformed of [undefined, { ...effects, descriptions: effects.descriptions.slice(1) },
+			{ ...effects, objects: [...effects.objects, effects.objects[0]!] },
+			...[NaN, -1, 0x80000000, 1.5].map(flags => ({ ...effects, descriptions: effects.descriptions.map(effect => ({ ...effect, flags })) }))])
+			expect(() => seal(malformed)).toThrow(/OFD/);
+		if (type !== "regular") expect(() => seal({ ...effects, objects: [{ id: 3, content }] })).toThrow(/OFD/);
+		expect(() => processWeakKey({ ...input, inheritedFDs: input.inheritedFDs.map(fd => ({ ...fd, object: 9 })) })).toThrow(/object/);
 		expect(() => processWeakKey({ ...input, inheritedFDs: input.inheritedFDs.map(fd => ({ ...fd, alias: 9 })) })).toThrow(/alias/);
+		if (type === "regular") {
+			expect(() => seal({ ...effects, descriptions: effects.descriptions.map(effect => ({ ...effect, position: { before: 2, after: 4 } })) })).toThrow(/OFD/);
+			expect(processWeakKey({ ...input, inheritedFDs: input.inheritedFDs.map(fd => fd.fd === 8 ? { ...fd, object: 8 } : fd) })).not.toBe(processWeakKey(input));
+		}
 	});
 });
 
