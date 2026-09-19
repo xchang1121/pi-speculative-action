@@ -23,8 +23,9 @@ export function straceCommand(
 	strace: string,
 	tracePrefix: string,
 	command: readonly string[],
+	streams = false,
 ): readonly string[] {
-	return [strace, "--kill-on-exit", "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", SYSCALL_FILTER, "-o", tracePrefix, ...command];
+	return [strace, "--kill-on-exit", streams ? "-f" : "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", SYSCALL_FILTER + (streams ? ",read,write,readv,writev,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_ctl,epoll_wait" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
 }
 
 export type ObservedProcessPath =
@@ -42,6 +43,7 @@ export interface StraceObservation {
 	readonly taints: readonly ProvenanceTaint[];
 	readonly tracedProcesses: number;
 	readonly incompleteReasons: readonly string[];
+	readonly streamJournal?: readonly { readonly inode: string; readonly kind: "consume" | "peek" | "produce" | "shutdown"; readonly data: Buffer }[];
 }
 
 export interface StraceObservationOptions {
@@ -56,6 +58,7 @@ export interface StraceObservationOptions {
 	readonly guardFilesystemSemanticsWithin?: readonly string[];
 	/** Private input images whose inherited OFD flags are reproduced and sealed by the caller. */
 	readonly inheritedFileImages?: readonly string[];
+	readonly inheritedStreams?: readonly string[];
 }
 
 interface TraceFile {
@@ -70,6 +73,7 @@ interface TraceProcess extends TraceRoot {
 	readonly fs: { shared: boolean; changed: boolean };
 }
 interface TraceLine {
+	readonly order?: number;
 	readonly name: string;
 	readonly args: readonly string[];
 	readonly result: string;
@@ -122,26 +126,27 @@ function parseTraceLine(line: string): TraceLine {
 	return failure;
 }
 
-function reassembleSyscalls(lines: readonly string[], pid: number): readonly TraceLine[] {
-	const pending = new Map<string, string[]>();
+function reassembleSyscalls(lines: readonly string[], pid: number, order?: readonly number[]): readonly TraceLine[] {
+	const pending = new Map<string, Array<{ text: string; order?: number }>>();
 	const complete: TraceLine[] = [];
-	for (const line of lines) {
+	for (const [index, line] of lines.entries()) {
+		const append = (text: string, sequence = order?.[index]) => complete.push({ ...parseTraceLine(text), ...(sequence !== undefined ? { order: sequence } : {}) });
 		const unfinished = /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(line);
 		if (unfinished) {
 			const name = unfinished[1]!;
-			(pending.get(name) ?? pending.set(name, []).get(name)!).push(line.replace(/\s*<unfinished \.\.\.>\s*$/, ""));
+			(pending.get(name) ?? pending.set(name, []).get(name)!).push({ text: line.replace(/\s*<unfinished \.\.\.>\s*$/, ""), order: order?.[index] });
 			continue;
 		}
 		const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(line);
 		if (!resumed) {
-			complete.push(parseTraceLine(line));
+			append(line);
 			continue;
 		}
 		const name = resumed[1]!;
 		const queue = pending.get(name);
 		const prefix = queue?.shift();
 		if (!prefix) complete.push({ name, args: [], result: "", failure: `resumed_without_unfinished:${pid}:${name}` });
-		else complete.push(parseTraceLine(`${prefix}${resumed[2]}`));
+		else append(`${prefix.text}${resumed[2]}`, /^(?:write|writev|sendto)$/.test(name) ? prefix.order : order?.[index]);
 		if (queue?.length === 0) pending.delete(name);
 	}
 	for (const name of pending.keys()) complete.push({ name, args: [], result: "", failure: `unfinished:${pid}:${name}` });
@@ -213,7 +218,8 @@ export async function observeStrace(
 		if (remaining === 0) break;
 		if (!name.startsWith(prefix)) continue;
 		const pid = Number.parseInt(name.slice(prefix.length), 10);
-		if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+		const ordered = name === `${prefix}stream`;
+		if (!ordered && (!Number.isSafeInteger(pid) || pid <= 0)) continue;
 		const target = path.join(directory, name);
 		let contents: string;
 		if (remaining === undefined) contents = await readFile(target, "utf8");
@@ -228,8 +234,17 @@ export async function observeStrace(
 				contents = buffer.toString("utf8", 0, bytesRead);
 			} finally { await handle.close(); }
 		}
-		files.push({ pid, lines: reassembleSyscalls(contents.split(/\r?\n/), pid),
-			terminated: /(?:^|\n)\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(contents) });
+		const groups = new Map<number, { lines: string[]; order?: number[] }>();
+		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/) });
+		else for (const [order, line] of contents.split(/\r?\n/).entries()) {
+			if (!line.trim()) continue;
+			const match = /^(\d+)\s+(.*)$/.exec(line);
+			if (!match) throw new Error("invalid ordered trace record");
+			const process = Number(match[1]), group = groups.get(process) ?? { lines: [], order: [] };
+			group.lines.push(match[2]!); group.order!.push(order); groups.set(process, group);
+		}
+		for (const [pid, group] of groups) files.push({ pid, lines: reassembleSyscalls(group.lines, pid, group.order),
+			terminated: /^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(group.lines.filter(line => line.trim()).at(-1) ?? "") });
 	}
 	const target = path.posix.resolve(executablePath);
 	const root = selectTraceRoot(files, target);
@@ -279,6 +294,7 @@ export async function observeStrace(
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]);
+	const streamJournal: Array<NonNullable<StraceObservation["streamJournal"]>[number] & { order: number }> = [];
 	const interposedExecutables = new Map(
 		(options.interposedExecutables ?? []).map(([intercepted, original]) => [
 			path.posix.resolve(intercepted), path.posix.resolve(original),
@@ -323,7 +339,26 @@ export async function observeStrace(
 			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") {
 				taints.add("pid_observation");
 			}
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line)) taints.add("network");
+			const endpoint = /^\d+<(?:pipe|UNIX-STREAM):\[(\d+)(?:->\d+)?\]>$/.exec(line.args[0] ?? "")?.[1];
+			const stream = endpoint && options.inheritedStreams?.includes(endpoint);
+			let streamCall = false;
+			if (stream) {
+				const produced = syscall === "write" || syscall === "writev" || syscall === "sendto" && /^(?:0|MSG_NOSIGNAL)$/.test(line.args[3] ?? "") && line.args[4] === "NULL" && line.args[5] === "0";
+				const consumed = syscall === "read" || syscall === "readv" || syscall === "recvfrom" && /^(?:0|MSG_PEEK)$/.test(line.args[3] ?? "") && line.args[4] === "NULL" && /^(?:NULL|0x0)$/.test(line.args[5] ?? "");
+				const bytes = /^"((?:\\.|[^"\\])*)"$/.exec(line.args[1] ?? "");
+				const vector = syscall === "readv" || syscall === "writev" ? queueVectors(line.args[1], Number(line.args[2])) : undefined;
+				const data = bytes ? decodeCBytes(bytes[1]!) : vector?.data, requested = vector?.length ?? Number(line.args[2]);
+				if (line.order !== undefined && (produced || consumed) && data && /^\d+$/.test(line.result)) {
+					const length = Number(line.result);
+					streamCall = data.length === length && (!produced || requested === length && length <= 4096);
+					if (streamCall && requested) streamJournal.push({ order: line.order, inode: endpoint, kind: produced ? "produce" : line.args[3] === "MSG_PEEK" ? "peek" : "consume", data });
+				} else if (line.order !== undefined && syscall === "shutdown" && line.result === "0" && /^(SHUT_RD|SHUT_WR|SHUT_RDWR)$/.test(line.args[1] ?? "")) {
+					streamJournal.push({ order: line.order, inode: endpoint, kind: "shutdown", data: Buffer.from([line.args[1] === "SHUT_RD" ? 1 : line.args[1] === "SHUT_WR" ? 2 : 3]) }); streamCall = true;
+				}
+				if (/^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) taints.add("unsupported_syscall");
+			}
+			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_ctl|epoll_wait)$/.test(syscall)) taints.add("unsupported_syscall");
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets.
 			// Locks, leases, async notifications and owners require additional effect evidence.
@@ -334,7 +369,7 @@ export async function observeStrace(
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					!((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
-						options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "")))
+						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream)))
 					taints.add("unsupported_syscall");
 			}
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
@@ -390,6 +425,7 @@ export async function observeStrace(
 	if (!complete) taints.add("trace_incomplete");
 	return {
 		complete,
+		...(options.inheritedStreams ? { streamJournal: streamJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event) } : {}),
 		paths: Object.freeze(
 			[
 				...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role) })),
@@ -720,6 +756,18 @@ function quotedArgument(argument: string | undefined): string | undefined {
 }
 
 function decodeCString(value: string): string {
+	// Paths must round-trip through Node's UTF-8 APIs; queue payloads remain bytes.
+	return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(decodeCBytes(value));
+}
+
+function queueVectors(value: string | undefined, count: number): { data: Buffer; length: number } | undefined {
+	if (!value || !/^\[(?:\{iov_base="(?:\\.|[^"\\])*", iov_len=\d+\}(?:, )?)*\]$/.test(value)) return;
+	const vectors = [...value.matchAll(/\{iov_base="((?:\\.|[^"\\])*)", iov_len=(\d+)\}/g)];
+	if (vectors.length !== count) return;
+	return { data: Buffer.concat(vectors.map(vector => decodeCBytes(vector[1]!))), length: vectors.reduce((sum, vector) => sum + Number(vector[2]), 0) };
+}
+
+function decodeCBytes(value: string): Buffer {
 	const chunks: Buffer[] = [];
 	let start = 0;
 	for (const match of value.matchAll(/\\(?:x([0-9a-fA-F]{2})|([0-7]{1,3})|(.))/g)) {
@@ -730,8 +778,7 @@ function decodeCString(value: string): string {
 		start = match.index + match[0].length;
 	}
 	chunks.push(Buffer.from(value.slice(start), "utf8"));
-	// strace escapes bytes, not Unicode code points. Refuse identities Node cannot represent losslessly.
-	return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
+	return Buffer.concat(chunks);
 }
 
 function sharedObjectRole(observedPath: string, role: DependencyRole): DependencyRole {

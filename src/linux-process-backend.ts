@@ -1103,6 +1103,8 @@ export class LinuxProcessReuseBackend {
 				kind: "replay",
 				exitCode: plan.certificate.result.exit.code,
 				output,
+				...(plan.certificate.result.resources?.streams ? { resourceEvents: plan.certificate.result.resources.streams.map(event =>
+					({ fd: event.id, kind: event.kind, data: plan.artifacts.read(event.data) })) } : {}),
 				...(resources ? { descriptorOffsets: descriptorInputs(resources).map(input => {
 					const descriptor = process.descriptors!.find(({ fd }) => fd === input.fd)!;
 					const effects = plan.certificate.result.resources!;
@@ -1111,7 +1113,8 @@ export class LinuxProcessReuseBackend {
 					return { fd: input.fd, before: input.offset, after: object.consumed ?? ofd.position?.after ?? 0,
 						device: descriptor.device, inode: descriptor.inode, flags: descriptor.flags, afterFlags: ofd.flags,
 						...(input.type === "directory" ? { path: input.sourcePath! } : {}),
-						...(input.type === "pipe" ? { content: Buffer.from(resources.objects[input.image]!.content!, "base64"), eof: resources.objects[input.image]!.queue!.eof }
+						...(input.type === "pipe" || input.type === "socket" ? { content: Buffer.from(resources.objects[input.image]!.content!, "base64"), eof: resources.objects[input.image]!.queue!.eof,
+							capacity: descriptor.capacity, socket: descriptor.socket }
 							: input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
 				}) } : {}),
 				commit: async () => {
@@ -1204,12 +1207,13 @@ export class LinuxProcessReuseBackend {
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
 			const inputs = descriptorInputs(request.resources);
+			const streamJournal = inputs.some(input => input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
 			const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
 			if (inputs.length) {
 				descriptorManifest = path.join(traceRoot, "fd-inputs");
 				descriptorReportPath = path.join(traceRoot, "fd-offsets");
 				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
-				let manifest = `FD1 ${inputs.length} ${Number(!!request.closeStdin)}\n`;
+				let manifest = `FD2 ${inputs.length} ${Number(!!request.closeStdin)} ${Number(streamJournal)}\n`;
 				for (const descriptor of inputs) {
 					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
@@ -1234,7 +1238,9 @@ export class LinuxProcessReuseBackend {
 					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
 					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
 						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
-					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${descriptor.type === "pipe" ? request.resources!.objects[descriptor.image]!.queue!.eof ? 1 : 2 : 0}\n${image}\n`;
+					const object = request.resources!.objects[descriptor.image]!;
+					const stream = object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
+					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1}\n${image}\n`;
 				}
 				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
 			}
@@ -1282,7 +1288,7 @@ export class LinuxProcessReuseBackend {
 				request.argv0,
 				logicalExecutable,
 				...request.args,
-			]);
+			], streamJournal);
 			const processStarted = performance.now();
 			outcome = await runSpawn(ready.strace, command.slice(1), {
 				cwd: request.cwd,
@@ -1302,6 +1308,10 @@ export class LinuxProcessReuseBackend {
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
 							.concat(inputs.some(input => input.type === "null") ? ["/dev/null"] : [])
 							.concat((descriptorOffsets ?? []).filter(position => inputs.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
+						inheritedStreams: streamJournal ? descriptorOffsets?.filter(position => {
+							const input = inputs.find(input => input.fd === position.fd)!;
+							return input.type === "socket" || input.type === "pipe";
+						}).map(position => position.inode) : undefined,
 					}),
 				] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
@@ -1353,7 +1363,7 @@ export class LinuxProcessReuseBackend {
 				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
 					const input = inputs.find(({ fd }) => fd === position.fd)!;
-					if (input.type === "null" || input.type === "pipe" || input.fd !== input.image) continue;
+					if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
 					const current = await lstat(image.physical, { bigint: true });
 					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile() || current.nlink !== 1n) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
@@ -1380,7 +1390,14 @@ export class LinuxProcessReuseBackend {
 						} else position.content = await this.store.artifacts.put(captured.content!);
 					} else throw new Error("unmodeled inherited FD metadata effect");
 				}
-				const result = { ...baseResult, ...(descriptorOffsets ? { resources: descriptorEffects(request.resources!, descriptorOffsets) } : {}) };
+				const streams: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["streams"]>[number][] = [];
+				for (const event of observation.streamJournal ?? []) {
+					const input = inputs.find(input => descriptorOffsets!.find(position => position.fd === input.fd)!.inode === event.inode &&
+						(event.kind === "produce" ? (input.flags & 3) !== 0 : event.kind === "shutdown" || (input.flags & 3) !== 1));
+					if (!input) throw new Error("unbound stream transition");
+					streams.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data) });
+				}
+				const result = { ...baseResult, ...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(streamJournal ? { streams } : {}) } } : {}) };
 				stage = "certificate";
 				const certificate = sealProcessCertificate({
 					prototype,
@@ -1557,6 +1574,7 @@ function bufferedProcessPrototype(
 			const input = inputs.find(({ fd }) => fd === descriptor.fd);
 			return input ? { ...descriptor, type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
 				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
+				...(snapshot.resources!.objects[input.image]!.queue ? { endpointDigest: digestObject({ queue: snapshot.resources!.objects[input.image]!.queue, socket: snapshot.resources!.objects[input.image]!.socket }) } : {}),
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}) } : descriptor;
 		}),
 		platformFingerprint,
@@ -1568,7 +1586,7 @@ function parseDescriptorOffsets(report: string, inputs: ReturnType<typeof descri
 	content?: import("./provenance-certificate.ts").ArtifactReference;
 }> {
 	const [header, ...lines] = report.trimEnd().split("\n");
-	if (header !== `FD1 ${inputs.length}` || lines.length !== inputs.length) throw new Error("incomplete inherited OFD result");
+	if (header !== `FD2 ${inputs.length}` || lines.length !== inputs.length) throw new Error("incomplete inherited OFD result");
 	return lines.map((line, index) => {
 		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(line)) throw new Error("invalid inherited OFD result");
 		const fields = line.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number), input = inputs[index]!;

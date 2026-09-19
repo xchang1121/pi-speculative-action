@@ -14,7 +14,7 @@ import { sha256Digest, type Sha256Digest, type ProcessResourceEffects, type Arti
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 
-const HELPER_PROTOCOL_VERSION = 18;
+const HELPER_PROTOCOL_VERSION = 19;
 const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -44,10 +44,12 @@ export interface HeldExecProcess {
 }
 
 export interface HeldFileDescriptor {
-	readonly type?: "null" | "directory" | "pipe";
-	/** Native non-consuming pipe snapshot; `owned` separately authorizes adoption. */
-	readonly pipeHex?: string;
+	readonly type?: "null" | "directory" | "pipe" | "socket";
+	/** Native non-consuming queue snapshot; `owned` separately authorizes adoption. */
+	readonly queueHex?: string;
 	readonly eof?: boolean;
+	readonly capacity?: number;
+	readonly socket?: { readonly shutdown: number; readonly peerShutdown: number; readonly peerInode: number; readonly peerQueued: number; readonly allocated: number };
 	readonly fd: number;
 	readonly alias: number;
 	readonly device: string;
@@ -64,10 +66,12 @@ export interface ProcessResourceGraph {
 		readonly object: number; readonly flags: number; readonly position?: number;
 	}>>;
 	readonly objects: Readonly<Record<number, {
-		readonly type: "regular" | "null" | "directory" | "pipe";
+		readonly type: "regular" | "null" | "directory" | "pipe" | "socket";
 		readonly contentDigest: Sha256Digest; readonly sourcePath?: string; readonly content?: string;
 		/** A queue belongs to the kernel object, independently of its read OFDs. */
-		readonly queue?: { readonly eof: boolean; readonly bytes: number; readonly producer: "closed" | "live" };
+		readonly queue?: { readonly eof: boolean; readonly bytes: number; readonly capacity: number; readonly producer: "closed" | "live" };
+		readonly socket?: { readonly shutdown: number; readonly allocated: number;
+			readonly peer: { readonly connected: boolean; readonly shutdown: number; readonly bytes: number; readonly object?: number } };
 	}>>;
 }
 
@@ -133,6 +137,7 @@ export type HeldExecDecision =
 			readonly kind: "replay";
 			readonly exitCode: number;
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
+			readonly resourceEvents?: readonly { readonly fd: number; readonly kind: "consume" | "peek" | "produce" | "shutdown"; readonly data: Buffer }[];
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
 			readonly descriptorOffsets?: readonly {
 				readonly fd: number; readonly device: string; readonly inode: string;
@@ -140,6 +145,8 @@ export type HeldExecDecision =
 				/** File replacement bytes, or the expected full pipe queue before consuming `after` bytes. */
 				readonly content?: Buffer;
 				readonly eof?: boolean;
+				readonly capacity?: number;
+				readonly socket?: HeldFileDescriptor["socket"];
 			}[];
 			/** Called only after the native tracer has made original execution impossible. */
 			readonly commit: () => Promise<void>;
@@ -301,24 +308,31 @@ export class LinuxHeldExecBoundary {
 				return;
 			}
 			const positions = decision.descriptorOffsets?.map(position => ({ ...position, afterFlags: position.afterFlags ?? position.flags })) ?? [];
-			const total = decision.output.reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0);
+			const resourceEvents = decision.resourceEvents ?? [];
+			const total = [...decision.output, ...resourceEvents].reduce((sum, event) => sum + event.data.length, 0) + positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0);
 			const descriptors = new Set<number>();
 			if (!Number.isSafeInteger(decision.exitCode) || decision.exitCode < 0 || decision.exitCode > 255 ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
 					const duplicate = descriptors.has(position.fd); descriptors.add(position.fd);
 					return duplicate || position.path !== undefined && (typeof position.path !== "string" || !path.isAbsolute(position.path) || position.path.includes("\0") || Buffer.byteLength(position.path) >= 4096) ||
 						position.content !== undefined && !Buffer.isBuffer(position.content) ||
+						![position.capacity ?? 0, ...Object.values(position.socket ?? {})].every(value => Number.isSafeInteger(value) && value >= 0) ||
 						![position.fd, position.flags, position.before, position.after, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
-				})) return void socket.end("C\n");
+				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||
+					!["consume", "peek", "produce", "shutdown"].includes(event.kind) || !Buffer.isBuffer(event.data) || event.data.length > 2 * 1024 * 1024)) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
-			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length}\n`));
+			await write(socket, Buffer.from(`P ${decision.exitCode} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length}\n`));
 			for (const position of positions) {
-				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)}\n`));
+				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)} ${position.capacity ?? 0} ${position.socket?.shutdown ?? 0} ${position.socket?.peerShutdown ?? 0} ${position.socket?.peerInode ?? 0} ${position.socket?.peerQueued ?? 0} ${position.socket?.allocated ?? 0}\n`));
 				if (position.path) await write(socket, Buffer.from(position.path));
 				if (position.content) await write(socket, position.content);
+			}
+			for (const event of resourceEvents) {
+				await write(socket, Buffer.from(`Q ${["consume", "peek", "produce", "shutdown"].indexOf(event.kind)} ${event.fd} ${event.data.length}\n`));
+				await write(socket, event.data);
 			}
 			for (const event of decision.output) {
 				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
@@ -421,12 +435,14 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		if (deniedPaths.some(denied => containsFilesystemPath(denied, endpoint) || containsFilesystemPath(denied, endpoint.replace(/ \(deleted\)$/, ""))))
 			throw new Error("inherited descriptor refers to a denied resource");
 		if (descriptor.type) {
-			if (descriptor.type === "pipe") {
-				if (!/^pipe:\[\d+\]$/.test(endpoint) || descriptor.pipeHex === undefined) throw new Error("unproven inherited pipe");
-				const bytes = Buffer.from(descriptor.pipeHex, "hex"); remaining -= bytes.length;
-				if (remaining < 0) throw new Error("inherited pipe exceeds input budget");
-				objects[fd] = { type: "pipe", contentDigest: sha256Digest(bytes), content: bytes.toString("base64"),
-					queue: { eof: descriptor.eof!, bytes: bytes.length, producer: descriptor.eof ? "closed" : "live" } };
+			if (descriptor.type === "pipe" || descriptor.type === "socket") {
+				if (!/^(pipe|socket):\[\d+\]$/.test(endpoint) || descriptor.queueHex === undefined) throw new Error("unproven inherited stream");
+				const bytes = Buffer.from(descriptor.queueHex, "hex"); remaining -= bytes.length;
+				if (remaining < 0) throw new Error("inherited stream exceeds input budget");
+				objects[fd] = { type: descriptor.type, contentDigest: sha256Digest(bytes), content: bytes.toString("base64"),
+					queue: { eof: descriptor.eof!, bytes: bytes.length, capacity: descriptor.capacity!, producer: descriptor.eof ? "closed" : "live" },
+					...(descriptor.socket ? { socket: { shutdown: descriptor.socket.shutdown, allocated: descriptor.socket.allocated,
+						peer: { connected: !!descriptor.socket.peerInode, shutdown: descriptor.socket.peerShutdown, bytes: descriptor.socket.peerQueued } } } : {}) };
 				images.set(file, fd); continue;
 			}
 			if (descriptor.type === "directory") {
@@ -451,6 +467,12 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		objects[fd] = { type: "regular", ...(sourcePath ? { sourcePath } : {}),
 			contentDigest: `sha256:${captured.hash}`, content: captured.content.toString("base64") };
 		images.set(file, fd);
+	}
+	for (const descriptor of descriptors) {
+		const object = descriptions[descriptor.alias]!.object, socket = objects[object]!.socket;
+		if (!socket) continue;
+		const peer = images.get(`${descriptor.device}:${descriptor.socket!.peerInode}`);
+		if (peer !== undefined) objects[object] = { ...objects[object]!, socket: { ...socket, peer: { ...socket.peer, object: peer } } };
 	}
 	return { handles, descriptions, objects };
 }
@@ -481,8 +503,9 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
-			(descriptor.type === "pipe" ? typeof descriptor.eof !== "boolean" || typeof descriptor.pipeHex !== "string" || descriptor.pipeHex.length > 4 * 1024 * 1024 || descriptor.pipeHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.pipeHex) : descriptor.pipeHex !== undefined || descriptor.eof !== undefined) ||
+		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe", "socket"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.offset !== 0 ||
+			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !Number.isSafeInteger(descriptor.capacity) || descriptor.capacity! < 4096 : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
+			(descriptor.type === "socket" ? !descriptor.socket || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => Number.isInteger(value) && value >= 0 && value <= 3) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => Number.isSafeInteger(value) && value >= 0) : descriptor.socket !== undefined) ||
 			![descriptor.fd, descriptor.alias, descriptor.flags, descriptor.offset].every(value => Number.isSafeInteger(value) && value >= 0) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>

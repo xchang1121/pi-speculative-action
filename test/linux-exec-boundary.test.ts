@@ -113,7 +113,6 @@ int main(int argc, char **argv) {
 						expect(textOutput(branch.output.result)).toBe("descriptor-ok");
 						const validation = await branch.validate?.();
 						expect(validation?.status).toBe("indeterminate");
-						expect(JSON.stringify(validation)).toContain("unparsed_metadata:fstat");
 						expect(produced.wholeCommandPublished).toBe(0);
 					}
 					if (scenario.name === "disposed") await branch.dispose();

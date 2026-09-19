@@ -106,12 +106,13 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
-		const native = mode.startsWith("native");
-		const mixed = mode.endsWith("mixed"), pipe = mode.includes("pipe"), opath = mode.includes("opath") || mixed, launcher = pipe || mode === "native-shared-table" || mode === "native-unshare" || opath;
+		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
+		const native = mode.startsWith("native"), running = mode.endsWith("running");
+		const mixed = mode.endsWith("mixed"), socket = mode.includes("socket"), duplex = mode.endsWith("duplex") || mode.endsWith("concurrent"), concurrent = mode.endsWith("concurrent"), pipe = mode.includes("pipe"), opath = mode.includes("opath") || mixed, launcher = pipe || socket || mode === "native-shared-table" || mode === "native-unshare" || opath;
 		const nullDevice = mixed || mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
 		const directory = mode.includes("directory") || mixed;
 		const descriptors = mode === "native-descriptors" || launcher || nullDevice || directory;
@@ -128,14 +129,18 @@ int main(void) {
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
-	for (volatile unsigned long iteration = 0; iteration < ${mode === "running" ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
+	for (volatile unsigned long iteration = 0; iteration < ${running ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
 	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
+	${socket ? 'char preview; if (recv(3, &preview, 1, MSG_PEEK) != 1 || preview != \'b\') return 106;' : ""}
 	${descriptors ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
-	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != O_RDONLY) return 74; close(alias);' : ""}
+	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != ' + (socket ? 'O_RDWR' : 'O_RDONLY') + ') return 74; close(alias);' : ""}
+	${socket ? (duplex ? 'char peer[5]; if (read(14, peer, 4) != 4 || memcmp(peer, "peer", 4)) return 100; ' + (concurrent ? 'pid_t child = fork(); if (child < 0) return 103; if (!child) { size_t length = 0; while (length < 5) { ssize_t size = read(14, peer + length, 5 - length); if (size <= 0) return 104; length += (size_t)size; } return memcmp(peer, "reply", 5) || write(14, "back", 4) != 4 || shutdown(14, SHUT_WR); } ' : '') : '') + 'if (write(3, "re", 2) != 2 || write(4, "ply", 3) != 3 || shutdown(4, SHUT_WR)) return 94;' + (duplex ? concurrent ? ' int status; if (waitpid(child, &status, 0) != child || status) return 105;' : ' if (read(14, peer, 5) != 5 || memcmp(peer, "reply", 5) || write(14, "back", 4) != 4 || shutdown(14, SHUT_WR)) return 101;' : '') : mode === "native-pipe-producer" ? 'if (write(14, "re", 2) != 2 || write(14, "ply", 3) != 3) return 94;' : ""}
 	${nullDevice ? 'char byte; if (write(6, "discard", 7) != 7 || read(7, &byte, 1) != 0 || lseek(6, 100, SEEK_SET) != 0 || fcntl(6, F_GETFL) != fcntl(7, F_GETFL)) return 75;' : ""}
 	${mode === "native-status" || mixed ? 'if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK) || fcntl(6, F_SETFL, fcntl(6, F_GETFL) | O_APPEND | O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK)) return 77;' : ""}
 	${mode === "native-null-stdin" ? 'if (read(0, &byte, 1) != 0) return 76;' : ""}
@@ -167,13 +172,16 @@ int main(int argc, char **argv) {
 	${opath ? 'int directory = open(".", O_PATH | O_DIRECTORY), file = open("fd.txt", O_PATH);\n\tif (directory < 0 || file < 0 || dup2(directory, 10) < 0 || dup2(directory, 11) < 0 || dup2(file, 12) < 0) return 79;\n\tclose(directory); if (file != 12) close(file);' : ""}
 	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; ' + (mode.includes("pipe-live") ? '' : 'close(fds[1]); ') + 'if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
 	${mixed ? 'int writable = open("anonymous", O_RDWR | O_CREAT | O_EXCL, 0600); if (writable < 0 || unlink("anonymous") || write(writable, "abcdef", 6) != 6 || lseek(writable, 0, SEEK_SET) != 0 || dup2(writable, 16) < 0 || dup2(writable, 17) < 0) return 87; close(writable); int reader = open("/proc/self/fd/16", O_RDONLY); if (reader < 0 || dup2(reader, 18) < 0) return 88; close(reader);' : ""}
+	${socket ? 'int fds[2]; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) || write(fds[1], "bcaXYZ", 6) != 6 || dup2(fds[0], 0) < 0) return 95; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0 || dup2(0, 8) < 0) return 96;' + (mode === "native-socket-half-closed" ? ' if (shutdown(fds[1], SHUT_WR)) return 97;' : '') : ""}
+	${duplex ? 'if (dup2(fds[1], 14) < 0 || write(0, "peer", 4) != 4) return 100;' : ""}
+	${mode === "native-pipe-producer" ? 'int output[2]; if (pipe2(output, O_CLOEXEC) || dup2(output[1], 14) < 0 || dup3(output[0], 15, O_CLOEXEC) < 0) return 95; close(output[0]); close(output[1]);' : ""}
 	puts(argv[1]); fflush(stdout);
 	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8}; char byte = 'x', control[CMSG_SPACE(sizeof(passed))] = {0};
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) return 89;
 	struct iovec vector = {&byte, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
 	struct cmsghdr *header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(passed));
 	memcpy(CMSG_DATA(header), passed, sizeof(passed)); if (sendmsg(sockets[0], &message, 0) != 1) return 90; close(sockets[0]);` : ""}
-	${pipe ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; return 0; }' : ""}
+	${pipe || socket ? 'pid_t child = fork(); if (child < 0) return 84; if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; ' + (socket || mode === "native-pipe-producer" ? 'char reply[6]; ' + (duplex ? 'if (read(0, reply, 4) != 4 || memcmp(reply, "back", 4) || read(0, reply, 1) != 0) return 102; ' : 'if (read(' + (socket ? 'fds[1]' : '15') + ', reply, 5) != 5 || memcmp(reply, "reply", 5)) return 98; ') + (socket ? 'if (read(fds[1], reply, 1) != 0) return 99; ' : '') : '') + 'return 0; }' : ""}
 	${mode === "native-pipe-live-transfer" ? `for (unsigned index = 0; index < 4; index++) close(passed[index]);
 	if (recvmsg(sockets[1], &message, MSG_CMSG_CLOEXEC) != 1) return 91;
 	int received[4], saved[4]; memcpy(received, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(received));
@@ -302,7 +310,7 @@ int main(int argc, char **argv) {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
 			const before = fixture.backend.metrics();
 			const publicationStart = publishing.mock.calls.length;
-			if (mode === "running") publication = holdProcessPublication(fixture.backend);
+			if (running) publication = holdProcessPublication(fixture.backend);
 			if (mode.includes("prepared-")) {
 				const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
 				const borrowing = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(async options => {
@@ -312,11 +320,13 @@ int main(int argc, char **argv) {
 				restorePreparation = () => borrowing.mockRestore();
 			}
 			await start("prepared");
-			if (mode === "running") await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
+			if (running) await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
 			else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
 				.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]);
-			if (launcher) await expect.poll(() => publishing.mock.calls.slice(publicationStart).some(([certificate]) =>
-				certificate.prototype.executablePath === path.join(fixture.workspace, "worker")), { timeout: 5000 }).toBe(true);
+			if (launcher && !running) await expect.poll(() => publishing.mock.calls.slice(publicationStart).some(([certificate]) =>
+				certificate.prototype.executablePath === path.join(fixture.workspace, "worker")), { timeout: 5000 }).toBe(true).catch(error => {
+				throw new Error(JSON.stringify({ metrics: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(), errors: errors.mock.calls.map(call => call[1]) }), { cause: error });
+			});
 			if (mode.includes("prepared-")) {
 				expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed after preparation\n");
 				restorePreparation?.(); restorePreparation = undefined;
@@ -324,7 +334,7 @@ int main(int argc, char **argv) {
 			}
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
-			if (mode === "running") {
+			if (running) {
 				let output = "";
 				await route.executor.execute({ command: changedParent, cwd: fixture.workspace, environment: fixture.environment,
 					scope: { ...scope, turnID: "foreign" }, onData: bytes => { output += bytes.toString(); } });
@@ -335,13 +345,13 @@ int main(int argc, char **argv) {
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
-			if (mode === "running") {
+			if (running) {
 				await expect.poll(() => publication!.evidence()?.decision.allowed).toBe(true);
 			}
 			const stalePreparation = mode.endsWith("prepared-stale");
 			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
-			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence: publication?.evidence(), metrics: fixture.backend.actorMetrics() })).toBe(Number(mode === "running"));
+			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence: publication?.evidence(), metrics: fixture.backend.actorMetrics() })).toBe(Number(running));
 			await host.finishTurn("prepared");
 			const execution = events.filter(event => event.type === "actor_action")
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
@@ -362,7 +372,7 @@ int main(int argc, char **argv) {
 				try { await expect(session.executeBinding(binding!)).rejects.toThrow("unavailable in this scope"); }
 				finally { await session.close(); }
 			});
-		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); await host?.dispose(); await fixture.dispose(); }
+		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test.for(["read", "write", "path-write", "unlinked"] as const)("learns and adopts regular OFDs with shared positions and predecessor inputs (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
@@ -464,9 +474,9 @@ int main(void) {
 				expect(childProcess.spawnSync(binary, args).status).toBe(64);
 			const queueImage = path.join(root, "queue"), queueManifest = path.join(root, "queue-queueManifest"), queueReport = path.join(root, "queue-queueReport");
 			await writeFile(queueImage, "abc");
-			for (const producer of [1, 2]) {
+			for (const producer of [1, 2, 4, 5]) {
 				await writeFile(queueReport, "");
-				await writeFile(queueManifest, `FD1 1 0\n0 0 0 0 ${Buffer.byteLength(queueImage)} ${producer}\n${queueImage}\n`);
+				await writeFile(queueManifest, `FD2 1 0 ${Number(producer >= 4)}\n0 0 ${producer >= 4 ? 2 : 0} 0 ${Buffer.byteLength(queueImage)} ${producer} ${producer >= 4 ? 212992 : 4096} 0 ${producer === 5 ? 3 : 0} -1\n${queueImage}\n`);
 				const child = childProcess.spawn(binary, ["--exec-fds", "12", queueManifest, queueReport, "consumer", "/bin/sh", "-c", "echo $$ >&2; exec /bin/cat"], { detached: true });
 				let output = "", childPID = "", completed = false;
 				child.stdout.on("data", data => { output += data.toString(); });
@@ -474,9 +484,9 @@ int main(void) {
 				const closed = once(child, "close").then(value => { completed = true; return value; });
 				try {
 					await expect.poll(() => output).toBe("abc");
-					if (producer === 1) {
+					if (producer === 1 || producer === 5) {
 						expect(await closed).toEqual([0, null]);
-						expect(await readFile(queueReport, "utf8")).toMatch(/^FD1 1\n0 0 3 /);
+						expect(await readFile(queueReport, "utf8")).toMatch(producer === 1 ? /^FD2 1\n0 0 3 / : /^FD2 1\n0 2 0 /);
 					} else {
 						await new Promise(resolve => setTimeout(resolve, 30));
 						expect(completed, "exhausted active input must block, never fabricate EOF").toBe(false);
@@ -556,14 +566,14 @@ int main(void) {
 			await writeFile(input, "abcdef");
 			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
 			await writeFile(report, "");
-			await writeFile(manifest, `FD1 3 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0\n${input}\n3 0 32768 1 0 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0\n${input}\n`);
+			await writeFile(manifest, `FD2 3 0 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1\n${input}\n3 0 32768 1 0 0 0 0 0 -1\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1\n${input}\n`);
 			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
 				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
 				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
 			expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
 			const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
 			expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
-				.toEqual(["FD1 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
+				.toEqual(["FD2 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
 			const external = path.join(root, "external-fd");
 			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
 			for (const shell of [binary, external]) {
@@ -635,7 +645,11 @@ int main(int argc, char **argv) {
 		if (socketpair(AF_UNIX, strstr(argv[1], "batch") ? SOCK_SEQPACKET : SOCK_STREAM, 0, sockets)) return 93;
 		pid_t child = fork(); if (child < 0) return 94;
 		if ((child != 0) != copying) {
-			close(sockets[1]); int fd = strstr(argv[1], "unowned") ? dup(9) : open(argv[2], O_RDONLY);
+			close(sockets[1]); int fd;
+			if (strstr(argv[1], "pipe")) {
+				int stream[2]; if (pipe(stream) || write(stream[1], "abcdef", 6) != 6) return 110;
+				close(stream[1]); fd = stream[0];
+			} else fd = strstr(argv[1], "unowned") ? dup(9) : open(argv[2], O_RDONLY);
 			if (fd < 0 || dup2(fd, 8) < 0) return 95;
 			if (fd != 8) close(fd);
 			if (copying) {
@@ -729,12 +743,12 @@ int main(int argc, char **argv) {
 }
 `);
 			execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", `${descriptorProbe}.c`, "-o", descriptorProbe]);
-			for (const mode of ["lock", "export", "rights", "rights-batch", "rights-failed", "rights-unowned", "rights-orphan", "pidfd", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
+			for (const mode of ["lock", "export", "rights", "rights-batch", "rights-failed", "rights-unowned", "rights-orphan", "rights-pipe-orphan", "pidfd", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
 				"unshare", "unshare-noop", "range-close", "range-cloexec", "range-invalid"]) {
 				let snapshot: HeldExecProcess["descriptors"], output = "";
 				const split = mode.startsWith("unshare") || mode.startsWith("range-");
 				const imported = mode.startsWith("rights") || mode === "pidfd";
-				const unknown = mode === "rights-unowned" || mode === "rights-orphan";
+				const unknown = mode === "rights-unowned";
 				const shared = mode === "unshare-noop" || mode === "range-invalid", slots: number[][] = [];
 				const ownership: boolean[] = [];
 				const commit = vi.fn(async () => {});
@@ -744,7 +758,7 @@ int main(int argc, char **argv) {
 					slots.push(snapshot!.map(({ fd }) => fd));
 					ownership.push(snapshot!.find(({ fd }) => fd === 3)!.owned);
 					return mode === "export" || split || imported ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
-						({ ...descriptor, before: offset, after: offset + 1 })), exitCode: 0, output: [], commit } : { kind: "continue" };
+						({ ...descriptor, before: offset, after: offset + 1, ...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.queueHex!, "hex") } : {}) })), exitCode: 0, output: [], commit } : { kind: "continue" };
 				} });
 				expect(await executor.execute({ command: `exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
 					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
@@ -795,10 +809,10 @@ int main(int argc, char **argv) {
 }
 `);
 			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", `${pipeProbe}.c`, "-o", pipeProbe]);
-			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure"]) {
-				const accepted = ["partial", "empty", "flags"].includes(mode);
+			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure", "journal", "journal-conflict", "journal-write-readonly", "journal-shutdown-pipe", "journal-commit-failure"]) {
+				const accepted = ["partial", "empty", "flags", "journal"].includes(mode), journal = mode.startsWith("journal"), failedCommit = mode.endsWith("commit-failure");
 				let output = "", descriptors: HeldExecProcess["descriptors"];
-				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("pipe commit failure"); });
+				const commit = vi.fn(async () => { if (failedCommit) throw new Error("pipe commit failure"); });
 				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: mode === "inspect" ? () => "inspect" : true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					descriptors = process.descriptors;
@@ -809,19 +823,21 @@ int main(int argc, char **argv) {
 					const descriptorOffsets = await Promise.all([0, 3, 8].map(async fd => {
 						const state = await filesystem.stat(`/proc/${process.pid}/fd/${fd}`, { bigint: true });
 						const flags = fd === 8 ? 32768 : 0;
-						return { fd, flags, device: String(state.dev), inode: String(state.ino), before: 0,
-							after: mode === "empty" ? 0 : mode === "overrun" ? 7 : mode === "queue-conflict" && fd === 8 ? 2 : 3,
+						return { fd, flags, device: String(state.dev), inode: String(state.ino), before: 0, capacity: descriptors?.find(descriptor => descriptor.fd === fd)?.capacity,
+							after: journal || mode === "empty" ? 0 : mode === "overrun" ? 7 : mode === "queue-conflict" && fd === 8 ? 2 : 3,
 							...(mode === "flags" && fd !== 8 ? { afterFlags: 2048 } : {}), content: Buffer.from(mode === "empty" ? "" : mode === "contents" ? "xxxxxx" : "abcdef") };
 					}));
-					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit };
+					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit,
+						...(journal ? { resourceEvents: [{ fd: 3, kind: "peek" as const, data: Buffer.from("abc") }, { fd: 0, kind: mode === "journal-write-readonly" ? "produce" as const : mode === "journal-shutdown-pipe" ? "shutdown" as const : "consume" as const, data: Buffer.from("ab") },
+							{ fd: 8, kind: "consume" as const, data: Buffer.from(mode === "journal-conflict" ? "x" : "c") }] } : {}) };
 				} });
 				const running = executor.execute({ command: `'${pipeProbe}' ${mode}`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
-				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
+				if (failedCommit) await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else {
 					expect(await running, mode).toEqual({ exitCode: 0 });
 					expect(output, mode).toBe(accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef");
 				}
-				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
+				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || failedCommit));
 				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
 			}
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",

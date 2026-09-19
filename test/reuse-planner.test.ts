@@ -66,7 +66,7 @@ describe("ProcessReusePlanner", () => {
 		expect(await readFile(file, "utf8")).toBe(bytes);
 		await expect(store.get(legacy.id)).rejects.toThrow("certificate integrity check failed");
 		await store.put(certificate);
-		expect(await planner.plan(request)).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: certificate.id, version: 8 } });
+		expect(await planner.plan(request)).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: certificate.id, version: 9 } });
 		await store.stats();
 	});
 

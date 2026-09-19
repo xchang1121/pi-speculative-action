@@ -2,7 +2,7 @@ import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 8 as const;
+export const PROCESS_CERTIFICATE_VERSION = 9 as const;
 export type Sha256Digest = `sha256:${string}`;
 
 export interface FilesystemTypeEvidence {
@@ -192,6 +192,7 @@ export type ExitOutcome =
 export interface ProcessResourceEffects {
 	readonly descriptions: readonly { readonly id: number; readonly position?: { readonly before: number; readonly after: number }; readonly flags?: number }[];
 	readonly objects: readonly { readonly id: number; readonly consumed?: number; readonly content?: ArtifactReference }[];
+	readonly streams?: readonly { readonly id: number; readonly kind: "consume" | "peek" | "produce" | "shutdown"; readonly data: ArtifactReference }[];
 }
 
 export interface ProcessResultRecord {
@@ -367,6 +368,7 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 		}
 	}
 	for (const object of certificate.result.resources?.objects ?? []) if (object.content) unique.set(object.content.digest, object.content);
+	for (const event of certificate.result.resources?.streams ?? []) unique.set(event.data.digest, event.data);
 	return [...unique.values()];
 }
 
@@ -378,7 +380,7 @@ export function certificateReplayable(
 	const stdinReplayable =
 		certificate.prototype.stdin.type === "closed" ||
 		(isSha256Digest(certificate.prototype.stdin.digest) && (certificate.prototype.stdin.eof ||
-			input?.type === "pipe" && input.eof === false && input.contentDigest === certificate.prototype.stdin.digest &&
+			(input?.type === "pipe" || input?.type === "socket") && input.eof === false && input.contentDigest === certificate.prototype.stdin.digest &&
 			certificate.result.resources?.objects.some(effect => effect.id === input.object && effect.consumed !== undefined) === true));
 	const accepted = new Set(acceptedTaints);
 	return (
@@ -487,14 +489,14 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		if (descriptor.alias === undefined) continue;
 		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
 		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
-		if (!["regular", "null", "directory", "pipe"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
-			descriptor.type === "pipe" && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
+		if (!["regular", "null", "directory", "pipe", "socket"].includes(descriptor.type) || !Number.isSafeInteger(descriptor.offset) || descriptor.offset! < 0 ||
+			(descriptor.type === "pipe" || descriptor.type === "socket") && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
 			(descriptor.type === "null" || descriptor.type === "directory") && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
 			descriptor.type === "directory" && (!descriptor.resourcePath || descriptor.resourcePath !== alias?.resourcePath) ||
 			!alias || alias.fd > descriptor.fd || alias.alias !== alias.fd || alias.type !== descriptor.type ||
 			alias.offset !== descriptor.offset || alias.object !== descriptor.object || alias.contentDigest !== descriptor.contentDigest ||
 			!object || object.fd > descriptor.fd || object.object !== object.fd || object.type !== descriptor.type ||
-			object.contentDigest !== descriptor.contentDigest || object.resourcePath !== descriptor.resourcePath || object.eof !== descriptor.eof) throw new Error("invalid inherited OFD alias or object");
+			object.contentDigest !== descriptor.contentDigest || object.endpointDigest !== descriptor.endpointDigest || object.resourcePath !== descriptor.resourcePath || object.eof !== descriptor.eof) throw new Error("invalid inherited OFD alias or object");
 	}
 	if (
 		!rawStdin || typeof stdin.eof !== "boolean" ||
@@ -667,11 +669,19 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		});
 		resources.objects.forEach((effect, index) => {
 			const descriptor = objects[index]!;
-			if (effect.id !== descriptor.fd || (descriptor.type === "pipe"
+			if (effect.id !== descriptor.fd || (descriptor.type === "pipe" || descriptor.type === "socket"
 				? !Number.isSafeInteger(effect.consumed) || effect.consumed! < 0 : effect.consumed !== undefined) ||
 				effect.content !== undefined && descriptor.type !== "regular") throw new Error("invalid inherited OFD object transition");
 			if (effect.content) validateArtifact(effect.content, artifactSizes);
 		});
+		if (resources.streams && (!Array.isArray(resources.streams) || resources.streams.length > 1024)) throw new Error("invalid stream journal");
+		for (const event of resources.streams ?? []) {
+			const descriptor = descriptions.find(descriptor => descriptor.fd === event.id);
+			if (!descriptor || !["pipe", "socket"].includes(descriptor.type) || !["consume", "peek", "produce", "shutdown"].includes(event.kind) ||
+				event.data.size > (event.kind === "produce" ? 4096 : 2 * 1024 * 1024) ||
+				event.kind === "shutdown" && (descriptor.type !== "socket" || event.data.size !== 1)) throw new Error("invalid stream transition");
+			validateArtifact(event.data, artifactSizes);
+		}
 	}
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
