@@ -1616,7 +1616,7 @@ function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "
 function formatOptimisticSpeedup(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs">): string {
 	const savings = timing.estimatedSavingsMs ?? NaN;
 	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
-	return `E2E ${percent} (optimistic)`;
+	return `E2E ${percent}`;
 }
 
 function formatDuration(ms: number): string {
