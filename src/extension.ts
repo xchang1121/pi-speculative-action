@@ -1551,7 +1551,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatOptimisticSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "E2E n/a",
+		metrics.tasks > 0 ? `${formatOptimisticSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1616,7 +1616,7 @@ function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "
 function formatOptimisticSpeedup(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs">): string {
 	const savings = timing.estimatedSavingsMs ?? NaN;
 	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
-	return `E2E ${percent}`;
+	return `End-to-End SpeedUp ${percent}`;
 }
 
 function formatDuration(ms: number): string {
