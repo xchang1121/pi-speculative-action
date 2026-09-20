@@ -1551,9 +1551,9 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
+		metrics.tasks > 0 ? `${formatOptimisticSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "E2E n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
-		metrics.tasks > 0 ? `${formatDuration(metrics.estimatedSavingsMs ?? NaN)} estimated savings (optimistic)` : "timing n/a",
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
 		providers > 0 ? `providers ${ready}/${providers} ready` : "providers probing",
@@ -1610,9 +1610,13 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 }
 
 function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs">): string {
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.estimatedSavingsMs ?? NaN)} estimated savings; ${formatOptimisticSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} observed overlap`;
+}
+
+function formatOptimisticSpeedup(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs">): string {
 	const savings = timing.estimatedSavingsMs ?? NaN;
-	const ratio = timing.endToEndMs > 0 && Number.isFinite(savings) ? `${formatNumber(1 + savings / timing.endToEndMs)}×` : "n/a";
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(savings)} estimated savings, ${ratio} optimistic speedup; ${formatDuration(timing.hiddenLatencyMs)} observed overlap`;
+	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
+	return `E2E ${percent} (optimistic)`;
 }
 
 function formatDuration(ms: number): string {
