@@ -1661,6 +1661,7 @@ export function makeSpeculativeActionRuntime<
 		const { state, actualCall, actualKey, actorAction, ranked, actorArrivedAt, preview, signal } = input;
 		const matchingCandidates = ranked.map(({ candidate }) => candidate);
 		const readyJoins = new Map<string, CandidateJoinDecision>();
+		const rebuilt = new Set<Candidate>();
 		const stopCandidate = (candidate: Candidate): boolean => {
 			const failure = signal?.aborted
 				? cause("control", "actor_aborted")
@@ -1819,7 +1820,6 @@ export function makeSpeculativeActionRuntime<
 				const validation = await validateCandidate(candidate, projection.validate);
 				if (stopCandidate(candidate)) break;
 				if (validation.status !== "valid") {
-					actorAction.rejectCandidate(candidate.id, choice.match, validation.cause);
 					if (validation.status === "stale") {
 						const retained = candidate.resultViews?.get(actualKey.key);
 						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes;
@@ -1827,7 +1827,12 @@ export function makeSpeculativeActionRuntime<
 							candidateStore.indexView(state.sessionID, candidate, actualKey.key, false); }
 						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
 						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause, true);
+						if (validation.reconstruct && !rebuilt.has(candidate) && branch.reconstructionScope === "current_action" && branch.reconstruct &&
+							candidate.route.reuse === "shared_result" && semantics.effect(actualKey) === "observation") {
+							rebuilt.add(candidate); ranked.push({ ...choice, match: { kind: "inputs", distance: choice.match.distance } }); continue;
+						}
 					}
+					actorAction.rejectCandidate(candidate.id, choice.match, validation.cause);
 					continue;
 				}
 				let output = projection.output;

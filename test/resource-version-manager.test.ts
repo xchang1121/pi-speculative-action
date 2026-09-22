@@ -443,6 +443,21 @@ describe("speculative action resource versions", () => {
 		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
 	});
 
+	test.each(["content", "names"] as const)("retains only independently proven metadata after %s revocation", async scope => {
+		const root = await workspace({ value: "A" }), manager = new ResourceVersionManager(root, { watch: false });
+		const token = await manager.capture(undefined, 8192), view = token.view!, target = scope === "names" ? root : path.join(root, "value");
+		const consume = async (inputs: typeof view) => scope === "names" ? inputs.readdir(target) : inputs.readFile(target);
+		try {
+			await view.stat(target, "type"); await consume(view); view.seal(); const bytes = view.bytes;
+			expect(view.invalidate(new Set([`${scope}:${target.replaceAll(path.sep, "/")}`]))).not.toContain(target.replaceAll(path.sep, "/"));
+			expect(view.bytes).toBeLessThan(bytes);
+			expect((await view.evaluate(view => view.stat(target, "type"))).isDirectory()).toBe(scope === "names");
+			await expect(view.evaluate(consume)).rejects.toThrow("resource_access_unproven");
+			view.invalidate(new Set([`type:${target.replaceAll(path.sep, "/")}`]));
+			await expect(view.evaluate(view => view.stat(target, "type"))).rejects.toThrow("resource_access_unproven");
+		} finally { await token.release(); manager.close(); }
+	});
+
 	test.each([false, true])("revokes changed inputs and reclaims preparations after borrowers finish (%s)", async (borrowed) => {
 		const root = await workspace({ a: "A", b: "B" }), a = path.join(root, "a"), b = path.join(root, "b");
 		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;

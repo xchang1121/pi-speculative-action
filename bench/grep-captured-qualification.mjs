@@ -66,8 +66,8 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
   const observeInputs = (view) => ({ ...view,
     readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
     readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
-    ...(view.prepare ? { prepare: (binding, key, build, consume) =>
-      view.prepare(binding, key, (borrowed) => build(observeInputs(borrowed)), consume) } : {}),
+    ...(view.prepare ? { prepare: (binding, key, build, consume, target) =>
+      view.prepare(binding, key, (borrowed) => build(observeInputs(borrowed)), consume, target) } : {}),
   });
   const invocation = { ...bound, filesystem: (view, request) => {
     executions++;
@@ -96,7 +96,7 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
     assert.deepEqual(await actor(), expected);
     assert.equal(executions, 1); assert.equal(reads.size, materialized);
     assert.equal(probe.actorCalls(), 0);
-    if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(probe.actorCalls(), 1); }
+    if (changed) { const next = await changed(); assert.deepEqual(await actor(), next); assert.equal(probe.actorCalls(), 0); }
     return { producerCalls: executions, inputFilesRead: materialized, actorCalls: probe.actorCalls(), reads: [...reads], enumerated: [...enumerated] };
   } finally { await probe.host.dispose(); }
 }
@@ -115,6 +115,7 @@ async function qualifyNamespace() {
     "search/excluded.txt": "needle excluded by git info\n", "search/ignored.txt": "needle excluded by root\n",
     "search/中文 name.txt": "n.e and NEEDLE unicode\n", "search/é.txt": "needle composed\n", "search/e\u0301.txt": "needle decomposed\n",
     "search/encoded\u00a0name.txt": "needle encoded nonbreaking name\n",
+    "search/\ue000.txt": "needle BMP order\n", "search/\u{10000}.txt": "needle supplementary order\n",
     "search/utf16.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("before\r\nneedle unicode\r\nafter\r\n", "utf16le")]),
     "search/binary.txt": Buffer.from("before\0needle binary\0after"), "search/long.txt": "needle " + "x".repeat(4096),
     "rules/shared-ignore": "hidden.txt\n", "search/linked-config/hidden.txt": "needle filtered by linked config\n",
@@ -190,6 +191,8 @@ async function qualifyNamespace() {
     ["mixed-encoding-context", { pattern: "(?P<word>needle)", context: 1 }],
     ["literal-case", { pattern: "n.e", literal: true, ignoreCase: true }],
     ["negative-query", { pattern: "not-present-anywhere" }],
+    ["invalid-pattern", { pattern: "[" }, true],
+    ["empty-selection-invalid-pattern", { pattern: "[", glob: "*.absent" }, true],
     ["limit", { limit: 1 }],
     ["file", { path: "search/utf16.txt", context: 1 }],
     ["explicit-ignored-directory", { path: "search/blocked" }],

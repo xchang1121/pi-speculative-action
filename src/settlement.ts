@@ -35,6 +35,8 @@ export type ResourceValidation =
 			readonly status: "stale";
 			readonly cause: ResolutionCause & { readonly stage: "freshness" };
 			readonly metrics: ValidationMetrics;
+			/** Changed inputs were revoked while independent computations survived; one observation rebuild may help. */
+			readonly reconstruct?: true;
 	  }
 	| {
 			readonly status: "indeterminate";

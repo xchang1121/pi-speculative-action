@@ -20,7 +20,7 @@ node bench/portable-kernel.mjs
 node bench/grep-captured-qualification.mjs
 ```
 
-两项使用当前完整构建，并共用 `search-journey.mjs` 的 Host 轮次、候选与 Actor 回退流程。第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 覆盖配置、目录、链接、输出、取消、输入预算及原生输入进程回收；同一工作区共用已准备的执行器，切换工作区时先回收旧执行器，各 Host 独立捕获和验证输入。这里只报告语义与回收结果，性能使用完整任务报告。
+两项使用当前完整构建，并共用 `search-journey.mjs` 的 Host 轮次、候选与 Actor 回退流程。第一项覆盖原版 find、生产 Host/TUI 路线、已完成与运行中采纳、输入变化、取消和关闭。grep 覆盖配置、目录、链接、编码与 Unicode 排序、无效正则、输出、局部变化后的增量采纳、取消、输入预算及原生输入进程回收；同一工作区共用已准备的执行器，切换工作区时先回收旧执行器，各 Host 独立捕获和验证输入。这里只报告语义与回收结果，性能使用完整任务报告。
 
 需要已有、合格的 Pi rg，不安装或下载。可用 `--case=<名称>` 选择 grep 场景。资格针对显式 captured profile，不能外推 Native Pi 默认语义、macOS、ARM64 或 ThinkThread。
 

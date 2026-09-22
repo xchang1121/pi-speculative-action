@@ -275,10 +275,16 @@ function resourceSnapshotBranch(
 	resourceVersions.set(inputSource, owner);
 	const inputResources = version.view && versions.flatMap(token => token.view?.resources ?? []);
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
-	const validate = async (token: ResourceVersionToken | readonly ResourceVersionToken[] | undefined) => {
-		const { expired, reason, ...metrics } = await validateResourceVersion(owned && token);
+	const validate = async (token: readonly ResourceVersionToken[] | undefined) => {
+		const { expired, reason, changed, ...metrics } = await validateResourceVersion(owned && token);
+		if (changed?.length) {
+			const dependencies = new Set(changed);
+			const inputs = new Set([...(owned ?? []), ...(token ?? [])].flatMap(version => [version.view, version.inputView?.deref()]));
+			for (const view of inputs) view?.invalidate(dependencies);
+		}
 		return expired
-			? { status: "stale" as const, cause: cause("freshness", reason ?? "resource_changed"), metrics }
+			? { status: "stale" as const, cause: cause("freshness", reason ?? "resource_changed"), metrics,
+				...(changed?.length && owned?.some(version => version.view?.hasPreparedInputs) ? { reconstruct: true as const } : {}) }
 			: { status: "valid" as const, metrics };
 	};
 	return {

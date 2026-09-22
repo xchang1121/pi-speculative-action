@@ -35,6 +35,7 @@ export type ResourceValidationMetrics = {
 export type ResourceVersionValidation = ResourceValidationMetrics & {
 	readonly expired: boolean;
 	readonly reason?: string;
+	readonly changed?: readonly string[];
 };
 
 export type ResourceChangeSet = {
@@ -52,6 +53,8 @@ export type ResourceVersionToken = {
 	readonly manager: ResourceVersionManager;
 	/** Best-effort retained inputs; absence never weakens the token's exact freshness evidence. */
 	readonly view?: ResourceReadView;
+	/** Non-owning revocation link carried by derived proofs; never grants input access. */
+	readonly inputView?: WeakRef<ResourceReadView>;
 	/** Revoke access immediately; completion includes admitted reads and ownership release. */
 	readonly release: () => void | Promise<void>;
 };
@@ -110,6 +113,7 @@ export class ResourceReadView {
 	}
 	get bytes(): number { return this.capturedBytes; }
 	get remainingBytes(): number { return Math.max(0, this.maxBytes - this.capturedBytes); }
+	get hasPreparedInputs(): boolean { return [...this.prepared?.bindings.values() ?? []].some(entries => [...entries.values()].some(entry => entry.retained && !entry.revoked && entry.destination.retained)); }
 	get canRetainObject(): boolean { return process.platform === "linux" && this.objectCount < 64; }
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
 	get resources() {
@@ -150,10 +154,16 @@ export class ResourceReadView {
 			entry.metadataDependency && dependencies.has(entry.metadataDependency)) {
 			this.releaseObject(entry);
 			if (entry.object !== undefined) this.objectCount--;
-			this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target);
+			const dependency = entry.metadataDependency;
+			if (dependency && !dependencies.has(dependency) && entry.type !== "alias") {
+				const bytes = Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(dependency) * 2 + 64;
+				this.entries.set(target, { type: entry.type, realPath: entry.realPath, dependency, metadataDependency: dependency, bytes });
+				this.capturedBytes -= entry.bytes - bytes;
+			} else { this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target); }
 		}
 		for (const entries of this.prepared?.bindings.values() ?? []) for (const [key, cached] of entries) {
-			if (cached.destination !== cached.origin || !cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key))) {
+			if (!cached.dependencies || [...cached.dependencies].some(key => dependencies.has(key)) ||
+				cached.proofs?.some(proof => [...proof.observations.keys()].some(key => dependencies.has(key)))) {
 				cached.revoked = true; entries.delete(key);
 				if (cached.resource) removed.push(cached.resource);
 				if (!cached.borrowers) void this.prepared!.lifetime.release(cached);
@@ -259,7 +269,7 @@ export class ResourceReadView {
 			this.assertComplete();
 			const inputEpoch = owner.inputEpoch;
 			const cached = prepared.bindings.get(binding)?.get(key);
-			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked &&
+			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked && cached.destination.retained &&
 				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
 			const inherit = (dependencies: ReadonlySet<string> | undefined) => {
 				if (!dependencies) this.dependencies = undefined;
@@ -279,7 +289,7 @@ export class ResourceReadView {
 				const run = async () => {
 					this.assertComplete(); cached.destination.assertComplete();
 					const result = await consume(cached.value as Parameters<typeof consume>[0]);
-					this.assertComplete(); if (!transferred) cached.destination.assertComplete(); return result;
+					this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
 				};
 				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
 			};
@@ -310,6 +320,7 @@ export class ResourceReadView {
 				declined: new Promise<void>(resolve => { decline = resolve; }),
 				composed: this.acceptProofs && new Promise<void>(resolve => { composed = resolve; }),
 				dispose: async () => { try { await resource?.dispose(); } finally {
+					if (prepared.bindings.get(binding)?.get(key) === pending) prepared.bindings.get(binding)!.delete(key);
 					await Promise.allSettled(pending.proofs?.map(proof => proof.release()) ?? []);
 					if (pending.retained) pending.destination.capturedBytes -= bytes;
 				} } };
@@ -328,7 +339,7 @@ export class ResourceReadView {
 				}, observed => { pending.dependencies = observed; });
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
-				bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 128 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 192 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				for (const proof of pending.proofs ?? []) for (const [key, entry] of proof.observations)
 					bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
@@ -342,7 +353,7 @@ export class ResourceReadView {
 						pending.retained = true; entries.set(key, pending); destination.capturedBytes += bytes;
 					}
 				}
-				if (destination !== owner && entries.get(key) === pending) entries.delete(key);
+				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
 			})();
 			const settled = () => { decline(); composed?.(); };
 			void pending.ready.then(settled, settled);
@@ -390,7 +401,7 @@ export class ResourceReadView {
 		this.failure = new Error("resource_snapshot_disposed");
 		return this.disposal ??= this.prepared ? this.prepared.lifetime.close(async () => {
 			await this.prepared!.lifetime.drain();
-			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].map(resource =>
+			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].filter(resource => resource.destination === this).map(resource =>
 				this.prepared!.lifetime.release(resource)))]);
 			this.prepared!.bindings.clear();
 		}) : this.pending?.then(() => {}, () => {});
@@ -612,7 +623,7 @@ export class ResourceVersionManager {
 			return {
 				root: this.root, physicalRoot, observations, epoch: this.epoch,
 				watching: Boolean(observing && this.reliable), preciseContent: Object.freeze(precise?.paths ?? []),
-				manager: this, ...(retained ? { view: retained } : {}), release,
+				manager: this, ...(retained ? { view: retained, inputView: new WeakRef(retained) } : {}), release,
 			};
 		} catch (error) {
 			await release();
@@ -646,12 +657,13 @@ export class ResourceVersionManager {
 			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
 			if (lateFailure) return validation(started, lateFailure, "watcher");
-			const expired = !current.length || current.some((entry) => {
+			const changed = current.filter((entry) => {
 				const captured = token.observations.get(dependencyKey(entry));
 				return entry.fingerprint !== captured?.fingerprint || (sealing && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp));
-			});
+			}).map(dependencyKey);
+			const expired = !current.length || changed.length > 0;
 			const reason = sealing ? "resource_observation_window_changed" : "resource_fingerprint_changed";
-			return validation(started, expired ? reason : undefined, "exact", current);
+			return { ...validation(started, expired ? reason : undefined, "exact", current), ...(!sealing && changed.length ? { changed } : {}) };
 		} catch {
 			const reason = sealing ? "resource_observation_window_unprovable" : "resource_validation_failed";
 			return validation(started, reason);
@@ -802,8 +814,9 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 		}
 		for (const group of groups.values()) {
 			const result = await group.manager.validate(group); checked.push(result);
-			if (result.expired) return validation(started, result.reason, "exact", checked);
 		}
+		const expired = checked.find(result => result.expired);
+		if (expired) return { ...validation(started, expired.reason, "exact", checked), changed: [...new Set(checked.flatMap(result => result.changed ?? []))] };
 		for (const source of token as ResourceVersionToken[]) source.view?.assertComplete(true);
 		return validation(started, undefined, "exact", checked);
 	} catch (error) { return validation(started, error instanceof Error ? error.message : "resource_validation_failed", "exact", checked); }

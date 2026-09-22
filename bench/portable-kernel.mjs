@@ -179,10 +179,10 @@ async function qualifyPiSearch(name) {
 			const actor = await execute("actor", fs, { args: query, signal });
 			const reconstructed = await ready.actor("retained-" + queries.indexOf(query), query);
 			assert.deepEqual(reconstructed.output, actor.result);
-			assert.equal(reconstructed.settlement.provider.kind, query.path === "." ? "actor" : "speculative");
-			if (query.path !== ".") assert.equal(reconstructed.settlement.provider.match?.kind, "inputs");
+			assert.equal(reconstructed.settlement.provider.kind, "speculative", JSON.stringify(reconstructed.settlement));
+			assert.equal(reconstructed.settlement.provider.match?.kind, "inputs");
 		}
-		assert.equal(ready.actorCalls(), 1, "a new query cannot extend a sealed candidate's input authority");
+		assert.equal(ready.actorCalls(), 0, "the authorized current query captures missing inputs within its bound root");
 		const reached = Promise.withResolvers(), resume = Promise.withResolvers();
 		const running = journey(async () => { reached.resolve(); await resume.promise; });
 		await running.start("running");
@@ -197,16 +197,16 @@ async function qualifyPiSearch(name) {
 		} finally { resume.resolve(); await running.host.dispose(); }
 		await fs.appendFile(path.join(root, ".gitignore"), "data-*.txt\nnotes.txt\n中文*\nutf16.txt\nUPPER.TXT\nnested/\n*é*\n*é*\n①*\n1*\n");
 		const stale = await ready.actor("stale");
-		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 2);
+		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 1);
 		assert.notDeepEqual(stale.output, expected);
 		const beforeReplay = counts.producer;
 		await ready.start("observed", false);
 		const observed = await ready.actor("observed");
 		assert.deepEqual(observed.output, stale.output);
 		assert.equal(bound.semantics.resourceScope, "captured_inputs");
-		assert.equal(observed.settlement.provider.kind, "actor", "ambient observation cannot certify a captured-only profile");
-		assert.equal(counts.producer, beforeReplay, "completed result adoption must not execute guest code");
-		assert.equal(ready.actorCalls(), observed.settlement.provider.kind === "actor" ? 3 : 2);
+		assert.equal(observed.settlement.provider.kind, "speculative"); assert.equal(observed.settlement.provider.match.kind, "inputs");
+		assert.equal(counts.producer, beforeReplay + 1, "the new query captures changed rules and reuses unaffected names");
+		assert.equal(ready.actorCalls(), 1);
 		const changed = journey(() => fs.appendFile(path.join(root, ".gitignore"), "# changed during search\n"));
 		await changed.start("changing");
 		assert.equal((await bounded(changed.candidate, "changed search")).status, "succeeded"); // Private captured inputs seal without rereading the host.
@@ -246,7 +246,7 @@ async function qualifyPiSearch(name) {
 		} finally { drain.resolve(); await Promise.allSettled([actor, rejected]); }
 		return { behaviors, rejectedEscapingLinks: true,
 			specialFileGate: process.platform === "linux" ? "FIFO rejected before open" : "not run: FIFO unavailable",
-			retainedInputQueries: queries.length - 1, uncapturedInputFallbacks: 1, ...counts,
+			retainedInputQueries: queries.length, uncapturedInputFallbacks: 0, ...counts,
 			crossTurnResultReuse: true, runningRuntimeJoin: true, runningActorCalls: running.actorCalls(),
 			staleActorExecutions: stale.settlement.provider.kind === "actor" ? 1 : 0, changedDuringSearchRejected: true, cancelledFullToolDiscarded: true,
 			actorRanWhileProducerPaused: true, concurrentProducers: true, retirementDrainsActorAndInputs: true, ignoredContentNotTransferred: true, recoveryActorCalls: 1,
