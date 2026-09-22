@@ -1354,6 +1354,30 @@ describe("structural speculative runtime", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it.each(["repaired", "changed-again", "failed", "aborted", "unscoped"] as const)("bounds incremental reconstruction and validates its replacement (%s)", async mode => {
+		const controller = new AbortController(), dispose = vi.fn();
+		const stale = () => ({ status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics(), reconstruct: true as const });
+		const validate = vi.fn(async () => stale()), queryValidate = vi.fn(async () => mode === "changed-again" ? stale() : validResource());
+		const reconstruct = vi.fn(async () => {
+			if (mode === "failed") throw new Error("replacement unavailable");
+			if (mode === "aborted") controller.abort();
+			return { output: "repaired", validate: queryValidate, dispose };
+		});
+		const { runtime, ready } = harness({ source: planSource({ propose: () => plan("seed") }),
+			execute: () => ({ ...world("expired", { validate }), inputSource: {}, inputResources: [{ path: "/workspace/README.md" }],
+				...(mode === "unscoped" ? {} : { reconstructionScope: "current_action" as const }), reconstruct }),
+		});
+		try {
+			await runtime.startTurn(start("seed")); await ready.promise;
+			const result = await runtime.prepareActorCall(call("seed"), controller.signal);
+			expect(result?.output).toBe(mode === "repaired" ? "repaired" : undefined);
+			expect(validate).toHaveBeenCalledOnce();
+			expect(reconstruct).toHaveBeenCalledTimes(mode === "unscoped" ? 0 : 1);
+			expect(queryValidate).toHaveBeenCalledTimes(mode === "repaired" || mode === "changed-again" ? 1 : 0);
+		} finally { await runtime.dispose(); }
+		expect(dispose).toHaveBeenCalledTimes(mode === "failed" || mode === "unscoped" ? 0 : 1);
+	});
+
 	it.each([false, true])("keeps independent results and inputs after revocation (indexed=%s)", async indexed => {
 		let bytes = 2048, budget = 4096;
 		const dispose = vi.fn(), coordinator = new EffectTransactionCoordinator<string>();

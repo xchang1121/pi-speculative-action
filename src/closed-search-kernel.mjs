@@ -14,6 +14,7 @@ export const CLOSED_SEARCH_PROFILE = Object.freeze({
 	find: Object.freeze({ minimatch: "10.2.5", ignore: "7.0.5", gitignore: "workspace ancestors and descendants; no global config",
 		platform: "linux", nocase: false, dot: true, matchBase: true, nocomment: true, nonegate: true, braceExpandMax: 10_000 }),
 	grep: Object.freeze({ versions: Object.freeze({ "win32:x64": "15.2.0", "linux:x64": "14.1.0" }), flags: Object.freeze(["--no-config", "--sort=path", "--no-ignore-global"]),
+		reuse: "per-file rg matches keyed by pattern, ignoreCase and literal; Pi owns context and limit",
 		process: "caller-owned pinned rg", filesystem: "caller-granted stat and readFile; no ambient fallback" }),
 	bootstrapEnvironment: Object.freeze({ PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" }),
 	filesystem: "readonly /workspace namespace; exact spelling; normalized in-root aliases; no ambient filesystem fallback",

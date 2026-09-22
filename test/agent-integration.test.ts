@@ -512,7 +512,10 @@ describe("speculative action host", () => {
 		const execute = world.speculation!.execute;
 		const sources = new Map<string, Awaited<ReturnType<typeof execute>>>();
 		vi.spyOn(world.speculation!, "execute").mockImplementation(async context => {
-			const branch = await execute(context); sources.set(context.toolName, branch);
+			const original = await execute(context);
+			// The query belongs to the grep owner; read supplies only its foreign file input.
+			const branch = context.toolName === "read" ? { ...original, inputResources: [{ path: path.join(cwd, "notes.txt") }] } : original;
+			sources.set(context.toolName, branch);
 			return !oversized ? branch : { ...branch, reconstruct: async request => {
 				const query = await branch.reconstruct!(request);
 				return query && { ...query, capturedBytes: 2 ** 30 };
@@ -543,34 +546,37 @@ describe("speculative action host", () => {
 			predict = false; await host.finishTurn("seed");
 			await host.startTurn({ ...startInput(tools[0]!, "query"), tools });
 			const original = await fs.readFile(path.join(cwd, "notes.txt"));
-			const args = { pattern: "two", path: "." }, expected = await tools[0]!.execute("reference", args);
+			const args = { pattern: "two", path: ".", limit: 1 }, expected = await tools[0]!.execute("reference", args);
 			const actor = vi.fn(() => tools[0]!.execute("native", args));
 			let call = { turnID: "query", id: "query", tool: "grep", args, tools };
+			const warm = { ...args, limit: 2 };
+			expect(await host.execute({ ...call, id: "warm-matches", args: warm }, undefined, () => { throw new Error("warm query should reuse inputs"); }))
+				.toEqual(await tools[0]!.execute("warm-oracle", warm));
 			await host.previewActorCall(call);
 			for (const id of ["query", "retained"]) expect(await host.execute({ ...call, id }, undefined, actor)).toEqual(expected);
 			expect(actor.mock.calls.length, JSON.stringify(events.filter(event => event.type === "actor_action").map(event => event.settlement))).toBe(0);
-			expect(evaluations).toBe(oversized ? 5 : 3);
+			expect(evaluations).toBe(oversized ? 6 : 4);
 			await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\nchanged unused line\n");
 			expect(await host.execute({ ...call, id: "stale-source" }, undefined, actor)).toEqual(expected);
-			expect(actor).toHaveBeenCalledOnce();
+			expect(actor).not.toHaveBeenCalled();
 			await writeFile(path.join(cwd, "notes.txt"), original);
 			expect(await host.execute({ ...call, id: "restored-source" }, undefined, actor)).toEqual(expected);
-			expect(actor).toHaveBeenCalledOnce();
+			expect(actor).not.toHaveBeenCalled();
 			await host.finishTurn("query"); await host.startTurn({ ...startInput(tools[0]!, "again"), tools });
 			call = { ...call, turnID: "again" }; const beforeRetirement = evaluations;
 			await sources.get("read")!.dispose();
 			expect(await host.execute({ ...call, id: "retired-source" }, undefined, actor)).toEqual(expected);
-			expect(actor).toHaveBeenCalledTimes(oversized ? 2 : 1);
+			expect(actor).not.toHaveBeenCalled();
 			if (!oversized) expect(evaluations).toBe(beforeRetirement);
 			await writeFile(path.join(cwd, "notes.txt"), "two changed after retirement\n");
 			expect(await host.execute({ ...call, id: "changed-after-retirement" }, undefined, actor)).toEqual(await tools[0]!.execute("reference", args));
-			expect(actor).toHaveBeenCalledTimes(oversized ? 3 : 2);
+			expect(actor).not.toHaveBeenCalled();
 			const find = { pattern: "notes.txt", path: "." }, findActor = vi.fn(() => tools[2]!.execute("native-find", find));
 			expect(await host.execute({ ...call, id: "surviving-source", tool: "find", args: find }, undefined, findActor))
 				.toEqual(await tools[2]!.execute("reference-find", find));
 			expect(findActor).not.toHaveBeenCalled();
 			await host.finishTurn(call.turnID, true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: oversized ? 4 : 5, exactReuseHits: 0, predictionsMatched: 0 });
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, predictionsMatched: 0 });
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 
@@ -582,8 +588,8 @@ describe("speculative action host", () => {
 		const invocation: ToolInvocation = { ...original, filesystem: (view, request) => original.filesystem!({ ...view, prepare: (binding, key, build, consume, target) => {
 			const pending = view.prepare!(binding, key, build, async value => {
 				const result = await consume(value);
-				if (mode === "cancelled" && request.callID === "second") await consuming.wait();
-				if (mode === "cancelled" && request.callID === "first") {
+				if (target === cwd && mode === "cancelled" && request.callID === "second") await consuming.wait();
+				if (target === cwd && mode === "cancelled" && request.callID === "first") {
 					await consuming.entered; cancelled.abort(new Error("first consumer cancelled")); throw cancelled.signal.reason;
 				}
 				return result;
@@ -673,7 +679,7 @@ describe("speculative action host", () => {
 			await host.finishTurn("seed"); stage = "query";
 			const captured = captures.mock.calls.length, reads = opened.mock.calls.length, prepared = preparations();
 			await host.startTurn({ ...startInput(tools[0]!, "query"), tools }); await ready("query", 1);
-			expect(captures.mock.calls.length - captured).toBe(Number(coverage !== "prepared"));
+			expect(captures.mock.calls.length - captured).toBe(1); // New regex results need a budgeted owner even when inputs are already prepared.
 			expect(preparations() - prepared).toBe(coverage === "prepared" ? 0 : 1);
 			const sourceReads = opened.mock.calls.slice(reads).filter(([file]) => String(file) === path.join(cwd, "notes.txt"));
 			expect(sourceReads).toHaveLength(0);
@@ -711,7 +717,7 @@ describe("speculative action host", () => {
 				const validation = await successor!.validate!(); expect(validation.status, JSON.stringify(validation)).toBe("valid");
 				expect(await host.execute(call, undefined, actor)).toEqual(await current());
 				expect(actor).toHaveBeenCalledOnce();
-				expect(captures.mock.calls.length).toBe(capturesBefore); expect(preparations()).toBe(preparedBefore);
+				expect(captures.mock.calls.length).toBe(capturesBefore + 1); expect(preparations()).toBe(preparedBefore);
 			}
 			for (const name of partial ? ["notes.txt", "other.txt"] : ["notes.txt"]) {
 				const file = path.join(cwd, name), original = await fs.readFile(file), calls = actor.mock.calls.length;
@@ -731,11 +737,11 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); opened.mockRestore(); directories.mockRestore(); }
 	});
 
-	it("reuses an unaffected grep input across turns after its exact output expires", async ({ skip }) => {
+	it.for(["edit", "write", "add", "delete", "ignore"] as const)("rebuilds only affected grep computations across turns (%s)", async (change, { skip }) => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
-		await writeFile(path.join(cwd, "other.txt"), "two unchanged\n");
-		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd)], args = { pattern: "two", path: ".", glob: "*.txt" };
+		await writeFile(path.join(cwd, "other.txt"), "two unchanged\nTWO upper\n");
+		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd), createWriteTool(cwd)], args = { pattern: "t.o", path: ".", glob: "*.txt" };
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep", "read"], maxBytes: () => 1024 * 1024 });
 		const ready = deferred(), events: SpeculativeActionEvent<string>[] = [];
 		let predict = true;
@@ -747,16 +753,39 @@ describe("speculative action host", () => {
 			executionWorlds: [{ ...world, observation: undefined }], // No fallback capture can replace the original input owner.
 			onEvent: event => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
 		});
-		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), directories = vi.spyOn(fs, "mkdtemp");
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), directories = vi.spyOn(fs, "mkdtemp"), writes = vi.spyOn(fs, "writeFile");
+		const matchedFiles = () => writes.mock.calls.filter(([file, bytes]) => path.basename(path.dirname(String(file))).startsWith("matches-") && Buffer.isBuffer(bytes)).length;
 		try {
 			await host.startTurn({ ...startInput(tools[0]!, "seed"), tools }); await ready.promise;
-			const current = async () => (await profile.invocations.get("grep")!.authoritative!({ args, callID: "reference", signal: new AbortController().signal })).result;
-			const actor = vi.fn(current), call = { turnID: "seed", id: "first", tool: "grep", args, tools };
+			expect(matchedFiles()).toBe(2);
+			const current = async (query: unknown = args) => (await profile.invocations.get("grep")!.authoritative!({ args: query, callID: "reference", signal: new AbortController().signal })).result;
+			const actor = vi.fn(() => current()), call = { turnID: "seed", id: "first", tool: "grep", args, tools };
 			expect(await host.execute(call, undefined, actor)).toEqual(await current()); expect(actor).not.toHaveBeenCalled();
 			predict = false; await host.finishTurn("seed");
-			await writeFile(path.join(cwd, "notes.txt"), "changed\n");
 			await host.startTurn({ ...startInput(tools[0]!, "changed"), tools });
-			expect(await host.execute({ ...call, turnID: "changed" }, undefined, actor)).toEqual(await current()); expect(actor).toHaveBeenCalledOnce();
+			for (const query of [{ ...args, context: 1 }, { ...args, limit: 1 }, { ...args, glob: "other.*" }, { ...args, path: "other.txt" }]) {
+				const fallback = vi.fn(() => current(query));
+				expect(await host.execute({ ...call, turnID: "changed", id: JSON.stringify(query), args: query }, undefined, fallback)).toEqual(await current(query));
+				expect(fallback).not.toHaveBeenCalled(); expect(matchedFiles()).toBe(2);
+			}
+			for (const query of [{ ...args, ignoreCase: true }, { ...args, literal: true }]) {
+				const fallback = vi.fn(() => current(query)), before = matchedFiles();
+				expect(await host.execute({ ...call, turnID: "changed", id: JSON.stringify(query), args: query }, undefined, fallback)).toEqual(await current(query));
+				expect(fallback).not.toHaveBeenCalled(); expect(matchedFiles()).toBe(before + 2);
+			}
+			if (change === "write") {
+				const input = { path: "notes.txt", content: "two changed\n" };
+				await host.execute({ ...call, turnID: "changed", id: "write", tool: "write", args: input }, undefined, () => tools[2]!.execute("write", input));
+			} else if (change === "delete") await fs.unlink(path.join(cwd, "notes.txt"));
+			else await writeFile(path.join(cwd, change === "add" ? "new.txt" : change === "ignore" ? ".ignore" : "notes.txt"),
+				change === "ignore" ? "notes.txt\n" : "two changed\n");
+			for (const id of ["changed", "retained-change"])
+				expect(await host.execute({ ...call, turnID: "changed", id }, undefined, actor)).toEqual(await current());
+			const narrowed = { ...args, context: 2 }, narrow = vi.fn(() => current(narrowed));
+			expect(await host.execute({ ...call, turnID: "changed", id: "changed-context", args: narrowed }, undefined, narrow)).toEqual(await current(narrowed));
+			expect(narrow).not.toHaveBeenCalled();
+			expect(actor.mock.calls.length, JSON.stringify(events.filter(event => event.type === "actor_action").map(event => event.type === "actor_action" && event.settlement.rejections))).toBe(0);
+			expect(matchedFiles()).toBe(change === "edit" || change === "write" || change === "add" ? 7 : 6);
 			await host.finishTurn("changed"); await host.startTurn({ ...startInput(tools[0]!, "sibling"), tools });
 			const input = { path: "other.txt" }, expected = await tools[1]!.execute("reference-read", input);
 			const fallback = vi.fn(() => tools[1]!.execute("fallback-read", input));
@@ -765,8 +794,8 @@ describe("speculative action host", () => {
 			expect(fallback).not.toHaveBeenCalled();
 			expect(captures.mock.calls.length).toBe(captured); expect(directories.mock.calls.length).toBe(prepared);
 			await host.finishTurn("sibling", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ exactReuseHits: 1, inputReuseHits: 2 });
-		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); directories.mockRestore(); }
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ exactReuseHits: 1, inputReuseHits: 11 });
+		} finally { await host.dispose(); await profile.pool.dispose(); captures.mockRestore(); directories.mockRestore(); writes.mockRestore(); }
 	});
 
 	it.skipIf(process.platform !== "linux")("leases captured file objects to internal Actor operations across turns", async () => {
@@ -947,9 +976,9 @@ describe("speculative action host", () => {
 			await host.execute(call, undefined, actor); expect(actor).toHaveBeenCalledTimes(2);
 			permitted = true; await writeFile(path.join(cwd, "notes.txt"), "changed\ncurrent");
 			expect((await host.execute({ ...call, id: "changed" }, undefined, actor)).content).toEqual([{ type: "text", text: "current" }]);
-			expect(actor).toHaveBeenCalledTimes(3);
+			expect(actor.mock.calls.length, JSON.stringify(events.filter(event => event.type === "actor_action" && event.settlement.actorAction.id === "changed"))).toBe(2);
 			await host.finishTurn("consumer", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 16, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 17, exactReuseHits: 0, partialResultReuseHits: 0, predictionsMatched: 0 });
 			expect(events.filter(event => event.type === "actor_action" && event.settlement.provider.kind === "speculative")
 				.every(event => event.type === "actor_action" && event.settlement.matchedPredictions.length === 0)).toBe(true);
 		} finally { await host.dispose(); await profile.pool.dispose(); directories.mockRestore(); mkdirs.mockRestore(); copies.mockRestore(); }
