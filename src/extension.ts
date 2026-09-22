@@ -1551,7 +1551,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatOptimisticSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a",
+		metrics.tasks > 0 ? `${formatSpeedups(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a; Tool time speed up n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1609,14 +1609,15 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs">): string {
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.estimatedSavingsMs ?? NaN)} estimated savings; ${formatOptimisticSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} observed overlap`;
+function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.estimatedSavingsMs ?? NaN)} estimated savings; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
-function formatOptimisticSpeedup(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs">): string {
+function formatSpeedups(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
 	const savings = timing.estimatedSavingsMs ?? NaN;
 	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
-	return `End-to-End SpeedUp ${percent}`;
+	const toolPercent = timing.toolExecutionMs > 0 && Number.isFinite(timing.hiddenLatencyMs) ? `${(100 * timing.hiddenLatencyMs / timing.toolExecutionMs).toFixed(1)}%` : "n/a";
+	return `End-to-End SpeedUp ${percent}; Tool time speed up ${toolPercent}`;
 }
 
 function formatDuration(ms: number): string {
