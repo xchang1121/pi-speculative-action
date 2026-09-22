@@ -6,7 +6,7 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, type AssistantMessage, type SimpleStreamOptions, type ThinkingLevel } from "@earendil-works/pi-ai";
 import { createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
@@ -14,7 +14,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
-import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
@@ -52,27 +52,18 @@ const mockToolCalls = [
 ] as const;
 
 function assistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
+	const message = fauxAssistantMessage(content, { stopReason });
 	return {
-		role: "assistant",
-		content,
+		...message,
 		api: "openai-responses",
 		provider: "openai",
 		model: "mock",
-		usage: {
-			input: 1,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 2,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason,
-		timestamp: Date.now(),
+		usage: { ...message.usage, cost: { ...message.usage.cost }, input: 1, output: 1, totalTokens: 2 },
 	};
 }
 
-function drafterCall(input: Record<string, unknown>): AssistantMessage {
-	return assistant([{ type: "toolCall", id: "draft-1", name: "read", arguments: input }], "toolUse");
+function drafterCall(input: Record<string, unknown>, name = "read", id = "draft-1"): AssistantMessage {
+	return assistant([{ type: "toolCall", id, name, arguments: input }], "toolUse");
 }
 
 function settings(candidateLimit = 1) {
@@ -84,6 +75,15 @@ function settings(candidateLimit = 1) {
 		tools: ["read"],
 		patternAware: { enabled: false },
 	};
+}
+
+function drafterHost(sessionID: string, options: CreateSpeculativeActionHostOptions) {
+	const events: SpeculativeActionEvent<string>[] = [];
+	const host = createSpeculativeActionHost(sessionID, {
+		draftModel: model("draft"), preflight: () => true, ...options,
+		onEvent: event => { events.push(event); options.onEvent?.(event); },
+	});
+	return { host, events };
 }
 
 function startInput(tool: AgentTool, turnID = "turn-1") {
@@ -187,13 +187,12 @@ describe("speculative action host", () => {
 		for (const requested of [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
 			for (const supported of [true, false]) {
 				const options: SimpleStreamOptions = Object.freeze({ reasoning: requested === "off" ? undefined : requested ?? "high", maxTokens: 1 });
-				const finished = [deferred(), deferred(), deferred()], order: number[] = [], events: SpeculativeActionEvent<string>[] = [];
+				const finished = [deferred(), deferred(), deferred()], order: number[] = [];
 				const complete = vi.fn<Parameters<typeof createDrafterPlanSource>[0]["complete"]>(async () => message);
-				const host = createSpeculativeActionHost("session", { cwd, complete, preflight: () => true,
+				const { host, events } = drafterHost("session", { cwd, complete,
 					draftModel: { ...model("draft"), reasoning: supported, thinkingLevelMap: { xhigh: "high", max: "max" } },
 					...(requested === undefined ? {} : { getDraftOptions: () => options }),
 					getSettings: () => ({ ...settings(), drafterMaxTokens: 128, drafterMaxDepth: 1, maxConcurrentActions: supported ? 1 : 3 }),
-					onEvent: (event) => { events.push(event); },
 					executionWorlds: [mockRuntimeWorld(async (context) => {
 						const offset = Number((context.args as { offset: number }).offset);
 						if (!supported && offset < 3) await finished[offset]!.promise;
@@ -323,18 +322,16 @@ describe("speculative action host", () => {
 					name: toolName, label: toolName, description: toolName, parameters: mockToolSchema, prepareArguments,
 					execute: resourceExecution ? async () => { throw new Error("Host tool must not execute speculatively"); } : speculativeExecution,
 				};
-				const events: SpeculativeActionEvent<string>[] = [];
 				const sandbox = resourceExecution
 					? createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: [toolName], maxBytes: () => 1024 * 1024 })
 					: toolRuntimeWorld();
 				const prepareWorld = vi.fn(async (_input: { signal?: AbortSignal }) => {});
 				let predictions = origin === "prediction";
-				const host = createSpeculativeActionHost(`session-${turnID}`, {
+				const { host, events } = drafterHost(`session-${turnID}`, {
 					cwd,
 					getSettings: () => ({ ...settings(), drafterEnabled: predictions, drafterMaxDepth: 0, tools: [toolName] }),
-					draftModel: model("draft"),
 					complete: async () =>
-						assistant([{ type: "toolCall", id: `draft-${toolName}`, name: toolName, arguments: proposal }], "toolUse"),
+						drafterCall(proposal, toolName, `draft-${toolName}`),
 					preflight: (request) => { permissions.push(request); return true; },
 					resolveInvocation: () => resourceExecution ? { ...invocation!, filesystem: async (view, request) => {
 						await speculativeExecution();
@@ -342,7 +339,6 @@ describe("speculative action host", () => {
 					} } : invocation,
 					executionWorlds: [{ ...sandbox, speculation: { ...sandbox.speculation!, prepare: prepareWorld } }],
 					onEvent: (event) => {
-						events.push(event);
 						if (event.type === "candidate" && event.state.status === "succeeded") completed.resolve();
 						if (event.type === "actor_action") adopted.resolve();
 					},
@@ -435,7 +431,6 @@ describe("speculative action host", () => {
 		const ready = deferred<void>(), entered = deferred<void>(), release = deferred<void>();
 		const worldDisposed = vi.fn(), committed = vi.fn();
 		const actor = vi.fn(() => tool.execute("actor", args));
-		const events: SpeculativeActionEvent<string>[] = [];
 		let offered: ToolSettlement | undefined;
 		const rule = { ...PI_READ_RANGE_PROJECTION_RULE, projectOutput: async (input: Parameters<typeof PI_READ_RANGE_PROJECTION_RULE.projectOutput>[0]) => {
 			offered ??= PI_READ_RANGE_PROJECTION_RULE.projectOutput(input);
@@ -456,11 +451,11 @@ describe("speculative action host", () => {
 				return branch.validate!();
 			}, commit: async () => { committed(); return branch.commit(); } };
 		} } };
-		const host = createSpeculativeActionHost("session", {
-			cwd, getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), draftModel: model("draft"),
-			complete: async () => drafterCall({ path: "notes.txt" }), preflight: () => true,
+		const { host, events } = drafterHost("session", {
+			cwd, getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }),
+			complete: async () => drafterCall({ path: "notes.txt" }),
 			projectionRules: phase === "unproven" ? undefined : [rule], executionWorlds: [world],
-			onEvent: (event) => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+			onEvent: (event) => { if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
 		});
 		try {
 			await host.startTurn(startInput(tool));
@@ -521,10 +516,10 @@ describe("speculative action host", () => {
 				return query && { ...query, capturedBytes: 2 ** 30 };
 			} };
 		});
-		const ready = deferred(), events: SpeculativeActionEvent<string>[] = [];
+		const ready = deferred();
 		let predict = true, completed = 0, evaluations = 0;
-		const host = createSpeculativeActionHost("composed", {
-			cwd, draftModel: model("draft"),
+		const { host, events } = drafterHost("composed", {
+			cwd,
 			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
 				candidateLimit: 1, maxConcurrentActions: 2, tools: tools.map(tool => tool.name) }),
 			complete: async () => assistant([
@@ -535,8 +530,8 @@ describe("speculative action host", () => {
 				const bound = profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} });
 				return bound && { ...bound, filesystem: bound.filesystem && ((...args) => { evaluations++; return bound.filesystem!(...args); }) };
 			},
-			preflight: () => true, executionWorlds: [world],
-			onEvent: event => { events.push(event); if (event.type === "candidate") {
+			executionWorlds: [world],
+			onEvent: event => { if (event.type === "candidate") {
 				if (event.state.status === "succeeded" && ++completed === 2) ready.resolve();
 				if (event.state.status === "failed" || event.state.status === "cancelled") ready.reject(new Error(JSON.stringify(event.state)));
 			} },
@@ -655,13 +650,12 @@ describe("speculative action host", () => {
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), opened = vi.spyOn(fs, "open");
 		const directories = vi.spyOn(fs, "mkdtemp");
 		const preparations = () => directories.mock.calls.filter(([target]) => path.basename(String(target)) === "inputs-").length;
-		const events: SpeculativeActionEvent<string>[] = [];
 		const ready = (turnID: string, count: number) => expect.poll(() => events.filter(event =>
 			event.type === "candidate" && event.turnID === turnID && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(count);
 		const args = { pattern: "two", path: ".", glob: partial ? "*.txt" : "notes.txt" };
 		let stage: "seed" | "query" | "names" = "seed", permitted = true;
-		const host = createSpeculativeActionHost("prediction-inputs", {
-			cwd, draftModel: model("draft"), preflight: () => permitted,
+		const { host, events } = drafterHost("prediction-inputs", {
+			cwd, preflight: () => permitted,
 			getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, maxConcurrentActions: 2,
 				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 6, resourceCacheMaxBytes: 1024 * 1024 }),
 			complete: async () => assistant(stage === "seed" ? [
@@ -670,7 +664,6 @@ describe("speculative action host", () => {
 			] : [{ type: "toolCall", id: "query", name: stage === "names" ? "ls" : "grep", arguments: stage === "names" ? { path: "." } : args }], "toolUse"),
 			resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 			executionWorlds: [world],
-			onEvent: event => { events.push(event); },
 		});
 		try {
 			await host.startTurn({ ...startInput(tools[0]!, "seed"), tools }); await ready("seed", 2);
@@ -743,15 +736,15 @@ describe("speculative action host", () => {
 		await writeFile(path.join(cwd, "other.txt"), "two unchanged\nTWO upper\n");
 		const tools: AgentTool[] = [createGrepTool(cwd), createReadTool(cwd), createWriteTool(cwd)], args = { pattern: "t.o", path: ".", glob: "*.txt" };
 		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep", "read"], maxBytes: () => 1024 * 1024 });
-		const ready = deferred(), events: SpeculativeActionEvent<string>[] = [];
+		const ready = deferred();
 		let predict = true;
-		const host = createSpeculativeActionHost("stale-output-inputs", {
-			cwd, draftModel: model("draft"), preflight: () => true,
+		const { host, events } = drafterHost("stale-output-inputs", {
+			cwd,
 			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0, tools: ["grep", "read"] }),
-			complete: async () => assistant([{ type: "toolCall", id: "seed", name: "grep", arguments: args }], "toolUse"),
+			complete: async () => drafterCall(args, "grep", "seed"),
 			resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 			executionWorlds: [{ ...world, observation: undefined }], // No fallback capture can replace the original input owner.
-			onEvent: event => { events.push(event); if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+			onEvent: event => { if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
 		});
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture"), directories = vi.spyOn(fs, "mkdtemp"), writes = vi.spyOn(fs, "writeFile");
 		const matchedFiles = () => writes.mock.calls.filter(([file, bytes]) => path.basename(path.dirname(String(file))).startsWith("matches-") && Buffer.isBuffer(bytes)).length;
@@ -807,13 +800,12 @@ describe("speculative action host", () => {
 				if (action.tool === "bash") { lookup = inputs; borrowed = (await borrowResourceObject(inputs?.(file) ?? [], file, await fs.stat(file, { bigint: true }), 65536))?.content; }
 				return execute();
 			} };
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("actor-object-inputs", { cwd, draftModel: model("draft"), preflight: () => true,
+		const { host, events } = drafterHost("actor-object-inputs", { cwd,
 			getSettings: () => ({ ...settings(), tools: ["read", "bash"], drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
 				resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 65536 }),
-			complete: async () => assistant([{ type: "toolCall", id: "read", name: "read", arguments: { path: "notes.txt" } }], "toolUse"),
+			complete: async () => drafterCall({ path: "notes.txt" }, "read", "read"),
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
-			executionWorlds: [world], onEvent: event => { events.push(event); } });
+			executionWorlds: [world] });
 		try {
 			await host.startTurn({ ...startInput(tools[0]!, "read"), tools });
 			await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 5000 }).toHaveLength(1);
@@ -830,14 +822,12 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace(), tools = [createWriteTool(cwd), createEditTool(cwd), createReadTool(cwd)] as const;
 		const args = tool === "write" ? { path: "notes.txt", content: "after\nsecond\n" }
 			: { path: "notes.txt", edits: [{ oldText: "one", newText: "after" }] };
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("actor-write-inputs", {
-			cwd, draftModel: model("draft"), preflight: () => true,
+		const { host, events } = drafterHost("actor-write-inputs", {
+			cwd,
 			getSettings: () => ({ ...settings(), tools: ["write", "edit", "read"], drafterEnabled: false, resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 65536 }),
 			complete: async () => { throw new Error("drafter disabled"); },
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
 			executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 65536 })],
-			onEvent: event => { events.push(event); },
 		});
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		try {
@@ -868,16 +858,15 @@ describe("speculative action host", () => {
 	it("reuses committed write inputs across turns while repeating mutations and rejecting stale reads", async () => {
 		const cwd = await temporaryWorkspace(), sandbox = new WorkspaceSandboxService();
 		const tools = [createWriteTool(cwd), createReadTool(cwd)], args = { path: "notes.txt", content: "committed\nsecond\n" };
-		const world = sandbox.createExecutionWorld({ driver: "git" }), events: SpeculativeActionEvent<string>[] = [];
+		const world = sandbox.createExecutionWorld({ driver: "git" });
 		let predict = true, readNext = false;
 		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture");
-		const host = createSpeculativeActionHost("committed-inputs", {
-			cwd, draftModel: model("draft"), preflight: () => true, getSettings: () => ({ ...settings(), tools: ["write", "read"],
+		const { host, events } = drafterHost("committed-inputs", {
+			cwd, getSettings: () => ({ ...settings(), tools: ["write", "read"],
 				drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 4, resourceCacheMaxBytes: 1024 * 1024 }),
-			complete: async () => assistant([{ type: "toolCall", id: "next", name: readNext ? "read" : "write", arguments: readNext ? { path: args.path } : args }], "toolUse"),
+			complete: async () => drafterCall(readNext ? { path: args.path } : args, readNext ? "read" : "write", "next"),
 			resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 			executionWorlds: [world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 })],
-			onEvent: event => { events.push(event); },
 		});
 		try {
 			await host.startTurn({ ...startInput(tools[0]!, "write"), tools });
@@ -917,15 +906,15 @@ describe("speculative action host", () => {
 		await writeFile(path.join(cwd, ".rgignore"), "# original transport rules\n");
 		await fs.mkdir(path.join(cwd, "nested")); await writeFile(path.join(cwd, "nested/extra.txt"), "unmatched");
 		const tools: AgentTool[] = [createReadTool(cwd), createLsTool(cwd), createFindTool(cwd), createGrepTool(cwd)];
-		const events: SpeculativeActionEvent<string>[] = [], ready = deferred<void>();
+		const ready = deferred<void>();
 		const directories = vi.spyOn(fs, "mkdtemp"), mkdirs = vi.spyOn(fs, "mkdir"), copies = vi.spyOn(fs, "writeFile");
 		const preparations = () => directories.mock.calls.filter(([name]) => path.basename(String(name)) === "inputs-").length;
 		let predict = true, permitted = true, rootOverride: string | undefined, evaluations = 0;
-		const host = createSpeculativeActionHost("resources", {
-			cwd, draftModel: model("draft"),
+		const { host, events } = drafterHost("resources", {
+			cwd,
 			getSettings: () => ({ ...settings(), drafterEnabled: predict, drafterGateEnabled: false, drafterMaxDepth: 0,
 				tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 16, resourceCacheMaxBytes: 1024 * 1024 }),
-			complete: async () => assistant([{ type: "toolCall", id: "search", name: "grep", arguments: { pattern: ".", path: "." } }], "toolUse"),
+			complete: async () => drafterCall({ pattern: ".", path: "." }, "grep", "search"),
 			resolveInvocation: (tool, input) => {
 				const invocation = profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} });
 				return invocation && { ...invocation, ...(rootOverride ? { filesystemRoot: rootOverride } : {}),
@@ -933,7 +922,7 @@ describe("speculative action host", () => {
 			},
 			preflight: context => { expect(context.action.tool).toBe(context.toolName); return permitted; },
 			executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 1024 * 1024 })],
-			onEvent: event => { events.push(event); if (event.type === "candidate") {
+			onEvent: event => { if (event.type === "candidate") {
 				if (event.state.status === "succeeded") ready.resolve();
 				else if (event.state.status === "failed" || event.state.status === "cancelled") ready.reject(new Error(JSON.stringify(event.state.cause)));
 			} },
@@ -1122,10 +1111,10 @@ describe("speculative action host", () => {
 			const resolveInvocation = vi.fn(() => boundary === "input" ? undefined : { executor: "fixture", ...(boundary === "identity"
 				? { identity: { value: make(profile) } } : { process: { command: "inspect", cwd, environment: {}, shell: process.execPath,
 					shellArgs: [], commandTransport: "argv" as const, value: make(profile) } }) });
-			const host = createSpeculativeActionHost("shapes", { cwd, actionSemantics,
+			const { host } = drafterHost("shapes", { cwd, actionSemantics,
 				getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, resourceCacheMaxEntries: 0, tools: ["inspect"] }),
-				draftModel: model("draft"), complete: async () => assistant([{ type: "toolCall", id: "draft", name: "inspect", arguments: { value: 0 } }], "toolUse"),
-				resolveInvocation, preflight: () => true, executionWorlds: [mockRuntimeWorld(execute, disposed)],
+				complete: async () => drafterCall({ value: 0 }, "inspect", "draft"),
+				resolveInvocation, executionWorlds: [mockRuntimeWorld(execute, disposed)],
 				onEvent: (event) => { if (shape === "plain" ? event.type === "candidate" && event.state.status === "succeeded" : event.type === "source_request") ready.resolve(); },
 			});
 			try {
@@ -1159,15 +1148,12 @@ describe("speculative action host", () => {
 			expect(signal).toBeInstanceOf(AbortSignal);
 			return phase === "running" ? allowed : allowed ? { ok: true as const } : { ok: false as const, reason: "host_denied", detail: "restricted" };
 		});
-		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("session", {
-			cwd, getSettings: () => ({ ...settings(), tools: ["bash"], drafterMaxDepth: 0 }), draftModel: model("draft"),
-			complete: vi.fn().mockResolvedValueOnce(assistant([{ type: "toolCall", id: "draft-bash", name: "bash",
-				arguments: { command: "printf data 2>&1 | tail -n 3" } }], "toolUse")).mockResolvedValue(assistant([], "stop")),
+		const { host, events } = drafterHost("session", {
+			cwd, getSettings: () => ({ ...settings(), tools: ["bash"], drafterMaxDepth: 0 }),
+			complete: vi.fn().mockResolvedValueOnce(drafterCall({ command: "printf data 2>&1 | tail -n 3" }, "bash", "draft-bash")).mockResolvedValue(assistant([], "stop")),
 			preflight: mode === "missing" ? undefined : preflight, executionWorlds: [sandbox, sandbox],
 			resolveInvocation: (name, args) => resolvePiToolInvocation(name, args, { cwd, environment: {}, shellPath: process.execPath }),
 			onEvent: (event) => {
-				events.push(event);
 				if (event.type === "candidate" && event.state.status === "succeeded" || event.type === "prediction" && event.settlement.observation === "unobserved") completed.resolve();
 			},
 		});
@@ -1427,7 +1413,6 @@ describe("speculative action host", () => {
 		const readTool = carried ? createReadTool(cwd) : learnedReadTool;
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
 		const available = deferred<PatternAwareStore>(), nextRequest = deferred<string>(), feedbackGate = deferred<void>();
-		const events: SpeculativeActionEvent<string>[] = [];
 		const actorTool = origin === "actor" ? { ...grepTool, parameters: Type.Object({ ...grepSchema.properties,
 			flags: Type.Optional(Type.String()) }) } : grepTool;
 		let actorSchema = "";
@@ -1440,14 +1425,13 @@ describe("speculative action host", () => {
 			if (origin === "preparing" && request.action?.tool === "read") { ready.resolve(); await routeGate.promise; }
 			return world.speculation.fingerprint!(request);
 		});
-		const host = createSpeculativeActionHost("probe", {
+		const { host, events } = drafterHost("probe", {
 			cwd,
 			getSettings: () => ({ ...settings(origin === "drafter" ? 1 : 4), drafterEnabled: origin === "drafter",
 				drafterMaxDepth: 0, tools: ["grep", "read"], patternAware: patternSettings }),
-			patternStore: origin === "closing" ? available.promise : patternStore, draftModel: model("draft"),
+			patternStore: origin === "closing" ? available.promise : patternStore,
 			preflight: ({ tool }) => tool.name !== "read" || allowRead,
-			complete: async () => assistant([{ type: "toolCall", id: "draft-grep", name: "grep",
-				arguments: { pattern: "one", path: "." } }], "toolUse"),
+			complete: async () => drafterCall({ pattern: "one", path: "." }, "grep", "draft-grep"),
 			resolveInvocation: (tool, input) => carried && tool === "read" ? resolvePiToolInvocation(tool, input, { cwd, environment: {} }) : undefined,
 			executionWorlds: carried ? [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 })]
 				: [{ ...world, speculation: { ...world.speculation, fingerprint } }],
@@ -1455,7 +1439,6 @@ describe("speculative action host", () => {
 			onActorActionMaterialized: ({ action }) => { actorSchema = action.schemaHash; },
 			onActorActionSettled: async () => { if (origin === "closing") ready.resolve(); await feedbackGate.promise; },
 			onEvent: (event) => {
-				events.push(event);
 				if (event.type === "candidate" && event.candidate.source === "drafter" && event.state.status === "succeeded") ready.resolve();
 				if (carried && event.type === "candidate" && event.state.status === "succeeded" ||
 					origin === "rejected" && event.type === "prediction" && event.settlement.observation === "unobserved") ready.resolve();
@@ -1732,7 +1715,7 @@ describe("speculative action host", () => {
 			if (phase === "model") { await gate.wait(); }
 			return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
 		});
-		const host = createSpeculativeActionHost("session", {
+		const { host } = drafterHost("session", {
 			cwd,
 			getSettings: () => ({ ...settings(), tools: [phase === "tools" ? "bash" : "read"] }),
 			draftModel,
