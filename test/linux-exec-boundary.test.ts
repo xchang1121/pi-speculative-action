@@ -1,8 +1,6 @@
 import { lstat, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
-import { adaptProcessToolOperations } from "../src/process-execution.ts";
 import {
 	commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark,
 	forkReusableBash, holdProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput,
@@ -64,10 +62,7 @@ int main(int argc, char **argv) {
 		await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker" });
 		await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-		const route = await backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
-			sourceRoot: workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
-				executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
-		});
+		const route = await fixture.prepareActorReplay();
 		if (!("executor" in route)) throw new Error(route.detail);
 		const produce = (command: string) => forkReusableBash(fixture, {
 			label: "producer", command, actionNamespace: "held-production", executionFingerprint,

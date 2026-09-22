@@ -549,7 +549,7 @@ int main(int argc, char **argv) {
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
 `);
-				execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", "fd-launch.c", "-o", "fd-launch"], { cwd: fixture.workspace });
+				await compileBenchmarkHelper(fixture.workspace, { source: "fd-launch.c", output: "fd-launch", arguments: ["-pthread", "-Werror"] });
 			}
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
@@ -970,7 +970,7 @@ static int take(int length,int peek,int truncated,char expected) {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
 		const binary = path.join(root, "helper");
-		execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), "-o", binary]);
+		await compileBenchmarkHelper(root, { source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), output: "helper", arguments: ["-pthread", "-Werror"] });
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
 			const run = (...args: string[]) => childProcess.spawnSync(binary, args, { encoding: "utf8", timeout: 1_000 });
@@ -1067,6 +1067,16 @@ static int take(int length,int peek,int truncated,char expected) {
 				await stopped;
 			}
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
+			const held = (options: Pick<Parameters<LinuxHeldExecBoundary["executor"]>[1], "decide" | "descriptors">, executor = native) => {
+				const wrapped = boundary.executor(executor, { sourceRoot: root, realShell: "/bin/bash", ...options });
+				let output = "";
+				return {
+					get output() { return output; },
+					execute: (command: string, request: Pick<Parameters<typeof native.execute>[0], "signal" | "scope"> = {}) =>
+						wrapped.execute({ command, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5,
+							onData: data => { output += data.toString(); }, ...request }),
+				};
+			};
 			await writeFile(path.join(root, "queue-owners.c"), `#define _GNU_SOURCE
 #include <fcntl.h>
 #include <poll.h>
@@ -1095,11 +1105,11 @@ int main(int argc, char **argv) {
 			await compileBenchmarkHelper(root, { source: "queue-owners.c", output: "queue-owners" });
 			for (const state of ["queued", "consumed"]) {
 				let outside: number | undefined;
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) === "/usr/bin/true") outside = process.descriptors?.find(({ fd }) => fd === 8)?.outside;
 					return { kind: "continue" };
 				} });
-				expect(await executor.execute({ command: `exec './queue-owners' ${state}`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				expect(await executor.execute(`exec './queue-owners' ${state}`)).toEqual({ exitCode: 0 });
 					expect(outside, state).toBe(state === "queued" ? 3 : 0);
 				}
 			await writeFile(path.join(root, "packet-capture.c"), `#define _GNU_SOURCE
@@ -1121,30 +1131,28 @@ int main(int argc,char **argv) {
 `);
 			await compileBenchmarkHelper(root, { source: "packet-capture.c", output: "packet-capture" });
 			for (const type of [2, 5]) {
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async () => ({ kind: "continue" }) });
-				expect(await executor.execute({ command: `exec './packet-capture' ${type}`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				const executor = held({ descriptors: true, decide: async () => ({ kind: "continue" }) });
+				expect(await executor.execute(`exec './packet-capture' ${type}`)).toEqual({ exitCode: 0 });
 			}
 			const compat = path.join(root, "compat32");
 			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
 			execFileSync("cc", ["-nostdlib", "-m32", "-static", `${compat}.s`, "-o", compat]);
 			if (childProcess.spawnSync(compat).status === 7) for (const descriptors of [false, true]) {
 				const decide = vi.fn(async () => ({ kind: "continue" as const }));
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors, decide });
-				expect(await executor.execute({ command: `exec '${compat}'`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
-					timeout: 5, onData: () => {} })).toEqual({ exitCode: 7 });
+				const executor = held({ descriptors, decide });
+				expect(await executor.execute(`exec '${compat}'`)).toEqual({ exitCode: 7 });
 				expect(decide).not.toHaveBeenCalled();
 			}
 			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", undefined]] as const) {
 				let inspected = 0;
 				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
-				const inspecting = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
+				const inspecting = held({ decide: async ({ pid }) => {
 					inspected++;
 					inspection = inspectHeldExecProcess(pid, await filesystem.readlink(`/proc/${pid}/exe`));
 					await inspection.catch(() => undefined);
 					return { kind: "continue" };
 				} });
-				expect(await inspecting.execute({ command: `exec /bin/true ${redirection}`, cwd: root,
-					environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				expect(await inspecting.execute(`exec /bin/true ${redirection}`)).toEqual({ exitCode: 0 });
 				expect(inspected).toBe(1);
 				// Assert outside the advisory callback, whose failures intentionally preserve native execution.
 				if (route) {
@@ -1169,27 +1177,24 @@ int main(int argc,char **argv) {
 			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
 			for (const shell of [binary, external]) {
 				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [];
-				const inspecting = boundary.executor(adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell })), {
-					sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
-						try {
-							const descriptors = process.descriptors!;
-							expect(descriptors).toBeDefined(); snapshots.push(descriptors);
-							const snapshot = await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), descriptors);
-							expect(snapshot.context.regularDescriptors).toEqual(descriptors);
-							const first = descriptors.find(({ fd }) => fd === 3)!;
-							expect(first).toMatchObject({ fd: 3, alias: 3, owned: true });
-							expect(descriptors.find(({ fd }) => fd === 4)).toEqual({ ...first, fd: 4 });
-							expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
-							if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
-							await new Promise(resolve => setTimeout(resolve, 30));
-							expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
-						} catch (error) { failures.push(error); }
-						return { kind: "continue" };
-					},
-				});
-				expect(await inspecting.execute({ command: `exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; ` +
-					`(while IFS= read -r -N 1 value <&4; do :; done) & /bin/true; wait; /bin/true`,
-					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} })).toEqual({ exitCode: 0 });
+				const inspecting = held({ descriptors: true, decide: async process => {
+					try {
+						const descriptors = process.descriptors!;
+						expect(descriptors).toBeDefined(); snapshots.push(descriptors);
+						const snapshot = await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), descriptors);
+						expect(snapshot.context.regularDescriptors).toEqual(descriptors);
+						const first = descriptors.find(({ fd }) => fd === 3)!;
+						expect(first).toMatchObject({ fd: 3, alias: 3, owned: true });
+						expect(descriptors.find(({ fd }) => fd === 4)).toEqual({ ...first, fd: 4 });
+						expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
+						if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
+						await new Promise(resolve => setTimeout(resolve, 30));
+						expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
+					} catch (error) { failures.push(error); }
+					return { kind: "continue" };
+				} }, adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell })));
+				expect(await inspecting.execute(`exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; ` +
+					`(while IFS= read -r -N 1 value <&4; do :; done) & /bin/true; wait; /bin/true`)).toEqual({ exitCode: 0 });
 				expect(failures).toEqual([]); expect(snapshots).toHaveLength(2);
 			}
 			const descriptorProbe = path.join(root, "descriptor-probe");
@@ -1333,28 +1338,27 @@ int main(int argc, char **argv) {
 	char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
 }
 `);
-			execFileSync("cc", ["-pthread", "-O2", "-Wall", "-Wextra", "-Werror", `${descriptorProbe}.c`, "-o", descriptorProbe]);
+			await compileBenchmarkHelper(root, { source: `${descriptorProbe}.c`, output: "descriptor-probe", arguments: ["-pthread", "-Werror"] });
 			for (const mode of ["lock", "export", "rights", "rights-batch", "rights-failed", "rights-unowned", "rights-orphan", "rights-pipe-orphan", "pidfd", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
 				"unshare", "unshare-noop", "range-close", "range-cloexec", "range-invalid"]) {
-				let snapshot: HeldExecProcess["descriptors"], output = "";
+				let snapshot: HeldExecProcess["descriptors"];
 				const split = mode.startsWith("unshare") || mode.startsWith("range-");
 				const imported = mode.startsWith("rights") || mode === "pidfd";
 				const unknown = mode === "rights-unowned";
 				const shared = mode === "unshare-noop" || mode === "range-invalid", slots: number[][] = [];
 				const ownership: boolean[] = [];
 				const commit = vi.fn(async () => {});
-				const executor = boundary.executor(mode === "rights-unowned" ? adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })) : native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					snapshot = process.descriptors;
 					slots.push(snapshot!.map(({ fd }) => fd));
 					ownership.push(snapshot!.find(({ fd }) => fd === 3)!.owned);
 					return mode === "export" || split || imported ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
 						({ ...descriptor, before: offset, after: Number(offset) + 1, ...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.queueHex!, "hex") } : {}) })), exitCode: 0, output: [], commit } : { kind: "continue" };
-				} });
-				expect(await executor.execute({ command: `exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
-					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`, cwd: root, environment: { PATH: "/usr/bin:/bin" },
-					timeout: 5, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
-				expect(output, mode).toBe(split ? "c" : imported && !unknown ? "b" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : imported && !unknown ? 1 : 0);
+				} }, mode === "rights-unowned" ? adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })) : native);
+				expect(await executor.execute(`exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
+					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`)).toEqual({ exitCode: 0 });
+				expect(executor.output, mode).toBe(split ? "c" : imported && !unknown ? "b" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : imported && !unknown ? 1 : 0);
 				if (!["lock", "export", "overlap"].includes(mode)) expect(snapshot?.map(({ fd, alias, owned }) => ({ fd, alias, owned })), mode).toEqual([
 					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: imported ? 67 : 3, owned: !unknown },
 					...(shared ? [{ fd: 68, alias: 3, owned: true }] : []),
@@ -1366,15 +1370,13 @@ int main(int argc, char **argv) {
 				if (mode === "export") expect(snapshot).toMatchObject([{ fd: 3, owned: false }]);
 				if (mode === "overlap") expect(ownership).toEqual([false, true]);
 			}
-			let pipeOutput = "";
-			const piped = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+			const piped = held({ descriptors: true, decide: async process => {
 				if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 				return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(1024 * 1024, "x") }],
 					descriptorOffsets: process.descriptors!.map(({ offset, ...descriptor }) => ({ ...descriptor, before: offset, after: Number(offset) + 1 })), commit: async () => {} };
 			} });
-			expect(await piped.execute({ command: `exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`,
-				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { pipeOutput += data.toString(); } })).toEqual({ exitCode: 0 });
-			expect(pipeOutput).toBe("1048576\nb");
+			expect(await piped.execute(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`)).toEqual({ exitCode: 0 });
+			expect(piped.output).toBe("1048576\nb");
 			const pipeProbe = path.join(root, "pipe-probe");
 			await writeFile(`${pipeProbe}.c`, `#define _GNU_SOURCE
 #include <fcntl.h>
@@ -1399,12 +1401,12 @@ int main(int argc, char **argv) {
 	return size < 0 || write(1, bytes, (size_t)size) != size;
 }
 `);
-			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", `${pipeProbe}.c`, "-o", pipeProbe]);
+			await compileBenchmarkHelper(root, { source: `${pipeProbe}.c`, output: "pipe-probe", arguments: ["-Werror"] });
 			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure", "journal", "journal-conflict", "journal-write-readonly", "journal-shutdown-pipe", "journal-commit-failure"]) {
 				const accepted = ["partial", "empty", "flags", "journal"].includes(mode), journal = mode.startsWith("journal"), failedCommit = mode.endsWith("commit-failure");
-				let output = "", descriptors: HeldExecProcess["descriptors"];
+				let descriptors: HeldExecProcess["descriptors"];
 				const commit = vi.fn(async () => { if (failedCommit) throw new Error("pipe commit failure"); });
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: mode === "inspect" ? () => "inspect" : true, decide: async process => {
+				const executor = held({ descriptors: mode === "inspect" ? () => "inspect" : true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					descriptors = process.descriptors;
 					if (mode === "stale") {
@@ -1422,11 +1424,11 @@ int main(int argc, char **argv) {
 						...(journal ? { resourceEvents: [{ fd: 3, kind: "peek" as const, data: Buffer.from("abc") }, { fd: 0, kind: mode === "journal-write-readonly" ? "produce" as const : mode === "journal-shutdown-pipe" ? "shutdown" as const : "consume" as const, data: Buffer.from("ab") },
 							{ fd: 8, kind: "consume" as const, data: Buffer.from(mode === "journal-conflict" ? "x" : "c") }] } : {}) };
 				} });
-				const running = executor.execute({ command: `'${pipeProbe}' ${mode}`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
+				const running = executor.execute(`'${pipeProbe}' ${mode}`);
 				if (failedCommit) await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else {
 					expect(await running, mode).toEqual({ exitCode: 0 });
-					expect(output, mode).toBe(accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef");
+					expect(executor.output, mode).toBe(accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef");
 				}
 				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || failedCommit));
 				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
@@ -1459,12 +1461,12 @@ int main(int argc, char **argv) {
 	return 0;
 }
 `);
-			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", messageProbe + ".c", "-o", messageProbe]);
+			await compileBenchmarkHelper(root, { source: messageProbe + ".c", output: "message-probe", arguments: ["-Werror"] });
 			for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel"]) {
-				let output = ""; const controller = new AbortController();
+				const controller = new AbortController();
 				const pinCounts: number[] = [];
 				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("message commit failure"); });
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					const descriptorOffsets = process.descriptors!.map(fd => ({ ...fd, before: fd.offset, after: fd.offset,
 						...(fd.queueHex !== undefined ? { content: Buffer.from(fd.queueHex, "hex") } : {}) }));
@@ -1481,14 +1483,13 @@ int main(int argc, char **argv) {
 					if (mode === "cancel") controller.abort();
 					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit };
 				} });
-				const running = executor.execute({ command: `'${messageProbe}' '${input}' ${Number(orphan)}`, cwd: root, signal: controller.signal,
-					environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data; } });
+				const running = executor.execute(`'${messageProbe}' '${input}' ${Number(orphan)}`, { signal: controller.signal });
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else if (mode === "cancel") await expect(running).rejects.toThrow();
-				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(output, mode).toBe(`${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`); }
+				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(executor.output, mode).toBe(`${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`); }
 				expect(commit, mode).toHaveBeenCalledTimes(mode === "messages" ? 2 : Number(mode === "commit-failure"));
 				if (pinCounts.length === 2) expect(pinCounts[1]).toBe(pinCounts[0]);
-				if (mode === "cancel" || mode === "commit-failure") expect(output).toBe("");
+				if (mode === "cancel" || mode === "commit-failure") expect(executor.output).toBe("");
 			}
 			const counterProbe = path.join(root, "counter-probe");
 			await writeFile(counterProbe + ".c", `#include <sys/eventfd.h>
@@ -1504,10 +1505,10 @@ int main(void) {
 	printf("%llu", (unsigned long long)value); return 0;
 }
 `);
-			execFileSync("cc", ["-O2", "-Wall", "-Wextra", "-Werror", counterProbe + ".c", "-o", counterProbe]);
+			await compileBenchmarkHelper(root, { source: counterProbe + ".c", output: "counter-probe", arguments: ["-Werror"] });
 			for (const mode of ["counter", "value", "identity", "alias", "overflow", "commit-failure"]) {
-				let output = ""; const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: true, decide: async process => {
+				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
+				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					const descriptorOffsets = process.descriptors!.filter(fd => fd.type === "eventfd").map(fd => {
 						const content = Buffer.alloc(9); content.writeBigUInt64LE(BigInt(mode === "value" || mode === "alias" && fd.fd === 21 ? 6 : fd.counter!.value));
@@ -1516,9 +1517,9 @@ int main(void) {
 					const data = Buffer.alloc(8); data.writeBigUInt64LE(mode === "overflow" ? 0xffffffffffffffffn : 2n);
 					return { kind: "replay", exitCode: 0, output: [], descriptorOffsets, resourceEvents: [{ fd: 21, kind: "produce", data }], commit };
 				} });
-				const running = executor.execute({ command: `'${counterProbe}'`, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: bytes => { output += bytes; } });
+				const running = executor.execute(`'${counterProbe}'`);
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
-				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(output, mode).toBe(mode === "counter" ? "7" : "5"); }
+				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(executor.output, mode).toBe(mode === "counter" ? "7" : "5"); }
 				expect(commit, mode).toHaveBeenCalledTimes(Number(mode === "counter" || mode === "commit-failure"));
 			}
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",
@@ -1527,12 +1528,12 @@ int main(void) {
 				const directory = mode.startsWith("directory"), opath = mode.includes("opath"), device = directory || opath || mode.startsWith("null") || mode === "zero";
 				const target = directory ? directoryInput : opath ? input : device ? mode === "zero" ? "/dev/zero" : "/dev/null" : input;
 				const accepted = mode === "shared" || mode === "unlinked" || mode === "null" || mode === "status-set" || mode === "status-clear" || mode === "directory" || mode === "opath" || mode === "opath-content" || mode === "directory-opath";
-				let output = "", heldPid = 0;
+				let heldPid = 0;
 				const commit = vi.fn(async () => {
 					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
 					if (mode === "commit-failure") throw new Error("injected offset commit failure");
 				}), adopted = vi.fn();
-				const executor = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", descriptors: directory, decide: async ({ pid, descriptors }) => {
+				const executor = held({ descriptors: directory, decide: async ({ pid, descriptors }) => {
 					if (await filesystem.readlink(`/proc/${pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					heldPid = pid;
 					const descriptorOffsets = await Promise.all([3, 4, 5].map(async fd => {
@@ -1561,38 +1562,32 @@ int main(void) {
 					return { kind: "replay", descriptorOffsets, exitCode: 0,
 						output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted };
 				} });
-				const running = executor.execute({ command: `exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
+				const running = executor.execute(`exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
 					(mode.startsWith("status-") ? `for fd in 3 4 5; do while read -r key value; do if [[ $key == flags: ]]; then (( (8#$value & 3072) == (${mode === "status-set" ? 3072 : 0} * (fd != 5)) )) || exit 90; fi; done </proc/self/fdinfo/$fd; done; ` : "") +
-					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`),
-					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); } });
+					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`));
 				if (mode === "commit-failure") {
-					await expect(running).rejects.toMatchObject({ disposition: "poisoned" }); expect(output).toBe("");
+					await expect(running).rejects.toMatchObject({ disposition: "poisoned" }); expect(executor.output).toBe("");
 				} else {
 					expect(await running).toEqual({ exitCode: 0 });
-					expect(output, mode).toBe(device ? (accepted ? "replayed:native" : "native") : accepted ? "replayed:d:b:e" : "a:a:b");
+					expect(executor.output, mode).toBe(device ? (accepted ? "replayed:native" : "native") : accepted ? "replayed:d:b:e" : "a:a:b");
 				}
 				expect(commit).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
 				expect(adopted).toHaveBeenCalledTimes(Number(accepted));
 			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
-				let callbacks = 0, observed = 0, closed = 0, output = "", heldPid = 0;
-				const concurrent = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
-					sourceRoot: root, realShell: "/bin/bash", decide: async process => {
-						if (++callbacks === 1) { heldPid = process.pid; await waiting.promise; }
-						return { kind: "continue", observeCompletion: async durationMs => {
-							await nextTurn(); closed++; if (durationMs !== undefined) observed++;
-						} };
-					},
-				});
-				const siblings = concurrent.execute({
-					command: `/bin/true & while [[ ! -e start-second-${killed} ]]; do :; done; /bin/echo sibling; wait`,
-					cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); },
-				});
+				let callbacks = 0, observed = 0, closed = 0, heldPid = 0;
+				const concurrent = held({ decide: async process => {
+					if (++callbacks === 1) { heldPid = process.pid; await waiting.promise; }
+					return { kind: "continue", observeCompletion: async durationMs => {
+						await nextTurn(); closed++; if (durationMs !== undefined) observed++;
+					} };
+				} }, { execute: request => native.execute(request).finally(nativeDone.resolve) });
+				const siblings = concurrent.execute(`/bin/true & while [[ ! -e start-second-${killed} ]]; do :; done; /bin/echo sibling; wait`);
 				try {
 					await vi.waitFor(() => expect(callbacks).toBe(1));
 					await writeFile(path.join(root, `start-second-${killed}`), "ready");
-					await vi.waitFor(() => { expect(output).toBe("sibling\n"); expect(observed).toBe(1); });
+					await vi.waitFor(() => { expect(concurrent.output).toBe("sibling\n"); expect(observed).toBe(1); });
 					expect(callbacks).toBe(2);
 					if (killed) { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
 					waiting.resolve(); expect(await siblings).toEqual({ exitCode: 0 }); expect(observed).toBe(killed ? 1 : 2);
@@ -1616,28 +1611,24 @@ int main(void) {
 			execFileSync("cc", ["-pthread", "-Wall", "-Wextra", "-Werror", `${threaded}.c`, "-o", threaded]);
 			for (const command of ["exec /bin/sh -c 'exec /bin/true'", `exec ${threaded}`]) {
 				const visited: string[] = [], completed: string[] = [];
-				const chained = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async ({ pid }) => {
+				const chained = held({ decide: async ({ pid }) => {
 					const image = `${pid}:${await filesystem.readlink(`/proc/${pid}/exe`)}`;
 					visited.push(image);
 					return { kind: "continue", observeCompletion: () => { completed.push(image); } };
 				} });
-				expect(await chained.execute({ command, cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: () => {} }))
+				expect(await chained.execute(command))
 					.toEqual({ exitCode: 0 });
 				expect(visited).toHaveLength(2);
 				expect(completed.sort(), "every exec image must retain its completion owner through replacement").toEqual(visited.sort());
 			}
-			let output = "";
 			const committed = vi.fn(async () => { await writeFile(path.join(root, "producer-armed"), "ready"); });
-			const delivery = boundary.executor(native, { sourceRoot: root, realShell: "/bin/bash", decide: async process => {
+			const delivery = held({ decide: async process => {
 				if (path.basename(await filesystem.readlink(`/proc/${process.pid}/exe`)) === "true")
 					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(2 * 1024 * 1024, 97) }], commit: committed };
 				return { kind: "continue" };
 			} });
-			expect(await delivery.execute({
-				command: "/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)",
-				cwd: root, environment: { PATH: "/usr/bin:/bin" }, timeout: 5, onData: data => { output += data.toString(); },
-			})).toEqual({ exitCode: 0 });
-			expect(output).toBe("2097152\n"); expect(committed).toHaveBeenCalledOnce();
+			expect(await delivery.execute("/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)")).toEqual({ exitCode: 0 });
+			expect(delivery.output).toBe("2097152\n"); expect(committed).toHaveBeenCalledOnce();
 			const actorContext = new AsyncLocalStorage<string>(), execIDs = new Set<string>();
 			for (const disposition of [undefined, "recoverable", "poisoned", "killed"] as const) {
 				const after = path.join(root, `after-${disposition}`);
@@ -1655,12 +1646,8 @@ int main(void) {
 					execIDs.add(process.id);
 					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit, adopted };
 				});
-				const executor = boundary.executor({ execute: request => native.execute(request).finally(nativeDone.resolve) }, {
-					sourceRoot: root, realShell: "/bin/bash",
-					decide,
-				});
-				const run = actorContext.run("original", () => executor.execute({ command: `/bin/true; printf continued > '${after}'`, cwd: root,
-					environment: { PATH: "/usr/bin:/bin" }, onData: () => {}, timeout: 5, scope }));
+				const executor = held({ decide }, { execute: request => native.execute(request).finally(nativeDone.resolve) });
+				const run = actorContext.run("original", () => executor.execute(`/bin/true; printf continued > '${after}'`, { scope }));
 				scope.turnID = "later";
 				if (disposition) {
 					await expect(run).rejects.toMatchObject({ disposition: "poisoned" });
@@ -2302,10 +2289,7 @@ int main(int argc, char **argv) {
 			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 			if (mode !== "rename") {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: instanceInput ? expect.stringMatching(/^\d+\n$/) : "U" }]);
-				const route = await backend.prepareActorReplay(adaptProcessToolOperations(createLocalBashOperations()), {
-					sourceRoot: workspace, invocation: () => undefined, held: { realShell: fixture.shellPath,
-						executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
-				}, true);
+				const route = await fixture.prepareActorReplay(true);
 				if (!("executor" in route)) throw new Error(route.detail);
 				let output = "";
 				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment,
