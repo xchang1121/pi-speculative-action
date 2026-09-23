@@ -1610,11 +1610,11 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 }
 
 function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.estimatedSavingsMs ?? NaN)} estimated savings; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.estimatedSavingsMs)} estimated savings; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
 function formatSpeedups(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
-	const savings = timing.estimatedSavingsMs ?? NaN;
+	const savings = timing.estimatedSavingsMs;
 	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
 	const toolPercent = timing.toolExecutionMs > 0 && Number.isFinite(timing.hiddenLatencyMs) ? `${(100 * timing.hiddenLatencyMs / timing.toolExecutionMs).toFixed(1)}%` : "n/a";
 	return `End-to-End SpeedUp ${percent}; Tool time speed up ${toolPercent}`;

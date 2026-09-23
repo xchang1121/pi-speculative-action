@@ -399,7 +399,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			authoritativeToolMs: summary.toolExecutionMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			estimatedSavingsMs: summary.estimatedSavingsMs,
-			optimisticAccelerationRatio: actualEndToEndMs > 0 && summary.estimatedSavingsMs !== undefined ? 1 + summary.estimatedSavingsMs / actualEndToEndMs : undefined,
+			optimisticAccelerationRatio: actualEndToEndMs > 0 ? 1 + summary.estimatedSavingsMs / actualEndToEndMs : undefined,
 			actorActions,
 			actorActionsByTool,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,

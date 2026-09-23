@@ -13,7 +13,8 @@ import {
 	READ_RANGE_COVERAGE_DETAILS_KEY,
 	type ReadRangeCoverage,
 } from "./action-key-projection.ts";
-import { asRecord, readActionRange } from "./action-semantics.ts";
+import { readActionRange } from "./action-semantics.ts";
+import { asRecord } from "./stable-json.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
 /** Optional Pi text-output fast path. Default hosts reuse sealed inputs without this rule. */

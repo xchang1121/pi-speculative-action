@@ -4,7 +4,8 @@ import {
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { asRecord, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, type ResourceInput } from "./resource-version.ts";
 import { relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -64,7 +65,7 @@ export function resolvePiToolInvocation(
 		const autoResizeImages = options.autoResizeImages ?? true;
 		const modelSupportsImages = options.modelSupportsImages ?? true;
 		// Shared with the ThinkThread runner's binding check.
-		const executor = "pi.filesystem.local.v2";
+		const executor = "pi.filesystem.local";
 		const invocation: ToolInvocation = {
 			executor,
 			filesystemRoot: cwd,

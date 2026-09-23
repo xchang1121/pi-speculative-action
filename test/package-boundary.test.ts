@@ -29,8 +29,12 @@ describe("speculative action package boundary", () => {
 			mode: "exact",
 		});
 		expect(processReuse.digestObject({ command: "printf ready" })).toMatch(/^sha256:[a-f0-9]{64}$/);
-		expect(root.makeSpeculativeActionRuntime).toBe(core.makeSpeculativeActionRuntime);
-		expect(root.ProcessReusePlanner).toBe(processReuse.ProcessReusePlanner);
+		expect(root.createSpeculativeActionHost).toBeTypeOf("function");
+		expect(core.makeSpeculativeActionRuntime).toBeTypeOf("function");
+		expect(processReuse.ProcessReusePlanner).toBeTypeOf("function");
+		expect(Object.keys(root).sort()).toEqual(["LinuxProcessReuseBackend", "ProcessExecutionCoordinator", "WorkspaceSandboxService",
+			"adaptProcessToolOperations", "createLinuxProcessExecutionWorld", "createResourceSnapshotExecutionWorld",
+			"createSpeculativeActionHost", "patternPlanActionID", "resolvePiToolInvocation"]);
 	});
 
 	test.each([

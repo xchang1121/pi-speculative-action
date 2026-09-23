@@ -214,7 +214,6 @@ interface ExecMount {
 }
 
 interface DispatcherRequest {
-	readonly version: 2;
 	readonly token: string;
 	readonly name: string;
 	readonly invokedPath: string;
@@ -243,7 +242,6 @@ interface BufferedOutput {
 }
 
 interface DispatcherResponse {
-	readonly version: 2;
 	readonly kind: "hit" | "executed" | "bypass" | "suspended";
 	readonly executable?: string;
 	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
@@ -663,8 +661,9 @@ export class LinuxProcessReuseBackend {
 			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
-		const imageLibrary = await Promise.all([execText(strace, ["--handoff-version"]), access(`${dispatcher}.so`)]).then(
-			([version]) => version.trim() === "2" ? `${dispatcher}.so` : undefined, () => undefined);
+		const imageLibrary = await execText(strace, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
+			`--handoff-library=${dispatcher}.so`, "--handoff-image=/dev/null", "--", "/bin/true"])
+			.then(() => `${dispatcher}.so`, () => undefined);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
 		try {
@@ -837,13 +836,10 @@ export class LinuxProcessReuseBackend {
 		socket.once("end", () => {
 			const pending = Promise.resolve().then(() => this.handleWireRequest(session, body))
 				.then((response) => { socket.end(JSON.stringify(response)); })
-				.catch(async (error) => {
+				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
-					const received = parseDispatcherRequest(body);
-					const request = received ? materializeDispatcherRequest(session, received) : undefined;
-					const executable = request ? await this.resolveRequestedExecutable(session, request).catch(() => undefined) : undefined;
-					socket.end(JSON.stringify({ version: 2, kind: "bypass", ...(executable ? { executable } : {}) }));
+					socket.end(JSON.stringify({ kind: "failed" }));
 				}).finally(() => { session.pending.delete(pending); });
 			session.pending.add(pending);
 		});
@@ -863,7 +859,7 @@ export class LinuxProcessReuseBackend {
 		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
 			session.incompleteReasons.add(`broker_bypass:${request.name}:${eligibility.reason}`);
-			return { version: 2, kind: "bypass", executable };
+			return { kind: "bypass", executable };
 		}
 		const { argv0, args, cwd, environment } = request;
 		return this.executeRequest(session, { argv0, args, cwd, environment }, executable, eligibility.route, requestID);
@@ -1198,7 +1194,7 @@ export class LinuxProcessReuseBackend {
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			session.computations.push(reusedComputation(certificate.result, started, acquired));
 			replayed = true;
-			return { version: 2, kind: "hit", weakKey, output, exit: certificate.result.exit };
+			return { kind: "hit", weakKey, output, exit: certificate.result.exit };
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
 			const observed = plan.certificate.result.observedProcessMs;
@@ -1254,7 +1250,7 @@ export class LinuxProcessReuseBackend {
 				descriptorManifest = path.join(traceRoot, "fd-inputs");
 				descriptorReportPath = path.join(traceRoot, "fd-offsets");
 				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
-				let manifest = `FD6 ${inputs.length} ${Number(!!request.closeStdin)} ${Number(resourceJournal)}\n`;
+				let manifest = `INPUTS ${inputs.length} ${Number(!!request.closeStdin)} ${Number(resourceJournal)}\n`;
 				for (const descriptor of inputs) {
 					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
 						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
@@ -1348,6 +1344,7 @@ export class LinuxProcessReuseBackend {
 			], resourceJournal, live);
 			const processStarted = performance.now();
 			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
+			stage = "execution";
 			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				cwd: request.cwd,
 				environment: request.environment,
@@ -1361,14 +1358,14 @@ export class LinuxProcessReuseBackend {
 						// Only probe while an Actor already waits within its join budget. A CPU
 						// prefix must be allowed to reach I/O instead of waiting forever for EOF.
 						while (!stop.aborted) {
-							const report = await readFile(descriptorReportPath!, "utf8").catch(() => ""), ready = /^RUN1 (\d+)\n$/.exec(report);
+							const report = await readFile(descriptorReportPath!, "utf8").catch(() => ""), ready = /^RUNNING (\d+)\n$/.exec(report);
 							if (ready) {
 								pid = Number(ready[1]);
 								const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => ""), syscall = Number(state.split(" ", 1)[0]);
 								if (!state) return;
 								if (IO_FRONTIERS.has(syscall)) break;
 								if (syscall >= 0) return;
-							} else if (report.startsWith("FD4 ")) return;
+							} else if (report.startsWith("OFD ")) return;
 							await delay(10, undefined, { signal: stop }).catch(() => undefined);
 						}
 						if (stop.aborted) return;
@@ -1561,9 +1558,16 @@ export class LinuxProcessReuseBackend {
 				this.setError(session, `post_execution_capture:${detail}`);
 				session.incompleteReasons.add(`nested_capture:${detail}`);
 			}
-			if (continuation) return { version: 2, kind: "suspended", weakKey };
+			if (continuation) return { kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
-			return { version: 2, kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
+			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
+		} catch (error) {
+			if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
+			const detail = failureDetail(error);
+			this.add(session, "bypasses");
+			this.setError(session, detail);
+			session.incompleteReasons.add(`broker:${detail}`);
+			return { kind: "bypass", executable };
 		} finally {
 			try { await Promise.all([descriptorReport?.close(), ...inheritedFiles.map(file => file.close())]); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
 			releaseInputs?.();
@@ -1712,7 +1716,7 @@ function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd:
 		if (end < 0 || end - cursor > 256) throw new Error("invalid continuation header");
 		const text = image.toString("ascii", cursor, end); cursor = end + 1; return text;
 	};
-	const first = line(), header = /^PIIMAGE3 (\d+) (\d+) (\d+) (\d+)$/.exec(first);
+	const first = line(), header = /^PIIMAGE (\d+) (\d+) (\d+) (\d+)$/.exec(first);
 	if (!header || Number(header[1]) !== frontier.pid || Number(header[2]) > 256) throw new Error("unbound continuation image");
 	const records = new Map<number, string[]>(), bound: string[] = [], descriptions = new Map<number, string[]>();
 	for (let index = 0; index < Number(header[2]); index++) {
@@ -1778,7 +1782,7 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 		if (end < 0 || end - cursor > 256) throw new Error("incomplete inherited OFD result");
 		const value = report.toString("ascii", cursor, end); cursor = end + 1; return value;
 	};
-	if (line() !== `FD4 ${inputs.length}`) throw new Error("invalid inherited OFD header");
+	if (line() !== `OFD ${inputs.length}`) throw new Error("invalid inherited OFD header");
 	const positions: ReturnType<typeof parseDescriptorOffsets> = inputs.map(input => {
 		const value = line();
 		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(value)) throw new Error("invalid inherited OFD result");
@@ -2213,7 +2217,6 @@ async function createProcessInterposition(input: {
 	const configurationPath = path.join(root, "configuration.json");
 	input.signal?.throwIfAborted();
 	const configuration = {
-		version: 2,
 		socketPath: input.socketPath,
 		token: input.token,
 		directories: directories.map(({ target, view, shadow }) => ({ target, view, shadow })),
@@ -2574,7 +2577,6 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
 		if (
-			request.version !== 2 ||
 			typeof request.token !== "string" ||
 			typeof request.name !== "string" ||
 			typeof request.invokedPath !== "string" ||
@@ -2586,8 +2588,7 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 			!request.args.every((argument) => typeof argument === "string" && !argument.includes("\0")) ||
 			typeof request.cwd !== "string" ||
 			!request.environment ||
-			typeof request.environment !== "object" ||
-			!validProcessContext(request.context)
+			typeof request.environment !== "object"
 		) {
 			return undefined;
 		}
@@ -2617,6 +2618,7 @@ async function eligibleRequest(
 	request: DispatcherRequest,
 	expectedContext: ProcessExecutionContext,
 ): Promise<RequestEligibility> {
+	if (!validProcessContext(request.context)) return { reason: "process_context_unsupported" };
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
 	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };

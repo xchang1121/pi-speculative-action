@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
 					const image = Array.isArray(args) && args.find(arg => arg.startsWith("--handoff-image="));
 					if (!image) continue;
 					const report = await readFile(path.join(path.dirname(image.slice("--handoff-image=".length)), "fd-offsets"), "utf8").catch(() => "");
-					const ready = /^RUN1 (\d+)\n$/.exec(report); if (!ready) continue;
+					const ready = /^RUNNING (\d+)\n$/.exec(report); if (!ready) continue;
 					const pid = Number(ready[1]), state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => "");
 					if (mode === "early") {
 						const usage = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""), fields = usage.slice(usage.lastIndexOf(")") + 2).split(" ");
@@ -998,7 +998,7 @@ static int take(int length,int peek,int truncated,char expected) {
 			await writeFile(queueImage, "abc");
 			for (const producer of [1, 2, 4, 5]) {
 				await writeFile(queueReport, "");
-				await writeFile(queueManifest, `FD6 1 0 ${Number(producer >= 4)}\n0 0 ${producer >= 4 ? 2 : 0} 0 ${Buffer.byteLength(queueImage)} ${producer} ${producer >= 4 ? 212992 : 4096} 0 ${producer === 5 ? 3 : 0} -1 3 1 ${Number(producer >= 4)}\n${queueImage}\n`);
+				await writeFile(queueManifest, `INPUTS 1 0 ${Number(producer >= 4)}\n0 0 ${producer >= 4 ? 2 : 0} 0 ${Buffer.byteLength(queueImage)} ${producer} ${producer >= 4 ? 212992 : 4096} 0 ${producer === 5 ? 3 : 0} -1 3 1 ${Number(producer >= 4)}\n${queueImage}\n`);
 				const child = childProcess.spawn(binary, ["--exec-fds", "12", queueManifest, queueReport, "consumer", "/bin/sh", "-c", "echo $$ >&2; exec /bin/cat"], { detached: true });
 				let output = "", childPID = "", completed = false;
 				child.stdout.on("data", data => { output += data.toString(); });
@@ -1008,13 +1008,13 @@ static int take(int length,int peek,int truncated,char expected) {
 					await expect.poll(() => output).toBe("abc");
 					if (producer === 1 || producer === 5) {
 						expect(await closed).toEqual([0, null]);
-					expect(await readFile(queueReport, "utf8")).toMatch(producer === 1 ? /^FD4 1\n0 0 3 / : /^FD4 1\n0 2 0 /);
+					expect(await readFile(queueReport, "utf8")).toMatch(producer === 1 ? /^OFD 1\n0 0 3 / : /^OFD 1\n0 2 0 /);
 					} else {
 						await new Promise(resolve => setTimeout(resolve, 30));
 						expect(completed, "exhausted active input must block, never fabricate EOF").toBe(false);
 						process.kill(-child.pid!, "SIGKILL"); await closed;
 						await expect.poll(async () => (await readFile(`/proc/${Number(childPID)}/stat`, "utf8").catch(() => "")).split(") ")[1]?.[0] ?? "").not.toMatch(/[RSDT]/);
-						expect(await readFile(queueReport, "utf8")).toMatch(/^RUN1 \d+\n$/);
+						expect(await readFile(queueReport, "utf8")).toMatch(/^RUNNING \d+\n$/);
 					}
 				} finally { if (!completed) { process.kill(-child.pid!, "SIGKILL"); await closed; } }
 			}
@@ -1024,7 +1024,7 @@ static int take(int length,int peek,int truncated,char expected) {
 				const readFD = socket ? 4 : 3, writeFD = socket ? 3 : 4;
 				const handles = socket ? [[3, 3, 2, 4, 4, queueImage], [4, 4, 2, 4, 3, peerImage], [5, 3, 2, 4, 4, ""]] :
 					[[3, 3, 0, 2, -1, queueImage], [4, 4, 1, 3, -1, queueImage], [5, 4, 1, 3, -1, ""]];
-				await writeFile(queueManifest, "FD6 3 0 1\n" + handles.map(([fd, alias, flags, stream, peer, image]) =>
+				await writeFile(queueManifest, "INPUTS 3 0 1\n" + handles.map(([fd, alias, flags, stream, peer, image]) =>
 					`${fd} ${alias} ${flags} 0 ${Buffer.byteLength(String(image))} ${stream} ${socket ? 212992 : 4096} 0 0 ${peer} 0 1 ${Number(socket)}\n${image}\n`).join(""));
 				const closed = childProcess.spawnSync("/usr/bin/timeout", ["--kill-after=1", "2", binary, "--exec-fds", "12", queueManifest, queueReport, "lifetime", "/bin/bash", "-c",
 					`exec ${writeFD}>&-; printf x >&5; (sleep 0.03; printf y >&5) & exec 5>&-; /bin/cat <&${readFD}; wait`], { encoding: "utf8" });
@@ -1165,14 +1165,14 @@ int main(int argc,char **argv) {
 			await writeFile(input, "abcdef");
 			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
 			await writeFile(report, "");
-			await writeFile(manifest, `FD6 3 0 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n3 0 32768 1 0 0 0 0 0 -1 3 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n`);
+			await writeFile(manifest, `INPUTS 3 0 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n3 0 32768 1 0 0 0 0 0 -1 3 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n`);
 			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
 				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
 				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
 			expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
 			const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
 			expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
-				.toEqual(["FD4 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
+				.toEqual(["OFD 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
 			const external = path.join(root, "external-fd");
 			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
 			for (const shell of [binary, external]) {
@@ -1891,7 +1891,7 @@ int main(void) {
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
-			expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
+			expect(branch.output.isError, JSON.stringify({ output: branch.output, metrics: fixture.backend.metrics() })).toBe(false);
 			const text = branch.output.result.content[0];
 			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n" + " ".repeat(32768) + ":end");
 			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
@@ -1899,7 +1899,7 @@ int main(void) {
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
 			expect(captures[0]!.finish).not.toHaveBeenCalled();
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
-			expect(branch.executionMetrics.reuse?.bypasses).toBe(1);
+			expect(branch.executionMetrics.reuse?.bypasses).toBe(5); // Capture failure, internal pipeline and three unsupported stdio contexts.
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
 			await branch.dispose();
 			branch = undefined;

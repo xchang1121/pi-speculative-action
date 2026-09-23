@@ -16,8 +16,6 @@ import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { captureWorkspaceStructure } from "./process-observation.ts";
 
-const HELPER_PROTOCOL_VERSION = 34;
-const WIRE_PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
@@ -224,7 +222,6 @@ interface ActiveExecution {
 }
 
 interface WireRequest {
-	readonly version: 1;
 	readonly token: string;
 	readonly execution: string;
 	readonly pid: number;
@@ -449,9 +446,6 @@ export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
 	if (process.platform !== "linux") throw new Error("Linux required");
 	const resolved = await realpath(binary ?? path.join(os.homedir(), ".local", "bin", "pi-speculative-held-exec"));
 	await access(resolved, fsConstants.X_OK);
-	if ((await execute(resolved, ["--protocol-version"])).stdout.trim() !== String(HELPER_PROTOCOL_VERSION)) {
-		throw new Error("held-exec protocol mismatch; rerun npm run setup:linux");
-	}
 	return resolved;
 }
 
@@ -604,7 +598,7 @@ function decodeNullFields(bytes: Buffer): string[] {
 function parseRequest(line: string): WireRequest | undefined {
 	try {
 		const value = JSON.parse(line) as Partial<WireRequest>;
-		return value.version === WIRE_PROTOCOL_VERSION && /^[0-9a-f]{64}$/.test(value.token ?? "") &&
+		return /^[0-9a-f]{64}$/.test(value.token ?? "") &&
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
 			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && (value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
 			validDescriptors(value.descriptors) ? value as WireRequest : undefined;

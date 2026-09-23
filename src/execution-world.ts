@@ -276,7 +276,7 @@ export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnost
 	readonly id: string;
 	readonly scope: ExecutionWorldScope;
 	readonly isolation: SpeculativeExecution;
-	/** Capabilities and health of speculative execution; retained at the top level for host compatibility. */
+	/** Capabilities of speculative execution; observation reports its own capabilities below. */
 	readonly capabilities: EffectCapabilities;
 	/** Omitted means every tool whose effect contract is covered. */
 	readonly tools?: readonly string[];

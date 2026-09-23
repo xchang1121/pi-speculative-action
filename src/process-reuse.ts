@@ -18,7 +18,6 @@ export {
 	type ProcessProducerProof,
 	type ProcessProvenanceCertificate,
 	type ProcessResultRecord,
-	PROCESS_CERTIFICATE_VERSION,
 	processStrongKey,
 	processWeakKey,
 	type ProvenanceTaint,

@@ -219,11 +219,11 @@ describe("ablation suite report", () => {
 		const report = summarizeSuite([
 			run("short", 1, { serializedCounterfactualMs: 1, actualEndToEndMs: 0.5 }),
 			run("long", 1, { serializedCounterfactualMs: 100, actualEndToEndMs: 200 }),
-			run("long", 2, { serializedCounterfactualMs: 300, actualEndToEndMs: 600, estimatedSavingsMs: undefined }),
+			run("long", 2, { serializedCounterfactualMs: 300, actualEndToEndMs: 600 }),
 			run("missing", 1, { actualEndToEndMs: invalid }),
 		]);
 		expect(report.pooled?.accelerationRatio).toBeCloseTo(401 / 800.5, 12);
-		expect(report.pooled?.optimisticAccelerationRatio).toBeUndefined(); // Older traces must not silently become zero savings.
+		expect(report.pooled?.optimisticAccelerationRatio).toBe(1);
 		expect(report.pooled?.meanLatencyDifferenceMs).toBeCloseTo(399.5 / 3, 12);
 		expect(report).toMatchObject({ runs: 4, unmeasuredRuns: 1, pooled: { runs: 3 }, byInstance: { missing: null },
 			invalidRuns: [{ instance: "missing", reasons: ["unavailable_timing"] }] });

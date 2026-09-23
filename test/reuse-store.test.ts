@@ -5,11 +5,7 @@ import { processPrototype, processCertificate, SPECULATIVE_PRODUCER } from "./pr
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	digestObject,
-	parseProcessCertificate,
-	sha256Digest,
-} from "../src/provenance-certificate.ts";
+import { sha256Digest } from "../src/provenance-certificate.ts";
 import { ArtifactCAS, ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 
@@ -37,10 +33,6 @@ describe("persistent provenance store", () => {
 		expect(await initial.mayHaveCertificates(executablePath)).toBe(false);
 		const duplicate = completed(first, 456, "test", 999);
 		expect(duplicate.id).toBe(certificate.id);
-		const { id: _id, ...legacyBody } = certificate;
-		const legacy = { ...legacyBody, id: digestObject(legacyBody) };
-		expect(parseProcessCertificate(legacy)).toBeUndefined();
-		for (const version of [2, 6]) expect(parseProcessCertificate({ ...certificate, version })).toBeUndefined();
 		const mutable = structuredClone(certificate), publishing = initial.put(mutable);
 		await Promise.resolve();
 		Object.assign(mutable, completed(first, 123, "changed"));

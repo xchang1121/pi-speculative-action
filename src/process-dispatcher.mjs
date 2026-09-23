@@ -28,7 +28,6 @@ if (process.argv.length === 5 && process.argv[2] === "--probe-context" && proces
 		invoked = path.basename(invokedPath);
 		if (!invoked) throw new Error("missing native dispatch target");
 		const response = await exchange({
-			version: 2,
 			token: configuration.token,
 			name: invoked,
 			invokedPath,
@@ -38,8 +37,10 @@ if (process.argv.length === 5 && process.argv[2] === "--probe-context" && proces
 			environment,
 			context: await captureProcessContext("self", ["0", "1", "2"]),
 		}, configuration.socketPath);
-		if (!response || response.version !== 2 || response.kind === "bypass") {
-			let executable = response?.executable ?? invokedPath;
+		if (!response || !["bypass", "hit", "executed", "suspended"].includes(response.kind)) throw new Error("invalid dispatch response");
+		if (response.kind === "bypass") {
+			if (typeof response.executable !== "string") throw new Error("missing bypass executable");
+			let executable = response.executable;
 			if (path.isAbsolute(executable)) {
 				const directory = configuration.directories.find(({ target, view }) =>
 					[target, view].some(candidate => path.resolve(path.dirname(executable)) === path.resolve(candidate)));
@@ -76,7 +77,6 @@ async function run(executable, commandArgs, argv0) {
 function validConfiguration(value) {
 	return Boolean(
 		value &&
-			value.version === 2 &&
 			typeof value.socketPath === "string" &&
 			typeof value.token === "string" &&
 			Array.isArray(value.directories) &&
